@@ -1,0 +1,14 @@
+/dist/__pycache__/
+/dist/.venv/
+/dist/app-*
+__pycache__/
+/app/__pycache__/
+/app/services/__pycache__/
+/app/models/__pycache__/
+/app/routers/__pycache__/
+/app/schemas/__pycache__/
+
+# ?섍꼍蹂??.env)???덈? 而ㅻ컠?섏? ?딆뒿?덈떎.
+.env
+.env.*
+!.env.example

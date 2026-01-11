@@ -1,0 +1,160 @@
+version: '3.8'
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: likenovel-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root1234
+      MYSQL_DATABASE: likenovel
+      MYSQL_USER: ln-admin
+      MYSQL_PASSWORD: likenovel684233^^
+    volumes:
+      - ./dist/init:/docker-entrypoint-initdb.d
+      - mysql-data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --bind-address=0.0.0.0
+    ports:
+      - "3806:3306"
+    networks:
+      - likenovel-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "ln-admin", "-plikenovel684233^^"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: "0.50"
+  keycloak-wait:
+    image: alpine
+    container_name: wait-initializing-mysql-complete-for-keycloak
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache netcat-openbsd &&
+        until nc -z mysql 3306; do
+          echo "waiting for mysql";
+          sleep 2;
+        done
+    networks:
+      - likenovel-network
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: "0.50"
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.2
+    container_name: likenovel-keycloak
+    restart: unless-stopped
+    environment:
+      KC_DB: mysql
+      KC_DB_URL: jdbc:mysql://mysql:3306/keycloak
+      KC_DB_USERNAME: ln-admin
+      KC_DB_PASSWORD: likenovel684233^^
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin1234
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_SSL_REQUIRED: "none"
+    command:
+      - start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      keycloak-wait:
+        condition: service_completed_successfully
+    networks:
+      - likenovel-network
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8080'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: "0.50"
+  # keycloak-init:
+  #   image: python:3.11-alpine
+  #   container_name: likenovel-keycloak-init
+  #   restart: "no"
+  #   depends_on:
+  #     keycloak:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./dist:/dist
+  #   command: >
+  #     sh -c "
+  #       apk add --no-cache curl &&
+  #       ls -la /dist/setup-keycloak.sh &&
+  #       cat /dist/setup-keycloak.sh &&
+  #       sh /dist/setup-keycloak.sh
+  #     "
+  #   networks:
+  #     - likenovel-network
+  #   labels:
+  #     - "com.docker.compose.ephemeral=true"
+  meilisearch:
+    image: getmeili/meilisearch:v1.7
+    container_name: likenovel-meilisearch
+    environment:
+      - MEILI_MASTER_KEY=VP0MJ1Ee4Dfk10sAUK_GPOlTkSCKoCxvRE1hDEkOaYs
+    command: ["meilisearch", "--http-addr", "0.0.0.0:7700"]
+    networks:
+      - likenovel-network
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: "0.50"
+  api:
+    build: .
+    container_name: likenovel-api
+    restart: unless-stopped
+    env_file:
+      - .env # 환경변수 파일 명시적으로 지정
+    expose:
+      - "8000" # 외부 포트 직접 열지 않음
+    volumes:
+      - .:/app
+    command: ["/app/dist/batch/start-cron.sh", "uvicorn", "app.main:be_app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      # keycloak-init:
+      #   condition: service_completed_successfully
+      meilisearch:
+        condition: service_started
+    networks:
+      - likenovel-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: "0.50"
+  nginx:
+    image: nginx:latest
+    container_name: likenovel-nginx
+    ports:
+      - "8800:443" # HTTPS는 8800 포트로 접근
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt/live/cloud.aiaracorp.com/fullchain.pem:/etc/ssl/certs/fullchain.pem:ro
+      - /etc/letsencrypt/live/cloud.aiaracorp.com/privkey.pem:/etc/ssl/private/privkey.pem:ro
+    depends_on:
+      - api
+    networks:
+      - likenovel-network
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: "0.50"
+networks:
+  likenovel-network:
+    driver: bridge
+volumes:
+  mysql-data:

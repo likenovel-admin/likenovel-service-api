@@ -1,0 +1,12 @@
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /home/ln-admin/likenovel/api
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStart:
+    - location: run_be.sh
+      timeout: 300
+      runas: ln-admin
+

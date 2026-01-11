@@ -1,0 +1,76 @@
+name: active aws codedeploy(fastapi backend server)
+
+on:
+  # prod 브랜치 PR시 push되면서 트리거 발생
+  push:
+    branches: [ "prod" ]
+
+  # Run workflow시 시작 트리거 발생(수작업 시 prod 선택 필수)
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: '(option) input additional comments'
+
+# github_token 사용 권한
+permissions:
+  contents: write
+
+# 워크플로우
+# 내부 동작은 github 내 가상환경에서 실행되는 형태
+jobs:
+  BuildAndRunBeServer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python Setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Poetry Setup
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+
+      - name: Poetry Build
+        run: |
+          # 필요시 major 적용(patch는 세 번째 숫자 증가)
+          poetry version patch
+          poetry install
+          poetry build
+          git config --global user.name 'likenovel-dev'
+          git config --global user.email 'infra@likenovel.net'
+          git add pyproject.toml
+          git commit -m "version update"
+          git push
+        working-directory: ./fastapi_be_server
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      - name: Deploy with AWS codedeploy
+        env:
+          APPLICATION_NAME: ln-dep
+          DEPLOY_CONFIG_NAME: CodeDeployDefault.AllAtOnce
+          DEPLOY_GROUP_NAME: ln-dep-grp-back
+          S3_BUCKET: ln-s3
+          TAGS: ${{ inputs.tags }}
+        run: |
+          # *.whl, appspec.yml, run_be.sh, gconf.py 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py
+          aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
+          aws deploy create-deployment \
+            --application-name $APPLICATION_NAME \
+            --deployment-config-name $DEPLOY_CONFIG_NAME \
+            --deployment-group-name $DEPLOY_GROUP_NAME \
+            --description "backend server deploy" \
+            --s3-location bucket=$S3_BUCKET,bundleType=zip,key=$GITHUB_SHA.zip
+          echo "(option) input additional comments: $TAGS"
+        working-directory: ./fastapi_be_server/dist
+

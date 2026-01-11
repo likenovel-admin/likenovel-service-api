@@ -1,0 +1,36 @@
+[tool.poetry]
+name = "app"
+version = "0.1.457"
+description = "fastapi be server"
+authors = ["likenovel-dev <infra@likenovel.net>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.112.2"
+uvicorn = {extras = ["standard"], version = "^0.30.6"}
+gunicorn = "^23.0.0"
+uvicorn-worker = "^0.2.0"
+sqlalchemy = {extras = ["asyncio"], version = "^2.0.32"}
+pymysql = "^1.1.1"
+aiomysql = "^0.2.0"
+pydantic-settings = "^2.4.0"
+httpx = ">=0.27.2,<0.29.0"
+pyjwt = {extras = ["crypto"], version = "^2.9.0"}
+pydantic = {extras = ["email"], version = "^2.8.2"}
+mailtrap = "^2.0.1"
+boto3 = "^1.35.17"
+pandas = "2.2.3"
+meilisearch = "^0.31.5"
+beautifulsoup4 = "^4.12.3"
+ebooklib = "^0.18"
+portone-server-sdk = "^0.8.0"
+bcrypt = "^4.3.0"
+firebase-admin = "7.0.0"
+python-multipart = "^0.0.6"
+pycryptodome = "^3.23.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

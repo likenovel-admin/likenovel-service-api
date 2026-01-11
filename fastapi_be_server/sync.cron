@@ -1,0 +1,1 @@
+* * * * * root python /app/sync_meilisearch.py >> /var/log/cron.log 2>&1
