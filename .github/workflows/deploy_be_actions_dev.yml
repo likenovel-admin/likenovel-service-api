@@ -1,0 +1,86 @@
+name: active aws codedeploy(fastapi backend server) - DEV
+
+on:
+  # dev 브랜치 push 시 스테이징(api-dev) 배포 트리거
+  push:
+    branches: [ "dev" ]
+
+  # 수동 배포 트리거 (긴급 배포/재시도용)
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: '(option) input additional comments'
+
+permissions:
+  contents: read
+
+jobs:
+  BuildAndRunBeServerDev:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python Setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Poetry Setup
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+
+      - name: Poetry Build (DEV)
+        run: |
+          # NOTE(DEV):
+          # - dev는 "검증 환경"이라 자동 버전 bump/자동 commit/push를 하지 않습니다.
+          # - 배포 산출물(wheel)만 생성합니다.
+          poetry install
+          poetry build
+        working-directory: ./fastapi_be_server
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy with AWS codedeploy (DEV)
+        env:
+          # DEV용 CodeDeploy 설정은 하드코딩하지 않고 Secrets로 주입합니다.
+          # - 운영/스테이징 배포 타겟이 섞이면 사고가 나므로, 반드시 분리된 값으로 설정하세요.
+          APPLICATION_NAME: ${{ secrets.CODEDEPLOY_APP_NAME_BACKEND_DEV }}
+          DEPLOY_CONFIG_NAME: ${{ secrets.CODEDEPLOY_CONFIG_NAME_BACKEND_DEV }}
+          DEPLOY_GROUP_NAME: ${{ secrets.CODEDEPLOY_GROUP_NAME_BACKEND_DEV }}
+          S3_BUCKET: ${{ secrets.CODEDEPLOY_S3_BUCKET }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -e
+          if [ -z "$APPLICATION_NAME" ] || [ -z "$DEPLOY_GROUP_NAME" ] || [ -z "$S3_BUCKET" ]; then
+            echo "[ERROR] Missing required CodeDeploy secrets for DEV."
+            echo "  - CODEDEPLOY_APP_NAME_BACKEND_DEV"
+            echo "  - CODEDEPLOY_GROUP_NAME_BACKEND_DEV"
+            echo "  - CODEDEPLOY_S3_BUCKET"
+            echo "  (optional) CODEDEPLOY_CONFIG_NAME_BACKEND_DEV"
+            exit 1
+          fi
+
+          # 기본값: CodeDeployDefault.AllAtOnce
+          if [ -z "$DEPLOY_CONFIG_NAME" ]; then
+            DEPLOY_CONFIG_NAME="CodeDeployDefault.AllAtOnce"
+          fi
+
+          # *.whl, appspec.yml, run_be.sh, gconf.py 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py
+          aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
+          aws deploy create-deployment \
+            --application-name $APPLICATION_NAME \
+            --deployment-config-name $DEPLOY_CONFIG_NAME \
+            --deployment-group-name $DEPLOY_GROUP_NAME \
+            --description "backend server deploy (DEV)" \
+            --s3-location bucket=$S3_BUCKET,bundleType=zip,key=$GITHUB_SHA.zip
+          echo "(option) input additional comments: $TAGS"
+        working-directory: ./fastapi_be_server/dist
+
