@@ -34,21 +34,27 @@ select m.*
            and created_date < curdate()
          group by product_id
     ),
+    tmp_common_rate as (
+        select
+            max(case when code_key = 'payment_fee_rate' then cast(code_value as decimal(10,4)) * 100 else 0 end) as fee_rate,
+            max(case when code_key = 'default_settlement_rate' then cast(code_value as decimal(10,4)) * 100 else 0 end) as settlement_rate
+        from tb_common_code
+        where code_group = 'common_rate' and use_yn = 'Y'
+    ),
     tmp_product_sales_list_summary as (
-        select product_id
-             , sum(case when item_type = 'normal' and device_type = 'web' then fee else 0 end) as fee_web
-             , sum(case when item_type = 'normal' and device_type = 'playstore' then fee else 0 end) as fee_playstore
-             , sum(case when item_type = 'normal' and device_type = 'ios' then fee else 0 end) as fee_ios
-             , sum(case when item_type = 'normal' and device_type = 'onestore' then fee else 0 end) as fee_onestore
-             , sum(case when item_type = 'comped' and device_type = 'web' then fee else 0 end) as fee_comped_ticket
-             , sum(case when item_type = 'normal' and device_type = 'web' then settlement_rate else 0 end) as settlement_rate_web
-             , sum(case when item_type = 'normal' and device_type = 'playstore' then settlement_rate else 0 end) as settlement_rate_playstore
-             , sum(case when item_type = 'normal' and device_type = 'ios' then settlement_rate else 0 end) as settlement_rate_ios
-             , sum(case when item_type = 'normal' and device_type = 'onestore' then settlement_rate else 0 end) as settlement_rate_onestore
-             , sum(case when item_type = 'comped' and device_type = 'web' then settlement_rate else 0 end) as settlement_rate_comped_ticket
-          from tb_cms_product_settlement
-         where item_type in ('normal', 'comped')
-         group by product_id
+        select a.product_id
+             , r.fee_rate as fee_web
+             , r.fee_rate as fee_playstore
+             , r.fee_rate as fee_ios
+             , r.fee_rate as fee_onestore
+             , r.fee_rate as fee_comped_ticket
+             , r.settlement_rate as settlement_rate_web
+             , r.settlement_rate as settlement_rate_playstore
+             , r.settlement_rate as settlement_rate_ios
+             , r.settlement_rate as settlement_rate_onestore
+             , r.settlement_rate as settlement_rate_comped_ticket
+          from tb_batch_daily_product_info_summary a
+         cross join tmp_common_rate r
     )
     select a.product_id
          , a.title
@@ -136,14 +142,35 @@ select m.*
            and created_date < curdate()
          group by product_id
     ),
+    tmp_common_rate2 as (
+        select
+            max(case when code_key = 'payment_fee_rate' then cast(code_value as decimal(10,4)) * 100 else 0 end) as fee_rate,
+            max(case when code_key = 'default_settlement_rate' then cast(code_value as decimal(10,4)) * 100 else 0 end) as settlement_rate
+        from tb_common_code
+        where code_group = 'common_rate' and use_yn = 'Y'
+    ),
     tmp_product_settlement_list_summary as (
-        select product_id
-             , item_type
-             , device_type
-             , fee
-             , settlement_rate
-          from tb_cms_product_settlement
-         where item_type in ('normal', 'discount', 'comped')
+        select a.product_id
+             , t.item_type
+             , t.device_type
+             , r.fee_rate as fee
+             , r.settlement_rate
+          from tb_batch_daily_product_info_summary a
+         cross join tmp_common_rate2 r
+         cross join (
+             select 'normal' as item_type, 'web' as device_type union all
+             select 'normal', 'playstore' union all
+             select 'normal', 'ios' union all
+             select 'normal', 'onestore' union all
+             select 'discount', 'web' union all
+             select 'discount', 'playstore' union all
+             select 'discount', 'ios' union all
+             select 'discount', 'onestore' union all
+             select 'comped', 'web' union all
+             select 'comped', 'playstore' union all
+             select 'comped', 'ios' union all
+             select 'comped', 'onestore'
+         ) t
     ),
     tmp_contract_offer_amount_list_summary as (
         select z.product_id
@@ -151,6 +178,28 @@ select m.*
           from tb_product_contract_offer z
          where z.use_yn = 'Y'
            and z.author_accept_yn = 'Y'
+    ),
+    tmp_prev_product_settlement_latest as (
+        select t.product_id
+             , t.item_type
+             , t.device_type
+             , t.privious_offer_amount
+             , t.current_offer_amount
+          from (
+            select d.product_id
+                 , d.item_type
+                 , d.device_type
+                 , d.privious_offer_amount
+                 , d.current_offer_amount
+                 , row_number() over (
+                       partition by d.product_id, d.item_type, d.device_type
+                       order by d.updated_date desc, d.id desc
+                   ) as rn
+              from tb_ptn_product_settlement d
+             where d.created_date >= date_sub(curdate(), interval 1 month) - interval day(curdate()) - 1 day
+               and d.created_date < curdate()
+          ) t
+         where t.rn = 1
     )
     select t.product_id
          , t.item_type
@@ -171,35 +220,44 @@ select m.*
          , 0 as created_id
          , 0 as updated_id
      from (
-        select a.product_id
-             , c.item_type
-             , c.device_type
-             , case when c.item_type = 'normal' and c.device_type = 'web' then b.sum_normal_price_web - b.sum_refund_normal_price_web
-                    when c.item_type = 'normal' and c.device_type = 'playstore' then b.sum_normal_price_playstore - b.sum_refund_normal_price_playstore
-                    when c.item_type = 'normal' and c.device_type = 'ios' then b.sum_normal_price_ios - b.sum_refund_normal_price_ios
-                    when c.item_type = 'normal' and c.device_type = 'onestore' then b.sum_normal_price_onestore - b.sum_refund_normal_price_onestore
-                    when c.item_type = 'discount' and c.device_type = 'web' then b.sum_discount_price_web - b.sum_refund_discount_price_web
-                    when c.item_type = 'discount' and c.device_type = 'playstore' then b.sum_discount_price_playstore - b.sum_refund_discount_price_playstore
-                    when c.item_type = 'discount' and c.device_type = 'ios' then b.sum_discount_price_ios - b.sum_refund_discount_price_ios
-                    when c.item_type = 'discount' and c.device_type = 'onestore' then b.sum_discount_price_onestore - b.sum_refund_discount_price_onestore
-                    when c.item_type = 'comped' and c.device_type = 'web' then b.sum_comped_ticket_price_web - b.sum_refund_comped_ticket_price_web
-                    when c.item_type = 'comped' and c.device_type = 'playstore' then b.sum_comped_ticket_price_playstore - b.sum_refund_comped_ticket_price_playstore
-                    when c.item_type = 'comped' and c.device_type = 'ios' then b.sum_comped_ticket_price_ios - b.sum_refund_comped_ticket_price_ios
-                    when c.item_type = 'comped' and c.device_type = 'onestore' then b.sum_comped_ticket_price_onestore - b.sum_refund_comped_ticket_price_onestore
-                    else 0
-                end as sum_total_sales_price
-             , round(c.fee / 100, 0) as fee
-             , c.settlement_rate
-             , case when d.privious_offer_amount is null then e.offer_price
-                    else coalesce(d.current_offer_amount, 0)
-                end as privious_offer_amount -- 당월 선계약금잔액
-          from tb_batch_daily_product_info_summary a
-         inner join tmp_product_settlement_summary b on a.product_id = b.product_id
-         inner join tmp_product_settlement_list_summary c on a.product_id = c.product_id
-          left join tb_ptn_product_settlement d on a.product_id = d.product_id
-           and d.created_date >= date_sub(curdate(), interval 1 month) - interval day(curdate()) - 1 day
-           and d.created_date < curdate()
-          left join tmp_contract_offer_amount_list_summary e on a.product_id = e.product_id
+        select s.product_id
+             , s.item_type
+             , s.device_type
+             , s.sum_total_sales_price
+             , round(s.sum_total_sales_price * (s.fee_rate / 100), 0) as fee
+             , s.settlement_rate
+             , s.privious_offer_amount
+          from (
+            select a.product_id
+                 , c.item_type
+                 , c.device_type
+                 , case when c.item_type = 'normal' and c.device_type = 'web' then b.sum_normal_price_web - b.sum_refund_normal_price_web
+                        when c.item_type = 'normal' and c.device_type = 'playstore' then b.sum_normal_price_playstore - b.sum_refund_normal_price_playstore
+                        when c.item_type = 'normal' and c.device_type = 'ios' then b.sum_normal_price_ios - b.sum_refund_normal_price_ios
+                        when c.item_type = 'normal' and c.device_type = 'onestore' then b.sum_normal_price_onestore - b.sum_refund_normal_price_onestore
+                        when c.item_type = 'discount' and c.device_type = 'web' then b.sum_discount_price_web - b.sum_refund_discount_price_web
+                        when c.item_type = 'discount' and c.device_type = 'playstore' then b.sum_discount_price_playstore - b.sum_refund_discount_price_playstore
+                        when c.item_type = 'discount' and c.device_type = 'ios' then b.sum_discount_price_ios - b.sum_refund_discount_price_ios
+                        when c.item_type = 'discount' and c.device_type = 'onestore' then b.sum_discount_price_onestore - b.sum_refund_discount_price_onestore
+                        when c.item_type = 'comped' and c.device_type = 'web' then b.sum_comped_ticket_price_web - b.sum_refund_comped_ticket_price_web
+                        when c.item_type = 'comped' and c.device_type = 'playstore' then b.sum_comped_ticket_price_playstore - b.sum_refund_comped_ticket_price_playstore
+                        when c.item_type = 'comped' and c.device_type = 'ios' then b.sum_comped_ticket_price_ios - b.sum_refund_comped_ticket_price_ios
+                        when c.item_type = 'comped' and c.device_type = 'onestore' then b.sum_comped_ticket_price_onestore - b.sum_refund_comped_ticket_price_onestore
+                        else 0
+                    end as sum_total_sales_price
+                 , c.fee as fee_rate
+                 , c.settlement_rate
+                 , case when d.privious_offer_amount is null then e.offer_price
+                        else coalesce(d.current_offer_amount, 0)
+                    end as privious_offer_amount -- 당월 선계약금잔액
+              from tb_batch_daily_product_info_summary a
+             inner join tmp_product_settlement_summary b on a.product_id = b.product_id
+             inner join tmp_product_settlement_list_summary c on a.product_id = c.product_id
+              left join tmp_prev_product_settlement_latest d on a.product_id = d.product_id
+               and c.item_type = d.item_type
+               and c.device_type = d.device_type
+              left join tmp_contract_offer_amount_list_summary e on a.product_id = e.product_id
+            ) s
         ) t
     ) m
  where m.product_id is not null
@@ -249,22 +307,27 @@ with tmp_income_settlement_summary as (
      where created_date >= date_sub(curdate(), interval 1 month) - interval day(curdate()) - 1 day
        and created_date < curdate()
      group by product_id, item_type, device_type
+),
+tmp_common_rate3 as (
+    select
+        max(case when code_key = 'payment_fee_rate' then cast(code_value as decimal(10,4)) * 100 else 0 end) as fee_rate,
+        max(case when code_key = 'default_settlement_rate' then cast(code_value as decimal(10,4)) * 100 else 0 end) as settlement_rate
+    from tb_common_code
+    where code_group = 'common_rate' and use_yn = 'Y'
 )
 select a.product_id
      , b.item_type
      , b.device_type
      , b.sum_income_price
-     , (c.fee + (100 - c.settlement_rate)) as total_fee_rate -- 결제 수수료 + 플랫폼 수수료
-     , round(b.sum_income_price * (100 - (c.fee + (100 - c.settlement_rate))) / 100, 1) as sum_income_price_exclude_fee
+     , (c.fee_rate + (100 - c.settlement_rate)) as total_fee_rate -- 결제 수수료 + 플랫폼 수수료
+     , round(b.sum_income_price * (100 - (c.fee_rate + (100 - c.settlement_rate))) / 100, 1) as sum_income_price_exclude_fee
      , 3.3 as withholding_tax_rate
-     , round(round(b.sum_income_price * (100 - (c.fee + (100 - c.settlement_rate))) / 100, 1) * 0.967, 1) as sum_income_price_final
+     , round(round(b.sum_income_price * (100 - (c.fee_rate + (100 - c.settlement_rate))) / 100, 1) * 0.967, 1) as sum_income_price_final
      , 0 as created_id
      , 0 as updated_id
   from tb_batch_daily_product_info_summary a
  inner join tmp_income_settlement_summary b on a.product_id = b.product_id
- inner join tb_cms_product_settlement c on a.product_id = c.product_id
-   and b.item_type = c.item_type
-   and b.device_type = c.device_type
+ cross join tmp_common_rate3 c
 ;
 
 update tb_cms_batch_job_process a
@@ -275,4 +338,3 @@ update tb_cms_batch_job_process a
 ;
 
 commit;
-

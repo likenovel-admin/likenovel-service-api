@@ -1,4 +1,5 @@
 from app.services.common import comm_service
+from app.services.order.product_order_service import create_product_order_with_items
 from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -164,21 +165,21 @@ async def purchase_episode_with_cash(
             },
         )
 
-        # 정산용 일별 판매 데이터 기록
-        query = text("""
-            INSERT INTO tb_batch_daily_sales_summary
-            (item_type, item_name, item_price, quantity, device_type, user_id, product_id, episode_id, order_date, pay_type, created_date)
-            VALUES ('own', :item_name, :item_price, 1, 'web', :user_id, :product_id, :episode_id, NOW(), 'cash', NOW())
-        """)
-        await db.execute(
-            query,
-            {
-                "item_name": item_name,
-                "item_price": CommonConstants.EPISODE_PURCHASE_PRICE,
-                "user_id": user_id,
-                "product_id": product_id,
-                "episode_id": episode_id,
-            },
+        await create_product_order_with_items(
+            db=db,
+            user_id=user_id,
+            pay_type="cash",
+            device_type="web",
+            created_id=settings.DB_DML_DEFAULT_ID,
+            items=[
+                {
+                    "item_name": item_name,
+                    "item_price": CommonConstants.EPISODE_PURCHASE_PRICE,
+                    "quantity": 1,
+                    "product_id": product_id,
+                    "episode_id": episode_id,
+                }
+            ],
         )
 
         # 통계 로그 추가
@@ -197,7 +198,7 @@ async def purchase_all_episodes_with_cash(
     db: AsyncSession,
 ):
     """
-    캐시로 작품의 전체 에피소드 구매 (소장)
+    캐시로 작품의 전체 에피소드 구매 또는 단행본 대여
     """
     if not kc_user_id:
         raise CustomResponseException(
@@ -215,8 +216,18 @@ async def purchase_all_episodes_with_cash(
             )
 
         # 작품 존재 여부 확인 및 작품명 조회
+        purchase_type = getattr(req_body, "purchase_type", "own") or "own"
+        if purchase_type not in {"own", "rental"}:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="유효하지 않은 구매 타입입니다.",
+            )
+
         query = text("""
-            SELECT product_id, title
+            SELECT product_id, title,
+                   COALESCE(single_regular_price, 0) as single_regular_price,
+                   COALESCE(single_rental_price, 0) as single_rental_price,
+                   COALESCE(series_regular_price, 0) as series_regular_price
             FROM tb_product
             WHERE product_id = :product_id
         """)
@@ -230,6 +241,20 @@ async def purchase_all_episodes_with_cash(
             )
 
         product_title = product_row["title"]
+        single_regular_price = int(product_row.get("single_regular_price") or 0)
+        single_rental_price = int(product_row.get("single_rental_price") or 0)
+        series_regular_price = int(product_row.get("series_regular_price") or 0)
+        if (
+            series_regular_price > 0
+            and (single_regular_price > 0 or single_rental_price > 0)
+        ):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="작품 가격 설정이 올바르지 않습니다.",
+            )
+        is_volume_product = (
+            series_regular_price <= 0 and single_regular_price > 0
+        )
 
         # 작품의 모든 에피소드 조회
         query = text("""
@@ -273,6 +298,25 @@ async def purchase_all_episodes_with_cash(
         # 전체 무제한 이용권 또는 작품 전체 소장 여부 확인
         has_full_access = None in owned_episodes
 
+        active_rental_query = text("""
+            SELECT id
+            FROM tb_user_productbook
+            WHERE user_id = :user_id
+              AND use_yn = 'Y'
+              AND own_type = 'rental'
+              AND (
+                (product_id = :product_id AND episode_id IS NULL)
+                OR
+                (product_id IS NULL AND episode_id IS NULL)
+              )
+              AND (rental_expired_date IS NULL OR rental_expired_date > NOW())
+            LIMIT 1
+        """)
+        active_rental_result = await db.execute(
+            active_rental_query, {"user_id": user_id, "product_id": product_id}
+        )
+        has_active_rental_access = active_rental_result.mappings().first() is not None
+
         # 구매 가능한 에피소드 필터링
         episodes_to_purchase = []
         skipped_free_count = 0
@@ -301,10 +345,34 @@ async def purchase_all_episodes_with_cash(
                 message=ErrorMessages.FREE_EPISODE_CANNOT_PURCHASE,
             )
 
-        # 필요한 총 캐시 계산
-        total_cash_needed = (
-            len(episodes_to_purchase) * CommonConstants.EPISODE_PURCHASE_PRICE
-        )
+        if purchase_type == "rental":
+            if not is_volume_product:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="단행본만 대여할 수 있습니다.",
+                )
+            if single_rental_price <= 0:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="대여 가격이 설정되지 않은 작품입니다.",
+                )
+            if has_full_access or has_active_rental_access:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="이미 이용 중인 작품입니다.",
+                )
+            total_cash_needed = single_rental_price
+        elif is_volume_product:
+            if has_full_access:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message=ErrorMessages.ALREADY_OWNED_EPISODE,
+                )
+            total_cash_needed = single_regular_price
+        else:
+            total_cash_needed = (
+                len(episodes_to_purchase) * CommonConstants.EPISODE_PURCHASE_PRICE
+            )
 
         # 사용자 캐시 잔액 조회
         query = text("""
@@ -353,7 +421,106 @@ async def purchase_all_episodes_with_cash(
             },
         )
 
+        # 단행본 대여 기록 등록
+        if purchase_type == "rental":
+            query = text("""
+                INSERT INTO tb_user_productbook
+                (user_id, profile_id, product_id, episode_id, own_type, ticket_type, use_yn, rental_expired_date, created_id, created_date, updated_id, updated_date)
+                VALUES (:user_id, :profile_id, :product_id, NULL, 'rental', 'cash', 'Y', DATE_ADD(NOW(), INTERVAL 3 DAY), :created_id, NOW(), :updated_id, NOW())
+            """)
+            await db.execute(
+                query,
+                {
+                    "user_id": user_id,
+                    "profile_id": req_body.profile_id,
+                    "product_id": product_id,
+                    "created_id": settings.DB_DML_DEFAULT_ID,
+                    "updated_id": settings.DB_DML_DEFAULT_ID,
+                },
+            )
+
+            await create_product_order_with_items(
+                db=db,
+                user_id=user_id,
+                pay_type="cash",
+                device_type="web",
+                created_id=settings.DB_DML_DEFAULT_ID,
+                items=[
+                    {
+                        "item_name": f"{product_title} - 단행본 대여",
+                        "item_price": total_cash_needed,
+                        "quantity": 1,
+                        "product_id": product_id,
+                        "episode_id": None,
+                    }
+                ],
+            )
+
+            await statistics_service.insert_site_statistics_log(
+                db=db, type="active", user_id=user_id
+            )
+
+            return {
+                "result": True,
+                "data": {
+                    "purchasedCount": len(episodes_to_purchase),
+                    "totalCashUsed": total_cash_needed,
+                    "skippedFreeCount": skipped_free_count,
+                    "skippedOwnedCount": skipped_owned_count,
+                },
+            }
+
+        # 단행본 소장 기록 등록
+        if is_volume_product:
+            query = text("""
+                INSERT INTO tb_user_productbook
+                (user_id, profile_id, product_id, episode_id, own_type, ticket_type, use_yn, created_id, created_date, updated_id, updated_date)
+                VALUES (:user_id, :profile_id, :product_id, NULL, 'own', 'cash', 'Y', :created_id, NOW(), :updated_id, NOW())
+            """)
+            await db.execute(
+                query,
+                {
+                    "user_id": user_id,
+                    "profile_id": req_body.profile_id,
+                    "product_id": product_id,
+                    "created_id": settings.DB_DML_DEFAULT_ID,
+                    "updated_id": settings.DB_DML_DEFAULT_ID,
+                },
+            )
+
+            await create_product_order_with_items(
+                db=db,
+                user_id=user_id,
+                pay_type="cash",
+                device_type="web",
+                created_id=settings.DB_DML_DEFAULT_ID,
+                items=[
+                    {
+                        "item_name": f"{product_title} - 단행본 소장",
+                        "item_price": total_cash_needed,
+                        "quantity": 1,
+                        "product_id": product_id,
+                        "episode_id": None,
+                    }
+                ],
+            )
+
+            await statistics_service.insert_site_statistics_log(
+                db=db, type="active", user_id=user_id
+            )
+
+            return {
+                "result": True,
+                "data": {
+                    "purchasedCount": len(episodes_to_purchase),
+                    "totalCashUsed": total_cash_needed,
+                    "skippedFreeCount": skipped_free_count,
+                    "skippedOwnedCount": skipped_owned_count,
+                },
+            }
+
         # 각 에피소드에 대한 소장 기록 등록
+        order_items = []
         for episode_id in episodes_to_purchase:
             query = text("""
                 INSERT INTO tb_user_productbook
@@ -382,20 +549,24 @@ async def purchase_all_episodes_with_cash(
                 else product_title
             )
 
-            query = text("""
-                INSERT INTO tb_batch_daily_sales_summary
-                (item_type, item_name, item_price, quantity, device_type, user_id, product_id, episode_id, order_date, pay_type, created_date)
-                VALUES ('own', :item_name, :item_price, 1, 'web', :user_id, :product_id, :episode_id, NOW(), 'cash', NOW())
-            """)
-            await db.execute(
-                query,
+            order_items.append(
                 {
                     "item_name": item_name,
                     "item_price": CommonConstants.EPISODE_PURCHASE_PRICE,
-                    "user_id": user_id,
+                    "quantity": 1,
                     "product_id": product_id,
                     "episode_id": episode_id,
-                },
+                }
+            )
+
+        if order_items:
+            await create_product_order_with_items(
+                db=db,
+                user_id=user_id,
+                pay_type="cash",
+                device_type="web",
+                created_id=settings.DB_DML_DEFAULT_ID,
+                items=order_items,
             )
 
         # 통계 로그 추가

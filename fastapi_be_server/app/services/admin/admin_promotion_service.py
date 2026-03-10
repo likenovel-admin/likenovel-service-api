@@ -407,6 +407,95 @@ async def end_applied_promotion_accept(id: int, db: AsyncSession):
     return {"result": applied_promotion}
 
 
+async def post_direct_promotion_batch(
+    req_body: admin_schema.PostDirectPromotionGiftReqBody, db: AsyncSession
+):
+    """
+    작품별 프로모션(admin-gift) 일괄 등록
+
+    Args:
+        req_body: 등록할 프로모션 정보 (작품 ID 목록, 대여권 수, 시작/종료 날짜)
+        db: 데이터베이스 세션
+
+    Returns:
+        등록된 프로모션 수
+    """
+
+    start_date = datetime.strptime(req_body.start_date, "%Y-%m-%d")
+    end_date = datetime.strptime(req_body.end_date, "%Y-%m-%d")
+    if start_date > end_date:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.INVALID_RECOMMEND_EXPOSE_START_DATE,
+        )
+
+    created_count = 0
+    for product_id in req_body.product_ids:
+        query = text("""
+            insert into tb_direct_promotion
+                (id, product_id, type, status, start_date, end_date,
+                 num_of_ticket_per_person, created_id, created_date)
+            values
+                (default, :product_id, 'admin-gift', 'ing', :start_date, :end_date,
+                 :num_of_ticket_per_person, :created_id, :created_date)
+        """)
+        await db.execute(query, {
+            "product_id": product_id,
+            "start_date": req_body.start_date,
+            "end_date": req_body.end_date,
+            "num_of_ticket_per_person": req_body.num_of_ticket_per_person,
+            "created_id": -1,
+            "created_date": datetime.now(),
+        })
+        created_count += 1
+
+    return {"result": {"created_count": created_count}}
+
+
+async def post_admin_direct_gift(
+    req_body: admin_schema.PostAdminDirectGiftReqBody, db: AsyncSession
+):
+    """
+    유저별 대여권 직접 지급
+
+    Args:
+        req_body: 지급 정보 (유저 ID 목록, 대여권 수, 사유, 만료일)
+        db: 데이터베이스 세션
+
+    Returns:
+        지급된 유저 수
+    """
+    from app.services.user import user_giftbook_service
+    import app.schemas.user_giftbook as user_giftbook_schema
+
+    created_count = 0
+    for user_id in req_body.user_ids:
+        giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
+            user_id=user_id,
+            product_id=None,
+            episode_id=None,
+            ticket_type="paid",
+            own_type="rental",
+            acquisition_type="admin_direct",
+            acquisition_id=None,
+            reason=req_body.reason,
+            amount=req_body.amount,
+            promotion_type=None,
+            expiration_date=req_body.expiration_date,
+            ticket_expiration_type="none",
+            ticket_expiration_value=None,
+        )
+        await user_giftbook_service.post_user_giftbook(
+            req_body=giftbook_req,
+            kc_user_id="",
+            db=db,
+            user_id=user_id,
+        )
+        created_count += 1
+
+    return {"result": {"created_count": created_count}}
+
+
 async def user_giftbook_list(
     search_target: str,
     search_word: str,

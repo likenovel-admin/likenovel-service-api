@@ -46,6 +46,9 @@ class PostProductsReqBody(ProductsBase):
     open_yn: str = Field(examples=["Y"], description="공개설정")
     monopoly_yn: str = Field(examples=["N"], description="독점여부")
     cp_contract_yn: str = Field(examples=["N"], description="계약여부")
+    product_type: Optional[str] = Field(
+        default=None, examples=["normal"], description="연재 유형(normal: 일반연재, null: 자유연재)"
+    )
 
 
 class PutProductsProductIdReqBody(ProductsBase):
@@ -175,6 +178,9 @@ class PostProductsProductIdContractOfferReqBody(ProductsBase):
 class PurchaseAllEpisodesWithCashReqBody(ProductsBase):
     # 작품 전체 에피소드 구매 요청 시 클라이언트에서 보내는 request body
     profile_id: int = Field(description="프로필 ID")
+    purchase_type: str = Field(
+        default="own", examples=["own"], description="구매 타입(own, rental)"
+    )
 
 
 class SponsorProductReqBody(ProductsBase):

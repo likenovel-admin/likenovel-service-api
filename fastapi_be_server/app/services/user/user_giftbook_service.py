@@ -762,14 +762,144 @@ async def post_user_giftbook(
         values ({values}, :created_id, :created_date)
     """)
 
-    await db.execute(query, params)
+    result = await db.execute(query, params)
+    giftbook_id = result.lastrowid
 
     await statistics_service.insert_site_statistics_log(
         db=db, type="active", user_id=user_id
     )
 
-    # 선물함에 저장만 하고, 받은 내역 기록 및 알림은 receive_user_giftbook에서 처리
-    # (대여권 받기 버튼을 눌러야 실제로 받은 것으로 처리됨)
+    promotion_type = getattr(req_body, "promotion_type", None)
+    acquisition_type = getattr(req_body, "acquisition_type", None)
+
+    # 알림 전송 (이미 자체 알림이 있는 호출자는 제외)
+    # - quest: quest_service.py에서 자체 알림 처리
+    # - reader-of-prev: author_service.py에서 자체 알림 처리
+    GIFTBOOK_NOTI_TITLES = {
+        "waiting-for-free": "기다리면 무료 대여권이 도착했습니다",
+        "free-for-first": "첫방문자 무료 대여권이 도착했습니다",
+        "6-9-path": "6-9패스 대여권이 도착했습니다",
+        "admin-gift": "대여권이 지급되었습니다",
+        "event": "이벤트 보상이 도착했습니다",
+    }
+    noti_title = GIFTBOOK_NOTI_TITLES.get(promotion_type)
+    if not noti_title and acquisition_type == "admin_direct":
+        noti_title = "대여권이 지급되었습니다"
+
+    if noti_title:
+        try:
+            noti_query = text("""
+                select noti_yn
+                  from tb_user_notification
+                 where user_id = :user_id
+                   and noti_type = 'benefit'
+            """)
+            noti_result = await db.execute(noti_query, {"user_id": req_body.user_id})
+            noti_setting = noti_result.mappings().first()
+
+            if not noti_setting or noti_setting.get("noti_yn") == "Y":
+                noti_content = ""
+                if req_body.product_id:
+                    product_query = text("""
+                        select title from tb_product where product_id = :product_id
+                    """)
+                    product_result = await db.execute(
+                        product_query, {"product_id": req_body.product_id}
+                    )
+                    product_info = product_result.mappings().first()
+                    if product_info:
+                        noti_content = f"[{product_info.get('title')}] {req_body.amount}장"
+
+                noti_insert = text("""
+                    insert into tb_user_notification_item
+                    (user_id, noti_type, title, content, read_yn, created_id, created_date)
+                    values (:user_id, 'benefit', :title, :content, 'N', -1, NOW())
+                """)
+                await db.execute(
+                    noti_insert,
+                    {
+                        "user_id": req_body.user_id,
+                        "title": noti_title,
+                        "content": noti_content,
+                    },
+                )
+        except Exception as e:
+            logger.error(f"Failed to send giftbook notification: {e}")
+
+    # 자동 받기 처리 (첫방문자, 기다무, 6-9패스, 관리자 지급)
+    # 선물함 페이지에서 받기 버튼을 누를 필요 없이 즉시 대여권 발급
+    AUTO_RECEIVE_PROMOTION_TYPES = {"waiting-for-free", "free-for-first", "6-9-path", "admin-gift", "event"}
+    should_auto_receive = (
+        (promotion_type and promotion_type in AUTO_RECEIVE_PROMOTION_TYPES)
+        or acquisition_type == "admin_direct"
+    )
+
+    if should_auto_receive:
+        try:
+            profile_query = text("""
+                SELECT profile_id FROM tb_user_profile
+                WHERE user_id = :user_id AND default_yn = 'Y'
+            """)
+            profile_result = await db.execute(profile_query, {"user_id": req_body.user_id})
+            profile = profile_result.mappings().one_or_none()
+
+            if profile:
+                profile_id = profile.get("profile_id")
+
+                # 대여권 유효기간 계산 (수령 시점 기준)
+                rental_expired_date = None
+                ticket_exp_type = getattr(req_body, "ticket_expiration_type", None)
+                ticket_exp_value = getattr(req_body, "ticket_expiration_value", None)
+                if ticket_exp_type == "on_receive_days" and ticket_exp_value:
+                    rental_expired_date = datetime.now() + timedelta(days=ticket_exp_value)
+                elif ticket_exp_type == "days" and ticket_exp_value:
+                    rental_expired_date = datetime.now() + timedelta(days=ticket_exp_value)
+                elif ticket_exp_type == "hours" and ticket_exp_value:
+                    rental_expired_date = datetime.now() + timedelta(hours=ticket_exp_value)
+
+                # 대여권 발급 (amount 개수만큼)
+                insert_pb_query = text("""
+                    INSERT INTO tb_user_productbook
+                    (user_id, profile_id, product_id, episode_id, own_type, ticket_type,
+                     acquisition_type, acquisition_id, rental_expired_date, use_yn, created_id, created_date)
+                    VALUES (:user_id, :profile_id, :product_id, :episode_id, :own_type, :ticket_type,
+                            'gift', :acquisition_id, :rental_expired_date, 'N', -1, NOW())
+                """)
+                for _ in range(req_body.amount):
+                    await db.execute(
+                        insert_pb_query,
+                        {
+                            "user_id": req_body.user_id,
+                            "profile_id": profile_id,
+                            "product_id": req_body.product_id,
+                            "episode_id": getattr(req_body, "episode_id", None),
+                            "own_type": req_body.own_type,
+                            "ticket_type": req_body.ticket_type,
+                            "acquisition_id": giftbook_id,
+                            "rental_expired_date": rental_expired_date,
+                        },
+                    )
+
+                # 선물함 받음 처리
+                update_gb_query = text("""
+                    UPDATE tb_user_giftbook
+                    SET received_yn = 'Y', received_date = NOW(),
+                        updated_id = -1, updated_date = NOW()
+                    WHERE id = :giftbook_id
+                """)
+                await db.execute(update_gb_query, {"giftbook_id": giftbook_id})
+
+                # 거래 내역 기록
+                await insert_gift_transaction(
+                    type="received",
+                    user_id=req_body.user_id,
+                    amount=req_body.amount,
+                    reason=f"자동 받기 (giftbook_id: {giftbook_id})",
+                    giftbook_id=giftbook_id,
+                    db=db,
+                )
+        except Exception as e:
+            logger.error(f"Failed to auto-receive giftbook: {e}")
 
     return {"result": req_body}
 

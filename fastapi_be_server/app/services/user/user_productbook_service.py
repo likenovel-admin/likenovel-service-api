@@ -6,11 +6,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 
 from app.exceptions import CustomResponseException
-from app.const import ErrorMessages
+from app.const import ErrorMessages, settings
 from app.utils.query import build_insert_query, build_update_query
 from app.utils.response import build_list_response, build_detail_response
 import app.schemas.user_productbook as user_productbook_schema
 import app.services.common.statistics_service as statistics_service
+from app.services.order.product_order_service import create_product_order_with_items
 
 logger = logging.getLogger("user_productbook_app")  # 커스텀 로거 생성
 
@@ -261,6 +262,7 @@ async def use_user_productbook(
         "updated_id = :updated_id",
         "updated_date = :updated_date",
         "use_yn = 'Y'",
+        "use_date = NOW()",
         "product_id = :product_id",
         "episode_id = :episode_id",
         "rental_expired_date = DATE_ADD(NOW(), INTERVAL 3 DAY)",
@@ -290,19 +292,21 @@ async def use_user_productbook(
     if ticket_type == "paid":
         item_name = f"{product_title} - {episode_no}화"
 
-        sales_query = text("""
-            INSERT INTO tb_batch_daily_sales_summary
-            (item_type, item_name, item_price, quantity, device_type, user_id, product_id, episode_id, order_date, pay_type, created_date)
-            VALUES ('paid', :item_name, 0, 1, 'web', :user_id, :product_id, :episode_id, NOW(), 'ticket', NOW())
-        """)
-        await db.execute(
-            sales_query,
-            {
-                "item_name": item_name,
-                "user_id": user_id,
-                "product_id": target_product_id,
-                "episode_id": episode_id,
-            },
+        await create_product_order_with_items(
+            db=db,
+            user_id=user_id,
+            pay_type="ticket_paid",
+            device_type="web",
+            created_id=settings.DB_DML_DEFAULT_ID,
+            items=[
+                {
+                    "item_name": item_name,
+                    "item_price": 0,
+                    "quantity": 1,
+                    "product_id": target_product_id,
+                    "episode_id": episode_id,
+                }
+            ],
         )
 
     return {"result": True}
@@ -367,6 +371,7 @@ async def get_available_rental_tickets(
                                         COALESCE(
                                             ap.type,
                                             dp.type,
+                                            ug.promotion_type,
                                             CASE upb.acquisition_type
                                                 WHEN 'event' THEN 'event'
                                                 WHEN 'gift' THEN 'gift'
@@ -381,13 +386,14 @@ async def get_available_rental_tickets(
                                  LEFT JOIN tb_direct_promotion dp
                                     ON upb.acquisition_type = 'direct_promotion'
                                     AND upb.acquisition_id = dp.id
+                                 LEFT JOIN tb_user_giftbook ug
+                                    ON upb.acquisition_type = 'gift'
+                                    AND upb.acquisition_id = ug.id
                                  WHERE upb.user_id = :user_id
                                  AND (
                                      upb.episode_id = :episode_id
                                      or
-                                     (upb.product_id = :product_id and upb.episode_id is null)
-                                     or
-                                     upb.product_id is null
+                                     (upb.episode_id is null and (upb.product_id = :product_id or upb.product_id is null))
                                  )
                                  AND upb.own_type = 'rental'
                                  AND upb.use_yn = 'N'
@@ -396,6 +402,7 @@ async def get_available_rental_tickets(
                                      COALESCE(
                                          ap.type,
                                          dp.type,
+                                         ug.promotion_type,
                                          CASE upb.acquisition_type
                                             WHEN 'event' THEN 'event'
                                             WHEN 'gift' THEN 'gift'
@@ -420,6 +427,7 @@ async def get_available_rental_tickets(
                                         COALESCE(
                                             ap.type,
                                             dp.type,
+                                            ug.promotion_type,
                                             CASE upb.acquisition_type
                                                 WHEN 'event' THEN 'event'
                                                 WHEN 'gift' THEN 'gift'
@@ -434,13 +442,14 @@ async def get_available_rental_tickets(
                                  LEFT JOIN tb_direct_promotion dp
                                     ON upb.acquisition_type = 'direct_promotion'
                                     AND upb.acquisition_id = dp.id
+                                 LEFT JOIN tb_user_giftbook ug
+                                    ON upb.acquisition_type = 'gift'
+                                    AND upb.acquisition_id = ug.id
                                  WHERE upb.user_id = :user_id
                                  AND (
                                      upb.episode_id in (select episode_id from tb_product_episode where product_id = :product_id)
                                      or
-                                     (upb.product_id = :product_id and upb.episode_id is null)
-                                     or
-                                     upb.product_id is null
+                                     (upb.episode_id is null and (upb.product_id = :product_id or upb.product_id is null))
                                  )
                                  AND upb.own_type = 'rental'
                                  AND upb.use_yn = 'N'
@@ -449,6 +458,7 @@ async def get_available_rental_tickets(
                                      COALESCE(
                                          ap.type,
                                          dp.type,
+                                         ug.promotion_type,
                                          CASE upb.acquisition_type
                                             WHEN 'event' THEN 'event'
                                             WHEN 'gift' THEN 'gift'
@@ -483,8 +493,37 @@ async def get_available_rental_tickets(
             type_value = type_value.replace("-", "_")
             count_by_type[type_value] = count_by_type.get(type_value, 0) + 1
 
+    # 기다무 타이머: 미사용 WFF 티켓이 0장일 때, 마지막 사용 시점 + 24h를 계산
+    wff_next_charge_at = None
+    if count_by_type.get("waiting_for_free", 0) == 0 and product_id is not None:
+        wff_timer_query = text("""
+            SELECT DATE_ADD(MAX(upb.use_date), INTERVAL 24 HOUR) as next_charge_at
+            FROM tb_user_productbook upb
+            LEFT JOIN tb_applied_promotion ap
+              ON upb.acquisition_type = 'applied_promotion' AND upb.acquisition_id = ap.id
+            LEFT JOIN tb_user_giftbook ug
+              ON upb.acquisition_type = 'gift' AND upb.acquisition_id = ug.id
+            WHERE upb.user_id = :user_id
+              AND (
+                (ap.type = 'waiting-for-free' AND ap.status = 'ing' AND (ap.end_date IS NULL OR ap.end_date >= NOW()))
+                OR
+                (ug.promotion_type = 'waiting-for-free')
+              )
+              AND upb.use_yn = 'Y'
+              AND upb.use_date IS NOT NULL
+              AND (upb.product_id = :product_id OR upb.product_id IS NULL)
+              AND timestampdiff(hour, upb.use_date, now()) < 24
+        """)
+        wff_result = await db.execute(
+            wff_timer_query, {"user_id": user_id, "product_id": product_id}
+        )
+        wff_row = wff_result.mappings().one_or_none()
+        if wff_row and wff_row["next_charge_at"]:
+            wff_next_charge_at = wff_row["next_charge_at"].isoformat()
+
     res_body = dict()
     res_body["data"] = data_list
     res_body["count_by_type"] = count_by_type
+    res_body["wff_next_charge_at"] = wff_next_charge_at
 
     return res_body

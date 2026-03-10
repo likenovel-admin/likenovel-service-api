@@ -1,13 +1,18 @@
 import logging
+from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+import portone_server_sdk as portone
 
-from app.const import ErrorMessages
+from app.const import ErrorMessages, settings
+from app.exceptions import CustomResponseException
 import app.schemas.admin as admin_schema
+from app.services.common import comm_service
 from app.utils.query import build_update_query, get_file_path_sub_query
 from app.utils.response import check_exists_or_404
 
 logger = logging.getLogger("admin_app")
+portone_client = portone.PortOneClient(secret=settings.PORTONE_SECRET_KEY)
 
 """
 관리자 기본 서비스 함수 모음
@@ -298,4 +303,251 @@ async def save_common_rate_data(
         "donation_settlement_rate": req_body.donation_settlement_rate,
         "payment_fee_rate": req_body.payment_fee_rate,
         "tax_amount_rate": req_body.tax_amount_rate,
+    }
+
+
+async def post_cancel_cash_charge_order(
+    order_id: int,
+    req_body: admin_schema.PostCancelCashChargeOrderReqBody,
+    kc_user_id: str,
+    db: AsyncSession,
+):
+    """
+    Admin-only: cancel a cash charge payment when the user has never spent cash.
+    """
+    admin_user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if admin_user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
+    reason = (
+        req_body.reason.strip()
+        if req_body and req_body.reason and req_body.reason.strip()
+        else "Admin canceled unused cash charge"
+    )
+
+    async with db.begin():
+        order_query = text(
+            """
+            SELECT
+                so.order_id,
+                so.order_no,
+                so.user_id,
+                so.cancel_yn,
+                so.total_price,
+                soi.id AS order_item_id,
+                sp.id AS payment_info_id,
+                sp.pg_payment_id
+            FROM tb_store_order so
+            LEFT JOIN tb_store_order_item soi ON soi.order_id = so.order_id
+            LEFT JOIN tb_store_payment sp ON sp.order_id = so.order_id
+            WHERE so.order_id = :order_id
+            ORDER BY soi.id ASC
+            LIMIT 1
+            FOR UPDATE
+            """
+        )
+        order_result = await db.execute(order_query, {"order_id": order_id})
+        order_row = order_result.mappings().one_or_none()
+        if not order_row:
+            raise CustomResponseException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                message="Order not found.",
+            )
+
+        order_data = dict(order_row)
+        if order_data.get("cancel_yn") == "Y":
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Order is already canceled.",
+            )
+
+        order_no = str(order_data.get("order_no") or "")
+        if not order_no.startswith("OC"):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Only cash charge orders can be canceled by this API.",
+            )
+
+        if not order_data.get("pg_payment_id") or not order_data.get("payment_info_id"):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Payment information is missing for this order.",
+            )
+
+        if not order_data.get("order_item_id"):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Order item is missing for this order.",
+            )
+
+        refund_exists_query = text(
+            """
+            SELECT id
+            FROM tb_store_refund
+            WHERE order_id = :order_id
+            LIMIT 1
+            """
+        )
+        refund_exists_result = await db.execute(refund_exists_query, {"order_id": order_id})
+        if refund_exists_result.mappings().one_or_none():
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Refund already exists for this order.",
+            )
+
+        cash_used_query = text(
+            """
+            SELECT 1
+            FROM tb_user_cashbook_transaction t
+            WHERE t.from_user_id = :user_id
+              AND t.use_yn = 'Y'
+              AND t.to_user_id <> t.from_user_id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM tb_user u
+                  WHERE u.user_id = t.created_id
+                    AND u.role_type = 'admin'
+              )
+            LIMIT 1
+            """
+        )
+        cash_used_result = await db.execute(
+            cash_used_query, {"user_id": int(order_data["user_id"])}
+        )
+        if cash_used_result.mappings().one_or_none():
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="User has already spent cash and is not eligible for cancel.",
+            )
+
+        charge_cash_amount = (int(order_data["total_price"]) * 11) // 10
+        if charge_cash_amount <= 0:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Invalid charge amount.",
+            )
+
+        balance_query = text(
+            """
+            SELECT COALESCE(SUM(balance), 0) AS balance
+            FROM tb_user_cashbook
+            WHERE user_id = :user_id
+            """
+        )
+        balance_result = await db.execute(
+            balance_query, {"user_id": int(order_data["user_id"])}
+        )
+        balance_row = balance_result.mappings().one_or_none()
+        current_balance = int((balance_row or {}).get("balance", 0))
+        if current_balance < charge_cash_amount:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.INSUFFICIENT_CASH_BALANCE,
+            )
+
+        try:
+            portone_client.payment.cancel_payment(
+                payment_id=order_data["pg_payment_id"],
+                reason=reason,
+            )
+        except Exception as e:
+            logger.error(
+                "cash charge cancel failed in payment gateway - order_id=%s, error=%s",
+                order_id,
+                str(e),
+            )
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message=ErrorMessages.PAYMENT_SERVICE_ERROR,
+            )
+
+        refund_insert_query = text(
+            """
+            INSERT INTO tb_store_refund
+            (refund_type, order_item_id, payment_info_id, order_id, refund_price, created_id, updated_id)
+            VALUES
+            ('cancel', :order_item_id, :payment_info_id, :order_id, :refund_price, :created_id, :updated_id)
+            """
+        )
+        await db.execute(
+            refund_insert_query,
+            {
+                "order_item_id": int(order_data["order_item_id"]),
+                "payment_info_id": int(order_data["payment_info_id"]),
+                "order_id": int(order_data["order_id"]),
+                "refund_price": int(order_data["total_price"]),
+                "created_id": admin_user_id,
+                "updated_id": admin_user_id,
+            },
+        )
+
+        cancel_order_query = text(
+            """
+            UPDATE tb_store_order
+            SET cancel_yn = 'Y', updated_id = :updated_id, updated_date = NOW()
+            WHERE order_id = :order_id
+            """
+        )
+        await db.execute(
+            cancel_order_query,
+            {"order_id": int(order_data["order_id"]), "updated_id": admin_user_id},
+        )
+
+        cancel_order_item_query = text(
+            """
+            UPDATE tb_store_order_item
+            SET cancel_yn = 'Y', updated_id = :updated_id, updated_date = NOW()
+            WHERE order_id = :order_id
+            """
+        )
+        await db.execute(
+            cancel_order_item_query,
+            {"order_id": int(order_data["order_id"]), "updated_id": admin_user_id},
+        )
+
+        cashbook_insert_query = text(
+            """
+            INSERT INTO tb_user_cashbook (user_id, balance, created_id, updated_id)
+            VALUES (:user_id, :balance, :created_id, :updated_id)
+            """
+        )
+        await db.execute(
+            cashbook_insert_query,
+            {
+                "user_id": int(order_data["user_id"]),
+                "balance": -charge_cash_amount,
+                "created_id": admin_user_id,
+                "updated_id": admin_user_id,
+            },
+        )
+
+        cash_tx_insert_query = text(
+            """
+            INSERT INTO tb_user_cashbook_transaction
+            (from_user_id, to_user_id, amount, created_id, created_date, updated_id)
+            VALUES (:from_user_id, -1, :amount, :created_id, NOW(), :updated_id)
+            """
+        )
+        await db.execute(
+            cash_tx_insert_query,
+            {
+                "from_user_id": int(order_data["user_id"]),
+                "amount": charge_cash_amount,
+                "created_id": admin_user_id,
+                "updated_id": admin_user_id,
+            },
+        )
+
+    return {
+        "result": True,
+        "data": {
+            "order_id": int(order_data["order_id"]),
+            "user_id": int(order_data["user_id"]),
+            "refund_price": int(order_data["total_price"]),
+            "reversed_cash_amount": int(charge_cash_amount),
+            "pg_payment_id": order_data["pg_payment_id"],
+        },
     }

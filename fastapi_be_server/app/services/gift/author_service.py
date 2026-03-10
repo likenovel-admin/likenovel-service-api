@@ -545,17 +545,6 @@ async def issue_reader_of_prev_promotion(
                 total_tickets += num_of_ticket
                 total_issued_count += 1
 
-        # 발급 완료 후 해당 프로모션들의 status를 'end'로 변경하고 start_date를 현재 날짜로 업데이트
-        for promo in author_promotions:
-            query = text("""
-                update tb_direct_promotion
-                   set status = 'end'
-                     , start_date = NOW()
-                     , updated_date = NOW()
-                 where id = :promo_id
-            """)
-            await db.execute(query, {"promo_id": promo["promotion_id"]})
-
         res_body = dict()
         res_body["result"] = True
         res_body["total_issued_count"] = total_issued_count
@@ -739,7 +728,7 @@ async def save_direct_promotion(
                 insert into tb_direct_promotion
                 (product_id, start_date, `type`, status, num_of_ticket_per_person, created_id, updated_id)
                 values
-                (:product_id, now(), 'free-for-first', 'pending', :ticket_count, :created_id, :updated_id)
+                (:product_id, now(), 'free-for-first', 'ing', :ticket_count, :created_id, :updated_id)
             """)
             await db.execute(
                 query,
@@ -804,6 +793,29 @@ async def save_direct_promotion(
                     "product_id": product_id,
                 },
             )
+
+        # reader-of-prev 저장 후 바로 발급 시도
+        if req_body.num_of_ticket_per_person_for_reader_of_prev and req_body.num_of_ticket_per_person_for_reader_of_prev > 0:
+            query = text("""
+                select id from tb_direct_promotion
+                where product_id = :product_id and `type` = 'reader-of-prev'
+            """)
+            result = await db.execute(query, {"product_id": product_id})
+            rop_promo = result.mappings().one_or_none()
+            if rop_promo:
+                try:
+                    issue_result = await issue_reader_of_prev_promotion(
+                        promotion_id=rop_promo["id"],
+                        kc_user_id=kc_user_id,
+                        db=db,
+                    )
+                    return {
+                        "result": True,
+                        "issued_count": issue_result.get("total_issued_count", 0),
+                        "issued_tickets": issue_result.get("total_tickets", 0),
+                    }
+                except CustomResponseException:
+                    pass
 
         res_body = dict()
         res_body["result"] = True

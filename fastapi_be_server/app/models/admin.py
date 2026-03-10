@@ -203,6 +203,29 @@ class AlgorithmRecommendSimilar(Base):
     )
 
 
+class PublisherPromotionConfig(Base):
+    __tablename__ = "tb_publisher_promotion_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(
+        String(100), nullable=False, comment="출판사 프로모션 구좌명"
+    )
+    created_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
 class DirectRecommend(Base):
     __tablename__ = "tb_direct_recommend"  # 직접 추천구좌
 

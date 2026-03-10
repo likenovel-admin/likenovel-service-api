@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# 배치 스크립트 공통 DB 접속 설정(Defensive)
+# - 민감정보(DB 계정/비밀번호)는 절대 하드코딩하지 않고 환경변수로만 주입합니다.
+# - env가 누락되면 조용히 실패하지 않고 명확한 에러로 종료합니다.
+set -uo pipefail
+
+LOCK_DIR="/tmp/ai-taste-hourly-batch.lock"
+
+# 동시실행 방지 락
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[WARN] ai_taste_hourly_batch already running ($LOCK_DIR exists), skipping." 1>&2
+  exit 0
+fi
+trap 'rm -rf "$LOCK_DIR"' EXIT
+
+DB_HOST="${DB_HOST:-mysql}"
+DB_PORT="${DB_PORT:-3306}"
+DB_USER="${DB_USER:-}"
+DB_PW="${DB_PW:-}"
+DB_NAME="${DB_NAME:-likenovel}"
+
+if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
+  echo "[ERROR] Missing DB_USER or DB_PW env for batch." 1>&2
+  exit 1
+fi
+
+MAX_RETRIES=3
+RETRY_DELAY=10
+
+for attempt in $(seq 1 $MAX_RETRIES); do
+  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --skip-ssl < /app/dist/batch/ai_taste_hourly_batch.sql
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    exit 0
+  fi
+  echo "[WARN] ai_taste_hourly_batch attempt $attempt/$MAX_RETRIES failed (exit=$rc)" 1>&2
+  if [ $attempt -lt $MAX_RETRIES ]; then
+    sleep $RETRY_DELAY
+  fi
+done
+
+echo "[ERROR] ai_taste_hourly_batch failed after $MAX_RETRIES attempts" 1>&2
+exit 1

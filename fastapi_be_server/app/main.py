@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, Response, status
 # from fastapi.middleware.cors import CORSMiddleware  # Nginx에서 CORS 처리
 from fastapi.responses import JSONResponse
@@ -8,6 +10,7 @@ from starlette.datastructures import MutableHeaders
 from app.const import settings, ErrorMessages
 from app.tags import tags_metadata
 from app.exceptions import CustomResponseException
+from app.utils.auto_migrate import run_auto_migrations
 
 import uuid
 import logging
@@ -17,8 +20,21 @@ from pathlib import Path
 from fastapi import APIRouter
 import app.routers as routers_pkg
 
+logger = logging.getLogger(__name__)
 
-be_app = FastAPI(openapi_tags=tags_metadata)  # swagger
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    try:
+        await run_auto_migrations()
+    except Exception as e:
+        logger.error(f"[auto_migrate] 초기화 실패 (앱은 계속 실행): {e}")
+    yield
+    # shutdown
+
+
+be_app = FastAPI(openapi_tags=tags_metadata, lifespan=lifespan)  # swagger
 # be_app = FastAPI(
 #     # docs_url=None,
 #     redoc_url=None,

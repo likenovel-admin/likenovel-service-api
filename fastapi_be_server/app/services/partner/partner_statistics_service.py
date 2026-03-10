@@ -1,7 +1,8 @@
 import json
 import logging
+import re
 from fastapi import status
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 
@@ -20,6 +21,12 @@ logger = logging.getLogger("partner_app")  # 커스텀 로거 생성
 """
 partner 파트너 통계 분석 관련 서비스 함수 모음
 """
+
+
+def _normalize_episode_title(title):
+    if title is None:
+        return None
+    return re.sub(r"\.epub$", "", str(title).strip(), flags=re.IGNORECASE)
 
 
 async def product_statistics_list(
@@ -48,7 +55,29 @@ async def product_statistics_list(
         작품별 통계 리스트 및 페이징 정보
     """
 
-    where = build_role_where_clause(user_data)
+    if user_data["role"] == "author":
+        where = f"""
+            AND s.product_id IN (
+                SELECT product_id
+                FROM tb_product
+                WHERE author_id = {user_data["user_id"]}
+            )
+        """
+    elif user_data["role"] == "partner":
+        where = f"""
+            AND s.product_id IN (
+                SELECT z.product_id
+                FROM tb_product_contract_offer z
+                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
+                AND y.apply_type = 'cp'
+                AND y.approval_date IS NOT NULL
+                WHERE z.use_yn = 'Y'
+                AND z.author_accept_yn = 'Y'
+                AND y.user_id = {user_data["user_id"]}
+            )
+        """
+    else:
+        where = ""
 
     if search_word != "":
         if search_target == CommonConstants.SEARCH_PRODUCT_TITLE:
@@ -117,6 +146,8 @@ async def product_statistics_list(
     result = await db.execute(query, limit_params)
     rows = result.mappings().all()
     results = [dict(row) for row in rows]
+    for row in results:
+        row["episode_title"] = _normalize_episode_title(row.get("episode_title"))
 
     # 2단계: product_id 목록 추출 후 cp_company_name 일괄 조회
     product_ids = list({row["product_id"] for row in results})
@@ -241,34 +272,49 @@ async def product_episode_statistics_list(
 
     # 전체 조회(/all)인 경우 count 쿼리 스킵
     is_full_query = page == -1 or count_per_page == -1
+    is_product_detail_query = (
+        search_target == CommonConstants.SEARCH_PRODUCT_ID and search_word != ""
+    )
 
     total_count = 0
     if not is_full_query:
-        # 전체 개수 구하기 (페이징 시에만)
+        count_select = (
+            "count(*) as total_count"
+            if is_product_detail_query
+            else "count(distinct s.product_id) as total_count"
+        )
         count_query = text(f"""
-            select count(*) as total_count
+            select {count_select}
             from tb_ptn_product_episode_statistics s
-            inner join tb_product p on p.product_id = s.product_id
             WHERE 1=1 {where}
         """)
         count_result = await db.execute(count_query, {})
         total_count = count_result.mappings().first()["total_count"]
 
-    # 1단계: 통계 데이터 조회 (cp_company_name 제외)
+    # 통계 테이블에서 먼저 최신 N건을 제한한 뒤 조인한다.
+    # 로컬 13306 경로에서는 s -> p 직접 조인이 full scan으로 커져 타임아웃이 난다.
     query = text(f"""
-        select p.*, s.*
-            , date(s.created_date) as `date`
+        select p.*, stats.*
             , e.episode_title
-        from tb_ptn_product_episode_statistics s
-        inner join tb_product p on p.product_id = s.product_id
-        left join tb_product_episode e on e.product_id = p.product_id and e.episode_no = s.episode_no and e.use_yn = 'Y'
-        WHERE 1=1 {where}
-        ORDER BY s.created_date DESC
-        {limit_clause}
+        from (
+            select s.*
+                , date(s.created_date) as `date`
+            from tb_ptn_product_episode_statistics s
+            WHERE 1=1 {where}
+            ORDER BY s.created_date DESC
+            {limit_clause}
+        ) stats
+        inner join tb_product p on p.product_id = stats.product_id
+        left join tb_product_episode e on e.product_id = stats.product_id
+            and e.episode_no = stats.episode_no
+            and e.use_yn = 'Y'
+        ORDER BY stats.created_date DESC
     """)
     result = await db.execute(query, limit_params)
     rows = result.mappings().all()
     results = [dict(row) for row in rows]
+    for row in results:
+        row["episode_title"] = _normalize_episode_title(row.get("episode_title"))
 
     # 전체 조회 시 결과 개수를 total_count로 사용
     if is_full_query:
@@ -292,8 +338,8 @@ async def product_episode_statistics_list(
                     AND z.author_accept_yn = 'Y'
             ) t
             WHERE t.rn = 1
-        """)
-        cp_result = await db.execute(cp_query, {"product_ids": tuple(product_ids)})
+        """).bindparams(bindparam("product_ids", expanding=True))
+        cp_result = await db.execute(cp_query, {"product_ids": product_ids})
         cp_map = {
             row["product_id"]: row["cp_company_name"]
             for row in cp_result.mappings().all()
@@ -691,6 +737,7 @@ async def hourly_inflow_detail_by_product_id(
 async def product_discovery_statistics_list(
     search_target: str,
     search_word: str,
+    scope: str,
     page: int,
     count_per_page: int,
     db: AsyncSession,
@@ -715,19 +762,19 @@ async def product_discovery_statistics_list(
         where += f"""
             AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = {user_data["user_id"]})
         """
-    # elif user_data["role"] == "partner":
-    #     where += f"""
-    #         AND product_id IN (
-    #             select z.product_id
-    #             from tb_product_contract_offer z
-    #             inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-    #             and y.apply_type = 'cp'
-    #             and y.approval_date is not null
-    #             where z.use_yn = 'Y'
-    #             and z.author_accept_yn = 'Y'
-    #             and y.user_id = {user_data["user_id"]}
-    #         )
-    #     """
+    elif user_data["role"] == "partner" and scope == "contracted":
+        where += f"""
+            AND product_id IN (
+                select z.product_id
+                from tb_product_contract_offer z
+                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
+                and y.apply_type = 'cp'
+                and y.approval_date is not null
+                where z.use_yn = 'Y'
+                and z.author_accept_yn = 'Y'
+                and y.user_id = {user_data["user_id"]}
+            )
+        """
 
     if search_word != "":
         if search_target == "story":
@@ -765,7 +812,7 @@ async def product_discovery_statistics_list(
                 and (select thumbnail_file_id from tb_product where product_id = ppds.product_id) = z.file_group_id) as cover_image_path
         from tb_ptn_product_discovery_statistics ppds
         WHERE 1=1 {where}
-        ORDER BY created_date DESC
+        ORDER BY updated_date DESC
         {limit_clause}
     """)
     result = await db.execute(query, limit_params)
@@ -774,7 +821,9 @@ async def product_discovery_statistics_list(
     return build_paginated_response(rows, total_count, page, count_per_page)
 
 
-async def product_discovery_statistics_detail_by_id(id: int, db: AsyncSession):
+async def product_discovery_statistics_detail_by_id(
+    id: int, scope: str, db: AsyncSession, user_data: dict
+):
     """
     특정 발굴작품의 상세 통계 정보를 조회하고 각종 지표를 계산
 
@@ -792,16 +841,43 @@ async def product_discovery_statistics_detail_by_id(id: int, db: AsyncSession):
         rows = result.mappings().all()
         return [dict(row) for row in rows]
 
-    statistics_data = await _query(
+    detail_where = "WHERE ppds.id = :id"
+    params = {"id": id}
+
+    if user_data["role"] == "author":
+        detail_where += """
+        AND ppds.product_id IN (
+            SELECT product_id
+            FROM tb_product
+            WHERE author_id = :user_id
+        )
         """
+        params["user_id"] = user_data["user_id"]
+    elif user_data["role"] == "partner" and scope == "contracted":
+        detail_where += """
+        AND ppds.product_id IN (
+            SELECT z.product_id
+            FROM tb_product_contract_offer z
+            INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
+            AND y.apply_type = 'cp'
+            AND y.approval_date IS NOT NULL
+            WHERE z.use_yn = 'Y'
+            AND z.author_accept_yn = 'Y'
+            AND y.user_id = :user_id
+        )
+        """
+        params["user_id"] = user_data["user_id"]
+
+    statistics_data = await _query(
+        f"""
         select
             ppds.*,
             cpe.*
         from tb_ptn_product_discovery_statistics ppds
         inner join tb_cms_product_evaluation cpe on cpe.product_id = ppds.product_id
-        WHERE ppds.id = :id
+        {detail_where}
     """,
-        {"id": id},
+        params,
     )
 
     check_exists_or_404(statistics_data, ErrorMessages.NOT_FOUND_DISCOVERY_STAT)
@@ -884,7 +960,7 @@ async def product_discovery_statistics_detail_by_id(id: int, db: AsyncSession):
     # 연재 성실성 = 주평균 연재횟수
     data["serial_integrity"] = data["writing_count_per_week"]
 
-    # 신규독자 유입율 = (최근일(D-day) 1화 조회수-24시간 1화 조회수)/24시간 1화 조회수*100, 근데 독자수가 없어서 계산 불가능이라는데...?
+    # TODO: cleaned garbled comment (encoding issue).
     # 첫화 기준 신규독자 유입율 계산을 단일 쿼리로 통합
     first_ep_usage = await _query(
         """
@@ -1031,10 +1107,12 @@ async def product_discovery_statistics_detail_by_id(id: int, db: AsyncSession):
     """,
         {"product_id": data["product_id"]},
     )
+    for row in episode_count_hit_info:
+        row["episode_title"] = _normalize_episode_title(row.get("episode_title"))
     data["episode_count_hit"] = episode_count_hit_info
 
     # 타깃독자 분석 = 1순위 독자 & 2순위 독자(%) -> 타깃독자 분석상세에서 첫번째, 두번째
-    # 타깃독자 분석상세 = 1순위 ~ 10순위까지 %나열 -> primary_reader_group1, primary_reader_group2 근데 %는 가져올 수가 있나? 이걸 사용하는게 아닌건가? 이거 말고는 뭐가 없는데?
+    # TODO: cleaned garbled comment (encoding issue).
     total_count_reader = await _query(
         """
         select count(*) as total_count from tb_user_product_usage where product_id = :product_id
@@ -1086,7 +1164,7 @@ async def product_discovery_statistics_detail_by_id(id: int, db: AsyncSession):
         if total_count > 0:
             percent = (int(info["count_user"]) / total_count) * 100
         data["reader_analysis"].append(
-            {"user_type": info["user_type"], "percent": percent}
+            {"user_type": info["user_type"], "percent": round(percent, 1)}
         )
 
     # 유사작 추천 = 태그(장르비슷), 비슷한 이용자(내용비슷), 북마크(장바구니)

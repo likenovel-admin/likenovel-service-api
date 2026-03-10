@@ -13,7 +13,11 @@ truncate tb_batch_daily_sales_summary
 ;
 
 insert into tb_batch_daily_sales_summary (item_type, item_name, item_price, quantity, device_type, user_id, order_date, product_id, episode_id, pay_type, created_id, updated_id)
-select (case when e.ticket_id is not null then e.ticket_type
+select (case when d.pay_type = 'sponsorship' then 'sponsorship'
+             when d.pay_type = 'ticket_paid' then 'paid'
+             when d.pay_type = 'ticket_comped' then 'comped'
+             when d.pay_type = 'ticket_free' then 'free'
+             when e.ticket_id is not null then e.ticket_type
              when c.item_info_id is not null then 'normal'
              else 'sponsorship' -- TODO: 후원(sponsorship), 광고(ad), 할인(discount) 테이블 신규 설계 후, 조건문 추가 필
        end) as item_type
@@ -44,7 +48,11 @@ truncate tb_batch_daily_refund_summary
 ;
 
 insert into tb_batch_daily_refund_summary (item_type, item_name, refund_type, refund_price, device_type, user_id, order_date, product_id, episode_id, pay_type, created_id, updated_id)
-select (case when f.ticket_id is not null then f.ticket_type
+select (case when d.pay_type = 'sponsorship' then 'sponsorship'
+             when d.pay_type = 'ticket_paid' then 'paid'
+             when d.pay_type = 'ticket_comped' then 'comped'
+             when d.pay_type = 'ticket_free' then 'free'
+             when f.ticket_id is not null then f.ticket_type
              when c.item_info_id is not null then 'normal'
              else 'sponsorship' -- TODO: 후원(sponsorship), 광고(ad), 할인(discount) 테이블 신규 설계 후, 조건문 추가 필
        end) as item_type
@@ -67,20 +75,35 @@ select (case when f.ticket_id is not null then f.ticket_type
   left join tb_ticket_item f on a.item_id = f.ticket_id
    and f.use_yn = 'Y'
  where a.cancel_yn = 'Y'
-   and a.created_date >= date_sub(curdate(), interval 1 day)
-   and a.created_date < curdate()
+   and e.created_date >= date_sub(curdate(), interval 1 day)
+   and e.created_date < curdate()
 ;
 
--- 전체연독률 = 15화 이상 회차 작품만 계산 (뒤 4번째 조회수/앞 4번째 조회수*100)
+-- 전체연독률 = 15화 이상 작품만 계산
+-- 산식: (최신화-3)화 조회수 / 4화 조회수 * 100
+-- 1~3화(초반 이탈구간) 및 최신 3화(미안정 조회수) 제외
 update tb_product_trend_index a
   join (
-    select z.product_id
-         , coalesce(round((left(cast(z.count_hit as char), 4) / right(cast(z.count_hit as char), 4)), 1), 0) * 100 as reading_rate
-      from tb_product z
-     where exists (select y.product_id from tb_product_episode y
-                    where y.product_id = z.product_id
-                    group by z.product_id
-                   having count(1) >= 15)
+    select ep4.product_id
+         , case when ep4.count_hit > 0
+                then round(ep_recent.count_hit / ep4.count_hit * 100, 1)
+                else null
+           end as reading_rate
+      from (
+        select product_id, coalesce(count_hit, 0) as count_hit
+          from tb_product_episode
+         where episode_no = 4
+      ) ep4
+      inner join (
+        select pe.product_id, coalesce(pe.count_hit, 0) as count_hit
+          from tb_product_episode pe
+         inner join (
+            select product_id, max(episode_no) - 3 as target_no
+              from tb_product_episode
+             group by product_id
+            having count(*) >= 15
+         ) mx on pe.product_id = mx.product_id and pe.episode_no = mx.target_no
+      ) ep_recent on ep4.product_id = ep_recent.product_id
   ) as t on a.product_id = t.product_id
    set a.reading_rate = t.reading_rate
  where 1=1
@@ -107,8 +130,55 @@ update tb_product_trend_index a
  where 1=1
 ;
 
+-- 작품별 주요 독자층 갱신 (상위 2개 인구통계 → JSON)
+update tb_product_trend_index pti
+ inner join (
+    select
+        product_id,
+        max(case when rn = 1 then demographic end) as demo1,
+        max(case when rn = 2 then demographic end) as demo2
+    from (
+        select
+            product_id,
+            demographic,
+            row_number() over (partition by product_id order by cnt desc) as rn
+        from (
+            select
+                ups.product_id,
+                concat(
+                    case
+                        when u.birthdate >= curdate() - interval 10 year then '10대'
+                        when u.birthdate >= curdate() - interval 20 year then '20대'
+                        when u.birthdate >= curdate() - interval 30 year then '30대'
+                        when u.birthdate >= curdate() - interval 40 year then '40대'
+                        when u.birthdate >= curdate() - interval 50 year then '50대'
+                        else '60대 이상'
+                    end,
+                    ' ',
+                    case when u.gender = 'M' then '남' else '여' end
+                ) as demographic,
+                count(distinct u.user_id) as cnt
+            from tb_user_product_usage ups
+            inner join tb_user u on u.user_id = ups.user_id
+            where u.gender is not null
+              and u.birthdate is not null
+            group by ups.product_id, demographic
+        ) agg
+    ) ranked
+    where rn <= 2
+    group by product_id
+) tmp on tmp.product_id = pti.product_id
+   set pti.primary_reader_group = case
+        when tmp.demo2 is not null then json_object('1', tmp.demo1, '2', tmp.demo2)
+        else json_object('1', tmp.demo1)
+    end
+;
+
 -- 작품 일별 집계(조회수)
 -- 전날 누적 조회수(privious) 및 현재 누적 조회수(current)
+delete from tb_batch_daily_product_count_summary where created_date >= curdate()
+;
+
 insert into tb_batch_daily_product_count_summary (product_id, current_count_hit, privious_count_hit, current_count_recommend, privious_count_recommend, current_count_bookmark, privious_count_bookmark, current_count_unbookmark, privious_count_unbookmark, current_count_cp_hit, privious_count_cp_hit, current_reading_rate, privious_reading_rate, current_count_interest, privious_count_interest, current_count_interest_sustain, privious_count_interest_sustain, current_count_interest_loss, privious_count_interest_loss, created_id, updated_id)
 with tmp_interest_summary as (
     select y.product_id
@@ -168,6 +238,9 @@ select a.product_id
 -- 회차 일별 집계(조회수)
 -- 전날 누적 조회수(privious) 및 현재 누적 조회수(current)
 -- 24시간 이내 조회수는 데이터 갱신 없이 배치 도는 시점(정각) 기준으로 산정 요청
+delete from tb_batch_daily_product_episode_count_summary where created_date >= curdate()
+;
+
 insert into tb_batch_daily_product_episode_count_summary (product_id, episode_id, episode_no, current_count_hit, privious_count_hit, current_count_recommend, privious_count_recommend, current_count_comment, privious_count_comment, current_count_evaluation, privious_count_evaluation, current_count_hit_in_24h, privious_count_hit_in_24h, created_id, updated_id)
 with tmp_user_product_usage_24h_summary as (
     select z.product_id
@@ -246,7 +319,7 @@ tmp_contract_offer_list_summary as (
       from (
           select z.product_id
                , y.company_name as cp_company_name
-               , ROW_NUMBER() OVER (PARTITION BY z.product_id ORDER BY z.updated_date DESC) as rn
+               , ROW_NUMBER() OVER (PARTITION BY z.product_id ORDER BY z.updated_date DESC, z.offer_id DESC) as rn
             from tb_product_contract_offer z
            inner join tb_user_profile_apply y on z.offer_user_id = y.user_id -- TODO: cp 계약, cp 부여 모듈 구현 후 수정 및 최종 테스트 필(초안 개발 완료. 신규유저 아이디 컬럼 추가 혹은 회사명 컬럼 추가 필)
              and y.apply_type = 'cp'
@@ -360,4 +433,3 @@ update tb_cms_batch_job_process a
 ;
 
 commit;
-

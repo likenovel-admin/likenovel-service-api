@@ -16,3 +16,9 @@ fastapi_be_server/.DS_Store
 fastapi_be_server/dist/analysis.log
 .idea/inspectionProfiles/Project_Default.xml
 .idea/likenovel-service-api.iml
+fastapi_be_server/.env
+fastapi_be_server/logs/
+fastapi_be_server/secrets/
+fastapi_be_server/test_analysis.log
+fastapi_be_server/likenovel-service-api/
+*.bak*

@@ -28,6 +28,16 @@ logger = logging.getLogger("admin_app")
 """
 
 
+def _normalize_set_topic_title(title: str | None) -> str:
+    normalized = (title or "").strip()
+    if normalized == "":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="구좌명을 입력해주세요.",
+        )
+    return normalized
+
+
 async def get_latest_updated_date(table_name: str, db: AsyncSession):
     """
     테이블의 최신 업데이트 날짜 조회
@@ -452,6 +462,33 @@ async def algorithm_recommend_set_topic_csv_upload(file: UploadFile, db: AsyncSe
 
     # 업로드된 데이터 중 유효한 데이터 반환
     return {"result": True}
+
+
+async def put_algorithm_recommend_set_topic(
+    id: int,
+    req_body: admin_schema.PutAlgorithmRecommendSetTopicReqBody,
+    db: AsyncSession,
+):
+    title = _normalize_set_topic_title(req_body.title)
+
+    query = text("""
+        SELECT *
+        FROM tb_algorithm_recommend_set_topic
+        WHERE id = :id
+    """)
+    result = await db.execute(query, {"id": id})
+    rows = result.mappings().all()
+    check_exists_or_404(rows, ErrorMessages.NOT_FOUND_ALGORITHM_RECOMMEND)
+
+    query = text("""
+        UPDATE tb_algorithm_recommend_set_topic
+        SET title = :title,
+            updated_id = 0
+        WHERE id = :id
+    """)
+    await db.execute(query, {"id": id, "title": title})
+
+    return {"result": {"id": id, "title": title}}
 
 
 async def algorithm_recommend_section_list(

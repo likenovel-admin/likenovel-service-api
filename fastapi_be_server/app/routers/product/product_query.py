@@ -111,6 +111,22 @@ async def products_of_managed(
 
 
 @router.get(
+    "/can-create-normal",
+    tags=["작품"],
+    responses={200: {"description": "일반연재 자격 확인"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_can_create_normal(
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    """일반연재 자격 확인: 기존 승급 작품이 있으면 can_create_normal=True"""
+    return await product_service.get_can_create_normal(
+        kc_user_id=user.get("sub"), db=db
+    )
+
+
+@router.get(
     "/all",
     tags=["작품"],
     responses={

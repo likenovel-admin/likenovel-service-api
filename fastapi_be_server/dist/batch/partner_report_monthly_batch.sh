@@ -3,7 +3,7 @@
 # 배치 스크립트 공통 DB 접속 설정(Defensive)
 # - 민감정보(DB 계정/비밀번호)는 절대 하드코딩하지 않고 환경변수로만 주입합니다.
 # - env가 누락되면 조용히 실패하지 않고 명확한 에러로 종료합니다.
-set -euo pipefail
+set -uo pipefail
 
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"
@@ -16,7 +16,20 @@ if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   exit 1
 fi
 
-# 작품별 월매출, 월별 정산, 선계약금 차감 조회, 후원 및 기타 정산
-mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --skip-ssl < /app/dist/batch/partner_report_monthly_batch.sql
+MAX_RETRIES=3
+RETRY_DELAY=10
 
-exit 0
+for attempt in $(seq 1 $MAX_RETRIES); do
+  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --skip-ssl < /app/dist/batch/partner_report_monthly_batch.sql
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    exit 0
+  fi
+  echo "[WARN] partner_report_monthly_batch attempt $attempt/$MAX_RETRIES failed (exit=$rc)" 1>&2
+  if [ $attempt -lt $MAX_RETRIES ]; then
+    sleep $RETRY_DELAY
+  fi
+done
+
+echo "[ERROR] partner_report_monthly_batch failed after $MAX_RETRIES attempts" 1>&2
+exit 1

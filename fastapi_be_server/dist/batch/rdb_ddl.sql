@@ -462,7 +462,7 @@ create table `tb_cms_product_evaluation` (
   `updated_id` int DEFAULT NULL COMMENT 'row를 갱신한 id',
   `updated_date` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   primary key (`id`),
-  key `product_id` (`product_id`)
+  unique key `product_id` (`product_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 ;
 

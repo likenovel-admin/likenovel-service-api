@@ -301,12 +301,26 @@ async def products_bookmark_by_user_id(
                         pe.episode_no as last_viewed_episode_no
                     FROM tb_user_product_usage upu
                     INNER JOIN (
-                        SELECT product_id, MAX(updated_date) as max_date
-                        FROM tb_user_product_usage
-                        WHERE user_id = :user_id
-                          AND product_id IN ({fetch_product_ids})
-                          AND use_yn = 'Y'
-                        GROUP BY product_id
+                        SELECT u2.product_id, MAX(u2.updated_date) as max_date
+                        FROM tb_user_product_usage u2
+                        INNER JOIN tb_product_episode ep2 ON u2.episode_id = ep2.episode_id
+                        WHERE u2.user_id = :user_id
+                          AND u2.product_id IN ({fetch_product_ids})
+                          AND u2.use_yn = 'Y'
+                          AND (
+                            ep2.open_yn = 'Y'
+                            OR EXISTS (
+                              SELECT 1 FROM tb_user_productbook pb
+                              WHERE (pb.episode_id = ep2.episode_id
+                                     OR (pb.episode_id IS NULL
+                                         AND (pb.product_id = ep2.product_id
+                                              OR pb.product_id IS NULL)))
+                                AND pb.user_id = :user_id
+                                AND pb.use_yn = 'Y'
+                                AND (pb.rental_expired_date IS NULL OR pb.rental_expired_date > NOW())
+                            )
+                          )
+                        GROUP BY u2.product_id
                     ) latest ON upu.product_id = latest.product_id
                              AND upu.updated_date = latest.max_date
                     LEFT JOIN tb_product_episode pe ON upu.episode_id = pe.episode_id

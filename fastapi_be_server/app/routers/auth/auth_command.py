@@ -1092,6 +1092,78 @@ async def put_auth_identity_password_reset(
 
 
 @router.post(
+    "/password/reset/send-code",
+    tags=["인증 - 기타"],
+    responses={
+        200: {
+            "description": "인증코드 발송 성공",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "success_1": {
+                            "summary": "인증코드 발송 성공",
+                            "value": {"message": "인증코드가 발송되었습니다."},
+                        }
+                    }
+                }
+            },
+        },
+    },
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_auth_password_reset_send_code(
+    req_body: auth_schema.PasswordResetSendCodeReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    """
+    비밀번호 재설정 인증코드 이메일 발송 (비로그인)
+    """
+
+    return await auth_service.post_password_reset_send_code(
+        req_body=req_body, db=db
+    )
+
+
+@router.put(
+    "/password/reset",
+    tags=["인증 - 기타"],
+    responses={
+        200: {
+            "description": "비밀번호 재설정 성공",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "success_1": {
+                            "summary": "비밀번호 재설정 성공",
+                            "value": None,
+                        }
+                    }
+                }
+            },
+        },
+        400: {
+            "description": "인증코드 불일치 또는 SNS 계정",
+        },
+        404: {
+            "description": "해당 이메일의 유저를 찾을 수 없음",
+        },
+    },
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_auth_public_password_reset(
+    req_body: auth_schema.PublicPasswordResetReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    """
+    이메일 인증코드 기반 비밀번호 재설정 (비로그인)
+    """
+
+    return await auth_service.put_public_password_reset(
+        req_body=req_body, db=db
+    )
+
+
+@router.post(
     "/signout",
     tags=["인증 - 세션"],
     responses={
@@ -1370,3 +1442,43 @@ async def put_auth_token_relay_callback(
     """
 
     return await auth_service.put_auth_token_relay_callback(req_body=req_body, db=db)
+
+
+@router.post(
+    "/token/partner-relay/issue",
+    tags=["인증 - partner relay"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_auth_token_partner_relay_issue(
+    req_body: auth_schema.TokenPartnerRelayIssueReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    """
+    Service에서 Partner로 이동할 1회용 릴레이 키 발급
+    """
+
+    return await auth_service.post_auth_token_partner_relay_issue(
+        req_body=req_body,
+        kc_user_id=user.get("sub") if user else None,
+        kc_client=user.get("azp") if user else None,
+        db=db,
+    )
+
+
+@router.post(
+    "/token/partner-relay/consume",
+    tags=["인증 - partner relay"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_auth_token_partner_relay_consume(
+    req_body: auth_schema.TokenPartnerRelayConsumeReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    """
+    Partner에서 릴레이 키를 소비하고 인증 토큰 수령
+    """
+
+    return await auth_service.post_auth_token_partner_relay_consume(
+        req_body=req_body, db=db
+    )

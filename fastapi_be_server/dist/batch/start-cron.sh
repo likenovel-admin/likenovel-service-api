@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# NOTE(Windows):
+# - 이 파일이 CRLF(\r\n)로 저장되면 컨테이너에서 shebang이 `/bin/bash\r`로 인식되어
+#   "no such file or directory"로 실행이 실패할 수 있습니다. (반드시 LF로 유지)
+
 # cron 서비스 시작
 service cron start
 

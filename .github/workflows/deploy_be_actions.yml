@@ -63,7 +63,7 @@ jobs:
           TAGS: ${{ inputs.tags }}
         run: |
           # *.whl, appspec.yml, run_be.sh, gconf.py 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
-          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py init/
           aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
           aws deploy create-deployment \
             --application-name $APPLICATION_NAME \

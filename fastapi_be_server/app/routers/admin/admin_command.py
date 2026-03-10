@@ -7,11 +7,14 @@ from app.utils.auth import analysis_logger, chk_cur_user
 import app.schemas.admin as admin_schema
 import app.schemas.auth as auth_schema
 from app.services.admin import (
+    admin_ai_onboarding_service,
+    admin_ai_metadata_service,
     admin_basic_service,
     admin_content_service,
     admin_event_service,
     admin_faq_service,
     admin_notification_service,
+    admin_product_evaluation_service,
     admin_promotion_service,
     admin_quest_service,
     admin_recommend_service,
@@ -362,6 +365,27 @@ async def post_publisher_promotion(
 
 
 @router.put(
+    "/publisher-promotion/config",
+    tags=["CMS - 출판사 프로모션"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_publisher_promotion_config(
+    req_body: admin_schema.PutPublisherPromotionConfigReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    출판사 프로모션 구좌 설정 수정
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_system_service.put_publisher_promotion_config(req_body, db=db)
+
+
+@router.put(
     "/publisher-promotion/{id}",
     tags=["CMS - 출판사 프로모션"],
     dependencies=[Depends(analysis_logger)],
@@ -447,6 +471,30 @@ async def algorithm_recommend_set_topic_csv_upload(
 
     return await admin_recommend_service.algorithm_recommend_set_topic_csv_upload(
         file, db=db
+    )
+
+
+@router.put(
+    "/algorithm-recommend/set-topic/{id}",
+    tags=["CMS - 알고리즘 추천구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_algorithm_recommend_set_topic(
+    req_body: admin_schema.PutAlgorithmRecommendSetTopicReqBody,
+    id: int = Path(..., description="주제 설정 번호"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    알고리즘 추천구좌 관리 - 주제 설정 제목 수정
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_recommend_service.put_algorithm_recommend_set_topic(
+        id, req_body, db=db
     )
 
 
@@ -1232,3 +1280,272 @@ async def delete_general_notice(
         raise e
 
     return await admin_system_service.delete_general_notice(id, db=db)
+
+@router.post(
+    "/direct-promotion/gift",
+    tags=["CMS - promotion"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_direct_promotion_gift(
+    req_body: admin_schema.PostDirectPromotionGiftReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    Admin direct promotion gift batch issue
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_promotion_service.post_direct_promotion_batch(req_body, db=db)
+
+
+@router.post(
+    "/user-giftbook/admin-direct",
+    tags=["CMS - giftbook"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_admin_direct_gift(
+    req_body: admin_schema.PostAdminDirectGiftReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    Admin direct user giftbook issuance
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_promotion_service.post_admin_direct_gift(req_body, db=db)
+
+
+@router.post(
+    "/apply-episode/{id}/accept",
+    tags=["CMS - episode review"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def accept_apply_episode(
+    id: int = Path(..., description="episode apply request id"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    Accept episode apply request
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_user_service.accept_apply_episode(id, user.get("sub"), db)
+
+
+@router.post(
+    "/apply-episode/{id}/deny",
+    tags=["CMS - episode review"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def deny_apply_episode(
+    id: int = Path(..., description="episode apply request id"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    Deny episode apply request
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_user_service.deny_apply_episode(id, user.get("sub"), db)
+
+
+@router.post(
+    "/cms-product-evaluation",
+    tags=["CMS - product evaluation"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def upsert_cms_product_evaluation(
+    req_body: admin_schema.UpsertCmsProductEvaluationReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    Upsert product evaluation score
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_product_evaluation_service.upsert_cms_product_evaluation(
+        product_id=req_body.product_id,
+        evaluation_score=req_body.evaluation_score,
+        user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.put(
+    "/ai-onboarding-products",
+    tags=["CMS - AI 온보딩 작품"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_ai_onboarding_products(
+    req_body: admin_schema.PutAiOnboardingProductsReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 온보딩 작품 목록 저장
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_onboarding_service.put_ai_onboarding_products(
+        product_ids=req_body.product_ids,
+        hero_tags=req_body.hero_tags,
+        world_tone_tags=req_body.world_tone_tags,
+        relation_tags=req_body.relation_tags,
+        db=db,
+    )
+
+
+@router.put(
+    "/ai-product-metadata/{product_id}",
+    tags=["CMS - AI 작품 메타정보"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_ai_product_metadata(
+    req_body: admin_schema.PutAiProductMetadataReqBody,
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 작품 메타정보 수동 수정
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_metadata_service.put_ai_product_metadata(
+        product_id=product_id,
+        req_body=req_body,
+        db=db,
+    )
+
+
+@router.put(
+    "/ai-product-metadata/{product_id}/exclude",
+    tags=["CMS - AI 작품 메타정보"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_ai_product_metadata_exclude(
+    req_body: admin_schema.PutAiProductMetadataExcludeReqBody,
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 작품 추천 제외 설정 변경
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_metadata_service.put_ai_product_metadata_exclude(
+        product_id=product_id,
+        exclude_from_recommend_yn=req_body.exclude_from_recommend_yn,
+        db=db,
+    )
+
+
+@router.post(
+    "/ai-product-metadata/{product_id}/reanalyze",
+    tags=["CMS - AI 작품 메타정보"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_ai_product_metadata_reanalyze(
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 작품 메타정보 재분석
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_metadata_service.reanalyze_ai_product_metadata(
+        product_id=product_id,
+        db=db,
+    )
+
+
+@router.post(
+    "/cash-orders/{order_id}/cancel",
+    tags=["CMS - payment"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_cancel_cash_charge_order(
+    req_body: admin_schema.PostCancelCashChargeOrderReqBody,
+    order_id: int = Path(..., description="store order id"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    Cancel cash charge order (admin only)
+    - only for users who have never spent cash
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_basic_service.post_cancel_cash_charge_order(
+        order_id=order_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.post(
+    "/users/create-account",
+    tags=["CMS - 회원"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_admin_create_account(
+    req_body: admin_schema.AdminCreateAccountReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    관리자 임의계정 발급
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    signup_body = auth_schema.SignupReqBody(
+        email=req_body.email,
+        password=req_body.password,
+        birthdate="2000-01-01",
+        gender="M",
+        ad_info_agree_yn="N",
+    )
+
+    return await auth_service.post_auth_signup(req_body=signup_body, db=db)

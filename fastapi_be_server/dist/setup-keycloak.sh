@@ -22,10 +22,18 @@ fi
 
 # Keycloak 관리자 토큰 획득
 echo "Getting admin token..."
+KC_ADMIN_USERNAME="${KC_ADMIN_USERNAME:-admin}"
+KC_ADMIN_PASSWORD="${KC_ADMIN_PASSWORD:-}"
+
+if [ -z "$KC_ADMIN_PASSWORD" ]; then
+    echo "[setup-keycloak.sh] ERROR: KC_ADMIN_PASSWORD is missing" >&2
+    exit 1
+fi
+
 TOKEN_RESPONSE=$(curl -X POST http://keycloak:8080/realms/master/protocol/openid-connect/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=admin" \
-  -d "password=admin1234" \
+  -d "username=${KC_ADMIN_USERNAME}" \
+  -d "password=${KC_ADMIN_PASSWORD}" \
   -d "grant_type=password" \
   -d "client_id=admin-cli")
 
@@ -70,6 +78,12 @@ fi
 
 # service 클라이언트 생성 (일반 로그인용)
 echo "Creating client 'service'..."
+KC_CLIENT_SECRET="${KC_CLIENT_SECRET:-}"
+if [ -z "$KC_CLIENT_SECRET" ]; then
+    echo "[setup-keycloak.sh] ERROR: KC_CLIENT_SECRET is missing" >&2
+    exit 1
+fi
+
 SERVICE_RESPONSE=$(curl -s -w "%{http_code}" -X POST http://keycloak:8080/admin/realms/likenovel/clients \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
@@ -78,7 +92,7 @@ SERVICE_RESPONSE=$(curl -s -w "%{http_code}" -X POST http://keycloak:8080/admin/
     "enabled": true,
     "publicClient": false,
     "clientAuthenticatorType": "client-secret",
-    "secret": "PaP1ULbtlNzXY2XKyw7juZtH0vqYMauP",
+    "secret": "'"$KC_CLIENT_SECRET"'",
     "redirectUris": ["http://localhost:8800/*", "http://cloud.aiaracorp.com:8800/*", "https://api.likenovel.net/*"],
     "webOrigins": ["http://localhost:3000", "http://cloud.aiaracorp.com:3001", "http://cloud.aiaracorp.com:3002", "http://cloud.aiaracorp.com:8800", "https://likenovel.net", "https://www.likenovel.net"],
     "standardFlowEnabled": true,
@@ -96,6 +110,12 @@ fi
 
 # service-keep 클라이언트 생성 (자동 로그인용)
 echo "Creating client 'service-keep'..."
+KC_CLIENT_KEEP_SIGNIN_SECRET="${KC_CLIENT_KEEP_SIGNIN_SECRET:-}"
+if [ -z "$KC_CLIENT_KEEP_SIGNIN_SECRET" ]; then
+    echo "[setup-keycloak.sh] ERROR: KC_CLIENT_KEEP_SIGNIN_SECRET is missing" >&2
+    exit 1
+fi
+
 KEEP_RESPONSE=$(curl -s -w "%{http_code}" -X POST http://keycloak:8080/admin/realms/likenovel/clients \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
@@ -104,7 +124,7 @@ KEEP_RESPONSE=$(curl -s -w "%{http_code}" -X POST http://keycloak:8080/admin/rea
     "enabled": true,
     "publicClient": false,
     "clientAuthenticatorType": "client-secret",
-    "secret": "3ERXPBS4jTNUxy4Ozz3EQOOkRQKsV8iZ",
+    "secret": "'"$KC_CLIENT_KEEP_SIGNIN_SECRET"'",
     "redirectUris": ["http://localhost:8800/*", "http://cloud.aiaracorp.com:8800/*", "https://api.likenovel.net/*"],
     "webOrigins": ["http://localhost:3000", "http://cloud.aiaracorp.com:3001", "http://cloud.aiaracorp.com:3002", "http://cloud.aiaracorp.com:8800", "https://likenovel.net", "https://www.likenovel.net"],
     "standardFlowEnabled": true,
@@ -159,6 +179,7 @@ fi
 
 # likenovel realm의 admin 계정에 모든 realm-management 역할 부여
 # 1. likenovel realm에 admin 계정 생성
+KC_LIKENOVEL_ADMIN_PASSWORD="${KC_LIKENOVEL_ADMIN_PASSWORD:-$KC_ADMIN_PASSWORD}"
 ADMIN_USER_RESPONSE=$(curl -s -w "%{http_code}" -X POST http://keycloak:8080/admin/realms/likenovel/users \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
@@ -166,7 +187,7 @@ ADMIN_USER_RESPONSE=$(curl -s -w "%{http_code}" -X POST http://keycloak:8080/adm
     "username": "admin",
     "enabled": true,
     "emailVerified": true,
-    "credentials": [{"type": "password", "value": "admin1234", "temporary": false}]
+    "credentials": [{"type": "password", "value": "'"$KC_LIKENOVEL_ADMIN_PASSWORD"'", "temporary": false}]
   }')
 
 # 2. likenovel realm의 admin 계정 id 조회
@@ -233,18 +254,23 @@ ADMIN_CLI_ID=$(curl -s -X GET "http://keycloak:8080/admin/realms/master/clients?
   | python3 -c "import sys, json; print(json.load(sys.stdin)[0]['id'])")
 
 # admin-cli 클라이언트 수정
+KC_ADMIN_CLI_SECRET="${KC_ADMIN_CLI_SECRET:-}"
+if [ -z "$KC_ADMIN_CLI_SECRET" ]; then
+  echo "[setup-keycloak.sh] WARN: KC_ADMIN_CLI_SECRET is missing; skip updating admin-cli client secret"
+else
 curl -s -X PUT "http://keycloak:8080/admin/realms/master/clients/$ADMIN_CLI_ID" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "clientId": "admin-cli",
-    "secret": "9VtzxUQ5-84mFfD3CwJkYqRE7_2B_HaLXb1OIj9zNks",
+    "secret": "'"$KC_ADMIN_CLI_SECRET"'",
     "publicClient": false,
     "serviceAccountsEnabled": true,
     "enabled": true
   }'
 
 echo "Updated 'admin-cli' client to use client secret"
+fi
 
 
 # 모든 Required Action Provider 리스트 가져오기

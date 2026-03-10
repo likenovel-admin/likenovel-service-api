@@ -19,7 +19,11 @@ select p.product_id, now() as created_date,
     select count(*) from tb_user_product_usage upu inner join tb_user u on u.user_id = upu.user_id where upu.product_id = p.product_id and date_sub(now(), interval 1 hour) <= upu.created_date and upu.created_date < now()
   ) as total_view_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
   ) as total_payment_count,
   (
     select count(*) from tb_user_product_usage upu inner join tb_user u on u.user_id = upu.user_id where upu.product_id = p.product_id and date_sub(now(), interval 1 hour) <= upu.created_date and upu.created_date < now()
@@ -30,51 +34,99 @@ select p.product_id, now() as created_date,
     and u.gender = 'F'
   ) as female_view_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'M'
   ) as male_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'F'
   ) as female_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'M' and timestampdiff(year, u.birthdate, curdate()) <= 29
   ) as male_20_under_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'M' and 30 <= timestampdiff(year, u.birthdate, curdate()) and timestampdiff(year, u.birthdate, curdate()) <= 39
   ) as male_30_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'M' and 40 <= timestampdiff(year, u.birthdate, curdate()) and timestampdiff(year, u.birthdate, curdate()) <= 49
   ) as male_40_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'M' and 50 <= timestampdiff(year, u.birthdate, curdate()) and timestampdiff(year, u.birthdate, curdate()) <= 59
   ) as male_50_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'M' and 60 <= timestampdiff(year, u.birthdate, curdate())
   ) as male_60_over_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'F' and timestampdiff(year, u.birthdate, curdate()) <= 29
   ) as female_20_under_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'F' and 30 <= timestampdiff(year, u.birthdate, curdate()) and timestampdiff(year, u.birthdate, curdate()) <= 39
   ) as female_30_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'F' and 40 <= timestampdiff(year, u.birthdate, curdate()) and timestampdiff(year, u.birthdate, curdate()) <= 49
   ) as female_40_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'F' and 50 <= timestampdiff(year, u.birthdate, curdate()) and timestampdiff(year, u.birthdate, curdate()) <= 59
   ) as female_50_payment_count,
   (
-    select count(*) from tb_product_order po inner join tb_user u on u.user_id = po.user_id where po.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
+    select count(*) from tb_product_order po
+    inner join tb_product_order_item poi on poi.order_id = po.order_id
+    inner join tb_product_order_item_info poii on poii.item_info_id = poi.item_id
+    inner join tb_user u on u.user_id = po.user_id
+    where poii.product_id = p.product_id and date_sub(now(), interval 1 hour) <= po.created_date and po.created_date < now()
     and u.gender = 'F' and 60 <= timestampdiff(year, u.birthdate, curdate())
   ) as female_60_over_payment_count,
   (

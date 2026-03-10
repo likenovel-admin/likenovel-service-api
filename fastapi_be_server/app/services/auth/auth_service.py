@@ -1,4 +1,5 @@
 import base64
+import secrets
 import time
 from fastapi import status
 from sqlalchemy import text
@@ -14,12 +15,13 @@ from app.const import settings, CommonConstants, ErrorMessages
 from app.exceptions import CustomResponseException
 from app.utils.auth import get_kc_signing_key
 from app.utils.time import get_cur_time
+from app.utils.email import send_password_reset_email
 import app.services.common.comm_service as comm_service
 import app.schemas.auth as auth_schema
 import app.services.common.statistics_service as statistics_service
 
 from httpx import AsyncClient
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -2722,31 +2724,43 @@ async def put_auth_identity_password_reset(
                                 f"kc_user_id: {existing_kc_user_id}"
                             )
 
-                            # DB의 kc_user_id를 기존 Keycloak 사용자의 ID로 업데이트
-                            logger.info(
-                                f"Syncing DB kc_user_id from {kc_user_id} to {existing_kc_user_id}"
+                            # DB에 이미 해당 kc_user_id를 가진 행이 있는지 확인 (중복 방지)
+                            dup_check = await db.execute(
+                                text("SELECT user_id FROM tb_user WHERE kc_user_id = :kc_user_id"),
+                                {"kc_user_id": existing_kc_user_id},
                             )
-                            query = text("""
-                                UPDATE tb_user
-                                SET kc_user_id = :new_kc_user_id
-                                WHERE kc_user_id = :old_kc_user_id
-                                  AND use_yn = 'Y'
-                            """)
-                            result = await db.execute(
-                                query,
-                                {
-                                    "new_kc_user_id": existing_kc_user_id,
-                                    "old_kc_user_id": kc_user_id,
-                                },
-                            )
-                            await db.commit()
-                            logger.info(
-                                f"DB sync successful. Rows affected: {result.rowcount}"
-                            )
+                            dup_row = dup_check.first()
 
-                            # 비밀번호 업데이트 재시도
+                            if not dup_row:
+                                # 충돌 없음 — kc_user_id 동기화 진행
+                                logger.info(
+                                    f"Syncing DB kc_user_id from {kc_user_id} to {existing_kc_user_id}"
+                                )
+                                query = text("""
+                                    UPDATE tb_user
+                                    SET kc_user_id = :new_kc_user_id
+                                    WHERE kc_user_id = :old_kc_user_id
+                                      AND use_yn = 'Y'
+                                """)
+                                result = await db.execute(
+                                    query,
+                                    {
+                                        "new_kc_user_id": existing_kc_user_id,
+                                        "old_kc_user_id": kc_user_id,
+                                    },
+                                )
+                                await db.commit()
+                                logger.info(
+                                    f"DB sync successful. Rows affected: {result.rowcount}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"kc_user_id sync skipped: {existing_kc_user_id} already belongs to user_id={dup_row[0]}"
+                                )
+
+                            # 비밀번호 업데이트
                             logger.info(
-                                f"Retrying password update for synced kc_user_id: {existing_kc_user_id}"
+                                f"Updating password for kc_user_id: {existing_kc_user_id}"
                             )
                             await comm_service.kc_users_id_endpoint(
                                 method="PUT",
@@ -2755,8 +2769,7 @@ async def put_auth_identity_password_reset(
                                 data_dict=data,
                             )
                             logger.info(
-                                f"Recovery completed: Synced DB with existing Keycloak user {existing_kc_user_id} "
-                                f"and reset password"
+                                f"Recovery completed: password reset for Keycloak user {existing_kc_user_id}"
                             )
                             return
 
@@ -2845,6 +2858,172 @@ async def put_auth_identity_password_reset(
         )
 
     return
+
+
+async def post_password_reset_send_code(
+    req_body: auth_schema.PasswordResetSendCodeReqBody,
+    db: AsyncSession,
+):
+    """
+    비밀번호 재설정 이메일 발송
+    - identity_yn = 'Y' → 400 (본인인증 완료 유저는 NICE 플로우 이용)
+    - identity_yn = 'N' → 재설정 링크 이메일 발송
+    """
+    try:
+        # 유저 조회
+        query = text("""
+            SELECT kc_user_id, use_yn, latest_signed_type, identity_yn
+              FROM tb_user
+             WHERE email = :email
+        """)
+        result = await db.execute(query, {"email": req_body.email})
+        user = result.mappings().first()
+
+        if not user:
+            raise CustomResponseException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                message=ErrorMessages.NOT_FOUND_USER,
+            )
+
+        if user["use_yn"] != "Y":
+            raise CustomResponseException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                message=ErrorMessages.ALREADY_WITHDRAWN_MEMBER,
+            )
+
+        if user["latest_signed_type"] != "likenovel":
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.SNS_ACCOUNT_PASSWORD_RESET_NOT_ALLOWED,
+            )
+
+        if user["identity_yn"] == "Y":
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="본인인증이 완료된 계정입니다. 휴대폰 본인인증으로 비밀번호를 재설정해주세요.",
+            )
+
+        # 1분 내 중복 요청 방지
+        recent_check = text("""
+            SELECT id FROM tb_email_verification_code
+             WHERE email = :email
+               AND purpose = 'password_reset'
+               AND created_date > DATE_SUB(NOW(), INTERVAL 1 MINUTE)
+             LIMIT 1
+        """)
+        recent = await db.execute(recent_check, {"email": req_body.email})
+        if recent.first():
+            raise CustomResponseException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                message=ErrorMessages.VERIFICATION_CODE_TOO_MANY_REQUESTS,
+            )
+
+        # 기존 미사용 토큰 무효화
+        await db.execute(
+            text("""
+                UPDATE tb_email_verification_code
+                   SET verified_yn = 'Y'
+                 WHERE email = :email
+                   AND purpose = 'password_reset'
+                   AND verified_yn = 'N'
+            """),
+            {"email": req_body.email},
+        )
+
+        # 토큰 생성
+        token = secrets.token_urlsafe(48)
+
+        # DB 저장 (5분 TTL)
+        await db.execute(
+            text("""
+                INSERT INTO tb_email_verification_code
+                       (email, token, purpose, expired_date)
+                VALUES (:email, :token, 'password_reset', DATE_ADD(NOW(), INTERVAL 5 MINUTE))
+            """),
+            {"email": req_body.email, "token": token},
+        )
+        await db.commit()
+
+        # 이메일 발송
+        try:
+            await send_password_reset_email(req_body.email, token)
+        except Exception as e:
+            logger.error(f"Failed to send password reset email to {req_body.email}: {e}")
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message=ErrorMessages.VERIFICATION_CODE_SEND_FAILED,
+            )
+
+        return {"message": "인증메일을 발송했습니다. 메일에서 비밀번호 재설정을 진행해주세요."}
+
+    except CustomResponseException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in post_password_reset_send_code: {e}", exc_info=True)
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.INTERNAL_SERVER_ERROR,
+        )
+
+
+async def put_public_password_reset(
+    req_body: auth_schema.PublicPasswordResetReqBody,
+    db: AsyncSession,
+):
+    """
+    이메일 인증 토큰 검증 후 비밀번호 재설정
+    """
+    try:
+        # 토큰 검증
+        query = text("""
+            SELECT id FROM tb_email_verification_code
+             WHERE email = :email
+               AND token = :token
+               AND purpose = 'password_reset'
+               AND verified_yn = 'N'
+               AND expired_date > NOW()
+             LIMIT 1
+        """)
+        result = await db.execute(
+            query, {"email": req_body.email, "token": req_body.token}
+        )
+        token_row = result.first()
+
+        if not token_row:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.INVALID_VERIFICATION_CODE,
+            )
+
+        # 토큰 사용 처리
+        await db.execute(
+            text("""
+                UPDATE tb_email_verification_code
+                   SET verified_yn = 'Y'
+                 WHERE id = :id
+            """),
+            {"id": token_row[0]},
+        )
+        await db.commit()
+
+        # 기존 비밀번호 재설정 로직 재사용
+        converted = auth_schema.IdentityPasswordResetReqBody(
+            email=req_body.email,
+            password=req_body.password,
+        )
+
+        return await put_auth_identity_password_reset(
+            req_body=converted, kc_user_id=None, db=db
+        )
+
+    except CustomResponseException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in put_public_password_reset: {e}", exc_info=True)
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.INTERNAL_SERVER_ERROR,
+        )
 
 
 async def post_auth_signout(
@@ -3207,6 +3386,237 @@ async def put_auth_token_relay_callback(
     res_body = {"data": res_data}
 
     return res_body
+
+
+async def post_auth_token_partner_relay_issue(
+    req_body: auth_schema.TokenPartnerRelayIssueReqBody,
+    kc_user_id: str,
+    kc_client: str,
+    db: AsyncSession,
+):
+    if not kc_user_id or not kc_client:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+        )
+
+    reissue_type = ""
+    if kc_client == settings.KC_CLIENT_ID:
+        reissue_type = "reissue_normal"
+    elif kc_client == settings.KC_CLIENT_KEEP_SIGNIN_ID:
+        reissue_type = "reissue_keep"
+    else:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.INVALID_TOKEN,
+        )
+
+    token_res = await comm_service.kc_token_endpoint(
+        method="POST",
+        type=reissue_type,
+        data_dict={"refresh_token": req_body.refresh_token},
+    )
+
+    access_token = token_res.get("access_token")
+    access_expires_in = token_res.get("access_expires_in")
+    refresh_token = token_res.get("refresh_token")
+    refresh_expires_in = token_res.get("refresh_expires_in")
+
+    if access_token is None or refresh_token is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.EXPIRED_REFRESH_TOKEN,
+        )
+
+    relay_key = comm_service.make_rand_uuid()
+
+    try:
+        async with db.begin():
+            query = text("""
+                             select user_id
+                               from tb_user
+                              where kc_user_id = :kc_user_id
+                                and use_yn = 'Y'
+                             """)
+
+            result = await db.execute(query, {"kc_user_id": kc_user_id})
+            user_row = result.mappings().first()
+
+            if not user_row:
+                raise CustomResponseException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    message=ErrorMessages.INVALID_TOKEN,
+                )
+
+            user_id = user_row.get("user_id")
+
+            query = text("""
+                             select sns_id
+                               from tb_user_social
+                              where user_id = :user_id
+                              order by sns_id asc
+                              limit 1
+                             """)
+
+            result = await db.execute(query, {"user_id": user_id})
+            social_row = result.mappings().first()
+
+            sns_id = None
+            if social_row:
+                sns_id = social_row.get("sns_id")
+            else:
+                query = text("""
+                                 insert into tb_user_social (user_id, sns_type, sns_link_id, created_id, updated_id)
+                                 values (:user_id, :sns_type, :sns_link_id, :created_id, :updated_id)
+                                 """)
+                await db.execute(
+                    query,
+                    {
+                        "user_id": user_id,
+                        "sns_type": "likenovel",
+                        "sns_link_id": comm_service.make_rand_uuid(),
+                        "created_id": settings.DB_DML_DEFAULT_ID,
+                        "updated_id": settings.DB_DML_DEFAULT_ID,
+                    },
+                )
+
+                result = await db.execute(text("select last_insert_id()"))
+                sns_id = result.scalar()
+
+            query = text("""
+                             update tb_user_social
+                                set temp_issued_key = :temp_issued_key
+                                  , access_token = :access_token
+                                  , access_expire_in = :access_expire_in
+                                  , refresh_token = :refresh_token
+                                  , refresh_expire_in = :refresh_expire_in
+                                  , updated_id = :updated_id
+                              where sns_id = :sns_id
+                             """)
+            await db.execute(
+                query,
+                {
+                    "temp_issued_key": relay_key,
+                    "access_token": access_token,
+                    "access_expire_in": access_expires_in,
+                    "refresh_token": refresh_token,
+                    "refresh_expire_in": refresh_expires_in,
+                    "updated_id": settings.DB_DML_DEFAULT_ID,
+                    "sns_id": sns_id,
+                },
+            )
+    except CustomResponseException:
+        raise
+    except OperationalError:
+        raise CustomResponseException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            message=ErrorMessages.DB_CONNECTION_ERROR,
+        )
+    except SQLAlchemyError:
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.DB_OPERATION_ERROR,
+        )
+    except Exception:
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.INTERNAL_SERVER_ERROR,
+        )
+
+    return {"data": {"relay": {"relayKey": relay_key, "expiresIn": 60}}}
+
+
+async def post_auth_token_partner_relay_consume(
+    req_body: auth_schema.TokenPartnerRelayConsumeReqBody, db: AsyncSession
+):
+    auth_data = {}
+    sns_id = None
+
+    try:
+        async with db.begin():
+            query = text("""
+                             select a.user_id
+                                  , a.birthdate
+                                  , a.gender
+                                  , b.sns_id
+                                  , b.access_token
+                                  , b.access_expire_in
+                                  , b.refresh_token
+                                  , b.refresh_expire_in
+                                  , b.sns_type
+                               from tb_user a
+                              inner join tb_user_social b on a.user_id = b.user_id
+                                and b.temp_issued_key = :relay_key
+                              where a.use_yn = 'Y'
+                                and timestampdiff(second, b.updated_date, now()) <= 60
+                              order by b.sns_id desc
+                              limit 1
+                              for update
+                             """)
+
+            result = await db.execute(query, {"relay_key": req_body.relay_key})
+            row = result.mappings().first()
+
+            if not row:
+                raise CustomResponseException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    message=ErrorMessages.INVALID_OR_EXPIRED_SESSION,
+                )
+
+            sns_id = row.get("sns_id")
+
+            access_token = row.get("access_token")
+            refresh_token = row.get("refresh_token")
+            if not access_token or not refresh_token:
+                raise CustomResponseException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    message=ErrorMessages.INVALID_OR_EXPIRED_SESSION,
+                )
+
+            auth_data = {
+                "accessToken": access_token,
+                "accessTokenExpiresIn": row.get("access_expire_in"),
+                "refreshToken": refresh_token,
+                "refreshTokenExpiresIn": row.get("refresh_expire_in"),
+                "recentSignInType": row.get("sns_type"),
+                "userId": row.get("user_id"),
+                "birthDate": row.get("birthdate"),
+                "gender": row.get("gender"),
+            }
+
+            query = text("""
+                             update tb_user_social
+                                set temp_issued_key = null
+                                  , access_token = null
+                                  , access_expire_in = null
+                                  , refresh_token = null
+                                  , refresh_expire_in = null
+                                  , updated_id = :updated_id
+                              where sns_id = :sns_id
+                             """)
+            await db.execute(
+                query,
+                {"updated_id": settings.DB_DML_DEFAULT_ID, "sns_id": sns_id},
+            )
+    except CustomResponseException:
+        raise
+    except OperationalError:
+        raise CustomResponseException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            message=ErrorMessages.DB_CONNECTION_ERROR,
+        )
+    except SQLAlchemyError:
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.DB_OPERATION_ERROR,
+        )
+    except Exception:
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.INTERNAL_SERVER_ERROR,
+        )
+
+    return {"data": {"auth": auth_data}}
 
 
 async def post_identity_token_for_password(

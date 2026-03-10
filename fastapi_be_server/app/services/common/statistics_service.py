@@ -232,78 +232,94 @@ async def payment_statistics_by_user(
     tb_payment_statistics_log에서 직접 집계
     """
 
-    where = "WHERE 1=1"
+    params = {}
+    where_conditions = [
+        "so.cancel_yn = 'N'",
+        "CAST(so.order_no AS CHAR) LIKE 'OC%'",
+    ]
 
     if search_word != "":
+        params["search_word"] = f"%{search_word}%"
         if search_target == "nickname":
-            where += f"""
-                AND user_id IN (SELECT user_id FROM tb_user_profile WHERE nickname LIKE '%{search_word}%')
-            """
+            where_conditions.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM tb_user_profile up
+                    WHERE up.user_id = so.user_id
+                      AND up.nickname LIKE :search_word
+                )
+                """
+            )
         elif search_target == CommonConstants.SEARCH_EMAIL:
-            where += f"""
-                AND user_id IN (SELECT user_id FROM tb_user WHERE email LIKE '%{search_word}%')
-            """
+            where_conditions.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM tb_user su
+                    WHERE su.user_id = so.user_id
+                      AND su.email LIKE :search_word
+                )
+                """
+            )
 
     if start_date is not None and end_date is not None:
-        where += f"""
-            AND DATE(`date`) BETWEEN '{start_date}' AND '{end_date}'
-        """
+        where_conditions.append("DATE(so.order_date) BETWEEN :start_date AND :end_date")
+        params["start_date"] = start_date
+        params["end_date"] = end_date
+
+    where_sql = "WHERE " + " AND ".join(where_conditions)
+
+    select_query = f"""
+        SELECT
+            so.order_date AS `date`,
+            so.order_date AS order_datetime,
+            CAST(so.order_no AS CHAR) AS order_no,
+            so.user_id,
+            u.email AS email,
+            {get_nickname_sub_query("so.user_id")},
+            so.order_id AS cash_order_id,
+            1 AS cash_order_count,
+            1 AS pay_count,
+            so.total_price AS pay_coin,
+            so.total_price AS pay_amount,
+            0 AS use_coin_count,
+            0 AS use_coin,
+            0 AS donation_count,
+            0 AS donation_coin,
+            0 AS ad_revenue
+        FROM tb_store_order so
+        LEFT JOIN tb_user u ON u.user_id = so.user_id
+        {where_sql}
+        ORDER BY so.order_date DESC, so.order_id DESC
+    """
 
     if page == -1 or count_per_page == -1:
-        query = text(f"""
-            SELECT
-                DATE(log.date) as `date`,
-                log.user_id,
-                (SELECT email FROM tb_user WHERE user_id = log.user_id) AS email,
-                {get_nickname_sub_query("log.user_id")},
-                SUM(CASE WHEN log.type = 'pay' THEN 1 ELSE 0 END) as pay_count,
-                SUM(CASE WHEN log.type = 'pay' THEN log.amount ELSE 0 END) as pay_coin,
-                SUM(CASE WHEN log.type = 'pay' THEN log.amount ELSE 0 END) as pay_amount,
-                SUM(CASE WHEN log.type = 'use_coin' THEN 1 ELSE 0 END) as use_coin_count,
-                SUM(CASE WHEN log.type = 'use_coin' THEN log.amount ELSE 0 END) as use_coin,
-                SUM(CASE WHEN log.type = 'donation' THEN 1 ELSE 0 END) as donation_count,
-                SUM(CASE WHEN log.type = 'donation' THEN log.amount ELSE 0 END) as donation_coin,
-                SUM(CASE WHEN log.type = 'ad' THEN log.amount ELSE 0 END) as ad_revenue
-            FROM tb_payment_statistics_log log
-            {where}
-            GROUP BY DATE(log.date), log.user_id
-            ORDER BY DATE(log.date) DESC, log.user_id
-        """)
-        result = await db.execute(query, {})
+        query = text(select_query)
+        result = await db.execute(query, params)
         rows = result.mappings().all()
         return [dict(row) for row in rows]
 
     offset = (page - 1) * count_per_page
 
-    count_query = text(f"""
-        SELECT COUNT(DISTINCT DATE(date), user_id) as total_count
-        FROM tb_payment_statistics_log
-        {where}
-    """)
-    count_result = await db.execute(count_query, {})
+    count_query = text(
+        f"""
+        SELECT COUNT(*) as total_count
+        FROM tb_store_order so
+        {where_sql}
+        """
+    )
+    count_result = await db.execute(count_query, params)
     total_count = dict(count_result.mappings().first())["total_count"]
 
-    query = text(f"""
-        SELECT
-            DATE(log.date) as `date`,
-            log.user_id,
-            (SELECT email FROM tb_user WHERE user_id = log.user_id) AS email,
-            {get_nickname_sub_query("log.user_id")},
-            SUM(CASE WHEN log.type = 'pay' THEN 1 ELSE 0 END) as pay_count,
-            SUM(CASE WHEN log.type = 'pay' THEN log.amount ELSE 0 END) as pay_coin,
-            SUM(CASE WHEN log.type = 'pay' THEN log.amount ELSE 0 END) as pay_amount,
-            SUM(CASE WHEN log.type = 'use_coin' THEN 1 ELSE 0 END) as use_coin_count,
-            SUM(CASE WHEN log.type = 'use_coin' THEN log.amount ELSE 0 END) as use_coin,
-            SUM(CASE WHEN log.type = 'donation' THEN 1 ELSE 0 END) as donation_count,
-            SUM(CASE WHEN log.type = 'donation' THEN log.amount ELSE 0 END) as donation_coin,
-            SUM(CASE WHEN log.type = 'ad' THEN log.amount ELSE 0 END) as ad_revenue
-        FROM tb_payment_statistics_log log
-        {where}
-        GROUP BY DATE(log.date), log.user_id
-        ORDER BY DATE(log.date) DESC, log.user_id
+    query = text(
+        select_query
+        + """
         LIMIT :limit OFFSET :offset
-    """)
-    result = await db.execute(query, {"limit": count_per_page, "offset": offset})
+    """
+    )
+    page_params = {**params, "limit": count_per_page, "offset": offset}
+    result = await db.execute(query, page_params)
     rows = result.mappings().all()
 
     return build_paginated_response(rows, total_count, page, count_per_page)

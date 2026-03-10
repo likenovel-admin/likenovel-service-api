@@ -103,6 +103,123 @@ async def post_episodes_products_product_id(
     )
 
 
+@router.post(
+    "/products/{product_id}/epub",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_products_product_id_epub(
+    req_body: episode_schema.PostEpisodesProductsProductIdEpubReqBody,
+    product_id: str = Path(..., description="작품 id"),
+    save: Optional[str] = Query(None, description="저장(Y)"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_products_product_id_epub(
+        save=save,
+        product_id=product_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.post(
+    "/products/{product_id}/epub/batch",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_products_product_id_epub_batch(
+    req_body: episode_schema.PostEpisodesProductsProductIdEpubBatchReqBody,
+    product_id: str = Path(..., description="작품 id"),
+    save: Optional[str] = Query(None, description="저장(Y)"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_products_product_id_epub_batch(
+        save=save,
+        product_id=product_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.post(
+    "/review-requests",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_review_requests(
+    req_body: episode_schema.PostEpisodesReviewRequestsReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_review_requests(
+        req_body=req_body, kc_user_id=user.get("sub"), db=db
+    )
+
+
+@router.post(
+    "/review-requests/cancel",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_review_requests_cancel(
+    req_body: episode_schema.PostEpisodesReviewCancelReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_review_requests_cancel(
+        req_body=req_body, kc_user_id=user.get("sub"), db=db
+    )
+
+
+@router.post(
+    "/delete",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_delete(
+    req_body: episode_schema.PostEpisodesDeleteReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_delete(
+        req_body=req_body, kc_user_id=user.get("sub"), db=db
+    )
+
+
+@router.post(
+    "/sale-start",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_sale_start(
+    req_body: episode_schema.PostEpisodesSaleStartReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_sale_start(
+        req_body=req_body, kc_user_id=user.get("sub"), db=db
+    )
+
+
+@router.post(
+    "/sale-reserve",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_sale_reserve(
+    req_body: episode_schema.PostEpisodesSaleReserveReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_sale_reserve(
+        req_body=req_body, kc_user_id=user.get("sub"), db=db
+    )
+
+
 @router.put(
     "/{episode_id}",
     tags=["회차 - 회차 관리"],

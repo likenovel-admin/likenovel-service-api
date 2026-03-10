@@ -151,6 +151,46 @@ class IdentityPasswordResetReqBody(AuthBase):
         return value
 
 
+class PasswordResetSendCodeReqBody(AuthBase):
+    # 비밀번호 재설정 인증코드 발송 요청
+    email: EmailStr = Field(examples=["test@test.com"], description="이메일")
+
+    @field_validator("email")
+    def validate_email(cls, value):
+        if len(value) > 100:
+            raise ValueError("이메일은 최대 100자 이하")
+
+        return value
+
+
+class PublicPasswordResetReqBody(AuthBase):
+    # 비로그인 상태에서 이메일 인증 링크 기반 비밀번호 재설정 요청
+    email: EmailStr = Field(examples=["test@test.com"], description="이메일")
+    token: str = Field(examples=["abc123..."], description="인증 토큰")
+    password: str = Field(examples=["test1234!"], description="새 비밀번호")
+
+    @field_validator("email")
+    def validate_email(cls, value):
+        if len(value) > 100:
+            raise ValueError("이메일은 최대 100자 이하")
+
+        return value
+
+    @field_validator("password")
+    def validate_password(cls, value):
+        if not (8 <= len(value) <= 20):
+            raise ValueError("최소 8자 이상 최대 20자 이하")
+
+        if not re.search(r"[A-Za-z]", value):
+            raise ValueError("영문 포함")
+        if not re.search(r"\d", value):
+            raise ValueError("숫자 포함")
+        if not re.search(r"[\W_]", value):
+            raise ValueError("특문 포함")
+
+        return value
+
+
 class IdentityTokenForPasswordReqBody(AuthBase):
     # 패스워드 재설정 요청 시 클라이언트에서 보내는 request body
     email: EmailStr = Field(examples=["test@test.com"], description="이메일")
@@ -186,6 +226,24 @@ class TokenRelayReqBody(AuthBase):
     # 리다이렉트 페이지 콜백 시 클라이언트에서 보내는 request body
     sns_id: int = Field(examples=[1], description="sns id")
     temp_issued_key: str = Field(examples=["ABCD"], description="발급받은 임시 키")
+
+
+class TokenPartnerRelayIssueReqBody(AuthBase):
+    # Service -> Partner 릴레이 발급 요청
+    refresh_token: str = Field(
+        examples=[
+            "eyJhbGciOiJIUzUxMiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICI4ZmRiZDhjNS1iOTNkLTRmN2EtYWNmOS0xNjljYzc5YzZiNzgifQ.eyJleHAiOjE3Mjk0MjMzMDUsImlhdCI6MTcyOTQyMTUwNSwianRpIjoiMDQyZWRmMWYtZWJmNS00ODQyLTg4Y2YtOTRmNWIyMzUwNGZlIiwiaXNzIjoiaHR0cHM6Ly9hdXRoLmxpa2Vub3ZlbC5kZXYvcmVhbG1zL2xpa2Vub3ZlbCIsImF1ZCI6Imh0dHBzOi8vYXV0aC5saWtlbm92ZWwuZGV2L3JlYWxtcy9saWtlbm92ZWwiLCJzdWIiOiI2NWY2MzVmYS00ZGQzLTQxOTYtOGYwMS1iOGIyNzFiMTEzMjgiLCJ0eXAiOiJSZWZyZXNoIiwiYXpwIjoic2VydmljZSIsInNpZCI6IjQ0YTA2OGRkLTIyOGEtNGY2Zi1iMjdkLWVkZGU2ZjY3YzBlOSIsInNjb3BlIjoib3BlbmlkIGVtYWlsIGJhc2ljIHdlYi1vcmlnaW5zIHJvbGVzIGFjciBwcm9maWxlIn0.NOXFilbGjROEXmq5T8_922WCaADl0c68cqsvgrhxIMrJwbV6Qhhhk2X2gszbFOkbLlFyZSpD6GuMuRrkAYarOQ"
+        ],
+        description="릴레이 발급용 리프레시 토큰",
+    )
+
+
+class TokenPartnerRelayConsumeReqBody(AuthBase):
+    # Service -> Partner 릴레이 소비 요청
+    relay_key: str = Field(
+        examples=["ABCD"],
+        description="발급받은 릴레이 키",
+    )
 
 
 """

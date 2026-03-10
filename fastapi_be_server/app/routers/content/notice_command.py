@@ -20,7 +20,7 @@ async def post_notice(
     공지사항 등록
     """
 
-    return await notice_service.post_notice(req_body, kc_user_id=user.get("sub"), db=db)
+    return await notice_service.post_notice(req_body, user_id=user.get("sub"), db=db)
 
 
 @router.put("/{id}", tags=["공지사항"], dependencies=[Depends(analysis_logger)])
@@ -35,7 +35,7 @@ async def put_notice(
     """
 
     return await notice_service.put_notice(
-        id, req_body, kc_user_id=user.get("sub"), db=db
+        id, req_body, user_id=user.get("sub"), db=db
     )
 
 
@@ -49,4 +49,4 @@ async def delete_notice(
     공지사항 삭제
     """
 
-    return await notice_service.delete_notice(id, kc_user_id=user.get("sub"), db=db)
+    return await notice_service.delete_notice(id, user_id=user.get("sub"), db=db)

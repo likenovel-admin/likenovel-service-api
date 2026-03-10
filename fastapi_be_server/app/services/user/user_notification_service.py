@@ -36,6 +36,7 @@ async def get_user_alarms(kc_user_id: str, db: AsyncSession):
                                     inner join tb_user_notification_item c on a.user_id = c.user_id
                                  where a.kc_user_id = :kc_user_id
                                     and a.use_yn = 'Y'
+                                 order by c.created_date desc
                                  """)
 
                 result = await db.execute(query, {"kc_user_id": kc_user_id})

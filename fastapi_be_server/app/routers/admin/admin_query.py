@@ -5,11 +5,14 @@ from typing import Dict, Any
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger, chk_cur_user
 from app.services.admin import (
+    admin_ai_onboarding_service,
+    admin_ai_metadata_service,
     admin_basic_service,
     admin_content_service,
     admin_event_service,
     admin_faq_service,
     admin_notification_service,
+    admin_product_evaluation_service,
     admin_promotion_service,
     admin_quest_service,
     admin_recommend_service,
@@ -682,6 +685,29 @@ async def badge(
         raise e
 
     return await admin_user_service.badge(db)
+
+
+@router.get(
+    "/apply-episode",
+    tags=["CMS - 회차 심사"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def apply_episode(
+    status: str = Query("all", description="상태(all | review | accepted | denied)"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(20, description="페이지당 개수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    회차 심사 신청 목록
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_user_service.apply_episode(status, page, count_per_page, db)
 
 
 @router.get(
@@ -1688,6 +1714,26 @@ async def publisher_promotion_list(
     return await admin_system_service.publisher_promotion_list(
         search_target, search_word, page, count_per_page, db
     )
+
+
+@router.get(
+    "/publisher-promotion/config",
+    tags=["CMS - 출판사 프로모션"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def publisher_promotion_config(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    출판사 프로모션 구좌 설정
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_system_service.publisher_promotion_config(db)
 
 
 @router.get(
@@ -4225,3 +4271,117 @@ async def notice_detail_by_notice_id(
     except Exception as e:
         raise e
     return await admin_system_service.notice_detail_by_notice_id(notice_id, db=db)
+
+
+@router.get(
+    "/cms-product-evaluation",
+    tags=["CMS - 작품 평가"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def cms_product_evaluation_list(
+    price_type: str = Query("free", description="가격유형 (free|paid)"),
+    search_target: str = Query("", description="검색 타겟 (product-title|author-name)"),
+    search_word: str = Query("", description="검색어"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(8, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    작품 평가 목록 조회
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_product_evaluation_service.cms_product_evaluation_list(
+        price_type=price_type,
+        search_target=search_target,
+        search_word=search_word,
+        page=page,
+        count_per_page=count_per_page,
+        db=db,
+    )
+
+
+@router.get(
+    "/ai-onboarding-products",
+    tags=["CMS - AI 온보딩 작품"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_onboarding_product_list(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 온보딩 작품 목록 조회
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_onboarding_service.ai_onboarding_product_list(db=db)
+
+
+@router.get(
+    "/ai-product-metadata",
+    tags=["CMS - AI 작품 메타정보"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_product_metadata_list(
+    search_target: str = Query("", description="검색 타겟 (product-title|author-name)"),
+    search_word: str = Query("", description="검색어"),
+    analysis_status: str = Query(
+        "all", description="분석 상태 (all|missing|pending|success|failed)"
+    ),
+    exclude_from_recommend_yn: str = Query(
+        "all", description="추천 제외 여부 (all|Y|N)"
+    ),
+    page: int = Query(1, ge=1, description="페이지"),
+    count_per_page: int = Query(8, ge=1, le=100, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 작품 메타정보 목록 조회
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_metadata_service.ai_product_metadata_list(
+        search_target=search_target,
+        search_word=search_word,
+        analysis_status=analysis_status,
+        exclude_from_recommend_yn=exclude_from_recommend_yn,
+        page=page,
+        count_per_page=count_per_page,
+        db=db,
+    )
+
+
+@router.get(
+    "/ai-product-metadata/{product_id}",
+    tags=["CMS - AI 작품 메타정보"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_product_metadata_detail(
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 작품 메타정보 상세 조회
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_metadata_service.ai_product_metadata_detail(
+        product_id=product_id,
+        db=db,
+    )

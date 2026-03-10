@@ -125,7 +125,7 @@ async def get_support_faqs_faq_id(faq_id: str, db: AsyncSession):
             bind_var["faq_id"] = faq_id
 
             result = await db.execute(query, bind_var)
-            db_rst = result.mappings().all()
+            db_rst = result.mappings().first()
 
             if db_rst:
                 faq_data = support_schema.GetSupportFaqsFaqIdToCamel(**db_rst)

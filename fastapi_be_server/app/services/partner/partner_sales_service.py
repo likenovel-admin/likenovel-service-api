@@ -1,4 +1,5 @@
 import logging
+import re
 from decimal import Decimal, ROUND_HALF_UP
 from fastapi import status
 from sqlalchemy import text
@@ -20,6 +21,12 @@ logger = logging.getLogger("partner_app")  # 커스텀 로거 생성
 """
 partner 파트너 매출/정산 관련 서비스 함수 모음
 """
+
+
+def _normalize_episode_title(title):
+    if title is None:
+        return None
+    return re.sub(r"\.epub$", "", str(title).strip(), flags=re.IGNORECASE)
 
 
 async def monthly_sales_by_product_list(
@@ -509,29 +516,71 @@ async def sales_by_episode_list(
                       """
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
+    is_full_query = page == -1 or count_per_page == -1
 
-    # 전체 개수 구하기
-    count_query = text(f"""
-        select count(*) as total_count
-        from tb_ptn_product_episode_sales
-        WHERE 1=1 {where}
-    """)
-    count_result = await db.execute(count_query, {})
-    total_count = count_result.mappings().first()["total_count"]
+    total_count = 0
+    if not is_full_query:
+        count_query = text(f"""
+            select count(distinct product_id) as total_count
+            from tb_ptn_product_episode_sales
+            WHERE 1=1 {where}
+        """)
+        count_result = await db.execute(count_query, {})
+        total_count = count_result.mappings().first()["total_count"]
 
-    # 실제 데이터 조회
-    query = text(f"""
-        select *,
-            (select episode_title from tb_product_episode where episode_id = s.episode_id) as episode_title
-        from tb_ptn_product_episode_sales s
-        WHERE 1=1 {where}
-        ORDER BY created_date DESC
-        {limit_clause}
-    """)
-    result = await db.execute(query, limit_params)
+        query = text(f"""
+            select sales.*
+                , e.episode_title
+            from (
+                select ranked.*
+                from (
+                    select s.*
+                        , row_number() over (
+                            partition by s.product_id
+                            order by s.created_date desc, s.id desc
+                        ) as rn
+                    from tb_ptn_product_episode_sales s
+                    WHERE 1=1 {where}
+                ) ranked
+                where ranked.rn = 1
+                order by ranked.created_date desc, ranked.id desc
+                {limit_clause}
+            ) sales
+            left join tb_product_episode e on e.episode_id = sales.episode_id
+            order by sales.created_date desc, sales.id desc
+        """)
+        result = await db.execute(query, limit_params)
+    else:
+        # 전체 다운로드는 기존처럼 회차 row 전체를 반환하되 count 쿼리는 건너뛴다.
+        query = text(f"""
+            select sales.*
+                , e.episode_title
+            from (
+                select s.*
+                from tb_ptn_product_episode_sales s
+                WHERE 1=1 {where}
+                ORDER BY s.created_date DESC, s.id DESC
+                {limit_clause}
+            ) sales
+            left join tb_product_episode e on e.episode_id = sales.episode_id
+            ORDER BY sales.created_date DESC, sales.id DESC
+        """)
+        result = await db.execute(query, limit_params)
     rows = result.mappings().all()
+    normalized_rows = []
+    for row in rows:
+        row_dict = dict(row)
+        row_dict["episode_title"] = _normalize_episode_title(
+            row_dict.get("episode_title")
+        )
+        normalized_rows.append(row_dict)
 
-    return build_paginated_response(rows, total_count, page, count_per_page)
+    if is_full_query:
+        total_count = len(normalized_rows)
+
+    return build_paginated_response(
+        normalized_rows, total_count, page, count_per_page
+    )
 
 
 async def sales_by_episode_list_by_product_id(
@@ -574,29 +623,47 @@ async def sales_by_episode_list_by_product_id(
     )
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
+    is_full_query = page == -1 or count_per_page == -1
 
-    # 전체 개수 구하기
-    count_query = text(f"""
-        select count(*) as total_count
-        from tb_ptn_product_episode_sales
-        WHERE product_id = {product_id} {where}
-    """)
-    count_result = await db.execute(count_query, params)
-    total_count = count_result.mappings().first()["total_count"]
+    total_count = 0
+    if not is_full_query:
+        count_query = text(f"""
+            select count(*) as total_count
+            from tb_ptn_product_episode_sales
+            WHERE product_id = {product_id} {where}
+        """)
+        count_result = await db.execute(count_query, params)
+        total_count = count_result.mappings().first()["total_count"]
 
-    # 실제 데이터 조회
     query = text(f"""
-        select *,
-            (select episode_title from tb_product_episode where episode_id = s.episode_id) as episode_title
-        from tb_ptn_product_episode_sales s
-        WHERE product_id = {product_id} {where}
-        ORDER BY created_date DESC
-        {limit_clause}
+        select sales.*
+            , e.episode_title
+        from (
+            select s.*
+            from tb_ptn_product_episode_sales s
+            WHERE product_id = {product_id} {where}
+            ORDER BY s.created_date DESC
+            {limit_clause}
+        ) sales
+        left join tb_product_episode e on e.episode_id = sales.episode_id
+        ORDER BY sales.created_date DESC
     """)
     result = await db.execute(query, limit_params | params)
     rows = result.mappings().all()
+    normalized_rows = []
+    for row in rows:
+        row_dict = dict(row)
+        row_dict["episode_title"] = _normalize_episode_title(
+            row_dict.get("episode_title")
+        )
+        normalized_rows.append(row_dict)
 
-    return build_paginated_response(rows, total_count, page, count_per_page)
+    if is_full_query:
+        total_count = len(normalized_rows)
+
+    return build_paginated_response(
+        normalized_rows, total_count, page, count_per_page
+    )
 
 
 async def daily_ticket_list(

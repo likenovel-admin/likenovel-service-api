@@ -69,7 +69,11 @@ async def get_genre_list(db: AsyncSession):
         장르 리스트
     """
     query = text("""
-                 SELECT * FROM tb_standard_keyword WHERE use_yn = 'Y' AND major_genre_yn = 'Y' AND category_id = 1 ORDER BY keyword_id ASC
+                 SELECT *
+                 FROM tb_standard_keyword
+                 WHERE use_yn = 'Y'
+                   AND category_id = 1
+                 ORDER BY major_genre_yn DESC, keyword_id ASC
                  """)
     result = await db.execute(query, {})
     rows = result.mappings().all()

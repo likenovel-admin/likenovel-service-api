@@ -22,13 +22,83 @@ from collections import defaultdict
 import app.services.common.statistics_service as statistics_service
 import app.schemas.user_giftbook as user_giftbook_schema
 import app.services.user.user_giftbook_service as user_giftbook_service
+import app.services.event.event_reward_service as event_reward_service
 
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 logger = logging.getLogger(__name__)
 
 """
-products 도메인 개별 서비스 함수 모음
+products ?꾨찓??媛쒕퀎 ?쒕퉬???⑥닔 紐⑥쓬
 """
+
+DEFAULT_PUBLISHER_PROMOTION_TITLE = "출판사 프로모션"
+
+
+async def _resolve_current_user_role(kc_user_id: str, db: AsyncSession) -> str:
+    """
+    kc_user_id 湲곗? ?꾩옱 ?ъ슜????븷??議고쉶?쒕떎.
+    admin > partner(cp) > author ?쒖쑝濡?留ㅽ븨?쒕떎.
+    """
+    query = text("""
+        select
+            u.role_type,
+            (
+                select apply_type
+                  from tb_user_profile_apply
+                 where user_id = u.user_id
+                   and approval_code = 'accepted'
+                 order by created_date desc
+                 limit 1
+            ) as apply_type
+          from tb_user u
+         where u.kc_user_id = :kc_user_id
+           and u.use_yn = 'Y'
+         limit 1
+    """)
+    result = await db.execute(query, {"kc_user_id": kc_user_id})
+    row = result.mappings().one_or_none()
+
+    if row is None:
+        return "author"
+
+    if row.get("role_type") == "admin":
+        return "admin"
+
+    if row.get("apply_type") == "cp":
+        return "partner"
+
+    return "author"
+
+
+async def _resolve_author_id(
+    author_nickname: str,
+    db: AsyncSession,
+    allow_external_author_nickname: bool = False,
+) -> int:
+    """
+    ?묎? ?됰꽕?꾩쑝濡?author_id瑜?議고쉶?쒕떎.
+    - 湲곕낯: tb_user_profile.nickname 留ㅼ묶 ?꾩슂
+    - allow_external_author_nickname=True ?닿퀬 ?됰꽕?꾩씠 鍮꾩뼱?덉? ?딆쑝硫?鍮꾪쉶???묎?(0) ?덉슜
+    """
+    query = text("""
+                     select user_id
+                       from tb_user_profile
+                      where nickname = :nickname
+                     """)
+
+    result = await db.execute(query, {"nickname": author_nickname})
+    db_rst = result.mappings().all()
+
+    if db_rst:
+        return db_rst[0].get("user_id")
+
+    if allow_external_author_nickname and author_nickname and author_nickname.strip():
+        return settings.DB_DML_DEFAULT_ID
+
+    raise CustomResponseException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        message=ErrorMessages.INVALID_NICKNAME_INFO,
+    )
 
 
 def get_select_fields_and_joins_for_product(
@@ -43,6 +113,9 @@ def get_select_fields_and_joins_for_product(
                 "p.synopsis_text as synopsis",
                 "p.author_name as authorNickname",
                 "p.price_type as priceType",
+                "COALESCE(p.single_regular_price, 0) as singleRegularPrice",
+                "COALESCE(p.single_rental_price, 0) as singleRentalPrice",
+                "COALESCE(p.series_regular_price, 0) as seriesRegularPrice",
                 "p.illustrator_name as illustratorNickname",
                 "ifnull(p.product_type, 'free') as productType",
                 "p.created_date as createdDate",
@@ -112,6 +185,7 @@ def get_select_fields_and_joins_for_product(
                 "p.monopoly_yn",
                 "p.contract_yn",
                 "p.status_code",
+                "p.publish_regular_yn",
                 "COALESCE(offer_stats.offer_count, 0) as offerCount",
                 "pco_latest.offer_id as offerId",
                 "pco_latest.offer_date as offerDate",
@@ -201,7 +275,21 @@ def get_select_fields_and_joins_for_product(
             ) aib ON aib.user_id = p.author_id
             LEFT JOIN tb_product_trend_index pti ON pti.product_id = p.product_id
             LEFT JOIN tb_product_count_variance pcv ON pcv.product_id = p.product_id
-            LEFT JOIN tb_batch_daily_product_count_summary pdcs ON pdcs.product_id = p.product_id
+            LEFT JOIN (
+                SELECT product_id, current_count_interest_sustain, current_count_interest_loss
+                FROM (
+                    SELECT
+                        product_id,
+                        current_count_interest_sustain,
+                        current_count_interest_loss,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY product_id
+                            ORDER BY created_date DESC, id DESC
+                        ) AS rn
+                    FROM tb_batch_daily_product_count_summary
+                ) latest_pdcs
+                WHERE rn = 1
+            ) pdcs ON pdcs.product_id = p.product_id
             LEFT JOIN (
                 SELECT product_id, COUNT(DISTINCT user_id) as total_interest
                 FROM tb_user_product_usage
@@ -228,7 +316,7 @@ def get_select_fields_and_joins_for_product(
                     FIRST_VALUE(offer_id) OVER (PARTITION BY product_id ORDER BY created_date DESC) as offer_id,
                     FIRST_VALUE(offer_date) OVER (PARTITION BY product_id ORDER BY created_date DESC) as offer_date,
                     FIRST_VALUE(offer_price) OVER (PARTITION BY product_id ORDER BY created_date DESC) as offer_price,
-                    FIRST_VALUE(CONCAT('정산비 CP ', offer_profit, ' : 작가 ', author_profit)) OVER (PARTITION BY product_id ORDER BY created_date DESC) as settlement_ratio,
+                    FIRST_VALUE(CONCAT('?뺤궛鍮?CP ', offer_profit, ' : ?묎? ', author_profit)) OVER (PARTITION BY product_id ORDER BY created_date DESC) as settlement_ratio,
                     FIRST_VALUE(CASE WHEN author_accept_yn = 'Y' THEN 'accepted' WHEN author_accept_yn = 'N' THEN 'review' ELSE 'review' END) OVER (PARTITION BY product_id ORDER BY created_date DESC) as decision_state
                 FROM tb_product_contract_offer
                 WHERE use_yn = 'Y'
@@ -323,14 +411,14 @@ def convert_product_data(row: RowMapping):
     data["badge"]["episodeUploadYn"] = data["hasEpisodeCount"] > 0
     data["badge"]["waitingForFreeYn"] = (
         "Y" if data.get("waitingForFreeStatus") == "ing" else "N"
-    )  # 기다리면 무료 프로모션 진행 여부
+    )  # 湲곕떎由щ㈃ 臾대즺 ?꾨줈紐⑥뀡 吏꾪뻾 ?щ?
     data["badge"]["sixNinePathYn"] = (
         "Y" if data.get("sixNinePathStatus") == "ing" else "N"
-    )  # 6-9 패스 프로모션 진행 여부
-    # data["badge"]["freeEpisodes"] = data.pop("freeEpisodes") if data.get("freeEpisodes") is not None else 0 # 첫 방문자 무료 이용권 지정 수 - n화무 아이콘 표시 -> 이거 사용 안함
+    )  # 6-9 ?⑥뒪 ?꾨줈紐⑥뀡 吏꾪뻾 ?щ?
+    # data["badge"]["freeEpisodes"] = data.pop("freeEpisodes") if data.get("freeEpisodes") is not None else 0 # 泥?諛⑸Ц??臾대즺 ?댁슜沅?吏????- n?붾Т ?꾩씠肄??쒖떆 -> ?닿굅 ?ъ슜 ?덊븿
     data["badge"]["newReleaseYn"] = data.pop(
         "newReleaseYn"
-    )  # 최신 회자 - UP 아이콘 표시
+    )  # 理쒖떊 ?뚯옄 - UP ?꾩씠肄??쒖떆
     data["badge"]["freeEpisodeTicketCount"] = data.pop("freeEpisodeTicketCount")
     data["badge"]["authorEventLevelBadgeImagePath"] = data.pop(
         "authorEventLevelBadgeImagePath"
@@ -394,8 +482,8 @@ def convert_product_data(row: RowMapping):
         if data.get("recommendIndicator") is not None
         else 0
     )
-    # data["trendindex"]["notRecommendCount"] = 0 # 비추천 기능 구현 안됨
-    # data["trendindex"]["notRecommendIndicator"] = 0 # 비추천 기능 구현 안됨
+    # data["trendindex"]["notRecommendCount"] = 0 # 鍮꾩텛泥?湲곕뒫 援ы쁽 ?덈맖
+    # data["trendindex"]["notRecommendIndicator"] = 0 # 鍮꾩텛泥?湲곕뒫 援ы쁽 ?덈맖
     data["trendindex"]["bookmarkCount"] = data.pop("count_bookmark")
     data["trendindex"]["bookmarkIndicator"] = (
         data.pop("bookmarkIndicator")
@@ -408,11 +496,14 @@ def convert_product_data(row: RowMapping):
         if data.get("readedEpisodeCount") is not None
         else 0
     )
-    data["trendindex"]["primaryReaderGroup"] = (
-        data.pop("primaryReaderGroup")
-        if data.get("primaryReaderGroup") is not None
-        else ""
-    )
+    raw_reader_group = data.pop("primaryReaderGroup", None)
+    if raw_reader_group and isinstance(raw_reader_group, str):
+        try:
+            data["trendindex"]["primaryReaderGroup"] = json.loads(raw_reader_group)
+        except (json.JSONDecodeError, TypeError):
+            data["trendindex"]["primaryReaderGroup"] = ""
+    else:
+        data["trendindex"]["primaryReaderGroup"] = raw_reader_group or ""
     data["properties"] = dict()
     data["properties"]["updateFrequency"] = data.pop("publish_days")
     data["properties"]["averageWeeklyEpisodes"] = (
@@ -420,7 +511,7 @@ def convert_product_data(row: RowMapping):
         if data.get("averageWeeklyEpisodes") is not None
         else 0
     )
-    # data["properties"]["remarkContentSnippet"] = "" # 관리자가 입력하는 비고 텍스트 - 미구현 상태
+    # data["properties"]["remarkContentSnippet"] = "" # 愿由ъ옄媛 ?낅젰?섎뒗 鍮꾧퀬 ?띿뒪??- 誘멸뎄???곹깭
     data["properties"]["latestEpisodeDate"] = data.pop("last_episode_date")
     data["properties"]["bookmarkYn"] = data.pop("bookmarkYn")
     data["contract"] = dict()
@@ -453,6 +544,7 @@ def convert_product_data(row: RowMapping):
         if data.get("offerDecisionState") is not None
         else "review"
     )
+    data["publishRegularYn"] = data.pop("publish_regular_yn", "Y")
     data["state"] = dict()
     data["state"]["ongoingState"] = data.pop("status_code")
     data["state"]["convertToPaidState"] = (
@@ -473,8 +565,8 @@ async def get_user_id(kc_user_id: str, db: AsyncSession):
 
 async def save_product_hit_log(product_id: int, db: AsyncSession):
     """
-    작품 일별 조회수 로그 저장
-    오늘 날짜의 조회수를 +1 증가
+    ?묓뭹 ?쇰퀎 議고쉶??濡쒓렇 ???
+    ?ㅻ뒛 ?좎쭨??議고쉶?섎? +1 利앷?
     """
     try:
         query = text("""
@@ -487,7 +579,7 @@ async def save_product_hit_log(product_id: int, db: AsyncSession):
         error_logger.error(
             f"Failed to save product hit log: product_id={product_id}, error={e}"
         )
-        # 로그 저장 실패는 메인 로직에 영향을 주지 않도록 예외를 무시
+        # 濡쒓렇 ????ㅽ뙣??硫붿씤 濡쒖쭅???곹뼢??二쇱? ?딅룄濡??덉쇅瑜?臾댁떆
 
 
 async def products_of_managed(
@@ -499,7 +591,7 @@ async def products_of_managed(
     db: AsyncSession,
 ):
     """
-    메인, 유료Top50, 무료Top50 작품 목록 조회
+    硫붿씤, ?좊즺Top50, 臾대즺Top50 ?묓뭹 紐⑸줉 議고쉶
     """
     user_id = await get_user_id(kc_user_id, db)
 
@@ -515,11 +607,11 @@ async def products_of_managed(
 
     filter_option = []
     filter_option.append('p.open_yn = "Y"')
-    # 성인등급 필터링: adult_yn이 N이면 전체이용가만 조회
+    # ?깆씤?깃툒 ?꾪꽣留? adult_yn??N?대㈃ ?꾩껜?댁슜媛留?議고쉶
     if adult_yn == "N":
         filter_option.append('p.ratings_code = "all"')
     # if division is not None:
-    #     # 이거 main으로만 받는거 같은데 굳이 필터가 있을 필요가 있나? tb_product에 division이 없기도 하고 일단 뺴자
+    # TODO: cleaned garbled comment (encoding issue).
     #     filter_option.append(f'division = "{division}"')
     order_by = "p.product_id DESC"
     join_rank = False
@@ -550,7 +642,7 @@ async def products_of_managed(
     res_body = dict()
     res_data = [convert_product_data(row) for row in rows]
 
-    # 비공개 작품 필터링 후 순위 재할당 (freeTop, paidTop인 경우)
+    # 鍮꾧났媛??묓뭹 ?꾪꽣留????쒖쐞 ?ы븷??(freeTop, paidTop??寃쎌슦)
     if join_rank:
         for idx, item in enumerate(res_data, start=1):
             if "rank" in item:
@@ -563,7 +655,7 @@ async def products_of_managed(
 
 async def product_by_product_id(product_id: str, kc_user_id: str, db: AsyncSession):
     """
-    작품 정보 조회
+    ?묓뭹 ?뺣낫 議고쉶
     """
     user_id = await get_user_id(kc_user_id, db)
 
@@ -610,12 +702,12 @@ async def products_all(
     adult_yn: str = "N",
 ):
     """
-    작품 목록 전체 조회(유료, 무료)
+    ?묓뭹 紐⑸줉 ?꾩껜 議고쉶(?좊즺, 臾대즺)
     """
     page = page if page else settings.PAGINATION_DEFAULT_PAGE_NO
     limit = limit if limit else settings.PAGINATION_PRODUCT_DEFAULT_LIMIT
 
-    # 필터 옵션 설정
+    # ?꾪꽣 ?듭뀡 ?ㅼ젙
     filter_option = []
     if price_type is not None:
         filter_option.append(f'p.price_type = "{price_type}"')
@@ -625,7 +717,10 @@ async def products_all(
         else:
             filter_option.append(f'p.product_type = "{product_type}"')
     if product_state is not None:
-        filter_option.append(f'p.status_code = "{product_state}"')
+        if product_state == "standalone":
+            filter_option.append("p.publish_regular_yn = 'N'")
+        else:
+            filter_option.append(f'p.status_code = "{product_state}"')
 
     try:
         if genres is not None:
@@ -641,17 +736,17 @@ async def products_all(
 
     user_id = await get_user_id(kc_user_id, db)
 
-    # 성인 작품 필터링
-    # adult_yn='Y'이고 로그인 상태이고 19세 이상인 경우에만 성인 작품 포함
-    # 그 외 모든 경우(미로그인, 19세 미만, adult_yn='N')는 성인 작품 제외
+    # ?깆씤 ?묓뭹 ?꾪꽣留?
+    # adult_yn='Y'?닿퀬 濡쒓렇???곹깭?닿퀬 19???댁긽??寃쎌슦?먮쭔 ?깆씤 ?묓뭹 ?ы븿
+    # 洹???紐⑤뱺 寃쎌슦(誘몃줈洹몄씤, 19??誘몃쭔, adult_yn='N')???깆씤 ?묓뭹 ?쒖쇅
     if user_id == -1:
-        # 미로그인 상태: 성인 작품 제외
+        # 誘몃줈洹몄씤 ?곹깭: ?깆씤 ?묓뭹 ?쒖쇅
         filter_option.append("p.ratings_code = 'all'")
     elif adult_yn != "Y":
-        # 로그인 상태이지만 adult_yn='N'인 경우: 성인 작품 제외
+        # 濡쒓렇???곹깭?댁?留?adult_yn='N'??寃쎌슦: ?깆씤 ?묓뭹 ?쒖쇅
         filter_option.append("p.ratings_code = 'all'")
     else:
-        # adult_yn='Y'인 경우: 사용자 나이 확인
+        # adult_yn='Y'??寃쎌슦: ?ъ슜???섏씠 ?뺤씤
         from app.utils.time import get_full_age
 
         user_query = text("""
@@ -665,14 +760,17 @@ async def products_all(
         if user_row and user_row["birthdate"]:
             user_age = get_full_age(date=user_row["birthdate"])
             if user_age < 19:
-                # 19세 미만: 성인 작품 제외
+                # 19??誘몃쭔: ?깆씤 ?묓뭹 ?쒖쇅
                 filter_option.append("p.ratings_code = 'all'")
-        # 19세 이상이고 adult_yn='Y'인 경우: 필터 추가 안함 (성인 작품 포함)
+        # 19???댁긽?닿퀬 adult_yn='Y'??寃쎌슦: ?꾪꽣 異붽? ?덊븿 (?깆씤 ?묓뭹 ?ы븿)
 
     query_parts = get_select_fields_and_joins_for_product(
         user_id=user_id, join_rank=False
     )
     filter_option.append("p.open_yn = 'Y'")
+    filter_option.append(
+        "EXISTS (SELECT 1 FROM tb_product_episode e WHERE e.product_id = p.product_id AND e.open_yn = 'Y' AND e.use_yn = 'Y')"
+    )
     query = text(f"""
         SELECT {query_parts["select_fields"]}
         FROM tb_product p
@@ -707,7 +805,7 @@ async def episodes_by_product_id(
     db: AsyncSession,
 ):
     """
-    작품 - 에피소드 목록
+    ?묓뭹 - ?먰뵾?뚮뱶 紐⑸줉
     """
     page = page if page else settings.PAGINATION_DEFAULT_PAGE_NO
     limit = limit if limit else settings.PAGINATION_DEFAULT_LIMIT
@@ -738,9 +836,7 @@ async def episodes_by_product_id(
                 (select own_type from tb_user_productbook where (
                     episode_id = e.episode_id
                     or
-                    (product_id = e.product_id and episode_id is null)
-                    or
-                    product_id is null
+                    (episode_id is null and (product_id = e.product_id or product_id is null))
                 ) and user_id = :user_id and use_yn = 'Y'
                 and (rental_expired_date IS NULL OR rental_expired_date > NOW())
                 order by id desc limit 1) as ownType,
@@ -758,13 +854,24 @@ async def episodes_by_product_id(
                     where (
                         episode_id = e.episode_id
                         or
-                        (product_id = e.product_id and episode_id is null)
-                        or
-                        product_id is null
+                        (episode_id is null and (product_id = e.product_id or product_id is null))
                     ) and user_id = :user_id and own_type = 'rental' and use_yn = 'Y'
                     order by id desc limit 1
                 ) as rentalRemaining
-            from tb_product_episode e where product_id = :product_id and e.open_yn = 'Y' and e.use_yn = 'Y'
+            from tb_product_episode e where product_id = :product_id and e.use_yn = 'Y'
+                and (
+                    e.open_yn = 'Y'
+                    OR EXISTS (
+                        select 1 from tb_user_productbook pb
+                        where (pb.episode_id = e.episode_id
+                               OR (pb.episode_id IS NULL
+                                   AND (pb.product_id = e.product_id
+                                        OR pb.product_id IS NULL)))
+                          AND pb.user_id = :user_id
+                          AND pb.use_yn = 'Y'
+                          AND (pb.rental_expired_date IS NULL OR pb.rental_expired_date > NOW())
+                    )
+                )
             order by {order_by} {order_dir}
             limit {limit} offset {(page - 1) * limit}
         """)
@@ -772,7 +879,7 @@ async def episodes_by_product_id(
         rows = result.mappings().all()
         episodes = [dict(row) for row in rows]
 
-        # rentalRemaining JSON 파싱
+        # rentalRemaining JSON ?뚯떛
         for episode in episodes:
             if episode.get("rentalRemaining"):
                 try:
@@ -791,54 +898,84 @@ async def episodes_by_product_id(
         rows = result.mappings().all()
         usage = [dict(row) for row in rows]
 
-        # 그룹핑 딕셔너리 생성
+        # 洹몃９???뺤뀛?덈━ ?앹꽦
         grouped_results = dict()
         grouped_results["episodes"] = episodes
         grouped_results["usage"] = usage
 
-        # 전체 에피소드 갯수 조회
+        # ?꾩껜 ?먰뵾?뚮뱶 媛?닔 議고쉶
         count_query = text("""
             select count(*) as total
-            from tb_product_episode where product_id = :product_id and open_yn = 'Y' and use_yn = 'Y'
+            from tb_product_episode e where e.product_id = :product_id and e.use_yn = 'Y'
+                and (
+                    e.open_yn = 'Y'
+                    OR EXISTS (
+                        select 1 from tb_user_productbook pb
+                        where (pb.episode_id = e.episode_id
+                               OR (pb.episode_id IS NULL
+                                   AND (pb.product_id = e.product_id
+                                        OR pb.product_id IS NULL)))
+                          AND pb.user_id = :user_id
+                          AND pb.use_yn = 'Y'
+                          AND (pb.rental_expired_date IS NULL OR pb.rental_expired_date > NOW())
+                    )
+                )
         """)
-        count_result = await db.execute(count_query, {"product_id": product_id})
+        count_result = await db.execute(count_query, {"product_id": product_id, "user_id": user_id})
         episodeTotalCount = count_result.scalar()
 
-        # 사용자 읽은 최종 회차
+        # ?ъ슜???쎌? 理쒖쥌 ?뚯감
         max_episode_no = 0
-        max_episode_id = max(
-            (hit.get("episodeId", 0) for hit in grouped_results["usage"])
-            if grouped_results["usage"]
-            else [0]
-        )
+        max_episode_id = 0
+        max_episode_title = ""
         min_episode_id = min(
             (hit.get("episodeId", 0) for hit in grouped_results["episodes"])
             if grouped_results["episodes"]
             else [0]
         )
 
-        # max_episode_id에 해당하는 episode_no를 별도로 조회
-        if max_episode_id > 0:
-            episode_no_query = text("""
-                select episode_no as episodeNo
-                from tb_product_episode
-                where episode_id = :episode_id
+        # 최근 읽은 에피소드 중 공개 또는 소유/대여 회차를 이어보기 대상으로 선정
+        if grouped_results["usage"]:
+            latest_read_query = text("""
+                select u.episode_id as episodeId, e.episode_no as episodeNo, e.episode_title as episodeTitle
+                from tb_user_product_usage u
+                join tb_product_episode e on u.episode_id = e.episode_id
+                where u.user_id = :user_id
+                  and u.product_id = :product_id
+                  and e.use_yn = 'Y'
+                  and (
+                    e.open_yn = 'Y'
+                    OR EXISTS (
+                      select 1 from tb_user_productbook pb
+                      where (pb.episode_id = e.episode_id
+                             OR (pb.episode_id IS NULL
+                                 AND (pb.product_id = e.product_id
+                                      OR pb.product_id IS NULL)))
+                        AND pb.user_id = :user_id
+                        AND pb.use_yn = 'Y'
+                        AND (pb.rental_expired_date IS NULL OR pb.rental_expired_date > NOW())
+                    )
+                  )
+                order by u.episode_id desc
+                limit 1
             """)
-            episode_no_result = await db.execute(
-                episode_no_query, {"episode_id": max_episode_id}
+            latest_read_result = await db.execute(
+                latest_read_query, {"user_id": user_id, "product_id": product_id}
             )
-            episode_no_row = episode_no_result.scalar()
-            if episode_no_row:
-                max_episode_no = episode_no_row
+            latest_read_row = latest_read_result.mappings().first()
+            if latest_read_row:
+                max_episode_id = latest_read_row["episodeId"]
+                max_episode_no = latest_read_row["episodeNo"]
+                max_episode_title = latest_read_row.get("episodeTitle", "")
 
-        # usage 데이터의 episodeId가 episodes에도 존재하는지 확인
+        # usage ?곗씠?곗쓽 episodeId媛 episodes?먮룄 議댁옱?섎뒗吏 ?뺤씤
         combined_new_episodes = []
         if user_id and "usage" in grouped_results and "episodes" in grouped_results:
             for episode in grouped_results["episodes"]:
                 for usage in grouped_results["usage"]:
-                    # 읽음여부, 추천여부
+                    # ?쎌쓬?щ?, 異붿쿇?щ?
                     if usage.get("episodeId", 0) == episode.get("episodeId", -1):
-                        # 일치하는 에피소드 정보에 사용 정보 추가 (읽음여부, 추천여부)
+                        # ?쇱튂?섎뒗 ?먰뵾?뚮뱶 ?뺣낫???ъ슜 ?뺣낫 異붽? (?쎌쓬?щ?, 異붿쿇?щ?)
                         episode["usage"] = {
                             "readYn": usage.get("readYn", "N"),
                             "recommendYn": usage.get("recommendYn", "N"),
@@ -854,7 +991,7 @@ async def episodes_by_product_id(
 
         for episode in combined_new_episodes:
             if "usage" not in episode:
-                # usage 정보가 없는 경우 -> 읽은적이 없어서 그런거니 둘 다 N으로 세팅
+                # usage ?뺣낫媛 ?녿뒗 寃쎌슦 -> ?쎌??곸씠 ?놁뼱??洹몃윴嫄곕땲 ????N?쇰줈 ?명똿
                 episode["usage"] = {"readYn": "N", "recommendYn": "N"}
 
         if max_episode_id == 0:
@@ -864,6 +1001,7 @@ async def episodes_by_product_id(
         res_body["data"] = {
             "latestEpisodeNo": max_episode_no,
             "latestEpisodeId": max_episode_id,
+            "latestEpisodeTitle": max_episode_title,
             "episodes": combined_new_episodes,
             "pagination": {
                 "totalCount": episodeTotalCount,
@@ -886,9 +1024,9 @@ async def product_details_group_by_product_id(
     product_id: str, kc_user_id: str, db: AsyncSession
 ):
     """
-    작품 상세 그룹 - 작품 상세, 작품 평가, 작품 공지, 에피소드 목록을 묶어서 응답
+    ?묓뭹 ?곸꽭 洹몃９ - ?묓뭹 ?곸꽭, ?묓뭹 ?됯?, ?묓뭹 怨듭?, ?먰뵾?뚮뱶 紐⑸줉??臾띠뼱???묐떟
 
-    NOTE: 작가가 자신의 작품을 조회할 때는 비공개 작품도 조회 가능해야 함 (작품 수정을 위해)
+    NOTE: ?묎?媛 ?먯떊???묓뭹??議고쉶???뚮뒗 鍮꾧났媛??묓뭹??議고쉶 媛?ν빐????(?묓뭹 ?섏젙???꾪빐)
     """
     try:
         user_id = await get_user_id(kc_user_id, db)
@@ -896,8 +1034,8 @@ async def product_details_group_by_product_id(
         query_parts = get_select_fields_and_joins_for_product(
             user_id=user_id, join_rank=False
         )
-        # 작가가 자신의 작품을 조회하는 경우 비공개 작품도 조회 가능
-        # 다른 사용자는 공개된 작품만 조회 가능
+        # ?묎?媛 ?먯떊???묓뭹??議고쉶?섎뒗 寃쎌슦 鍮꾧났媛??묓뭹??議고쉶 媛??
+        # ?ㅻⅨ ?ъ슜?먮뒗 怨듦컻???묓뭹留?議고쉶 媛??
         query = text(f"""
             SELECT {query_parts["select_fields"]}
             FROM tb_product p
@@ -909,7 +1047,28 @@ async def product_details_group_by_product_id(
         rows = result.mappings().all()
         product = convert_product_data(rows[0]) if rows else None
 
-        # 로그인한 사용자인 경우 ownType 조회를 위해 user_id 전달
+        # 작품이 존재하지만 비공개인 경우 조기 반환
+        if product is None:
+            private_check_query = text("""
+                select product_id, open_yn
+                from tb_product
+                where product_id = :product_id
+            """)
+            private_check_result = await db.execute(private_check_query, {"product_id": product_id})
+            private_check_row = private_check_result.mappings().first()
+            if private_check_row and private_check_row.get("open_yn") == "N":
+                return {
+                    "data": {
+                        "product": {"privateYn": "Y"},
+                        "episodes": [],
+                        "evaluations": {},
+                        "notices": [],
+                        "comments": [],
+                        "issuedVouchers": [],
+                    }
+                }
+
+        # 濡쒓렇?명븳 ?ъ슜?먯씤 寃쎌슦 ownType 議고쉶瑜??꾪빐 user_id ?꾨떖
         episode_query_params = {"product_id": product_id}
         own_type_query = ""
         if user_id and user_id != -1:
@@ -918,54 +1077,122 @@ async def product_details_group_by_product_id(
                 , (select own_type from tb_user_productbook where (
                     episode_id = e.episode_id
                     or
-                    (product_id = e.product_id and episode_id is null)
-                    or
-                    product_id is null
+                    (episode_id is null and (product_id = e.product_id or product_id is null))
                 ) and user_id = :user_id and use_yn = 'Y'
                 and (rental_expired_date IS NULL OR rental_expired_date > NOW())
                 order by id desc limit 1) as ownType
             """
 
+        # NOTE:
+        # ?쇰? ?섍꼍(dev RDS ???먮뒗 tb_product_episode_apply 留덉씠洹몃젅?댁뀡???꾩쭅 諛섏쁺?섏? ?딆븘
+        # details-group 議고쉶 ??500??諛쒖깮?????덈떎. ?뚯씠釉?議댁옱 ?щ????곕씪 reviewYn 怨꾩궛?앹쓣 遺꾧린?쒕떎.
+        review_yn_query = "'N' as reviewYn"
+        episode_version_query = "1 as episodeVersion"
+        latest_apply_id_query = "NULL as latestApplyId"
+        latest_apply_status_query = "NULL as latestApplyStatus"
+        latest_apply_join_query = ""
+        table_exists_query = text("""
+            select 1
+            from information_schema.tables
+            where table_schema = database()
+              and table_name = 'tb_product_episode_apply'
+            limit 1
+        """)
+        table_exists_result = await db.execute(table_exists_query)
+        has_episode_apply_table = table_exists_result.scalar() is not None
+        if has_episode_apply_table:
+            latest_apply_id_query = "pea_latest.latest_apply_id as latestApplyId"
+            latest_apply_status_query = "pea_latest.latest_apply_status as latestApplyStatus"
+            episode_version_query = """
+                case
+                    when ifnull(pea_accepted.accepted_count, 0) < 1 then 1
+                    else pea_accepted.accepted_count
+                end as episodeVersion
+            """
+            review_yn_query = """
+                case
+                    when pea_latest.latest_apply_status = 'review' then 'Y'
+                    else 'N'
+                end as reviewYn
+            """
+            latest_apply_join_query = """
+                left join (
+                    select
+                        pea.episode_id,
+                        pea.id as latest_apply_id,
+                        pea.status_code as latest_apply_status
+                    from tb_product_episode_apply pea
+                    inner join (
+                        select
+                            episode_id,
+                            max(id) as max_id
+                        from tb_product_episode_apply
+                        where use_yn = 'Y'
+                        group by episode_id
+                    ) pea_max
+                      on pea_max.episode_id = pea.episode_id
+                     and pea_max.max_id = pea.id
+                    where pea.use_yn = 'Y'
+                ) pea_latest
+                  on pea_latest.episode_id = e.episode_id
+                left join (
+                    select
+                        episode_id,
+                        count(*) as accepted_count
+                    from tb_product_episode_apply
+                    where use_yn = 'Y'
+                      and status_code = 'accepted'
+                    group by episode_id
+                ) pea_accepted
+                  on pea_accepted.episode_id = e.episode_id
+            """
+
         query = text(f"""
             select
-                episode_id as episodeId,
-                product_id as productId,
-                episode_no as episodeNo,
-                episode_title as episodeTitle,
-                episode_text_count as episodeTextCount,
-                comment_open_yn as commentOpenYn,
-                count_evaluation as countEvaluation,
+                e.episode_id as episodeId,
+                e.product_id as productId,
+                e.episode_no as episodeNo,
+                e.episode_title as episodeTitle,
+                e.episode_text_count as episodeTextCount,
+                e.comment_open_yn as commentOpenYn,
+                e.count_evaluation as countEvaluation,
                 COALESCE((
                     select count_evaluation_indicator
                     from tb_product_episode_count_variance
                     where episode_id = e.episode_id
                     order by created_date desc limit 1
                 ), 0) as countEvaluationIndicator,
-                count_comment as countComment,
+                e.count_comment as countComment,
                 COALESCE((
                     select count_comment_indicator
                     from tb_product_episode_count_variance
                     where episode_id = e.episode_id
                     order by created_date desc limit 1
                 ), 0) as countCommentIndicator,
-                price_type as priceType,
-                evaluation_open_yn as evaluationOpenYn,
-                publish_reserve_date as publishReserveDate,
-                count_hit as countHit,
+                e.price_type as priceType,
+                e.evaluation_open_yn as evaluationOpenYn,
+                e.publish_reserve_date as publishReserveDate,
+                e.count_hit as countHit,
                 COALESCE((
                     select count_hit_indicator
                     from tb_product_episode_count_variance
                     where episode_id = e.episode_id
                     order by created_date desc limit 1
                 ), 0) as countHitIndicator,
-                count_recommend as countRecommend,
+                e.count_recommend as countRecommend,
                 COALESCE((
                     select count_recommend_indicator
                     from tb_product_episode_count_variance
                     where episode_id = e.episode_id
                     order by created_date desc limit 1
                 ), 0) as countRecommendIndicator,
-                open_yn as episodeOpenYn,
+                e.open_yn as episodeOpenYn,
+                e.open_yn as openYn,
+                e.use_yn as useYn,
+                {episode_version_query},
+                {latest_apply_id_query},
+                {latest_apply_status_query},
+                {review_yn_query},
                 (select count(*) from tb_product_episode_like where episode_id = e.episode_id) as countLike,
                 COALESCE((
                     select count(*) - count(*) +
@@ -974,9 +1201,11 @@ async def product_details_group_by_product_id(
                             and DATE(created_date) <= CURDATE() - INTERVAL 1 DAY)
                     from dual
                 ), 0) as countLikeIndicator,
-                created_date as createdDate
+                e.created_date as createdDate
                 {own_type_query}
-            from tb_product_episode e where product_id = :product_id and e.use_yn = 'Y'
+            from tb_product_episode e
+            {latest_apply_join_query}
+            where e.product_id = :product_id and e.use_yn = 'Y'
         """)
         result = await db.execute(query, episode_query_params)
         rows = result.mappings().all()
@@ -997,9 +1226,9 @@ async def product_details_group_by_product_id(
             combined_new_episodes = []
             for episode in episodes:
                 for usage in useage:
-                    # 읽음여부, 추천여부
+                    # ?쎌쓬?щ?, 異붿쿇?щ?
                     if usage.get("episodeId", 0) == episode.get("episodeId", -1):
-                        # 일치하는 에피소드 정보에 사용 정보 추가 (읽음여부, 추천여부)
+                        # ?쇱튂?섎뒗 ?먰뵾?뚮뱶 ?뺣낫???ъ슜 ?뺣낫 異붽? (?쎌쓬?щ?, 異붿쿇?щ?)
                         episode["usage"] = {
                             "readYn": usage.get("readYn", "N"),
                             "recommendYn": usage.get("recommendYn", "N"),
@@ -1045,12 +1274,12 @@ async def product_details_group_by_product_id(
         grouped_results["notices"] = notices
         grouped_results["comments"] = comments
 
-        # 새로 지급된 대여권 알림 정보
+        # ?덈줈 吏湲됰맂 ??ш텒 ?뚮┝ ?뺣낫
         issued_vouchers = []
 
-        # 첫 방문자 무료 이용권 자동 발급 (free-for-first) -> 선물함으로 지급
+        # 泥?諛⑸Ц??臾대즺 ?댁슜沅??먮룞 諛쒓툒 (free-for-first) -> ?좊Ъ?⑥쑝濡?吏湲?
         if user_id and user_id != -1:
-            # 이 작품을 이전에 방문한 적이 있는지 체크 (tb_user_product_usage에 기록이 있는지)
+            # ???묓뭹???댁쟾??諛⑸Ц???곸씠 ?덈뒗吏 泥댄겕 (tb_user_product_usage??湲곕줉???덈뒗吏)
             query = text("""
                 select count(*) as visit_count
                   from tb_user_product_usage
@@ -1062,21 +1291,23 @@ async def product_details_group_by_product_id(
             )
             visit_count = result.scalar()
 
-            # 첫 방문인 경우 (visit_count == 0)
+            # 泥?諛⑸Ц??寃쎌슦 (visit_count == 0)
             if visit_count == 0:
-                # 진행중인 free-for-first 프로모션 조회
+                # 吏꾪뻾以묒씤 free-for-first ?꾨줈紐⑥뀡 議고쉶
                 query = text("""
                     select dp.id, dp.num_of_ticket_per_person, dp.type
                       from tb_direct_promotion dp
                      where dp.product_id = :product_id
-                       and dp.type = 'free-for-first'
+                       and dp.type in ('free-for-first', 'admin-gift')
                        and dp.status = 'ing'
+                       and DATE(dp.start_date) <= CURDATE()
+                       and (dp.end_date IS NULL OR DATE(dp.end_date) >= CURDATE())
                 """)
                 result = await db.execute(query, {"product_id": product_id})
-                promotion = result.mappings().one_or_none()
+                promotions = result.mappings().all()
 
-                if promotion:
-                    # 이미 이 프로모션으로 선물함에 받았는지 체크 (선물함 또는 대여권)
+                for promotion in promotions:
+                    # ?대? ???꾨줈紐⑥뀡?쇰줈 ?좊Ъ?⑥뿉 諛쏆븯?붿? 泥댄겕 (?좊Ъ???먮뒗 ??ш텒)
                     query = text("""
                         select count(*) as already_received
                           from tb_user_giftbook
@@ -1089,24 +1320,25 @@ async def product_details_group_by_product_id(
                     )
                     already_received = result.scalar()
 
-                    # 아직 받지 않았으면 선물함으로 발급
+                    # ?꾩쭅 諛쏆? ?딆븯?쇰㈃ ?좊Ъ?⑥쑝濡?諛쒓툒
                     if already_received == 0:
                         num_of_ticket = promotion["num_of_ticket_per_person"]
-                        # 첫방문자 무료: 유효기간 없음 (프로모션 종료 시 만료)
+                        promo_type = promotion["type"]
+                        # 泥ル갑臾몄옄 臾대즺: ?좏슚湲곌컙 ?놁쓬 (?꾨줈紐⑥뀡 醫낅즺 ??留뚮즺)
                         # expiration_date = None, ticket_expiration_type = 'none'
                         giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
                             user_id=user_id,
                             product_id=product_id,
                             episode_id=None,
-                            ticket_type=promotion["type"],
+                            ticket_type="paid" if promo_type == "admin-gift" else promo_type,
                             own_type="rental",
                             acquisition_type="direct_promotion",
                             acquisition_id=promotion["id"],
                             reason="첫방문자 무료 대여권",
                             amount=num_of_ticket,
-                            promotion_type="free-for-first",
-                            expiration_date=None,  # 유효기간 없음 (프로모션 종료 시 만료)
-                            ticket_expiration_type="none",  # 수령 후 대여권 유효기간 없음
+                            promotion_type=promo_type,
+                            expiration_date=None,  # ?좏슚湲곌컙 ?놁쓬 (?꾨줈紐⑥뀡 醫낅즺 ??留뚮즺)
+                            ticket_expiration_type="none",  # ?섎졊 ????ш텒 ?좏슚湲곌컙 ?놁쓬
                             ticket_expiration_value=None,
                         )
                         await user_giftbook_service.post_user_giftbook(
@@ -1115,24 +1347,24 @@ async def product_details_group_by_product_id(
                             db=db,
                             user_id=user_id,
                         )
-                        # 알림 정보 추가
+                        # ?뚮┝ ?뺣낫 異붽?
                         issued_vouchers.append(
                             {
-                                "type": "free-for-first",
+                                "type": promo_type,
                                 "amount": num_of_ticket,
-                                "message": f"첫방문자 무료 대여권이 {num_of_ticket}장 지급 되었습니다.",
+                                "message": f"첫방문자 무료 대여권 {num_of_ticket}장이 지급되었습니다",
                             }
                         )
 
-        # 6-9 패스 자동 발급 -> 선물함으로 지급
+        # 6-9 ?⑥뒪 ?먮룞 諛쒓툒 -> ?좊Ъ?⑥쑝濡?吏湲?
         if user_id and user_id != -1:
-            # 현재 시간 확인 (6-9시 또는 18-21시) - KST 기준
+            # ?꾩옱 ?쒓컙 ?뺤씤 (6-9???먮뒗 18-21?? - KST 湲곗?
             from zoneinfo import ZoneInfo
 
             kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
             current_hour = kst_now.hour
             if (6 <= current_hour < 9) or (18 <= current_hour < 21):
-                # 진행중인 6-9-path 프로모션 조회
+                # 吏꾪뻾以묒씤 6-9-path ?꾨줈紐⑥뀡 議고쉶
                 query = text("""
                     select ap.id, ap.product_id, ap.type
                       from tb_applied_promotion ap
@@ -1146,7 +1378,7 @@ async def product_details_group_by_product_id(
                 sixnine_promotion = result.mappings().one_or_none()
 
                 if sixnine_promotion:
-                    # 오늘 이미 선물함에 받았는지 체크
+                    # ?ㅻ뒛 ?대? ?좊Ъ?⑥뿉 諛쏆븯?붿? 泥댄겕
                     query = text("""
                         select count(*) as received_today
                           from tb_user_giftbook
@@ -1161,9 +1393,9 @@ async def product_details_group_by_product_id(
                     )
                     received_today = result.scalar()
 
-                    # 오늘 아직 받지 않았으면 선물함으로 발급
+                    # ?ㅻ뒛 ?꾩쭅 諛쏆? ?딆븯?쇰㈃ ?좊Ъ?⑥쑝濡?諛쒓툒
                     if received_today == 0:
-                        # 6-9패스: 유효기간 하루 (수령 시점부터)
+                        # 6-9?⑥뒪: ?좏슚湲곌컙 ?섎（ (?섎졊 ?쒖젏遺??
                         giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
                             user_id=user_id,
                             product_id=product_id,
@@ -1175,9 +1407,9 @@ async def product_details_group_by_product_id(
                             reason="6-9패스 대여권",
                             amount=1,
                             promotion_type="6-9-path",
-                            expiration_date=None,  # 선물함 유효기간 없음
-                            ticket_expiration_type="on_receive_days",  # 수령 시점부터 N일
-                            ticket_expiration_value=1,  # 하루
+                            expiration_date=None,  # ?좊Ъ???좏슚湲곌컙 ?놁쓬
+                            ticket_expiration_type="on_receive_days",  # ?섎졊 ?쒖젏遺??N??
+                            ticket_expiration_value=1,  # ?섎（
                         )
                         await user_giftbook_service.post_user_giftbook(
                             req_body=giftbook_req,
@@ -1185,18 +1417,18 @@ async def product_details_group_by_product_id(
                             db=db,
                             user_id=user_id,
                         )
-                        # 알림 정보 추가
+                        # ?뚮┝ ?뺣낫 異붽?
                         issued_vouchers.append(
                             {
                                 "type": "6-9-path",
                                 "amount": 1,
-                                "message": "6-9패스 대여권이 지급 되었습니다.",
+                                "message": f"6-9패스 대여권 {giftbook_req.amount}장이 지급되었습니다",
                             }
                         )
 
-        # 기다리면 무료 (waiting-for-free) 최초 1개 자동 발급 -> 선물함으로 지급
+        # 湲곕떎由щ㈃ 臾대즺 (waiting-for-free) 理쒖큹 1媛??먮룞 諛쒓툒 -> ?좊Ъ?⑥쑝濡?吏湲?
         if user_id and user_id != -1:
-            # 진행중인 waiting-for-free 프로모션 조회
+            # 吏꾪뻾以묒씤 waiting-for-free ?꾨줈紐⑥뀡 議고쉶
             query = text("""
                 select ap.id, ap.product_id, ap.type
                   from tb_applied_promotion ap
@@ -1210,7 +1442,7 @@ async def product_details_group_by_product_id(
             waiting_promotion = result.mappings().one_or_none()
 
             if waiting_promotion:
-                # 이미 이 프로모션으로 선물함에 받았는지 체크
+                # ?대? ???꾨줈紐⑥뀡?쇰줈 ?좊Ъ?⑥뿉 諛쏆븯?붿? 泥댄겕
                 query = text("""
                     select count(*) as already_received
                       from tb_user_giftbook
@@ -1224,9 +1456,9 @@ async def product_details_group_by_product_id(
                 )
                 already_received = result.scalar()
 
-                # 아직 받지 않았으면 선물함으로 1개 발급
+                # ?꾩쭅 諛쏆? ?딆븯?쇰㈃ ?좊Ъ?⑥쑝濡?1媛?諛쒓툒
                 if already_received == 0:
-                    # 기다리면 무료: 유효기간 없음
+                    # 湲곕떎由щ㈃ 臾대즺: ?좏슚湲곌컙 ?놁쓬
                     giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
                         user_id=user_id,
                         product_id=product_id,
@@ -1238,8 +1470,8 @@ async def product_details_group_by_product_id(
                         reason="기다리면 무료 대여권",
                         amount=1,
                         promotion_type="waiting-for-free",
-                        expiration_date=None,  # 선물함 유효기간 없음
-                        ticket_expiration_type="none",  # 수령 후 대여권 유효기간 없음
+                        expiration_date=None,  # ?좊Ъ???좏슚湲곌컙 ?놁쓬
+                        ticket_expiration_type="none",  # ?섎졊 ????ш텒 ?좏슚湲곌컙 ?놁쓬
                         ticket_expiration_value=None,
                     )
                     await user_giftbook_service.post_user_giftbook(
@@ -1248,16 +1480,49 @@ async def product_details_group_by_product_id(
                         db=db,
                         user_id=user_id,
                     )
-                    # 알림 정보 추가
+                    # ?뚮┝ ?뺣낫 異붽?
                     issued_vouchers.append(
                         {
                             "type": "waiting-for-free",
                             "amount": 1,
-                            "message": "기다리면 무료 대여권이 지급 되었습니다.",
+                            "message": f"기다리면 무료 대여권 {giftbook_req.amount}장이 지급되었습니다",
                         }
                     )
 
-        # 지급된 대여권 알림 정보를 응답에 추가
+        # 吏湲됰맂 ??ш텒 ?뚮┝ ?뺣낫瑜??묐떟??異붽?
+        # 선작독자 대여권 자동 받기 (미수령 건이 있으면 상세 페이지 진입 시 처리)
+        if user_id and user_id != -1:
+            unreceived_query = text("""
+                SELECT id, amount
+                  FROM tb_user_giftbook
+                 WHERE user_id = :user_id
+                   AND product_id = :product_id
+                   AND promotion_type = 'reader-of-prev'
+                   AND received_yn = 'N'
+                   AND (expiration_date IS NULL OR expiration_date > NOW())
+            """)
+            unreceived_result = await db.execute(
+                unreceived_query, {"user_id": user_id, "product_id": product_id}
+            )
+            unreceived_gifts = unreceived_result.mappings().all()
+
+            for gift in unreceived_gifts:
+                try:
+                    await user_giftbook_service.receive_user_giftbook(
+                        giftbook_id=gift["id"],
+                        kc_user_id=kc_user_id,
+                        db=db,
+                    )
+                    issued_vouchers.append(
+                        {
+                            "type": "reader-of-prev",
+                            "amount": gift["amount"],
+                            "message": f"선작독자 무료 대여권 {gift['amount']}장이 지급되었습니다",
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to auto-receive reader-of-prev gift: {e}")
+
         grouped_results["issuedVouchers"] = issued_vouchers
 
         res_body = dict()
@@ -1286,11 +1551,11 @@ async def product_evaluations_by_id(
     author_id: str = None,
 ):
     """
-    작품 평가 조회
+    ?묓뭹 ?됯? 議고쉶
     """
 
     try:
-        # 필터 옵션 설정
+        # ?꾪꽣 ?듭뀡 ?ㅼ젙
         filter_option = []
         if product_id is not None:
             filter_option.append(f'eval.product_id = "{product_id}"')
@@ -1324,11 +1589,11 @@ async def suggest_products_by_product_id(
     product_id: str, nearby: str, kc_user_id: str, db: AsyncSession
 ):
     """
-    작품 상세 - 추천작품 조회
+    ?묓뭹 ?곸꽭 - 異붿쿇?묓뭹 議고쉶
     """
 
     try:
-        # 필터 옵션 설정
+        # ?꾪꽣 ?듭뀡 ?ㅼ젙
         filter_option = [f'product_id = "{product_id}"']
         if nearby is not None:
             filter_option.append(f'type = "{nearby}"')
@@ -1349,7 +1614,7 @@ async def suggest_products_by_product_id(
         suggested_results = json.loads(dict(row).get("similar_subject_ids"))
 
         if len(suggested_results) > 0:
-            # 필터 옵션 설정
+            # ?꾪꽣 ?듭뀡 ?ㅼ젙
             filter_option = (
                 (
                     f"p.product_id IN ({','.join(map(str, suggested_results))}) AND p.open_yn = 'Y'"
@@ -1391,26 +1656,26 @@ async def suggest_managed_products(
     db: AsyncSession, kc_user_id: str | None = None, adult_yn: str = "N"
 ):
     """
-    메인 - 추천작품 조회
+    硫붿씤 - 異붿쿇?묓뭹 議고쉶
 
-    tb_algorithm_recommend_section 에서
-    로그인 상태에 따라
-    첫번째~네번째 섹션 비로그인(2,3,4,5)
-    첫번째~네번째 섹션 로그인(6,7,8,9)
-    에 해당하는 feature를 가져와서
-    tb_algorithm_recommend_set_topic 에서 feature가 일치하는 항목들을 가져온다.
+    tb_algorithm_recommend_section ?먯꽌
+    濡쒓렇???곹깭???곕씪
+    泥ル쾲吏??ㅻ쾲吏??뱀뀡 鍮꾨줈洹몄씤(2,3,4,5)
+    泥ル쾲吏??ㅻ쾲吏??뱀뀡 濡쒓렇??6,7,8,9)
+    ???대떦?섎뒗 feature瑜?媛?몄???
+    tb_algorithm_recommend_set_topic ?먯꽌 feature媛 ?쇱튂?섎뒗 ??ぉ?ㅼ쓣 媛?몄삩??
     """
 
     try:
-        # 사용자별 feature 값을 조회하여 필터링
-        user_features = {}  # feature명 -> target 번호 매핑
-        section_features = []  # 추천 섹션의 feature 목록 (순서대로)
+        # ?ъ슜?먮퀎 feature 媛믪쓣 議고쉶?섏뿬 ?꾪꽣留?
+        user_features = {}  # feature紐?-> target 踰덊샇 留ㅽ븨
+        section_features = []  # 異붿쿇 ?뱀뀡??feature 紐⑸줉 (?쒖꽌?濡?
 
         if kc_user_id is not None:
-            # 로그인 유저: 사용자별 feature 조회
+            # 濡쒓렇???좎?: ?ъ슜?먮퀎 feature 議고쉶
             user_id = await get_user_id(kc_user_id, db)
 
-            # 사용자의 feature 값 조회
+            # ?ъ슜?먯쓽 feature 媛?議고쉶
             query = text("""
                 SELECT feature_1, feature_2, feature_3, feature_4, feature_5,
                        feature_6, feature_7, feature_8, feature_9, feature_10, feature_basic
@@ -1421,22 +1686,22 @@ async def suggest_managed_products(
             user_feature_row = result.mappings().one_or_none()
 
             if user_feature_row:
-                # 사용자의 feature 값이 있는 경우
+                # ?ъ슜?먯쓽 feature 媛믪씠 ?덈뒗 寃쎌슦
                 user_feature_data = dict(user_feature_row)
 
-                # feature_1~10, feature_basic까지 매핑 저장
+                # feature_1~10, feature_basic源뚯? 留ㅽ븨 ???
                 for i in range(1, 11):
                     feature_key = f"feature_{i}"
                     target_value = user_feature_data.get(feature_key)
                     if target_value is not None and target_value != 0:
                         user_features[feature_key] = target_value
 
-                # feature_basic도 매핑 (male, female 등)
+                # feature_basic??留ㅽ븨 (male, female ??
                 feature_basic_value = user_feature_data.get("feature_basic")
                 if feature_basic_value:
                     user_features["feature_basic"] = feature_basic_value
 
-                # 로그인 시 추천 섹션 (id 6,7,8,9) 조회
+                # 濡쒓렇????異붿쿇 ?뱀뀡 (id 6,7,8,9) 議고쉶
                 query = text("""
                     SELECT feature FROM tb_algorithm_recommend_section
                     WHERE id IN (6, 7, 8, 9)
@@ -1446,7 +1711,7 @@ async def suggest_managed_products(
                 rows = result.mappings().all()
                 section_features = [dict(row).get("feature") for row in rows]
             else:
-                # 사용자의 feature 값이 없는 경우: 비로그인과 동일
+                # ?ъ슜?먯쓽 feature 媛믪씠 ?녿뒗 寃쎌슦: 鍮꾨줈洹몄씤怨??숈씪
                 query = text("""
                     SELECT feature FROM tb_algorithm_recommend_section
                     WHERE id IN (2, 3, 4, 5)
@@ -1456,7 +1721,7 @@ async def suggest_managed_products(
                 rows = result.mappings().all()
                 section_features = [dict(row).get("feature") for row in rows]
         else:
-            # 비로그인: default 섹션만 (id 2,3,4,5)
+            # 鍮꾨줈洹몄씤: default ?뱀뀡留?(id 2,3,4,5)
             query = text("""
                 SELECT feature FROM tb_algorithm_recommend_section
                 WHERE id IN (2, 3, 4, 5)
@@ -1466,7 +1731,7 @@ async def suggest_managed_products(
             rows = result.mappings().all()
             section_features = [dict(row).get("feature") for row in rows]
 
-        # 검색 결과
+        # 寃??寃곌낵
         suggested_results = []
         section_mapping = {
             "default_1": 1,
@@ -1480,12 +1745,12 @@ async def suggest_managed_products(
             "feature_basic": 9,
         }
 
-        # 각 섹션별로 정확히 1개씩만 가져오기
+        # 媛??뱀뀡蹂꾨줈 ?뺥솗??1媛쒖뵫留?媛?몄삤湲?
         for feature_name in section_features:
             if not feature_name:
                 continue
 
-            # default인 경우 target 없이 조회
+            # default??寃쎌슦 target ?놁씠 議고쉶
             if feature_name.startswith("default_"):
                 query = text("""
                     SELECT *
@@ -1495,16 +1760,16 @@ async def suggest_managed_products(
                 """)
                 result = await db.execute(query, {"feature": feature_name})
                 hit = result.mappings().one_or_none()
-            # feature인 경우 사용자의 target과 매칭
+            # feature??寃쎌슦 ?ъ슜?먯쓽 target怨?留ㅼ묶
             else:
-                # 사용자의 해당 feature target 값 확인
+                # ?ъ슜?먯쓽 ?대떦 feature target 媛??뺤씤
                 target_value = user_features.get(feature_name)
 
                 if target_value is None:
-                    # 사용자에게 할당된 feature가 없으면 기본값 1 사용
+                    # ?ъ슜?먯뿉寃??좊떦??feature媛 ?놁쑝硫?湲곕낯媛?1 ?ъ슜
                     target_value = 1
 
-                # feature와 target이 일치하는 레코드 조회
+                # feature? target???쇱튂?섎뒗 ?덉퐫??議고쉶
                 query = text("""
                     SELECT *
                     FROM tb_algorithm_recommend_set_topic
@@ -1584,7 +1849,7 @@ async def other_products_of_author(
     db: AsyncSession,
 ):
     """
-    작가의 다른 작품 목록
+    ?묎????ㅻⅨ ?묓뭹 紐⑸줉
     """
     page = page if page else settings.PAGINATION_DEFAULT_PAGE_NO
     limit = limit if limit else settings.PAGINATION_DEFAULT_LIMIT
@@ -1592,17 +1857,17 @@ async def other_products_of_author(
     order_dir = order_dir if order_dir else settings.PAGINATION_ORDER_DIRECTION_DESC
 
     try:
-        # 필터 옵션 설정
+        # ?꾪꽣 ?듭뀡 ?ㅼ젙
         filter_option = [f'p.author_id = "{author_id}"']
         if author_nickname is not None:
             filter_option.append(f'p.author_name = "{author_nickname}"')
         if price_type is not None:
             filter_option.append(f'p.price_type = "{price_type}"')
         if adult_yn is not None:
-            # adult_yn='Y': 전체 조회 (성인 포함), adult_yn='N': 성인 제외 (all만)
+            # adult_yn='Y': ?꾩껜 議고쉶 (?깆씤 ?ы븿), adult_yn='N': ?깆씤 ?쒖쇅 (all留?
             if adult_yn == "N":
                 filter_option.append('p.ratings_code = "all"')
-            # adult_yn='Y'일 경우 필터 추가 안함 (전체 조회)
+            # adult_yn='Y'??寃쎌슦 ?꾪꽣 異붽? ?덊븿 (?꾩껜 議고쉶)
         if exclude_product_id is not None:
             filter_option.append(f'p.product_id != "{exclude_product_id}"')
 
@@ -1653,7 +1918,7 @@ async def get_products_cover_upload_file_name(
                     message=ErrorMessages.LOGIN_REQUIRED,
                 )
 
-            # 랜덤 생성 uuid 중복 체크
+            # ?쒕뜡 ?앹꽦 uuid 以묐났 泥댄겕
             while True:
                 file_name_to_uuid = comm_service.make_rand_uuid()
                 file_name_to_uuid = f"{file_name_to_uuid}.webp"
@@ -1763,7 +2028,7 @@ async def get_products_product_id_conversion(
                 )
 
             if category == "rank-up":
-                # 일반승급: 글자수 20,000자 이상, 5회차 이상
+                # ?쇰컲?밴툒: 湲?먯닔 20,000???댁긽, 5?뚯감 ?댁긽
                 query = text("""
                                     select a.product_id
                                         , case when count(1) >= 5 then 'Y' else 'N' end as episode_fulfill_yn
@@ -2063,6 +2328,15 @@ async def get_products_product_id_info(
                                     , a.paid_open_date as paid_setting_date
                                     , a.paid_episode_no
                                     , a.price_type
+                                    , a.product_type
+                                    , case when exists (
+                                        select 1
+                                          from tb_product_paid_apply ppa
+                                         where ppa.product_id = a.product_id
+                                           and ppa.use_yn = 'Y'
+                                           and ppa.status_code = 'accepted'
+                                      ) then 'Y' else 'N'
+                                      end as paid_approved_yn
                                 from tb_product a
                                 where a.user_id = :user_id
                                 and a.product_id = :product_id
@@ -2103,6 +2377,8 @@ async def get_products_product_id_info(
                     "paidSettingDate": db_rst[0].get("paid_setting_date"),
                     "paidEpisodeNo": db_rst[0].get("paid_episode_no"),
                     "priceType": db_rst[0].get("price_type"),
+                    "paidApprovedYn": db_rst[0].get("paid_approved_yn"),
+                    "productType": db_rst[0].get("product_type"),
                 }
         except CustomResponseException as e:
             logger.error(e)
@@ -2136,8 +2412,9 @@ async def get_products_product_id_info(
 async def post_products(
     req_body: product_schema.PostProductsReqBody, kc_user_id: str, db: AsyncSession
 ):
+    res_data = {}
     if kc_user_id:
-        # 연재요일 검증
+        # ?곗옱?붿씪 寃利?
         publish_days = {}
         for item in req_body.update_frequency:
             if item not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
@@ -2169,8 +2446,13 @@ async def post_products(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         message=ErrorMessages.LOGIN_REQUIRED,
                     )
+                current_user_role = await _resolve_current_user_role(
+                    kc_user_id=kc_user_id, db=db
+                )
+                allow_external_author_nickname = current_user_role in ("admin", "partner")
+                created_price_type = "free"
 
-                # 중복 작품 생성 방지 (10초 내 동일 제목)
+                # 以묐났 ?묓뭹 ?앹꽦 諛⑹? (10珥????숈씪 ?쒕ぉ)
                 duplicate_check_query = text("""
                     SELECT COUNT(*) as cnt FROM tb_product
                     WHERE user_id = :user_id
@@ -2188,7 +2470,7 @@ async def post_products(
                         message=ErrorMessages.DUPLICATE_PRODUCT_CREATION,
                     )
 
-                # 연재상태 검증
+                # ?곗옱?곹깭 寃利?
                 query = text("""
                                  select 1
                                    from tb_common_code
@@ -2208,26 +2490,14 @@ async def post_products(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                # 작가명 검증
-                query = text("""
-                                 select user_id
-                                   from tb_user_profile
-                                  where nickname = :nickname
-                                 """)
+                # ?묎?紐?寃利?(愿由ъ옄/CP??誘멸????됰꽕???덉슜)
+                author_id = await _resolve_author_id(
+                    author_nickname=req_body.author_nickname,
+                    db=db,
+                    allow_external_author_nickname=allow_external_author_nickname,
+                )
 
-                result = await db.execute(query, {"nickname": req_body.author_nickname})
-                db_rst = result.mappings().all()
-
-                author_id = None
-                if db_rst:
-                    author_id = db_rst[0].get("user_id")
-                else:
-                    raise CustomResponseException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        message=ErrorMessages.INVALID_NICKNAME_INFO,
-                    )
-
-                # 1차 장르 검증
+                # 1李??λⅤ 寃利?
                 query = text("""
                                  select keyword_id
                                       , keyword_name
@@ -2257,7 +2527,7 @@ async def post_products(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                # 2차 장르 검증
+                # 2李??λⅤ 寃利?
                 sub_genre_id = None
                 if db_rst:
                     if req_body.sub_genre is None or req_body.sub_genre == "":
@@ -2279,7 +2549,7 @@ async def post_products(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                # 키워드 검증
+                # ?ㅼ썙??寃利?
                 query = text("""
                                  select keyword_id
                                       , keyword_name
@@ -2314,9 +2584,24 @@ async def post_products(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
+                if current_user_role in ("admin", "partner"):
+                    product_type = "normal"
+                elif req_body.product_type == "normal":
+                    # 일반연재 자격 확인: 기존 승급 작품이 있는지 체크
+                    qual_query = text("""
+                        SELECT 1 FROM tb_product
+                        WHERE user_id = (SELECT user_id FROM tb_user WHERE kc_user_id = :kc_user_id AND use_yn = 'Y')
+                          AND product_type = 'normal'
+                        LIMIT 1
+                    """)
+                    qual_result = await db.execute(qual_query, {"kc_user_id": kc_user_id})
+                    product_type = "normal" if qual_result.scalar() else None
+                else:
+                    product_type = None
+
                 query = text("""
-                                 insert into tb_product (title, price_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, monopoly_yn, contract_yn, created_id, updated_id)
-                                 select :title, :price_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :monopoly_yn, :contract_yn, :created_id, :updated_id
+                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, monopoly_yn, contract_yn, created_id, updated_id)
+                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :monopoly_yn, :contract_yn, :created_id, :updated_id
                                    from tb_user
                                   where kc_user_id = :kc_user_id
                                     and use_yn = 'Y'
@@ -2326,7 +2611,8 @@ async def post_products(
                     query,
                     {
                         "kc_user_id": kc_user_id,
-                        "price_type": "free",
+                        "price_type": created_price_type,
+                        "product_type": product_type,
                         "thumbnail_file_id": req_body.cover_image_file_id
                         if req_body.cover_image_file_id
                         and req_body.cover_image_file_id != 0
@@ -2358,6 +2644,7 @@ async def post_products(
 
                 result = await db.execute(query)
                 new_product_id = result.scalar()
+                res_data = {"product_id": new_product_id}
 
                 # tb_product_trend_index ins
                 query = text("""
@@ -2414,7 +2701,7 @@ async def post_products(
                             },
                         )
 
-                # tb_ptn_product_statistics 초기 데이터 생성 (파트너 통계용)
+                # tb_ptn_product_statistics 珥덇린 ?곗씠???앹꽦 (?뚰듃???듦퀎??
                 query = text("""
                     INSERT INTO tb_ptn_product_statistics
                     (product_id, title, author_nickname, count_episode, paid_yn,
@@ -2439,7 +2726,15 @@ async def post_products(
                     },
                 )
 
-                # TODO 최상단 작가인 경우 업로드 알람 생성
+                # TODO 理쒖긽???묎???寃쎌슦 ?낅줈???뚮엺 ?앹꽦
+
+                try:
+                    await event_reward_service.check_and_grant_event_reward(
+                        event_type="add-product", user_id=user_id, product_id=new_product_id, db=db
+                    )
+                except Exception as e:
+                    logger.error(f"Event reward check failed: {e}")
+
         except CustomResponseException:
             raise
         except OperationalError:
@@ -2460,7 +2755,9 @@ async def post_products(
             message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
         )
 
-    return
+    res_body = {"data": res_data}
+
+    return res_body
 
 
 async def put_products_product_id(
@@ -2472,7 +2769,7 @@ async def put_products_product_id(
     product_id_to_int = int(product_id)
 
     if kc_user_id:
-        # 연재요일 검증
+        # ?곗옱?붿씪 寃利?
         publish_days = {}
         for item in req_body.update_frequency:
             if item not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
@@ -2504,8 +2801,12 @@ async def put_products_product_id(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         message=ErrorMessages.LOGIN_REQUIRED,
                     )
+                current_user_role = await _resolve_current_user_role(
+                    kc_user_id=kc_user_id, db=db
+                )
+                allow_external_author_nickname = current_user_role in ("admin", "partner")
 
-                # 연재상태 검증
+                # ?곗옱?곹깭 寃利?
                 query = text("""
                                  select 1
                                    from tb_common_code
@@ -2525,26 +2826,14 @@ async def put_products_product_id(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                # 작가명 검증
-                query = text("""
-                                 select user_id
-                                   from tb_user_profile
-                                  where nickname = :nickname
-                                 """)
+                # ?묎?紐?寃利?(愿由ъ옄/CP??誘멸????됰꽕???덉슜)
+                author_id = await _resolve_author_id(
+                    author_nickname=req_body.author_nickname,
+                    db=db,
+                    allow_external_author_nickname=allow_external_author_nickname,
+                )
 
-                result = await db.execute(query, {"nickname": req_body.author_nickname})
-                db_rst = result.mappings().all()
-
-                author_id = None
-                if db_rst:
-                    author_id = db_rst[0].get("user_id")
-                else:
-                    raise CustomResponseException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        message=ErrorMessages.INVALID_NICKNAME_INFO,
-                    )
-
-                # 1차 장르 검증
+                # 1李??λⅤ 寃利?
                 query = text("""
                                  select keyword_id
                                       , keyword_name
@@ -2574,7 +2863,7 @@ async def put_products_product_id(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                # 2차 장르 검증
+                # 2李??λⅤ 寃利?
                 sub_genre_id = None
                 if db_rst:
                     if req_body.sub_genre is None or req_body.sub_genre == "":
@@ -2596,7 +2885,7 @@ async def put_products_product_id(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                # 키워드 검증
+                # ?ㅼ썙??寃利?
                 query = text("""
                                  select keyword_id
                                       , keyword_name
@@ -2631,29 +2920,21 @@ async def put_products_product_id(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                # 무료 작품인 경우 유료 관련 값 무시
-                check_price_type_query = text("""
-                    SELECT price_type FROM tb_product WHERE product_id = :product_id
-                """)
-                price_type_result = await db.execute(check_price_type_query, {"product_id": product_id_to_int})
-                price_type_row = price_type_result.mappings().first()
+                # 臾대즺 ?묓뭹??寃쎌슦 ?좊즺 愿??媛?臾댁떆
 
-                if price_type_row and price_type_row["price_type"] == "free":
-                    req_body.paid_setting_date = None
-                    req_body.paid_episode_no = None
-
-                # 유료 검증
+                # ?좊즺 寃利?
                 if req_body.paid_setting_date or (
                     req_body.paid_episode_no and req_body.paid_episode_no != 0
                 ):
                     query = text("""
                                      select 1
                                        from tb_product a
-                                      inner join tb_product_paid_apply b on a.product_id = b.product_id
+                                      left join tb_product_paid_apply b on a.product_id = b.product_id
                                         and b.use_yn = 'Y'
                                         and b.status_code = 'accepted'
                                       where a.product_id = :product_id
-                                        and a.price_type = 'paid'
+                                        and (a.price_type = 'paid' or b.id is not null)
+                                      limit 1
                                      """)
 
                     result = await db.execute(query, {"product_id": product_id_to_int})
@@ -2896,7 +3177,7 @@ async def put_products_product_id_conversion(
                     )
 
                 if category == "rank-up":
-                    # 일반승급: 글자수 20,000자 이상, 5회차 이상 (조건만 만족하면 바로 승급 처리)
+                    # ?쇰컲?밴툒: 湲?먯닔 20,000???댁긽, 5?뚯감 ?댁긽 (議곌굔留?留뚯”?섎㈃ 諛붾줈 ?밴툒 泥섎━)
                     query = text("""
                                      select a.product_id
                                        from tb_product a
@@ -2931,7 +3212,7 @@ async def put_products_product_id_conversion(
                             "productType": "normal",
                         }
                 elif category == "paid":
-                    # 유료전환: 최대 2번 신청 가능, 심사 후 승인하면 승급 처리
+                    # ?좊즺?꾪솚: 理쒕? 2踰??좎껌 媛?? ?ъ궗 ???뱀씤?섎㈃ ?밴툒 泥섎━
                     query = text("""
                                      select a.product_id
                                        from tb_product a
@@ -3010,7 +3291,7 @@ async def put_products_product_id_conversion(
 
 
 def _count_evaluations(user_evaluations: List[dict]) -> dict:
-    """평가 코드별 개수를 집계하는 내부 함수"""
+    """?됯? 肄붾뱶蹂?媛쒖닔瑜?吏묎퀎?섎뒗 ?대? ?⑥닔"""
     evaluation_counts = defaultdict(int)
     for hit in user_evaluations:
         if "evaluationCode" in hit:
@@ -3071,7 +3352,7 @@ async def get_user_interest_drop_products(kc_user_id: str, db: AsyncSession):
                         [str(product.get("productId")) for product in res_data]
                     )
 
-                    # 에피소드 정보 조회 (latestEpisodeNo, firstEpisodeId)
+                    # ?먰뵾?뚮뱶 ?뺣낫 議고쉶 (latestEpisodeNo, firstEpisodeId)
                     episode_info_query = text(f"""
                         SELECT
                             product_id,
@@ -3095,7 +3376,7 @@ async def get_user_interest_drop_products(kc_user_id: str, db: AsyncSession):
                         for row in episode_info_rows
                     }
 
-                    # 사용자의 최근 읽은 에피소드 조회 (lastViewedEpisodeId, lastViewedEpisodeNo)
+                    # ?ъ슜?먯쓽 理쒓렐 ?쎌? ?먰뵾?뚮뱶 議고쉶 (lastViewedEpisodeId, lastViewedEpisodeNo)
                     recent_read_map = {}
                     if user_id:
                         recent_read_query = text(f"""
@@ -3105,12 +3386,26 @@ async def get_user_interest_drop_products(kc_user_id: str, db: AsyncSession):
                                 pe.episode_no as last_viewed_episode_no
                             FROM tb_user_product_usage upu
                             INNER JOIN (
-                                SELECT product_id, MAX(updated_date) as max_date
-                                FROM tb_user_product_usage
-                                WHERE user_id = :user_id
-                                  AND product_id IN ({fetch_product_ids})
-                                  AND use_yn = 'Y'
-                                GROUP BY product_id
+                                SELECT u2.product_id, MAX(u2.updated_date) as max_date
+                                FROM tb_user_product_usage u2
+                                INNER JOIN tb_product_episode ep2 ON u2.episode_id = ep2.episode_id
+                                WHERE u2.user_id = :user_id
+                                  AND u2.product_id IN ({fetch_product_ids})
+                                  AND u2.use_yn = 'Y'
+                                  AND (
+                                    ep2.open_yn = 'Y'
+                                    OR EXISTS (
+                                      SELECT 1 FROM tb_user_productbook pb
+                                      WHERE (pb.episode_id = ep2.episode_id
+                                             OR (pb.episode_id IS NULL
+                                                 AND (pb.product_id = ep2.product_id
+                                                      OR pb.product_id IS NULL)))
+                                        AND pb.user_id = :user_id
+                                        AND pb.use_yn = 'Y'
+                                        AND (pb.rental_expired_date IS NULL OR pb.rental_expired_date > NOW())
+                                    )
+                                  )
+                                GROUP BY u2.product_id
                             ) latest ON upu.product_id = latest.product_id
                                      AND upu.updated_date = latest.max_date
                             LEFT JOIN tb_product_episode pe ON upu.episode_id = pe.episode_id
@@ -3129,11 +3424,11 @@ async def get_user_interest_drop_products(kc_user_id: str, db: AsyncSession):
                             for row in recent_read_rows
                         }
 
-                    # 에피소드 정보를 각 작품 데이터에 추가
+                    # ?먰뵾?뚮뱶 ?뺣낫瑜?媛??묓뭹 ?곗씠?곗뿉 異붽?
                     for product in res_data:
                         product_id = product.get("productId")
 
-                        # 에피소드 정보 추가
+                        # ?먰뵾?뚮뱶 ?뺣낫 異붽?
                         if product_id in episode_info_map:
                             product["latestEpisodeNo"] = episode_info_map[product_id][
                                 "latestEpisodeNo"
@@ -3145,7 +3440,7 @@ async def get_user_interest_drop_products(kc_user_id: str, db: AsyncSession):
                             product["latestEpisodeNo"] = None
                             product["firstEpisodeId"] = None
 
-                        # 최근 읽은 에피소드 정보 추가
+                        # 理쒓렐 ?쎌? ?먰뵾?뚮뱶 ?뺣낫 異붽?
                         if product_id in recent_read_map:
                             product["lastViewedEpisodeId"] = recent_read_map[
                                 product_id
@@ -3195,11 +3490,11 @@ async def get_user_interest_drop_products_soon(
                         [str(row.get("product_id")) for row in db_rst]
                     )
 
-                    # 필터 옵션 설정
+                    # ?꾪꽣 ?듭뀡 ?ㅼ젙
                     filter_option = []
                     filter_option.append(f"p.product_id IN ({fetch_product_ids})")
                     filter_option.append("p.open_yn = 'Y'")
-                    # 성인등급 필터링: adult_yn이 N이면 전체이용가만 조회
+                    # ?깆씤?깃툒 ?꾪꽣留? adult_yn??N?대㈃ ?꾩껜?댁슜媛留?議고쉶
                     if adult_yn == "N":
                         filter_option.append("p.ratings_code = 'all'")
 
@@ -3230,7 +3525,7 @@ async def get_user_interest_drop_products_soon(
 
 async def get_product_rank(db: AsyncSession):
     """
-    유/무료 top 50 조회
+    ??臾대즺 top 50 議고쉶
     """
     query = text("""
                  SELECT * FROM tb_product_rank ORDER BY current_rank ASC
@@ -3244,7 +3539,7 @@ async def products_in_publisher_promotion(
     kc_user_id: str, db: AsyncSession, adult_yn: str = "N"
 ):
     """
-    출판사 프로모션 상품 리스트 조회
+    異쒗뙋???꾨줈紐⑥뀡 ?곹뭹 由ъ뒪??議고쉶
     """
     user_id = await get_user_id(kc_user_id, db)
 
@@ -3263,8 +3558,22 @@ async def products_in_publisher_promotion(
     result = await db.execute(query, {})
     rows = result.mappings().all()
 
+    config_query = text("""
+        SELECT title
+        FROM tb_publisher_promotion_config
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+    config_result = await db.execute(config_query, {})
+    config_row = config_result.mappings().one_or_none()
+    section_title = (
+        (config_row.get("title") if config_row is not None else None)
+        or DEFAULT_PUBLISHER_PROMOTION_TITLE
+    )
+
     res_body = dict()
     res_body["data"] = [convert_product_data(row) for row in rows]
+    res_body["title"] = section_title
 
     return res_body
 
@@ -3273,7 +3582,7 @@ async def products_in_latest_update(
     kc_user_id: str, db: AsyncSession, adult_yn: str = "N"
 ):
     """
-    최신 업데이트 상품 리스트 조회
+    理쒖떊 ?낅뜲?댄듃 ?곹뭹 由ъ뒪??議고쉶
     """
     user_id = await get_user_id(kc_user_id, db)
 
@@ -3299,7 +3608,7 @@ async def products_in_latest_update(
 
 async def products_in_applied_promotion(type: str, kc_user_id: str, db: AsyncSession):
     """
-    신청 프로모션 상품 리스트 조회
+    ?좎껌 ?꾨줈紐⑥뀡 ?곹뭹 由ъ뒪??議고쉶
     """
     user_id = await get_user_id(kc_user_id, db)
 
@@ -3323,14 +3632,14 @@ async def products_in_applied_promotion(type: str, kc_user_id: str, db: AsyncSes
         start_date: datetime = row.get("promotion_start_date")
         end_date: datetime | None = row.get("promotion_end_date")
 
-        # start_date부터 end_date까지 날짜별로 데이터를 분류
+        # start_date遺??end_date源뚯? ?좎쭨蹂꾨줈 ?곗씠?곕? 遺꾨쪟
         current_date = start_date.date() if start_date else None
         end_date_only = end_date.date() if end_date else None
 
         if current_date:
             if end_date_only:
-                # end_date가 있으면 start_date부터 end_date까지 범위 내 모든 날짜에 추가
-                # 안전장치: 최대 10년(3650일)까지만 처리
+                # end_date媛 ?덉쑝硫?start_date遺??end_date源뚯? 踰붿쐞 ??紐⑤뱺 ?좎쭨??異붽?
+                # ?덉쟾?μ튂: 理쒕? 10??3650??源뚯?留?泥섎━
                 days_processed = 0
                 while current_date <= end_date_only and days_processed < 3650:
                     date_str = current_date.isoformat()
@@ -3340,13 +3649,13 @@ async def products_in_applied_promotion(type: str, kc_user_id: str, db: AsyncSes
                     current_date += timedelta(days=1)
                     days_processed += 1
             else:
-                # end_date가 없으면 start_date에만 추가
+                # end_date媛 ?놁쑝硫?start_date?먮쭔 異붽?
                 date_str = current_date.isoformat()
                 if date_str not in res_body["data"]:
                     res_body["data"][date_str] = []
                 res_body["data"][date_str].append(data)
 
-    # 날짜를 역순(최신 날짜부터)으로 정렬
+    # ?좎쭨瑜???닚(理쒖떊 ?좎쭨遺???쇰줈 ?뺣젹
     res_body["data"] = dict(sorted(res_body["data"].items(), reverse=True))
 
     return res_body
@@ -3359,13 +3668,13 @@ async def post_product_report(
     db: AsyncSession,
 ):
     """
-    작품 신고
+    ?묓뭹 ?좉퀬
     """
     product_id_to_int = int(product_id)
     if kc_user_id:
         try:
             async with db.begin():
-                # 사용자 확인
+                # ?ъ슜???뺤씤
                 user_id = await comm_service.get_user_from_kc(kc_user_id, db)
                 if user_id == -1:
                     raise CustomResponseException(
@@ -3420,18 +3729,18 @@ async def post_product_report(
 
 async def revive_product_interest(product_id: str, kc_user_id: str, db: AsyncSession):
     """
-    관심 되살리기: 관심끊기기 임박 상태를 관심 유지중으로 변경
-    tb_user_product_usage의 updated_date를 현재 시간으로 업데이트
+    愿???섏궡由ш린: 愿?щ걡湲곌린 ?꾨컯 ?곹깭瑜?愿???좎?以묒쑝濡?蹂寃?
+    tb_user_product_usage??updated_date瑜??꾩옱 ?쒓컙?쇰줈 ?낅뜲?댄듃
     """
     try:
         product_id_to_int = int(product_id)
     except ValueError:
         raise CustomResponseException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            message="유효하지 않은 작품 ID입니다.",
+            message="유효하지 않은 작품 ID입니다",
         )
 
-    # kc_user_id로 user_id 조회
+    # kc_user_id濡?user_id 議고쉶
     user_id = await comm_service.get_user_from_kc(kc_user_id, db)
     if user_id == -1:
         raise CustomResponseException(
@@ -3439,7 +3748,7 @@ async def revive_product_interest(product_id: str, kc_user_id: str, db: AsyncSes
             message=ErrorMessages.LOGIN_REQUIRED,
         )
 
-    # 작품 존재 여부 확인
+    # ?묓뭹 議댁옱 ?щ? ?뺤씤
     product_query = text("""
         SELECT product_id
         FROM tb_product
@@ -3454,8 +3763,8 @@ async def revive_product_interest(product_id: str, kc_user_id: str, db: AsyncSes
             message="작품을 찾을 수 없습니다.",
         )
 
-    # tb_user_product_usage에서 가장 최근 레코드 조회
-    # 이 테이블은 episode_id별로 레코드가 생성되므로 ORDER BY로 최신 레코드만 조회
+    # tb_user_product_usage?먯꽌 媛??理쒓렐 ?덉퐫??議고쉶
+    # ???뚯씠釉붿? episode_id蹂꾨줈 ?덉퐫?쒓? ?앹꽦?섎?濡?ORDER BY濡?理쒖떊 ?덉퐫?쒕쭔 議고쉶
     usage_query = text("""
         SELECT id, updated_date,
                DATE_ADD(COALESCE(updated_date, created_date), INTERVAL 3 DAY) as interest_end_date
@@ -3479,7 +3788,7 @@ async def revive_product_interest(product_id: str, kc_user_id: str, db: AsyncSes
 
     now = datetime.now()
 
-    # 해당 레코드의 updated_date 업데이트
+    # ?대떦 ?덉퐫?쒖쓽 updated_date ?낅뜲?댄듃
     update_query = text("""
         UPDATE tb_user_product_usage
         SET updated_date = :updated_date,
@@ -3495,7 +3804,7 @@ async def revive_product_interest(product_id: str, kc_user_id: str, db: AsyncSes
         },
     )
 
-    # 새로운 관심 종료일 계산 (현재 시간 + 3일)
+    # ?덈줈??愿??醫낅즺??怨꾩궛 (?꾩옱 ?쒓컙 + 3??
     from datetime import timedelta
 
     interest_end_date = now + timedelta(days=3)
@@ -3505,7 +3814,7 @@ async def revive_product_interest(product_id: str, kc_user_id: str, db: AsyncSes
             "productId": product_id_to_int,
             "interestStatus": "interest_active",
             "interestEndDate": interest_end_date.isoformat(),
-            "message": "관심이 성공적으로 되살아났습니다.",
+            "message": "관심이 성공적으로 활성화되었습니다",
         }
     }
 
@@ -3514,21 +3823,21 @@ async def suggest_products_by_recent_viewed(
     kc_user_id: str, adult_yn: str, db: AsyncSession
 ):
     """
-    최근 본 작품 기반 추천 작품 조회
+    理쒓렐 蹂??묓뭹 湲곕컲 異붿쿇 ?묓뭹 議고쉶
 
-    사용자가 가장 최근에 본 작품을 기반으로 유사한 작품들을 추천합니다.
-    tb_algorithm_recommend_similar 테이블의 데이터를 활용합니다.
+    ?ъ슜?먭? 媛??理쒓렐??蹂??묓뭹??湲곕컲?쇰줈 ?좎궗???묓뭹?ㅼ쓣 異붿쿇?⑸땲??
+    tb_algorithm_recommend_similar ?뚯씠釉붿쓽 ?곗씠?곕? ?쒖슜?⑸땲??
 
     Args:
-        kc_user_id: 현재 사용자 keycloak ID
-        adult_yn: 성인 작품 포함 여부 (Y | N)
-        db: 데이터베이스 세션
+        kc_user_id: ?꾩옱 ?ъ슜??keycloak ID
+        adult_yn: ?깆씤 ?묓뭹 ?ы븿 ?щ? (Y | N)
+        db: ?곗씠?곕쿋?댁뒪 ?몄뀡
 
     Returns:
-        추천 작품 목록
+        異붿쿇 ?묓뭹 紐⑸줉
     """
     try:
-        # 사용자 ID 조회
+        # ?ъ슜??ID 議고쉶
         user_id = await get_user_id(kc_user_id, db)
 
         if user_id == -1:
@@ -3537,7 +3846,7 @@ async def suggest_products_by_recent_viewed(
                 message=ErrorMessages.LOGIN_REQUIRED,
             )
 
-        # 가장 최근에 본 작품 조회
+        # 媛??理쒓렐??蹂??묓뭹 議고쉶
         recent_query = text("""
             SELECT product_id
             FROM tb_user_product_recent
@@ -3550,12 +3859,12 @@ async def suggest_products_by_recent_viewed(
         recent_row = result.mappings().one_or_none()
 
         if recent_row is None:
-            # 최근 본 작품이 없으면 빈 배열 반환
+            # 理쒓렐 蹂??묓뭹???놁쑝硫?鍮?諛곗뿴 諛섑솚
             return {"data": []}
 
         recent_product_id = recent_row["product_id"]
 
-        # 최근 본 작품 기반 추천 작품 ID 조회
+        # 理쒓렐 蹂??묓뭹 湲곕컲 異붿쿇 ?묓뭹 ID 議고쉶
         recommend_query = text("""
             SELECT similar_subject_ids
             FROM tb_algorithm_recommend_similar
@@ -3566,16 +3875,16 @@ async def suggest_products_by_recent_viewed(
         recommend_row = result.mappings().one_or_none()
 
         if recommend_row is None or not recommend_row["similar_subject_ids"]:
-            # 추천 데이터가 없으면 빈 배열 반환
+            # 異붿쿇 ?곗씠?곌? ?놁쑝硫?鍮?諛곗뿴 諛섑솚
             return {"data": []}
 
-        # JSON 파싱하여 추천 작품 ID 리스트 추출
+        # JSON ?뚯떛?섏뿬 異붿쿇 ?묓뭹 ID 由ъ뒪??異붿텧
         suggested_product_ids = json.loads(recommend_row["similar_subject_ids"])
 
         if not suggested_product_ids or len(suggested_product_ids) == 0:
             return {"data": []}
 
-        # 추천 작품 상세 정보 조회
+        # 異붿쿇 ?묓뭹 ?곸꽭 ?뺣낫 議고쉶
         adult_filter = "AND p.ratings_code = 'all'" if adult_yn == "N" else ""
         filter_option = (
             f"p.product_id IN ({','.join(map(str, suggested_product_ids))}) AND p.open_yn = 'Y' {adult_filter}"
@@ -3610,36 +3919,36 @@ async def get_direct_recommend_products(
     kc_user_id: str | None, db: AsyncSession, adult_yn: str = "N"
 ):
     """
-    직접 추천 구좌 작품 목록 조회
+    吏곸젒 異붿쿇 援ъ쥖 ?묓뭹 紐⑸줉 議고쉶
 
-    관리자가 설정한 직접 추천 구좌의 작품들을 조회합니다.
-    노출 기간과 시간대를 고려하여 현재 활성화된 추천 구좌만 반환합니다.
+    愿由ъ옄媛 ?ㅼ젙??吏곸젒 異붿쿇 援ъ쥖???묓뭹?ㅼ쓣 議고쉶?⑸땲??
+    ?몄텧 湲곌컙怨??쒓컙?瑜?怨좊젮?섏뿬 ?꾩옱 ?쒖꽦?붾맂 異붿쿇 援ъ쥖留?諛섑솚?⑸땲??
 
     Args:
-        kc_user_id: 현재 사용자 keycloak ID (선택)
-        db: 데이터베이스 세션
-        adult_yn: 성인등급 작품 포함 여부 (Y/N)
+        kc_user_id: ?꾩옱 ?ъ슜??keycloak ID (?좏깮)
+        db: ?곗씠?곕쿋?댁뒪 ?몄뀡
+        adult_yn: ?깆씤?깃툒 ?묓뭹 ?ы븿 ?щ? (Y/N)
 
     Returns:
-        직접 추천 구좌 작품 목록
+        吏곸젒 異붿쿇 援ъ쥖 ?묓뭹 紐⑸줉
     """
     try:
-        # 사용자 ID 조회 (로그인 상태 확인용, 필수 아님)
+        # ?ъ슜??ID 議고쉶 (濡쒓렇???곹깭 ?뺤씤?? ?꾩닔 ?꾨떂)
         user_id = None
         if kc_user_id:
             user_id = await get_user_id(kc_user_id, db)
             if user_id == -1:
                 user_id = None
 
-        # 현재 시간 기준으로 활성화된 직접 추천 구좌 조회
+        # ?꾩옱 ?쒓컙 湲곗??쇰줈 ?쒖꽦?붾맂 吏곸젒 異붿쿇 援ъ쥖 議고쉶
         now = datetime.now()
-        day_of_week = now.weekday()  # 0=월요일, 6=일요일
+        day_of_week = now.weekday()  # 0=?붿슂?? 6=?쇱슂??
 
-        # 평일(0-4) / 주말(5-6) 구분
+        # ?됱씪(0-4) / 二쇰쭚(5-6) 援щ텇
         is_weekend = day_of_week >= 5
 
-        # 활성화된 직접 추천 구좌 조회
-        # DB는 UTC 시간이므로 한국 시간(+9시간)으로 변환하여 비교
+        # ?쒖꽦?붾맂 吏곸젒 異붿쿇 援ъ쥖 議고쉶
+        # DB??UTC ?쒓컙?대?濡??쒓뎅 ?쒓컙(+9?쒓컙)?쇰줈 蹂?섑븯??鍮꾧탳
         if is_weekend:
             time_condition = """
                 AND TIME(CONVERT_TZ(NOW(), '+00:00', '+09:00')) BETWEEN CAST(exposure_start_time_weekend AS TIME) AND CAST(exposure_end_time_weekend AS TIME)
@@ -3663,7 +3972,7 @@ async def get_direct_recommend_products(
         if not recommend_rows:
             return {"data": []}
 
-        # 각 추천 구좌별로 작품 조회
+        # 媛?異붿쿇 援ъ쥖蹂꾨줈 ?묓뭹 議고쉶
         results = []
         for recommend_row in recommend_rows:
             product_ids = json.loads(recommend_row["product_ids"])
@@ -3671,7 +3980,7 @@ async def get_direct_recommend_products(
             if not product_ids or len(product_ids) == 0:
                 continue
 
-            # 작품 상세 정보 조회
+            # ?묓뭹 ?곸꽭 ?뺣낫 議고쉶
             adult_filter = "AND p.ratings_code = 'all'" if adult_yn == "N" else ""
             filter_option = (
                 f"p.product_id IN ({','.join(map(str, product_ids))}) AND p.open_yn = 'Y' {adult_filter}"
@@ -3693,7 +4002,7 @@ async def get_direct_recommend_products(
             result = await db.execute(products_query, {})
             product_rows = result.mappings().all()
 
-            # 추천 구좌 정보와 작품 리스트를 함께 반환
+            # 異붿쿇 援ъ쥖 ?뺣낫? ?묓뭹 由ъ뒪?몃? ?④퍡 諛섑솚
             results.append(
                 {
                     "recommendId": recommend_row["id"],
@@ -3710,3 +4019,15 @@ async def get_direct_recommend_products(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             message=ErrorMessages.DB_OPERATION_ERROR,
         )
+
+
+async def get_can_create_normal(kc_user_id: str, db: AsyncSession):
+    """일반연재 자격 확인: 기존 승급된 작품이 1개 이상 있으면 True"""
+    query = text("""
+        SELECT 1 FROM tb_product
+        WHERE user_id = (SELECT user_id FROM tb_user WHERE kc_user_id = :kc_user_id AND use_yn = 'Y')
+          AND product_type = 'normal'
+        LIMIT 1
+    """)
+    result = await db.execute(query, {"kc_user_id": kc_user_id})
+    return {"can_create_normal": result.scalar() is not None}

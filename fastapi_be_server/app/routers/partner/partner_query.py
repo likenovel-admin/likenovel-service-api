@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, Path
+from fastapi import APIRouter, Depends, Query, Path, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any, Optional
 
@@ -10,6 +10,8 @@ import app.services.partner.partner_statistics_service as partner_statistics_ser
 import app.services.partner.partner_sales_service as partner_sales_service
 import app.services.partner.partner_income_service as partner_income_service
 from app.utils.common import check_user
+from app.exceptions import CustomResponseException
+from app.const import ErrorMessages
 
 router = APIRouter(prefix="/partners")
 
@@ -251,6 +253,7 @@ async def product_list(
         "",
         description="연재 상태(연재중 - ongoing | 휴재중 - rest | 완결 - end | 연재중지 - stop), 선택안한 상태에서는 값이 없거나 비워두세요",
     ),
+    has_episode_apply_yn: str = Query("", description="심사신청 작품만 보기(Y/N)"),
     search_target: str = Query(
         "", description="검색 타겟(product-title | product-id | author-name | cp-name)"
     ),
@@ -280,6 +283,7 @@ async def product_list(
     return await partner_product_service.product_list(
         contract_type,
         status_code,
+        has_episode_apply_yn,
         search_target,
         search_word,
         page,
@@ -446,6 +450,7 @@ async def product_list_for_download(
         "",
         description="연재 상태(연재중 - ongoing | 휴재중 - rest | 완결 - end | 연재중지 - stop), 선택안한 상태에서는 값이 없거나 비워두세요",
     ),
+    has_episode_apply_yn: str = Query("", description="심사신청 작품만 보기(Y/N)"),
     search_target: str = Query(
         "", description="검색 타겟(product-title | product-id | author-name | cp-name)"
     ),
@@ -473,6 +478,7 @@ async def product_list_for_download(
     return await partner_product_service.product_list(
         contract_type,
         status_code,
+        has_episode_apply_yn,
         search_target,
         search_word,
         -1,
@@ -3535,6 +3541,7 @@ async def income_settlement_summary(
 async def product_discovery_statistics_list(
     search_target: str = Query("", description="검색 타겟(story | keyword-genre)"),
     search_word: str = Query("", description="검색어"),
+    scope: str = Query("", description="뷰 범위(contracted)"),
     page: int = Query(1, description="페이지"),
     count_per_page: int = Query(8, description="한 페이지 내 갯수"),
     db: AsyncSession = Depends(get_likenovel_db),
@@ -3549,7 +3556,7 @@ async def product_discovery_statistics_list(
         raise e
 
     return await partner_statistics_service.product_discovery_statistics_list(
-        search_target, search_word, page, count_per_page, db, user_data
+        search_target, search_word, scope, page, count_per_page, db, user_data
     )
 
 
@@ -3633,6 +3640,7 @@ async def product_discovery_statistics_list(
 async def product_discovery_statistics_list_for_download(
     search_target: str = Query("", description="검색 타겟(story | keyword-genre)"),
     search_word: str = Query("", description="검색어"),
+    scope: str = Query("", description="뷰 범위(contracted)"),
     db: AsyncSession = Depends(get_likenovel_db),
     user: Dict[str, Any] = Depends(chk_cur_user),
 ):
@@ -3644,8 +3652,14 @@ async def product_discovery_statistics_list_for_download(
     except Exception as e:
         raise e
 
+    if user_data["role"] == "author":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
+
     return await partner_statistics_service.product_discovery_statistics_list(
-        search_target, search_word, -1, -1, db, user_data
+        search_target, search_word, scope, -1, -1, db, user_data
     )
 
 
@@ -3717,6 +3731,7 @@ async def product_discovery_statistics_list_for_download(
 )
 async def product_discovery_statistics_detail_by_id(
     id: int = Path(..., description="발굴작품 번호"),
+    scope: str = Query("", description="뷰 범위(contracted)"),
     db: AsyncSession = Depends(get_likenovel_db),
     user: Dict[str, Any] = Depends(chk_cur_user),
 ):
@@ -3724,10 +3739,10 @@ async def product_discovery_statistics_detail_by_id(
     파트너 - 발굴 통계 발굴작품 조회
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        user_data = await check_user(kc_user_id=user.get("sub"), db=db)
     except Exception as e:
         raise e
 
     return await partner_statistics_service.product_discovery_statistics_detail_by_id(
-        id, db
+        id, scope, db, user_data
     )

@@ -66,6 +66,11 @@ class User(Base):
         nullable=False,
         comment="권한 - 일반, 관리자",
     )
+    ai_onboarding_dismissed_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE),
+        server_default="N",
+        comment="AI 온보딩 모달 숨김 여부(계정 기준)",
+    )
     created_id: Mapped[int] = mapped_column(
         Integer, nullable=True, comment="row를 생성한 id"
     )
@@ -852,4 +857,32 @@ class UserSuggest(Base):
         TIMESTAMP,
         nullable=False,
         server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class EmailVerificationCode(Base):
+    __tablename__ = "tb_email_verification_code"  # 이메일 인증 코드 (비밀번호 재설정)
+
+    # column
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(
+        String(100), index=True, nullable=False, comment="이메일"
+    )
+    token: Mapped[str] = mapped_column(
+        String(64), index=True, nullable=False, comment="인증 토큰"
+    )
+    purpose: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        server_default="password_reset",
+        comment="용도",
+    )
+    verified_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N", comment="인증 여부"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    expired_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, comment="만료 일시"
     )

@@ -25,7 +25,13 @@ async def get_products_notices_product_notice_id_info(
     product_notice_id: str, kc_user_id: str, db: AsyncSession
 ):
     res_data = {}
-    product_notice_id_to_int = int(product_notice_id)
+    try:
+        product_notice_id_to_int = int(product_notice_id)
+    except (TypeError, ValueError):
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_NOTICE_INFO,
+        )
 
     try:
         # 로그인한 사용자인 경우 user_id 조회
@@ -120,8 +126,14 @@ async def post_products_product_id_notices(
     product_notice_id: Optional[str] = None,
 ):
     res_data = {}
-    product_id_to_int = int(product_id)
-    product_notice_id_to_int = int(product_notice_id) if product_notice_id else None
+    try:
+        product_id_to_int = int(product_id)
+        product_notice_id_to_int = int(product_notice_id) if product_notice_id else None
+    except (TypeError, ValueError):
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_NOTICE_INFO,
+        )
 
     if kc_user_id:
         try:
@@ -284,7 +296,13 @@ async def put_products_notices_product_notice_id(
     kc_user_id: str,
     db: AsyncSession,
 ):
-    product_notice_id_to_int = int(product_notice_id)
+    try:
+        product_notice_id_to_int = int(product_notice_id)
+    except (TypeError, ValueError):
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_NOTICE_INFO,
+        )
 
     if kc_user_id:
         try:
@@ -385,7 +403,13 @@ async def put_products_notices_product_notice_id_open(
     product_notice_id: str, kc_user_id: str, db: AsyncSession
 ):
     res_data = {}
-    product_notice_id_to_int = int(product_notice_id)
+    try:
+        product_notice_id_to_int = int(product_notice_id)
+    except (TypeError, ValueError):
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_NOTICE_INFO,
+        )
 
     if kc_user_id:
         try:

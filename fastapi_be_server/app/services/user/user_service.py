@@ -597,7 +597,7 @@ async def get_user_cash(kc_user_id: str, db: AsyncSession):
                             from (
                                 select case when a.amount > 0 then 'charge' else 'use' end as category
                                     , a.amount
-                                    , null as product_title
+                                    , '캐시 지급' as product_title
                                     , null as episode_title
                                     , a.created_date
                                 from tb_user_cashbook_transaction a

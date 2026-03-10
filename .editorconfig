@@ -1,0 +1,14 @@
+root = true
+
+[*.{py,ts,tsx,js,jsx,mjs,cjs,json,md,yml,yaml,toml,ini,cfg,conf,sql,xml,html,css,scss,less,sh,bash,zsh,ps1,bat,cmd,txt,csv,env}]
+charset = utf-8
+insert_final_newline = true
+end_of_line = lf
+
+[*.py]
+indent_style = space
+indent_size = 4
+
+[*.{ts,tsx,js,jsx,json,md,yml,yaml}]
+indent_style = space
+indent_size = 2

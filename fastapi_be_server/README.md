@@ -162,9 +162,10 @@ docker-compose up -d
    - **API 서버**: FastAPI 애플리케이션
 
 4. 서비스 접속:
-   - **API 서버**: http://localhost:8800
+   - **API 서버**: http://localhost:8000 (nginx 미사용 기본)
+   - **API 서버(nginx 사용 시)**: https://localhost:8800 (`--profile linux-nginx`로 nginx 실행)
    - **Keycloak 관리 콘솔**: http://localhost:8080
-     - 관리자 계정: `admin` / `admin1234`
+     - 관리자 계정: `admin` / (비밀번호는 환경변수로 주입)
      - Realm: `likenovel`
 
 > 🎉 **자동 설정**: Keycloak은 컨테이너 시작 시 자동으로 초기화되며, 필요한 realm과 클라이언트가 자동으로 생성됩니다.
@@ -198,7 +199,7 @@ poetry run gunicorn -k uvicorn.workers.UvicornWorker app.main:be_app --bind 0.0.
 ### Docker Compose로 실행된 Keycloak (자동 설정)
 
 - **URL**: http://localhost:8080
-- **관리자 계정**: `admin` / `admin1234`
+- **관리자 계정**: `admin` / (비밀번호는 환경변수로 주입)
 - **Realm**: `likenovel` (자동 생성)
 - **클라이언트** (자동 생성):
   - `service`: 일반 로그인용
@@ -210,8 +211,8 @@ poetry run gunicorn -k uvicorn.workers.UvicornWorker app.main:be_app --bind 0.0.
 1. Keycloak 서버 설치 및 실행
 2. `likenovel` realm 생성
 3. 필요한 클라이언트 생성:
-   - `service` (secret: `PaP1ULbtlNzXY2XKyw7juZtH0vqYMauP`)
-   - `service-keep` (secret: `3ERXPBS4jTNUxy4Ozz3EQOOkRQKsV8iZ`)
+   - `service` (secret은 환경변수/시크릿으로 주입)
+   - `service-keep` (secret은 환경변수/시크릿으로 주입)
 4. `app/const.py`에서 Keycloak URL 수정
 
 ---

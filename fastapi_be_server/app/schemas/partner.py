@@ -12,12 +12,21 @@ request area
 
 
 class PutProductReqBody(AdminBase):
-    # 관리자 수정 요청 시 클라이언트에서 보내는 request body
+    # 파트너/관리자 작품 수정 request body
+    author_nickname: Optional[str] = Field(
+        default=None, examples=["작가명"], description="작가명"
+    )
+    cover_image_file_id: Optional[int] = Field(
+        default=None, examples=[123], description="표지 이미지 파일 ID"
+    )
     title: Optional[str] = Field(
         default=None, examples=["작품명"], description="작품명"
     )
+    synopsis: Optional[str] = Field(
+        default=None, examples=["작품 소개"], description="작품 소개"
+    )
     ratings_code: Optional[str] = Field(
-        default=None, examples=["all"], description="연령등급(전체-all, 성인-adult)"
+        default=None, examples=["all"], description="연령등급(all, 15, adult)"
     )
     primary_genre_id: Optional[int] = Field(
         default=None, examples=[1], description="1차 장르"
@@ -28,50 +37,55 @@ class PutProductReqBody(AdminBase):
     status_code: Optional[str] = Field(
         default=None,
         examples=["ongoing"],
-        description="연재 상태코드(연재중-ongoing, 휴재중-rest, 완결-end, 연재중지-stop)",
+        description="연재 상태코드(ongoing, rest, end, stop)",
     )
-    uci: Optional[str] = Field(default=None, examples=["uci"], description="uci 코드")
-    isbn: Optional[str] = Field(
-        default=None, examples=["isbn"], description="isbn 코드"
-    )
+    uci: Optional[str] = Field(default=None, examples=["uci"], description="UCI 코드")
+    isbn: Optional[str] = Field(default=None, examples=["isbn"], description="ISBN 코드")
     series_regular_price: Optional[int] = Field(
         default=None, examples=[100], description="연재 가격"
     )
     single_regular_price: Optional[int] = Field(
-        default=None, examples=[100], description="단행본 가격"
+        default=None, examples=[100], description="단행본 소장 가격"
+    )
+    single_rental_price: Optional[int] = Field(
+        default=None, examples=[100], description="단행본 대여 가격"
     )
     cp_company_name: Optional[str] = Field(
-        default=None, examples=[""], description="cp사명, 설정 안하는 경우 빈 문자열"
+        default=None, examples=[""], description="CP명, 미지정이면 빈 문자열"
     )
     monopoly_yn: Optional[str] = Field(
         default=None, examples=["Y"], description="독점 여부"
     )
     open_yn: Optional[str] = Field(
-        default=None,
-        examples=["Y"],
-        description="공개 여부, 작품 블라인드 체크시 N, 체크 해제시 Y",
+        default=None, examples=["Y"], description="공개 여부"
     )
     cp_offered_price: Optional[float] = Field(
         default=None,
         examples=[100],
-        description="cp사 제안 금액, 만원 단위, 100입력시 100만원, cp_id값이 있는 경우 필수",
+        description="CP 제안 금액(만원 단위)",
     )
     cp_settlement_rate: Optional[float] = Field(
         default=None,
         examples=[85],
-        description="cp사-작가 정산시 작가의 정산비, 전체 100을 기준으로 작성해주세요, cp_id값이 있는 경우 필수",
+        description="CP 정산율(0~100)",
+    )
+    free_episode_start_no: Optional[int] = Field(
+        default=None, examples=[1], description="무료회차 시작 번호"
+    )
+    free_episode_end_no: Optional[int] = Field(
+        default=None, examples=[20], description="무료회차 종료 번호"
     )
 
 
 class PutPtnProductSalesReqBody(AdminBase):
-    # 관리자 수정 요청 시 클라이언트에서 보내는 request body
+    # 파트너 정산 수정 request body
     sum_settlement_price_web: Optional[int] = Field(
         default=None, examples=[40000], description="유상 정산액"
     )
     sum_settlement_comped_ticket_price: Optional[int] = Field(
         default=None, examples=[40000], description="무상 정산액"
     )
-    tax_price: Optional[int] = Field(default=None, examples=[40000], description="세액")
+    tax_price: Optional[int] = Field(default=None, examples=[40000], description="원천세")
     settlement_rate: Optional[float] = Field(
         default=None, examples=[70], description="정산율"
     )

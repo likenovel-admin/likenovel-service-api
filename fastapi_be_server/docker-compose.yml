@@ -5,10 +5,12 @@ services:
     container_name: likenovel-mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root1234
-      MYSQL_DATABASE: likenovel
-      MYSQL_USER: ln-admin
-      MYSQL_PASSWORD: likenovel684233^^
+      # NOTE: 로컬 개발용 기본값만 둡니다. 실제 값은 `.env`로 주입하세요.
+      MYSQL_ROOT_PASSWORD: ${LN_LOCAL_MYSQL_ROOT_PASSWORD:-local-root-change-me}
+      MYSQL_DATABASE: ${LN_LOCAL_MYSQL_DATABASE:-likenovel}
+      # 앱에서 이미 사용하는 DB 환경변수(SSOT)와 동일하게 맞춥니다.
+      MYSQL_USER: ${DB_USER_ID:-ln-admin}
+      MYSQL_PASSWORD: ${DB_USER_PW:-local-pass-change-me}
     volumes:
       - ./dist/init:/docker-entrypoint-initdb.d
       - mysql-data:/var/lib/mysql
@@ -18,7 +20,7 @@ services:
     networks:
       - likenovel-network
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "ln-admin", "-plikenovel684233^^"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u \"$${MYSQL_USER}\" -p\"$${MYSQL_PASSWORD}\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -53,10 +55,10 @@ services:
     environment:
       KC_DB: mysql
       KC_DB_URL: jdbc:mysql://mysql:3306/keycloak
-      KC_DB_USERNAME: ln-admin
-      KC_DB_PASSWORD: likenovel684233^^
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin1234
+      KC_DB_USERNAME: ${DB_USER_ID:-ln-admin}
+      KC_DB_PASSWORD: ${DB_USER_PW:-local-pass-change-me}
+      KEYCLOAK_ADMIN: ${KC_ADMIN_USERNAME:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:-local-admin-change-me}
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_SSL_REQUIRED: "none"
@@ -102,7 +104,7 @@ services:
     image: getmeili/meilisearch:v1.7
     container_name: likenovel-meilisearch
     environment:
-      - MEILI_MASTER_KEY=VP0MJ1Ee4Dfk10sAUK_GPOlTkSCKoCxvRE1hDEkOaYs
+      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-local-master-key-change-me}
     command: ["meilisearch", "--http-addr", "0.0.0.0:7700"]
     networks:
       - likenovel-network
@@ -115,8 +117,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env # 환경변수 파일 명시적으로 지정
-    expose:
-      - "8000" # 외부 포트 직접 열지 않음
+    # NOTE:
+    # - 로컬 개발(특히 Windows)에서 nginx 인증서 마운트가 불가능한 경우가 많아,
+    #   API 컨테이너 포트를 직접 호스트로 노출합니다.
+    ports:
+      - "8000:8000"
     volumes:
       - .:/app
     command: ["/app/dist/batch/start-cron.sh", "uvicorn", "app.main:be_app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -140,6 +145,12 @@ services:
   nginx:
     image: nginx:latest
     container_name: likenovel-nginx
+    # NOTE:
+    # - 아래 인증서 경로는 Linux 서버(/etc/letsencrypt/*) 기준입니다.
+    # - Windows 로컬에서는 해당 경로가 없어 컨테이너가 실패할 수 있으니,
+    #   필요할 때만 profile로 실행합니다: `--profile linux-nginx`
+    profiles:
+      - linux-nginx
     ports:
       - "8800:443" # HTTPS는 8800 포트로 접근
     volumes:

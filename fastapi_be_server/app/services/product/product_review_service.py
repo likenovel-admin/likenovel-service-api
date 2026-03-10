@@ -12,6 +12,7 @@ from datetime import datetime
 
 import app.schemas.product_review as product_review_schema
 import app.services.common.statistics_service as statistics_service
+import app.services.event.event_reward_service as event_reward_service
 from app.exceptions import CustomResponseException
 from app.utils.query import (
     build_insert_query,
@@ -355,6 +356,13 @@ async def post_product_review(
     await statistics_service.insert_site_statistics_log(
         db=db, type="active", user_id=user_id
     )
+
+    try:
+        await event_reward_service.check_and_grant_event_reward(
+            event_type="add-comment", user_id=user_id, product_id=req_body.product_id, db=db
+        )
+    except Exception as e:
+        logger.error(f"Event reward check failed: {e}")
 
     return {"result": req_body}
 

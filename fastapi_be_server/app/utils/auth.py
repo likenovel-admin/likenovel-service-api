@@ -112,27 +112,41 @@ async def chk_revoked_token(token: str, decoded_token: dict):
             message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
         )
 
-    try:
-        async with AsyncClient() as ac:
-            res = await ac.post(url=url, data=data, auth=auth)
-            res.raise_for_status()
+    last_exc = None
+    for attempt in range(3):
+        try:
+            async with AsyncClient(timeout=5.0) as ac:
+                res = await ac.post(url=url, data=data, auth=auth)
+                res.raise_for_status()
 
-            res_json = res.json()
+                res_json = res.json()
 
-            logging.getLogger("log_test").info({"res_json": res_json})
+                logging.getLogger("log_test").info({"res_json": res_json})
 
-            if not res_json.get("active", False):
-                raise CustomResponseException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
-                )
+                if not res_json.get("active", False):
+                    raise CustomResponseException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+                    )
 
-            return res_json
-    except HTTPStatusError:
-        raise CustomResponseException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
-        )
+                return res_json
+        except HTTPStatusError:
+            raise CustomResponseException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+            )
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                await asyncio.sleep(0.3 * (attempt + 1))
+
+    logging.getLogger(__name__).error(
+        f"[auth] Keycloak introspect failed after 3 retries: {last_exc}"
+    )
+    raise CustomResponseException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+    )
 
 
 async def chk_jwt_token(token: str):
@@ -151,6 +165,8 @@ async def chk_jwt_token(token: str):
             algorithms=settings.KC_PK_ALGORITHMS,
             issuer=settings.KC_ISSUER_BASE_URL,
             audience=settings.KC_AUDIENCE,
+            # 컨테이너/호스트 시계 미세 오차(수초)로 인한 iat 검증 실패 방지
+            leeway=5,
         )
 
         await chk_revoked_token(token, decoded_token)

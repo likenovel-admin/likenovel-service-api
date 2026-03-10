@@ -27,6 +27,71 @@ logger = logging.getLogger("admin_app")
 관리자 시스템/키워드 관리 서비스 함수 모음
 """
 
+DEFAULT_PUBLISHER_PROMOTION_TITLE = "출판사 프로모션"
+
+
+def _normalize_required_title(title: str | None) -> str:
+    normalized = (title or "").strip()
+    if normalized == "":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="구좌명을 입력해주세요.",
+        )
+    if len(normalized) > 100:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="구좌명은 100자 이하로 입력해주세요.",
+        )
+    return normalized
+
+
+async def publisher_promotion_config(db: AsyncSession):
+    query = text("""
+        SELECT *
+        FROM tb_publisher_promotion_config
+        WHERE id = 1
+    """)
+    result = await db.execute(query, {})
+    row = result.mappings().one_or_none()
+
+    if row is None:
+        return {"data": {"title": DEFAULT_PUBLISHER_PROMOTION_TITLE}}
+
+    return build_detail_response(row)
+
+
+async def put_publisher_promotion_config(
+    req_body: admin_schema.PutPublisherPromotionConfigReqBody, db: AsyncSession
+):
+    title = _normalize_required_title(req_body.title)
+
+    query = text("""
+        SELECT id
+        FROM tb_publisher_promotion_config
+        WHERE id = 1
+    """)
+    result = await db.execute(query, {})
+    row = result.mappings().one_or_none()
+
+    if row is None:
+        query = text("""
+            INSERT INTO tb_publisher_promotion_config
+                (id, title, created_id, updated_id)
+            VALUES
+                (1, :title, 0, 0)
+        """)
+        await db.execute(query, {"title": title})
+    else:
+        query = text("""
+            UPDATE tb_publisher_promotion_config
+            SET title = :title,
+                updated_id = 0
+            WHERE id = :id
+        """)
+        await db.execute(query, {"id": row.get("id"), "title": title})
+
+    return {"result": {"title": title}}
+
 
 async def keywords_category_list(db: AsyncSession):
     """

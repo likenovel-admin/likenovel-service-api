@@ -8,6 +8,7 @@ from typing import Optional
 from app.const import LOGGER_TYPE, settings, ErrorMessages
 from app.exceptions import CustomResponseException
 import app.schemas.product as product_schema
+import app.services.event.event_reward_service as event_reward_service
 from app.utils.query import (
     get_file_path_sub_query,
     get_badge_image_sub_query,
@@ -707,6 +708,17 @@ async def post_products_comments_episodes_episode_id(
                          """)
 
         await db.execute(query, {"episode_id": episode_id_to_int})
+
+        try:
+            comment_product_query = text("SELECT product_id FROM tb_product_episode WHERE episode_id = :episode_id")
+            comment_product_result = await db.execute(comment_product_query, {"episode_id": episode_id_to_int})
+            comment_product = comment_product_result.mappings().first()
+            if comment_product:
+                await event_reward_service.check_and_grant_event_reward(
+                    event_type="add-comment", user_id=user_id, product_id=comment_product["product_id"], db=db
+                )
+        except Exception as e:
+            error_logger.error(f"Event reward check failed: {e}")
 
         query = text("""
                          select count_comment

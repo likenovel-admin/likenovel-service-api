@@ -8,7 +8,7 @@ __pycache__/
 /app/routers/__pycache__/
 /app/schemas/__pycache__/
 
-# ?섍꼍蹂??.env)???덈? 而ㅻ컠?섏? ?딆뒿?덈떎.
+# 로컬/운영 환경 값(.env)은 절대 커밋하지 않습니다.
 .env
 .env.*
 !.env.example

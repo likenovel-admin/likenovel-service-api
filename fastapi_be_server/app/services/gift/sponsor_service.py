@@ -10,6 +10,7 @@ from app.utils.common import handle_exceptions
 import app.services.common.statistics_service as statistics_service
 import app.schemas.author as author_schema
 import app.schemas.product as product_schema
+from app.services.order.product_order_service import create_product_order_with_items
 
 logger = logging.getLogger(__name__)
 
@@ -145,20 +146,21 @@ async def sponsor_author(
         },
     )
 
-    # 정산용 일별 판매 데이터 기록 - 작가 후원
-    query = text("""
-        INSERT INTO tb_batch_daily_sales_summary
-        (item_type, item_name, item_price, quantity, device_type, user_id, order_date, product_id, episode_id, author_id, pay_type, created_date)
-        VALUES ('sponsorship', :item_name, :item_price, 1, 'web', :user_id, NOW(), 0, 0, :author_id, 'cash', NOW())
-    """)
-    await db.execute(
-        query,
-        {
-            "item_name": f"{author_nickname} 작가 후원",
-            "item_price": req_body.donation_price,
-            "user_id": user_id,
-            "author_id": author_id,
-        },
+    await create_product_order_with_items(
+        db=db,
+        user_id=user_id,
+        pay_type="sponsorship",
+        device_type="web",
+        created_id=settings.DB_DML_DEFAULT_ID,
+        items=[
+            {
+                "item_name": f"{author_nickname} 작가 후원",
+                "item_price": req_body.donation_price,
+                "quantity": 1,
+                "product_id": 0,
+                "episode_id": 0,
+            }
+        ],
     )
 
     # 통계 로그 추가
@@ -341,21 +343,21 @@ async def sponsor_product(
         },
     )
 
-    # 정산용 일별 판매 데이터 기록
-    query = text("""
-        INSERT INTO tb_batch_daily_sales_summary
-        (item_type, item_name, item_price, quantity, device_type, user_id, order_date, product_id, episode_id, author_id, pay_type, created_date)
-        VALUES ('sponsorship', :item_name, :item_price, 1, 'web', :user_id, NOW(), :product_id, 0, :author_id, 'cash', NOW())
-    """)
-    await db.execute(
-        query,
-        {
-            "item_name": f"{product_title} 후원",
-            "item_price": req_body.donation_price,
-            "user_id": user_id,
-            "product_id": product_id,
-            "author_id": author_id,
-        },
+    await create_product_order_with_items(
+        db=db,
+        user_id=user_id,
+        pay_type="sponsorship",
+        device_type="web",
+        created_id=settings.DB_DML_DEFAULT_ID,
+        items=[
+            {
+                "item_name": f"{product_title} 후원",
+                "item_price": req_body.donation_price,
+                "quantity": 1,
+                "product_id": product_id,
+                "episode_id": 0,
+            }
+        ],
     )
 
     # 통계 로그 추가

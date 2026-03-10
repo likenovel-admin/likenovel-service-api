@@ -27,7 +27,12 @@ router = APIRouter(prefix="/products")
             "description": "Successful Response",
             "content": {
                 "application/json": {
-                    "examples": {"success_1": {"summary": "OK", "value": None}}
+                    "examples": {
+                        "success_1": {
+                            "summary": "생성된 작품 id 반환",
+                            "value": {"data": {"product_id": 1}},
+                        }
+                    }
                 }
             },
         },

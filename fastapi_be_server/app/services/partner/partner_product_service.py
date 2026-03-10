@@ -7,7 +7,11 @@ from datetime import datetime
 
 from app.exceptions import CustomResponseException
 import app.schemas.partner as partner_schema
-from app.utils.query import build_update_query, get_pagination_params
+from app.utils.query import (
+    build_update_query,
+    get_file_path_sub_query,
+    get_pagination_params,
+)
 from app.utils.response import build_paginated_response, check_exists_or_404
 from app.const import CommonConstants
 from app.const import ErrorMessages
@@ -22,6 +26,7 @@ partner 작품 관리 서비스 함수 모음
 async def product_list(
     contract_type: str,
     status_code: str,
+    has_episode_apply_yn: str,
     search_target: str,
     search_word: str,
     page: int,
@@ -114,6 +119,20 @@ async def product_list(
                      AND a.status_code = '{status_code}'
                      """
 
+    if has_episode_apply_yn == "Y":
+        where += """
+                     AND EXISTS (
+                         SELECT 1
+                           FROM tb_product_episode pe
+                           INNER JOIN tb_product_episode_apply pea
+                              ON pea.episode_id = pe.episode_id
+                             AND pea.use_yn = 'Y'
+                             AND pea.status_code = 'review'
+                          WHERE pe.product_id = a.product_id
+                            AND pe.use_yn = 'Y'
+                     )
+                 """
+
     if search_word != "":
         if search_target == CommonConstants.SEARCH_PRODUCT_TITLE:
             where += f"""
@@ -147,35 +166,39 @@ async def product_list(
                           )
                           """
 
+    sales_summary_cte = ""
+    sales_summary_join = ""
+
     # 회차별 매출 페이지에서 호출 시 매출 데이터 필터링
     if from_episode_sales_page:
         sales_date_condition = ""
         if start_date:
-            sales_date_condition += f" AND DATE(sales.created_date) >= '{start_date}'"
+            sales_date_condition += (
+                f" AND sales.created_date >= '{start_date} 00:00:00'"
+            )
         if end_date:
-            sales_date_condition += f" AND DATE(sales.created_date) <= '{end_date}'"
+            sales_date_condition += (
+                f" AND sales.created_date < DATE_ADD('{end_date}', INTERVAL 1 DAY)"
+            )
 
-        where += f"""
-                     AND EXISTS (
-                         SELECT 1
-                         FROM tb_ptn_product_episode_sales sales
-                         WHERE sales.product_id = a.product_id
-                         {sales_date_condition}
-                     )
-                     """
+        sales_summary_cte = f"""
+        ,
+        tmp_episode_sales_product_summary as (
+            select distinct sales.product_id
+            from tb_ptn_product_episode_sales sales
+            where 1=1
+            {sales_date_condition}
+        )
+        """
+        sales_summary_join = """
+        inner join tmp_episode_sales_product_summary eps on eps.product_id = a.product_id
+        """
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
 
     # 전체 개수 구하기
     count_query = text(f"""
-        with tmp_product_episode_summary as (
-            select product_id
-                , count(1) as count_episode
-                , sum(current_count_evaluation) as count_evaluation
-            from tb_batch_daily_product_episode_count_summary
-            group by product_id
-        ),
-        tmp_contract_offer_summary as (
+        with tmp_contract_offer_summary as (
             select z.product_id
                 , y.company_name as cp_company_name
             from tb_product_contract_offer z
@@ -185,9 +208,10 @@ async def product_list(
             where z.use_yn = 'Y'
             and z.author_accept_yn = 'Y'
         )
+        {sales_summary_cte}
         select count(a.product_id) as total_count
         from tb_product a
-        left join tmp_product_episode_summary b on a.product_id = b.product_id
+        {sales_summary_join}
         left join tmp_contract_offer_summary d on a.product_id = d.product_id
         WHERE 1=1 {where}
         ;
@@ -200,8 +224,8 @@ async def product_list(
         with tmp_product_episode_summary as (
             select product_id
                 , count(1) as count_episode
-                , sum(current_count_evaluation) as count_evaluation
-            from tb_batch_daily_product_episode_count_summary
+            from tb_product_episode
+            where use_yn = 'Y'
             group by product_id
         ),
         tmp_contract_offer_summary as (
@@ -214,9 +238,22 @@ async def product_list(
             where z.use_yn = 'Y'
             and z.author_accept_yn = 'Y'
         )
+        {sales_summary_cte}
+        ,
+        filtered_products as (
+            select a.product_id
+                , a.created_date
+            from tb_product a
+            {sales_summary_join}
+            left join tmp_contract_offer_summary d on a.product_id = d.product_id
+            WHERE 1=1 {where}
+            ORDER BY a.created_date DESC
+            {limit_clause}
+        )
         select a.product_id
             , a.title
             , a.author_name as author_nickname
+            , a.synopsis_text as synopsis
             , coalesce(b.count_episode, 0) as count_episode
             , case when d.cp_company_name is null then null
                     when d.cp_company_name = '라이크노벨' then '일반'
@@ -241,14 +278,15 @@ async def product_list(
                 and a.sub_genre_id = z.keyword_id) as sub_genre
             , a.sub_genre_id
             , a.single_regular_price
+            , a.single_rental_price
             , a.series_regular_price
             , a.monopoly_yn
-        from tb_product a
+            , {get_file_path_sub_query("a.thumbnail_file_id", "cover_image_path", "cover")}
+        from filtered_products fp
+        inner join tb_product a on a.product_id = fp.product_id
         left join tmp_product_episode_summary b on a.product_id = b.product_id
         left join tmp_contract_offer_summary d on a.product_id = d.product_id
-        WHERE 1=1 {where}
-        ORDER BY a.created_date DESC
-        {limit_clause}
+        ORDER BY fp.created_date DESC
     """)
     result = await db.execute(query, limit_params)
     rows = result.mappings().all()
@@ -273,8 +311,8 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
         with tmp_product_episode_summary as (
             select product_id
                 , count(1) as count_episode
-                , sum(current_count_evaluation) as count_evaluation
-            from tb_batch_daily_product_episode_count_summary
+            from tb_product_episode
+            where use_yn = 'Y'
             group by product_id
         ),
         tmp_contract_offer_summary as (
@@ -291,6 +329,7 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
         )
         select a.product_id
             , a.title
+            , a.synopsis_text as synopsis
             , a.author_name as author_nickname
             , coalesce(b.count_episode, 0) as count_episode
             , case when d.cp_company_name is null then null
@@ -316,9 +355,22 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
                 and a.sub_genre_id = z.keyword_id) as sub_genre
             , a.sub_genre_id
             , a.single_regular_price
+            , a.single_rental_price
             , a.series_regular_price
+            , a.paid_episode_no
+            , (select min(e.episode_no)
+                 from tb_product_episode e
+                where e.product_id = a.product_id
+                  and e.use_yn = 'Y'
+                  and e.price_type = 'free') as free_episode_start_no
+            , (select max(e.episode_no)
+                 from tb_product_episode e
+                where e.product_id = a.product_id
+                  and e.use_yn = 'Y'
+                  and e.price_type = 'free') as free_episode_end_no
             , a.monopoly_yn
-            , case when a.open_yn = 'Y' then 'N' else 'Y' end as blind_yn
+            , a.blind_yn
+            , {get_file_path_sub_query("a.thumbnail_file_id", "cover_image_path", "cover")}
             {
         ''', case when d.cp_author_profit is null then null else d.cp_author_profit / 100 end as cp_author_profit
             , d.cp_offer_price as cp_contract_price'''
@@ -356,6 +408,7 @@ async def put_product(
 
     if req_body.ratings_code is not None and req_body.ratings_code not in [
         "all",
+        "15",
         "adult",
     ]:
         raise CustomResponseException(
@@ -390,7 +443,7 @@ async def put_product(
         query = text("""
                     select z.keyword_name from tb_standard_keyword z
                         where z.use_yn = 'Y'
-                        and z.major_genre_yn = 'Y'
+                        and z.major_genre_yn = 'N'
                         and :sub_genre_id = z.keyword_id
                     """)
         result = await db.execute(query, {"sub_genre_id": req_body.sub_genre_id})
@@ -406,6 +459,155 @@ async def put_product(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.PRIMARY_SECONDARY_GENRE_SAME,
         )
+
+    query = text("""
+                SELECT uci, isbn, series_regular_price, single_regular_price, single_rental_price
+                  FROM tb_product
+                 WHERE product_id = :product_id
+                 LIMIT 1
+                """)
+    result = await db.execute(query, {"product_id": product_id})
+    product_row = result.mappings().one_or_none()
+    if product_row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_PRODUCT,
+        )
+
+    incoming_uci = req_body.uci.strip() if isinstance(req_body.uci, str) else None
+    incoming_isbn = req_body.isbn.strip() if isinstance(req_body.isbn, str) else None
+    current_uci = (product_row.get("uci") or "").strip()
+    current_isbn = (product_row.get("isbn") or "").strip()
+
+    next_uci = incoming_uci if req_body.uci is not None else current_uci
+    next_isbn = incoming_isbn if req_body.isbn is not None else current_isbn
+
+    if not next_uci and not next_isbn:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.UCI_OR_ISBN_REQUIRED,
+        )
+
+    current_series_regular_price = int(product_row.get("series_regular_price") or 0)
+    current_single_regular_price = int(product_row.get("single_regular_price") or 0)
+    current_single_rental_price = int(product_row.get("single_rental_price") or 0)
+
+    next_series_regular_price = (
+        int(req_body.series_regular_price)
+        if req_body.series_regular_price is not None
+        else current_series_regular_price
+    )
+    next_single_regular_price = (
+        int(req_body.single_regular_price)
+        if req_body.single_regular_price is not None
+        else current_single_regular_price
+    )
+    next_single_rental_price = (
+        int(req_body.single_rental_price)
+        if req_body.single_rental_price is not None
+        else current_single_rental_price
+    )
+
+    for field_name, value in [
+        ("연재 가격", next_series_regular_price),
+        ("단행본 소장가격", next_single_regular_price),
+        ("단행본 대여가격", next_single_rental_price),
+    ]:
+        if value < 0:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=f"{field_name}은(는) 0 이상이어야 합니다.",
+            )
+
+    is_next_serial_product = next_series_regular_price > 0
+    is_next_volume_product = (
+        next_series_regular_price == 0 and next_single_regular_price > 0
+    )
+
+    if is_next_serial_product:
+        if next_series_regular_price != 100:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="연재 가격은 100원으로 고정됩니다.",
+            )
+        if next_single_regular_price > 0 or next_single_rental_price > 0:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="연재 작품에는 단행본 소장/대여 가격을 함께 저장할 수 없습니다.",
+            )
+    elif is_next_volume_product:
+        if next_single_rental_price <= 0:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="단행본에는 대여가격을 함께 입력해주세요.",
+            )
+    elif next_single_rental_price > 0:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="단행본 소장가격 없이 대여가격만 저장할 수 없습니다.",
+        )
+
+    next_price_type = "paid"
+    free_episode_start_no = req_body.free_episode_start_no
+    free_episode_end_no = req_body.free_episode_end_no
+    fields_set = getattr(req_body, "model_fields_set", set()) or set()
+    has_free_episode_range_input = (
+        "free_episode_start_no" in fields_set or "free_episode_end_no" in fields_set
+    )
+    has_free_episode_range = (
+        free_episode_start_no is not None and free_episode_end_no is not None
+    )
+    clear_free_episode_range = (
+        has_free_episode_range_input
+        and free_episode_start_no is None
+        and free_episode_end_no is None
+    )
+
+    if has_free_episode_range_input and not has_free_episode_range and not clear_free_episode_range:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="무료회차 시작/종료 회차를 모두 입력해주세요.",
+        )
+
+    if has_free_episode_range:
+        if free_episode_start_no is None or free_episode_end_no is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="무료회차 시작/종료 회차를 모두 입력해주세요.",
+            )
+        if (
+            free_episode_start_no <= 0
+            or free_episode_end_no <= 0
+            or free_episode_start_no > 999
+            or free_episode_end_no > 999
+        ):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="무료회차 범위는 1~999 사이 숫자만 입력 가능합니다.",
+            )
+        if free_episode_start_no > free_episode_end_no:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="무료회차 시작 번호는 종료 번호보다 클 수 없습니다.",
+            )
+        query = text("""
+                     select max(episode_no) as max_episode_no
+                       from tb_product_episode
+                      where product_id = :product_id
+                        and use_yn = 'Y'
+                     """)
+        result = await db.execute(query, {"product_id": product_id})
+        row = result.mappings().one_or_none()
+        max_episode_no = row.get("max_episode_no") if row else None
+        if (
+            max_episode_no is not None
+            and max_episode_no > 0
+            and free_episode_end_no > int(max_episode_no)
+        ):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="무료회차 종료 번호는 현재 등록된 마지막 회차를 초과할 수 없습니다.",
+            )
 
     if req_body.cp_company_name is not None:
         if req_body.cp_offered_price is not None and req_body.cp_offered_price < 0:
@@ -442,7 +644,10 @@ async def put_product(
     set_clause, params = build_update_query(
         req_body,
         allowed_fields=[
+            "author_nickname",
+            "cover_image_file_id",
             "title",
+            "synopsis",
             "ratings_code",
             "primary_genre_id",
             "sub_genre_id",
@@ -451,10 +656,31 @@ async def put_product(
             "isbn",
             "series_regular_price",
             "single_regular_price",
+            "single_rental_price",
             "monopoly_yn",
             "open_yn",
         ],
+        field_mapping={
+            "author_nickname": "author_name",
+            "cover_image_file_id": "thumbnail_file_id",
+            "synopsis": "synopsis_text",
+        },
     )
+    # open_yn 변경 시 blind_yn도 동기화
+    if hasattr(req_body, 'open_yn') and req_body.open_yn is not None:
+        set_clause = f"{set_clause}, blind_yn = :blind_yn"
+        params["blind_yn"] = "Y" if req_body.open_yn == "N" else "N"
+
+    set_clause = f"{set_clause}, price_type = :price_type"
+    params["price_type"] = next_price_type
+    if has_free_episode_range or clear_free_episode_range:
+        set_clause = f"{set_clause}, paid_episode_no = :paid_episode_no"
+        if next_price_type == "paid":
+            params["paid_episode_no"] = (
+                free_episode_end_no + 1 if has_free_episode_range else 1
+            )
+        else:
+            params["paid_episode_no"] = None
     params["product_id"] = product_id
 
     query = text(f"UPDATE tb_product SET {set_clause} WHERE product_id = :product_id")
@@ -517,6 +743,37 @@ async def put_product(
                          update tb_product_contract_offer set use_yn = 'N' where product_id = :product_id
                          """)
         await db.execute(query, {"product_id": product_id})
+
+    if has_free_episode_range or clear_free_episode_range:
+        if has_free_episode_range:
+            query = text("""
+                         UPDATE tb_product_episode
+                            SET price_type = CASE
+                                WHEN episode_no BETWEEN :free_episode_start_no AND :free_episode_end_no THEN 'free'
+                                ELSE 'paid'
+                            END,
+                                updated_id = :updated_id
+                          WHERE product_id = :product_id
+                            AND use_yn = 'Y'
+                         """)
+            await db.execute(
+                query,
+                {
+                    "product_id": product_id,
+                    "free_episode_start_no": free_episode_start_no,
+                    "free_episode_end_no": free_episode_end_no,
+                    "updated_id": -1,
+                },
+            )
+        else:
+            query = text("""
+                         UPDATE tb_product_episode
+                            SET price_type = 'paid',
+                                updated_id = :updated_id
+                          WHERE product_id = :product_id
+                            AND use_yn = 'Y'
+                         """)
+            await db.execute(query, {"product_id": product_id, "updated_id": -1})
 
     return {"result": req_body}
 

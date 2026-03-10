@@ -50,20 +50,20 @@ select m.*
          , a.contract_type
          , a.cp_company_name
          , a.paid_open_date
-         , c.count_total_sales
-         , c.sum_total_sales_price
-         , c.count_normal_sales
-         , c.sum_normal_price
-         , c.count_discount_sales
-         , c.sum_discount_price
-         , c.count_paid_ticket_sales
-         , c.sum_paid_ticket_price
-         , c.count_comped_ticket_sales
-         , c.sum_comped_ticket_price
-         , c.count_free_ticket_sales
-         , c.sum_free_ticket_price
-         , d.count_total_refund
-         , d.sum_total_refund_price
+         , coalesce(c.count_total_sales, 0) as count_total_sales
+         , coalesce(c.sum_total_sales_price, 0) as sum_total_sales_price
+         , coalesce(c.count_normal_sales, 0) as count_normal_sales
+         , coalesce(c.sum_normal_price, 0) as sum_normal_price
+         , coalesce(c.count_discount_sales, 0) as count_discount_sales
+         , coalesce(c.sum_discount_price, 0) as sum_discount_price
+         , coalesce(c.count_paid_ticket_sales, 0) as count_paid_ticket_sales
+         , coalesce(c.sum_paid_ticket_price, 0) as sum_paid_ticket_price
+         , coalesce(c.count_comped_ticket_sales, 0) as count_comped_ticket_sales
+         , coalesce(c.sum_comped_ticket_price, 0) as sum_comped_ticket_price
+         , coalesce(c.count_free_ticket_sales, 0) as count_free_ticket_sales
+         , coalesce(c.sum_free_ticket_price, 0) as sum_free_ticket_price
+         , coalesce(d.count_total_refund, 0) as count_total_refund
+         , coalesce(d.sum_total_refund_price, 0) as sum_total_refund_price
          , 0 as created_id
          , 0 as updated_id
       from tb_batch_daily_product_info_summary a
@@ -73,8 +73,8 @@ select m.*
       left join tmp_product_episode_refund_summary d on a.product_id = d.product_id
        and b.episode_id = d.episode_id
     ) m
- where m.count_total_sales is not null
-   and m.count_total_refund is not null
+ where m.count_total_sales > 0
+    or m.count_total_refund > 0
 ;
 
 -- 일별 이용권 상세 (당일 데이터 삭제 후 재생성)
@@ -228,7 +228,7 @@ select a.product_id
 truncate tb_ptn_product_discovery_statistics
 ;
 
-insert into tb_ptn_product_discovery_statistics (product_id, title, author_nickname, count_episode, count_hit, count_hit_per_episode, count_read_user, count_bookmark, count_unbookmark, count_recommend, count_evaluation, count_cp_hit, reading_rate, writing_count_per_week, count_interest_sustain, count_interest_loss, primary_reader_group1, primary_reader_group2, primary_genre, sub_genre, score1, score2, score3, created_id, updated_id)
+insert into tb_ptn_product_discovery_statistics (product_id, title, author_nickname, count_episode, count_hit, count_hit_per_episode, count_read_user, count_bookmark, count_unbookmark, count_recommend, count_evaluation, count_cp_hit, reading_rate, writing_count_per_week, count_interest_sustain, count_interest_loss, primary_reader_group1, primary_reader_group2, primary_genre, sub_genre, score1, score2, score3, created_id, updated_id, created_date, updated_date)
 select a.product_id
      , a.title
      , a.author_nickname
@@ -254,11 +254,22 @@ select a.product_id
      , d.score3
      , 0 as created_id
      , 0 as updated_id
+     , a.publish_date
+     , coalesce(p.last_episode_date, a.publish_date)
   from tb_batch_daily_product_info_summary a
+ inner join tb_product p on a.product_id = p.product_id
  inner join tb_batch_daily_product_count_summary b on a.product_id = b.product_id
  inner join tb_product_trend_index c on a.product_id = c.product_id
- inner join tb_cms_product_evaluation d on a.product_id = d.product_id
-   and d.evaluation_yn = 'Y'
+ inner join (
+    select e1.product_id, e1.score1, e1.score2, e1.score3
+      from tb_cms_product_evaluation e1
+     inner join (
+        select product_id, max(id) as max_id
+          from tb_cms_product_evaluation
+         where evaluation_yn = 'Y'
+         group by product_id
+     ) e2 on e1.id = e2.max_id
+ ) d on a.product_id = d.product_id
 ;
 
 -- 작품별 월매출 및 월별 정산용 임시 합산 (당일 데이터 삭제 후 재생성)
@@ -322,53 +333,53 @@ select m.*
          group by product_id
     )
     select a.product_id
-         , b.sum_normal_price_web
-         , b.sum_normal_price_playstore
-         , b.sum_normal_price_ios
-         , b.sum_normal_price_onestore
-         , b.sum_discount_price_web
-         , b.sum_discount_price_playstore
-         , b.sum_discount_price_ios
-         , b.sum_discount_price_onestore
-         , b.sum_paid_ticket_price_web
-         , b.sum_paid_ticket_price_playstore
-         , b.sum_paid_ticket_price_ios
-         , b.sum_paid_ticket_price_onestore
-         , b.sum_comped_ticket_price_web
-         , b.sum_comped_ticket_price_playstore
-         , b.sum_comped_ticket_price_ios
-         , b.sum_comped_ticket_price_onestore
-         , b.sum_free_ticket_price_web
-         , b.sum_free_ticket_price_playstore
-         , b.sum_free_ticket_price_ios
-         , b.sum_free_ticket_price_onestore
-         , c.sum_refund_normal_price_web
-         , c.sum_refund_normal_price_playstore
-         , c.sum_refund_normal_price_ios
-         , c.sum_refund_normal_price_onestore
-         , c.sum_refund_discount_price_web
-         , c.sum_refund_discount_price_playstore
-         , c.sum_refund_discount_price_ios
-         , c.sum_refund_discount_price_onestore
-         , c.sum_refund_paid_ticket_price_web
-         , c.sum_refund_paid_ticket_price_playstore
-         , c.sum_refund_paid_ticket_price_ios
-         , c.sum_refund_paid_ticket_price_onestore
-         , c.sum_refund_comped_ticket_price_web
-         , c.sum_refund_comped_ticket_price_playstore
-         , c.sum_refund_comped_ticket_price_ios
-         , c.sum_refund_comped_ticket_price_onestore
-         , c.sum_refund_free_ticket_price_web
-         , c.sum_refund_free_ticket_price_playstore
-         , c.sum_refund_free_ticket_price_ios
-         , c.sum_refund_free_ticket_price_onestore
+         , coalesce(b.sum_normal_price_web, 0) as sum_normal_price_web
+         , coalesce(b.sum_normal_price_playstore, 0) as sum_normal_price_playstore
+         , coalesce(b.sum_normal_price_ios, 0) as sum_normal_price_ios
+         , coalesce(b.sum_normal_price_onestore, 0) as sum_normal_price_onestore
+         , coalesce(b.sum_discount_price_web, 0) as sum_discount_price_web
+         , coalesce(b.sum_discount_price_playstore, 0) as sum_discount_price_playstore
+         , coalesce(b.sum_discount_price_ios, 0) as sum_discount_price_ios
+         , coalesce(b.sum_discount_price_onestore, 0) as sum_discount_price_onestore
+         , coalesce(b.sum_paid_ticket_price_web, 0) as sum_paid_ticket_price_web
+         , coalesce(b.sum_paid_ticket_price_playstore, 0) as sum_paid_ticket_price_playstore
+         , coalesce(b.sum_paid_ticket_price_ios, 0) as sum_paid_ticket_price_ios
+         , coalesce(b.sum_paid_ticket_price_onestore, 0) as sum_paid_ticket_price_onestore
+         , coalesce(b.sum_comped_ticket_price_web, 0) as sum_comped_ticket_price_web
+         , coalesce(b.sum_comped_ticket_price_playstore, 0) as sum_comped_ticket_price_playstore
+         , coalesce(b.sum_comped_ticket_price_ios, 0) as sum_comped_ticket_price_ios
+         , coalesce(b.sum_comped_ticket_price_onestore, 0) as sum_comped_ticket_price_onestore
+         , coalesce(b.sum_free_ticket_price_web, 0) as sum_free_ticket_price_web
+         , coalesce(b.sum_free_ticket_price_playstore, 0) as sum_free_ticket_price_playstore
+         , coalesce(b.sum_free_ticket_price_ios, 0) as sum_free_ticket_price_ios
+         , coalesce(b.sum_free_ticket_price_onestore, 0) as sum_free_ticket_price_onestore
+         , coalesce(c.sum_refund_normal_price_web, 0) as sum_refund_normal_price_web
+         , coalesce(c.sum_refund_normal_price_playstore, 0) as sum_refund_normal_price_playstore
+         , coalesce(c.sum_refund_normal_price_ios, 0) as sum_refund_normal_price_ios
+         , coalesce(c.sum_refund_normal_price_onestore, 0) as sum_refund_normal_price_onestore
+         , coalesce(c.sum_refund_discount_price_web, 0) as sum_refund_discount_price_web
+         , coalesce(c.sum_refund_discount_price_playstore, 0) as sum_refund_discount_price_playstore
+         , coalesce(c.sum_refund_discount_price_ios, 0) as sum_refund_discount_price_ios
+         , coalesce(c.sum_refund_discount_price_onestore, 0) as sum_refund_discount_price_onestore
+         , coalesce(c.sum_refund_paid_ticket_price_web, 0) as sum_refund_paid_ticket_price_web
+         , coalesce(c.sum_refund_paid_ticket_price_playstore, 0) as sum_refund_paid_ticket_price_playstore
+         , coalesce(c.sum_refund_paid_ticket_price_ios, 0) as sum_refund_paid_ticket_price_ios
+         , coalesce(c.sum_refund_paid_ticket_price_onestore, 0) as sum_refund_paid_ticket_price_onestore
+         , coalesce(c.sum_refund_comped_ticket_price_web, 0) as sum_refund_comped_ticket_price_web
+         , coalesce(c.sum_refund_comped_ticket_price_playstore, 0) as sum_refund_comped_ticket_price_playstore
+         , coalesce(c.sum_refund_comped_ticket_price_ios, 0) as sum_refund_comped_ticket_price_ios
+         , coalesce(c.sum_refund_comped_ticket_price_onestore, 0) as sum_refund_comped_ticket_price_onestore
+         , coalesce(c.sum_refund_free_ticket_price_web, 0) as sum_refund_free_ticket_price_web
+         , coalesce(c.sum_refund_free_ticket_price_playstore, 0) as sum_refund_free_ticket_price_playstore
+         , coalesce(c.sum_refund_free_ticket_price_ios, 0) as sum_refund_free_ticket_price_ios
+         , coalesce(c.sum_refund_free_ticket_price_onestore, 0) as sum_refund_free_ticket_price_onestore
          , 0 as created_id
          , 0 as updated_id
       from tb_batch_daily_product_info_summary a
       left join tmp_product_sales_daily_summary b on a.product_id = b.product_id
       left join tmp_product_refund_daily_summary c on a.product_id = c.product_id
       where b.count_total_sales is not null
-         and c.count_total_refund is not null
+         or c.count_total_refund is not null
     ) m
 ;
 
@@ -426,4 +437,3 @@ update tb_cms_batch_job_process a
 ;
 
 commit;
-

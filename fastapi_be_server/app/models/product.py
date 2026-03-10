@@ -1,7 +1,7 @@
-from sqlalchemy import Integer, String, TIMESTAMP, text, Double
+from sqlalchemy import BigInteger, Date, Double, Integer, String, Text, TIMESTAMP, text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from datetime import datetime
+from datetime import date, datetime
 
 from app.const import settings
 from app.rdb import Base
@@ -92,6 +92,9 @@ class Product(Base):
     open_yn: Mapped[str] = mapped_column(
         String(settings.VARCHAR_YN_SIZE), server_default="N", comment="공개 여부"
     )
+    blind_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE), server_default="N", comment="관리자 블라인드 여부"
+    )
     approval_yn: Mapped[str] = mapped_column(
         String(settings.VARCHAR_YN_SIZE), server_default="N", comment="유료 승인 여부"
     )
@@ -114,6 +117,9 @@ class Product(Base):
     uci: Mapped[str] = mapped_column(String(50), nullable=True, comment="uci 코드")
     single_regular_price: Mapped[int] = mapped_column(
         Integer, server_default="0", comment="단행본 가격"
+    )
+    single_rental_price: Mapped[int] = mapped_column(
+        Integer, server_default="0", comment="단행본 대여 가격"
     )
     series_regular_price: Mapped[int] = mapped_column(
         Integer, server_default="0", comment="연재 가격"
@@ -386,6 +392,54 @@ class ProductPaidApply(Base):
     )
     approval_user_id: Mapped[int] = mapped_column(
         Integer, index=True, nullable=True, comment="승인한 유저 아이디"
+    )
+    approval_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=True, comment="승인 일자"
+    )
+    created_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class ProductEpisodeApply(Base):
+    __tablename__ = "tb_product_episode_apply"  # 회차 심사 신청
+
+    # column
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    episode_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="회차 아이디"
+    )
+    status_code: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_CODE_SIZE),
+        index=True,
+        nullable=False,
+        comment="상태코드 - 심사중, 반려, 승인",
+    )
+    req_user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="신청자 사용자 아이디"
+    )
+    req_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        comment="신청 일자",
+    )
+    use_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE), server_default="Y", comment="사용 여부"
+    )
+    approval_user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=True, comment="승인자 사용자 아이디"
     )
     approval_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=True, comment="승인 일자"
@@ -931,6 +985,404 @@ class ProductEpisodeLike(Base):
     )
     updated_id: Mapped[int] = mapped_column(
         Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class ProductAiMetadata(Base):
+    __tablename__ = "tb_product_ai_metadata"  # 작품 AI 메타데이터
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    protagonist_type: Mapped[str] = mapped_column(
+        String(200), nullable=True, comment="주인공 유형"
+    )
+    protagonist_desc: Mapped[str] = mapped_column(
+        String(500), nullable=True, comment="주인공 설명"
+    )
+    protagonist_current_age_band: Mapped[str] = mapped_column(
+        String(30), nullable=True, comment="주인공 현재 연령대"
+    )
+    protagonist_mental_age_band: Mapped[str] = mapped_column(
+        String(30), nullable=True, comment="주인공 정신연령대"
+    )
+    past_life_age_band: Mapped[str] = mapped_column(
+        String(30), nullable=True, comment="전생 연령대"
+    )
+    regression_type: Mapped[str] = mapped_column(
+        String(30), nullable=True, comment="회귀/빙의/환생/none"
+    )
+    heroine_type: Mapped[str] = mapped_column(
+        String(200), nullable=True, comment="히로인 유형"
+    )
+    heroine_weight: Mapped[str] = mapped_column(
+        String(50), nullable=True, comment="히로인 비중"
+    )
+    romance_chemistry_weight: Mapped[str] = mapped_column(
+        String(20), nullable=True, comment="연애 케미 비중"
+    )
+    mood: Mapped[str] = mapped_column(String(200), nullable=True, comment="분위기")
+    pacing: Mapped[str] = mapped_column(
+        String(50), nullable=True, comment="전개 속도"
+    )
+    premise: Mapped[str] = mapped_column(String(500), nullable=True, comment="핵심 소재")
+    hook: Mapped[str] = mapped_column(String(300), nullable=True, comment="1화 훅")
+    episode_summary_text: Mapped[str] = mapped_column(
+        Text, nullable=True, comment="작품요약 (1~10화 3문장 요약)"
+    )
+    protagonist_goal_primary: Mapped[str] = mapped_column(
+        String(30), nullable=True, comment="주인공 대목표"
+    )
+    goal_confidence: Mapped[float] = mapped_column(
+        Double, nullable=True, comment="주인공 대목표 confidence"
+    )
+    overall_confidence: Mapped[float] = mapped_column(
+        Double, nullable=True, comment="전체 confidence"
+    )
+    axis_label_scores: Mapped[str] = mapped_column(
+        String(8000), nullable=True, comment="축별 라벨 점수"
+    )
+    protagonist_material_tags: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="주인공 능력/매력 태그"
+    )
+    worldview_tags: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="세계관 태그"
+    )
+    protagonist_type_tags: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="주인공 타입(타) 태그"
+    )
+    protagonist_job_tags: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="주인공 직업(직) 태그"
+    )
+    axis_style_tags: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="작풍(작) 태그"
+    )
+    axis_romance_tags: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="연애/케미(연) 태그"
+    )
+    themes: Mapped[str] = mapped_column(String(3000), nullable=True, comment="테마 태그")
+    similar_famous: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="유사 유명작"
+    )
+    taste_tags: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="취향 태그"
+    )
+    raw_analysis: Mapped[str] = mapped_column(
+        String(12000), nullable=True, comment="LLM 원본 응답"
+    )
+    analyzed_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=True, comment="분석 일시"
+    )
+    model_version: Mapped[str] = mapped_column(
+        String(50), nullable=True, comment="사용 모델 버전"
+    )
+    analysis_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default="pending",
+        comment="분석 상태 (pending/success/failed)",
+    )
+    analysis_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="분석 시도 누적 횟수"
+    )
+    analysis_error_message: Mapped[str] = mapped_column(
+        String(1000), nullable=True, comment="분석 실패 사유"
+    )
+    exclude_from_recommend_yn: Mapped[str] = mapped_column(
+        String(1),
+        nullable=False,
+        server_default="N",
+        comment="추천 제외 여부",
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class ProductAiOnboarding(Base):
+    __tablename__ = "tb_ai_onboarding_product"  # AI 온보딩 작품 노출 관리
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    sort_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="온보딩 노출 순서"
+    )
+    use_yn: Mapped[str] = mapped_column(
+        String(1),
+        nullable=False,
+        server_default="Y",
+        comment="사용 여부",
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class ProductAiOnboardingTag(Base):
+    __tablename__ = "tb_ai_onboarding_tag"  # AI 온보딩 태그 노출 관리
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tab_key: Mapped[str] = mapped_column(
+        String(20), index=True, nullable=False, comment="탭 키 (hero/worldTone/relation)"
+    )
+    tag_name: Mapped[str] = mapped_column(
+        String(100), nullable=False, comment="태그명"
+    )
+    sort_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="탭 내 노출 순서"
+    )
+    use_yn: Mapped[str] = mapped_column(
+        String(1),
+        nullable=False,
+        server_default="Y",
+        comment="사용 여부",
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class UserAiSignalEvent(Base):
+    __tablename__ = "tb_user_ai_signal_event"  # AI 추천용 유저 행동 원천 이벤트
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="유저 아이디"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    episode_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=True, comment="회차 아이디"
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="이벤트 타입"
+    )
+    session_id: Mapped[str] = mapped_column(
+        String(64), index=True, nullable=True, comment="세션 아이디"
+    )
+    active_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="활성 열람 시간(초)"
+    )
+    scroll_depth: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="스크롤 깊이(0~1)"
+    )
+    progress_ratio: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="진행률(0~1)"
+    )
+    next_available_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N", comment="다음화 존재 여부"
+    )
+    latest_episode_reached_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N", comment="최신화 도달 여부"
+    )
+    event_payload: Mapped[str] = mapped_column(
+        String(3000), nullable=True, comment="추가 이벤트 페이로드"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class UserAiSignalEventDaily(Base):
+    __tablename__ = "tb_user_ai_signal_event_daily"  # AI 추천용 유저 행동 일단위 집계
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    stat_date: Mapped[date] = mapped_column(
+        Date, index=True, nullable=False, comment="집계일"
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="유저 아이디"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="이벤트 타입"
+    )
+    event_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="이벤트 건수"
+    )
+    sum_active_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="활성 열람 시간 합계(초)"
+    )
+    avg_scroll_depth: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="평균 스크롤 깊이"
+    )
+    avg_progress_ratio: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="평균 진행률"
+    )
+    latest_episode_reached_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="최신화 도달 건수"
+    )
+    revisit_24h_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="24시간 내 재방문 건수"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class UserAiSignalEventWeekly(Base):
+    __tablename__ = "tb_user_ai_signal_event_weekly"  # AI 추천용 유저 행동 주단위 집계
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    week_start_date: Mapped[date] = mapped_column(
+        Date, index=True, nullable=False, comment="주 시작일(월요일)"
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="유저 아이디"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="이벤트 타입"
+    )
+    event_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="이벤트 건수"
+    )
+    sum_active_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="활성 열람 시간 합계(초)"
+    )
+    avg_scroll_depth: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="평균 스크롤 깊이"
+    )
+    avg_progress_ratio: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="평균 진행률"
+    )
+    latest_episode_reached_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="최신화 도달 건수"
+    )
+    revisit_24h_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="24시간 내 재방문 건수"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class UserTasteFactorScore(Base):
+    __tablename__ = "tb_user_taste_factor_score"  # 유저 취향 축 점수
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="유저 아이디"
+    )
+    factor_type: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="축 타입"
+    )
+    factor_key: Mapped[str] = mapped_column(
+        String(120), nullable=False, comment="축 키"
+    )
+    score: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="점수"
+    )
+    signal_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="반영 신호 수"
+    )
+    last_event_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=True, comment="최종 반영 이벤트 시각"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiSlotServingLog(Base):
+    __tablename__ = "tb_ai_slot_serving_log"  # AI 추천 구좌 노출/성과 로그
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="유저 아이디"
+    )
+    slot_type: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="구좌 타입"
+    )
+    slot_key: Mapped[str] = mapped_column(
+        String(100), nullable=True, comment="구좌 키"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    served_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    clicked_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N", comment="클릭 여부"
+    )
+    continued_3ep_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N", comment="3화 연독 여부"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiSignalRetentionPolicy(Base):
+    __tablename__ = "tb_ai_signal_retention_policy"  # AI 시그널 원천로그 보관 정책
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="90", comment="원천 이벤트 보관일"
+    )
+    rollup_before_delete_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="Y", comment="삭제 전 롤업 여부"
+    )
+    enabled_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="Y", comment="정책 사용 여부"
+    )
+    last_rollup_date: Mapped[date] = mapped_column(
+        Date, nullable=True, comment="마지막 롤업 기준일"
+    )
+    last_purge_before_date: Mapped[date] = mapped_column(
+        Date, nullable=True, comment="마지막 삭제 기준일"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
     updated_date: Mapped[datetime] = mapped_column(
         TIMESTAMP,

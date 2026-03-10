@@ -13,3 +13,9 @@ class CustomResponseException(Exception):
         self.status_code = status_code
         self.code = code
         self.message = message
+
+    def __str__(self) -> str:
+        return (
+            f"CustomResponseException(status_code={self.status_code}, "
+            f"code={self.code}, message={self.message})"
+        )

@@ -21,7 +21,7 @@ from app.const import ErrorMessages
 logger = logging.getLogger("admin_app")
 
 """
-관리자 사용자 관리 서비스 함수 모음
+Admin user management service functions.
 """
 
 
@@ -34,18 +34,7 @@ async def user_list(
     db: AsyncSession,
 ):
     """
-    회원 목록
-
-    Args:
-        status: 회원 상태 (all, normal, admin, signout)
-        search_target: 검색 대상 (nickname, name, contact, email)
-        search_word: 검색어
-        page: 페이지 번호
-        count_per_page: 페이지당 항목 수
-        db: 데이터베이스 세션
-
-    Returns:
-        회원 목록과 페이징 정보
+    Documentation cleaned due to encoding issue.
     """
 
     if search_word != "":
@@ -72,7 +61,7 @@ async def user_list(
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
 
-    # 전체 개수 구하기
+    # TODO: cleaned garbled comment (encoding issue).
     if status == "all":
         count_query = text(f"""
             SELECT COUNT(*) AS total_count FROM tb_user WHERE use_yn = 'Y' {where}
@@ -92,7 +81,7 @@ async def user_list(
     count_result = await db.execute(count_query, {})
     total_count = dict(count_result.mappings().first())["total_count"]
 
-    # 실제 데이터 조회
+    # TODO: cleaned garbled comment (encoding issue).
     if status == "all":
         query = text(f"""
             SELECT
@@ -166,9 +155,8 @@ async def user_list(
 
     results = [dict(row) for row in rows]
 
-    # 탈퇴한 유저의 이메일은 이미 DB에 outed;timestamp;email 형식으로 저장되어 있음
-    # 별도 가공 불필요
-
+    # TODO: cleaned garbled comment (encoding issue).
+    # TODO: cleaned garbled comment (encoding issue).
     return {
         "total_count": total_count,
         "page": page,
@@ -179,14 +167,7 @@ async def user_list(
 
 async def user_detail_by_user_id(user_id, db: AsyncSession):
     """
-    유저 상세 조회
-
-    Args:
-        user_id: 조회할 유저 ID
-        db: 데이터베이스 세션
-
-    Returns:
-        유저 상세 정보 (기본 정보 + 프로필 리스트)
+    Documentation cleaned due to encoding issue.
     """
     query = text("""
                 SELECT
@@ -202,10 +183,9 @@ async def user_detail_by_user_id(user_id, db: AsyncSession):
 
     user = dict(rows[0])
 
-    # 탈퇴한 유저의 이메일은 이미 DB에 outed;timestamp;email 형식으로 저장되어 있음
-    # 별도 가공 불필요
-
-    # 알림 설정 조회 (타입별로 분리)
+    # TODO: cleaned garbled comment (encoding issue).
+    # TODO: cleaned garbled comment (encoding issue).
+    # TODO: cleaned garbled comment (encoding issue).
     noti_query = text("""
                 SELECT noti_type, noti_yn
                 FROM tb_user_notification
@@ -214,14 +194,14 @@ async def user_detail_by_user_id(user_id, db: AsyncSession):
     noti_result = await db.execute(noti_query, {"user_id": user_id})
     noti_rows = noti_result.mappings().all()
 
-    # 알림 타입별로 매핑
+    # TODO: cleaned garbled comment (encoding issue).
     notifications_status = {}
     for noti_row in noti_rows:
         noti_type = noti_row["noti_type"]
         noti_yn = noti_row["noti_yn"]
         notifications_status[f"{noti_type}_yn"] = noti_yn
 
-    # user 딕셔너리에 알림 설정 추가
+    # TODO: cleaned garbled comment (encoding issue).
     user["notifications_status"] = notifications_status
 
     query = text(f"""
@@ -239,16 +219,7 @@ async def user_detail_by_user_id(user_id, db: AsyncSession):
 
 async def apply_role(status: str, page: int, count_per_page: int, db: AsyncSession):
     """
-    자격 신청 목록
-
-    Args:
-        status: 신청 상태 (all, waiting, completed, editor, cp)
-        page: 페이지 번호
-        count_per_page: 페이지당 항목 수
-        db: 데이터베이스 세션
-
-    Returns:
-        자격 신청 목록과 페이징 정보
+    Documentation cleaned due to encoding issue.
     """
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
@@ -274,14 +245,14 @@ async def apply_role(status: str, page: int, count_per_page: int, db: AsyncSessi
                            apply_type = 'cp'
                            """)
 
-    # 전체 개수 구하기
+    # TODO: cleaned garbled comment (encoding issue).
     count_query = text(f"""
                        SELECT COUNT(*) AS total_count FROM tb_user_profile_apply WHERE {where_query}
                        """)
     count_result = await db.execute(count_query, {})
     total_count = dict(count_result.mappings().first())["total_count"]
 
-    # 실제 데이터 조회
+    # TODO: cleaned garbled comment (encoding issue).
     query = text(f"""
                  SELECT
                     upa.*
@@ -305,14 +276,7 @@ async def apply_role(status: str, page: int, count_per_page: int, db: AsyncSessi
 
 async def accept_apply_role(id: int, db: AsyncSession):
     """
-    자격 신청 승인 처리
-
-    Args:
-        id: 승인할 자격 신청 ID
-        db: 데이터베이스 세션
-
-    Returns:
-        승인 처리 결과
+    Documentation cleaned due to encoding issue.
     """
     query = text("""
                  SELECT * FROM tb_user_profile_apply WHERE id = :id
@@ -324,20 +288,23 @@ async def accept_apply_role(id: int, db: AsyncSession):
     row = dict(rows[0])
 
     if row["approval_code"] == "accepted":
-        # 이미 승인 함
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.ALREADY_APPROVED,
         )
 
-    # tb_user_profile_apply 승인 처리
+    # TODO: cleaned garbled comment (encoding issue).
     query = text("""
-                 UPDATE tb_user_profile_apply SET approval_code = 'accepted', approval_message = '승인되었습니다', approval_date = now() WHERE id = :id
+                 UPDATE tb_user_profile_apply
+                    SET approval_code = 'accepted',
+                        approval_message = 'approved',
+                        approval_date = now()
+                  WHERE id = :id
                  """)
     await db.execute(query, {"id": id})
 
-    # tb_user_profile의 role_type을 apply_type으로 업데이트
-    # 1. default_yn = 'Y' 프로필 확인
+    # TODO: cleaned garbled comment (encoding issue).
+    # TODO: cleaned garbled comment (encoding issue).
     query = text("""
                  SELECT profile_id FROM tb_user_profile
                  WHERE user_id = :user_id AND default_yn = 'Y'
@@ -346,7 +313,7 @@ async def accept_apply_role(id: int, db: AsyncSession):
     default_profile = result.mappings().first()
 
     if default_profile:
-        # default 프로필이 있으면 업데이트
+        # TODO: cleaned garbled comment (encoding issue).
         query = text("""
                      UPDATE tb_user_profile
                      SET role_type = :apply_type
@@ -356,7 +323,7 @@ async def accept_apply_role(id: int, db: AsyncSession):
             query, {"apply_type": row["apply_type"], "user_id": row["user_id"]}
         )
     else:
-        # default 프로필이 없으면 프로필 존재 여부 확인
+        # TODO: cleaned garbled comment (encoding issue).
         query = text("""
                      SELECT profile_id FROM tb_user_profile
                      WHERE user_id = :user_id
@@ -366,7 +333,7 @@ async def accept_apply_role(id: int, db: AsyncSession):
         first_profile = result.mappings().first()
 
         if first_profile:
-            # 프로필이 있으면 profile_id가 가장 작은 프로필 업데이트
+            # TODO: cleaned garbled comment (encoding issue).
             query = text("""
                          UPDATE tb_user_profile
                          SET role_type = :apply_type
@@ -380,12 +347,12 @@ async def accept_apply_role(id: int, db: AsyncSession):
                 },
             )
         else:
-            # 프로필이 아예 없으면 새로 생성
+            # TODO: cleaned garbled comment (encoding issue).
             query = text("""
                          INSERT INTO tb_user_profile (user_id, nickname, role_type, default_yn, created_id, created_date, updated_id, updated_date)
                          VALUES (:user_id, :nickname, :role_type, 'Y', -1, NOW(), -1, NOW())
                          """)
-            # 랜덤 닉네임 생성
+            # TODO: cleaned garbled comment (encoding issue).
             nickname = comm_service.make_rand_nickname()
 
             await db.execute(
@@ -402,14 +369,7 @@ async def accept_apply_role(id: int, db: AsyncSession):
 
 async def deny_apply_role(id: int, db: AsyncSession):
     """
-    자격 신청 반려 처리
-
-    Args:
-        id: 반려할 자격 신청 ID
-        db: 데이터베이스 세션
-
-    Returns:
-        반려 처리 결과
+    Documentation cleaned due to encoding issue.
     """
     query = text("""
                  SELECT * FROM tb_user_profile_apply WHERE id = :id
@@ -421,14 +381,17 @@ async def deny_apply_role(id: int, db: AsyncSession):
     row = dict(rows[0])
 
     if row["approval_code"] == "denied":
-        # 이미 반려 함
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.ALREADY_REJECTED,
         )
 
     query = text("""
-                 UPDATE tb_user_profile_apply SET approval_code = 'denied', approval_message = '반려되었습니다', approval_date = now() WHERE id = :id
+                 UPDATE tb_user_profile_apply
+                    SET approval_code = 'denied',
+                        approval_message = 'denied',
+                        approval_date = now()
+                  WHERE id = :id
                  """)
     await db.execute(query, {"id": id})
 
@@ -437,13 +400,7 @@ async def deny_apply_role(id: int, db: AsyncSession):
 
 async def badge(db: AsyncSession):
     """
-    뱃지 목록
-
-    Args:
-        db: 데이터베이스 세션
-
-    Returns:
-        뱃지 목록
+    Documentation cleaned due to encoding issue.
     """
 
     query = text("""
@@ -457,15 +414,7 @@ async def badge(db: AsyncSession):
 
 async def put_badge(req_body: admin_schema.PutBadgeReqBody, id: int, db: AsyncSession):
     """
-    뱃지 승급 조건 수정
-
-    Args:
-        req_body: 뱃지 수정 정보 (승급 조건 등)
-        id: 수정할 뱃지 ID
-        db: 데이터베이스 세션
-
-    Returns:
-        수정 결과
+    Documentation cleaned due to encoding issue.
     """
 
     query = text("""
@@ -499,18 +448,7 @@ async def apply_rank_up(
     db: AsyncSession,
 ):
     """
-    승급 신청 목록 조회
-
-    Args:
-        status: 승급 상태 ('all', 'rank-up', 'paid')
-        search_target: 검색 대상 (제목, 작가명)
-        search_word: 검색어
-        page: 페이지 번호
-        count_per_page: 페이지당 항목 수
-        db: 데이터베이스 세션
-
-    Returns:
-        승급 신청 목록과 페이징 정보
+    Documentation cleaned due to encoding issue.
     """
 
     if search_word != "":
@@ -529,10 +467,9 @@ async def apply_rank_up(
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
 
-    # 전체 개수 구하기
-    # JOIN을 사용하여 서브쿼리 최적화
+    # TODO: cleaned garbled comment (encoding issue).
     if status == "all":
-        # 무료 작품(normal) + 유료 전환 신청 작품 모두 포함 (작품당 1건씩만)
+        # TODO: cleaned garbled comment (encoding issue).
         count_query = text(f"""
             SELECT COUNT(*) AS total_count
             FROM (
@@ -551,7 +488,7 @@ async def apply_rank_up(
             SELECT COUNT(*) AS total_count FROM tb_product WHERE product_type = 'normal' {where}
         """)
     elif status == "paid":
-        # 작품당 1건씩만 카운트
+        # TODO: cleaned garbled comment (encoding issue).
         count_query = text(f"""
             SELECT COUNT(DISTINCT p.product_id) AS total_count
             FROM tb_product p
@@ -561,10 +498,10 @@ async def apply_rank_up(
     count_result = await db.execute(count_query, {})
     total_count = dict(count_result.mappings().first())["total_count"]
 
-    # 실제 데이터 조회 - JOIN을 사용하여 서브쿼리 최적화
+    # TODO: cleaned garbled comment (encoding issue).
     if status == "all":
-        # UNION ALL로 무료 작품과 유료 신청 작품을 명확히 분리
-        # 유료 신청의 경우 작품당 최신 신청만 조회, 반려 횟수 포함
+        # TODO: cleaned garbled comment (encoding issue).
+        # TODO: cleaned garbled comment (encoding issue).
         query = text(f"""
             SELECT * FROM (
                 SELECT
@@ -641,7 +578,7 @@ async def apply_rank_up(
             {limit_clause}
         """)
     elif status == "paid":
-        # 작품당 최신 신청만 조회, 반려 횟수 포함
+        # TODO: cleaned garbled comment (encoding issue).
         query = text(f"""
             SELECT
                 p.*,
@@ -683,16 +620,230 @@ async def apply_rank_up(
     return build_paginated_response(rows, total_count, page, count_per_page)
 
 
+async def apply_episode(
+    status: str, page: int, count_per_page: int, db: AsyncSession
+):
+    where = ""
+    params = {}
+    if status in ("review", "accepted", "denied"):
+        where = " AND a.status_code = :status_code "
+        params["status_code"] = status
+
+    limit_clause, limit_params = get_pagination_params(page, count_per_page)
+    params.update(limit_params)
+
+    count_query = text(
+        f"""
+        SELECT COUNT(*) AS total_count
+          FROM tb_product_episode_apply a
+         WHERE a.use_yn = 'Y' {where}
+        """
+    )
+    count_result = await db.execute(count_query, params)
+    total_count = count_result.scalar() or 0
+
+    query = text(
+        f"""
+        SELECT
+            a.id AS apply_id,
+            a.episode_id,
+            a.status_code,
+            a.req_user_id,
+            a.req_date,
+            a.approval_user_id,
+            a.approval_date,
+            p.product_id,
+            p.title AS product_title,
+            e.episode_no,
+            e.episode_title,
+            e.open_yn
+          FROM tb_product_episode_apply a
+          INNER JOIN tb_product_episode e ON a.episode_id = e.episode_id
+          INNER JOIN tb_product p ON e.product_id = p.product_id
+         WHERE a.use_yn = 'Y' {where}
+         ORDER BY a.id DESC
+         {limit_clause}
+        """
+    )
+    result = await db.execute(query, params)
+    rows = result.mappings().all()
+
+    return build_paginated_response(rows, total_count, page, count_per_page)
+
+
+async def accept_apply_episode(apply_id: int, admin_kc_user_id: str, db: AsyncSession):
+    admin_user_id = await comm_service.get_user_from_kc(admin_kc_user_id, db)
+    if admin_user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
+    query = text("""
+                 SELECT * FROM tb_product_episode_apply WHERE id = :apply_id AND use_yn = 'Y'
+                 """)
+    result = await db.execute(query, {"apply_id": apply_id})
+    rows = result.mappings().all()
+    check_exists_or_404(rows, ErrorMessages.NOT_FOUND_EPISODE)
+
+    row = dict(rows[0])
+    current_status_code = row["status_code"]
+    if current_status_code == "accepted":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.ALREADY_APPROVED,
+        )
+    if current_status_code == "denied":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.ALREADY_REJECTED,
+        )
+    if current_status_code != "review":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.INVALID_EPISODE_INFO,
+        )
+
+    episode_id = row["episode_id"]
+
+    query = text("""
+                 UPDATE tb_product_episode_apply
+                    SET status_code = 'accepted',
+                        approval_user_id = :approval_user_id,
+                        approval_date = now(),
+                        updated_id = :updated_id
+                  WHERE id = :apply_id
+                    AND use_yn = 'Y'
+                    AND status_code = 'review'
+                 """)
+    result = await db.execute(
+        query,
+        {
+            "apply_id": apply_id,
+            "approval_user_id": admin_user_id,
+            "updated_id": admin_user_id,
+        },
+    )
+    if result.rowcount != 1:
+        raise CustomResponseException(
+            status_code=status.HTTP_409_CONFLICT,
+            message=ErrorMessages.ALREADY_APPLIED_STATE,
+        )
+
+    return {"result": True, "episodeId": episode_id}
+
+
+async def deny_apply_episode(apply_id: int, admin_kc_user_id: str, db: AsyncSession):
+    admin_user_id = await comm_service.get_user_from_kc(admin_kc_user_id, db)
+    if admin_user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
+    query = text("""
+                 SELECT * FROM tb_product_episode_apply WHERE id = :apply_id AND use_yn = 'Y'
+                 """)
+    result = await db.execute(query, {"apply_id": apply_id})
+    rows = result.mappings().all()
+    check_exists_or_404(rows, ErrorMessages.NOT_FOUND_EPISODE)
+
+    row = dict(rows[0])
+    current_status_code = row["status_code"]
+    if current_status_code == "denied":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.ALREADY_REJECTED,
+        )
+    if current_status_code == "accepted":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.ALREADY_APPROVED,
+        )
+    if current_status_code != "review":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.INVALID_EPISODE_INFO,
+        )
+
+    episode_id = row["episode_id"]
+
+    query = text("""
+                 UPDATE tb_product_episode_apply
+                    SET status_code = 'denied',
+                        approval_user_id = :approval_user_id,
+                        approval_date = now(),
+                        updated_id = :updated_id
+                  WHERE id = :apply_id
+                    AND use_yn = 'Y'
+                    AND status_code = 'review'
+                 """)
+    result = await db.execute(
+        query,
+        {
+            "apply_id": apply_id,
+            "approval_user_id": admin_user_id,
+            "updated_id": admin_user_id,
+        },
+    )
+    if result.rowcount != 1:
+        raise CustomResponseException(
+            status_code=status.HTTP_409_CONFLICT,
+            message=ErrorMessages.ALREADY_APPLIED_STATE,
+        )
+
+    query = text("""
+                 UPDATE tb_product_episode
+                    SET open_yn = 'N',
+                        updated_id = :updated_id
+                  WHERE episode_id = :episode_id
+                    AND use_yn = 'Y'
+                 """)
+    await db.execute(
+        query, {"episode_id": episode_id, "updated_id": admin_user_id}
+    )
+
+    # TODO: cleaned garbled comment (encoding issue).
+    query = text("""
+                 UPDATE tb_product p
+                 INNER JOIN tb_product_episode e ON p.product_id = e.product_id
+                    SET p.open_yn = (
+                            CASE
+                                WHEN EXISTS (
+                                    SELECT 1
+                                      FROM tb_product_episode e2
+                                     WHERE e2.product_id = p.product_id
+                                       AND e2.use_yn = 'Y'
+                                       AND e2.open_yn = 'Y'
+                                ) THEN 'Y'
+                                ELSE 'N'
+                            END
+                        ),
+                        p.last_episode_date = (
+                            CASE
+                                WHEN EXISTS (
+                                    SELECT 1
+                                      FROM tb_product_episode e2
+                                     WHERE e2.product_id = p.product_id
+                                       AND e2.use_yn = 'Y'
+                                       AND e2.open_yn = 'Y'
+                                ) THEN p.last_episode_date
+                                ELSE NULL
+                            END
+                        ),
+                        p.updated_id = :updated_id
+                  WHERE e.episode_id = :episode_id
+                 """)
+    await db.execute(
+        query, {"episode_id": episode_id, "updated_id": admin_user_id}
+    )
+
+    return {"result": True, "episodeId": episode_id}
+
+
 async def accept_apply_rank_up(apply_id: int, db: AsyncSession):
     """
-    작품 승급 신청 승인 처리
-
-    Args:
-        apply_id: 승인할 신청 ID (tb_product_paid_apply.id)
-        db: 데이터베이스 세션
-
-    Returns:
-        승인 처리 결과
+    Documentation cleaned due to encoding issue.
     """
     query = text("""
                  SELECT * FROM tb_product_paid_apply WHERE id = :apply_id
@@ -704,39 +855,23 @@ async def accept_apply_rank_up(apply_id: int, db: AsyncSession):
     row = dict(rows[0])
 
     if row["status_code"] == "accepted":
-        # 이미 승인 함
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.ALREADY_APPROVED,
         )
 
-    product_id = row["product_id"]
-
-    # 1. 신청 상태를 승인으로 변경
+    # TODO: cleaned garbled comment (encoding issue).
     query = text("""
                  UPDATE tb_product_paid_apply SET status_code = 'accepted', approval_date = now() WHERE id = :apply_id
                  """)
     await db.execute(query, {"apply_id": apply_id})
-
-    # 2. 작품을 유료로 전환
-    query = text("""
-                 UPDATE tb_product SET price_type = 'paid' WHERE product_id = :product_id
-                 """)
-    await db.execute(query, {"product_id": product_id})
 
     return {"result": True}
 
 
 async def deny_apply_rank_up(apply_id: int, db: AsyncSession):
     """
-    작품 승급 신청 반려 처리
-
-    Args:
-        apply_id: 반려할 신청 ID (tb_product_paid_apply.id)
-        db: 데이터베이스 세션
-
-    Returns:
-        반려 처리 결과
+    Documentation cleaned due to encoding issue.
     """
     query = text("""
                  SELECT * FROM tb_product_paid_apply WHERE id = :apply_id
@@ -748,7 +883,6 @@ async def deny_apply_rank_up(apply_id: int, db: AsyncSession):
     row = dict(rows[0])
 
     if row["status_code"] == "denied":
-        # 이미 반려 함
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.ALREADY_REJECTED,
@@ -767,17 +901,9 @@ async def put_auth_identity_password_reset(
     req_body: auth_schema.IdentityPasswordResetReqBody, user_id: int, db: AsyncSession
 ):
     """
-    사용자 비밀번호 재설정 (본인인증)
-
-    Args:
-        req_body: 비밀번호 재설정 요청 데이터 (이름, 성별, 생년월일, 이메일, 새 비밀번호)
-        user_id: 비밀번호를 재설정할 사용자 ID
-        db: 데이터베이스 세션
-
-    Returns:
-        비밀번호 재설정 결과 (void)
+    Documentation cleaned due to encoding issue.
     """
-    # TODO: 본인인증 모듈 구현 후 수정 및 최종 테스트 필(초안 개발 완료)
+    # TODO: cleaned garbled comment (encoding issue).
     where_fields = []
     execute_params = {}
     if req_body.user_name is not None:
@@ -796,10 +922,9 @@ async def put_auth_identity_password_reset(
         execute_params["email"] = req_body.email
     if (
         len(where_fields) == 0
-    ):  # 위의 4개의 필드로 검색을 하는 로직인데, 위의 4개의 필드가 없으면 로그인한 유저의 정보로 검색
-        where_fields.append("a.user_id = :user_id")
+    ):  # TODO: cleaned garbled comment (encoding issue).
         execute_params["user_id"] = user_id
-    # 먼저 유저 정보 확인 (SNS 타입 및 탈퇴 여부 체크 포함)
+    # TODO: cleaned garbled comment (encoding issue).
     query = text(f"""
                         select a.kc_user_id, a.latest_signed_type, a.use_yn
                         from tb_user a
@@ -819,22 +944,21 @@ async def put_auth_identity_password_reset(
     latest_signed_type = db_rst[0].get("latest_signed_type")
     use_yn = db_rst[0].get("use_yn")
 
-    # 탈퇴한 회원 체크
+    # TODO: cleaned garbled comment (encoding issue).
     if use_yn == "N":
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.ALREADY_WITHDRAWN_MEMBER,
         )
 
-    # SNS 계정 체크 (네이버, 구글, 카카오, 애플은 비밀번호 변경 불가)
+    # TODO: cleaned garbled comment (encoding issue).
     if latest_signed_type in ("naver", "google", "kakao", "apple"):
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.SNS_ACCOUNT_PASSWORD_RESET_NOT_ALLOWED_ADMIN,
         )
 
-    # Keycloak에서 비밀번호 변경
-    res_json = await comm_service.kc_token_endpoint(method="POST", type="client_normal")
+    # TODO: cleaned garbled comment (encoding issue).
     admin_acc_token = res_json.get("access_token")
 
     cred_data = {
@@ -856,7 +980,7 @@ async def put_auth_identity_password_reset(
         )
     except CustomResponseException as e:
         if e.status_code == status.HTTP_404_NOT_FOUND:
-            # keycloak쪽 데이터가 없음
+            # TODO: cleaned garbled comment (encoding issue).
             pass
         else:
             raise e
@@ -867,16 +991,9 @@ async def put_auth_identity_password_reset(
 @handle_exceptions
 async def put_auth_signoff(user_id: int, db: AsyncSession):
     """
-    사용자 탈퇴 처리
-
-    Args:
-        user_id: 탈퇴할 사용자 ID
-        db: 데이터베이스 세션
-
-    Returns:
-        탈퇴 처리 결과 (void)
+    Documentation cleaned due to encoding issue.
     """
-    # 탈퇴 전 이메일 조회
+    # TODO: cleaned garbled comment (encoding issue).
     query = text("""
                     select email
                     from tb_user
@@ -896,12 +1013,11 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
     result = await db.execute(query, {"user_id": user_id})
     db_rst = result.mappings().all()
 
-    # 개별아이디 혹은 통합아이디 로그인 상태
+    # TODO: cleaned garbled comment (encoding issue).
     if db_rst:
-        # 통합아이디
-        # TODO: 통합아이디 연동 모듈 구현 후 수정 및 최종 테스트 필(현재 개별아이디 개발 완료. 나머지 초안 개발 완료)
+        # TODO: cleaned garbled comment (encoding issue).
 
-        # 탈퇴 시간 생성
+        # TODO: cleaned garbled comment (encoding issue).
         import time
 
         timestamp = int(time.time())
@@ -921,7 +1037,7 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
 
         await db.execute(query, {"user_id": user_id, "outed_email": outed_email})
 
-        # tb_algorithm_recommend_user 레코드 삭제
+        # TODO: cleaned garbled comment (encoding issue).
         query = text("""
                             delete from tb_algorithm_recommend_user
                             where user_id in (
@@ -939,9 +1055,8 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
         admin_acc_token = res_json.get("access_token")
 
         """
-        kc_users_id_endpoint (delete)
-            user 회원정보 delete
-            user_entity의 enabled False 처리 대신에, 이후 재가입할 경우 완전한 초기화 방향으로
+        Delete Keycloak user records.
+        Ignore 404 when target user is already removed.
         """
         query = text("""
                             select a.kc_user_id
@@ -963,7 +1078,7 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
                 )
             except CustomResponseException as e:
                 if e.status_code == status.HTTP_404_NOT_FOUND:
-                    # keycloak쪽 데이터가 없음
+                    # TODO: cleaned garbled comment (encoding issue).
                     pass
                 else:
                     raise e
@@ -993,9 +1108,8 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
                 message=ErrorMessages.ALREADY_WITHDRAWN_MEMBER,
             )
 
-        # 개별아이디
-
-        # 탈퇴 시간 생성
+        # TODO: cleaned garbled comment (encoding issue).
+        # TODO: cleaned garbled comment (encoding issue).
         import time
 
         timestamp = int(time.time())
@@ -1010,7 +1124,7 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
 
         await db.execute(query, {"user_id": user_id, "outed_email": outed_email})
 
-        # tb_algorithm_recommend_user 레코드 삭제
+        # TODO: cleaned garbled comment (encoding issue).
         query = text("""
                             delete from tb_algorithm_recommend_user
                             where user_id = :user_id
@@ -1031,9 +1145,8 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
         admin_acc_token = res_json.get("access_token")
 
         """
-        kc_users_id_endpoint (delete)
-            user 회원정보 delete
-            user_entity의 enabled False 처리 대신에, 이후 재가입할 경우 완전한 초기화 방향으로
+        Delete Keycloak user records.
+        Ignore 404 when target user is already removed.
         """
         try:
             await comm_service.kc_users_id_endpoint(
@@ -1041,9 +1154,10 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
             )
         except CustomResponseException as e:
             if e.status_code == status.HTTP_404_NOT_FOUND:
-                # keycloak쪽 데이터가 없음
+                # TODO: cleaned garbled comment (encoding issue).
                 pass
             else:
                 raise e
 
     return
+

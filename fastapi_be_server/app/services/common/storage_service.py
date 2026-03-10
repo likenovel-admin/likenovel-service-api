@@ -61,10 +61,19 @@ async def get_presigned_upload_url(
                 if not db_rst:
                     break
 
+            if group_type == "epub":
+                bucket_name = settings.R2_SC_EPUB_BUCKET
+                file_id = file_name_to_uuid
+                file_path = f"{settings.R2_SC_DOMAIN}/epub/{file_name_to_uuid}"
+            else:
+                bucket_name = settings.R2_SC_IMAGE_BUCKET
+                file_id = f"{group_type}/{file_name_to_uuid}"
+                file_path = f"{settings.R2_SC_CDN_URL}/{group_type}/{file_name_to_uuid}"
+
             presigned_url = comm_service.make_r2_presigned_url(
                 type="upload",
-                bucket_name=settings.R2_SC_IMAGE_BUCKET,
-                file_id=f"{group_type}/{file_name_to_uuid}",
+                bucket_name=bucket_name,
+                file_id=file_id,
             )
 
             query = text("""
@@ -99,7 +108,7 @@ async def get_presigned_upload_url(
                     "file_group_id": new_file_group_id,
                     "file_name": file_name_to_uuid,
                     "file_org_name": file_name,
-                    "file_path": f"{settings.R2_SC_CDN_URL}/{group_type}/{file_name_to_uuid}",
+                    "file_path": file_path,
                     "created_id": settings.DB_DML_DEFAULT_ID,
                     "updated_id": settings.DB_DML_DEFAULT_ID,
                 },

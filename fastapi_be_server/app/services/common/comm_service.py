@@ -180,7 +180,16 @@ async def kc_token_endpoint(method: str, type: str, data_dict: Optional[dict] = 
                 return res.json()
     except HTTPStatusError as e:
         error_message = await e.response.aread()
-        logger.error(f"Keycloak Error Response: {error_message.decode()}")
+        decoded_error_message = error_message.decode(errors="ignore")
+        logger.error(f"Keycloak Error Response: {decoded_error_message}")
+
+        error_code = None
+        try:
+            error_json = json.loads(decoded_error_message)
+            error_code = error_json.get("error")
+        except Exception:
+            error_code = None
+
         if type in ["reissue_normal", "reissue_keep"]:
             await kc_logout_endpoint(
                 method="POST", type=type, user_ref_token=data_dict["refresh_token"]
@@ -188,6 +197,21 @@ async def kc_token_endpoint(method: str, type: str, data_dict: Optional[dict] = 
             raise CustomResponseException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 message=ErrorMessages.EXPIRED_REFRESH_TOKEN,
+            )
+        elif (
+            type
+            in [
+                "user_normal_signin",
+                "user_keep_signin",
+                "user_normal_signin_code",
+                "user_keep_signin_code",
+            ]
+            and error_code == "invalid_grant"
+        ):
+            # invalid_grant: user credentials mismatch or user not found in Keycloak
+            raise CustomResponseException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                message=ErrorMessages.INVALID_LOGIN_INFO,
             )
         else:
             raise CustomResponseException(

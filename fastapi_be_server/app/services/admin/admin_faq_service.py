@@ -97,13 +97,13 @@ async def post_faq(req_body: admin_schema.PostFAQReqBody, db: AsyncSession):
     if req_body is not None:
         logger.info(f"post_faq: {req_body}")
 
-    if len(req_body.subject) == 0:
+    if req_body.subject is not None and len(req_body.subject) == 0:
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.FAQ_TITLE_REQUIRED,
         )
 
-    if len(req_body.content) == 0:
+    if req_body.content is not None and len(req_body.content) == 0:
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.FAQ_CONTENT_REQUIRED,
