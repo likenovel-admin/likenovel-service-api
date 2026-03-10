@@ -5,19 +5,25 @@
 # - env가 누락되면 조용히 실패하지 않고 명확한 에러로 종료합니다.
 set -uo pipefail
 
-# 기존 동작을 최대한 유지하기 위해 DB_HOST/SQL_FILE은 기본값을 두고, 필요시 env로 override 합니다.
-DB_HOST="${DB_HOST:-10.0.100.78}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-}"
 DB_PW="${DB_PW:-}"
 DB_NAME="${DB_NAME:-likenovel}"
-SQL_FILE="${SQL_FILE:-/home/ln-admin/likenovel/batch/paid_episode_convert_batch.sql}"
+
+# SSL: MariaDB(--skip-ssl) vs MySQL 8.0+(--ssl-mode=DISABLED)
+if [ -z "${MYSQL_SSL_OPT:-}" ]; then
+  if mysql --version 2>&1 | grep -qi mariadb; then MYSQL_SSL_OPT="--skip-ssl"; else MYSQL_SSL_OPT="--ssl-mode=DISABLED"; fi
+fi
+SQL_FILE="${SQL_FILE:-${SCRIPT_DIR}/paid_episode_convert_batch.sql}"
 
 if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   echo "[ERROR] Missing DB_USER or DB_PW env for batch." 1>&2
   exit 1
 fi
 
-mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" < "$SQL_FILE"
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" $MYSQL_SSL_OPT < "$SQL_FILE"
 
 exit 0

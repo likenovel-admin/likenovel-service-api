@@ -11,12 +11,17 @@ DB_USER="${DB_USER:-}"
 DB_PW="${DB_PW:-}"
 DB_NAME="${DB_NAME:-likenovel}"
 
+# SSL: MariaDB(--skip-ssl) vs MySQL 8.0+(--ssl-mode=DISABLED)
+if [ -z "${MYSQL_SSL_OPT:-}" ]; then
+  if mysql --version 2>&1 | grep -qi mariadb; then MYSQL_SSL_OPT="--skip-ssl"; else MYSQL_SSL_OPT="--ssl-mode=DISABLED"; fi
+fi
+
 if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   echo "[ERROR] Missing DB_USER or DB_PW env for batch." 1>&2
   exit 1
 fi
 
 # 회차별 매출, 일별 이용권 상세, 후원 내역, 기타 수익 내역, 작품별 통계, 회차별 통계, 발굴통계, 작품별 월매출 및 월별 정산용 임시 합산, 후원 및 기타 정산용 임시 합산
-mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --skip-ssl < /app/dist/batch/partner_report_daily_batch.sql
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" $MYSQL_SSL_OPT < /app/dist/batch/partner_report_daily_batch.sql
 
 exit 0

@@ -11,6 +11,11 @@ DB_USER="${DB_USER:-}"
 DB_PW="${DB_PW:-}"
 DB_NAME="${DB_NAME:-likenovel}"
 
+# SSL: MariaDB(--skip-ssl) vs MySQL 8.0+(--ssl-mode=DISABLED)
+if [ -z "${MYSQL_SSL_OPT:-}" ]; then
+  if mysql --version 2>&1 | grep -qi mariadb; then MYSQL_SSL_OPT="--skip-ssl"; else MYSQL_SSL_OPT="--ssl-mode=DISABLED"; fi
+fi
+
 if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   echo "[ERROR] Missing DB_USER or DB_PW env for batch." 1>&2
   exit 1
@@ -20,7 +25,7 @@ MAX_RETRIES=3
 RETRY_DELAY=10
 
 for attempt in $(seq 1 $MAX_RETRIES); do
-  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --skip-ssl < /app/dist/batch/service_reset_hourly_batch.sql
+  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" $MYSQL_SSL_OPT < /app/dist/batch/service_reset_hourly_batch.sql
   rc=$?
   if [ $rc -eq 0 ]; then
     exit 0

@@ -47,6 +47,11 @@ DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-}"
 DB_PW="${DB_PW:-}"
 DB_NAME="${DB_NAME:-likenovel}"
+
+# SSL: MariaDB(--skip-ssl) vs MySQL 8.0+(--ssl-mode=DISABLED)
+if [ -z "${MYSQL_SSL_OPT:-}" ]; then
+  if mysql --version 2>&1 | grep -qi mariadb; then MYSQL_SSL_OPT="--skip-ssl"; else MYSQL_SSL_OPT="--ssl-mode=DISABLED"; fi
+fi
 IN_PROGRESS_STALE_MINUTES="${IN_PROGRESS_STALE_MINUTES:-${IN_PROGRESS_GUARD_MINUTES:-60}}"
 HEARTBEAT_EVERY_LOOPS="${HEARTBEAT_EVERY_LOOPS:-20}"
 MAX_PURGE_LOOPS="${MAX_PURGE_LOOPS:-10000}"
@@ -76,7 +81,7 @@ if ! [[ "$MAX_PURGE_LOOPS" =~ ^[0-9]+$ ]] || [ "$MAX_PURGE_LOOPS" -lt 1 ]; then
   exit 1
 fi
 
-MYSQL_CMD=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" --skip-ssl)
+MYSQL_CMD=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" $MYSQL_SSL_OPT)
 HEARTBEAT_WORKER_PID=""
 BATCH_RUN_TOKEN=$(( (RANDOM << 16) | RANDOM ))
 

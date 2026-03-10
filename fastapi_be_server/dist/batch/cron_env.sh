@@ -19,3 +19,10 @@ export DB_PORT="${DB_PORT:-3306}"
 export DB_USER="${DB_USER:-${DB_USER_ID:-}}"
 export DB_PW="${DB_PW:-${DB_USER_PW:-}}"
 export DB_NAME="${DB_NAME:-likenovel}"
+
+# MariaDB는 --skip-ssl, MySQL 8.0+는 --ssl-mode=DISABLED
+if mysql --version 2>&1 | grep -qi mariadb; then
+  export MYSQL_SSL_OPT="--skip-ssl"
+else
+  export MYSQL_SSL_OPT="--ssl-mode=DISABLED"
+fi
