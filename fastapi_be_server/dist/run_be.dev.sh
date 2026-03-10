@@ -16,6 +16,9 @@ fi
 rm -rf ./__pycache__
 rm -rf ./.venv
 
+# 로그 디렉토리 생성 (없으면 라우터 import 실패)
+mkdir -p ./logs/data ./logs/error
+
 # .env.production → .env (pydantic_settings가 .env를 읽음)
 cp .env.production .env
 
@@ -23,6 +26,12 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip3 install --upgrade pip
 pip3 install "$(ls -v app-*.whl | tail -n 1)"
+
+# .env를 시스템 환경변수로 export (const.py의 os.getenv가 읽을 수 있도록)
+set -a
+source .env
+set +a
+
 gunicorn -c ./gconf.py
 deactivate
 
