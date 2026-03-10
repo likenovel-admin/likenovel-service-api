@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# dev 백엔드 서버 새로운 배포 버전으로 재기동
+
+sudo chown -R ln-admin:ln-admin /home/ln-admin/likenovel/api-dev
+sudo chmod -R 700 /home/ln-admin/likenovel/api-dev
+
+cd /home/ln-admin/likenovel/api-dev
+
+# 최초 배포 시 pidfile이 없을 수 있음
+if [ -f gunicorn.pid ]; then
+  kill -TERM $(cat gunicorn.pid)
+  sleep 10
+fi
+
+rm -rf ./__pycache__
+rm -rf ./.venv
+
+# .env.production → .env (pydantic_settings가 .env를 읽음)
+cp .env.production .env
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install --upgrade pip
+pip3 install "$(ls -v app-*.whl | tail -n 1)"
+gunicorn -c ./gconf.py
+deactivate
+
+exit 0

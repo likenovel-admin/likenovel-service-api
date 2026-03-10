@@ -47,6 +47,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      # ---------------------------------------------------------------------
+      # Build env file (DO NOT COMMIT)
+      # ---------------------------------------------------------------------
+      - name: Write .env.production (DEV)
+        working-directory: ./fastapi_be_server/dist
+        run: |
+          set -e
+          printf '%s' "${{ secrets.BACKEND_ENV_DEV }}" | tr -d '\r' > .env.production
+
       - name: Deploy with AWS codedeploy (DEV)
         env:
           # DEV용 CodeDeploy 설정은 하드코딩하지 않고 Secrets로 주입합니다.
@@ -72,8 +81,13 @@ jobs:
             DEPLOY_CONFIG_NAME="CodeDeployDefault.AllAtOnce"
           fi
 
-          # *.whl, appspec.yml, run_be.sh, gconf.py 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
-          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py init/
+          # dev 전용 설정 파일로 교체
+          cp appspec.dev.yml appspec.yml
+          cp run_be.dev.sh run_be.sh
+          cp gconf.dev.py gconf.py
+
+          # *.whl, appspec.yml, run_be.sh, gconf.py, .env.production 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py .env.production init/
           aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
           aws deploy create-deployment \
             --application-name $APPLICATION_NAME \
