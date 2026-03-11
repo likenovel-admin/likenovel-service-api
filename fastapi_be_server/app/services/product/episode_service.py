@@ -3209,6 +3209,139 @@ async def post_episodes_sale_reserve(
     return res_body
 
 
+async def post_episodes_sale_reserve_cancel(
+    req_body: episode_schema.PostEpisodesSaleReserveCancelReqBody,
+    kc_user_id: str,
+    db: AsyncSession,
+):
+    res_data = {}
+
+    if kc_user_id:
+        try:
+            async with _transaction_scope(db):
+                user_id, user_info = await comm_service.get_user_from_kc(
+                    kc_user_id, db, addUserInfo=["role_type"]
+                )
+                if user_id == -1:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        message=ErrorMessages.LOGIN_REQUIRED,
+                    )
+
+                if not req_body.episode_ids:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                episode_ids = sorted(
+                    {
+                        int(episode_id)
+                        for episode_id in req_body.episode_ids
+                        if int(episode_id) > 0
+                    }
+                )
+                if not episode_ids:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                is_admin = (user_info or {}).get("role_type") == "admin"
+                params = {"user_id": user_id, "is_admin": 1 if is_admin else 0}
+                placeholders = []
+                for idx, episode_id in enumerate(episode_ids):
+                    key = f"episode_id_{idx}"
+                    params[key] = episode_id
+                    placeholders.append(f":{key}")
+                in_clause = ", ".join(placeholders)
+
+                # 예약 취소 대상: open_yn='N' AND publish_reserve_date IS NOT NULL
+                # 이미 배치에 의해 open_yn='Y'가 된 회차는 조건에 걸리지 않음
+                query = text(
+                    f"""
+                    select
+                        e.episode_id
+                    from tb_product_episode e
+                    inner join tb_product p
+                       on p.product_id = e.product_id
+                    where e.use_yn = 'Y'
+                      and e.open_yn = 'N'
+                      and e.publish_reserve_date IS NOT NULL
+                      and e.episode_id in ({in_clause})
+                      and (:is_admin = 1 or p.user_id = :user_id)
+                    for update
+                    """
+                )
+                result = await db.execute(query, params)
+                rows = result.mappings().all()
+
+                eligible_episode_ids = [int(row["episode_id"]) for row in rows]
+                skipped_episode_ids = [
+                    eid for eid in episode_ids if eid not in eligible_episode_ids
+                ]
+
+                if not eligible_episode_ids:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        message="이미 판매중이거나 예약된 회차가 없습니다.",
+                    )
+
+                update_params = {"updated_id": user_id}
+                episode_placeholders = []
+                for idx, eid in enumerate(eligible_episode_ids):
+                    key = f"eligible_episode_id_{idx}"
+                    update_params[key] = eid
+                    episode_placeholders.append(f":{key}")
+                eligible_in_clause = ", ".join(episode_placeholders)
+
+                query = text(
+                    f"""
+                    update tb_product_episode
+                       set publish_reserve_date = NULL,
+                           updated_id = :updated_id,
+                           updated_date = NOW()
+                     where use_yn = 'Y'
+                       and episode_id in ({eligible_in_clause})
+                    """
+                )
+                await db.execute(query, update_params)
+
+                res_data = {
+                    "count": len(eligible_episode_ids),
+                    "episodeIds": eligible_episode_ids,
+                    "skippedEpisodeIds": skipped_episode_ids,
+                }
+        except CustomResponseException as e:
+            logger.error(e)
+            raise
+        except OperationalError as e:
+            logger.error(e)
+            raise CustomResponseException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                message=ErrorMessages.DB_CONNECTION_ERROR,
+            )
+        except SQLAlchemyError as e:
+            logger.error(e)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message=ErrorMessages.DB_OPERATION_ERROR,
+            )
+        except Exception as e:
+            logger.error(e)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    else:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+        )
+
+    res_body = {"data": res_data}
+    return res_body
+
+
 async def put_episodes_episode_id(
     episode_id: str,
     req_body: episode_schema.PutEpisodesEpisodeIdReqBody,
@@ -3619,11 +3752,10 @@ async def put_episodes_episode_id_open(
                     publish_reserve_yn = db_rst[0].get("publish_reserve_yn")
                     last_episode_date = db_rst[0].get("last_episode_date")
 
-                    # TODO: cleaned garbled comment (encoding issue).
-                    # TODO: cleaned garbled comment (encoding issue).
                     query = text("""
                                      update tb_product_episode a
                                         set a.open_yn = (case when a.open_yn = 'N' then 'Y' else 'N' end)
+                                          , a.publish_reserve_date = (case when a.open_yn = 'N' then NULL else a.publish_reserve_date end)
                                           , a.open_changed_date = NOW()
                                           , a.updated_id = :user_id
                                       where a.episode_id = :episode_id

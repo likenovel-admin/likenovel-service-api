@@ -220,6 +220,21 @@ async def post_episodes_sale_reserve(
     )
 
 
+@router.post(
+    "/sale-reserve-cancel",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_sale_reserve_cancel(
+    req_body: episode_schema.PostEpisodesSaleReserveCancelReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_sale_reserve_cancel(
+        req_body=req_body, kc_user_id=user.get("sub"), db=db
+    )
+
+
 @router.put(
     "/{episode_id}",
     tags=["회차 - 회차 관리"],

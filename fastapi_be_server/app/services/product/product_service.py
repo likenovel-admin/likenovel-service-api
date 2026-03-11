@@ -1338,8 +1338,8 @@ async def product_details_group_by_product_id(
                             amount=num_of_ticket,
                             promotion_type=promo_type,
                             expiration_date=None,  # ?좏슚湲곌컙 ?놁쓬 (?꾨줈紐⑥뀡 醫낅즺 ??留뚮즺)
-                            ticket_expiration_type="none",  # ?섎졊 ????ш텒 ?좏슚湲곌컙 ?놁쓬
-                            ticket_expiration_value=None,
+                            ticket_expiration_type="days",  # 수령 후 7일
+                            ticket_expiration_value=7,
                         )
                         await user_giftbook_service.post_user_giftbook(
                             req_body=giftbook_req,
@@ -3637,25 +3637,45 @@ async def products_in_applied_promotion(type: str, kc_user_id: str, db: AsyncSes
         end_date_only = end_date.date() if end_date else None
 
         if current_date:
-            if end_date_only:
-                # end_date媛 ?덉쑝硫?start_date遺??end_date源뚯? 踰붿쐞 ??紐⑤뱺 ?좎쭨??異붽?
-                # ?덉쟾?μ튂: 理쒕? 10??3650??源뚯?留?泥섎━
-                days_processed = 0
-                while current_date <= end_date_only and days_processed < 3650:
-                    date_str = current_date.isoformat()
-                    if date_str not in res_body["data"]:
-                        res_body["data"][date_str] = []
-                    res_body["data"][date_str].append(data)
-                    current_date += timedelta(days=1)
-                    days_processed += 1
-            else:
-                # end_date媛 ?놁쑝硫?start_date?먮쭔 異붽?
-                date_str = current_date.isoformat()
-                if date_str not in res_body["data"]:
-                    res_body["data"][date_str] = []
-                res_body["data"][date_str].append(data)
+            # start_date에만 작품 추가 (기간 전체 중복 표시 방지)
+            date_str = current_date.isoformat()
+            if date_str not in res_body["data"]:
+                res_body["data"][date_str] = []
+            res_body["data"][date_str].append(data)
 
     # ?좎쭨瑜???닚(理쒖떊 ?좎쭨遺???쇰줈 ?뺣젹
+    res_body["data"] = dict(sorted(res_body["data"].items(), reverse=True))
+
+    return res_body
+
+
+async def products_in_admin_gift_promotion(kc_user_id: str, db: AsyncSession):
+    user_id = await get_user_id(kc_user_id, db)
+
+    query_parts = get_select_fields_and_joins_for_product(
+        user_id=user_id, join_rank=False
+    )
+    query = text(f"""
+        SELECT {query_parts["select_fields"]}, dp.created_date AS promotion_created_date
+        FROM tb_product p
+        {query_parts["joins"]}
+        INNER JOIN tb_direct_promotion dp ON p.product_id = dp.product_id AND dp.type = 'admin-gift' AND dp.status = 'ing'
+        WHERE p.open_yn = 'Y'
+    """)
+    result = await db.execute(query)
+    rows = result.mappings().all()
+
+    res_body = dict()
+    res_body["data"] = {}
+    for row in rows:
+        data = convert_product_data(row)
+        created_date: datetime = row.get("promotion_created_date")
+        if created_date:
+            date_str = created_date.date().isoformat()
+            if date_str not in res_body["data"]:
+                res_body["data"][date_str] = []
+            res_body["data"][date_str].append(data)
+
     res_body["data"] = dict(sorted(res_body["data"].items(), reverse=True))
 
     return res_body

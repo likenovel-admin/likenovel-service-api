@@ -2568,6 +2568,21 @@ async def products_in_applied_promotion_6_9_pass(
 
 
 @router.get(
+    "/admin-gift",
+    tags=["작품"],
+    responses={200: {"description": "관리자 선물함 작품 조회"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def products_in_admin_gift_promotion(
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await product_service.products_in_admin_gift_promotion(
+        kc_user_id=user.get("sub"), db=db
+    )
+
+
+@router.get(
     "/{product_id}",
     tags=["작품"],
     responses={

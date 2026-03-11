@@ -114,6 +114,12 @@ class PostEpisodesSaleReserveReqBody(EpisodesBase):
         return value
 
 
+class PostEpisodesSaleReserveCancelReqBody(EpisodesBase):
+    episode_ids: List[int] = Field(
+        default_factory=list, description="판매 예약 취소할 회차 ID 목록"
+    )
+
+
 class PutEpisodesEpisodeIdReqBody(EpisodesBase):
     # 회차 수정 요청 body
     title: str = Field(examples=["라이크노벨 1회차"], description="제목")
