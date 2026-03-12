@@ -35,4 +35,15 @@ set +a
 gunicorn -c ./gconf.py
 deactivate
 
+# 배치 파일 동기화 + cron.d 등록
+BATCH_SRC=/home/ln-admin/likenovel/api-dev/dist/batch
+BATCH_DST=/home/ln-admin/likenovel/batch-dev
+mkdir -p "$BATCH_DST"
+cp "$BATCH_SRC"/*.sh "$BATCH_DST/"
+cp "$BATCH_SRC"/*.sql "$BATCH_DST/"
+cp "$BATCH_SRC"/*.py "$BATCH_DST/" 2>/dev/null || true
+chmod +x "$BATCH_DST"/*.sh
+sudo cp "$BATCH_SRC/cron_job.dev.sh" /etc/cron.d/likenovel-dev
+sudo chmod 644 /etc/cron.d/likenovel-dev
+
 exit 0
