@@ -739,26 +739,13 @@ async def algorithm_recommend_similar_csv_upload(
     decoded = contents.decode("utf-8")
     reader = csv.DictReader(io.StringIO(decoded))
 
-    # 각 row 처리
+    # 각 row 처리 (upsert)
+    query = text("""
+        INSERT INTO tb_algorithm_recommend_similar (type, product_id, similar_subject_ids)
+        VALUES (:type, :product_id, :similar_subject_ids)
+        ON DUPLICATE KEY UPDATE similar_subject_ids = VALUES(similar_subject_ids)
+    """)
     for row in reader:
-        query = text("""
-            select * from tb_algorithm_recommend_similar where type = :type and product_id = :product_id
-        """)
-        result = await db.execute(
-            query, {"type": type, "product_id": row["product_id"]}
-        )
-        rows = result.mappings().all()
-        if len(rows) > 0:
-            query = text("""
-                        UPDATE tb_algorithm_recommend_similar SET
-                            similar_subject_ids = :similar_subject_ids
-                        WHERE type = :type AND product_id = :product_id
-                        """)
-        else:
-            query = text("""
-                        INSERT INTO tb_algorithm_recommend_similar (type, product_id, similar_subject_ids)
-                        VALUES (:type, :product_id, :similar_subject_ids)
-                        """)
         await db.execute(
             query,
             {

@@ -49,6 +49,15 @@ class PostProductsReqBody(ProductsBase):
     product_type: Optional[str] = Field(
         default=None, examples=["normal"], description="연재 유형(normal: 일반연재, null: 자유연재)"
     )
+    series_regular_price: Optional[int] = Field(
+        default=None, examples=[0], description="연재 가격"
+    )
+    single_regular_price: Optional[int] = Field(
+        default=None, examples=[0], description="단행본 소장 가격"
+    )
+    single_rental_price: Optional[int] = Field(
+        default=None, examples=[0], description="단행본 대여 가격"
+    )
 
 
 class PutProductsProductIdReqBody(ProductsBase):

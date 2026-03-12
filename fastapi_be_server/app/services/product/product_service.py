@@ -1604,14 +1604,18 @@ async def suggest_products_by_product_id(
             where {" and ".join(filter_option)}
         """)
         result = await db.execute(query, {})
-        row = result.mappings().one_or_none()
+        row = result.mappings().first()
 
         if row is None:
             res_body = dict()
             res_body["data"] = []
             return res_body
 
-        suggested_results = json.loads(dict(row).get("similar_subject_ids"))
+        raw_ids = dict(row).get("similar_subject_ids")
+        if not raw_ids or not raw_ids.strip():
+            return {"data": []}
+
+        suggested_results = json.loads(raw_ids)
 
         if len(suggested_results) > 0:
             # ?꾪꽣 ?듭뀡 ?ㅼ젙
@@ -1650,6 +1654,8 @@ async def suggest_products_by_product_id(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             message=ErrorMessages.DB_OPERATION_ERROR,
         )
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {"data": []}
 
 
 async def suggest_managed_products(
@@ -2450,7 +2456,14 @@ async def post_products(
                     kc_user_id=kc_user_id, db=db
                 )
                 allow_external_author_nickname = current_user_role in ("admin", "partner")
-                created_price_type = "free"
+                series_regular_price = int(req_body.series_regular_price or 0)
+                single_regular_price = int(req_body.single_regular_price or 0)
+                single_rental_price = int(req_body.single_rental_price or 0)
+                created_price_type = (
+                    "paid"
+                    if series_regular_price > 0 or single_regular_price > 0
+                    else "free"
+                )
 
                 # 以묐났 ?묓뭹 ?앹꽦 諛⑹? (10珥????숈씪 ?쒕ぉ)
                 duplicate_check_query = text("""
@@ -2600,8 +2613,8 @@ async def post_products(
                     product_type = None
 
                 query = text("""
-                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, monopoly_yn, contract_yn, created_id, updated_id)
-                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :monopoly_yn, :contract_yn, :created_id, :updated_id
+                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, monopoly_yn, contract_yn, series_regular_price, single_regular_price, single_rental_price, created_id, updated_id)
+                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :monopoly_yn, :contract_yn, :series_regular_price, :single_regular_price, :single_rental_price, :created_id, :updated_id
                                    from tb_user
                                   where kc_user_id = :kc_user_id
                                     and use_yn = 'Y'
@@ -2633,6 +2646,9 @@ async def post_products(
                         "open_yn": req_body.open_yn,
                         "monopoly_yn": req_body.monopoly_yn,
                         "contract_yn": req_body.cp_contract_yn,
+                        "series_regular_price": series_regular_price,
+                        "single_regular_price": single_regular_price,
+                        "single_rental_price": single_rental_price,
                         "created_id": settings.DB_DML_DEFAULT_ID,
                         "updated_id": settings.DB_DML_DEFAULT_ID,
                     },
