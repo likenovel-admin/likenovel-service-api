@@ -114,7 +114,7 @@ async def check_user(kc_user_id: str | None, db: AsyncSession, role: str = "") -
     if user["role_type"] == "admin":
         return {"user_id": int(user["user_id"]), "role": "admin"}
     elif user["apply_type"] == "cp":
-        return {"user_id": int(user["user_id"]), "role": "partner"}
+        return {"user_id": int(user["user_id"]), "role": "CP"}
     elif user["apply_type"] == "editor":
         return {"user_id": int(user["user_id"]), "role": "author"}
     return {"user_id": int(user["user_id"]), "role": "author"}

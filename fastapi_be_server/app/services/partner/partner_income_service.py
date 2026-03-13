@@ -52,7 +52,7 @@ async def sponsorship_recodes_list(
                 OR sr.author_id = {user_data["user_id"]}
             )
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND (
                 sr.product_id IN (
@@ -326,7 +326,7 @@ async def income_recodes_list(
         where += f"""
             AND product_id IN (select product_id from tb_product where author_id = {user_data["user_id"]})
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND product_id IN (
                 select z.product_id
@@ -441,7 +441,7 @@ async def income_settlement_list(
                 OR (sponsor_type = 'author' AND author_nickname IN (select author_name from tb_product where author_id = {user_data["user_id"]} LIMIT 1))
             )
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND product_id IN (
                 select z.product_id
@@ -601,7 +601,7 @@ async def income_settlement_summary(
                 OR author_id = :user_id
             )
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         sponsorship_where = """
             AND (
                 product_id IN (
@@ -690,7 +690,7 @@ async def income_settlement_summary(
         settlement_where = """
             AND product_id IN (select product_id from tb_product where author_id = :user_id)
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         settlement_where = """
             AND product_id IN (
                 select z.product_id
@@ -727,7 +727,7 @@ async def income_settlement_summary(
         addictive_where = """
             AND product_id IN (select product_id from tb_product where author_id = :user_id)
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         addictive_where = """
             AND product_id IN (
                 select z.product_id

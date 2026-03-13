@@ -65,7 +65,7 @@ async def _resolve_current_user_role(kc_user_id: str, db: AsyncSession) -> str:
         return "admin"
 
     if row.get("apply_type") == "cp":
-        return "partner"
+        return "CP"
 
     return "author"
 
@@ -138,7 +138,7 @@ def get_select_fields_and_joins_for_product(
                 "wff.status as waitingForFreeStatus",
                 "p69.status as sixNinePathStatus",
                 # "fff.num_of_ticket_per_person as freeEpisodes",
-                "if(p.last_episode_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR), 'Y', 'N') as newReleaseYn",
+                "if(p.created_date >= DATE_SUB(NOW(), INTERVAL 3 DAY), 'Y', 'N') as newReleaseYn",
                 "COALESCE(ut.ticket_count, 0) as freeEpisodeTicketCount"
                 if user_id
                 else "0 as freeEpisodeTicketCount",
@@ -768,9 +768,6 @@ async def products_all(
         user_id=user_id, join_rank=False
     )
     filter_option.append("p.open_yn = 'Y'")
-    filter_option.append(
-        "EXISTS (SELECT 1 FROM tb_product_episode e WHERE e.product_id = p.product_id AND e.open_yn = 'Y' AND e.use_yn = 'Y')"
-    )
     query = text(f"""
         SELECT {query_parts["select_fields"]}
         FROM tb_product p
@@ -2329,6 +2326,7 @@ async def get_products_product_id_info(
                                             else 'N'
                                     end as adult_yn
                                     , a.open_yn
+                                    , a.blind_yn
                                     , a.monopoly_yn
                                     , a.contract_yn
                                     , a.paid_open_date as paid_setting_date
@@ -2378,6 +2376,7 @@ async def get_products_product_id_info(
                     "synopsis": db_rst[0].get("synopsis_text"),
                     "adultYn": db_rst[0].get("adult_yn"),
                     "openYn": db_rst[0].get("open_yn"),
+                    "blindYn": db_rst[0].get("blind_yn"),
                     "monopolyYn": db_rst[0].get("monopoly_yn"),
                     "cpContractYn": db_rst[0].get("contract_yn"),
                     "paidSettingDate": db_rst[0].get("paid_setting_date"),
@@ -2455,7 +2454,13 @@ async def post_products(
                 current_user_role = await _resolve_current_user_role(
                     kc_user_id=kc_user_id, db=db
                 )
-                allow_external_author_nickname = current_user_role in ("admin", "partner")
+                allow_external_author_nickname = current_user_role in ("admin", "CP")
+                requested_blind_yn = (req_body.blind_yn or "N").upper()
+                if current_user_role != "admin" and requested_blind_yn != "N":
+                    raise CustomResponseException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        message="관리자 블라인드는 관리자만 변경할 수 있습니다.",
+                    )
                 series_regular_price = int(req_body.series_regular_price or 0)
                 single_regular_price = int(req_body.single_regular_price or 0)
                 single_rental_price = int(req_body.single_rental_price or 0)
@@ -2597,7 +2602,7 @@ async def post_products(
                         message=ErrorMessages.INVALID_PRODUCT_INFO,
                     )
 
-                if current_user_role in ("admin", "partner"):
+                if current_user_role in ("admin", "CP"):
                     product_type = "normal"
                 elif req_body.product_type == "normal":
                     # 일반연재 자격 확인: 기존 승급 작품이 있는지 체크
@@ -2613,8 +2618,8 @@ async def post_products(
                     product_type = None
 
                 query = text("""
-                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, monopoly_yn, contract_yn, series_regular_price, single_regular_price, single_rental_price, created_id, updated_id)
-                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :monopoly_yn, :contract_yn, :series_regular_price, :single_regular_price, :single_rental_price, :created_id, :updated_id
+                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, blind_yn, monopoly_yn, contract_yn, series_regular_price, single_regular_price, single_rental_price, created_id, updated_id)
+                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :blind_yn, :monopoly_yn, :contract_yn, :series_regular_price, :single_regular_price, :single_rental_price, :created_id, :updated_id
                                    from tb_user
                                   where kc_user_id = :kc_user_id
                                     and use_yn = 'Y'
@@ -2643,7 +2648,8 @@ async def post_products(
                         "sub_genre_id": sub_genre_id,
                         "synopsis_text": req_body.synopsis,
                         "ratings_code": "adult" if req_body.adult_yn == "Y" else "all",
-                        "open_yn": req_body.open_yn,
+                        "open_yn": "N" if requested_blind_yn == "Y" else req_body.open_yn,
+                        "blind_yn": requested_blind_yn,
                         "monopoly_yn": req_body.monopoly_yn,
                         "contract_yn": req_body.cp_contract_yn,
                         "series_regular_price": series_regular_price,
@@ -2820,7 +2826,44 @@ async def put_products_product_id(
                 current_user_role = await _resolve_current_user_role(
                     kc_user_id=kc_user_id, db=db
                 )
-                allow_external_author_nickname = current_user_role in ("admin", "partner")
+                allow_external_author_nickname = current_user_role in ("admin", "CP")
+                query = text("""
+                                 select blind_yn, open_yn
+                                   from tb_product
+                                  where product_id = :product_id
+                                  limit 1
+                                 """)
+                result = await db.execute(query, {"product_id": product_id_to_int})
+                current_product = result.mappings().one_or_none()
+                if current_product is None:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        message=ErrorMessages.NOT_FOUND_PRODUCT,
+                    )
+                current_blind_yn = (current_product.get("blind_yn") or "N").upper()
+                current_open_yn = (current_product.get("open_yn") or "N").upper()
+                fields_set = getattr(req_body, "model_fields_set", set()) or set()
+                blind_yn_in_request = "blind_yn" in fields_set
+                requested_blind_yn = (
+                    (req_body.blind_yn or current_blind_yn).upper()
+                    if blind_yn_in_request
+                    else current_blind_yn
+                )
+                if current_user_role != "admin":
+                    if blind_yn_in_request and requested_blind_yn != current_blind_yn:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            message="관리자 블라인드는 관리자만 변경할 수 있습니다.",
+                        )
+                    if (
+                        current_blind_yn == "Y"
+                        and "open_yn" in fields_set
+                        and req_body.open_yn != current_open_yn
+                    ):
+                        raise CustomResponseException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            message="관리자 블라인드된 작품은 공개 상태를 변경할 수 없습니다.",
+                        )
 
                 # ?곗옱?곹깭 寃利?
                 query = text("""
@@ -2982,6 +3025,7 @@ async def put_products_product_id(
                                           , a.sub_genre_id = :sub_genre_id
                                           , a.ratings_code = :ratings_code
                                           , a.open_yn = :open_yn
+                                          , a.blind_yn = :blind_yn
                                           , a.monopoly_yn = :monopoly_yn
                                           , a.contract_yn = :contract_yn
                                           , a.paid_open_date = :paid_open_date
@@ -2994,7 +3038,7 @@ async def put_products_product_id(
                                                        and z.user_id = a.user_id)
                                      """)
 
-                    await db.execute(
+                    result = await db.execute(
                         query,
                         {
                             "kc_user_id": kc_user_id,
@@ -3014,7 +3058,8 @@ async def put_products_product_id(
                             "ratings_code": "adult"
                             if req_body.adult_yn == "Y"
                             else "all",
-                            "open_yn": req_body.open_yn,
+                            "open_yn": "N" if requested_blind_yn == "Y" else req_body.open_yn,
+                            "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": req_body.cp_contract_yn,
                             "paid_open_date": convert_to_kor_time(
@@ -3028,6 +3073,11 @@ async def put_products_product_id(
                             else None,
                         },
                     )
+                    if result.rowcount == 0:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            message=ErrorMessages.FORBIDDEN,
+                        )
                 else:
                     query = text("""
                                      update tb_product a
@@ -3044,6 +3094,7 @@ async def put_products_product_id(
                                           , a.sub_genre_id = :sub_genre_id
                                           , a.ratings_code = :ratings_code
                                           , a.open_yn = :open_yn
+                                          , a.blind_yn = :blind_yn
                                           , a.monopoly_yn = :monopoly_yn
                                           , a.contract_yn = :contract_yn
                                           , a.paid_open_date = :paid_open_date
@@ -3056,7 +3107,7 @@ async def put_products_product_id(
                                                        and z.user_id = a.user_id)
                                      """)
 
-                    await db.execute(
+                    result = await db.execute(
                         query,
                         {
                             "kc_user_id": kc_user_id,
@@ -3077,7 +3128,8 @@ async def put_products_product_id(
                             "ratings_code": "adult"
                             if req_body.adult_yn == "Y"
                             else "all",
-                            "open_yn": req_body.open_yn,
+                            "open_yn": "N" if requested_blind_yn == "Y" else req_body.open_yn,
+                            "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": req_body.cp_contract_yn,
                             "paid_open_date": convert_to_kor_time(
@@ -3091,6 +3143,11 @@ async def put_products_product_id(
                             else None,
                         },
                     )
+                    if result.rowcount == 0:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            message=ErrorMessages.FORBIDDEN,
+                        )
 
                 # tb_mapped_product_keyword upd
                 query = text("""

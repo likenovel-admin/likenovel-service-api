@@ -108,7 +108,7 @@ async def get_user(kc_user_id: str, db: AsyncSession):
                 elif apply_type == "editor":
                     user_role = "editor"
                 else:
-                    user_role = role_type
+                    user_role = "user"
 
                 adult_yn = (
                     "Y" if get_full_age(date=db_rst[0].get("birthdate")) >= 19 else "N"
@@ -223,7 +223,7 @@ async def get_user_info(kc_user_id: str, db: AsyncSession):
                 elif apply_type == "editor":
                     user_role = "editor"
                 else:
-                    user_role = role_type
+                    user_role = "user"
 
                 # CP 또는 편집자 신청/승인 여부 확인
                 # apply_status가 'review' 또는 'accepted'이면 "Y", 그 외(rejected, null)는 "N"

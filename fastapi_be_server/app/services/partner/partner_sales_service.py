@@ -66,7 +66,7 @@ async def monthly_sales_by_product_list(
         where += f"""
             AND p.author_id = {user_data["user_id"]}
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         additional_joins += """
             INNER JOIN tb_product p ON pps.product_id = p.product_id
         """
@@ -458,7 +458,7 @@ async def sales_by_episode_list(
         where += f"""
             AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = {user_data["user_id"]})
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND product_id IN (
                 select z.product_id
@@ -697,7 +697,7 @@ async def daily_ticket_list(
         where += f"""
             AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = {user_data["user_id"]})
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND product_id IN (
                 select z.product_id
@@ -811,7 +811,7 @@ async def monthly_settlement_list(
         where += f"""
             AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = {user_data["user_id"]})
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND product_id IN (
                 select z.product_id
@@ -925,7 +925,7 @@ async def product_contract_offer_deduction_list(
         where += f"""
             AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = {user_data["user_id"]})
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND product_id IN (
                 select z.product_id

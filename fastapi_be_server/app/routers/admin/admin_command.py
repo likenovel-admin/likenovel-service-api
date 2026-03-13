@@ -1540,6 +1540,10 @@ async def post_admin_create_account(
     except Exception as e:
         raise e
 
+    # check_user의 SELECT로 implicit transaction이 시작된 상태이므로,
+    # post_auth_signup 내부의 db.begin()과 충돌하지 않도록 커밋하여 종료
+    await db.commit()
+
     signup_body = auth_schema.SignupReqBody(
         email=req_body.email,
         password=req_body.password,

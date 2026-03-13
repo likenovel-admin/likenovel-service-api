@@ -286,7 +286,7 @@ def build_role_where_clause(
         return f"""
             AND {author_id_column} = {user_data["user_id"]}
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         return f"""
             AND {product_id_column} IN (
                 SELECT z.product_id

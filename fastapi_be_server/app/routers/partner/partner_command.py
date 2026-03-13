@@ -41,11 +41,11 @@ async def put_product(
     파트너 - 작품 관리 / 작품 리스트
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        user_data = await check_user(kc_user_id=user.get("sub"), db=db)
     except Exception as e:
         raise e
 
-    return await partner_product_service.put_product(req_body, id, db=db)
+    return await partner_product_service.put_product(req_body, id, db=db, user_data=user_data)
 
 
 @router.delete(
@@ -82,7 +82,7 @@ async def put_monthly_sales_by_product(
     파트너 - 매출 및 정산 > 작품별 월매출
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
     except Exception as e:
         raise e
 
@@ -103,7 +103,7 @@ async def settlement_sponsorship_recodes(
     파트너 - 매출 및 정산 > 후원 내역 정산
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
     except Exception as e:
         raise e
 

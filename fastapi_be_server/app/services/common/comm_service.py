@@ -13,6 +13,8 @@ import boto3
 import logging
 from botocore.config import Config
 from ebooklib import epub
+from bs4 import BeautifulSoup
+from html import escape as html_escape
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -596,16 +598,20 @@ async def make_epub(
     # metadata
     book.set_language("ko")
 
-    # 표지 이미지
+    # 표지 이미지 — 속성값을 XML-escape하여 &, <, >, " 등에 의한 파싱 에러 방지
     cover_chapter = epub.EpubHtml(title="Cover", file_name="cover.xhtml")
+    safe_cover_path = html_escape(cover_image_path or "", quote=True)
+    safe_title = html_escape(episode_title or "", quote=True)
     cover_chapter.content = (
-        f'<div><img src="{cover_image_path}" alt="{episode_title}"/></div>'
+        f'<div><img src="{safe_cover_path}" alt="{safe_title}"/></div>'
     )
     book.add_item(cover_chapter)
 
-    # 내용
+    # 내용 — 에디터 HTML을 valid XHTML로 변환
+    # BeautifulSoup이 &nbsp;→U+00A0, <br>→<br/>, 미이스케이프 &→&amp; 등 처리
     content_chapter = epub.EpubHtml(title="Content", file_name="content.xhtml")
-    content_chapter.content = content_db
+    soup = BeautifulSoup(content_db or "", "html.parser")
+    content_chapter.content = str(soup)
     book.add_item(content_chapter)
 
     book.toc = []

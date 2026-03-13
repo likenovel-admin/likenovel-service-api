@@ -243,7 +243,7 @@ class CommonConstants:
 
     # 사용자 역할
     ROLE_ADMIN = "admin"
-    ROLE_PARTNER = "partner"
+    ROLE_PARTNER = "CP"
     ROLE_AUTHOR = "author"
     ROLE_NORMAL = "normal"
 

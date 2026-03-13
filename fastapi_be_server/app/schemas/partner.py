@@ -59,6 +59,9 @@ class PutProductReqBody(AdminBase):
     open_yn: Optional[str] = Field(
         default=None, examples=["Y"], description="공개 여부"
     )
+    blind_yn: Optional[str] = Field(
+        default=None, examples=["N"], description="블라인드 여부"
+    )
     cp_offered_price: Optional[float] = Field(
         default=None,
         examples=[100],

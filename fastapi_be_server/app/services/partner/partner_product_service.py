@@ -91,7 +91,7 @@ async def product_list(
         where += f"""
             AND a.author_id = {user_data["user_id"]}
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where += f"""
             AND a.product_id IN (
                 select z.product_id
@@ -392,7 +392,8 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
 
 
 async def put_product(
-    req_body: partner_schema.PutProductReqBody, product_id: int, db: AsyncSession
+    req_body: partner_schema.PutProductReqBody, product_id: int, db: AsyncSession,
+    user_data: dict = None,
 ):
     """
     작품 수정
@@ -401,10 +402,48 @@ async def put_product(
         req_body: 작품 수정 요청 데이터
         product_id: 작품 ID
         db: 데이터베이스 세션
+        user_data: 사용자 정보 (user_id, role)
 
     Returns:
         수정된 작품 정보 딕셔너리
     """
+
+    # 권한 체크: 작가는 자기 작품만, CP는 계약작품+자기작품만, admin은 전체
+    if user_data:
+        user_id = user_data["user_id"]
+        role = user_data["role"]
+        if role == "author":
+            check_query = text("""
+                SELECT 1 FROM tb_product
+                WHERE product_id = :product_id AND author_id = :user_id
+            """)
+            result = await db.execute(check_query, {"product_id": product_id, "user_id": user_id})
+            if result.scalar() is None:
+                raise CustomResponseException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    message="본인 작품만 수정할 수 있습니다.",
+                )
+        elif role == "CP":
+            check_query = text("""
+                SELECT 1 FROM tb_product p
+                WHERE p.product_id = :product_id
+                  AND (p.author_id = :user_id
+                       OR EXISTS (
+                           SELECT 1 FROM tb_product_contract_offer co
+                           INNER JOIN tb_user_profile_apply upa ON co.offer_user_id = upa.user_id
+                             AND upa.apply_type = 'cp' AND upa.approval_date IS NOT NULL
+                           WHERE co.product_id = p.product_id
+                             AND co.use_yn = 'Y' AND co.author_accept_yn = 'Y'
+                             AND co.offer_user_id = :user_id
+                       ))
+            """)
+            result = await db.execute(check_query, {"product_id": product_id, "user_id": user_id})
+            if result.scalar() is None:
+                raise CustomResponseException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    message="본인 작품 또는 계약 작품만 수정할 수 있습니다.",
+                )
+        # admin은 제한 없음
 
     if req_body.ratings_code is not None and req_body.ratings_code not in [
         "all",
@@ -461,7 +500,8 @@ async def put_product(
         )
 
     query = text("""
-                SELECT uci, isbn, series_regular_price, single_regular_price, single_rental_price
+                SELECT uci, isbn, series_regular_price, single_regular_price, single_rental_price,
+                       blind_yn, open_yn
                   FROM tb_product
                  WHERE product_id = :product_id
                  LIMIT 1
@@ -482,7 +522,13 @@ async def put_product(
     next_uci = incoming_uci if req_body.uci is not None else current_uci
     next_isbn = incoming_isbn if req_body.isbn is not None else current_isbn
 
-    if not next_uci and not next_isbn:
+    next_price_type = (
+        "paid"
+        if next_series_regular_price > 0 or next_single_regular_price > 0
+        else "free"
+    )
+
+    if next_price_type == "paid" and not next_uci and not next_isbn:
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.UCI_OR_ISBN_REQUIRED,
@@ -491,6 +537,8 @@ async def put_product(
     current_series_regular_price = int(product_row.get("series_regular_price") or 0)
     current_single_regular_price = int(product_row.get("single_regular_price") or 0)
     current_single_rental_price = int(product_row.get("single_rental_price") or 0)
+    current_blind_yn = (product_row.get("blind_yn") or "N").upper()
+    current_open_yn = (product_row.get("open_yn") or "N").upper()
 
     next_series_regular_price = (
         int(req_body.series_regular_price)
@@ -547,10 +595,23 @@ async def put_product(
             message="단행본 소장가격 없이 대여가격만 저장할 수 없습니다.",
         )
 
-    next_price_type = "paid"
     free_episode_start_no = req_body.free_episode_start_no
     free_episode_end_no = req_body.free_episode_end_no
     fields_set = getattr(req_body, "model_fields_set", set()) or set()
+    blind_yn_in_request = "blind_yn" in fields_set
+    open_yn_in_request = "open_yn" in fields_set
+
+    if user_data and user_data["role"] != "admin":
+        if blind_yn_in_request and req_body.blind_yn != current_blind_yn:
+            raise CustomResponseException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                message="관리자 블라인드는 관리자만 변경할 수 있습니다.",
+            )
+        if current_blind_yn == "Y" and open_yn_in_request and req_body.open_yn != current_open_yn:
+            raise CustomResponseException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                message="관리자 블라인드된 작품은 공개 상태를 변경할 수 없습니다.",
+            )
     has_free_episode_range_input = (
         "free_episode_start_no" in fields_set or "free_episode_end_no" in fields_set
     )
@@ -659,6 +720,7 @@ async def put_product(
             "single_rental_price",
             "monopoly_yn",
             "open_yn",
+            *([] if not blind_yn_in_request else ["blind_yn"]),
         ],
         field_mapping={
             "author_nickname": "author_name",
@@ -666,10 +728,13 @@ async def put_product(
             "synopsis": "synopsis_text",
         },
     )
-    # open_yn 변경 시 blind_yn도 동기화
-    if hasattr(req_body, 'open_yn') and req_body.open_yn is not None:
-        set_clause = f"{set_clause}, blind_yn = :blind_yn"
-        params["blind_yn"] = "Y" if req_body.open_yn == "N" else "N"
+
+    next_blind_yn = (req_body.blind_yn or "").upper() if blind_yn_in_request else current_blind_yn
+    if next_blind_yn == "Y":
+        if "open_yn" in params:
+            params["open_yn"] = "N"
+        else:
+            set_clause = f"{set_clause}, open_yn = 'N'"
 
     set_clause = f"{set_clause}, price_type = :price_type"
     params["price_type"] = next_price_type

@@ -44,6 +44,7 @@ class PostProductsReqBody(ProductsBase):
     synopsis: str = Field(examples=["작품에 대한 소개입니다."], description="작품소개")
     adult_yn: str = Field(examples=["N"], description="연령등급(전체이용가 n, 성인 y)")
     open_yn: str = Field(examples=["Y"], description="공개설정")
+    blind_yn: Optional[str] = Field(default=None, examples=["N"], description="블라인드 여부")
     monopoly_yn: str = Field(examples=["N"], description="독점여부")
     cp_contract_yn: str = Field(examples=["N"], description="계약여부")
     product_type: Optional[str] = Field(
@@ -90,6 +91,7 @@ class PutProductsProductIdReqBody(ProductsBase):
     synopsis: str = Field(examples=["작품에 대한 소개입니다."], description="작품소개")
     adult_yn: str = Field(examples=["N"], description="연령등급(전체이용가 n, 성인 y)")
     open_yn: str = Field(examples=["Y"], description="공개설정")
+    blind_yn: Optional[str] = Field(default=None, examples=["N"], description="블라인드 여부")
     monopoly_yn: str = Field(examples=["N"], description="독점여부")
     cp_contract_yn: str = Field(examples=["N"], description="계약여부")
     paid_setting_date: Optional[datetime] = Field(

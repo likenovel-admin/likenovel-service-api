@@ -2975,6 +2975,7 @@ async def post_episodes_sale_start(
                        set p.open_yn = 'Y',
                            p.last_episode_date = now(),
                            p.updated_id = :updated_id
+                     where p.blind_yn = 'N'
                     """
                 )
                 await db.execute(query, update_params)

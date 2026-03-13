@@ -46,9 +46,18 @@ async def partner_profiles_of_partner(user_id, db: AsyncSession):
 
     query = text(f"""
                  SELECT
-                    *,
+                    up.*,
+                    CASE
+                        WHEN u.role_type = 'admin' THEN 'admin'
+                        WHEN (SELECT apply_type FROM tb_user_profile_apply
+                              WHERE user_id = u.user_id AND approval_date IS NOT NULL
+                              ORDER BY created_date DESC LIMIT 1) = 'cp' THEN 'CP'
+                        ELSE 'author'
+                    END as role_type,
                     {get_file_path_sub_query("up.profile_image_id", "profile_image_path")}
-                 FROM tb_user_profile up WHERE user_id = :user_id
+                 FROM tb_user_profile up
+                 INNER JOIN tb_user u ON u.user_id = up.user_id
+                 WHERE up.user_id = :user_id
                  """)
     result = await db.execute(query, {"user_id": user_id})
     rows = result.mappings().all()

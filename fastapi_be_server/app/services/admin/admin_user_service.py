@@ -809,6 +809,7 @@ async def deny_apply_episode(apply_id: int, admin_kc_user_id: str, db: AsyncSess
                  INNER JOIN tb_product_episode e ON p.product_id = e.product_id
                     SET p.open_yn = (
                             CASE
+                                WHEN p.blind_yn = 'Y' THEN 'N'
                                 WHEN EXISTS (
                                     SELECT 1
                                       FROM tb_product_episode e2

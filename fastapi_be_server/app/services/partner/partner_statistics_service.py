@@ -63,7 +63,7 @@ async def product_statistics_list(
                 WHERE author_id = {user_data["user_id"]}
             )
         """
-    elif user_data["role"] == "partner":
+    elif user_data["role"] == "CP":
         where = f"""
             AND s.product_id IN (
                 SELECT z.product_id
@@ -635,7 +635,7 @@ async def hourly_inflow_detail_by_product_id(
     where = build_role_where_clause(user_data)
     product_title_join = ""
 
-    if user_data["role"] in ["author", "partner"]:
+    if user_data["role"] in ["author", "CP"]:
         product_title_join = """
             INNER JOIN tb_product p ON hi.product_id = p.product_id
         """
@@ -762,7 +762,7 @@ async def product_discovery_statistics_list(
         where += f"""
             AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = {user_data["user_id"]})
         """
-    elif user_data["role"] == "partner" and scope == "contracted":
+    elif user_data["role"] == "CP" and scope == "contracted":
         where += f"""
             AND product_id IN (
                 select z.product_id
@@ -853,7 +853,7 @@ async def product_discovery_statistics_detail_by_id(
         )
         """
         params["user_id"] = user_data["user_id"]
-    elif user_data["role"] == "partner" and scope == "contracted":
+    elif user_data["role"] == "CP" and scope == "contracted":
         detail_where += """
         AND ppds.product_id IN (
             SELECT z.product_id
