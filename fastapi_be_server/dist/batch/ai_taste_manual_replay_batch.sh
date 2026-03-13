@@ -99,7 +99,7 @@ if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   exit 1
 fi
 
-MYSQL_CMD=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" $MYSQL_SSL_OPT)
+MYSQL_CMD=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT)
 ALLOW_DUPLICATE_YN='N'
 if [ "$ALLOW_DUPLICATE" -eq 1 ]; then
   ALLOW_DUPLICATE_YN='Y'

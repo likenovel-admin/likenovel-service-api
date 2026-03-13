@@ -25,7 +25,7 @@ MAX_RETRIES=3
 RETRY_DELAY=10
 
 for attempt in $(seq 1 $MAX_RETRIES); do
-  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" $MYSQL_SSL_OPT < /app/dist/batch/partner_report_monthly_batch.sql
+  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < /app/dist/batch/partner_report_monthly_batch.sql
   rc=$?
   if [ $rc -eq 0 ]; then
     exit 0

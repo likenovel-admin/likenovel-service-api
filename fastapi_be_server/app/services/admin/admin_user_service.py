@@ -924,6 +924,7 @@ async def put_auth_identity_password_reset(
     if (
         len(where_fields) == 0
     ):  # TODO: cleaned garbled comment (encoding issue).
+        where_fields.append("a.user_id = :user_id")
         execute_params["user_id"] = user_id
     # TODO: cleaned garbled comment (encoding issue).
     query = text(f"""
@@ -959,7 +960,7 @@ async def put_auth_identity_password_reset(
             message=ErrorMessages.SNS_ACCOUNT_PASSWORD_RESET_NOT_ALLOWED_ADMIN,
         )
 
-    # TODO: cleaned garbled comment (encoding issue).
+    res_json = await comm_service.kc_token_endpoint(method="POST", type="client_normal")
     admin_acc_token = res_json.get("access_token")
 
     cred_data = {

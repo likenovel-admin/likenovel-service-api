@@ -734,6 +734,106 @@ async def hourly_inflow_detail_by_product_id(
     return data
 
 
+async def _discovery_statistics_list_summary(
+    search_target: str,
+    search_word: str,
+    scope: str,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+    user_data: dict,
+):
+    """작품요약 뷰: 작가/계약CP의 모든 작품 표시 (발굴통계 데이터 유무와 무관)"""
+
+    where = ""
+    if user_data["role"] == "author":
+        where += f" AND p.author_id = {user_data['user_id']}"
+    elif user_data["role"] == "CP" and scope == "contracted":
+        where += f"""
+            AND p.product_id IN (
+                SELECT z.product_id
+                FROM tb_product_contract_offer z
+                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
+                    AND y.apply_type = 'cp'
+                    AND y.approval_date IS NOT NULL
+                WHERE z.use_yn = 'Y'
+                    AND z.author_accept_yn = 'Y'
+                    AND y.user_id = {user_data['user_id']}
+            )
+        """
+
+    if search_word != "":
+        if search_target == "story":
+            where += f"""
+                AND (p.title LIKE '%{search_word}%' OR p.synopsis_text LIKE '%{search_word}%')
+            """
+        elif search_target == "keyword-genre":
+            where += f"""
+                AND (
+                    EXISTS (SELECT 1 FROM tb_standard_keyword k WHERE k.keyword_id = p.primary_genre_id AND k.use_yn = 'Y' AND k.keyword_name LIKE '%{search_word}%')
+                    OR
+                    EXISTS (SELECT 1 FROM tb_standard_keyword k WHERE k.keyword_id = p.sub_genre_id AND k.use_yn = 'Y' AND k.keyword_name LIKE '%{search_word}%')
+                )
+            """
+
+    limit_clause, limit_params = get_pagination_params(page, count_per_page)
+
+    count_query = text(f"""
+        SELECT COUNT(*) as total_count
+        FROM tb_product p
+        WHERE 1=1 {where}
+    """)
+    count_result = await db.execute(count_query, {})
+    total_count = count_result.mappings().first()["total_count"]
+
+    query = text(f"""
+        SELECT
+            COALESCE(ppds.id, 0) as id,
+            p.product_id,
+            p.title,
+            p.author_name as author_nickname,
+            COALESCE(ppds.count_episode, (SELECT COUNT(1) FROM tb_product_episode pe WHERE pe.product_id = p.product_id AND pe.use_yn = 'Y')) as count_episode,
+            COALESCE(ppds.count_hit, 0) as count_hit,
+            COALESCE(ppds.count_hit_per_episode, 0) as count_hit_per_episode,
+            COALESCE(ppds.count_read_user, 0) as count_read_user,
+            COALESCE(ppds.count_bookmark, 0) as count_bookmark,
+            COALESCE(ppds.count_unbookmark, 0) as count_unbookmark,
+            COALESCE(ppds.count_recommend, 0) as count_recommend,
+            COALESCE(ppds.count_evaluation, 0) as count_evaluation,
+            COALESCE(ppds.count_cp_hit, 0) as count_cp_hit,
+            COALESCE(ppds.reading_rate, 0) as reading_rate,
+            COALESCE(ppds.writing_count_per_week, 0) as writing_count_per_week,
+            COALESCE(ppds.count_interest_sustain, 0) as count_interest_sustain,
+            COALESCE(ppds.count_interest_loss, 0) as count_interest_loss,
+            COALESCE(ppds.primary_reader_group1, '') as primary_reader_group1,
+            ppds.primary_reader_group2,
+            (SELECT z.keyword_name FROM tb_standard_keyword z WHERE z.keyword_id = p.primary_genre_id AND z.use_yn = 'Y' LIMIT 1) as primary_genre,
+            (SELECT z.keyword_name FROM tb_standard_keyword z WHERE z.keyword_id = p.sub_genre_id AND z.use_yn = 'Y' LIMIT 1) as sub_genre,
+            COALESCE(ppds.score1, 0) as score1,
+            COALESCE(ppds.score2, 0) as score2,
+            COALESCE(ppds.score3, 0) as score3,
+            0 as created_id,
+            p.created_date,
+            0 as updated_id,
+            COALESCE(ppds.updated_date, p.created_date) as updated_date,
+            (SELECT y.file_path FROM tb_common_file z, tb_common_file_item y
+                WHERE z.file_group_id = y.file_group_id
+                AND z.use_yn = 'Y'
+                AND y.use_yn = 'Y'
+                AND z.group_type = 'cover'
+                AND p.thumbnail_file_id = z.file_group_id) as cover_image_path
+        FROM tb_product p
+        LEFT JOIN tb_ptn_product_discovery_statistics ppds ON p.product_id = ppds.product_id
+        WHERE 1=1 {where}
+        ORDER BY p.created_date DESC
+        {limit_clause}
+    """)
+    result = await db.execute(query, limit_params)
+    rows = result.mappings().all()
+
+    return build_paginated_response(rows, total_count, page, count_per_page)
+
+
 async def product_discovery_statistics_list(
     search_target: str,
     search_word: str,
@@ -757,24 +857,17 @@ async def product_discovery_statistics_list(
         dict: 전체 개수, 페이징 정보, 발굴작품 통계 목록 (커버 이미지 포함)
     """
 
+    # 작품요약 뷰(작가/계약CP): 모든 작품 표시 (발굴통계 데이터 유무와 무관)
+    is_summary_view = (
+        user_data["role"] == "author"
+        or (user_data["role"] == "CP" and scope == "contracted")
+    )
+    if is_summary_view:
+        return await _discovery_statistics_list_summary(
+            search_target, search_word, scope, page, count_per_page, db, user_data
+        )
+
     where = """"""
-    if user_data["role"] == "author":
-        where += f"""
-            AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = {user_data["user_id"]})
-        """
-    elif user_data["role"] == "CP" and scope == "contracted":
-        where += f"""
-            AND product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            )
-        """
 
     if search_word != "":
         if search_target == "story":

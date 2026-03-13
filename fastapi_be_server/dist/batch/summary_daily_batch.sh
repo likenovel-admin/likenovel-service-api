@@ -29,7 +29,7 @@ run_with_retry() {
   local sql_file="$1"
   local batch_name="$2"
   for attempt in $(seq 1 $MAX_RETRIES); do
-    mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" $MYSQL_SSL_OPT < "$sql_file"
+    mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < "$sql_file"
     rc=$?
     if [ $rc -eq 0 ]; then
       return 0

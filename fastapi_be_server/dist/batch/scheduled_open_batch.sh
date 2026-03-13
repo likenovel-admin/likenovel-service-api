@@ -24,6 +24,6 @@ if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   exit 1
 fi
 
-mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" $MYSQL_SSL_OPT < "$SQL_FILE"
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < "$SQL_FILE"
 
 exit 0

@@ -81,7 +81,7 @@ if ! [[ "$MAX_PURGE_LOOPS" =~ ^[0-9]+$ ]] || [ "$MAX_PURGE_LOOPS" -lt 1 ]; then
   exit 1
 fi
 
-MYSQL_CMD=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" $MYSQL_SSL_OPT)
+MYSQL_CMD=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT)
 HEARTBEAT_WORKER_PID=""
 BATCH_RUN_TOKEN=$(( (RANDOM << 16) | RANDOM ))
 
