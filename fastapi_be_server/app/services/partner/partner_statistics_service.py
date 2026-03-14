@@ -750,6 +750,7 @@ async def _discovery_statistics_list_summary(
         where += f" AND p.author_id = {user_data['user_id']}"
     elif user_data["role"] == "CP" and scope == "contracted":
         where += f"""
+            AND p.open_yn = 'Y'
             AND p.product_id IN (
                 SELECT z.product_id
                 FROM tb_product_contract_offer z
@@ -763,11 +764,11 @@ async def _discovery_statistics_list_summary(
         """
 
     if search_word != "":
-        if search_target == "story":
-            where += f"""
-                AND (p.title LIKE '%{search_word}%' OR p.synopsis_text LIKE '%{search_word}%')
-            """
-        elif search_target == "keyword-genre":
+        if search_target == "title":
+            where += f" AND p.title LIKE '%{search_word}%'"
+        elif search_target == "author":
+            where += f" AND p.author_name LIKE '%{search_word}%'"
+        elif search_target == "genre":
             where += f"""
                 AND (
                     EXISTS (SELECT 1 FROM tb_standard_keyword k WHERE k.keyword_id = p.primary_genre_id AND k.use_yn = 'Y' AND k.keyword_name LIKE '%{search_word}%')
@@ -870,25 +871,23 @@ async def product_discovery_statistics_list(
     where = """"""
 
     if search_word != "":
-        if search_target == "story":
+        if search_target == "title":
+            where += f" AND ppds.title LIKE '%{search_word}%'"
+        elif search_target == "author":
+            where += f" AND ppds.author_nickname LIKE '%{search_word}%'"
+        elif search_target == "genre":
             where += f"""
-                          AND product_id IN (SELECT product_id FROM tb_product WHERE title LIKE '%{search_word}%' OR synopsis_text LIKE '%{search_word}%')
-                          """
-        elif search_target == "keyword-genre":
-            where += f"""
-                          AND (
-                              primary_genre LIKE '%{search_word}%'
-                              OR
-                              sub_genre LIKE '%{search_word}%'
-                          )
-                          """
+                AND (ppds.primary_genre LIKE '%{search_word}%' OR ppds.sub_genre LIKE '%{search_word}%')
+            """
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
 
     # 전체 개수 구하기
     count_query = text(f"""
         select count(*) as total_count
-        from tb_ptn_product_discovery_statistics
+        from tb_ptn_product_discovery_statistics ppds
+        inner join tb_product p on ppds.product_id = p.product_id
+            and p.open_yn = 'Y' and p.status_code = 'ongoing'
         WHERE 1=1 {where}
     """)
     count_result = await db.execute(count_query, {})
@@ -896,16 +895,18 @@ async def product_discovery_statistics_list(
 
     # 실제 데이터 조회
     query = text(f"""
-        select *
+        select ppds.*
             , (select y.file_path from tb_common_file z, tb_common_file_item y
                 where z.file_group_id = y.file_group_id
                 and z.use_yn = 'Y'
                 and y.use_yn = 'Y'
                 and z.group_type = 'cover'
-                and (select thumbnail_file_id from tb_product where product_id = ppds.product_id) = z.file_group_id) as cover_image_path
+                and p.thumbnail_file_id = z.file_group_id) as cover_image_path
         from tb_ptn_product_discovery_statistics ppds
+        inner join tb_product p on ppds.product_id = p.product_id
+            and p.open_yn = 'Y' and p.status_code = 'ongoing'
         WHERE 1=1 {where}
-        ORDER BY updated_date DESC
+        ORDER BY ppds.updated_date DESC
         {limit_clause}
     """)
     result = await db.execute(query, limit_params)
