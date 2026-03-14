@@ -6,10 +6,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 ALLOWED_AI_SIGNAL_EVENT_TYPES = {
-    "episode_view",
-    "episode_end",
-    "latest_episode_reached",
-    "next_episode_click",
+    "episode_view",       # 회차 열람 시작 (+ exit 시 progress_ratio 수집)
+    "episode_end",        # 완독 (progress >= 95%)
+    "latest_episode_reached",  # 최신화 열람 도달 신호 (완독 의미 아님, 최신화를 열었다는 사실)
+    "next_episode_click",      # 다음 화 이동 클릭
 }
 ALLOWED_AI_FACTOR_TYPES = {
     "protagonist",
