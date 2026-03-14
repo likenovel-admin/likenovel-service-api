@@ -522,18 +522,6 @@ async def put_product(
     next_uci = incoming_uci if req_body.uci is not None else current_uci
     next_isbn = incoming_isbn if req_body.isbn is not None else current_isbn
 
-    next_price_type = (
-        "paid"
-        if next_series_regular_price > 0 or next_single_regular_price > 0
-        else "free"
-    )
-
-    if next_price_type == "paid" and not next_uci and not next_isbn:
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message=ErrorMessages.UCI_OR_ISBN_REQUIRED,
-        )
-
     current_series_regular_price = int(product_row.get("series_regular_price") or 0)
     current_single_regular_price = int(product_row.get("single_regular_price") or 0)
     current_single_rental_price = int(product_row.get("single_rental_price") or 0)
@@ -555,6 +543,18 @@ async def put_product(
         if req_body.single_rental_price is not None
         else current_single_rental_price
     )
+
+    next_price_type = (
+        "paid"
+        if next_series_regular_price > 0 or next_single_regular_price > 0
+        else "free"
+    )
+
+    if next_price_type == "paid" and not next_uci and not next_isbn:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.UCI_OR_ISBN_REQUIRED,
+        )
 
     for field_name, value in [
         ("연재 가격", next_series_regular_price),
