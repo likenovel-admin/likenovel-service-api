@@ -518,6 +518,8 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                     , a.price_type
                                     , a.open_yn
                                     , (select p.open_yn from tb_product p where p.product_id = a.product_id) as product_open_yn
+                                    , (select p.author_id from tb_product p where p.product_id = a.product_id) as product_author_id
+                                    , (select p.user_id from tb_product p where p.product_id = a.product_id) as product_user_id
                                     , (select own_type from tb_user_productbook where (
                                         episode_id = a.episode_id -- note: cleaned garbled comment (encoding issue)
                                         or
@@ -584,11 +586,15 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
             db_rst = result.mappings().all()
 
             if db_rst:
-                # 비공개 에피소드: 소유/대여 중이 아니면 접근 차단
+                # 비공개 에피소드: 소유/대여 중이 아니면 접근 차단 (작품 소유자는 예외)
                 episode_open_yn = db_rst[0].get("open_yn", "Y")
                 episode_own_type = db_rst[0].get("own_type")
                 product_open_yn = db_rst[0].get("product_open_yn", "Y")
-                if product_open_yn == "N" or (episode_open_yn == "N" and not episode_own_type):
+                product_author_id = db_rst[0].get("product_author_id")
+                product_user_id = db_rst[0].get("product_user_id")
+                is_owner = (product_author_id is not None and product_author_id == user_id) or \
+                           (product_user_id is not None and product_user_id == user_id)
+                if not is_owner and (product_open_yn == "N" or (episode_open_yn == "N" and not episode_own_type)):
                     res_data = {
                         "product_id": db_rst[0].get("product_id"),
                         "title": db_rst[0].get("title"),

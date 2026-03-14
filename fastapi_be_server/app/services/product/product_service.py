@@ -1038,7 +1038,7 @@ async def product_details_group_by_product_id(
             FROM tb_product p
             {query_parts["joins"]}
             WHERE p.product_id = :product_id
-              AND (p.open_yn = 'Y' OR p.user_id = :user_id)
+              AND (p.open_yn = 'Y' OR p.user_id = :user_id OR p.author_id = :user_id)
         """)
         result = await db.execute(query, {"product_id": product_id, "user_id": user_id})
         rows = result.mappings().all()
