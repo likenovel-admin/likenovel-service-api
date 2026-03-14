@@ -423,127 +423,100 @@ async def issue_reader_of_prev_promotion(
                 message=ErrorMessages.CANNOT_ISSUE_NOT_IN_PROGRESS_PROMOTION,
             )
 
-        # 작가의 모든 작품에 reader-of-prev 프로모션이 설정되어 있는지 조회
         author_user_id = promotion.get("author_user_id")
-        query = text("""
-            select dp.id as promotion_id, dp.product_id, dp.num_of_ticket_per_person, dp.type,
-                   p.title as product_title, p.author_name
-              from tb_direct_promotion dp
-             inner join tb_product p on dp.product_id = p.product_id
-             where p.author_id = :author_id
-               and dp.type = 'reader-of-prev'
-               and dp.status in ('ing', 'pending')
-        """)
-        result = await db.execute(query, {"author_id": author_user_id})
-        author_promotions = result.mappings().all()
-
-        if not author_promotions:
-            raise CustomResponseException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                message=ErrorMessages.NO_READER_OF_PREV_PROMOTION_IN_PROGRESS,
-            )
+        promo_product_id = promotion.get("product_id")
+        promo_id = promotion.get("id")
+        num_of_ticket = promotion.get("num_of_ticket_per_person")
+        product_title = promotion.get("product_title")
 
         total_issued_count = 0
         total_tickets = 0
 
-        # 각 작품별로 처리
-        for promo in author_promotions:
-            promo_product_id = promo["product_id"]
-            promo_id = promo["promotion_id"]
-            num_of_ticket = promo["num_of_ticket_per_person"]
+        # 현재 프로모션이 연결된 작품의 북마크 유저에게만 발급한다.
+        query = text("""
+            select user_id
+              from tb_user_bookmark
+             where product_id = :product_id
+               and use_yn = 'Y'
+        """)
+        result = await db.execute(query, {"product_id": promo_product_id})
+        bookmark_users = result.mappings().all()
 
-            # 해당 작품을 북마크한 유저 조회
+        for bookmark_user in bookmark_users:
+            bookmark_user_id = bookmark_user["user_id"]
+
+            # 해당 유저가 이번 주에 이 작품으로 선물함에 받았는지 체크 (작품별로 일주일에 한 번)
             query = text("""
-                select user_id
-                  from tb_user_bookmark
-                 where product_id = :product_id
-                   and use_yn = 'Y'
+                select count(*) as count
+                  from tb_user_giftbook ug
+                 inner join tb_direct_promotion dp on ug.acquisition_id = dp.id
+                 where ug.user_id = :user_id
+                   and dp.product_id = :product_id
+                   and ug.acquisition_type = 'direct_promotion'
+                   and dp.type = 'reader-of-prev'
+                   and YEARWEEK(ug.created_date, 1) = YEARWEEK(NOW(), 1)
             """)
-            result = await db.execute(query, {"product_id": promo_product_id})
-            bookmark_users = result.mappings().all()
+            result = await db.execute(
+                query,
+                {
+                    "user_id": bookmark_user_id,
+                    "product_id": promo_product_id,
+                },
+            )
+            already_received_this_week = result.scalar()
 
-            # 이 작품에 북마크한 유저가 없으면 스킵
-            if not bookmark_users:
+            # 이미 이번 주에 이 작품에서 받았으면 스킵
+            if already_received_this_week > 0:
                 continue
 
-            # 각 유저에게 선물함으로 대여권 지급
-            product_title = promo["product_title"]
+            # 선작독자: 유효기간 1주일 (선물함 유효기간도 1주일)
+            expiration_date_str = (datetime.now() + timedelta(days=7)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
+                user_id=bookmark_user_id,
+                product_id=promo_product_id,
+                episode_id=None,
+                ticket_type=promotion["type"],
+                own_type="rental",
+                acquisition_type="direct_promotion",
+                acquisition_id=promo_id,
+                reason="선작독자 무료 대여권",
+                amount=num_of_ticket,
+                promotion_type="reader-of-prev",
+                expiration_date=expiration_date_str,  # 선물함 유효기간 1주일
+                ticket_expiration_type="days",  # 수령 후 대여권 유효기간 7일
+                ticket_expiration_value=7,
+            )
+            await user_giftbook_service.post_user_giftbook(
+                req_body=giftbook_req,
+                kc_user_id="",
+                db=db,
+                user_id=bookmark_user_id,
+            )
 
-            for bookmark_user in bookmark_users:
-                bookmark_user_id = bookmark_user["user_id"]
-
-                # 해당 유저가 이번 주에 이 작품으로 선물함에 받았는지 체크 (작품별로 일주일에 한 번)
-                query = text("""
-                    select count(*) as count
-                      from tb_user_giftbook ug
-                     inner join tb_direct_promotion dp on ug.acquisition_id = dp.id
-                     where ug.user_id = :user_id
-                       and dp.product_id = :product_id
-                       and ug.acquisition_type = 'direct_promotion'
-                       and dp.type = 'reader-of-prev'
-                       and YEARWEEK(ug.created_date, 1) = YEARWEEK(NOW(), 1)
+            # 선작독자 무료 대여권 지급 알림 전송
+            try:
+                notification_title = f"{product_title} 작가가 회원님께 드리는 무료열람권(대여권)이 도착하였습니다"
+                notification_query = text("""
+                    INSERT INTO tb_user_notification_item
+                    (user_id, noti_type, title, content, read_yn, created_id, created_date)
+                    VALUES (:user_id, 'promotion', :title, '', 'N', :created_id, NOW())
                 """)
-                result = await db.execute(
-                    query,
+                await db.execute(
+                    notification_query,
                     {
                         "user_id": bookmark_user_id,
-                        "product_id": promo_product_id,
+                        "title": notification_title,
+                        "created_id": author_user_id,
                     },
                 )
-                already_received_this_week = result.scalar()
+            except Exception as e:
+                # 알림 실패해도 대여권 지급은 성공으로 처리
+                logger.error(f"Failed to send reader-of-prev notification: {e}")
 
-                # 이미 이번 주에 이 작품에서 받았으면 스킵
-                if already_received_this_week > 0:
-                    continue
-
-                # 선작독자: 유효기간 1주일 (선물함 유효기간도 1주일)
-                expiration_date_str = (datetime.now() + timedelta(days=7)).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
-                    user_id=bookmark_user_id,
-                    product_id=promo_product_id,
-                    episode_id=None,
-                    ticket_type=promo["type"],
-                    own_type="rental",
-                    acquisition_type="direct_promotion",
-                    acquisition_id=promo_id,
-                    reason="선작독자 무료 대여권",
-                    amount=num_of_ticket,
-                    promotion_type="reader-of-prev",
-                    expiration_date=expiration_date_str,  # 선물함 유효기간 1주일
-                    ticket_expiration_type="days",  # 수령 후 대여권 유효기간 7일
-                    ticket_expiration_value=7,
-                )
-                await user_giftbook_service.post_user_giftbook(
-                    req_body=giftbook_req,
-                    kc_user_id="",
-                    db=db,
-                    user_id=bookmark_user_id,
-                )
-
-                # 선작독자 무료 대여권 지급 알림 전송
-                try:
-                    notification_title = f"{product_title} 작가가 회원님께 드리는 무료열람권(대여권)이 도착하였습니다"
-                    notification_query = text("""
-                        INSERT INTO tb_user_notification_item
-                        (user_id, noti_type, title, content, read_yn, created_id, created_date)
-                        VALUES (:user_id, 'promotion', :title, '', 'N', :created_id, NOW())
-                    """)
-                    await db.execute(
-                        notification_query,
-                        {
-                            "user_id": bookmark_user_id,
-                            "title": notification_title,
-                            "created_id": author_user_id,
-                        },
-                    )
-                except Exception as e:
-                    # 알림 실패해도 대여권 지급은 성공으로 처리
-                    logger.error(f"Failed to send reader-of-prev notification: {e}")
-
-                total_tickets += num_of_ticket
-                total_issued_count += 1
+            total_tickets += num_of_ticket
+            total_issued_count += 1
 
         res_body = dict()
         res_body["result"] = True
@@ -716,6 +689,8 @@ async def save_direct_promotion(
                 message=ErrorMessages.FORBIDDEN_PRODUCT_FOR_DIRECT_PROMOTION,
             )
 
+        # free-for-first: 0 이하면 신규 생성하지 않음
+        fff_count = req_body.num_of_ticket_per_person_for_free_for_first or 0
         query = text("""
             select * from tb_direct_promotion where product_id = :product_id and `type` = 'free-for-first'
         """)
@@ -723,38 +698,40 @@ async def save_direct_promotion(
         db_rst = result.mappings().one_or_none()
 
         if not db_rst:
-            # 없으면 등록해서 값 저장
-            query = text("""
-                insert into tb_direct_promotion
-                (product_id, start_date, `type`, status, num_of_ticket_per_person, created_id, updated_id)
-                values
-                (:product_id, now(), 'free-for-first', 'ing', :ticket_count, :created_id, :updated_id)
-            """)
-            await db.execute(
-                query,
-                {
-                    "product_id": product_id,
-                    "ticket_count": req_body.num_of_ticket_per_person_for_free_for_first,
-                    "created_id": settings.DB_DML_DEFAULT_ID,
-                    "updated_id": settings.DB_DML_DEFAULT_ID,
-                },
-            )
+            if fff_count > 0:
+                query = text("""
+                    insert into tb_direct_promotion
+                    (product_id, start_date, `type`, status, num_of_ticket_per_person, created_id, updated_id)
+                    values
+                    (:product_id, now(), 'free-for-first', 'ing', :ticket_count, :created_id, :updated_id)
+                """)
+                await db.execute(
+                    query,
+                    {
+                        "product_id": product_id,
+                        "ticket_count": fff_count,
+                        "created_id": settings.DB_DML_DEFAULT_ID,
+                        "updated_id": settings.DB_DML_DEFAULT_ID,
+                    },
+                )
         else:
-            # 있으면 업데이트
-            query = text("""
-                update tb_direct_promotion
-                set num_of_ticket_per_person = :ticket_count,
-                    updated_date = NOW()
-                where product_id = :product_id and `type` = 'free-for-first'
-            """)
-            await db.execute(
-                query,
-                {
-                    "ticket_count": req_body.num_of_ticket_per_person_for_free_for_first,
-                    "product_id": product_id,
-                },
-            )
+            if fff_count > 0:
+                query = text("""
+                    update tb_direct_promotion
+                    set num_of_ticket_per_person = :ticket_count,
+                        updated_date = NOW()
+                    where product_id = :product_id and `type` = 'free-for-first'
+                """)
+                await db.execute(
+                    query,
+                    {
+                        "ticket_count": fff_count,
+                        "product_id": product_id,
+                    },
+                )
 
+        # reader-of-prev: 0 이하면 신규 생성하지 않음
+        rop_count = req_body.num_of_ticket_per_person_for_reader_of_prev or 0
         query = text("""
             select * from tb_direct_promotion where product_id = :product_id and `type` = 'reader-of-prev'
         """)
@@ -762,37 +739,37 @@ async def save_direct_promotion(
         db_rst = result.mappings().one_or_none()
 
         if not db_rst:
-            # 없으면 등록해서 값 저장
-            query = text("""
-                insert into tb_direct_promotion
-                (product_id, start_date, `type`, status, num_of_ticket_per_person, created_id, updated_id)
-                values
-                (:product_id, now(), 'reader-of-prev', 'pending', :ticket_count, :created_id, :updated_id)
-            """)
-            await db.execute(
-                query,
-                {
-                    "product_id": product_id,
-                    "ticket_count": req_body.num_of_ticket_per_person_for_reader_of_prev,
-                    "created_id": settings.DB_DML_DEFAULT_ID,
-                    "updated_id": settings.DB_DML_DEFAULT_ID,
-                },
-            )
+            if rop_count > 0:
+                query = text("""
+                    insert into tb_direct_promotion
+                    (product_id, start_date, `type`, status, num_of_ticket_per_person, created_id, updated_id)
+                    values
+                    (:product_id, now(), 'reader-of-prev', 'pending', :ticket_count, :created_id, :updated_id)
+                """)
+                await db.execute(
+                    query,
+                    {
+                        "product_id": product_id,
+                        "ticket_count": rop_count,
+                        "created_id": settings.DB_DML_DEFAULT_ID,
+                        "updated_id": settings.DB_DML_DEFAULT_ID,
+                    },
+                )
         else:
-            # 있으면 업데이트
-            query = text("""
-                update tb_direct_promotion
-                set num_of_ticket_per_person = :ticket_count,
-                    updated_date = NOW()
-                where product_id = :product_id and `type` = 'reader-of-prev'
-            """)
-            await db.execute(
-                query,
-                {
-                    "ticket_count": req_body.num_of_ticket_per_person_for_reader_of_prev,
-                    "product_id": product_id,
-                },
-            )
+            if rop_count > 0:
+                query = text("""
+                    update tb_direct_promotion
+                    set num_of_ticket_per_person = :ticket_count,
+                        updated_date = NOW()
+                    where product_id = :product_id and `type` = 'reader-of-prev'
+                """)
+                await db.execute(
+                    query,
+                    {
+                        "ticket_count": rop_count,
+                        "product_id": product_id,
+                    },
+                )
 
         # reader-of-prev 저장 후 바로 발급 시도
         if req_body.num_of_ticket_per_person_for_reader_of_prev and req_body.num_of_ticket_per_person_for_reader_of_prev > 0:
