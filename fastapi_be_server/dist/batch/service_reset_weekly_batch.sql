@@ -43,14 +43,6 @@ update tb_quest_user a
 --  where 1=1
 -- ;
 
--- 선작 독자 무료 이용권 프로모션 status 초기화 (end -> ing)
-update tb_direct_promotion
-   set status = 'ing'
-     , updated_date = NOW()
- where type = 'reader-of-prev'
-   and status = 'end'
-;
-
 update tb_cms_batch_job_process a
    set a.completed_yn = 'Y'
      , a.created_id = 0
@@ -59,4 +51,3 @@ update tb_cms_batch_job_process a
 ;
 
 commit;
-

@@ -753,8 +753,8 @@ async def save_direct_promotion(
                     },
                 )
 
-        # reader-of-prev: 0 이하면 신규 생성하지 않음
-        rop_count = req_body.num_of_ticket_per_person_for_reader_of_prev or 0
+        # reader-of-prev: 0 이하면 stop, 1 이상이면 ing
+        rop_count = max(req_body.num_of_ticket_per_person_for_reader_of_prev or 0, 0)
         query = text("""
             select * from tb_direct_promotion where product_id = :product_id and `type` = 'reader-of-prev'
         """)
@@ -767,7 +767,7 @@ async def save_direct_promotion(
                     insert into tb_direct_promotion
                     (product_id, start_date, `type`, status, num_of_ticket_per_person, created_id, updated_id)
                     values
-                    (:product_id, now(), 'reader-of-prev', 'pending', :ticket_count, :created_id, :updated_id)
+                    (:product_id, now(), 'reader-of-prev', 'ing', :ticket_count, :created_id, :updated_id)
                 """)
                 await db.execute(
                     query,
@@ -779,20 +779,21 @@ async def save_direct_promotion(
                     },
                 )
         else:
-            if rop_count > 0:
-                query = text("""
-                    update tb_direct_promotion
-                    set num_of_ticket_per_person = :ticket_count,
-                        updated_date = NOW()
-                    where product_id = :product_id and `type` = 'reader-of-prev'
-                """)
-                await db.execute(
-                    query,
-                    {
-                        "ticket_count": rop_count,
-                        "product_id": product_id,
-                    },
-                )
+            query = text("""
+                update tb_direct_promotion
+                set num_of_ticket_per_person = :ticket_count,
+                    status = :promotion_status,
+                    updated_date = NOW()
+                where product_id = :product_id and `type` = 'reader-of-prev'
+            """)
+            await db.execute(
+                query,
+                {
+                    "ticket_count": rop_count,
+                    "promotion_status": "ing" if rop_count > 0 else "stop",
+                    "product_id": product_id,
+                },
+            )
 
         # reader-of-prev 저장 후 바로 발급 시도
         if req_body.num_of_ticket_per_person_for_reader_of_prev and req_body.num_of_ticket_per_person_for_reader_of_prev > 0:
