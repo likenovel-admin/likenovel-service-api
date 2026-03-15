@@ -388,6 +388,9 @@ class ErrorMessages:
         "선작 독자 무료 대여권 프로모션만 발급할 수 있습니다."
     )
     CANNOT_ISSUE_NOT_IN_PROGRESS_PROMOTION = "진행중인 프로모션만 발급할 수 있습니다."
+    CANNOT_START_READER_OF_PREV_WITHOUT_TICKETS = (
+        "선작 독자 무료 대여권 장수를 1 이상 설정한 뒤 적용해주세요."
+    )
     ALREADY_ISSUED_THIS_WEEK = (
         "이미 이번 주에 발급했습니다. 다음 주 월요일에 다시 발급할 수 있습니다."
     )

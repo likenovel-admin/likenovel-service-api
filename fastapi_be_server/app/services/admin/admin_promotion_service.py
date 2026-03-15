@@ -88,19 +88,11 @@ async def direct_promotion_list(
     result = await db.execute(query, limit_params)
     rows = result.mappings().all()
 
-    # 선작 독자 프로모션은 발급 후 항상 중지 상태로 표시
-    results = []
-    for row in rows:
-        row_dict = dict(row)
-        if row_dict.get("type") == "reader-of-prev":
-            row_dict["status"] = "stop"
-        results.append(row_dict)
-
     return {
         "total_count": total_count,
         "page": page,
         "count_per_page": count_per_page,
-        "results": results,
+        "results": [dict(row) for row in rows],
     }
 
 

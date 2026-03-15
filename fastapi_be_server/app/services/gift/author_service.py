@@ -264,6 +264,21 @@ async def stop_direct_promotion(promotion_id: int, kc_user_id: str, db: AsyncSes
             message=ErrorMessages.FORBIDDEN_DIRECT_PROMOTION_FOR_STOP,
         )
 
+    if promotion.get("type") == "reader-of-prev":
+        query = text("""
+            update tb_direct_promotion
+            set status = 'stop',
+                num_of_ticket_per_person = 0,
+                updated_date = NOW()
+            where id = :id
+        """)
+        await db.execute(query, {"id": promotion_id})
+
+        res_body = dict()
+        res_body["result"] = True
+
+        return res_body
+
     # end 상태인 프로모션은 중지할 수 없음
     if promotion.get("status") == "end":
         raise CustomResponseException(
@@ -319,6 +334,27 @@ async def start_direct_promotion(promotion_id: int, kc_user_id: str, db: AsyncSe
             status_code=status.HTTP_403_FORBIDDEN,
             message=ErrorMessages.FORBIDDEN_DIRECT_PROMOTION_FOR_START,
         )
+
+    if promotion.get("type") == "reader-of-prev":
+        if (promotion.get("num_of_ticket_per_person") or 0) <= 0:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.CANNOT_START_READER_OF_PREV_WITHOUT_TICKETS,
+            )
+
+        query = text("""
+            update tb_direct_promotion
+            set status = 'ing',
+                updated_date = NOW()
+            where id = :id
+              and status <> 'ing'
+        """)
+        await db.execute(query, {"id": promotion_id})
+
+        res_body = dict()
+        res_body["result"] = True
+
+        return res_body
 
     # end 상태인 프로모션은 시작할 수 없음
     if promotion.get("status") == "end":
@@ -376,11 +412,21 @@ async def end_direct_promotion(promotion_id: int, kc_user_id: str, db: AsyncSess
             message=ErrorMessages.FORBIDDEN_DIRECT_PROMOTION_FOR_STOP,
         )
 
-    query = text("""
-        update tb_direct_promotion
-        set status = 'end'
-        where id = :id
-    """)
+    if promotion.get("type") == "reader-of-prev":
+        query = text("""
+            update tb_direct_promotion
+            set status = 'stop',
+                num_of_ticket_per_person = 0,
+                updated_date = NOW()
+            where id = :id
+        """)
+    else:
+        query = text("""
+            update tb_direct_promotion
+            set status = 'end',
+                updated_date = NOW()
+            where id = :id
+        """)
     await db.execute(query, {"id": promotion_id})
 
     res_body = dict()
@@ -436,9 +482,8 @@ async def issue_reader_of_prev_promotion(
                 message=ErrorMessages.CANNOT_ISSUE_NON_READER_OF_PREV_PROMOTION,
             )
 
-        # 상태 체크 (ing 또는 pending 상태에서 발급 가능)
-        # PM 요청: 시작 전(pending) 상태에서도 선물함 발급이 가능하도록 수정
-        if promotion.get("status") not in ("ing", "pending"):
+        # 상태 체크 (ing 상태에서만 발급 가능)
+        if promotion.get("status") != "ing":
             raise CustomResponseException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 message=ErrorMessages.CANNOT_ISSUE_NOT_IN_PROGRESS_PROMOTION,
@@ -816,7 +861,7 @@ async def save_direct_promotion(
                         "issued_tickets": issue_result.get("total_tickets", 0),
                     }
                 except CustomResponseException:
-                    pass
+                    raise
 
         res_body = dict()
         res_body["result"] = True
