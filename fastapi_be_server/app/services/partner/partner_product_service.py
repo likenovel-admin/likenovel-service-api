@@ -255,6 +255,7 @@ async def product_list(
         select a.product_id
             , a.title
             , a.author_name as author_nickname
+            , a.author_id as author_user_id
             , a.synopsis_text as synopsis
             , coalesce(b.count_episode, 0) as count_episode
             , case when d.cp_company_name is null then null
