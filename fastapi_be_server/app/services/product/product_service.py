@@ -32,6 +32,20 @@ products ?꾨찓??媛쒕퀎 ?쒕퉬???⑥닔 紐⑥쓬
 """
 
 DEFAULT_PUBLISHER_PROMOTION_TITLE = "출판사 프로모션"
+MAIN_RULE_SLOT_DEFINITIONS = [
+    {
+        "slot_key": "free-new-3up",
+        "suggest_id": 1001,
+        "suggest_name": "free-new-3up",
+        "suggest_title": "3화 돌파 신작",
+    },
+    {
+        "slot_key": "free-binge-10up",
+        "suggest_id": 1002,
+        "suggest_name": "free-binge-10up",
+        "suggest_title": "10화 연독 인기작",
+    },
+]
 
 
 async def _resolve_current_user_role(kc_user_id: str, db: AsyncSession) -> str:
@@ -1288,70 +1302,73 @@ async def product_details_group_by_product_id(
             )
             visit_count = result.scalar()
 
-            # 泥?諛⑸Ц??寃쎌슦 (visit_count == 0)
-            if visit_count == 0:
-                # 吏꾪뻾以묒씤 free-for-first ?꾨줈紐⑥뀡 議고쉶
+            query = text("""
+                select dp.id, dp.num_of_ticket_per_person, dp.type
+                  from tb_direct_promotion dp
+                 where dp.product_id = :product_id
+                   and dp.type in ('free-for-first', 'admin-gift')
+                   and dp.status = 'ing'
+                   and DATE(dp.start_date) <= CURDATE()
+                   and (dp.end_date IS NULL OR DATE(dp.end_date) >= CURDATE())
+            """)
+            result = await db.execute(query, {"product_id": product_id})
+            promotions = result.mappings().all()
+
+            for promotion in promotions:
+                promo_type = promotion["type"]
+                if promo_type == "free-for-first" and visit_count != 0:
+                    continue
+
                 query = text("""
-                    select dp.id, dp.num_of_ticket_per_person, dp.type
-                      from tb_direct_promotion dp
-                     where dp.product_id = :product_id
-                       and dp.type in ('free-for-first', 'admin-gift')
-                       and dp.status = 'ing'
-                       and DATE(dp.start_date) <= CURDATE()
-                       and (dp.end_date IS NULL OR DATE(dp.end_date) >= CURDATE())
+                    select count(*) as already_received
+                      from tb_user_giftbook
+                     where user_id = :user_id
+                       and acquisition_type = 'direct_promotion'
+                       and acquisition_id = :promotion_id
                 """)
-                result = await db.execute(query, {"product_id": product_id})
-                promotions = result.mappings().all()
+                result = await db.execute(
+                    query, {"user_id": user_id, "promotion_id": promotion["id"]}
+                )
+                already_received = result.scalar()
 
-                for promotion in promotions:
-                    # ?대? ???꾨줈紐⑥뀡?쇰줈 ?좊Ъ?⑥뿉 諛쏆븯?붿? 泥댄겕 (?좊Ъ???먮뒗 ??ш텒)
-                    query = text("""
-                        select count(*) as already_received
-                          from tb_user_giftbook
-                         where user_id = :user_id
-                           and acquisition_type = 'direct_promotion'
-                           and acquisition_id = :promotion_id
-                    """)
-                    result = await db.execute(
-                        query, {"user_id": user_id, "promotion_id": promotion["id"]}
+                if already_received == 0:
+                    num_of_ticket = promotion["num_of_ticket_per_person"]
+                    reason = (
+                        "관리자 지급 대여권" if promo_type == "admin-gift" else "첫방문자 무료 대여권"
                     )
-                    already_received = result.scalar()
-
-                    # ?꾩쭅 諛쏆? ?딆븯?쇰㈃ ?좊Ъ?⑥쑝濡?諛쒓툒
-                    if already_received == 0:
-                        num_of_ticket = promotion["num_of_ticket_per_person"]
-                        promo_type = promotion["type"]
-                        # 泥ル갑臾몄옄 臾대즺: ?좏슚湲곌컙 ?놁쓬 (?꾨줈紐⑥뀡 醫낅즺 ??留뚮즺)
-                        # expiration_date = None, ticket_expiration_type = 'none'
-                        giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
-                            user_id=user_id,
-                            product_id=product_id,
-                            episode_id=None,
-                            ticket_type="paid" if promo_type == "admin-gift" else promo_type,
-                            own_type="rental",
-                            acquisition_type="direct_promotion",
-                            acquisition_id=promotion["id"],
-                            reason="첫방문자 무료 대여권",
-                            amount=num_of_ticket,
-                            promotion_type=promo_type,
-                            expiration_date=None,  # ?좏슚湲곌컙 ?놁쓬 (?꾨줈紐⑥뀡 醫낅즺 ??留뚮즺)
-                            ticket_expiration_type="days",  # 수령 후 7일
-                            ticket_expiration_value=7,
-                        )
-                        await user_giftbook_service.post_user_giftbook(
-                            req_body=giftbook_req,
-                            kc_user_id="",
-                            db=db,
-                            user_id=user_id,
-                        )
-                        # ?뚮┝ ?뺣낫 異붽?
-                        issued_vouchers.append(
-                            {
-                                "type": promo_type,
-                                "amount": num_of_ticket,
-                                "message": f"첫방문자 무료 대여권 {num_of_ticket}장이 지급되었습니다",
-                            }
-                        )
+                    message = (
+                        f"관리자 지급 대여권 {num_of_ticket}장이 지급되었습니다"
+                        if promo_type == "admin-gift"
+                        else f"첫방문자 무료 대여권 {num_of_ticket}장이 지급되었습니다"
+                    )
+                    giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
+                        user_id=user_id,
+                        product_id=product_id,
+                        episode_id=None,
+                        ticket_type="paid" if promo_type == "admin-gift" else promo_type,
+                        own_type="rental",
+                        acquisition_type="direct_promotion",
+                        acquisition_id=promotion["id"],
+                        reason=reason,
+                        amount=num_of_ticket,
+                        promotion_type=promo_type,
+                        expiration_date=None,
+                        ticket_expiration_type="days",
+                        ticket_expiration_value=7,
+                    )
+                    await user_giftbook_service.post_user_giftbook(
+                        req_body=giftbook_req,
+                        kc_user_id="",
+                        db=db,
+                        user_id=user_id,
+                    )
+                    issued_vouchers.append(
+                        {
+                            "type": promo_type,
+                            "amount": num_of_ticket,
+                            "message": message,
+                        }
+                    )
 
         # 6-9 ?⑥뒪 ?먮룞 諛쒓툒 -> ?좊Ъ?⑥쑝濡?吏湲?
         if user_id and user_id != -1:
@@ -3679,6 +3696,70 @@ async def products_in_latest_update(
     return res_body
 
 
+async def products_in_main_rule_slots(
+    kc_user_id: str | None, db: AsyncSession, adult_yn: str = "N"
+):
+    user_id = await get_user_id(kc_user_id, db) if kc_user_id else None
+
+    query_parts = get_select_fields_and_joins_for_product(
+        user_id=user_id, join_rank=False
+    )
+    adult_filter = (
+        "AND p.ratings_code = 'all'"
+        if adult_yn == "N"
+        else "AND p.ratings_code IN ('all', 'adult')"
+    )
+
+    res_body = {"data": []}
+
+    for slot in MAIN_RULE_SLOT_DEFINITIONS:
+        query = text(f"""
+            SELECT {query_parts["select_fields"]}, s.display_order
+              FROM tb_main_rule_slot_snapshot s
+              INNER JOIN tb_product p
+                      ON p.product_id = s.product_id
+              {query_parts["joins"]}
+             WHERE s.slot_key = :slot_key
+               AND s.adult_yn = :adult_yn
+               AND s.snapshot_start_date = (
+                   SELECT MAX(s2.snapshot_start_date)
+                     FROM tb_main_rule_slot_snapshot s2
+                    WHERE s2.slot_key = :slot_key
+                      AND s2.adult_yn = :adult_yn
+                      AND s2.snapshot_start_date <= CURDATE()
+               )
+               AND p.price_type = 'free'
+               AND p.open_yn = 'Y'
+               AND p.blind_yn = 'N'
+               AND p.status_code IN ('ongoing', 'rest')
+               {adult_filter}
+             ORDER BY s.display_order ASC
+        """)
+        result = await db.execute(
+            query,
+            {
+                "slot_key": slot["slot_key"],
+                "adult_yn": adult_yn,
+            },
+        )
+        rows = result.mappings().all()
+
+        if not rows:
+            continue
+
+        res_body["data"].append(
+            {
+                "suggestId": slot["suggest_id"],
+                "suggestName": slot["suggest_name"],
+                "suggestTarget": "free",
+                "suggestTitle": slot["suggest_title"],
+                "products": [convert_product_data(row) for row in rows],
+            }
+        )
+
+    return res_body
+
+
 async def products_in_applied_promotion(type: str, kc_user_id: str, db: AsyncSession):
     """
     ?좎껌 ?꾨줈紐⑥뀡 ?곹뭹 由ъ뒪??議고쉶
@@ -3694,6 +3775,8 @@ async def products_in_applied_promotion(type: str, kc_user_id: str, db: AsyncSes
         {query_parts["joins"]}
         INNER JOIN tb_applied_promotion ap ON p.product_id = ap.product_id AND ap.type = :type AND ap.status = 'ing'
         WHERE p.open_yn = 'Y'
+          AND DATE(ap.start_date) <= CURDATE()
+          AND (ap.end_date IS NULL OR DATE(ap.end_date) >= CURDATE())
     """)
     result = await db.execute(query, {"type": type})
     rows = result.mappings().all()
@@ -3734,6 +3817,8 @@ async def products_in_admin_gift_promotion(kc_user_id: str, db: AsyncSession):
         {query_parts["joins"]}
         INNER JOIN tb_direct_promotion dp ON p.product_id = dp.product_id AND dp.type = 'admin-gift' AND dp.status = 'ing'
         WHERE p.open_yn = 'Y'
+          AND DATE(dp.start_date) <= CURDATE()
+          AND (dp.end_date IS NULL OR DATE(dp.end_date) >= CURDATE())
     """)
     result = await db.execute(query)
     rows = result.mappings().all()

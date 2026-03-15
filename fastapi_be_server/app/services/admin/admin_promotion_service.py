@@ -290,6 +290,22 @@ async def accept_applied_promotion_accept(
         )
 
     query = text("""
+        select count(*) as cnt
+          from tb_applied_promotion
+         where status = 'ing'
+           and created_date >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)
+           and created_date < DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 7 DAY)
+    """)
+    result = await db.execute(query, {})
+    ing_count = result.scalar() or 0
+
+    if ing_count >= 20:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.NO_AVAILABLE_APPLIED_PROMOTION_SLOT,
+        )
+
+    query = text("""
                         update tb_applied_promotion set
                         status = 'ing',
                         end_date = :end_date

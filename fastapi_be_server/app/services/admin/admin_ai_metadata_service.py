@@ -34,7 +34,7 @@ AXIS_LIMITS: dict[str, tuple[int, int]] = {
     "타": (1, 3),
     "목": (1, 1),
 }
-DEFAULT_GOAL_LABEL = "생존"
+DEFAULT_GOAL_LABEL = "성장"
 
 DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EXTRACTOR_V1이다.
 입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 7축 메타를 추출한다.
@@ -42,8 +42,11 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 
 핵심 규칙:
 1) 허용 라벨 목록 외 신규 라벨 생성 금지.
+1-1) 각 라벨의 의미는 "라벨 정의" 섹션을 참고하여 판단한다. 이름만으로 추측하지 않는다.
+1-2) summary의 모든 필드를 빈 값 없이 채운다. null 금지. themes/taste_tags도 각각 1개 이상.
+1-3) heroine이 없는 작품은 heroine_type에 주요 여성 캐릭터를 기재하고, heroine_weight는 "none"으로 설정한다.
 2) 출력 JSON 스키마를 정확히 지킨다.
-3) 목표축(목)은 1개만 선택. 불명확하면 "생존".
+3) 목표축(목)은 1개만 선택. 라벨 정의를 참고하여 작품의 핵심 목표에 가장 부합하는 라벨을 선택한다.
 4) 연애축(연)은 연애/케미가 드러날 때만 선택 가능. 없으면 빈 배열 가능.
 5) confidence는 0~1 범위 숫자.
 6) axis_label_scores는 축별 라벨 점수 목록으로 작성하고 각 score는 0~1 범위 숫자다.
@@ -76,6 +79,9 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
 허용 라벨(축별 SSOT JSON):
 {allowed_labels_json}
 
+라벨 정의(분류 기준):
+{label_definitions_text}
+
 분석 회차 본문:
 {episodes_text}
 
@@ -83,16 +89,15 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
 {{
   "summary": {{
     "protagonist_type": "string",
-    "protagonist_desc": "string|null",
-    "heroine_type": "string|null",
-    "heroine_weight": "high|mid|low|none|null",
+    "protagonist_desc": "string",
+    "heroine_type": "string",
+    "heroine_weight": "high|mid|low|none",
     "mood": "string",
-    "pacing": "fast|medium|slow|null",
+    "pacing": "fast|medium|slow",
     "premise": "string",
-    "hook": "string|null",
-    "episode_summary_text": "string|null",
+    "hook": "string",
+    "episode_summary_text": "string",
     "themes": ["string"],
-    "similar_famous": ["string"],
     "taste_tags": ["string"]
   }},
   "axis_labels": {{
@@ -197,6 +202,53 @@ def _allowed_labels_for_prompt() -> str:
     loaded = _load_allowed_labels_by_axis()
     ordered = {axis: sorted(loaded[axis]) for axis in AXIS_ORDER}
     return json.dumps(ordered, ensure_ascii=False)
+
+
+def _label_defs_candidates() -> list[Path]:
+    resolved = Path(__file__).resolve()
+    parents = resolved.parents
+    app_root = parents[3] if len(parents) > 3 else Path(settings.ROOT_PATH)
+
+    candidates: list[Path] = [
+        Path(settings.ROOT_PATH) / "dist" / "ai" / "label-definitions-by-axis.json",
+        app_root / "dist" / "ai" / "label-definitions-by-axis.json",
+    ]
+    for parent in parents:
+        candidates.append(parent / "docs" / "ai-codebook" / "label-definitions-by-axis.json")
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        deduped.append(path)
+        seen.add(path)
+    return deduped
+
+
+_LABEL_DEFS_CACHE: str | None = None
+
+
+def _load_label_definitions() -> str:
+    """라벨 정의 JSON을 프롬프트용 텍스트로 변환."""
+    global _LABEL_DEFS_CACHE
+    if _LABEL_DEFS_CACHE is not None:
+        return _LABEL_DEFS_CACHE
+
+    for path in _label_defs_candidates():
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8-sig") as fp:
+            raw = json.load(fp)
+        lines = []
+        for axis, defs in raw.items():
+            if isinstance(defs, dict):
+                for label, desc in defs.items():
+                    lines.append(f"  [{axis}] {label}: {desc}")
+        _LABEL_DEFS_CACHE = "\n".join(lines)
+        return _LABEL_DEFS_CACHE
+    _LABEL_DEFS_CACHE = ""
+    return _LABEL_DEFS_CACHE
 
 
 def _strip_html(content: str) -> str:
@@ -549,7 +601,7 @@ def _normalize_ai_payload(
         ),
         "episode_summary_text": _sanitize_episode_summary_text(pick("episode_summary_text")),
         "themes": _safe_list(pick("themes"), "themes"),
-        "similar_famous": _safe_list(pick("similar_famous"), "similar_famous"),
+        "similar_famous": [],
         "taste_tags": taste_tags,
         "protagonist_material_tags": axis_labels["능"],
         "worldview_tags": axis_labels["세"],
@@ -573,7 +625,23 @@ def _normalize_ai_payload(
         normalized["protagonist_type"] = _safe_text(
             normalized["protagonist_type"], "protagonist_type", 200, required=True
         )
+        normalized["protagonist_desc"] = _sanitize_korean_narrative_text(
+            normalized["protagonist_desc"],
+            "protagonist_desc",
+            500,
+            required=True,
+            min_length=8,
+        )
+        normalized["heroine_type"] = _safe_text(
+            normalized["heroine_type"], "heroine_type", 200, required=True
+        )
+        normalized["heroine_weight"] = _safe_enum(
+            normalized["heroine_weight"], "heroine_weight", ALLOWED_HEROINE_WEIGHT, required=True
+        )
         normalized["mood"] = _safe_text(normalized["mood"], "mood", 200, required=True)
+        normalized["pacing"] = _safe_enum(
+            normalized["pacing"], "pacing", ALLOWED_PACING, required=True
+        )
         normalized["premise"] = _sanitize_korean_narrative_text(
             normalized["premise"],
             "premise",
@@ -581,6 +649,15 @@ def _normalize_ai_payload(
             required=True,
             min_length=10,
         )
+        normalized["hook"] = _sanitize_korean_narrative_text(
+            normalized["hook"],
+            "hook",
+            300,
+            required=True,
+            min_length=6,
+        )
+        if not normalized["themes"]:
+            raise ValueError("themes requires at least 1 item")
 
     return normalized
 
@@ -1149,6 +1226,7 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
         n_requested=MAX_ANALYZE_EPISODES,
         n_received=used_count,
         allowed_labels_json=_allowed_labels_for_prompt(),
+        label_definitions_text=_load_label_definitions(),
         episodes_text=episode_context,
     )
 

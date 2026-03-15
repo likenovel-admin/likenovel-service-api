@@ -142,15 +142,30 @@ async def get_products_promotions(
             dp_dict = dict(dp_row)
             direct_promotions_by_product[product_id].append(dp_dict)
 
+        query = text("""
+            select count(*) as cnt
+              from tb_applied_promotion
+             where status = 'ing'
+               and created_date >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)
+               and created_date < DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 7 DAY)
+        """)
+        result = await db.execute(query, {})
+        global_remaining_slots = max(20 - (result.scalar() or 0), 0)
+
         query = text(f"""
             select this_week.*,
                    case
+                     when this_week.type = '6-9-path' and this_week.status = 'deny' then '다음주에 다시 신청해주세요'
                      when rejected.created_date is not null then
                        concat(DATE_FORMAT(DATE_ADD(rejected.created_date, INTERVAL 6 MONTH), '%Y.%m.%d'), ' 신청 가능')
                      else ''
                    end as can_apply_text,
-                   20 - IFNULL(ing_count.cnt, 0) as remaining_slots,
                    case
+                     when this_week.type = '6-9-path' and this_week.status = 'deny' then 20
+                     else :remaining_slots
+                   end as remaining_slots,
+                   case
+                     when this_week.type = '6-9-path' and this_week.status = 'deny' then false
                      when rejected.created_date is null then true
                      when DATE_ADD(rejected.created_date, INTERVAL 6 MONTH) <= CURDATE() then true
                      else false
@@ -163,9 +178,19 @@ async def get_products_promotions(
                 select *
                   from tb_applied_promotion
                  where product_id in ({", ".join(map(str, product_ids))})
-                   and status not in ('end', 'cancel', 'deny')
-                   and created_date >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)
-                   and created_date < DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 7 DAY)
+                   and (
+                     (
+                       status in ('apply', 'ing')
+                       and created_date >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)
+                       and created_date < DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 7 DAY)
+                     )
+                     or (
+                       type = '6-9-path'
+                       and status = 'deny'
+                       and updated_date >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)
+                       and updated_date < DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 7 DAY)
+                     )
+                   )
               ) this_week
               left join (
                 select product_id, created_date
@@ -175,17 +200,8 @@ async def get_products_promotions(
                  order by created_date desc
                  limit 1
               ) rejected on this_week.product_id = rejected.product_id
-              left join (
-                select product_id, count(*) as cnt
-                  from tb_applied_promotion
-                 where product_id in ({", ".join(map(str, product_ids))})
-                   and status = 'ing'
-                   and created_date >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)
-                   and created_date < DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 7 DAY)
-                 group by product_id
-              ) ing_count on this_week.product_id = ing_count.product_id
         """)
-        result = await db.execute(query, {})
+        result = await db.execute(query, {"remaining_slots": global_remaining_slots})
         applied_promotion_rows = result.mappings().all()
         applied_promotions_by_product = {}
         for ap_row in applied_promotion_rows:
@@ -199,6 +215,7 @@ async def get_products_promotions(
             product["directPromotions"] = direct_promotions_by_product.get(
                 product_id, []
             )
+            product["appliedPromotionRemainingSlots"] = global_remaining_slots
             product["appliedPromotions"] = applied_promotions_by_product.get(
                 product_id, []
             )

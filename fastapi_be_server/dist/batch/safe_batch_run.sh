@@ -17,7 +17,7 @@ Usage:
 
 Modes:
   hourly   : ai_taste_hourly + service_reset_hourly + summary_hourly
-  daily    : ai_signal_daily + summary_daily + service_reset_daily + partner_report_daily + statistics_aggregation_daily
+  daily    : ai_signal_daily + ai_engagement_metrics_daily + main_rule_slot_snapshot + summary_daily + service_reset_daily + partner_report_daily + statistics_aggregation_daily
   weekly   : service_reset_weekly (runs only on Monday unless --force-cycle)
   monthly  : partner_report_monthly (runs only on day 1 unless --force-cycle)
   all      : hourly + daily + weekly + monthly (weekly/monthly still date-guarded)
@@ -138,6 +138,8 @@ run_hourly() {
 
 run_daily() {
   run_ai_script "ai_signal_daily_batch.sh"
+  run_ai_script "ai_engagement_metrics_daily_batch.sh"
+  run_ai_script "main_rule_slot_snapshot_batch.sh"
   run_script "summary_daily_batch.sh"
   run_script "service_reset_daily_batch.sh"
   run_script "partner_report_daily_batch.sh"

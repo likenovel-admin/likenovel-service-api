@@ -181,6 +181,35 @@ heartbeat_job_running
 start_heartbeat_worker
 LAST_HEARTBEAT_TS="$(date +%s)"
 
+FACTOR_DELETED=1
+TOTAL_FACTOR_DELETED=0
+FACTOR_LOOP_COUNT=0
+while [ "$FACTOR_DELETED" -gt 0 ]; do
+  FACTOR_LOOP_COUNT=$((FACTOR_LOOP_COUNT + 1))
+  if [ "$FACTOR_LOOP_COUNT" -gt "$MAX_PURGE_LOOPS" ]; then
+    echo "[ERROR] Factor purge loop exceeded MAX_PURGE_LOOPS=${MAX_PURGE_LOOPS}" 1>&2
+    exit 1
+  fi
+
+  FACTOR_DELETED=$(MYSQL_PWD="$DB_PW" "${MYSQL_CMD[@]}" -N -e "
+    DELETE FROM tb_user_ai_signal_event_factor
+     WHERE created_date < '$PURGE_DATE'
+     LIMIT 5000;
+    SELECT ROW_COUNT();
+  ")
+  TOTAL_FACTOR_DELETED=$((TOTAL_FACTOR_DELETED + FACTOR_DELETED))
+
+  NOW_TS="$(date +%s)"
+  if [ $((FACTOR_LOOP_COUNT % HEARTBEAT_EVERY_LOOPS)) -eq 0 ] || [ $((NOW_TS - LAST_HEARTBEAT_TS)) -ge "$HEARTBEAT_INTERVAL_SECONDS" ]; then
+    heartbeat_job_running
+    LAST_HEARTBEAT_TS="$NOW_TS"
+  fi
+
+  if [ "$FACTOR_DELETED" -gt 0 ]; then
+    sleep 0.05
+  fi
+done
+
 DELETED=1
 TOTAL_DELETED=0
 LOOP_COUNT=0
@@ -210,7 +239,7 @@ while [ "$DELETED" -gt 0 ]; do
   fi
 done
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Purge complete: ${TOTAL_DELETED} rows deleted."
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Purge complete: factor=${TOTAL_FACTOR_DELETED}, event=${TOTAL_DELETED} rows deleted."
 
 # 3) purge 성공 후에만 정책/상태 기록
 TARGET_DATE=$(date -d 'yesterday' '+%Y-%m-%d')

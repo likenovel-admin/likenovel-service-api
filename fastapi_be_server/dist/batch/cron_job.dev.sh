@@ -10,6 +10,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 0 * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/service_reset_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/service_reset_daily_batch.log 2>&1
 20 0 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/summary_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/summary_daily_batch.log 2>&1
 30 1 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_signal_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_signal_daily_batch.log 2>&1
+40 1 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_engagement_metrics_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_engagement_metrics_daily_batch.log 2>&1
+45 1 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/main_rule_slot_snapshot_batch.sh >> /home/ln-admin/likenovel/batch-dev/main_rule_slot_snapshot_batch.log 2>&1
 0 0 * * 1  ln-admin bash /home/ln-admin/likenovel/batch-dev/service_reset_weekly_batch.sh >> /home/ln-admin/likenovel/batch-dev/service_reset_weekly_batch.log 2>&1
 0 0 1 * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/partner_report_monthly_batch.sh >> /home/ln-admin/likenovel/batch-dev/partner_report_monthly_batch.log 2>&1
 

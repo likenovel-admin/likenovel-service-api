@@ -4,6 +4,7 @@ from fastapi import status
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import asyncio
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ from collections import Counter
 from datetime import datetime
 import hashlib
 from pathlib import Path
+import time
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -22,7 +24,7 @@ from app.schemas.ai_recommendation import MAX_EVENT_PAYLOAD_LENGTH
 
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 logger = logging.getLogger(__name__)
-MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 5
+MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 3
 AXIS_CONFIDENCE_THRESHOLD = 0.55
 AXIS_WEIGHT = {
     "type": 18.0,
@@ -101,6 +103,7 @@ SIGNAL_FACTOR_ALLOWED_AXES: dict[str, tuple[str, ...]] = {
     "mood": ("style",),
 }
 AI_SLOT_FEEDBACK_SIGNAL_EVENTS = {
+    "taste_slot_click",
     "episode_view",
     "latest_episode_reached",
     "next_episode_click",
@@ -108,6 +111,13 @@ AI_SLOT_FEEDBACK_SIGNAL_EVENTS = {
 AI_SLOT_FEEDBACK_WINDOW_DAYS = 30
 AI_SLOT_FEEDBACK_MIN_EPISODES = 3
 ENGAGEMENT_SAMPLE_TARGET = 20
+MAX_SIGNAL_FACTOR_LABELS_PER_AXIS = 3
+DERIVED_REVISIT_24H_FACTOR_MULTIPLIER = 0.7
+SIGNAL_FACTOR_METADATA_CACHE_TTL_SECONDS = 60.0
+SIGNAL_FACTOR_METADATA_CACHE_MAX_ITEMS = 2048
+_SIGNAL_FACTOR_METADATA_CACHE: dict[int, tuple[float, dict]] = {}
+_SIGNAL_FACTOR_METADATA_CACHE_LOCKS: dict[int, asyncio.Lock] = {}
+_SIGNAL_FACTOR_METADATA_CACHE_LOCKS_GUARD = asyncio.Lock()
 LATEST_ENGAGEMENT_JOIN_SQL = """
 LEFT JOIN (
     SELECT em.product_id,
@@ -535,97 +545,334 @@ def _increment_label_counter(counter: dict[str, int], labels: list[str], *, weig
 
 
 async def _get_signal_factor_metadata(product_id: int, db: AsyncSession) -> dict | None:
-    query = text(
-        """
-        SELECT
-            m.protagonist_type,
-            m.protagonist_goal_primary,
-            m.goal_confidence,
-            m.mood,
-            m.protagonist_material_tags,
-            m.worldview_tags,
-            m.protagonist_type_tags,
-            m.protagonist_job_tags,
-            m.axis_style_tags,
-            m.axis_romance_tags,
-            m.romance_chemistry_weight
-        FROM tb_product_ai_metadata m
-        WHERE m.product_id = :product_id
-          AND m.analysis_status = 'success'
-          AND COALESCE(m.exclude_from_recommend_yn, 'N') = 'N'
-        LIMIT 1
-        """
-    )
-    result = await db.execute(query, {"product_id": product_id})
-    row = result.mappings().one_or_none()
-    if not row:
+    now = time.monotonic()
+    cached_entry = _SIGNAL_FACTOR_METADATA_CACHE.get(product_id)
+    if cached_entry and (now - cached_entry[0]) < SIGNAL_FACTOR_METADATA_CACHE_TTL_SECONDS:
+        return _clone_signal_factor_metadata(cached_entry[1])
+
+    async with await _get_signal_factor_metadata_lock(product_id):
+        now = time.monotonic()
+        cached_entry = _SIGNAL_FACTOR_METADATA_CACHE.get(product_id)
+        if cached_entry and (now - cached_entry[0]) < SIGNAL_FACTOR_METADATA_CACHE_TTL_SECONDS:
+            return _clone_signal_factor_metadata(cached_entry[1])
+
+        _prune_signal_factor_metadata_cache(now)
+
+        query = text(
+            """
+            SELECT
+                m.protagonist_type,
+                m.protagonist_goal_primary,
+                m.goal_confidence,
+                m.mood,
+                m.protagonist_material_tags,
+                m.worldview_tags,
+                m.protagonist_type_tags,
+                m.protagonist_job_tags,
+                m.axis_style_tags,
+                m.axis_romance_tags,
+                m.romance_chemistry_weight
+            FROM tb_product_ai_metadata m
+            WHERE m.product_id = :product_id
+              AND m.analysis_status = 'success'
+              AND COALESCE(m.exclude_from_recommend_yn, 'N') = 'N'
+            LIMIT 1
+            """
+        )
+        result = await db.execute(query, {"product_id": product_id})
+        row = result.mappings().one_or_none()
+        if not row:
+            return None
+
+        metadata = _metadata_row_to_dict(row)
+        _SIGNAL_FACTOR_METADATA_CACHE[product_id] = (time.monotonic(), metadata)
+        _prune_signal_factor_metadata_cache(time.monotonic())
+        return _clone_signal_factor_metadata(metadata)
+
+
+async def _get_signal_factor_metadata_lock(product_id: int) -> asyncio.Lock:
+    async with _SIGNAL_FACTOR_METADATA_CACHE_LOCKS_GUARD:
+        lock = _SIGNAL_FACTOR_METADATA_CACHE_LOCKS.get(product_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _SIGNAL_FACTOR_METADATA_CACHE_LOCKS[product_id] = lock
+        return lock
+
+
+def _clone_signal_factor_metadata(metadata: dict | None) -> dict | None:
+    if metadata is None:
         return None
-    return _metadata_row_to_dict(row)
+    cloned: dict = {}
+    for key, value in metadata.items():
+        if isinstance(value, list):
+            cloned[key] = list(value)
+        elif isinstance(value, dict):
+            cloned[key] = dict(value)
+        else:
+            cloned[key] = value
+    return cloned
 
 
-def _pick_default_signal_factor(event_type: str, metadata: dict) -> tuple[str, str, float] | None:
+def _prune_signal_factor_metadata_cache(now: float) -> None:
+    expired_product_ids = [
+        product_id
+        for product_id, (cached_at, _) in _SIGNAL_FACTOR_METADATA_CACHE.items()
+        if (now - cached_at) >= SIGNAL_FACTOR_METADATA_CACHE_TTL_SECONDS
+    ]
+    for product_id in expired_product_ids:
+        _SIGNAL_FACTOR_METADATA_CACHE.pop(product_id, None)
+
+    if len(_SIGNAL_FACTOR_METADATA_CACHE) <= SIGNAL_FACTOR_METADATA_CACHE_MAX_ITEMS:
+        return
+
+    overflow = len(_SIGNAL_FACTOR_METADATA_CACHE) - SIGNAL_FACTOR_METADATA_CACHE_MAX_ITEMS
+    oldest_product_ids = sorted(
+        _SIGNAL_FACTOR_METADATA_CACHE.items(),
+        key=lambda item: item[1][0],
+    )[:overflow]
+    for product_id, _ in oldest_product_ids:
+        _SIGNAL_FACTOR_METADATA_CACHE.pop(product_id, None)
+
+
+def _collect_signal_factor_labels(metadata: dict) -> dict[str, list[str]]:
     protagonist_labels = _unique_nonempty_labels(
         _as_list(metadata.get("protagonist_type_tags")) + [metadata.get("protagonist_type")]
-    )
-    material_labels = _unique_nonempty_labels(_as_list(metadata.get("protagonist_material_tags")))
-    job_labels = _unique_nonempty_labels(_as_list(metadata.get("protagonist_job_tags")))
-    worldview_labels = _unique_nonempty_labels(_as_list(metadata.get("worldview_tags")))
+    )[:MAX_SIGNAL_FACTOR_LABELS_PER_AXIS]
+    material_labels = _unique_nonempty_labels(
+        _as_list(metadata.get("protagonist_material_tags"))
+    )[:MAX_SIGNAL_FACTOR_LABELS_PER_AXIS]
+    job_labels = _unique_nonempty_labels(
+        _as_list(metadata.get("protagonist_job_tags"))
+    )[:MAX_SIGNAL_FACTOR_LABELS_PER_AXIS]
+    worldview_labels = _unique_nonempty_labels(
+        _as_list(metadata.get("worldview_tags"))
+    )[:MAX_SIGNAL_FACTOR_LABELS_PER_AXIS]
     romance_labels = _unique_nonempty_labels(
         _as_list(metadata.get("axis_romance_tags")) + [metadata.get("romance_chemistry_weight")]
-    )
-    style_labels = _unique_nonempty_labels(_as_list(metadata.get("axis_style_tags")))
+    )[:MAX_SIGNAL_FACTOR_LABELS_PER_AXIS]
+    style_labels = _unique_nonempty_labels(
+        _as_list(metadata.get("axis_style_tags")) + [metadata.get("mood")]
+    )[:MAX_SIGNAL_FACTOR_LABELS_PER_AXIS]
+
     goal_labels: list[str] = []
     goal_label = str(metadata.get("protagonist_goal_primary") or "").strip()
     goal_confidence = _safe_float(metadata.get("goal_confidence"), 0.0)
     if goal_label and not (goal_label == "생존" and goal_confidence < 0.6):
         goal_labels.append(goal_label)
 
-    candidates: list[tuple[str, list[str], float]] = []
-    if event_type == "next_episode_click":
-        candidates = [
-            ("protagonist", protagonist_labels, 3.0),
-            ("material", material_labels, 2.6),
-            ("job", job_labels, 2.4),
-            ("goal", goal_labels, 2.2),
+    return {
+        "protagonist": protagonist_labels,
+        "material": material_labels,
+        "job": job_labels,
+        "goal": goal_labels[:MAX_SIGNAL_FACTOR_LABELS_PER_AXIS],
+        "worldview": worldview_labels,
+        "romance": romance_labels,
+        "style": style_labels,
+    }
+
+
+def _signal_factor_score_plan(
+    event_type: str,
+    *,
+    base_event_type: str | None = None,
+    score_multiplier: float = 1.0,
+) -> list[tuple[str, float]]:
+    normalized_event_type = str(event_type or "").strip().lower()
+    if normalized_event_type == "revisit_24h":
+        source_event_type = str(base_event_type or "").strip().lower()
+        if source_event_type not in {"episode_view", "latest_episode_reached"}:
+            source_event_type = "episode_view"
+        return _signal_factor_score_plan(
+            source_event_type,
+            score_multiplier=score_multiplier * DERIVED_REVISIT_24H_FACTOR_MULTIPLIER,
+        )
+
+    if normalized_event_type == "next_episode_click":
+        plan = [
+            ("protagonist", 3.0),
+            ("material", 2.6),
+            ("job", 2.4),
+            ("goal", 2.2),
+            ("worldview", 1.9),
+            ("style", 1.7),
+            ("romance", 1.5),
         ]
-    elif event_type == "latest_episode_reached":
-        candidates = [
-            ("goal", goal_labels, 2.8),
-            ("worldview", worldview_labels, 2.5),
-            ("romance", romance_labels, 2.3),
-            ("style", style_labels, 2.1),
-            ("protagonist", protagonist_labels, 1.8),
+    elif normalized_event_type == "episode_end":
+        plan = [
+            ("protagonist", 2.4),
+            ("material", 2.1),
+            ("worldview", 1.9),
+            ("style", 1.7),
+            ("job", 1.6),
+            ("goal", 1.5),
+            ("romance", 1.4),
+        ]
+    elif normalized_event_type == "latest_episode_reached":
+        plan = [
+            ("goal", 2.8),
+            ("worldview", 2.5),
+            ("romance", 2.3),
+            ("style", 2.1),
+            ("protagonist", 1.8),
+            ("material", 1.7),
+            ("job", 1.6),
+        ]
+    elif normalized_event_type == "taste_slot_click":
+        plan = [
+            ("style", 1.8),
+            ("worldview", 1.6),
+            ("material", 1.5),
+            ("protagonist", 1.4),
+            ("job", 1.3),
+            ("goal", 1.2),
+            ("romance", 1.1),
         ]
     else:
-        candidates = [
-            ("style", style_labels, 1.4),
-            ("worldview", worldview_labels, 1.2),
-            ("romance", romance_labels, 1.1),
-            ("material", material_labels, 1.0),
-            ("job", job_labels, 0.95),
-            ("protagonist", protagonist_labels, 0.9),
-            ("goal", goal_labels, 0.85),
+        plan = [
+            ("style", 1.4),
+            ("worldview", 1.2),
+            ("romance", 1.1),
+            ("material", 1.0),
+            ("job", 0.95),
+            ("protagonist", 0.9),
+            ("goal", 0.85),
         ]
 
-    for factor_type, labels, signal_score in candidates:
-        if not labels:
+    return [(factor_type, round(score * score_multiplier, 6)) for factor_type, score in plan]
+
+
+def _build_signal_factor_entries_from_metadata(
+    event_type: str,
+    metadata: dict,
+    *,
+    base_event_type: str | None = None,
+    score_multiplier: float = 1.0,
+) -> list[dict[str, float | str]]:
+    labels_by_type = _collect_signal_factor_labels(metadata)
+    plan = _signal_factor_score_plan(
+        event_type,
+        base_event_type=base_event_type,
+        score_multiplier=score_multiplier,
+    )
+
+    entries: list[dict[str, float | str]] = []
+    seen: set[tuple[str, str]] = set()
+    for factor_type, signal_score in plan:
+        if signal_score <= 0:
             continue
-        for label in labels:
-            normalized_factor_type, normalized_factor_key = _normalize_signal_factor(factor_type, label)
-            if normalized_factor_type and normalized_factor_key:
-                return normalized_factor_type, normalized_factor_key, signal_score
-    return None
+        for label in labels_by_type.get(factor_type, []):
+            normalized_factor_type, normalized_factor_key = _normalize_signal_factor(
+                factor_type, label
+            )
+            if not normalized_factor_type or not normalized_factor_key:
+                continue
+            dedupe_key = (normalized_factor_type, normalized_factor_key)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            entries.append(
+                {
+                    "factor_type": normalized_factor_type,
+                    "factor_key": normalized_factor_key,
+                    "signal_score": signal_score,
+                }
+            )
+    return entries
 
 
-async def _resolve_default_signal_factor(
+def _scale_signal_factor_entries(
+    entries: list[dict[str, float | str]],
+    multiplier: float,
+) -> list[dict[str, float | str]]:
+    if multiplier == 1:
+        return entries
+    return [
+        {
+            "factor_type": entry["factor_type"],
+            "factor_key": entry["factor_key"],
+            "signal_score": round(_safe_float(entry["signal_score"], 0.0) * multiplier, 6),
+        }
+        for entry in entries
+        if _safe_float(entry["signal_score"], 0.0) > 0
+    ]
+
+
+async def _resolve_signal_factor_entries(
     product_id: int,
     event_type: str,
     db: AsyncSession,
-) -> tuple[str, str, float] | None:
+    *,
+    base_event_type: str | None = None,
+    score_multiplier: float = 1.0,
+) -> list[dict[str, float | str]]:
     metadata = await _get_signal_factor_metadata(product_id, db)
     if not metadata:
-        return None
-    return _pick_default_signal_factor(event_type, metadata)
+        return []
+    return _build_signal_factor_entries_from_metadata(
+        event_type,
+        metadata,
+        base_event_type=base_event_type,
+        score_multiplier=score_multiplier,
+    )
+
+
+async def _insert_ai_signal_event_factors(
+    *,
+    event_id: int,
+    user_id: int,
+    product_id: int,
+    episode_id: int | None,
+    event_type: str,
+    factor_entries: list[dict[str, float | str]],
+    db: AsyncSession,
+) -> None:
+    if not factor_entries:
+        return
+
+    query = text(
+        """
+        INSERT INTO tb_user_ai_signal_event_factor (
+            event_id,
+            user_id,
+            product_id,
+            episode_id,
+            event_type,
+            factor_type,
+            factor_key,
+            signal_score
+        ) VALUES (
+            :event_id,
+            :user_id,
+            :product_id,
+            :episode_id,
+            :event_type,
+            :factor_type,
+            :factor_key,
+            :signal_score
+        )
+        """
+    )
+    rows = [
+        {
+            "event_id": event_id,
+            "user_id": user_id,
+            "product_id": product_id,
+            "episode_id": episode_id,
+            "event_type": event_type,
+            "factor_type": entry["factor_type"],
+            "factor_key": entry["factor_key"],
+            "signal_score": entry["signal_score"],
+        }
+        for entry in factor_entries
+    ]
+    await db.execute(query, rows)
+
+
+def _should_skip_signal_factor_generation(event_type: str, payload: dict) -> bool:
+    normalized_event_type = str(event_type or "").strip().lower()
+    if normalized_event_type == "episode_view" and str(payload.get("trigger") or "").strip().lower() == "exit":
+        return True
+    return False
 
 
 # ──────────────────────────────────────────────────────────
@@ -774,43 +1021,16 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
                 status_code=status.HTTP_400_BAD_REQUEST,
                 message="next_episode_click 리다이렉트 정보가 유효하지 않습니다.",
             )
-    factor_type = req_body.get("factor_type")
-    factor_key = req_body.get("factor_key")
-    signal_score = req_body.get("signal_score")
-    if event_type == "next_episode_click" and (not factor_type or not factor_key):
-        default_factor = await _resolve_default_signal_factor(product_id, event_type, db)
-        if default_factor:
-            default_factor_type, default_factor_key, default_signal_score = default_factor
-            if not factor_type:
-                factor_type = default_factor_type
-            if not factor_key:
-                factor_key = default_factor_key
-            if signal_score is None:
-                signal_score = default_signal_score
 
-    normalized_factor_type, normalized_factor_key = _normalize_signal_factor(factor_type, factor_key)
-    if factor_type and factor_key and (not normalized_factor_type or not normalized_factor_key):
-        logger.warning(
-            "drop invalid AI signal factor: user_id=%s product_id=%s event_type=%s factor_type=%s factor_key=%s",
-            user_id,
+    if not _should_skip_signal_factor_generation(event_type, payload):
+        signal_factor_entries = await _resolve_signal_factor_entries(
             product_id,
             event_type,
-            factor_type,
-            factor_key,
+            db,
         )
-        factor_type = None
-        factor_key = None
-        signal_score = None
     else:
-        factor_type = normalized_factor_type
-        factor_key = normalized_factor_key
+        signal_factor_entries = []
 
-    if factor_type:
-        payload["factor_type"] = factor_type
-    if factor_key:
-        payload["factor_key"] = factor_key
-    if signal_score is not None:
-        payload["signal_score"] = signal_score
     if payload:
         serialized_payload = json.dumps(payload, ensure_ascii=False)
         if len(serialized_payload) > MAX_EVENT_PAYLOAD_LENGTH:
@@ -822,7 +1042,10 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
         serialized_payload = None
 
     should_insert_revisit_24h = False
-    if event_type in {"episode_view", "latest_episode_reached"}:
+    if (
+        event_type in {"episode_view", "latest_episode_reached"}
+        and not _should_skip_signal_factor_generation(event_type, payload)
+    ):
         revisit_check_query = text(
             """
             SELECT 1
@@ -879,7 +1102,7 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
         """
     )
 
-    await db.execute(
+    insert_result = await db.execute(
         query,
         {
             "user_id": user_id,
@@ -895,6 +1118,17 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
             "event_payload": serialized_payload,
         },
     )
+    event_id = insert_result.lastrowid
+    if event_id and signal_factor_entries:
+        await _insert_ai_signal_event_factors(
+            event_id=int(event_id),
+            user_id=user_id,
+            product_id=product_id,
+            episode_id=episode_id,
+            event_type=event_type,
+            factor_entries=signal_factor_entries,
+            db=db,
+        )
 
     if should_insert_revisit_24h:
         revisit_payload = json.dumps(
@@ -904,7 +1138,7 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
             },
             ensure_ascii=False,
         )
-        await db.execute(
+        revisit_insert_result = await db.execute(
             query,
             {
                 "user_id": user_id,
@@ -920,6 +1154,28 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
                 "event_payload": revisit_payload,
             },
         )
+        revisit_event_id = revisit_insert_result.lastrowid
+        revisit_factor_entries = _scale_signal_factor_entries(
+            signal_factor_entries,
+            DERIVED_REVISIT_24H_FACTOR_MULTIPLIER,
+        )
+        if not revisit_factor_entries:
+            revisit_factor_entries = await _resolve_signal_factor_entries(
+                product_id,
+                "revisit_24h",
+                db,
+                base_event_type=event_type,
+            )
+        if revisit_event_id and revisit_factor_entries:
+            await _insert_ai_signal_event_factors(
+                event_id=int(revisit_event_id),
+                user_id=user_id,
+                product_id=product_id,
+                episode_id=episode_id,
+                event_type="revisit_24h",
+                factor_entries=revisit_factor_entries,
+                db=db,
+            )
 
     # 추천 구좌 피드백 루프 반영 (클릭/3화 연독)
     try:
@@ -961,34 +1217,36 @@ async def _update_ai_slot_feedback_flags(
         "product_id": product_id,
     }
 
-    click_query = text(
-        f"""
-        UPDATE tb_ai_slot_serving_log target
-        JOIN (
-            SELECT s.id
-            FROM tb_ai_slot_serving_log s
-            WHERE s.user_id = :user_id
-              AND s.product_id = :product_id
-              AND s.clicked_yn = 'N'
-              AND s.served_at >= DATE_SUB(NOW(), INTERVAL {AI_SLOT_FEEDBACK_WINDOW_DAYS} DAY)
-              AND s.served_at > COALESCE(
-                    (
-                        SELECT MAX(c.served_at)
-                        FROM tb_ai_slot_serving_log c
-                        WHERE c.user_id = :user_id
-                          AND c.product_id = :product_id
-                          AND c.clicked_yn = 'Y'
-                          AND c.served_at >= DATE_SUB(NOW(), INTERVAL {AI_SLOT_FEEDBACK_WINDOW_DAYS} DAY)
-                    ),
-                    TIMESTAMP('1970-01-01 00:00:00')
-                )
-            ORDER BY s.served_at DESC, s.id DESC
-            LIMIT 1
-        ) picked ON picked.id = target.id
-        SET target.clicked_yn = 'Y'
-        """
-    )
-    await db.execute(click_query, params)
+    if normalized_event_type == "taste_slot_click":
+        click_query = text(
+            f"""
+            UPDATE tb_ai_slot_serving_log target
+            JOIN (
+                SELECT s.id
+                FROM tb_ai_slot_serving_log s
+                WHERE s.user_id = :user_id
+                  AND s.product_id = :product_id
+                  AND s.clicked_yn = 'N'
+                  AND s.served_at >= DATE_SUB(NOW(), INTERVAL {AI_SLOT_FEEDBACK_WINDOW_DAYS} DAY)
+                  AND s.served_at > COALESCE(
+                        (
+                            SELECT MAX(c.served_at)
+                            FROM tb_ai_slot_serving_log c
+                            WHERE c.user_id = :user_id
+                              AND c.product_id = :product_id
+                              AND c.clicked_yn = 'Y'
+                              AND c.served_at >= DATE_SUB(NOW(), INTERVAL {AI_SLOT_FEEDBACK_WINDOW_DAYS} DAY)
+                        ),
+                        TIMESTAMP('1970-01-01 00:00:00')
+                    )
+                ORDER BY s.served_at DESC, s.id DESC
+                LIMIT 1
+            ) picked ON picked.id = target.id
+            SET target.clicked_yn = 'Y'
+            """
+        )
+        await db.execute(click_query, params)
+        return
 
     continued_query = text(
         f"""
@@ -1918,7 +2176,9 @@ def _section_has_collected_category(section: dict, axis_strengths: dict[str, flo
             if normalized and normalized not in parsed_axes:
                 parsed_axes.append(normalized)
     if parsed_axes:
-        return all(axis_strengths.get(axis, 0.0) > 0 for axis in parsed_axes)
+        positive_count = sum(1 for axis in parsed_axes if axis_strengths.get(axis, 0.0) > 0)
+        required_count = math.ceil(len(parsed_axes) / 2)
+        return positive_count >= required_count
 
     mapped_axes = _dimension_to_axes(str(section.get("dimension") or ""))
     if not mapped_axes:

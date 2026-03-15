@@ -86,30 +86,49 @@ insert into tb_user_taste_factor_score (
     created_date,
     updated_date
 )
-select e.user_id
-     , json_unquote(json_extract(e.event_payload, '$.factor_type')) as factor_type
-     , json_unquote(json_extract(e.event_payload, '$.factor_key')) as factor_key
-     , sum(
-         coalesce(
-             cast(trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) as decimal(18,6)),
-             0
-         )
-       ) as score
+select s.user_id
+     , s.factor_type
+     , s.factor_key
+     , sum(s.signal_score) as score
      , count(1) as signal_count
-     , max(e.created_date) as last_event_date
+     , max(s.created_date) as last_event_date
      , now() as created_date
      , now() as updated_date
-  from tb_user_ai_signal_event e
- where e.id >= @replay_from_id
-   and e.id <= @replay_to_id
-   and json_extract(e.event_payload, '$.factor_type') is not null
-   and json_extract(e.event_payload, '$.factor_key') is not null
-   and nullif(json_unquote(json_extract(e.event_payload, '$.factor_type')), '') is not null
-   and nullif(json_unquote(json_extract(e.event_payload, '$.factor_key')), '') is not null
-   and trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) regexp '^-?[0-9]+(\\.[0-9]+)?$'
- group by e.user_id
-        , json_unquote(json_extract(e.event_payload, '$.factor_type'))
-        , json_unquote(json_extract(e.event_payload, '$.factor_key'))
+  from (
+        select f.user_id
+             , f.factor_type
+             , f.factor_key
+             , cast(f.signal_score as decimal(18,6)) as signal_score
+             , f.created_date
+          from tb_user_ai_signal_event_factor f
+         where f.event_id >= @replay_from_id
+           and f.event_id <= @replay_to_id
+        union all
+        select e.user_id
+             , json_unquote(json_extract(e.event_payload, '$.factor_type')) as factor_type
+             , json_unquote(json_extract(e.event_payload, '$.factor_key')) as factor_key
+             , coalesce(
+                    cast(trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) as decimal(18,6)),
+                    0
+               ) as signal_score
+             , e.created_date
+          from tb_user_ai_signal_event e
+         where e.id >= @replay_from_id
+           and e.id <= @replay_to_id
+           and json_extract(e.event_payload, '$.factor_type') is not null
+           and json_extract(e.event_payload, '$.factor_key') is not null
+           and nullif(json_unquote(json_extract(e.event_payload, '$.factor_type')), '') is not null
+           and nullif(json_unquote(json_extract(e.event_payload, '$.factor_key')), '') is not null
+           and trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) regexp '^-?[0-9]+(\\.[0-9]+)?$'
+           and not exists (
+                select 1
+                  from tb_user_ai_signal_event_factor fx
+                 where fx.event_id = e.id
+           )
+  ) s
+ group by s.user_id
+        , s.factor_type
+        , s.factor_key
 on duplicate key update
     score = coalesce(score, 0) + values(score),
     signal_count = coalesce(signal_count, 0) + values(signal_count),

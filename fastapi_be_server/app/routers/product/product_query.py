@@ -2328,6 +2328,22 @@ async def products_in_publisher_promotion(
 
 
 @router.get(
+    "/main-rule-slots",
+    tags=["작품"],
+    responses={200: {"description": "메인 규칙형 구좌 작품 조회"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def products_in_main_rule_slots(
+    adult_yn: str = Query("N", description="성인등급 작품 포함 여부 (Y/N)"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await product_service.products_in_main_rule_slots(
+        kc_user_id=user.get("sub"), db=db, adult_yn=adult_yn
+    )
+
+
+@router.get(
     "/latest-update",
     tags=["작품"],
     responses={

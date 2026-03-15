@@ -625,12 +625,20 @@ async def sales_by_episode_list_by_product_id(
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
     is_full_query = page == -1 or count_per_page == -1
 
+    non_zero_clause = """
+            AND (
+                coalesce(count_total_sales, 0) > 0
+                OR coalesce(count_total_refund, 0) > 0
+            )
+    """
+
     total_count = 0
     if not is_full_query:
         count_query = text(f"""
             select count(*) as total_count
             from tb_ptn_product_episode_sales
             WHERE product_id = {product_id} {where}
+            {non_zero_clause}
         """)
         count_result = await db.execute(count_query, params)
         total_count = count_result.mappings().first()["total_count"]
@@ -642,6 +650,7 @@ async def sales_by_episode_list_by_product_id(
             select s.*
             from tb_ptn_product_episode_sales s
             WHERE product_id = {product_id} {where}
+            {non_zero_clause}
             ORDER BY s.created_date DESC
             {limit_clause}
         ) sales

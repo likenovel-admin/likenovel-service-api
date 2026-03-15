@@ -55,13 +55,24 @@ set @watermark = @last_processed_date;
 -- 첫 실행(last_processed_date is null)에서만 초기 워터마크를 계산한다.
 set @init_watermark_sql = if(
     @watermark is null,
-    'select coalesce(min(e.created_date), @batch_end) into @watermark
-       from tb_user_ai_signal_event e
-      where json_extract(e.event_payload, ''$.factor_type'') is not null
-        and json_extract(e.event_payload, ''$.factor_key'') is not null
-        and nullif(json_unquote(json_extract(e.event_payload, ''$.factor_type'')), '''') is not null
-        and nullif(json_unquote(json_extract(e.event_payload, ''$.factor_key'')), '''') is not null
-        and trim(json_unquote(json_extract(e.event_payload, ''$.signal_score''))) regexp ''^-?[0-9]+(\\\\.[0-9]+)?$''',
+    'select coalesce(min(x.created_date), @batch_end) into @watermark
+       from (
+            select f.created_date
+              from tb_user_ai_signal_event_factor f
+            union all
+            select e.created_date
+              from tb_user_ai_signal_event e
+             where json_extract(e.event_payload, ''$.factor_type'') is not null
+               and json_extract(e.event_payload, ''$.factor_key'') is not null
+               and nullif(json_unquote(json_extract(e.event_payload, ''$.factor_type'')), '''') is not null
+               and nullif(json_unquote(json_extract(e.event_payload, ''$.factor_key'')), '''') is not null
+               and trim(json_unquote(json_extract(e.event_payload, ''$.signal_score''))) regexp ''^-?[0-9]+(\\\\.[0-9]+)?$''
+               and not exists (
+                    select 1
+                      from tb_user_ai_signal_event_factor fx
+                     where fx.event_id = e.id
+               )
+       ) x',
     'select 1'
 );
 prepare stmt_init_watermark from @init_watermark_sql;
@@ -76,8 +87,7 @@ update tb_cms_batch_job_process a
  where a.id = @job_id
 ;
 
--- 이벤트 payload에서 factor_type/factor_key/signal_score를 추출해
--- 유저 취향 축 점수 테이블에 워터마크 이후 신규 이벤트만 증분 반영
+-- factor detail 테이블을 우선 읽고, detail이 없는 과거 payload factor row만 fallback으로 증분 반영
 insert into tb_user_taste_factor_score (
     user_id,
     factor_type,
@@ -88,30 +98,49 @@ insert into tb_user_taste_factor_score (
     created_date,
     updated_date
 )
-select e.user_id
-     , json_unquote(json_extract(e.event_payload, '$.factor_type')) as factor_type
-     , json_unquote(json_extract(e.event_payload, '$.factor_key')) as factor_key
-     , sum(
-         coalesce(
-             cast(trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) as decimal(18,6)),
-             0
-         )
-       ) as score
+select s.user_id
+     , s.factor_type
+     , s.factor_key
+     , sum(s.signal_score) as score
      , count(1) as signal_count
-     , max(e.created_date) as last_event_date
+     , max(s.created_date) as last_event_date
      , now() as created_date
      , now() as updated_date
-  from tb_user_ai_signal_event e
- where e.created_date >= @watermark
-   and e.created_date < @batch_end
-   and json_extract(e.event_payload, '$.factor_type') is not null
-   and json_extract(e.event_payload, '$.factor_key') is not null
-   and nullif(json_unquote(json_extract(e.event_payload, '$.factor_type')), '') is not null
-   and nullif(json_unquote(json_extract(e.event_payload, '$.factor_key')), '') is not null
-   and trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) regexp '^-?[0-9]+(\\.[0-9]+)?$'
- group by e.user_id
-        , json_unquote(json_extract(e.event_payload, '$.factor_type'))
-        , json_unquote(json_extract(e.event_payload, '$.factor_key'))
+  from (
+        select f.user_id
+             , f.factor_type
+             , f.factor_key
+             , cast(f.signal_score as decimal(18,6)) as signal_score
+             , f.created_date
+          from tb_user_ai_signal_event_factor f
+         where f.created_date >= @watermark
+           and f.created_date < @batch_end
+        union all
+        select e.user_id
+             , json_unquote(json_extract(e.event_payload, '$.factor_type')) as factor_type
+             , json_unquote(json_extract(e.event_payload, '$.factor_key')) as factor_key
+             , coalesce(
+                    cast(trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) as decimal(18,6)),
+                    0
+               ) as signal_score
+             , e.created_date
+          from tb_user_ai_signal_event e
+         where e.created_date >= @watermark
+           and e.created_date < @batch_end
+           and json_extract(e.event_payload, '$.factor_type') is not null
+           and json_extract(e.event_payload, '$.factor_key') is not null
+           and nullif(json_unquote(json_extract(e.event_payload, '$.factor_type')), '') is not null
+           and nullif(json_unquote(json_extract(e.event_payload, '$.factor_key')), '') is not null
+           and trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) regexp '^-?[0-9]+(\\.[0-9]+)?$'
+           and not exists (
+                select 1
+                  from tb_user_ai_signal_event_factor fx
+                 where fx.event_id = e.id
+           )
+  ) s
+ group by s.user_id
+        , s.factor_type
+        , s.factor_key
 on duplicate key update
     score = coalesce(score, 0) + values(score),
     signal_count = coalesce(signal_count, 0) + values(signal_count),
@@ -121,15 +150,28 @@ on duplicate key update
 
 -- 이번 실행에서 실제 반영된 이벤트의 최대 created_date를 계산한다.
 set @processed_max_created_date = (
-    select max(e.created_date)
-      from tb_user_ai_signal_event e
-     where e.created_date >= @watermark
-       and e.created_date < @batch_end
-       and json_extract(e.event_payload, '$.factor_type') is not null
-       and json_extract(e.event_payload, '$.factor_key') is not null
-       and nullif(json_unquote(json_extract(e.event_payload, '$.factor_type')), '') is not null
-       and nullif(json_unquote(json_extract(e.event_payload, '$.factor_key')), '') is not null
-       and trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) regexp '^-?[0-9]+(\\.[0-9]+)?$'
+    select max(x.created_date)
+      from (
+            select f.created_date
+              from tb_user_ai_signal_event_factor f
+             where f.created_date >= @watermark
+               and f.created_date < @batch_end
+            union all
+            select e.created_date
+              from tb_user_ai_signal_event e
+             where e.created_date >= @watermark
+               and e.created_date < @batch_end
+               and json_extract(e.event_payload, '$.factor_type') is not null
+               and json_extract(e.event_payload, '$.factor_key') is not null
+               and nullif(json_unquote(json_extract(e.event_payload, '$.factor_type')), '') is not null
+               and nullif(json_unquote(json_extract(e.event_payload, '$.factor_key')), '') is not null
+               and trim(json_unquote(json_extract(e.event_payload, '$.signal_score'))) regexp '^-?[0-9]+(\\.[0-9]+)?$'
+               and not exists (
+                    select 1
+                      from tb_user_ai_signal_event_factor fx
+                     where fx.event_id = e.id
+               )
+      ) x
 );
 
 -- 워터마크 + 완료 마킹 (트랜잭션 내에서 원자적으로)

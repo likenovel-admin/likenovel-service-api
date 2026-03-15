@@ -743,6 +743,48 @@ class ProductCountVariance(Base):
     )
 
 
+class MainRuleSlotSnapshot(Base):
+    __tablename__ = "tb_main_rule_slot_snapshot"  # 메인 규칙형 구좌 3일 스냅샷
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slot_key: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="구좌 키"
+    )
+    adult_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE),
+        index=True,
+        nullable=False,
+        server_default="N",
+        comment="성인 작품 포함 여부",
+    )
+    snapshot_start_date: Mapped[date] = mapped_column(
+        Date, index=True, nullable=False, comment="스냅샷 시작일"
+    )
+    snapshot_end_date: Mapped[date] = mapped_column(
+        Date, index=True, nullable=False, comment="스냅샷 종료일"
+    )
+    display_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="노출 순서"
+    )
+    product_id: Mapped[int | None] = mapped_column(
+        Integer, index=True, nullable=True, comment="작품 ID, 후보가 없으면 NULL sentinel"
+    )
+    created_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
 class ProductEpisodeCountVariance(Base):
     __tablename__ = (
         "tb_product_episode_count_variance"  # 회차 인디케이터 (일배치에서 ins)
@@ -1201,6 +1243,39 @@ class UserAiSignalEvent(Base):
     )
     event_payload: Mapped[str] = mapped_column(
         String(3000), nullable=True, comment="추가 이벤트 페이로드"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class UserAiSignalEventFactor(Base):
+    __tablename__ = "tb_user_ai_signal_event_factor"  # AI 추천용 유저 행동 factor detail
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, index=True, nullable=False, comment="원본 이벤트 아이디"
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="유저 아이디"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    episode_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=True, comment="회차 아이디"
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="원본 이벤트 타입"
+    )
+    factor_type: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="취향 축 타입"
+    )
+    factor_key: Mapped[str] = mapped_column(
+        String(120), index=True, nullable=False, comment="취향 축 키"
+    )
+    signal_score: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="신호 점수"
     )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")

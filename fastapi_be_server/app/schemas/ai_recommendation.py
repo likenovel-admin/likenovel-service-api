@@ -1,26 +1,15 @@
 import json
-import math
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 ALLOWED_AI_SIGNAL_EVENT_TYPES = {
+    "taste_slot_click",  # 메인 AI 추천 구좌 클릭
     "episode_view",       # 회차 열람 시작 (+ exit 시 progress_ratio 수집)
     "episode_end",        # 완독 (progress >= 95%)
     "latest_episode_reached",  # 최신화 열람 도달 신호 (완독 의미 아님, 최신화를 열었다는 사실)
     "next_episode_click",      # 다음 화 이동 클릭
-}
-ALLOWED_AI_FACTOR_TYPES = {
-    "protagonist",
-    "job",
-    "goal",
-    "material",
-    "worldview",
-    "romance",
-    "style",
-    "theme",
-    "mood",
 }
 MAX_EVENT_PAYLOAD_LENGTH = 3000
 
@@ -110,13 +99,6 @@ class PostAiSignalEventReqBody(BaseModel):
     progress_ratio: float = Field(default=0.0, ge=0.0, le=1.0, description="진행률(0~1)")
     next_available_yn: str = Field(default="N", description="다음화 존재 여부(Y/N)")
     latest_episode_reached_yn: str = Field(default="N", description="최신화 도달 여부(Y/N)")
-    factor_type: Optional[str] = Field(
-        default=None, max_length=50, description="취향 축 타입(선택)"
-    )
-    factor_key: Optional[str] = Field(
-        default=None, max_length=120, description="취향 축 키(선택)"
-    )
-    signal_score: Optional[float] = Field(default=None, description="신호 점수(선택)")
     event_payload: Optional[dict] = Field(default=None, description="추가 이벤트 페이로드(선택)")
 
     @field_validator("event_type")
@@ -137,37 +119,6 @@ class PostAiSignalEventReqBody(BaseModel):
             raise ValueError("Y/N 값만 허용됩니다.")
         return upper
 
-    @field_validator("factor_type")
-    @classmethod
-    def validate_factor_type(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        normalized = value.strip().lower()
-        if not normalized:
-            return None
-        if normalized not in ALLOWED_AI_FACTOR_TYPES:
-            raise ValueError("허용되지 않은 factor_type 입니다.")
-        return normalized
-
-    @field_validator("factor_key")
-    @classmethod
-    def normalize_factor_key(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
-
-    @field_validator("signal_score")
-    @classmethod
-    def validate_signal_score(cls, value: Optional[float]) -> Optional[float]:
-        if value is None:
-            return None
-        if not math.isfinite(value):
-            raise ValueError("signal_score는 유한한 숫자여야 합니다.")
-        if value < -20 or value > 20:
-            raise ValueError("signal_score 허용 범위를 벗어났습니다.")
-        return float(value)
-
     @field_validator("event_payload")
     @classmethod
     def validate_event_payload(cls, value: Optional[dict]) -> Optional[dict]:
@@ -177,16 +128,6 @@ class PostAiSignalEventReqBody(BaseModel):
         if len(serialized) > MAX_EVENT_PAYLOAD_LENGTH:
             raise ValueError("event_payload 크기가 허용 범위를 초과했습니다.")
         return value
-
-    @model_validator(mode="after")
-    def validate_factor_fields(self):
-        has_factor_type = bool(self.factor_type)
-        has_factor_key = bool(self.factor_key)
-        if has_factor_type != has_factor_key:
-            raise ValueError("factor_type과 factor_key는 함께 전달되어야 합니다.")
-        if self.signal_score is not None and not (has_factor_type and has_factor_key):
-            raise ValueError("signal_score는 factor_type/factor_key와 함께 전달되어야 합니다.")
-        return self
 
 
 # 취향 추천 섹션

@@ -38,7 +38,7 @@ MAX_ANALYZE_EPISODES = 10
 MAX_ANALYZE_CHARS = 60000
 MAX_LLM_OUTPUT_TOKENS = int(os.getenv("AI_METADATA_MAX_TOKENS", "4096"))
 MIN_REQUIRED_EPISODES = 3
-DEFAULT_GOAL_LABEL = "생존"
+DEFAULT_GOAL_LABEL = "성장"
 
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
@@ -65,6 +65,17 @@ LABELS_JSON_CANDIDATES = [
     / "ai"
     / "allowed-labels-by-axis.json",
 ]
+LABEL_DEFS_JSON_CANDIDATES = [
+    ROOT_DIR / "ai" / "label-definitions-by-axis.json",  # 컨테이너: /app/dist/ai/
+    ROOT_DIR / "docs" / "ai-codebook" / "label-definitions-by-axis.json",
+    ROOT_DIR
+    / "likenovel-service-api"
+    / "likenovel-service-api"
+    / "fastapi_be_server"
+    / "dist"
+    / "ai"
+    / "label-definitions-by-axis.json",
+]
 
 DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EXTRACTOR_V1이다.
 입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 7축 메타를 추출한다.
@@ -72,9 +83,12 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 
 핵심 규칙:
 1) 허용 라벨 목록 외 신규 라벨 생성 금지.
-2) 목표축(목)은 1개만 선택. 불명확하면 "생존".
+1-1) 각 라벨의 의미는 "라벨 정의" 섹션을 참고하여 판단한다. 이름만으로 추측하지 않는다.
+2) 목표축(목)은 1개만 선택. 라벨 정의를 참고하여 작품의 핵심 목표에 가장 부합하는 라벨을 선택한다.
 3) 연애축(연)은 연애/케미가 드러날 때만 선택 가능. 없으면 빈 배열 가능.
 4) confidence는 0~1 범위 숫자.
+5) summary의 모든 필드를 빈 값 없이 채운다. null 금지. themes/taste_tags도 각각 1개 이상.
+6) heroine이 없는 작품은 heroine_type에 주요 여성 캐릭터를 기재하고, heroine_weight는 "none"으로 설정한다.
 """
 
 DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하세요.
@@ -91,6 +105,9 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
 허용 라벨(축별 SSOT JSON):
 {allowed_labels_json}
 
+라벨 정의(분류 기준):
+{label_definitions_text}
+
 분석 회차 본문:
 {episodes_text}
 
@@ -98,15 +115,14 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
 {{
   "summary": {{
     "protagonist_type": "string",
-    "protagonist_desc": "string|null",
-    "heroine_type": "string|null",
-    "heroine_weight": "high|mid|low|none|null",
+    "protagonist_desc": "string",
+    "heroine_type": "string",
+    "heroine_weight": "high|mid|low|none",
     "mood": "string",
-    "pacing": "fast|medium|slow|null",
+    "pacing": "fast|medium|slow",
     "premise": "string",
-    "hook": "string|null",
+    "hook": "string",
     "themes": ["string"],
-    "similar_famous": ["string"],
     "taste_tags": ["string"]
   }},
   "axis_labels": {{
@@ -345,6 +361,22 @@ def load_allowed_labels() -> dict[str, set[str]]:
     raise ValueError("allowed-labels-by-axis.json 파일을 찾을 수 없습니다.")
 
 
+def load_label_definitions() -> str:
+    """라벨 정의 JSON을 프롬프트용 텍스트로 변환."""
+    for path in LABEL_DEFS_JSON_CANDIDATES:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8-sig") as fp:
+            raw = json.load(fp)
+        lines = []
+        for axis, defs in raw.items():
+            if isinstance(defs, dict):
+                for label, desc in defs.items():
+                    lines.append(f"  [{axis}] {label}: {desc}")
+        return "\n".join(lines)
+    return ""
+
+
 def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str]]) -> dict[str, Any]:
     summary = payload.get("summary")
     if not isinstance(summary, dict):
@@ -392,11 +424,14 @@ def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str
         )
         taste_tags = list(dict.fromkeys(merged))[:30]
 
+    themes = _safe_list(summary.get("themes"), "summary.themes")
+    if not themes:
+        raise ValueError("summary.themes requires at least 1 item")
     return {
         "protagonist_type": protagonist_type,
-        "protagonist_desc": _safe_text(summary.get("protagonist_desc"), "summary.protagonist_desc", 500),
-        "heroine_type": _safe_text(summary.get("heroine_type"), "summary.heroine_type", 200),
-        "heroine_weight": _safe_enum(summary.get("heroine_weight"), "summary.heroine_weight", ALLOWED_HEROINE_WEIGHT),
+        "protagonist_desc": _safe_text(summary.get("protagonist_desc"), "summary.protagonist_desc", 500, required=True),
+        "heroine_type": _safe_text(summary.get("heroine_type"), "summary.heroine_type", 200, required=True),
+        "heroine_weight": _safe_enum(summary.get("heroine_weight"), "summary.heroine_weight", ALLOWED_HEROINE_WEIGHT, required=True),
         "romance_chemistry_weight": _safe_enum(
             summary.get("romance_chemistry_weight"),
             "summary.romance_chemistry_weight",
@@ -404,11 +439,11 @@ def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str
         )
         or ("mid" if normalized_axis["연"] else "none"),
         "mood": mood,
-        "pacing": _safe_enum(summary.get("pacing"), "summary.pacing", ALLOWED_PACING),
+        "pacing": _safe_enum(summary.get("pacing"), "summary.pacing", ALLOWED_PACING, required=True),
         "premise": premise,
-        "hook": _safe_text(summary.get("hook"), "summary.hook", 300),
-        "themes": _safe_list(summary.get("themes"), "summary.themes"),
-        "similar_famous": _safe_list(summary.get("similar_famous"), "summary.similar_famous"),
+        "hook": _safe_text(summary.get("hook"), "summary.hook", 300, required=True),
+        "themes": themes,
+        "similar_famous": [],
         "taste_tags": taste_tags,
         "protagonist_goal_primary": normalized_axis["목"][0],
         "goal_confidence": _safe_confidence(axis_confidence.get("목"), "axis_confidence.목"),
@@ -483,6 +518,7 @@ def analyze_product(
             {axis: sorted(allowed_labels[axis]) for axis in AXIS_ORDER},
             ensure_ascii=False,
         ),
+        label_definitions_text=load_label_definitions(),
         episodes_text=episodes_text,
     )
     raw = call_claude(DNA_SYSTEM_PROMPT, user_prompt)
