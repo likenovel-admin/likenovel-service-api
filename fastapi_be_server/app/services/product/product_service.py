@@ -1041,9 +1041,15 @@ async def product_details_group_by_product_id(
     """
     try:
         user_id = await get_user_id(kc_user_id, db)
+        current_user_role = await _resolve_current_user_role(kc_user_id, db)
 
         query_parts = get_select_fields_and_joins_for_product(
             user_id=user_id, join_rank=False
+        )
+        product_visibility_condition = (
+            "1=1"
+            if current_user_role == "admin"
+            else "(p.open_yn = 'Y' OR p.user_id = :user_id OR p.author_id = :user_id)"
         )
         # ?묎?媛 ?먯떊???묓뭹??議고쉶?섎뒗 寃쎌슦 鍮꾧났媛??묓뭹??議고쉶 媛??
         # ?ㅻⅨ ?ъ슜?먮뒗 怨듦컻???묓뭹留?議고쉶 媛??
@@ -1052,7 +1058,7 @@ async def product_details_group_by_product_id(
             FROM tb_product p
             {query_parts["joins"]}
             WHERE p.product_id = :product_id
-              AND (p.open_yn = 'Y' OR p.user_id = :user_id OR p.author_id = :user_id)
+              AND {product_visibility_condition}
         """)
         result = await db.execute(query, {"product_id": product_id, "user_id": user_id})
         rows = result.mappings().all()
