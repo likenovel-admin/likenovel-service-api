@@ -54,6 +54,10 @@ async def user_list(
             where = text(f"""
                         AND email LIKE '%{search_word}%'
                         """)
+        elif search_target == "user_id":
+            where = text(f"""
+                        AND user_id = '{search_word}'
+                        """)
         else:
             where = text("""""")
     else:

@@ -710,8 +710,8 @@ async def save_direct_promotion(
                 message=ErrorMessages.FORBIDDEN_PRODUCT_FOR_DIRECT_PROMOTION,
             )
 
-        # free-for-first: 0 이하면 신규 생성하지 않음
-        fff_count = req_body.num_of_ticket_per_person_for_free_for_first or 0
+        # free-for-first: 0 이하면 stop, 1 이상이면 ing
+        fff_count = max(req_body.num_of_ticket_per_person_for_free_for_first or 0, 0)
         query = text("""
             select * from tb_direct_promotion where product_id = :product_id and `type` = 'free-for-first'
         """)
@@ -736,10 +736,11 @@ async def save_direct_promotion(
                     },
                 )
         else:
-            if fff_count > 0:
+            if db_rst["status"] != "end":
                 query = text("""
                     update tb_direct_promotion
                     set num_of_ticket_per_person = :ticket_count,
+                        status = :promotion_status,
                         updated_date = NOW()
                     where product_id = :product_id and `type` = 'free-for-first'
                 """)
@@ -747,6 +748,7 @@ async def save_direct_promotion(
                     query,
                     {
                         "ticket_count": fff_count,
+                        "promotion_status": "ing" if fff_count > 0 else "stop",
                         "product_id": product_id,
                     },
                 )
