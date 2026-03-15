@@ -273,8 +273,10 @@ async def stop_direct_promotion(promotion_id: int, kc_user_id: str, db: AsyncSes
 
     query = text("""
         update tb_direct_promotion
-        set status = 'stop'
+        set status = 'stop',
+            updated_date = NOW()
         where id = :id
+          and status <> 'stop'
     """)
     await db.execute(query, {"id": promotion_id})
 
@@ -327,8 +329,10 @@ async def start_direct_promotion(promotion_id: int, kc_user_id: str, db: AsyncSe
 
     query = text("""
         update tb_direct_promotion
-        set status = 'ing'
+        set status = 'ing',
+            updated_date = NOW()
         where id = :id
+          and status <> 'ing'
     """)
     await db.execute(query, {"id": promotion_id})
 

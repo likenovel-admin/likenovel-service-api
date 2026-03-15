@@ -65,7 +65,7 @@ async def product_statistics_list(
         """
     elif user_data["role"] == "CP":
         where = f"""
-            AND s.product_id IN (
+            AND (s.product_id IN (
                 SELECT z.product_id
                 FROM tb_product_contract_offer z
                 INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
@@ -74,7 +74,9 @@ async def product_statistics_list(
                 WHERE z.use_yn = 'Y'
                 AND z.author_accept_yn = 'Y'
                 AND y.user_id = {user_data["user_id"]}
-            )
+            ) OR s.product_id IN (
+                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
+            ))
         """
     else:
         where = ""
@@ -750,8 +752,7 @@ async def _discovery_statistics_list_summary(
         where += f" AND p.author_id = {user_data['user_id']}"
     elif user_data["role"] == "CP" and scope == "contracted":
         where += f"""
-            AND p.open_yn = 'Y'
-            AND p.product_id IN (
+            AND (p.product_id IN (
                 SELECT z.product_id
                 FROM tb_product_contract_offer z
                 INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
@@ -760,7 +761,7 @@ async def _discovery_statistics_list_summary(
                 WHERE z.use_yn = 'Y'
                     AND z.author_accept_yn = 'Y'
                     AND y.user_id = {user_data['user_id']}
-            )
+            ) OR p.user_id = {user_data['user_id']})
         """
 
     if search_word != "":
@@ -949,7 +950,7 @@ async def product_discovery_statistics_detail_by_id(
         params["user_id"] = user_data["user_id"]
     elif user_data["role"] == "CP" and scope == "contracted":
         detail_where += """
-        AND ppds.product_id IN (
+        AND (ppds.product_id IN (
             SELECT z.product_id
             FROM tb_product_contract_offer z
             INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
@@ -958,7 +959,9 @@ async def product_discovery_statistics_detail_by_id(
             WHERE z.use_yn = 'Y'
             AND z.author_accept_yn = 'Y'
             AND y.user_id = :user_id
-        )
+        ) OR ppds.product_id IN (
+            SELECT product_id FROM tb_product WHERE user_id = :user_id
+        ))
         """
         params["user_id"] = user_data["user_id"]
 

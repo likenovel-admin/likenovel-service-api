@@ -361,13 +361,14 @@ async def publisher_promotion_list(
     query = text(f"""
         with tmp_contract_offer_summary as (
             select z.product_id
-                , y.company_name as cp_company_name
+                , MAX(y.company_name) as cp_company_name
             from tb_product_contract_offer z
             inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
             and y.apply_type = 'cp'
             and y.approval_date is not null
             where z.use_yn = 'Y'
             and z.author_accept_yn = 'Y'
+            GROUP BY z.product_id
         )
         SELECT
             pp.*, p.*

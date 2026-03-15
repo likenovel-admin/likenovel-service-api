@@ -2564,25 +2564,27 @@ async def post_products(
 
                 # 2李??λⅤ 寃利?
                 sub_genre_id = None
-                if db_rst:
-                    if req_body.sub_genre is None or req_body.sub_genre == "":
-                        pass
-                    else:
-                        for row in db_rst:
-                            if req_body.sub_genre == row["keyword_name"]:
-                                sub_genre_id = row["keyword_id"]
-                                break
+                if req_body.sub_genre is not None and req_body.sub_genre != "":
+                    sub_genre_query = text("""
+                                     select keyword_id
+                                          , keyword_name
+                                       from tb_standard_keyword
+                                      where use_yn = 'Y'
+                                        and major_genre_yn != 'Y'
+                                     """)
+                    sub_genre_result = await db.execute(sub_genre_query)
+                    sub_genre_rst = sub_genre_result.mappings().all()
 
-                        if sub_genre_id is None:
-                            raise CustomResponseException(
-                                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                                message=ErrorMessages.INVALID_PRODUCT_INFO,
-                            )
-                else:
-                    raise CustomResponseException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        message=ErrorMessages.INVALID_PRODUCT_INFO,
-                    )
+                    for row in sub_genre_rst:
+                        if req_body.sub_genre == row["keyword_name"]:
+                            sub_genre_id = row["keyword_id"]
+                            break
+
+                    if sub_genre_id is None:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.INVALID_PRODUCT_INFO,
+                        )
 
                 # ?ㅼ썙??寃利?
                 query = text("""
@@ -2941,25 +2943,27 @@ async def put_products_product_id(
 
                 # 2李??λⅤ 寃利?
                 sub_genre_id = None
-                if db_rst:
-                    if req_body.sub_genre is None or req_body.sub_genre == "":
-                        pass
-                    else:
-                        for row in db_rst:
-                            if req_body.sub_genre == row["keyword_name"]:
-                                sub_genre_id = row["keyword_id"]
-                                break
+                if req_body.sub_genre is not None and req_body.sub_genre != "":
+                    sub_genre_query = text("""
+                                     select keyword_id
+                                          , keyword_name
+                                       from tb_standard_keyword
+                                      where use_yn = 'Y'
+                                        and major_genre_yn != 'Y'
+                                     """)
+                    sub_genre_result = await db.execute(sub_genre_query)
+                    sub_genre_rst = sub_genre_result.mappings().all()
 
-                        if sub_genre_id is None:
-                            raise CustomResponseException(
-                                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                                message=ErrorMessages.INVALID_PRODUCT_INFO,
-                            )
-                else:
-                    raise CustomResponseException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        message=ErrorMessages.INVALID_PRODUCT_INFO,
-                    )
+                    for row in sub_genre_rst:
+                        if req_body.sub_genre == row["keyword_name"]:
+                            sub_genre_id = row["keyword_id"]
+                            break
+
+                    if sub_genre_id is None:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.INVALID_PRODUCT_INFO,
+                        )
 
                 # ?ㅼ썙??寃利?
                 query = text("""

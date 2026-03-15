@@ -93,16 +93,17 @@ async def product_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND a.product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            )
+            AND (a.user_id = {user_data["user_id"]}
+                 OR a.product_id IN (
+                    select z.product_id
+                    from tb_product_contract_offer z
+                    inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
+                    and y.apply_type = 'cp'
+                    and y.approval_date is not null
+                    where z.use_yn = 'Y'
+                    and z.author_accept_yn = 'Y'
+                    and y.user_id = {user_data["user_id"]}
+                ))
         """
 
     if contract_type == CommonConstants.CONTRACT_NORMAL:
@@ -230,13 +231,14 @@ async def product_list(
         ),
         tmp_contract_offer_summary as (
             select z.product_id
-                , y.company_name as cp_company_name
+                , MAX(y.company_name) as cp_company_name
             from tb_product_contract_offer z
             inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
             and y.apply_type = 'cp'
             and y.approval_date is not null
             where z.use_yn = 'Y'
             and z.author_accept_yn = 'Y'
+            GROUP BY z.product_id
         )
         {sales_summary_cte}
         ,
@@ -317,15 +319,16 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
         ),
         tmp_contract_offer_summary as (
             select z.product_id
-                , y.company_name as cp_company_name
-                , z.author_profit as cp_author_profit
-                , z.offer_price as cp_offer_price
+                , MAX(y.company_name) as cp_company_name
+                , MAX(z.author_profit) as cp_author_profit
+                , MAX(z.offer_price) as cp_offer_price
             from tb_product_contract_offer z
             inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
             and y.apply_type = 'cp'
             and y.approval_date is not null
             where z.use_yn = 'Y'
             and z.author_accept_yn = 'Y'
+            GROUP BY z.product_id
         )
         select a.product_id
             , a.title
@@ -428,6 +431,7 @@ async def put_product(
                 SELECT 1 FROM tb_product p
                 WHERE p.product_id = :product_id
                   AND (p.author_id = :user_id
+                       OR p.user_id = :user_id
                        OR EXISTS (
                            SELECT 1 FROM tb_product_contract_offer co
                            INNER JOIN tb_user_profile_apply upa ON co.offer_user_id = upa.user_id

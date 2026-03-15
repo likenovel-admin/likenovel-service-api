@@ -71,7 +71,7 @@ async def monthly_sales_by_product_list(
             INNER JOIN tb_product p ON pps.product_id = p.product_id
         """
         where += f"""
-            AND p.product_id IN (
+            AND (p.product_id IN (
                 select z.product_id
                 from tb_product_contract_offer z
                 inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
@@ -80,7 +80,7 @@ async def monthly_sales_by_product_list(
                 where z.use_yn = 'Y'
                 and z.author_accept_yn = 'Y'
                 and y.user_id = {user_data["user_id"]}
-            )
+            ) OR p.user_id = {user_data["user_id"]})
         """
 
     if search_word != "":
@@ -460,7 +460,7 @@ async def sales_by_episode_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND product_id IN (
+            AND (product_id IN (
                 select z.product_id
                 from tb_product_contract_offer z
                 inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
@@ -469,7 +469,9 @@ async def sales_by_episode_list(
                 where z.use_yn = 'Y'
                 and z.author_accept_yn = 'Y'
                 and y.user_id = {user_data["user_id"]}
-            )
+            ) OR product_id IN (
+                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
+            ))
         """
 
     if search_word != "":
@@ -708,7 +710,7 @@ async def daily_ticket_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND product_id IN (
+            AND (product_id IN (
                 select z.product_id
                 from tb_product_contract_offer z
                 inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
@@ -717,7 +719,9 @@ async def daily_ticket_list(
                 where z.use_yn = 'Y'
                 and z.author_accept_yn = 'Y'
                 and y.user_id = {user_data["user_id"]}
-            )
+            ) OR product_id IN (
+                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
+            ))
         """
 
     if search_word != "":
@@ -822,7 +826,7 @@ async def monthly_settlement_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND product_id IN (
+            AND (product_id IN (
                 select z.product_id
                 from tb_product_contract_offer z
                 inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
@@ -831,7 +835,9 @@ async def monthly_settlement_list(
                 where z.use_yn = 'Y'
                 and z.author_accept_yn = 'Y'
                 and y.user_id = {user_data["user_id"]}
-            )
+            ) OR product_id IN (
+                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
+            ))
         """
 
     if search_word != "":
@@ -936,7 +942,7 @@ async def product_contract_offer_deduction_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND product_id IN (
+            AND (product_id IN (
                 select z.product_id
                 from tb_product_contract_offer z
                 inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
@@ -945,7 +951,9 @@ async def product_contract_offer_deduction_list(
                 where z.use_yn = 'Y'
                 and z.author_accept_yn = 'Y'
                 and y.user_id = {user_data["user_id"]}
-            )
+            ) OR product_id IN (
+                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
+            ))
         """
 
     if search_word != "":
