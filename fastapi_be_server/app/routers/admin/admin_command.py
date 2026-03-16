@@ -10,6 +10,7 @@ from app.services.admin import (
     admin_ai_onboarding_service,
     admin_ai_metadata_service,
     admin_basic_service,
+    admin_blind_service,
     admin_content_service,
     admin_event_service,
     admin_faq_service,
@@ -1553,3 +1554,22 @@ async def post_admin_create_account(
     )
 
     return await auth_service.post_auth_signup(req_body=signup_body, db=db)
+
+
+@router.post(
+    "/products/batch-blind",
+    tags=["CMS - 작품 블라인드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_batch_blind(
+    req_body: admin_schema.PostBatchBlindReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """작품 일괄 블라인드 처리"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_blind_service.batch_blind(
+        product_ids=req_body.product_ids,
+        blind_yn=req_body.blind_yn,
+        db=db,
+    )

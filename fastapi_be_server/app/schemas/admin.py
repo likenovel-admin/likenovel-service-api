@@ -776,3 +776,8 @@ class AdminCreateAccountReqBody(AdminBase):
         if not re.search(r"[\W_]", value):
             raise ValueError("특문 포함")
         return value
+
+
+class PostBatchBlindReqBody(AdminBase):
+    product_ids: List[int] = Field(description="블라인드 대상 작품 ID 목록")
+    blind_yn: str = Field(examples=["Y"], description="블라인드 여부 (Y/N)")

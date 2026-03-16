@@ -8,6 +8,7 @@ from app.services.admin import (
     admin_ai_onboarding_service,
     admin_ai_metadata_service,
     admin_basic_service,
+    admin_blind_service,
     admin_content_service,
     admin_event_service,
     admin_faq_service,
@@ -4383,5 +4384,31 @@ async def ai_product_metadata_detail(
 
     return await admin_ai_metadata_service.ai_product_metadata_detail(
         product_id=product_id,
+        db=db,
+    )
+
+
+@router.get(
+    "/products/blind-list",
+    tags=["CMS - 작품 블라인드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_blind_list(
+    page: int = Query(default=1),
+    count_per_page: int = Query(default=50),
+    blind_yn: str = Query(default=""),
+    search_target: str = Query(default=""),
+    search_word: str = Query(default=""),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """작품 블라인드 목록 조회"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_blind_service.blind_list(
+        page=page,
+        count_per_page=count_per_page,
+        blind_yn=blind_yn or None,
+        search_target=search_target or None,
+        search_word=search_word or None,
         db=db,
     )
