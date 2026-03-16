@@ -1,4 +1,4 @@
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -24,14 +24,20 @@ async def blind_list(
                 where_clauses.append("a.title LIKE :sw")
                 params["sw"] = f"%{word}%"
             elif search_target == "author-name":
-                where_clauses.append("a.author_nickname LIKE :sw")
+                where_clauses.append("a.author_name LIKE :sw")
                 params["sw"] = f"%{word}%"
             elif search_target == "product-id":
-                where_clauses.append("a.product_id = :pid")
-                params["pid"] = int(word)
+                try:
+                    params["pid"] = int(word)
+                    where_clauses.append("a.product_id = :pid")
+                except ValueError:
+                    where_clauses.append("1=0")
             elif search_target == "user-id":
-                where_clauses.append("a.user_id = :uid")
-                params["uid"] = int(word)
+                try:
+                    params["uid"] = int(word)
+                    where_clauses.append("a.user_id = :uid")
+                except ValueError:
+                    where_clauses.append("1=0")
 
     where_sql = " AND ".join(where_clauses)
 
@@ -50,8 +56,8 @@ async def blind_list(
         SELECT a.product_id
              , a.title
              , a.user_id
-             , a.author_nickname
-             , a.primary_genre
+             , a.author_name
+             , COALESCE(g.keyword_name, '') AS primary_genre
              , a.blind_yn
              , a.created_date
              , (SELECT COUNT(*)
@@ -59,6 +65,8 @@ async def blind_list(
                  WHERE e.product_id = a.product_id
                    AND e.use_yn = 'Y') AS episode_count
           FROM tb_product a
+          LEFT JOIN tb_standard_keyword g
+            ON g.keyword_id = a.primary_genre_id
          WHERE {where_sql}
          ORDER BY a.product_id DESC
          LIMIT :limit OFFSET :offset
@@ -86,7 +94,6 @@ async def batch_blind(
     if blind_val not in ("Y", "N"):
         blind_val = "N"
 
-    # blind_yn=Y 이면 open_yn=N 도 같이 처리
     if blind_val == "Y":
         query = text("""
             UPDATE tb_product
@@ -94,15 +101,15 @@ async def batch_blind(
                  , open_yn = 'N'
                  , updated_date = NOW()
              WHERE product_id IN :ids
-        """)
+        """).bindparams(bindparam("ids", expanding=True))
     else:
         query = text("""
             UPDATE tb_product
                SET blind_yn = 'N'
                  , updated_date = NOW()
              WHERE product_id IN :ids
-        """)
+        """).bindparams(bindparam("ids", expanding=True))
 
-    result = await db.execute(query, {"ids": tuple(product_ids)})
+    result = await db.execute(query, {"ids": product_ids})
 
     return {"result": True, "updated_count": result.rowcount}
