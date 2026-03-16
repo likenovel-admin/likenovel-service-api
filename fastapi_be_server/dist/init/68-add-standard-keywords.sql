@@ -1,0 +1,107 @@
+-- 기본태그 대량 추가: 소재(category_id=2), 캐릭터(category_id=3), 직업(category_id=4)
+-- 기존 키워드와 중복되지 않는 것만 INSERT
+
+-- ============ 소재 (category_id=2) ============
+INSERT INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
+SELECT t.keyword_name, 2, 'N', 'Y', 0, NOW(), 0, NOW()
+FROM (
+    SELECT '회귀' AS keyword_name UNION ALL SELECT '귀환' UNION ALL SELECT '타임루프'
+    UNION ALL SELECT '게이트' UNION ALL SELECT '각성' UNION ALL SELECT '나혼자'
+    UNION ALL SELECT '랭커' UNION ALL SELECT '레이드' UNION ALL SELECT '서바이벌'
+    UNION ALL SELECT '탑등반물' UNION ALL SELECT '튜토리얼' UNION ALL SELECT '게임시스템'
+    UNION ALL SELECT '귀농' UNION ALL SELECT '농사' UNION ALL SELECT '요리'
+    UNION ALL SELECT '도박' UNION ALL SELECT '주식' UNION ALL SELECT '부동산'
+    UNION ALL SELECT '투자' UNION ALL SELECT '가상화폐' UNION ALL SELECT '현질'
+    UNION ALL SELECT '로또' UNION ALL SELECT '사이다' UNION ALL SELECT '깽판'
+    UNION ALL SELECT '오해' UNION ALL SELECT '만능' UNION ALL SELECT '노가다'
+    UNION ALL SELECT '19금' UNION ALL SELECT 'SNS' UNION ALL SELECT '가족'
+    UNION ALL SELECT '결혼' UNION ALL SELECT '이혼' UNION ALL SELECT '돌싱'
+    UNION ALL SELECT '불륜' UNION ALL SELECT '연예계' UNION ALL SELECT '예능'
+    UNION ALL SELECT '유튜브' UNION ALL SELECT '인터넷방송' UNION ALL SELECT '음악'
+    UNION ALL SELECT '예술' UNION ALL SELECT '골프' UNION ALL SELECT '축구'
+    UNION ALL SELECT '야구' UNION ALL SELECT '농구' UNION ALL SELECT '테니스'
+    UNION ALL SELECT '바둑' UNION ALL SELECT '메디컬' UNION ALL SELECT '인공지능'
+    UNION ALL SELECT '격투' UNION ALL SELECT '라이벌' UNION ALL SELECT '남녀역전'
+    UNION ALL SELECT '시한부' UNION ALL SELECT '시간정지' UNION ALL SELECT '최면'
+    UNION ALL SELECT '타락' UNION ALL SELECT '부활' UNION ALL SELECT '불멸'
+    UNION ALL SELECT '퇴마' UNION ALL SELECT '크툴루' UNION ALL SELECT '괴담'
+    UNION ALL SELECT '첩보' UNION ALL SELECT '암흑가' UNION ALL SELECT '기갑물'
+    UNION ALL SELECT '해양' UNION ALL SELECT '외계' UNION ALL SELECT '전설'
+    UNION ALL SELECT '전염병' UNION ALL SELECT '포스트아포칼립스' UNION ALL SELECT '트롤'
+    UNION ALL SELECT '트립퍼' UNION ALL SELECT '혈통' UNION ALL SELECT '화산'
+    UNION ALL SELECT '한국사' UNION ALL SELECT '세계사' UNION ALL SELECT '고구려'
+    UNION ALL SELECT '고려' UNION ALL SELECT '고조선' UNION ALL SELECT '신라'
+    UNION ALL SELECT '백제' UNION ALL SELECT '부여' UNION ALL SELECT '대한제국'
+    UNION ALL SELECT '삼국지' UNION ALL SELECT '마계' UNION ALL SELECT '마교'
+    UNION ALL SELECT '사파' UNION ALL SELECT '정파' UNION ALL SELECT '선협'
+    UNION ALL SELECT '소림' UNION ALL SELECT '무공' UNION ALL SELECT '무당'
+    UNION ALL SELECT '객잔' UNION ALL SELECT '개방' UNION ALL SELECT '왕족'
+    UNION ALL SELECT '명문세가' UNION ALL SELECT '명품' UNION ALL SELECT '기업'
+    UNION ALL SELECT '은퇴' UNION ALL SELECT '육성' UNION ALL SELECT '계략'
+    UNION ALL SELECT '독립군' UNION ALL SELECT '아이템' UNION ALL SELECT '아티팩트'
+    UNION ALL SELECT '오러' UNION ALL SELECT '배달원' UNION ALL SELECT '구원'
+    UNION ALL SELECT '나노머신' UNION ALL SELECT '성기사'
+) t
+WHERE NOT EXISTS (
+    SELECT 1 FROM tb_standard_keyword sk
+    WHERE sk.keyword_name = t.keyword_name AND sk.category_id = 2
+);
+
+-- ============ 캐릭터 (category_id=3) ============
+INSERT INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
+SELECT t.keyword_name, 3, 'N', 'Y', 0, NOW(), 0, NOW()
+FROM (
+    SELECT '천마' AS keyword_name UNION ALL SELECT '망나니' UNION ALL SELECT '고인물'
+    UNION ALL SELECT '노력가' UNION ALL SELECT '구원자' UNION ALL SELECT '영웅'
+    UNION ALL SELECT 'NPC' UNION ALL SELECT '노예' UNION ALL SELECT '능력자'
+    UNION ALL SELECT '다크히어로' UNION ALL SELECT '마피아' UNION ALL SELECT '재벌'
+    UNION ALL SELECT '귀족' UNION ALL SELECT '양아치' UNION ALL SELECT '상남자'
+    UNION ALL SELECT '하남자' UNION ALL SELECT '협객' UNION ALL SELECT '낭인'
+    UNION ALL SELECT '색마' UNION ALL SELECT '성좌' UNION ALL SELECT '지존'
+    UNION ALL SELECT '악역영애' UNION ALL SELECT '조력자' UNION ALL SELECT '검은머리'
+    UNION ALL SELECT '고블린' UNION ALL SELECT '오크' UNION ALL SELECT '드워프'
+    UNION ALL SELECT '외계인' UNION ALL SELECT '몬스터' UNION ALL SELECT '곤충'
+) t
+WHERE NOT EXISTS (
+    SELECT 1 FROM tb_standard_keyword sk
+    WHERE sk.keyword_name = t.keyword_name AND sk.category_id = 3
+);
+
+-- ============ 직업 (category_id=4) ============
+INSERT INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
+SELECT t.keyword_name, 4, 'N', 'Y', 0, NOW(), 0, NOW()
+FROM (
+    SELECT '헌터' AS keyword_name UNION ALL SELECT '학생' UNION ALL SELECT '군인'
+    UNION ALL SELECT '경찰' UNION ALL SELECT '형사' UNION ALL SELECT '검사(법)'
+    UNION ALL SELECT '판사' UNION ALL SELECT '변호사' UNION ALL SELECT '의원'
+    UNION ALL SELECT '한의사' UNION ALL SELECT '소환사' UNION ALL SELECT '네크로맨서'
+    UNION ALL SELECT '정령사' UNION ALL SELECT '궁수' UNION ALL SELECT '권사'
+    UNION ALL SELECT '기사' UNION ALL SELECT '성기사' UNION ALL SELECT '검투사'
+    UNION ALL SELECT '격투가' UNION ALL SELECT '암살자' UNION ALL SELECT '살수'
+    UNION ALL SELECT '총잡이' UNION ALL SELECT '칼잡이' UNION ALL SELECT '스파이'
+    UNION ALL SELECT '해적' UNION ALL SELECT '도사' UNION ALL SELECT '무속인'
+    UNION ALL SELECT '무인' UNION ALL SELECT '대장장이' UNION ALL SELECT '농부'
+    UNION ALL SELECT '상인' UNION ALL SELECT '요리사' UNION ALL SELECT '배우'
+    UNION ALL SELECT '가수' UNION ALL SELECT '아이돌' UNION ALL SELECT '작가'
+    UNION ALL SELECT '작곡가' UNION ALL SELECT '연주가' UNION ALL SELECT '화가'
+    UNION ALL SELECT '디자이너' UNION ALL SELECT '개발자' UNION ALL SELECT '건축가'
+    UNION ALL SELECT '과학자' UNION ALL SELECT '교수' UNION ALL SELECT '선생님'
+    UNION ALL SELECT '사업가' UNION ALL SELECT '회사원' UNION ALL SELECT '공무원'
+    UNION ALL SELECT '소방관' UNION ALL SELECT '군주' UNION ALL SELECT '정치인'
+    UNION ALL SELECT '기자' UNION ALL SELECT '스트리머' UNION ALL SELECT '유튜버'
+    UNION ALL SELECT 'BJ' UNION ALL SELECT 'DJ' UNION ALL SELECT 'PD'
+    UNION ALL SELECT '감독' UNION ALL SELECT '매니저' UNION ALL SELECT '개그맨'
+    UNION ALL SELECT '모험가' UNION ALL SELECT '조련사' UNION ALL SELECT '사육사'
+    UNION ALL SELECT '사진사' UNION ALL SELECT '프로게이머' UNION ALL SELECT '운동선수'
+    UNION ALL SELECT '투자가' UNION ALL SELECT '회계사' UNION ALL SELECT '세무사'
+    UNION ALL SELECT '변리사' UNION ALL SELECT '배달원' UNION ALL SELECT '생산직'
+    UNION ALL SELECT '교도관' UNION ALL SELECT '해병대' UNION ALL SELECT '해결사'
+    UNION ALL SELECT '청부업자' UNION ALL SELECT '책사' UNION ALL SELECT '종교인'
+    UNION ALL SELECT '각성자' UNION ALL SELECT '하녀' UNION ALL SELECT '학사'
+    UNION ALL SELECT '학자' UNION ALL SELECT '예술가' UNION ALL SELECT '전문가'
+    UNION ALL SELECT '흑마법사' UNION ALL SELECT '기타_전문직'
+) t
+WHERE NOT EXISTS (
+    SELECT 1 FROM tb_standard_keyword sk
+    WHERE sk.keyword_name = t.keyword_name AND sk.category_id = 4
+);

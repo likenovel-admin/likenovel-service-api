@@ -11,6 +11,7 @@ from app.services.admin import (
     admin_ai_metadata_service,
     admin_basic_service,
     admin_blind_service,
+    admin_bulk_upload_service,
     admin_content_service,
     admin_event_service,
     admin_faq_service,
@@ -1573,3 +1574,42 @@ async def post_batch_blind(
         blind_yn=req_body.blind_yn,
         db=db,
     )
+
+
+# ──────────────────── 일괄 업로드 ────────────────────
+
+
+@router.post(
+    "/bulk-upload/preview",
+    tags=["CMS - 일괄 업로드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_bulk_upload_preview(
+    excel: UploadFile = File(...),
+    zip_file: UploadFile = File(None),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """엑셀+zip 미리보기"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    excel_bytes = await excel.read()
+    zip_bytes = await zip_file.read() if zip_file else None
+    return await admin_bulk_upload_service.preview_bulk_upload(excel_bytes, zip_bytes, db)
+
+
+@router.post(
+    "/bulk-upload/execute",
+    tags=["CMS - 일괄 업로드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_bulk_upload_execute(
+    excel: UploadFile = File(...),
+    zip_file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """일괄 생성 실행"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    excel_bytes = await excel.read()
+    zip_bytes = await zip_file.read()
+    return await admin_bulk_upload_service.execute_bulk_upload(excel_bytes, zip_bytes, db)
