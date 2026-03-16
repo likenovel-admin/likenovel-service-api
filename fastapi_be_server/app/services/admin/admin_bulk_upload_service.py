@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.const import settings
 from app.services.common import comm_service
 
 logger = logging.getLogger(__name__)
