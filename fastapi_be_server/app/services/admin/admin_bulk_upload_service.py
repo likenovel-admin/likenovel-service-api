@@ -99,8 +99,9 @@ async def preview_bulk_upload(
     if missing:
         return {"error": f"누락 컬럼: {', '.join(missing)}", "results": []}
 
-    # zip에서 폴더별 파일 수 카운트
+    # zip에서 폴더별 파일 수 카운트 + 표지 감지
     episode_counts: dict[str, int] = {}
+    cover_exists: dict[str, bool] = {}
     if zip_bytes:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             for name in zf.namelist():
@@ -109,8 +110,13 @@ async def preview_bulk_upload(
                 parts = Path(name).parts
                 if len(parts) >= 2:
                     folder = parts[0]
-                    if name.lower().endswith(".txt"):
+                    fname_lower = parts[-1].lower()
+                    if fname_lower.endswith(".txt"):
                         episode_counts[folder] = episode_counts.get(folder, 0) + 1
+                    elif fname_lower.startswith("cover") and fname_lower.endswith(
+                        (".jpg", ".jpeg", ".png", ".webp")
+                    ):
+                        cover_exists[folder] = True
 
     # 장르 name → id 매핑 로드
     genre_map = await _load_genre_map(db)
@@ -147,6 +153,7 @@ async def preview_bulk_upload(
                 errors.append("연재주기에 유효한 요일(월~일)이 없음")
 
         ep_count = episode_counts.get(title, 0)
+        has_cover = cover_exists.get(title, False)
         account_exists = email.lower() in existing_emails
 
         results.append({
@@ -166,6 +173,7 @@ async def preview_bulk_upload(
             "first_open_ep": int(first_open) if first_open.isdigit() else 1,
             "start_date": start_date,
             "episode_count": ep_count,
+            "has_cover": has_cover,
             "account_exists": account_exists,
             "errors": errors,
         })
@@ -191,19 +199,24 @@ async def execute_bulk_upload(
 
     # zip 풀기
     episode_files: dict[str, dict[int, str]] = {}  # {title: {ep_no: content}}
+    cover_files: dict[str, bytes] = {}  # {title: image_bytes}
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for name in zf.namelist():
             if name.endswith("/") or name.startswith("__MACOSX"):
                 continue
             parts = Path(name).parts
-            if len(parts) >= 2 and name.lower().endswith(".txt"):
+            if len(parts) >= 2:
                 folder = parts[0]
-                filename = parts[-1]
-                # "작품명 N화.txt" → N 추출
-                ep_no = _extract_episode_no(filename)
-                if ep_no is not None:
-                    content = zf.read(name).decode("utf-8-sig")
-                    episode_files.setdefault(folder, {})[ep_no] = content
+                fname_lower = parts[-1].lower()
+                if fname_lower.endswith(".txt"):
+                    ep_no = _extract_episode_no(parts[-1])
+                    if ep_no is not None:
+                        content = zf.read(name).decode("utf-8-sig")
+                        episode_files.setdefault(folder, {})[ep_no] = content
+                elif fname_lower.startswith("cover") and fname_lower.endswith(
+                    (".jpg", ".jpeg", ".png", ".webp")
+                ):
+                    cover_files[folder] = zf.read(name)
 
     genre_map = await _load_genre_map(db)
     keyword_map = await _load_keyword_map(db)
@@ -225,11 +238,13 @@ async def execute_bulk_upload(
             )
 
             # 2) 작품 생성
+            cover_bytes = cover_files.get(row["title"])
             product_id = await _create_product(
                 user_id=user_id,
                 row=row,
                 genre_map=genre_map,
                 keyword_map=keyword_map,
+                cover_bytes=cover_bytes,
                 db=db,
             )
 
@@ -396,12 +411,21 @@ async def _create_product(
     genre_map: dict[str, int],
     keyword_map: dict[str, int],
     db: AsyncSession,
+    cover_bytes: bytes | None = None,
 ) -> int:
-    """작품 생성 + 키워드 매핑."""
+    """작품 생성 + 키워드 매핑 + 표지 업로드."""
     primary_genre_id = genre_map.get(row["genre1"], 0)
     sub_genre_id = genre_map.get(row["genre2"]) if row["genre2"] else None
     ratings_code = "adult" if row["rating"] == "19" else ("15" if row["rating"] == "15" else "all")
     publish_days = _parse_publish_days(row["schedule_days"])
+
+    # 표지 업로드 (있으면)
+    thumbnail_file_id = None
+    if cover_bytes:
+        try:
+            thumbnail_file_id = await _upload_cover_image(cover_bytes, db)
+        except Exception as e:
+            logger.warning(f"Cover upload failed for {row['title']}: {e}")
 
     await db.execute(
         text("""
@@ -409,15 +433,15 @@ async def _create_product(
                 title, price_type, product_type, status_code, ratings_code,
                 synopsis_text, user_id, author_id, author_name,
                 publish_regular_yn, publish_days,
-                primary_genre_id, sub_genre_id,
+                primary_genre_id, sub_genre_id, thumbnail_file_id,
                 open_yn, blind_yn, monopoly_yn, contract_yn,
                 series_regular_price, single_regular_price, single_rental_price,
                 created_id, updated_id
             ) VALUES (
-                :title, 'free', NULL, 'ongoing', :ratings_code,
+                :title, 'free', 'normal', 'ongoing', :ratings_code,
                 :synopsis, :user_id, :user_id, :author_name,
                 'Y', :publish_days,
-                :primary_genre_id, :sub_genre_id,
+                :primary_genre_id, :sub_genre_id, :thumbnail_file_id,
                 :open_yn, 'N', :monopoly_yn, :contract_yn,
                 0, 0, 0,
                 :user_id, :user_id
@@ -432,6 +456,7 @@ async def _create_product(
             "publish_days": json.dumps(publish_days),
             "primary_genre_id": primary_genre_id,
             "sub_genre_id": sub_genre_id,
+            "thumbnail_file_id": thumbnail_file_id,
             "open_yn": row.get("open_yn", "N"),
             "monopoly_yn": row.get("monopoly", "N"),
             "contract_yn": row.get("contract", "N"),
@@ -557,6 +582,47 @@ async def _create_episodes(
             # EPUB 실패해도 episode_content로 대체 가능하므로 계속 진행
 
     return len(sorted_eps)
+
+
+async def _upload_cover_image(image_bytes: bytes, db: AsyncSession) -> int:
+    """표지 이미지를 R2에 업로드하고 tb_common_file 레코드를 생성, file_group_id 반환."""
+    file_uuid = f"{uuid4()}.webp"
+
+    # presigned URL 생성
+    presigned_url = comm_service.make_r2_presigned_url(
+        type="upload",
+        bucket_name=settings.R2_SC_IMAGE_BUCKET,
+        file_id=f"cover/{file_uuid}",
+    )
+
+    # R2에 직접 업로드
+    from httpx import AsyncClient
+    async with AsyncClient() as ac:
+        res = await ac.put(url=presigned_url, content=image_bytes, headers={"Content-Type": "image/webp"})
+        res.raise_for_status()
+
+    # tb_common_file
+    await db.execute(
+        text("INSERT INTO tb_common_file (group_type, use_yn, created_id, updated_id) VALUES ('cover', 'Y', 0, 0)")
+    )
+    file_group_result = await db.execute(text("SELECT LAST_INSERT_ID() AS id"))
+    file_group_id = file_group_result.scalar()
+
+    # tb_common_file_item
+    await db.execute(
+        text("""
+            INSERT INTO tb_common_file_item (file_group_id, file_name, file_org_name, file_path, use_yn, created_id, updated_id)
+            VALUES (:file_group_id, :file_name, :file_org_name, :file_path, 'Y', 0, 0)
+        """),
+        {
+            "file_group_id": file_group_id,
+            "file_name": file_uuid,
+            "file_org_name": f"cover_{file_uuid}",
+            "file_path": f"{settings.R2_SC_CDN_URL}/cover/{file_uuid}",
+        },
+    )
+
+    return file_group_id
 
 
 async def _generate_and_upload_epub(
