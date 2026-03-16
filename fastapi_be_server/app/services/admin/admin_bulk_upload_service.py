@@ -581,6 +581,13 @@ async def _create_episodes(
             logger.warning(f"EPUB upload failed for episode {episode_id}: {e}")
             # EPUB 실패해도 episode_content로 대체 가능하므로 계속 진행
 
+    # 공개된 회차가 있으면 last_episode_date 업데이트 (일반연재 목록 정렬용)
+    if first_open_ep >= 1:
+        await db.execute(
+            text("UPDATE tb_product SET last_episode_date = now() WHERE product_id = :product_id"),
+            {"product_id": product_id},
+        )
+
     return len(sorted_eps)
 
 
