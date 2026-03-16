@@ -9,6 +9,7 @@ import logging
 import secrets
 import string
 import tempfile
+import traceback
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -253,8 +254,9 @@ async def execute_bulk_upload(
             })
         except Exception as e:
             await db.rollback()
+            tb = traceback.format_exc()
             logger.exception(f"Bulk upload failed for: {row['title']}")
-            results.append({**row, "status": "failed", "message": str(e)})
+            results.append({**row, "status": "failed", "message": f"{type(e).__name__}: {e}\n{tb}"})
 
     success_count = sum(1 for r in results if r.get("status") == "created")
     return {
