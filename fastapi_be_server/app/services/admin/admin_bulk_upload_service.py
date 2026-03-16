@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.const import settings
 from app.services.common import comm_service
+from app.utils.query import get_file_path_sub_query
 
 logger = logging.getLogger(__name__)
 
@@ -575,6 +576,7 @@ async def _create_episodes(
                 episode_id=episode_id,
                 episode_title=ep_title,
                 html_content=html_content,
+                product_id=product_id,
                 db=db,
             )
         except Exception as e:
@@ -636,15 +638,27 @@ async def _generate_and_upload_epub(
     episode_id: int,
     episode_title: str,
     html_content: str,
+    product_id: int,
     db: AsyncSession,
 ):
     """EPUB 생성 → R2 업로드 → tb_common_file 연결."""
     file_uuid = f"{uuid4()}.epub"
 
+    # 표지 URL 조회 (정상 플로우와 동일)
+    cover_result = await db.execute(
+        text(f"""
+            SELECT {get_file_path_sub_query("p.thumbnail_file_id", "cover_image_path", "cover")}
+            FROM tb_product p WHERE p.product_id = :product_id
+        """),
+        {"product_id": product_id},
+    )
+    cover_row = cover_result.mappings().first()
+    cover_image_path = (cover_row.get("cover_image_path") or "") if cover_row else ""
+
     # EPUB 생성
     await comm_service.make_epub(
         file_org_name=file_uuid,
-        cover_image_path="",
+        cover_image_path=cover_image_path,
         episode_title=episode_title,
         content_db=html_content,
     )

@@ -598,14 +598,16 @@ async def make_epub(
     # metadata
     book.set_language("ko")
 
-    # 표지 이미지 — 속성값을 XML-escape하여 &, <, >, " 등에 의한 파싱 에러 방지
-    cover_chapter = epub.EpubHtml(title="Cover", file_name="cover.xhtml")
-    safe_cover_path = html_escape(cover_image_path or "", quote=True)
-    safe_title = html_escape(episode_title or "", quote=True)
-    cover_chapter.content = (
-        f'<div><img src="{safe_cover_path}" alt="{safe_title}"/></div>'
-    )
-    book.add_item(cover_chapter)
+    # 표지 이미지 — 경로가 있을 때만 표지 챕터 생성
+    cover_chapter = None
+    if cover_image_path:
+        cover_chapter = epub.EpubHtml(title="Cover", file_name="cover.xhtml")
+        safe_cover_path = html_escape(cover_image_path, quote=True)
+        safe_title = html_escape(episode_title or "", quote=True)
+        cover_chapter.content = (
+            f'<div><img src="{safe_cover_path}" alt="{safe_title}"/></div>'
+        )
+        book.add_item(cover_chapter)
 
     # 내용 — 에디터 HTML을 valid XHTML로 변환
     # BeautifulSoup이 &nbsp;→U+00A0, <br>→<br/>, 미이스케이프 &→&amp; 등 처리
@@ -617,7 +619,7 @@ async def make_epub(
     book.toc = []
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = [cover_chapter, content_chapter]
+    book.spine = ([cover_chapter] if cover_chapter else []) + [content_chapter]
 
     # ROOT_PATH에 파일 생성
     file_path = Path(f"{settings.ROOT_PATH}/{file_org_name}")
