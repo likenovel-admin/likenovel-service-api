@@ -649,11 +649,11 @@ async def _generate_and_upload_epub(
         content_db=html_content,
     )
 
-    # R2 presigned URL 생성 + 업로드
+    # R2 presigned URL 생성 + 업로드 (정상 플로우와 동일: file_id에 epub/ 접두사 없이)
     presigned_url = comm_service.make_r2_presigned_url(
         type="upload",
         bucket_name=settings.R2_SC_EPUB_BUCKET,
-        file_id=f"epub/{file_uuid}",
+        file_id=file_uuid,
     )
     await comm_service.upload_epub_to_r2(url=presigned_url, file_name=file_uuid)
 
@@ -667,7 +667,7 @@ async def _generate_and_upload_epub(
     file_group_result = await db.execute(text("SELECT LAST_INSERT_ID() AS id"))
     file_group_id = file_group_result.scalar()
 
-    # tb_common_file_item
+    # tb_common_file_item (정상 플로우와 동일: R2_SC_DOMAIN 사용)
     await db.execute(
         text("""
             INSERT INTO tb_common_file_item (
@@ -682,7 +682,7 @@ async def _generate_and_upload_epub(
             "file_group_id": file_group_id,
             "file_name": file_uuid,
             "file_org_name": f"{episode_id}.epub",
-            "file_path": f"{settings.R2_SC_CDN_URL}/epub/{file_uuid}",
+            "file_path": f"{settings.R2_SC_DOMAIN}/epub/{file_uuid}",
         },
     )
 
