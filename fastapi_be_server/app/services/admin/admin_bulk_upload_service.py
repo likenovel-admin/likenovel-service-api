@@ -9,7 +9,6 @@ import logging
 import secrets
 import string
 import tempfile
-import traceback
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -254,9 +253,8 @@ async def execute_bulk_upload(
             })
         except Exception as e:
             await db.rollback()
-            tb = traceback.format_exc()
             logger.exception(f"Bulk upload failed for: {row['title']}")
-            results.append({**row, "status": "failed", "message": f"{type(e).__name__}: {e}\n{tb}"})
+            results.append({**row, "status": "failed", "message": f"{type(e).__name__}: {e}"})
 
     success_count = sum(1 for r in results if r.get("status") == "created")
     return {
@@ -320,18 +318,33 @@ async def _ensure_user(
     if existing:
         return existing["user_id"]
 
-    # Keycloak 계정 생성
+    # Keycloak 계정 생성 (이미 존재하면 조회로 전환)
     password = _generate_password()
-    kc_user_id = await comm_service.kc_users_endpoint(
-        method="POST",
-        admin_acc_token=admin_token,
-        data_dict={
-            "username": email,
-            "email": email,
-            "enabled": True,
-            "credentials": [{"type": "password", "value": password, "temporary": False}],
-        },
-    )
+    try:
+        kc_user_id = await comm_service.kc_users_endpoint(
+            method="POST",
+            admin_acc_token=admin_token,
+            data_dict={
+                "username": email,
+                "email": email,
+                "enabled": True,
+                "credentials": [{"type": "password", "value": password, "temporary": False}],
+            },
+        )
+    except Exception as e:
+        if getattr(e, "status_code", None) == 409:
+            # Keycloak에 이미 존재 → 조회
+            kc_users = await comm_service.kc_users_endpoint(
+                method="GET",
+                admin_acc_token=admin_token,
+                params_dict={"email": email},
+            )
+            if kc_users:
+                kc_user_id = kc_users[0]["id"]
+            else:
+                raise
+        else:
+            raise
 
     # tb_user
     await db.execute(
