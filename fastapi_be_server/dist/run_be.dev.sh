@@ -36,7 +36,7 @@ gunicorn -c ./gconf.py
 deactivate
 
 # 배치 파일 동기화 + cron.d 등록
-BATCH_SRC=/home/ln-admin/likenovel/api-dev/dist/batch
+BATCH_SRC=/home/ln-admin/likenovel/api-dev/batch
 BATCH_DST=/home/ln-admin/likenovel/batch-dev
 mkdir -p "$BATCH_DST"
 cp "$BATCH_SRC"/*.sh "$BATCH_DST/"
