@@ -6,6 +6,8 @@
 # - 매일 03:00 실행 (cron_job.sh)
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 LOCK_DIR="/tmp/ai-dna-extract-daily-batch.lock"
 
 # 동시실행 방지 락
@@ -45,7 +47,7 @@ fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting AI DNA extract batch..."
 
-python3 /app/dist/batch/extract_product_dna.py --all
+python3 "${SCRIPT_DIR}/extract_product_dna.py" --all
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] AI DNA extract batch completed."
 

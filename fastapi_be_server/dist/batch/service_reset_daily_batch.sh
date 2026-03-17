@@ -5,6 +5,8 @@
 # - env가 누락되면 조용히 실패하지 않고 명확한 에러로 종료합니다.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-}"
@@ -44,9 +46,9 @@ run_with_retry() {
 }
 
 # 퀘스트(출석체크, 평가하기, 작품 리뷰 작성하기, 회차 결제하기), 작가홈 관련 인디케이터(작품, 회차)
-run_with_retry /app/dist/batch/service_reset_daily_batch.sql "service_reset_daily_batch" || BATCH_FAILED=1
+run_with_retry ${SCRIPT_DIR}/service_reset_daily_batch.sql "service_reset_daily_batch" || BATCH_FAILED=1
 
 # 회차별 매출, 일별 이용권 상세, 후원 내역, 기타 수익 내역, 작품별 통계, 회차별 통계, 발굴통계, 작품별 월매출 및 월별 정산용 임시 합산, 후원 및 기타 정산용 임시 합산
-run_with_retry /app/dist/batch/partner_report_daily_batch.sql "partner_report_daily_batch" || BATCH_FAILED=1
+run_with_retry ${SCRIPT_DIR}/partner_report_daily_batch.sql "partner_report_daily_batch" || BATCH_FAILED=1
 
 exit $BATCH_FAILED

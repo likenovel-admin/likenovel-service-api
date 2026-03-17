@@ -5,6 +5,8 @@
 # - env가 누락되면 조용히 실패하지 않고 명확한 에러로 종료합니다.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 LOCK_DIR="/tmp/ai-signal-daily-batch.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
 MAX_LOCK_AGE_SECONDS="${MAX_LOCK_AGE_SECONDS:-21600}"
@@ -162,7 +164,7 @@ trap cleanup_on_exit EXIT
 # 1) 일/주 집계 (SQL)
 MYSQL_PWD="$DB_PW" "${MYSQL_CMD[@]}" \
   --init-command="SET @batch_run_token=${BATCH_RUN_TOKEN}; SET @in_progress_stale_minutes=${IN_PROGRESS_STALE_MINUTES};" \
-  < /app/dist/batch/ai_signal_daily_batch.sql
+  < "${SCRIPT_DIR}/ai_signal_daily_batch.sql"
 
 # 2) retention 청크 삭제 (CREATE PROCEDURE 권한 불필요)
 PURGE_DATE=$(MYSQL_PWD="$DB_PW" "${MYSQL_CMD[@]}" -N -e "

@@ -5,6 +5,8 @@
 # - env가 누락되면 조용히 실패하지 않고 명확한 에러로 종료합니다.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-}"
@@ -25,7 +27,7 @@ MAX_RETRIES=3
 RETRY_DELAY=10
 
 for attempt in $(seq 1 $MAX_RETRIES); do
-  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < /app/dist/batch/partner_report_monthly_batch.sql
+  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < "${SCRIPT_DIR}/partner_report_monthly_batch.sql"
   rc=$?
   if [ $rc -eq 0 ]; then
     exit 0

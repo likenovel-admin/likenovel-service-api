@@ -3,6 +3,8 @@
 # 관리자가 미처리 이벤트 범위만 수동 재처리할 때 사용하는 스크립트
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 FROM_ID=""
 TO_ID=""
 DRY_RUN=0
@@ -12,7 +14,7 @@ RUN_TOKEN=""
 usage() {
   cat <<'EOF'
 Usage:
-  bash /app/dist/batch/ai_taste_manual_replay_batch.sh --from-id <event_id> --to-id <event_id> [--dry-run] [--allow-duplicate]
+  bash ai_taste_manual_replay_batch.sh --from-id <event_id> --to-id <event_id> [--dry-run] [--allow-duplicate]
 
 Options:
   --from-id   replay 시작 event id (포함)
@@ -164,7 +166,7 @@ fi
 RUN_TOKEN=$(( $(date +%s) * 1000000 + $$ ))
 if ! MYSQL_PWD="$DB_PW" "${MYSQL_CMD[@]}" \
   --init-command="SET @replay_from_id=${FROM_ID}; SET @replay_to_id=${TO_ID}; SET @manual_run_token=${RUN_TOKEN}; SET @manual_allow_duplicate_yn='${ALLOW_DUPLICATE_YN}'; SET @manual_source_total_count=${TOTAL_COUNT}; SET @manual_source_valid_count=${VALID_COUNT}; SET @manual_requested_by='manual-admin';" \
-  < /app/dist/batch/ai_taste_manual_replay_batch.sql; then
+  < "${SCRIPT_DIR}/ai_taste_manual_replay_batch.sql"; then
   MYSQL_PWD="$DB_PW" "${MYSQL_CMD[@]}" -e "
     INSERT INTO tb_ai_taste_manual_replay_log (
         run_token,

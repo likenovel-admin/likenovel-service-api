@@ -2,6 +2,8 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 LOCK_DIR="/tmp/ai-engagement-metrics-daily-batch.lock"
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -29,7 +31,7 @@ MAX_RETRIES=3
 RETRY_DELAY=10
 
 for attempt in $(seq 1 $MAX_RETRIES); do
-  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < /app/dist/batch/ai_engagement_metrics_daily_batch.sql
+  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < "${SCRIPT_DIR}/ai_engagement_metrics_daily_batch.sql"
   rc=$?
   if [ $rc -eq 0 ]; then
     exit 0

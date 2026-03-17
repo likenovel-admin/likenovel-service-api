@@ -24,5 +24,13 @@ pip3 install "$(ls -v app-*.whl | tail -n 1)"
 gunicorn -c ./gconf.py
 deactivate
 
-exit 0
+# 배치 파일 동기화
+BATCH_SRC=/home/ln-admin/likenovel/api/dist/batch
+BATCH_DST=/home/ln-admin/likenovel/batch
+mkdir -p "$BATCH_DST"
+cp "$BATCH_SRC"/*.sh "$BATCH_DST/"
+cp "$BATCH_SRC"/*.sql "$BATCH_DST/"
+cp "$BATCH_SRC"/*.py "$BATCH_DST/" 2>/dev/null || true
+chmod +x "$BATCH_DST"/*.sh
 
+exit 0
