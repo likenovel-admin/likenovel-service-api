@@ -603,9 +603,8 @@ async def make_epub(
     if cover_image_path:
         cover_chapter = epub.EpubHtml(title="Cover", file_name="cover.xhtml")
         safe_cover_path = html_escape(cover_image_path, quote=True)
-        safe_title = html_escape(episode_title or "", quote=True)
         cover_chapter.content = (
-            f'<div><img src="{safe_cover_path}" alt="{safe_title}"/></div>'
+            f'<div><img src="{safe_cover_path}" alt="cover"/></div>'
         )
         book.add_item(cover_chapter)
 

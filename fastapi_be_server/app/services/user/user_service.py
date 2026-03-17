@@ -178,6 +178,8 @@ async def get_user_info(kc_user_id: str, db: AsyncSession):
                                   , (select approval_code from tb_user_profile_apply where user_id = a.user_id and approval_code in ('review', 'accepted') order by created_date desc limit 1) as apply_status
                                   , a.identity_yn
                                   , a.email
+                                  , a.user_name
+                                  , a.mobile_no
                                   , d.default_yn
                                   , (select sum(balance) from tb_user_cashbook b where a.user_id = b.user_id) as balance
                                   , coalesce((select count(1) from tb_user_productbook z
@@ -245,6 +247,8 @@ async def get_user_info(kc_user_id: str, db: AsyncSession):
                     "userRole": user_role,
                     "identityYn": db_rst[0].get("identity_yn"),
                     "email": db_rst[0].get("email"),
+                    "userName": db_rst[0].get("user_name"),
+                    "mobileNo": db_rst[0].get("mobile_no"),
                     "totalCash": db_rst[0].get("balance"),
                     "totalTicket": db_rst[0].get("ticket"),
                     "totalInterestSustainCount": db_rst[0].get("interest_count"),
