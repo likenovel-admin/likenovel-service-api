@@ -54,6 +54,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-northeast-2
 
+      - name: Write .env.production (PROD)
+        run: |
+          printf '%s' "${{ secrets.BACKEND_ENV_PROD }}" | tr -d '\r' > .env.production
+        working-directory: ./fastapi_be_server/dist
+
       - name: Deploy with AWS codedeploy
         env:
           APPLICATION_NAME: ln-dep
@@ -62,8 +67,8 @@ jobs:
           S3_BUCKET: ln-s3
           TAGS: ${{ inputs.tags }}
         run: |
-          # *.whl, appspec.yml, run_be.sh, gconf.py 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
-          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py init/
+          # *.whl, appspec.yml, run_be.sh, gconf.py, .env.production, init/, batch/ 압축
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py .env.production init/ batch/
           aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
           aws deploy create-deployment \
             --application-name $APPLICATION_NAME \
