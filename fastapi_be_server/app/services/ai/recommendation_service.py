@@ -797,6 +797,54 @@ def _scale_signal_factor_entries(
     ]
 
 
+def _is_exit_episode_view(event_type: str, payload: dict | None) -> bool:
+    normalized_event_type = str(event_type or "").strip().lower()
+    if normalized_event_type != "episode_view":
+        return False
+    trigger = str((payload or {}).get("trigger") or "").strip().lower()
+    return trigger == "exit"
+
+
+def _compute_signal_factor_score_multiplier(
+    event_type: str,
+    payload: dict | None,
+    *,
+    progress_ratio: float = 0.0,
+    active_seconds: float = 0.0,
+) -> float:
+    if not _is_exit_episode_view(event_type, payload):
+        return 1.0
+
+    progress = max(0.0, min(1.0, _safe_float(progress_ratio, 0.0)))
+    active = max(0.0, _safe_float(active_seconds, 0.0))
+
+    # 상세만 보고 나가거나, 아주 얕은 스크롤/체류는 taste 신호로 취급하지 않는다.
+    if progress < 0.05 or active < 8:
+        return 0.0
+
+    # 95% 이상은 episode_end/latest_episode_reached가 이미 강한 신호를 담당한다.
+    if progress >= 0.95:
+        return 0.0
+
+    if progress < 0.15:
+        multiplier = 0.2
+    elif progress < 0.4:
+        multiplier = 0.45
+    elif progress < 0.7:
+        multiplier = 0.7
+    else:
+        multiplier = 0.95
+
+    if active >= 180:
+        multiplier += 0.1
+    elif active >= 60:
+        multiplier += 0.05
+    elif active < 20:
+        multiplier *= 0.85
+
+    return round(min(multiplier, 1.05), 6)
+
+
 async def _resolve_signal_factor_entries(
     product_id: int,
     event_type: str,
@@ -850,6 +898,8 @@ async def _insert_ai_signal_event_factors(
             :factor_key,
             :signal_score
         )
+        ON DUPLICATE KEY UPDATE
+            signal_score = VALUES(signal_score)
         """
     )
     rows = [
@@ -868,11 +918,24 @@ async def _insert_ai_signal_event_factors(
     await db.execute(query, rows)
 
 
-def _should_skip_signal_factor_generation(event_type: str, payload: dict) -> bool:
+def _should_skip_signal_factor_generation(
+    event_type: str,
+    payload: dict,
+    *,
+    progress_ratio: float = 0.0,
+    active_seconds: float = 0.0,
+) -> bool:
     normalized_event_type = str(event_type or "").strip().lower()
-    if normalized_event_type == "episode_view" and str(payload.get("trigger") or "").strip().lower() == "exit":
+    if normalized_event_type in {"product_detail_view", "product_detail_exit"}:
         return True
-    return False
+
+    multiplier = _compute_signal_factor_score_multiplier(
+        event_type,
+        payload,
+        progress_ratio=progress_ratio,
+        active_seconds=active_seconds,
+    )
+    return multiplier <= 0
 
 
 # ──────────────────────────────────────────────────────────
@@ -956,6 +1019,15 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
     payload.pop("factor_key", None)
     payload.pop("signal_score", None)
 
+    progress_ratio = _safe_float(req_body.get("progress_ratio", 0), 0.0)
+    active_seconds = _safe_int(req_body.get("active_seconds", 0), 0)
+    signal_score_multiplier = _compute_signal_factor_score_multiplier(
+        event_type,
+        payload,
+        progress_ratio=progress_ratio,
+        active_seconds=active_seconds,
+    )
+
     if event_type == "next_episode_click":
         if episode_id is None:
             raise CustomResponseException(
@@ -1022,11 +1094,17 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
                 message="next_episode_click 리다이렉트 정보가 유효하지 않습니다.",
             )
 
-    if not _should_skip_signal_factor_generation(event_type, payload):
+    if not _should_skip_signal_factor_generation(
+        event_type,
+        payload,
+        progress_ratio=progress_ratio,
+        active_seconds=active_seconds,
+    ):
         signal_factor_entries = await _resolve_signal_factor_entries(
             product_id,
             event_type,
             db,
+            score_multiplier=signal_score_multiplier,
         )
     else:
         signal_factor_entries = []
@@ -1044,7 +1122,13 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
     should_insert_revisit_24h = False
     if (
         event_type in {"episode_view", "latest_episode_reached"}
-        and not _should_skip_signal_factor_generation(event_type, payload)
+        and not _is_exit_episode_view(event_type, payload)
+        and not _should_skip_signal_factor_generation(
+            event_type,
+            payload,
+            progress_ratio=progress_ratio,
+            active_seconds=active_seconds,
+        )
     ):
         revisit_check_query = text(
             """
@@ -1110,9 +1194,9 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
             "episode_id": episode_id,
             "event_type": event_type,
             "session_id": req_body.get("session_id"),
-            "active_seconds": req_body.get("active_seconds", 0),
+            "active_seconds": active_seconds,
             "scroll_depth": req_body.get("scroll_depth", 0),
-            "progress_ratio": req_body.get("progress_ratio", 0),
+            "progress_ratio": progress_ratio,
             "next_available_yn": req_body.get("next_available_yn", "N"),
             "latest_episode_reached_yn": req_body.get("latest_episode_reached_yn", "N"),
             "event_payload": serialized_payload,

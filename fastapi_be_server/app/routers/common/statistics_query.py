@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, Query
+from typing import Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db
-from app.utils.auth import analysis_logger
+from app.utils.common import check_user
+from app.utils.auth import analysis_logger, chk_cur_user
 import app.services.common.statistics_service as statistics_service
 
 router = APIRouter(prefix="/statistics")
@@ -157,6 +159,38 @@ async def site_statistics_for_excel_download(
     """
 
     return await statistics_service.site_statistics(start_date, end_date, -1, -1, db)
+
+
+@router.get(
+    "/product-detail-funnel",
+    tags=["작품 상세 퍼널 통계"],
+    responses={
+        200: {"description": "작품 상세 퍼널 일별 통계"},
+        422: {"description": "Validation Error"},
+        500: {"description": "Internal Server Error"},
+    },
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_detail_funnel_statistics(
+    start_date: str | None = Query(None, description="시작 날짜"),
+    end_date: str | None = Query(None, description="종료 날짜"),
+    product_id: int | None = Query(None, description="작품 ID"),
+    entry_source: str | None = Query(None, description="상세 진입 source(nullable, __null__ 지원)"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(20, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    작품 상세 퍼널 통계
+    detail_entry_date는 상세페이지 진입 일시 기준 집계일이다.
+    """
+
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+
+    return await statistics_service.product_detail_funnel_statistics(
+        start_date, end_date, product_id, entry_source, page, count_per_page, db
+    )
 
 
 @router.get(

@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 ALLOWED_AI_SIGNAL_EVENT_TYPES = {
+    "product_detail_view",  # 작품 상세 진입 raw event
+    "product_detail_exit",  # 작품 상세 이탈 raw event
     "taste_slot_click",  # 메인 AI 추천 구좌 클릭
     "episode_view",       # 회차 열람 시작 (+ exit 시 progress_ratio 수집)
     "episode_end",        # 완독 (progress >= 95%)
