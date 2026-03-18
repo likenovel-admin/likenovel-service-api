@@ -38,6 +38,16 @@ IDEMPOTENT_ERRORS = {
     1826,  # Duplicate foreign key constraint name
 }
 
+# 레거시 init SQL 중 일부는 선택 기능 테이블 부재/과거 드리프트 상황에서
+# 안전하게 no-op 처리해도 되는 케이스가 있다.
+FILE_IDEMPOTENT_ERRORS = {
+    "05-migration_tb_user_profile_apply.sql": {1091, 1146},
+    "15-migration_chat_user_based.sql": {1054, 1091, 1146},
+    "20-alter_store_order.sql": {1054, 1146},
+    "27-alter_payment_statistics_by_user_unique_key.sql": {1091, 1146},
+    "68-add-standard-keywords.sql": {1062, 1146},
+}
+
 LOCK_NAME = "likenovel_auto_migrate"
 
 
@@ -46,13 +56,15 @@ def _parse_statements(sql_content: str) -> list[str]:
     # 블록 주석 제거
     sql_content = re.sub(r"/\*.*?\*/", "", sql_content, flags=re.DOTALL)
 
+    # 라인 주석은 split 이전에 제거해야, 주석 안 세미콜론 때문에 statement가 깨지지 않는다.
+    sql_content = "\n".join(
+        line for line in sql_content.splitlines()
+        if line.strip() and not line.strip().startswith("--")
+    )
+
     statements = []
     for part in sql_content.split(";"):
-        # 라인 주석 제거
-        lines = [
-            line for line in part.strip().splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
+        lines = [line for line in part.strip().splitlines() if line.strip()]
         stmt = "\n".join(lines).strip()
         if not stmt:
             continue
@@ -132,7 +144,7 @@ async def _execute_pending(conn):
         all_ok = True
         for stmt in statements:
             try:
-                await conn.execute(text(stmt))
+                await conn.exec_driver_sql(stmt)
                 await conn.commit()
             except Exception as e:
                 await conn.rollback()
@@ -140,7 +152,11 @@ async def _execute_pending(conn):
                 if hasattr(e, "orig") and hasattr(e.orig, "args"):
                     error_code = e.orig.args[0]
 
-                if error_code in IDEMPOTENT_ERRORS:
+                allowed_errors = IDEMPOTENT_ERRORS | FILE_IDEMPOTENT_ERRORS.get(
+                    sql_file.name, set()
+                )
+
+                if error_code in allowed_errors:
                     logger.info(
                         f"[auto_migrate] {sql_file.name} — 이미 적용된 DDL 스킵 "
                         f"(MySQL {error_code})"

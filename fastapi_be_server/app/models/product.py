@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Date, Double, Integer, String, Text, TIMESTAMP, text
+from sqlalchemy import BigInteger, Date, Double, Integer, String, Text, TIMESTAMP, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from datetime import date, datetime
@@ -1359,6 +1359,158 @@ class UserAiSignalEventWeekly(Base):
     )
     revisit_24h_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0", comment="24시간 내 재방문 건수"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class ProductDetailFunnelDaily(Base):
+    __tablename__ = "tb_product_detail_funnel_daily"  # 작품 상세 퍼널 일별 mart
+    __table_args__ = (
+        UniqueConstraint(
+            "computed_date",
+            "product_id",
+            "entry_source_norm",
+            name="uk_product_detail_funnel_daily",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    computed_date: Mapped[date] = mapped_column(
+        Date, index=True, nullable=False, comment="집계일(퍼널 세션 시작일)"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    entry_source: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, comment="상세 진입 source(nullable)"
+    )
+    entry_source_norm: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        server_default="__null__",
+        comment="NULL dedupe용 source key",
+    )
+    detail_view_raw_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="raw 상세 진입 이벤트 수"
+    )
+    detail_view_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="dedupe된 상세 퍼널 세션 수"
+    )
+    detail_view_user_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="상세 퍼널 진입 유저 수"
+    )
+    detail_to_view_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="상세->viewer 전환 세션 수"
+    )
+    detail_to_view_user_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="상세->viewer 전환 유저 수"
+    )
+    detail_exit_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="작품 컨텍스트 이탈 세션 수"
+    )
+    exit_home_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="홈 이동 이탈 세션 수"
+    )
+    exit_search_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="검색 이동 이탈 세션 수"
+    )
+    exit_other_product_detail_session_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="다른 작품 상세 이동 이탈 세션 수",
+    )
+    exit_other_route_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="기타 경로 이동 이탈 세션 수"
+    )
+    episode_exit_event_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="세션 내 회차 exit 이벤트 수"
+    )
+    avg_episode_exit_progress_ratio: Mapped[float | None] = mapped_column(
+        Double, nullable=True, comment="세션 내 회차 exit 평균 진행률"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class ProductEpisodeDropoffDaily(Base):
+    __tablename__ = "tb_product_episode_dropoff_daily"  # 작품 회차별 읽다 나감 일별 mart
+    __table_args__ = (
+        UniqueConstraint(
+            "computed_date",
+            "product_id",
+            "episode_id",
+            name="uk_product_episode_dropoff_daily",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    computed_date: Mapped[date] = mapped_column(
+        Date, index=True, nullable=False, comment="집계일(회차 읽기 시작일)"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    episode_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="회차 아이디"
+    )
+    episode_no: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="회차 번호"
+    )
+    episode_title: Mapped[str | None] = mapped_column(
+        String(settings.VARCHAR_COMM_SIZE), nullable=True, comment="회차 제목"
+    )
+    read_start_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="읽기 시작 수"
+    )
+    episode_dropoff_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="읽다 나감 수(progress 95% 미만)",
+    )
+    episode_dropoff_rate: Mapped[float] = mapped_column(
+        Double, nullable=False, server_default="0", comment="읽다 나감 비율"
+    )
+    avg_dropoff_progress_ratio: Mapped[float | None] = mapped_column(
+        Double, nullable=True, comment="평균 이탈 지점(progress 95% 미만)"
+    )
+    near_complete_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="거의 다 읽음 수(progress 95% 이상)",
+    )
+    dropoff_0_10_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="0~10% 구간 이탈 수"
+    )
+    dropoff_10_30_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="10~30% 구간 이탈 수"
+    )
+    dropoff_30_60_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="30~60% 구간 이탈 수"
+    )
+    dropoff_60_90_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="60~90% 구간 이탈 수"
+    )
+    dropoff_90_plus_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="90% 이상 이탈 수(95% 미만)",
     )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")

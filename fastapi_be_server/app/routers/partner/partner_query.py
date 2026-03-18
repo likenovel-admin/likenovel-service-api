@@ -843,6 +843,80 @@ async def product_statistics_list_for_download(
 
 
 @router.get(
+    "/product-detail-funnel-statistics",
+    tags=["파트너 - 작품 상세 퍼널 통계"],
+    responses={
+        200: {"description": "작가 범위 작품 상세 퍼널 통계 목록"},
+        422: {"description": "Validation Error"},
+        500: {"description": "Internal Server Error"},
+    },
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_detail_funnel_statistics_list(
+    product_id: int | None = Query(None, description="작품 ID"),
+    entry_source: str = Query("", description="상세 진입 source(nullable, __null__ 지원)"),
+    search_start_date: str = Query("", description="기간 검색 시작일"),
+    search_end_date: str = Query("", description="기간 검색 종료일"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(20, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    파트너 - 통계 분석 > 작품 상세 퍼널 통계
+    상세페이지 진입 일시 기준 일별 집계
+    """
+    user_data = await check_user(kc_user_id=user.get("sub"), db=db)
+
+    return await partner_statistics_service.product_detail_funnel_statistics_list(
+        product_id,
+        entry_source,
+        search_start_date,
+        search_end_date,
+        page,
+        count_per_page,
+        db,
+        user_data,
+    )
+
+
+@router.get(
+    "/product-episode-dropoff-statistics",
+    tags=["파트너 - 회차별 읽다 나감 통계"],
+    responses={
+        200: {"description": "작가 범위 작품 회차별 읽다 나감 통계 목록"},
+        422: {"description": "Validation Error"},
+        500: {"description": "Internal Server Error"},
+    },
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_episode_dropoff_statistics_list(
+    product_id: int | None = Query(None, description="작품 ID"),
+    search_start_date: str = Query("", description="기간 검색 시작일"),
+    search_end_date: str = Query("", description="기간 검색 종료일"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(100, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    파트너 - 통계 분석 > 작품 회차별 읽다 나감 통계
+    회차 읽기 시작일 기준 기간 합산 집계
+    """
+    user_data = await check_user(kc_user_id=user.get("sub"), db=db)
+
+    return await partner_statistics_service.product_episode_dropoff_statistics_list(
+        product_id,
+        search_start_date,
+        search_end_date,
+        page,
+        count_per_page,
+        db,
+        user_data,
+    )
+
+
+@router.get(
     "/product-episode-statistics",
     tags=["파트너 - 회차별 통계"],
     responses={

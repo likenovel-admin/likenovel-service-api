@@ -14,6 +14,7 @@ from app.utils.query import (
 from app.utils.response import build_paginated_response, check_exists_or_404
 from app.utils.common import handle_exceptions
 from app.const import CommonConstants
+import app.services.common.statistics_service as common_statistics_service
 from app.const import ErrorMessages
 
 logger = logging.getLogger("partner_app")  # 커스텀 로거 생성
@@ -357,6 +358,64 @@ async def product_episode_statistics_list(
         "count_per_page": count_per_page,
         "results": results,
     }
+
+
+@handle_exceptions
+async def product_detail_funnel_statistics_list(
+    product_id: int | None,
+    entry_source: str,
+    search_start_date: str,
+    search_end_date: str,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+    user_data: dict,
+):
+    """
+    작품 상세 퍼널 일별 통계 조회
+    """
+
+    return await common_statistics_service.product_detail_funnel_statistics(
+        start_date=search_start_date or None,
+        end_date=search_end_date or None,
+        product_id=product_id,
+        entry_source=entry_source or None,
+        page=page,
+        count_per_page=count_per_page,
+        db=db,
+        extra_conditions=[
+            "product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)"
+        ],
+        extra_params={"author_id": user_data["user_id"]},
+    )
+
+
+@handle_exceptions
+async def product_episode_dropoff_statistics_list(
+    product_id: int | None,
+    search_start_date: str,
+    search_end_date: str,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+    user_data: dict,
+):
+    """
+    작품 회차별 읽다 나감 통계 조회
+    """
+
+    return await common_statistics_service.product_episode_dropoff_statistics(
+        start_date=search_start_date or None,
+        end_date=search_end_date or None,
+        product_id=product_id,
+        page=page,
+        count_per_page=count_per_page,
+        db=db,
+        extra_conditions=[
+            "product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)"
+        ],
+        extra_params={"author_id": user_data["user_id"]},
+    )
 
 
 async def cart_analysis_list(

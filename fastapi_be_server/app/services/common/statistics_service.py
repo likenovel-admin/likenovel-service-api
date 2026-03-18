@@ -1,9 +1,11 @@
 import logging
+from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 
 from app.const import CommonConstants
+from app.exceptions import CustomResponseException
 from app.utils.query import get_nickname_sub_query
 from app.utils.response import build_paginated_response
 
@@ -85,6 +87,246 @@ async def site_statistics(
         LIMIT :limit OFFSET :offset
     """)
     result = await db.execute(query, {"limit": count_per_page, "offset": offset})
+    rows = result.mappings().all()
+
+    return build_paginated_response(rows, total_count, page, count_per_page)
+
+
+async def product_detail_funnel_statistics(
+    start_date: str | None,
+    end_date: str | None,
+    product_id: int | None,
+    entry_source: str | None,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+    extra_conditions: list[str] | None = None,
+    extra_params: dict | None = None,
+):
+    """
+    작품 상세 퍼널 일별 mart 조회
+    detail_entry_date - 상세페이지 진입 일시 기준 집계일
+    """
+
+    params = dict(extra_params or {})
+    where_conditions: list[str] = list(extra_conditions or [])
+
+    if bool(start_date) != bool(end_date):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="start_date와 end_date는 함께 전달해야 합니다.",
+        )
+
+    if start_date is not None and end_date is not None:
+        try:
+            normalized_start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            normalized_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="날짜 형식이 올바르지 않습니다.",
+            )
+
+        if normalized_start_date > normalized_end_date:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="start_date는 end_date보다 늦을 수 없습니다.",
+            )
+
+        if (normalized_end_date - normalized_start_date).days > 89:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="조회 기간은 최대 90일까지 선택할 수 있습니다.",
+            )
+
+        where_conditions.append("computed_date BETWEEN :start_date AND :end_date")
+        params["start_date"] = normalized_start_date.isoformat()
+        params["end_date"] = normalized_end_date.isoformat()
+
+    if product_id is not None:
+        where_conditions.append("product_id = :product_id")
+        params["product_id"] = product_id
+
+    normalized_entry_source = (entry_source or "").strip()
+    if normalized_entry_source:
+        if normalized_entry_source == "__null__":
+            where_conditions.append("entry_source IS NULL")
+        else:
+            where_conditions.append("entry_source = :entry_source")
+            params["entry_source"] = normalized_entry_source
+
+    where_sql = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
+    select_sql = f"""
+        SELECT
+            computed_date AS detail_entry_date,
+            product_id,
+            entry_source,
+            detail_view_raw_count,
+            detail_view_session_count,
+            detail_view_user_count,
+            detail_to_view_session_count,
+            detail_to_view_user_count,
+            detail_exit_session_count,
+            exit_home_session_count,
+            exit_search_session_count,
+            exit_other_product_detail_session_count,
+            exit_other_route_session_count,
+            episode_exit_event_count,
+            avg_episode_exit_progress_ratio,
+            created_date,
+            updated_date
+        FROM tb_product_detail_funnel_daily
+        {where_sql}
+        ORDER BY computed_date DESC, product_id ASC, entry_source_norm ASC
+    """
+
+    if page == -1 or count_per_page == -1:
+        result = await db.execute(text(select_sql), params)
+        rows = result.mappings().all()
+        return rows
+
+    offset = (page - 1) * count_per_page
+    count_query = text(
+        f"""
+        SELECT COUNT(*) AS total_count
+        FROM tb_product_detail_funnel_daily
+        {where_sql}
+    """
+    )
+    count_result = await db.execute(count_query, params)
+    total_count = dict(count_result.mappings().first())["total_count"]
+
+    paged_query = text(
+        select_sql
+        + """
+        LIMIT :limit OFFSET :offset
+    """
+    )
+    page_params = {**params, "limit": count_per_page, "offset": offset}
+    result = await db.execute(paged_query, page_params)
+    rows = result.mappings().all()
+
+    return build_paginated_response(rows, total_count, page, count_per_page)
+
+
+async def product_episode_dropoff_statistics(
+    start_date: str | None,
+    end_date: str | None,
+    product_id: int | None,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+    extra_conditions: list[str] | None = None,
+    extra_params: dict | None = None,
+):
+    """
+    작품 회차별 읽다 나감 통계 조회
+    computed_date는 회차 읽기 시작일 기준으로 집계된 mart를 기간 합산하여 반환한다.
+    """
+
+    params = dict(extra_params or {})
+    where_conditions: list[str] = list(extra_conditions or [])
+
+    if bool(start_date) != bool(end_date):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="start_date와 end_date는 함께 전달해야 합니다.",
+        )
+
+    if start_date is not None and end_date is not None:
+        try:
+            normalized_start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            normalized_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="날짜 형식이 올바르지 않습니다.",
+            )
+
+        if normalized_start_date > normalized_end_date:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="start_date는 end_date보다 늦을 수 없습니다.",
+            )
+
+        if (normalized_end_date - normalized_start_date).days > 89:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="조회 기간은 최대 90일까지 선택할 수 있습니다.",
+            )
+
+        where_conditions.append("computed_date BETWEEN :start_date AND :end_date")
+        params["start_date"] = normalized_start_date.isoformat()
+        params["end_date"] = normalized_end_date.isoformat()
+
+    if product_id is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="product_id는 필수입니다.",
+        )
+
+    where_conditions.append("product_id = :product_id")
+    params["product_id"] = product_id
+
+    where_sql = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
+    select_sql = f"""
+        SELECT
+            product_id,
+            episode_id,
+            MAX(episode_no) AS episode_no,
+            MAX(episode_title) AS episode_title,
+            SUM(read_start_count) AS read_start_count,
+            SUM(episode_dropoff_count) AS episode_dropoff_count,
+            CASE
+                WHEN SUM(read_start_count) = 0 THEN 0
+                ELSE SUM(episode_dropoff_count) / SUM(read_start_count)
+            END AS episode_dropoff_rate,
+            CASE
+                WHEN SUM(episode_dropoff_count) = 0 THEN NULL
+                ELSE SUM(COALESCE(avg_dropoff_progress_ratio, 0) * episode_dropoff_count) / SUM(episode_dropoff_count)
+            END AS avg_dropoff_progress_ratio,
+            SUM(near_complete_count) AS near_complete_count,
+            SUM(dropoff_0_10_count) AS dropoff_0_10_count,
+            SUM(dropoff_10_30_count) AS dropoff_10_30_count,
+            SUM(dropoff_30_60_count) AS dropoff_30_60_count,
+            SUM(dropoff_60_90_count) AS dropoff_60_90_count,
+            SUM(dropoff_90_plus_count) AS dropoff_90_plus_count
+        FROM tb_product_episode_dropoff_daily
+        {where_sql}
+        GROUP BY product_id, episode_id
+        ORDER BY MAX(episode_no) ASC, episode_id ASC
+    """
+
+    if page == -1 or count_per_page == -1:
+        result = await db.execute(text(select_sql), params)
+        rows = result.mappings().all()
+        return rows
+
+    offset = (page - 1) * count_per_page
+    count_query = text(
+        f"""
+        SELECT COUNT(*) AS total_count
+        FROM (
+            SELECT episode_id
+            FROM tb_product_episode_dropoff_daily
+            {where_sql}
+            GROUP BY product_id, episode_id
+        ) t
+    """
+    )
+    count_result = await db.execute(count_query, params)
+    total_count = dict(count_result.mappings().first())["total_count"]
+
+    paged_query = text(
+        select_sql
+        + """
+        LIMIT :limit OFFSET :offset
+    """
+    )
+    page_params = {**params, "limit": count_per_page, "offset": offset}
+    result = await db.execute(paged_query, page_params)
     rows = result.mappings().all()
 
     return build_paginated_response(rows, total_count, page, count_per_page)

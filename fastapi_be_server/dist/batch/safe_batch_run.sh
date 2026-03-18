@@ -137,11 +137,12 @@ run_hourly() {
 }
 
 run_daily() {
+  run_script "service_reset_daily_batch.sh"
+  run_script "summary_daily_batch.sh"
   run_ai_script "ai_signal_daily_batch.sh"
+  run_ai_script "ai_product_detail_funnel_daily_batch.sh"
   run_ai_script "ai_engagement_metrics_daily_batch.sh"
   run_ai_script "main_rule_slot_snapshot_batch.sh"
-  run_script "summary_daily_batch.sh"
-  run_script "service_reset_daily_batch.sh"
   run_script "partner_report_daily_batch.sh"
   run_script "statistics_aggregation_daily_batch.sh"
 }
