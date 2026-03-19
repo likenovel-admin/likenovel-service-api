@@ -24,7 +24,7 @@ from app.schemas.ai_recommendation import MAX_EVENT_PAYLOAD_LENGTH
 
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 logger = logging.getLogger(__name__)
-MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 3
+MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 5
 AXIS_CONFIDENCE_THRESHOLD = 0.55
 AXIS_WEIGHT = {
     "type": 18.0,
