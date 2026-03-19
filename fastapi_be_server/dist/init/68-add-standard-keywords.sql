@@ -2,7 +2,7 @@
 -- 기존 키워드와 중복되지 않는 것만 INSERT
 
 -- ============ 소재 (category_id=2) ============
-INSERT INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
+INSERT IGNORE INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
 SELECT t.keyword_name, 2, 'N', 'Y', 0, NOW(), 0, NOW()
 FROM (
     SELECT '회귀' AS keyword_name UNION ALL SELECT '귀환' UNION ALL SELECT '타임루프'
@@ -48,7 +48,7 @@ WHERE NOT EXISTS (
 );
 
 -- ============ 캐릭터 (category_id=3) ============
-INSERT INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
+INSERT IGNORE INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
 SELECT t.keyword_name, 3, 'N', 'Y', 0, NOW(), 0, NOW()
 FROM (
     SELECT '천마' AS keyword_name UNION ALL SELECT '망나니' UNION ALL SELECT '고인물'
@@ -68,7 +68,7 @@ WHERE NOT EXISTS (
 );
 
 -- ============ 직업 (category_id=4) ============
-INSERT INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
+INSERT IGNORE INTO tb_standard_keyword (keyword_name, category_id, major_genre_yn, use_yn, created_id, created_date, updated_id, updated_date)
 SELECT t.keyword_name, 4, 'N', 'Y', 0, NOW(), 0, NOW()
 FROM (
     SELECT '헌터' AS keyword_name UNION ALL SELECT '학생' UNION ALL SELECT '군인'

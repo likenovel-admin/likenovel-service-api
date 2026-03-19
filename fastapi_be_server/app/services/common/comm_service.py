@@ -16,7 +16,7 @@ from ebooklib import epub
 from bs4 import BeautifulSoup
 from html import escape as html_escape
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlunparse
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,16 @@ from app.exceptions import CustomResponseException
 from app.const import ErrorMessages
 
 logger = logging.getLogger(__name__)
+
+EPUB_DEV_CDN_HOST = "cdn.likenovel.dev"
+EPUB_PROD_CDN_HOST = "cdn.likenovel.net"
+EPUB_NORMALIZABLE_ASSET_PREFIXES = (
+    "/cover/",
+    "/episode/",
+    "/user/",
+    "/badge/",
+    "/panel/",
+)
 
 """
 재사용하는 공통 서비스 함수 모음
@@ -601,8 +611,17 @@ async def make_epub(
     # 표지 이미지 — 경로가 있을 때만 표지 챕터 생성
     cover_chapter = None
     if cover_image_path:
+        normalized_cover_image_path, cover_replacement_count = (
+            _normalize_epub_asset_url(cover_image_path)
+        )
+        if cover_replacement_count:
+            logger.info(
+                "make_epub normalized cover asset host: file=%s replacements=%s",
+                file_org_name,
+                cover_replacement_count,
+            )
         cover_chapter = epub.EpubHtml(title="Cover", file_name="cover.xhtml")
-        safe_cover_path = html_escape(cover_image_path, quote=True)
+        safe_cover_path = html_escape(normalized_cover_image_path, quote=True)
         cover_chapter.content = (
             f'<div><img src="{safe_cover_path}" alt="cover"/></div>'
         )
@@ -612,12 +631,20 @@ async def make_epub(
     # BeautifulSoup이 &nbsp;→U+00A0, <br>→<br/>, 미이스케이프 &→&amp; 등 처리
     content_chapter = epub.EpubHtml(title="Content", file_name="content.xhtml")
     soup = BeautifulSoup(content_db or "", "html.parser")
+    content_replacement_count = _normalize_epub_asset_urls_in_soup(soup)
+    if content_replacement_count:
+        logger.info(
+            "make_epub normalized content asset hosts: file=%s replacements=%s",
+            file_org_name,
+            content_replacement_count,
+        )
     content_chapter.content = str(soup)
     book.add_item(content_chapter)
 
     book.toc = []
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
+
     book.spine = ([cover_chapter] if cover_chapter else []) + [content_chapter]
 
     # ROOT_PATH에 파일 생성
@@ -625,6 +652,91 @@ async def make_epub(
     epub.write_epub(str(file_path), book, {})
 
     return
+
+
+def _normalize_epub_asset_url(value: str) -> tuple[str, int]:
+    if not value:
+        return value, 0
+
+    raw_value = value.strip()
+    if not raw_value:
+        return value, 0
+
+    protocol_relative = raw_value.startswith("//")
+    parse_target = f"https:{raw_value}" if protocol_relative else raw_value
+    parsed = urlparse(parse_target)
+
+    if not parsed.scheme or not parsed.netloc:
+        return value, 0
+
+    hostname = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if hostname != EPUB_DEV_CDN_HOST:
+        return value, 0
+    if not any(path.startswith(prefix) for prefix in EPUB_NORMALIZABLE_ASSET_PREFIXES):
+        return value, 0
+
+    normalized_value = urlunparse(parsed._replace(netloc=EPUB_PROD_CDN_HOST))
+    if protocol_relative:
+        normalized_value = normalized_value.replace("https://", "//", 1)
+
+    return normalized_value, 1
+
+
+def _normalize_epub_asset_srcset(value: str) -> tuple[str, int]:
+    if not value:
+        return value, 0
+
+    normalized_candidates: list[str] = []
+    replacement_count = 0
+
+    for candidate in value.split(","):
+        stripped_candidate = candidate.strip()
+        if not stripped_candidate:
+            continue
+
+        parts = stripped_candidate.split()
+        normalized_url, normalized_count = _normalize_epub_asset_url(parts[0])
+        replacement_count += normalized_count
+        normalized_candidates.append(" ".join([normalized_url, *parts[1:]]))
+
+    if not normalized_candidates:
+        return value, 0
+
+    return ", ".join(normalized_candidates), replacement_count
+
+
+def _normalize_epub_asset_urls_in_soup(soup: BeautifulSoup) -> int:
+    replacement_count = 0
+
+    normalizable_attributes = (
+        ("img", "src"),
+        ("img", "srcset"),
+        ("source", "src"),
+        ("source", "srcset"),
+        ("video", "poster"),
+    )
+
+    for tag_name, attribute_name in normalizable_attributes:
+        for tag in soup.find_all(tag_name):
+            current_value = tag.get(attribute_name)
+            if not current_value:
+                continue
+
+            if attribute_name == "srcset":
+                normalized_value, normalized_count = _normalize_epub_asset_srcset(
+                    current_value
+                )
+            else:
+                normalized_value, normalized_count = _normalize_epub_asset_url(
+                    current_value
+                )
+
+            if normalized_count:
+                tag[attribute_name] = normalized_value
+                replacement_count += normalized_count
+
+    return replacement_count
 
 
 async def upload_epub_to_r2(url: str, file_name: str):
