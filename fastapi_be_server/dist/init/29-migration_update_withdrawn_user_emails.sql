@@ -12,13 +12,14 @@
 -- 1. 탈퇴 유저의 이메일을 outed 형식으로 업데이트
 UPDATE tb_user
 SET email = CONCAT(
-    'outed;',
+    'outed',
+    CHAR(59),
     UNIX_TIMESTAMP(updated_date),
-    ';',
+    CHAR(59),
     email
 )
 WHERE use_yn = 'N'
-  AND email NOT LIKE 'outed;%'
+  AND email NOT LIKE CONCAT('outed', CHAR(59), CHAR(37))
   AND email IS NOT NULL
   AND email != '';
 
@@ -33,7 +34,7 @@ WHERE user_id IN (
 -- 마이그레이션 결과 확인 쿼리 (선택사항)
 -- SELECT
 --     COUNT(*) AS total_withdrawn_users,
---     SUM(CASE WHEN email LIKE 'outed;%' THEN 1 ELSE 0 END) AS correctly_formatted,
---     SUM(CASE WHEN email NOT LIKE 'outed;%' THEN 1 ELSE 0 END) AS incorrectly_formatted
+--     SUM(CASE WHEN email LIKE CONCAT('outed', CHAR(59), CHAR(37)) THEN 1 ELSE 0 END) AS correctly_formatted,
+--     SUM(CASE WHEN email NOT LIKE CONCAT('outed', CHAR(59), CHAR(37)) THEN 1 ELSE 0 END) AS incorrectly_formatted
 -- FROM tb_user
 -- WHERE use_yn = 'N';
