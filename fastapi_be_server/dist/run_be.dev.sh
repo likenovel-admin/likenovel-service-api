@@ -21,6 +21,8 @@ mkdir -p ./logs/data ./logs/error
 
 # .env.production → .env (pydantic_settings가 .env를 읽음)
 cp .env.production .env
+# trailing newline 보장 (없으면 cron_env.sh의 while read가 마지막 줄 스킵)
+tail -c1 .env | read -r _ || echo >> .env
 
 python3 -m venv .venv
 source .venv/bin/activate
