@@ -40,9 +40,10 @@ MAX_LLM_OUTPUT_TOKENS = int(os.getenv("AI_METADATA_MAX_TOKENS", "4096"))
 MIN_REQUIRED_EPISODES = 3
 DEFAULT_GOAL_LABEL = "성장"
 FAILED_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_FAILED_RETRY_COOLDOWN_DAYS", "3"))
-ANALYSIS_PIPELINE_VERSION = os.getenv("AI_METADATA_PIPELINE_VERSION", "dna-v20260320-label-repair")
+INCOMPLETE_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_INCOMPLETE_RETRY_COOLDOWN_DAYS", "3"))
+ANALYSIS_PIPELINE_VERSION = os.getenv("AI_METADATA_PIPELINE_VERSION", "dna-v20260320-r1")
 UNSUPPORTED_LABEL_ERROR_PREFIX = "unsupported_label:"
-CURRENT_ANALYSIS_VERSION = f"{ANTHROPIC_MODEL}|{ANALYSIS_PIPELINE_VERSION}"[:50]
+CURRENT_ANALYSIS_VERSION = ANALYSIS_PIPELINE_VERSION[:50]
 
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
@@ -243,19 +244,22 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
                 )
                 OR (
                     COALESCE(m.analysis_status, 'pending') != 'failed'
+                    AND m.analyzed_at IS NULL
+                )
+                OR (
+                    COALESCE(m.analysis_status, 'pending') = 'success'
                     AND (
-                        m.analyzed_at IS NULL
-                        OR (
-                            SELECT COUNT(*)
-                            FROM tb_product_episode le
-                            WHERE le.product_id = p.product_id
-                              AND le.use_yn = 'Y'
-                              AND le.open_yn = 'Y'
-                        ) < {MAX_ANALYZE_EPISODES}
-                    )
+                        SELECT COUNT(*)
+                        FROM tb_product_episode le
+                        WHERE le.product_id = p.product_id
+                          AND le.use_yn = 'Y'
+                          AND le.open_yn = 'Y'
+                    ) < {MAX_ANALYZE_EPISODES}
+                    AND COALESCE(m.analyzed_at, m.updated_date, m.created_date, '1970-01-01 00:00:00')
+                        < DATE_SUB(NOW(), INTERVAL {INCOMPLETE_RETRY_COOLDOWN_DAYS} DAY)
                 )
             )
-            """  # 미분석 또는 10화 미만(완결 전) 작품은 매 배치 갱신
+            """  # 미분석 즉시, 실패는 cooldown 뒤, 10화 미만 성공작은 3일 간격 재분석
             params.extend([CURRENT_ANALYSIS_VERSION, f"{UNSUPPORTED_LABEL_ERROR_PREFIX}%"])
 
         cur.execute(
