@@ -13,6 +13,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 35 1 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_product_detail_funnel_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_product_detail_funnel_daily_batch.log 2>&1
 40 1 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_engagement_metrics_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_engagement_metrics_daily_batch.log 2>&1
 45 1 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/main_rule_slot_snapshot_batch.sh >> /home/ln-admin/likenovel/batch-dev/main_rule_slot_snapshot_batch.log 2>&1
+50 1 * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_product_episode_dropoff_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_product_episode_dropoff_daily_batch.log 2>&1
 0 0 * * 1  ln-admin bash /home/ln-admin/likenovel/batch-dev/service_reset_weekly_batch.sh >> /home/ln-admin/likenovel/batch-dev/service_reset_weekly_batch.log 2>&1
 0 0 1 * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/partner_report_monthly_batch.sh >> /home/ln-admin/likenovel/batch-dev/partner_report_monthly_batch.log 2>&1
 
