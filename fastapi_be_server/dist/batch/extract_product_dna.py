@@ -39,6 +39,10 @@ MAX_ANALYZE_CHARS = 60000
 MAX_LLM_OUTPUT_TOKENS = int(os.getenv("AI_METADATA_MAX_TOKENS", "4096"))
 MIN_REQUIRED_EPISODES = 3
 DEFAULT_GOAL_LABEL = "성장"
+FAILED_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_FAILED_RETRY_COOLDOWN_DAYS", "3"))
+ANALYSIS_PIPELINE_VERSION = os.getenv("AI_METADATA_PIPELINE_VERSION", "dna-v20260320-label-repair")
+UNSUPPORTED_LABEL_ERROR_PREFIX = "unsupported_label:"
+CURRENT_ANALYSIS_VERSION = f"{ANTHROPIC_MODEL}|{ANALYSIS_PIPELINE_VERSION}"[:50]
 
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
@@ -149,6 +153,38 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
   "overall_confidence": 0.0
 }}"""
 
+DNA_REPAIR_TEMPLATE = """아래는 1차 분석 결과 JSON이다.
+이 JSON에는 허용되지 않은 라벨이 포함되어 있어 저장할 수 없다.
+
+작품명: {title}
+문제 축: {axis}
+문제 라벨: {label}
+
+허용 라벨(축별 SSOT JSON):
+{allowed_labels_json}
+
+라벨 정의(분류 기준):
+{label_definitions_text}
+
+기존 JSON:
+{raw_payload_json}
+
+수정 규칙:
+1) 허용 라벨 목록 외 값은 절대 사용하지 않는다.
+2) axis_labels의 정상 라벨은 최대한 유지한다.
+3) 문제 축과 문제 라벨을 교정하고, 각 축의 최소 개수를 충족한다.
+4) goal(목) 축은 정확히 1개만 남긴다.
+5) 전체 출력은 반드시 JSON 단일 객체만 반환한다.
+6) 설명문, 코드블록, 주석 금지.
+"""
+
+
+class UnsupportedLabelError(ValueError):
+    def __init__(self, axis: str, label: str):
+        self.axis = axis
+        self.label = label
+        super().__init__(f"axis_labels.{axis} contains unsupported label: {label}")
+
 
 def db_connect():
     if not DB_USER or not DB_PASSWORD:
@@ -169,6 +205,7 @@ def db_connect():
 def get_products(conn, product_id: int | None = None, force: bool = False):
     """분석 대상 작품 목록 조회."""
     with conn.cursor() as cur:
+        params: list[Any] = []
         where = """
             p.open_yn = 'Y'
             AND COALESCE(u.role_type, 'normal') != 'admin'
@@ -191,21 +228,35 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
             ) >= 3
         """
         if product_id:
-            where += f" AND p.product_id = {product_id}"
+            where += " AND p.product_id = %s"
+            params.append(product_id)
         if not force:
             where += f"""
             AND (
                 m.id IS NULL
-                OR m.analyzed_at IS NULL
+                OR COALESCE(m.model_version, '') <> %s
                 OR (
-                    SELECT COUNT(*)
-                    FROM tb_product_episode le
-                    WHERE le.product_id = p.product_id
-                      AND le.use_yn = 'Y'
-                      AND le.open_yn = 'Y'
-                ) < {MAX_ANALYZE_EPISODES}
+                    COALESCE(m.analysis_status, 'pending') = 'failed'
+                    AND COALESCE(m.analysis_error_message, '') NOT LIKE %s
+                    AND COALESCE(m.updated_date, m.created_date, '1970-01-01 00:00:00')
+                        < DATE_SUB(NOW(), INTERVAL {FAILED_RETRY_COOLDOWN_DAYS} DAY)
+                )
+                OR (
+                    COALESCE(m.analysis_status, 'pending') != 'failed'
+                    AND (
+                        m.analyzed_at IS NULL
+                        OR (
+                            SELECT COUNT(*)
+                            FROM tb_product_episode le
+                            WHERE le.product_id = p.product_id
+                              AND le.use_yn = 'Y'
+                              AND le.open_yn = 'Y'
+                        ) < {MAX_ANALYZE_EPISODES}
+                    )
+                )
             )
             """  # 미분석 또는 10화 미만(완결 전) 작품은 매 배치 갱신
+            params.extend([CURRENT_ANALYSIS_VERSION, f"{UNSUPPORTED_LABEL_ERROR_PREFIX}%"])
 
         cur.execute(
             f"""
@@ -232,7 +283,8 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
             LEFT JOIN tb_product_ai_metadata m ON m.product_id = p.product_id
             WHERE {where}
             ORDER BY p.count_hit DESC
-        """
+        """,
+            params,
         )
         return cur.fetchall()
 
@@ -342,6 +394,13 @@ def _safe_list(value: Any, field_name: str, max_items: int = 15, max_item_length
     return list(dict.fromkeys(normalized_items))
 
 
+def _format_allowed_labels_json(allowed_labels: dict[str, set[str]]) -> str:
+    return json.dumps(
+        {axis: sorted(allowed_labels[axis]) for axis in AXIS_ORDER},
+        ensure_ascii=False,
+    )
+
+
 def load_allowed_labels() -> dict[str, set[str]]:
     for path in LABELS_JSON_CANDIDATES:
         if not path.exists():
@@ -394,7 +453,7 @@ def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str
         labels = _safe_list(axis_labels.get(axis), f"axis_labels.{axis}", max_items=max_items, max_item_length=50)
         for label in labels:
             if label not in allowed_labels[axis]:
-                raise ValueError(f"axis_labels.{axis} contains unsupported label: {label}")
+                raise UnsupportedLabelError(axis, label)
         if len(labels) < min_items:
             if axis == "목":
                 fallback = DEFAULT_GOAL_LABEL if DEFAULT_GOAL_LABEL in allowed_labels["목"] else sorted(allowed_labels["목"])[0]
@@ -501,14 +560,13 @@ def parse_json(raw: str) -> dict:
     return json.loads(text)
 
 
-def analyze_product(
+def _build_analysis_prompt(
     product: dict,
     allowed_labels: dict[str, set[str]],
     episodes_text: str,
     used_count: int,
-) -> tuple[dict, dict]:
-    """작품 1개 분석."""
-    user_prompt = DNA_USER_TEMPLATE.format(
+) -> str:
+    return DNA_USER_TEMPLATE.format(
         title=product["title"],
         genres=product.get("genres") or "",
         keywords=product.get("keywords") or "",
@@ -517,16 +575,46 @@ def analyze_product(
         status_code=product.get("status_code", ""),
         n_requested=MAX_ANALYZE_EPISODES,
         n_received=used_count,
-        allowed_labels_json=json.dumps(
-            {axis: sorted(allowed_labels[axis]) for axis in AXIS_ORDER},
-            ensure_ascii=False,
-        ),
+        allowed_labels_json=_format_allowed_labels_json(allowed_labels),
         label_definitions_text=load_label_definitions(),
         episodes_text=episodes_text,
     )
+
+
+def _build_repair_prompt(
+    product: dict,
+    allowed_labels: dict[str, set[str]],
+    parsed_payload: dict[str, Any],
+    error: UnsupportedLabelError,
+) -> str:
+    return DNA_REPAIR_TEMPLATE.format(
+        title=product["title"],
+        axis=error.axis,
+        label=error.label,
+        allowed_labels_json=_format_allowed_labels_json(allowed_labels),
+        label_definitions_text=load_label_definitions(),
+        raw_payload_json=json.dumps(parsed_payload, ensure_ascii=False),
+    )
+
+
+def analyze_product(
+    product: dict,
+    allowed_labels: dict[str, set[str]],
+    episodes_text: str,
+    used_count: int,
+) -> tuple[dict, dict]:
+    """작품 1개 분석."""
+    user_prompt = _build_analysis_prompt(product, allowed_labels, episodes_text, used_count)
     raw = call_claude(DNA_SYSTEM_PROMPT, user_prompt)
     parsed = parse_json(raw)
-    normalized = normalize_payload(parsed, allowed_labels)
+    try:
+        normalized = normalize_payload(parsed, allowed_labels)
+    except UnsupportedLabelError as repair_error:
+        repair_prompt = _build_repair_prompt(product, allowed_labels, parsed, repair_error)
+        repaired_raw = call_claude(DNA_SYSTEM_PROMPT, repair_prompt)
+        repaired_parsed = parse_json(repaired_raw)
+        normalized = normalize_payload(repaired_parsed, allowed_labels)
+        parsed = repaired_parsed
     return normalized, parsed
 
 
@@ -606,7 +694,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 json.dumps(dna.get("similar_famous", []), ensure_ascii=False),
                 json.dumps(dna.get("taste_tags", []), ensure_ascii=False),
                 json.dumps(parsed, ensure_ascii=False),
-                ANTHROPIC_MODEL,
+                CURRENT_ANALYSIS_VERSION,
                 attempt_count,
             ),
         )
@@ -631,9 +719,15 @@ def save_failed(conn, product_id: int, attempt_count: int, error_message: str):
                 product_id,
                 attempt_count,
                 (error_message or "unknown error")[:1000],
-                ANTHROPIC_MODEL,
+                CURRENT_ANALYSIS_VERSION,
             ),
         )
+
+
+def _format_failure_message(error: Exception) -> str:
+    if isinstance(error, UnsupportedLabelError):
+        return f"{UNSUPPORTED_LABEL_ERROR_PREFIX}{error.axis}:{error.label}"
+    return (str(error) or "unknown error")[:1000]
 
 
 def main():
@@ -680,8 +774,11 @@ def main():
                 analyzed = True
                 print(f"OK (attempt={attempt})")
                 break
+            except UnsupportedLabelError as e:
+                last_error = _format_failure_message(e)
+                break
             except Exception as e:
-                last_error = str(e)
+                last_error = _format_failure_message(e)
                 if attempt <= MAX_RETRY_COUNT:
                     time.sleep(1.0)
 
