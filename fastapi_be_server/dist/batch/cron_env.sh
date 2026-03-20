@@ -17,16 +17,20 @@ fi
 ENV_FILE="${BATCH_ENV_FILE:-$_ENV_FILE}"
 
 _loaded=false
-if [ -r "$ENV_FILE" ]; then
-  while IFS="=" read -r key value; do
-    case "$key" in
-      DB_HOST|DB_IP|DB_PORT|DB_USER|DB_PW|DB_USER_ID|DB_USER_PW|DB_NAME|ANTHROPIC_API_KEY|ANTHROPIC_MODEL)
-        export "$key=$value"
-        ;;
-    esac
-  done < "$ENV_FILE"
-  _loaded=true
-fi
+for _try in 1 2 3; do
+  if [ -r "$ENV_FILE" ] && [ -s "$ENV_FILE" ]; then
+    while IFS="=" read -r key value; do
+      case "$key" in
+        DB_HOST|DB_IP|DB_PORT|DB_USER|DB_PW|DB_USER_ID|DB_USER_PW|DB_NAME|ANTHROPIC_API_KEY|ANTHROPIC_MODEL)
+          export "$key=$value"
+          ;;
+      esac
+    done < "$ENV_FILE"
+    _loaded=true
+    break
+  fi
+  sleep 3
+done
 
 # Docker 환경 fallback
 if [ "$_loaded" = false ] && [ -r /proc/1/environ ]; then
