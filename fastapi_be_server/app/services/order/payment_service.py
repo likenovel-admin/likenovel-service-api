@@ -170,6 +170,35 @@ async def _find_virtual_account_binding(
     return dict(row) if row else None
 
 
+async def _find_active_virtual_account_binding_by_user(
+    user_id: int, db: AsyncSession
+) -> dict[str, Any] | None:
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                pending_id,
+                payment_id,
+                user_id,
+                item_name,
+                item_price,
+                paid_synced_at,
+                expired_at
+            FROM tb_portone_virtual_account_pending
+            WHERE user_id = :user_id
+              AND paid_synced_at IS NULL
+              AND expired_at IS NOT NULL
+              AND expired_at > NOW()
+            ORDER BY expired_at DESC, pending_id DESC
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    )
+    row = result.mappings().one_or_none()
+    return dict(row) if row else None
+
+
 def _verify_virtual_account_payment_against_binding(
     payment: portone.payment.PaidPayment, binding: dict[str, Any]
 ) -> None:
@@ -599,3 +628,70 @@ async def payment_verify_virtual_account(
         status_code=status.HTTP_400_BAD_REQUEST,
         message=ErrorMessages.INVALID_PAYMENT_STATUS,
     )
+
+
+async def get_active_virtual_account_pending(kc_user_id: str, db: AsyncSession):
+    user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
+    binding = await _find_active_virtual_account_binding_by_user(int(user_id), db)
+    if binding is None:
+        return {"has_pending": False}
+
+    try:
+        actual_payment = portone_client.payment.get_payment(
+            payment_id=binding["payment_id"]
+        )
+    except Exception as exc:
+        logger.error("active virtual account lookup failed: %s", exc)
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.PAYMENT_SERVICE_ERROR,
+        ) from exc
+
+    if isinstance(actual_payment, portone.payment.VirtualAccountIssuedPayment):
+        item, _ = _verify_virtual_account_payment(
+            actual_payment, expected_user_id=int(user_id)
+        )
+        await _upsert_virtual_account_binding(
+            actual_payment,
+            user_id=int(user_id),
+            item=item,
+            db=db,
+        )
+        return {
+            "has_pending": True,
+            "payment": {
+                "status": "VIRTUAL_ACCOUNT_ISSUED",
+                "payment_id": actual_payment.id,
+                "tx_id": actual_payment.transaction_id,
+            },
+            "virtual_account": _extract_virtual_account_info(actual_payment),
+        }
+
+    if isinstance(actual_payment, portone.payment.PaidPayment):
+        _extract_virtual_account_info(actual_payment)
+        item, _ = _verify_virtual_account_payment(
+            actual_payment, expected_user_id=int(user_id)
+        )
+        await _upsert_virtual_account_binding(
+            actual_payment,
+            user_id=int(user_id),
+            item=item,
+            db=db,
+        )
+        await _sync_virtual_account_paid_payment(actual_payment.id, db)
+        return {
+            "has_pending": False,
+            "payment": {
+                "status": "PAID",
+                "payment_id": actual_payment.id,
+                "tx_id": actual_payment.transaction_id,
+            },
+        }
+
+    return {"has_pending": False}
