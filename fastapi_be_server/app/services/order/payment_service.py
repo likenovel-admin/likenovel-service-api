@@ -531,6 +531,9 @@ async def get_raw_body(request: Request) -> bytes:
 
 
 async def payment_receive_webhook(request: Request, body: bytes, db: AsyncSession):
+    import pathlib
+    _wh_log = pathlib.Path("/home/ln-admin/likenovel/api/logs/webhook_debug.log")
+
     if not PORTONE_WEBHOOK_SECRET:
         logger.error("PORTONE_WEBHOOK_SECRET is missing")
         raise CustomResponseException(
@@ -538,29 +541,38 @@ async def payment_receive_webhook(request: Request, body: bytes, db: AsyncSessio
             message=ErrorMessages.PAYMENT_SERVICE_ERROR,
         )
 
+    raw_body = body.decode("utf-8")
+    with _wh_log.open("a") as f:
+        f.write(f"\n--- {datetime.now().isoformat()} ---\n")
+        f.write(f"body: {raw_body[:2000]}\n")
+
     try:
         webhook = portone.webhook.verify(
             PORTONE_WEBHOOK_SECRET,
-            body.decode("utf-8"),
+            raw_body,
             request.headers,
         )
     except portone.webhook.WebhookVerificationError as exc:
-        logger.warning("invalid portone webhook signature: %s", exc)
+        with _wh_log.open("a") as f:
+            f.write(f"VERIFY FAILED: {exc}\n")
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.INVALID_PAYMENT_STATUS,
         ) from exc
 
+    with _wh_log.open("a") as f:
+        f.write(f"verified: type(webhook)={type(webhook).__name__}, is_dict={isinstance(webhook, dict)}\n")
+        if isinstance(webhook, dict):
+            f.write(f"dict keys: {list(webhook.keys())}, type_field={webhook.get('type')}\n")
+
     if isinstance(webhook, dict):
-        logger.info("webhook deserialized as raw dict: type=%s", webhook.get("type"))
         if webhook.get("type") == "Transaction.Paid":
             payment_id = (webhook.get("data") or {}).get("paymentId")
             if payment_id:
-                logger.info("processing dict webhook Transaction.Paid payment_id=%s", payment_id)
+                with _wh_log.open("a") as f:
+                    f.write(f"PROCESSING Transaction.Paid payment_id={payment_id}\n")
                 await _sync_virtual_account_paid_payment(payment_id, db)
         return {"ok": True}
-
-    logger.info("webhook type=%s", type(webhook).__name__)
 
     if isinstance(webhook, portone.webhook.WebhookTransactionPaid):
         await _sync_virtual_account_paid_payment(webhook.data.payment_id, db)
