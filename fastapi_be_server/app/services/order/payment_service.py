@@ -505,17 +505,16 @@ async def _sync_virtual_account_paid_payment(payment_id: str, db: AsyncSession) 
         _verify_virtual_account_payment_against_binding(actual_payment, binding)
         user_id = int(binding["user_id"])
 
-        async with db.begin():
-            await _create_cash_charge_order_for_virtual_account_paid(
-                payment=actual_payment,
-                user_id=user_id,
-                db=db,
-            )
-            await _mark_virtual_account_binding_paid(
-                payment_id=payment_id,
-                user_id=user_id,
-                db=db,
-            )
+        await _create_cash_charge_order_for_virtual_account_paid(
+            payment=actual_payment,
+            user_id=user_id,
+            db=db,
+        )
+        await _mark_virtual_account_binding_paid(
+            payment_id=payment_id,
+            user_id=user_id,
+            db=db,
+        )
     except SQLAlchemyError as exc:
         logger.error("virtual account paid db error: %s", exc)
         raise CustomResponseException(
