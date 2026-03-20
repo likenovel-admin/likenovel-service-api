@@ -531,9 +531,6 @@ async def get_raw_body(request: Request) -> bytes:
 
 
 async def payment_receive_webhook(request: Request, body: bytes, db: AsyncSession):
-    import pathlib
-    _wh_log = pathlib.Path("/home/ln-admin/likenovel/api/logs/webhook_debug.log")
-
     if not PORTONE_WEBHOOK_SECRET:
         logger.error("PORTONE_WEBHOOK_SECRET is missing")
         raise CustomResponseException(
@@ -541,41 +538,31 @@ async def payment_receive_webhook(request: Request, body: bytes, db: AsyncSessio
             message=ErrorMessages.PAYMENT_SERVICE_ERROR,
         )
 
-    raw_body = body.decode("utf-8")
-    with _wh_log.open("a") as f:
-        f.write(f"\n--- {datetime.now().isoformat()} ---\n")
-        f.write(f"body: {raw_body[:2000]}\n")
-
     try:
         webhook = portone.webhook.verify(
             PORTONE_WEBHOOK_SECRET,
-            raw_body,
+            body.decode("utf-8"),
             request.headers,
         )
     except portone.webhook.WebhookVerificationError as exc:
-        with _wh_log.open("a") as f:
-            f.write(f"VERIFY FAILED: {exc}\n")
+        logger.warning("invalid portone webhook signature: %s", exc)
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.INVALID_PAYMENT_STATUS,
         ) from exc
 
-    with _wh_log.open("a") as f:
-        f.write(f"verified: type(webhook)={type(webhook).__name__}, is_dict={isinstance(webhook, dict)}\n")
-        if isinstance(webhook, dict):
-            f.write(f"dict keys: {list(webhook.keys())}, type_field={webhook.get('type')}\n")
-
-    if isinstance(webhook, dict):
-        if webhook.get("type") == "Transaction.Paid":
-            payment_id = (webhook.get("data") or {}).get("paymentId")
-            if payment_id:
-                with _wh_log.open("a") as f:
-                    f.write(f"PROCESSING Transaction.Paid payment_id={payment_id}\n")
-                await _sync_virtual_account_paid_payment(payment_id, db)
-        return {"ok": True}
-
+    # SDK 타입 매칭 성공
     if isinstance(webhook, portone.webhook.WebhookTransactionPaid):
         await _sync_virtual_account_paid_payment(webhook.data.payment_id, db)
+        return {"ok": True}
+
+    # SDK 역직렬화 실패 → raw dict: 포트원 실제 페이로드 형식으로 처리
+    # 실제 형식: {"tx_id":"...", "payment_id":"...", "status":"Paid"}
+    if isinstance(webhook, dict):
+        wh_status = webhook.get("status")
+        payment_id = webhook.get("payment_id")
+        if wh_status == "Paid" and payment_id:
+            await _sync_virtual_account_paid_payment(payment_id, db)
 
     return {"ok": True}
 
