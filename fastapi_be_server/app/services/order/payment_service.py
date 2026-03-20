@@ -552,7 +552,15 @@ async def payment_receive_webhook(request: Request, body: bytes, db: AsyncSessio
         ) from exc
 
     if isinstance(webhook, dict):
+        logger.info("webhook deserialized as raw dict: type=%s", webhook.get("type"))
+        if webhook.get("type") == "Transaction.Paid":
+            payment_id = (webhook.get("data") or {}).get("paymentId")
+            if payment_id:
+                logger.info("processing dict webhook Transaction.Paid payment_id=%s", payment_id)
+                await _sync_virtual_account_paid_payment(payment_id, db)
         return {"ok": True}
+
+    logger.info("webhook type=%s", type(webhook).__name__)
 
     if isinstance(webhook, portone.webhook.WebhookTransactionPaid):
         await _sync_virtual_account_paid_payment(webhook.data.payment_id, db)
