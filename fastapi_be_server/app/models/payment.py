@@ -164,6 +164,52 @@ class StorePayment(Base):
     )
 
 
+class PortoneVirtualAccountPending(Base):
+    __tablename__ = "tb_portone_virtual_account_pending"
+
+    pending_id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    payment_id: Mapped[str] = mapped_column(
+        String(50), index=True, nullable=False, comment="PortOne payment_id"
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="유저 아이디"
+    )
+    item_name: Mapped[str] = mapped_column(
+        String(200), nullable=False, comment="결제 아이템명"
+    )
+    item_price: Mapped[int] = mapped_column(
+        Integer, server_default="0", comment="결제 금액"
+    )
+    pg_tx_id: Mapped[str] = mapped_column(
+        String(50), nullable=True, comment="PortOne tx_id"
+    )
+    issued_at: Mapped[str] = mapped_column(
+        String(40), nullable=True, comment="가상계좌 발급 시각"
+    )
+    expired_at: Mapped[str] = mapped_column(
+        String(40), nullable=True, comment="가상계좌 입금 만료 시각"
+    )
+    paid_synced_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=True, comment="입금 완료 주문 반영 시각"
+    )
+    created_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
 class StorePaymentInfo(Base):
     __tablename__ = "tb_store_payment_info"
 
