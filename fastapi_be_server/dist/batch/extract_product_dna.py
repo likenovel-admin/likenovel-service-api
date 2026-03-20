@@ -53,8 +53,10 @@ AXIS_LIMITS: dict[str, tuple[int, int]] = {
 ALLOWED_HEROINE_WEIGHT = {"high", "mid", "low", "none"}
 ALLOWED_PACING = {"fast", "medium", "slow"}
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
 LABELS_JSON_CANDIDATES = [
+    SCRIPT_DIR / "allowed-labels-by-axis.json",  # 서버 배치 디렉토리
     ROOT_DIR / "ai" / "allowed-labels-by-axis.json",  # 컨테이너: /app/dist/ai/
     ROOT_DIR / "docs" / "ai-codebook" / "allowed-labels-by-axis.json",  # 로컬 프로젝트 루트
     ROOT_DIR
@@ -66,6 +68,7 @@ LABELS_JSON_CANDIDATES = [
     / "allowed-labels-by-axis.json",
 ]
 LABEL_DEFS_JSON_CANDIDATES = [
+    SCRIPT_DIR / "label-definitions-by-axis.json",  # 서버 배치 디렉토리
     ROOT_DIR / "ai" / "label-definitions-by-axis.json",  # 컨테이너: /app/dist/ai/
     ROOT_DIR / "docs" / "ai-codebook" / "label-definitions-by-axis.json",
     ROOT_DIR
