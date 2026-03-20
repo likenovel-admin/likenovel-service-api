@@ -1,30 +1,32 @@
 #!/bin/bash
 
 # 배치용 환경변수 로더
-# 서버: BATCH_ENV_FILE 또는 ../api/.env, ../api-dev/.env 에서 읽음
-# Docker: /proc/1/environ 에서 읽음
+# 서버: 배치 디렉토리명으로 dev/prod 판별 후 올바른 .env 로딩
+# Docker: /proc/1/environ fallback
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_CANDIDATES=(
-  "${BATCH_ENV_FILE:-}"
-  "${SCRIPT_DIR}/../api/.env"
-  "${SCRIPT_DIR}/../api-dev/.env"
-)
+
+# 환경 판별: batch-dev → api-dev/.env, batch → api/.env
+if [[ "$SCRIPT_DIR" == *"batch-dev"* ]]; then
+  _ENV_FILE="${SCRIPT_DIR}/../api-dev/.env"
+else
+  _ENV_FILE="${SCRIPT_DIR}/../api/.env"
+fi
+
+# BATCH_ENV_FILE 명시 지정 시 우선
+ENV_FILE="${BATCH_ENV_FILE:-$_ENV_FILE}"
 
 _loaded=false
-for ef in "${ENV_CANDIDATES[@]}"; do
-  if [ -n "$ef" ] && [ -r "$ef" ]; then
-    while IFS="=" read -r key value; do
-      case "$key" in
-        DB_HOST|DB_IP|DB_PORT|DB_USER|DB_PW|DB_USER_ID|DB_USER_PW|DB_NAME|ANTHROPIC_API_KEY|ANTHROPIC_MODEL)
-          export "$key=$value"
-          ;;
-      esac
-    done < "$ef"
-    _loaded=true
-    break
-  fi
-done
+if [ -r "$ENV_FILE" ]; then
+  while IFS="=" read -r key value; do
+    case "$key" in
+      DB_HOST|DB_IP|DB_PORT|DB_USER|DB_PW|DB_USER_ID|DB_USER_PW|DB_NAME|ANTHROPIC_API_KEY|ANTHROPIC_MODEL)
+        export "$key=$value"
+        ;;
+    esac
+  done < "$ENV_FILE"
+  _loaded=true
+fi
 
 # Docker 환경 fallback
 if [ "$_loaded" = false ] && [ -r /proc/1/environ ]; then
