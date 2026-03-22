@@ -1203,6 +1203,17 @@ async def product_details_group_by_product_id(
                     where episode_id = e.episode_id
                     order by created_date desc limit 1
                 ), 0) as countRecommendIndicator,
+                (
+                    select cfi.file_org_name
+                    from tb_common_file cf
+                    inner join tb_common_file_item cfi
+                       on cfi.file_group_id = cf.file_group_id
+                      and cfi.use_yn = 'Y'
+                    where cf.use_yn = 'Y'
+                      and cf.group_type = 'epub'
+                      and cf.file_group_id = e.epub_file_id
+                    limit 1
+                ) as epubFileName,
                 e.open_yn as episodeOpenYn,
                 e.open_yn as openYn,
                 e.use_yn as useYn,

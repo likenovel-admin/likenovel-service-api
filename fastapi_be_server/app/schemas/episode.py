@@ -75,6 +75,18 @@ class PostEpisodesProductsProductIdEpubBatchReqBody(EpisodesBase):
     )
 
 
+class EpisodeTitleBulkUpdateItem(EpisodesBase):
+    no: int = Field(examples=[1], description="회차 번호")
+    file_name: str = Field(examples=["1.epub"], description="현재 EPUB 파일명")
+    title: str = Field(examples=["1화 새로운 제목"], description="변경할 회차명")
+
+
+class PostEpisodesProductsProductIdTitlesBulkReqBody(EpisodesBase):
+    episodes: List[EpisodeTitleBulkUpdateItem] = Field(
+        default_factory=list, description="회차명 일괄 수정 대상 목록"
+    )
+
+
 class PostEpisodesReviewRequestsReqBody(EpisodesBase):
     episode_ids: List[int] = Field(
         default_factory=list, description="심사 신청할 회차 ID 목록"
@@ -159,4 +171,3 @@ class PurchaseEpisodeWithCashReqBody(EpisodesBase):
 """
 response area
 """
-
