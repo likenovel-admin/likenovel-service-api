@@ -146,6 +146,25 @@ async def post_episodes_products_product_id_epub_batch(
 
 
 @router.post(
+    "/products/{product_id}/titles/bulk",
+    tags=["회차 - 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_episodes_products_product_id_titles_bulk(
+    req_body: episode_schema.PostEpisodesProductsProductIdTitlesBulkReqBody,
+    product_id: str = Path(..., description="작품 id"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.post_episodes_products_product_id_titles_bulk(
+        product_id=product_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.post(
     "/review-requests",
     tags=["회차 - 회차 관리"],
     dependencies=[Depends(analysis_logger)],

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import posixpath
 from datetime import datetime
 from io import BytesIO
 from fastapi import status
@@ -10,6 +11,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from zipfile import BadZipFile, ZipFile
+from xml.etree import ElementTree as ET
 
 from bs4 import BeautifulSoup
 from httpx import AsyncClient, HTTPStatusError, RequestError, Timeout
@@ -30,6 +32,10 @@ logger = logging.getLogger(__name__)
 """
 Episodes service
 """
+
+_EPUB_XHTML_EXTENSIONS = (".xhtml", ".html", ".htm")
+_COPYRIGHT_KEYWORDS = ("발행일", "발행인", "isbn", "uci", "ⓒ", "©", "copyright")
+_COPYRIGHT_FILE_NAMES = {"copy", "right", "rights", "colophon"}
 
 
 @asynccontextmanager
@@ -92,6 +98,233 @@ def _default_episode_price_type(
     )
 
 
+def _is_episode_upload_completed(
+    latest_apply_status: Optional[str],
+    open_yn: Optional[str],
+    publish_reserve_date: Optional[datetime],
+) -> bool:
+    effective_open_yn = open_yn or "N"
+    if effective_open_yn == "Y":
+        return False
+
+    if latest_apply_status not in (None, "", "cancel"):
+        return False
+
+    reserve_at = _to_kst_naive(publish_reserve_date)
+    if reserve_at is None:
+        return True
+
+    now_kst = datetime.now(ZoneInfo(settings.KOREA_TIMEZONE)).replace(tzinfo=None)
+    return reserve_at <= now_kst
+
+
+def _normalize_bulk_episode_title(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _has_disallowed_control_chars(value: str) -> bool:
+    return any(ord(char) < 32 for char in value)
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _is_xhtml_path(file_name: str) -> bool:
+    return file_name.lower().endswith(_EPUB_XHTML_EXTENSIONS)
+
+
+def _is_copyright_file_name(file_name: str) -> bool:
+    base_name = posixpath.splitext(posixpath.basename(file_name.lower()))[0]
+    return base_name.startswith("copyright") or base_name in _COPYRIGHT_FILE_NAMES
+
+
+def _count_copyright_keyword_hits(text: str) -> int:
+    normalized_text = text.lower()
+    return sum(1 for keyword in _COPYRIGHT_KEYWORDS if keyword.lower() in normalized_text)
+
+
+def _extract_epub_document_parts(html_bytes: bytes) -> tuple[str, str]:
+    soup = BeautifulSoup(html_bytes, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    body = soup.find("body")
+    html_content = body.decode_contents() if body else str(soup)
+    text_content = soup.get_text(separator=" ", strip=True)
+    return html_content, text_content
+
+
+def _read_spine_xhtml_paths_from_epub(epub_zip: ZipFile) -> Optional[list[str]]:
+    try:
+        container_xml = epub_zip.read("META-INF/container.xml")
+        container_root = ET.fromstring(container_xml)
+    except Exception:
+        return None
+
+    opf_path: Optional[str] = None
+    for element in container_root.iter():
+        if _xml_local_name(element.tag) != "rootfile":
+            continue
+        full_path = element.attrib.get("full-path")
+        if full_path:
+            opf_path = full_path
+            break
+
+    if not opf_path:
+        return None
+
+    try:
+        opf_xml = epub_zip.read(opf_path)
+        opf_root = ET.fromstring(opf_xml)
+    except Exception:
+        return None
+
+    opf_dir = posixpath.dirname(opf_path)
+    manifest_map: dict[str, str] = {}
+    spine_paths: list[str] = []
+
+    for element in opf_root.iter():
+        if _xml_local_name(element.tag) != "item":
+            continue
+        item_id = element.attrib.get("id")
+        href = element.attrib.get("href")
+        if not item_id or not href:
+            continue
+        manifest_map[item_id] = posixpath.normpath(posixpath.join(opf_dir, href))
+
+    for element in opf_root.iter():
+        if _xml_local_name(element.tag) != "itemref":
+            continue
+        idref = element.attrib.get("idref")
+        if not idref:
+            continue
+        resolved_path = manifest_map.get(idref)
+        if not resolved_path or not _is_xhtml_path(resolved_path):
+            continue
+        spine_paths.append(resolved_path)
+
+    return spine_paths or None
+
+
+def _extract_epub_payload_via_spine(epub_binary: bytes) -> Optional[dict[str, object]]:
+    try:
+        with ZipFile(BytesIO(epub_binary)) as epub_zip:
+            spine_paths = _read_spine_xhtml_paths_from_epub(epub_zip)
+            if not spine_paths:
+                return None
+
+            docs: list[dict[str, str]] = []
+            for spine_path in spine_paths:
+                if not _is_xhtml_path(spine_path):
+                    continue
+                try:
+                    html_bytes = epub_zip.read(spine_path)
+                except KeyError:
+                    return None
+                html_content, text_content = _extract_epub_document_parts(html_bytes)
+                docs.append(
+                    {
+                        "path": spine_path,
+                        "html": html_content,
+                        "text": text_content,
+                    }
+                )
+
+            if not docs:
+                return None
+
+            filtered_docs = docs[:] if len(docs) == 1 else docs[1:]
+            if not filtered_docs:
+                return {"text_count": 0, "html_content": ""}
+
+            copyright_indexes: set[int] = set()
+            inspect_start_idx = max(0, len(filtered_docs) - 3)
+            for idx in range(inspect_start_idx, len(filtered_docs)):
+                doc = filtered_docs[idx]
+                keyword_hits = _count_copyright_keyword_hits(doc["text"])
+                if keyword_hits >= 2 or (
+                    keyword_hits >= 1 and _is_copyright_file_name(doc["path"])
+                ):
+                    copyright_indexes.add(idx)
+
+            if copyright_indexes:
+                filtered_docs = [
+                    doc
+                    for idx, doc in enumerate(filtered_docs)
+                    if idx not in copyright_indexes
+                ]
+
+            html_content = "".join(doc["html"] for doc in filtered_docs)
+            text_count = sum(len(doc["text"]) for doc in filtered_docs if doc["text"])
+            return {"text_count": text_count, "html_content": html_content}
+    except (BadZipFile, ValueError):
+        raise
+    except Exception:
+        return None
+
+
+def _extract_epub_payload_via_zip_fallback(epub_binary: bytes) -> dict[str, object]:
+    docs: list[dict[str, str]] = []
+
+    with ZipFile(BytesIO(epub_binary)) as epub_zip:
+        for file_info in epub_zip.infolist():
+            if file_info.is_dir():
+                continue
+
+            file_name = file_info.filename
+            if not _is_xhtml_path(file_name):
+                continue
+
+            html_content = epub_zip.read(file_info)
+            body_html, text_content = _extract_epub_document_parts(html_content)
+            docs.append(
+                {
+                    "path": file_name,
+                    "html": body_html,
+                    "text": text_content,
+                }
+            )
+
+    filtered_docs = [
+        doc for doc in docs if "cover" not in doc["path"].lower()
+    ]
+    inspect_start_idx = max(0, len(filtered_docs) - 3)
+    copyright_indexes: set[int] = set()
+    for idx in range(inspect_start_idx, len(filtered_docs)):
+        doc = filtered_docs[idx]
+        keyword_hits = _count_copyright_keyword_hits(doc["text"])
+        if keyword_hits >= 2 or (
+            keyword_hits >= 1 and _is_copyright_file_name(doc["path"])
+        ):
+            copyright_indexes.add(idx)
+
+    if copyright_indexes:
+        filtered_docs = [
+            doc
+            for idx, doc in enumerate(filtered_docs)
+            if idx not in copyright_indexes
+        ]
+
+    return {
+        "text_count": sum(len(doc["text"]) for doc in filtered_docs if doc["text"]),
+        "html_content": "".join(doc["html"] for doc in filtered_docs),
+    }
+
+
+def _extract_epub_payload_from_epub(epub_binary: bytes) -> dict[str, object]:
+    payload = _extract_epub_payload_via_spine(epub_binary)
+    if payload is not None:
+        return {
+            "text_count": int(payload.get("text_count") or 0),
+            "html_content": str(payload.get("html_content") or ""),
+        }
+
+    return _extract_epub_payload_via_zip_fallback(epub_binary)
+
+
 async def _promote_product_price_type_to_paid(
     product_id: int, updated_id: int, db: AsyncSession
 ) -> None:
@@ -112,51 +345,14 @@ async def _promote_product_price_type_to_paid(
 
 
 def _extract_text_count_from_epub(epub_binary: bytes) -> int:
-    total_text_count = 0
-
-    with ZipFile(BytesIO(epub_binary)) as epub_zip:
-        for file_info in epub_zip.infolist():
-            if file_info.is_dir():
-                continue
-
-            file_name = file_info.filename.lower()
-            if not file_name.endswith((".xhtml", ".html", ".htm")):
-                continue
-
-            html_content = epub_zip.read(file_info)
-            soup = BeautifulSoup(html_content, "html.parser")
-
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
-
-            text_content = soup.get_text(separator=" ", strip=True)
-            if text_content:
-                total_text_count += len(text_content)
-
-    return total_text_count
+    payload = _extract_epub_payload_from_epub(epub_binary)
+    return int(payload.get("text_count") or 0)
 
 
 def _extract_html_content_from_epub(epub_binary: bytes) -> str:
-    """EPUB에서 본문 HTML을 추출한다 (cover.xhtml 제외)."""
-    parts = []
-    with ZipFile(BytesIO(epub_binary)) as epub_zip:
-        for file_info in epub_zip.infolist():
-            if file_info.is_dir():
-                continue
-            file_name = file_info.filename.lower()
-            if not file_name.endswith((".xhtml", ".html", ".htm")):
-                continue
-            # 표지 파일 제외
-            if "cover" in file_name:
-                continue
-            html_content = epub_zip.read(file_info)
-            soup = BeautifulSoup(html_content, "html.parser")
-            body = soup.find("body")
-            if body:
-                parts.append(body.decode_contents())
-            else:
-                parts.append(str(soup))
-    return "".join(parts)
+    """EPUB에서 본문 HTML을 추출한다."""
+    payload = _extract_epub_payload_from_epub(epub_binary)
+    return str(payload.get("html_content") or "")
 
 
 async def _download_epub_binary_from_r2(
@@ -290,13 +486,10 @@ async def _get_epub_cache_from_epub_files(
                     response = await ac.get(url=presigned_url)
                     response.raise_for_status()
                 epub_bytes = response.content
-                text_count = await asyncio.to_thread(
-                    _extract_text_count_from_epub, epub_bytes
+                epub_payload = await asyncio.to_thread(
+                    _extract_epub_payload_from_epub, epub_bytes
                 )
-                html_content = await asyncio.to_thread(
-                    _extract_html_content_from_epub, epub_bytes
-                )
-                return file_group_id, {"text_count": text_count, "html_content": html_content}
+                return file_group_id, epub_payload
             except (HTTPStatusError, RequestError, BadZipFile, ValueError) as e:
                 logger.warning(
                     "Failed to extract epub in batch. file_group_id=%s, reason=%s",
@@ -2003,11 +2196,14 @@ async def post_episodes_products_product_id_epub(
                 epub_binary = await _download_epub_binary_from_r2(
                     req_body.epub_file_id, db
                 )
-                episode_text_count = (
-                    _extract_text_count_from_epub(epub_binary) if epub_binary else 0
+                epub_payload = (
+                    _extract_epub_payload_from_epub(epub_binary)
+                    if epub_binary
+                    else {"text_count": 0, "html_content": ""}
                 )
-                episode_content_from_epub = (
-                    _extract_html_content_from_epub(epub_binary) if epub_binary else ""
+                episode_text_count = int(epub_payload.get("text_count") or 0)
+                episode_content_from_epub = str(
+                    epub_payload.get("html_content") or ""
                 )
 
 
@@ -2420,6 +2616,224 @@ async def post_episodes_products_product_id_epub_batch(
     res_body = {"data": res_data}
 
     return res_body
+
+
+async def post_episodes_products_product_id_titles_bulk(
+    product_id: str,
+    req_body: episode_schema.PostEpisodesProductsProductIdTitlesBulkReqBody,
+    kc_user_id: str,
+    db: AsyncSession,
+):
+    res_data = {}
+
+    if kc_user_id:
+        try:
+            async with _transaction_scope(db):
+                user_id, user_info = await comm_service.get_user_from_kc(
+                    kc_user_id, db, addUserInfo=["role_type"]
+                )
+                if user_id == -1:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        message=ErrorMessages.LOGIN_REQUIRED,
+                    )
+
+                product_id_to_int = int(product_id)
+                rows_from_sheet = req_body.episodes or []
+                if not rows_from_sheet:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                normalized_rows: list[dict] = []
+                seen_episode_nos: set[int] = set()
+                for row in rows_from_sheet:
+                    episode_no = int(row.no) if int(row.no) > 0 else 0
+                    file_name = _normalize_bulk_episode_title(row.file_name)
+                    episode_title = _normalize_bulk_episode_title(row.title)
+
+                    if (
+                        episode_no <= 0
+                        or not file_name
+                        or not episode_title
+                        or len(episode_title) > 300
+                        or _has_disallowed_control_chars(file_name)
+                        or _has_disallowed_control_chars(episode_title)
+                        or episode_no in seen_episode_nos
+                    ):
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.INVALID_EPISODE_INFO,
+                        )
+
+                    seen_episode_nos.add(episode_no)
+                    normalized_rows.append(
+                        {
+                            "episode_no": episode_no,
+                            "file_name": file_name,
+                            "episode_title": episode_title,
+                        }
+                    )
+
+                is_admin = (user_info or {}).get("role_type") == "admin"
+
+                query = text(
+                    """
+                    select
+                        e.episode_id,
+                        e.episode_no,
+                        e.episode_title,
+                        e.open_yn,
+                        e.publish_reserve_date,
+                        pea_latest.latest_apply_status,
+                        cfi.file_org_name as epub_file_name
+                    from tb_product_episode e
+                    inner join tb_product p
+                       on p.product_id = e.product_id
+                    left join (
+                        select
+                            pea.episode_id,
+                            pea.status_code as latest_apply_status
+                        from tb_product_episode_apply pea
+                        inner join (
+                            select episode_id, max(id) as max_id
+                            from tb_product_episode_apply
+                            where use_yn = 'Y'
+                            group by episode_id
+                        ) pea_max
+                          on pea_max.episode_id = pea.episode_id
+                         and pea_max.max_id = pea.id
+                        where pea.use_yn = 'Y'
+                    ) pea_latest
+                      on pea_latest.episode_id = e.episode_id
+                    left join tb_common_file cf
+                      on cf.file_group_id = e.epub_file_id
+                     and cf.group_type = 'epub'
+                     and cf.use_yn = 'Y'
+                    left join tb_common_file_item cfi
+                      on cfi.file_group_id = cf.file_group_id
+                     and cfi.use_yn = 'Y'
+                    where e.product_id = :product_id
+                      and e.use_yn = 'Y'
+                      and (:is_admin = 1 or p.user_id = :user_id)
+                    for update
+                    """
+                )
+                result = await db.execute(
+                    query,
+                    {
+                        "product_id": product_id_to_int,
+                        "is_admin": 1 if is_admin else 0,
+                        "user_id": user_id,
+                    },
+                )
+                rows = result.mappings().all()
+                if not rows:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                eligible_rows = []
+                episode_row_by_no: dict[int, dict] = {}
+                for row in rows:
+                    if _is_episode_upload_completed(
+                        latest_apply_status=row.get("latest_apply_status"),
+                        open_yn=row.get("open_yn"),
+                        publish_reserve_date=row.get("publish_reserve_date"),
+                    ):
+                        episode_no = int(row.get("episode_no"))
+                        if episode_no in episode_row_by_no:
+                            raise CustomResponseException(
+                                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                message=ErrorMessages.INVALID_EPISODE_INFO,
+                            )
+                        episode_row_by_no[episode_no] = dict(row)
+                        eligible_rows.append(dict(row))
+
+                if len(eligible_rows) != len(normalized_rows):
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                update_rows = []
+                updated_episode_ids = []
+                for sheet_row in normalized_rows:
+                    current_row = episode_row_by_no.get(sheet_row["episode_no"])
+                    if current_row is None:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.INVALID_EPISODE_INFO,
+                        )
+
+                    current_file_name = _normalize_bulk_episode_title(
+                        current_row.get("epub_file_name")
+                    )
+                    if not current_file_name or current_file_name != sheet_row["file_name"]:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.INVALID_EPISODE_INFO,
+                        )
+
+                    update_rows.append(
+                        {
+                            "episode_id": int(current_row.get("episode_id")),
+                            "episode_title": sheet_row["episode_title"],
+                            "updated_id": user_id,
+                        }
+                    )
+                    updated_episode_ids.append(int(current_row.get("episode_id")))
+
+                query = text(
+                    """
+                    update tb_product_episode
+                       set episode_title = :episode_title,
+                           updated_id = :updated_id
+                     where episode_id = :episode_id
+                       and use_yn = 'Y'
+                    """
+                )
+                await db.execute(query, update_rows)
+
+                res_data = {
+                    "count": len(update_rows),
+                    "episodeIds": updated_episode_ids,
+                }
+        except ValueError as e:
+            logger.error(e, exc_info=True)
+            raise CustomResponseException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                message=ErrorMessages.INVALID_EPISODE_INFO,
+            )
+        except CustomResponseException as e:
+            logger.error(e, exc_info=True)
+            raise
+        except OperationalError as e:
+            logger.error(e, exc_info=True)
+            raise CustomResponseException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                message=ErrorMessages.DB_CONNECTION_ERROR,
+            )
+        except SQLAlchemyError as e:
+            logger.error(e, exc_info=True)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message=ErrorMessages.DB_OPERATION_ERROR,
+            )
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    else:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+        )
+
+    return {"data": res_data}
 
 
 async def post_episodes_review_requests(
