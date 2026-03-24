@@ -4044,6 +4044,26 @@ async def get_common_rate_data(
 
 
 @router.get(
+    "/platform-service-rate",
+    tags=["CMS - 플랫폼 수수료"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_platform_service_rate_config(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    플랫폼 수수료 설정 조회
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_basic_service.get_platform_service_rate_config(db)
+
+
+@router.get(
     "/products/simple",
     tags=["CMS - 작품"],
     responses={

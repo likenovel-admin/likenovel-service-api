@@ -15,6 +15,11 @@ from app.utils.query import get_file_path_sub_query
 from app.utils.response import build_list_response
 import app.services.common.comm_service as comm_service
 import app.schemas.product as product_schema
+from app.services.common.cp_link_service import (
+    get_accepted_cp_info_by_nickname,
+    get_accepted_cp_info_by_user_id,
+    normalize_cp_nickname,
+)
 
 from app.config.log_config import service_error_logger
 
@@ -113,6 +118,36 @@ async def _resolve_author_id(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         message=ErrorMessages.INVALID_NICKNAME_INFO,
     )
+
+
+async def _resolve_cp_link_info(
+    cp_contract_yn: str,
+    cp_nickname: str | None,
+    db: AsyncSession,
+    *,
+    for_update: bool = False,
+) -> dict | None:
+    if cp_contract_yn != "Y":
+        return None
+
+    normalized_cp_nickname = normalize_cp_nickname(cp_nickname)
+    if normalized_cp_nickname is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message="유효한 CP를 확인할 수 없습니다.",
+        )
+
+    cp_info = await get_accepted_cp_info_by_nickname(
+        normalized_cp_nickname, db, for_update=for_update
+    )
+    if cp_info is None:
+        logger.warning("invalid cp nickname requested during contract validation")
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message="유효한 CP를 확인할 수 없습니다.",
+        )
+
+    return cp_info
 
 
 def get_select_fields_and_joins_for_product(
@@ -2363,10 +2398,27 @@ async def get_products_product_id_info(
                                     , a.blind_yn
                                     , a.monopoly_yn
                                     , a.contract_yn
+                                    , a.cp_user_id
+                                    , (
+                                        select up.nickname
+                                          from tb_user_profile up
+                                         where up.user_id = a.cp_user_id
+                                           and up.default_yn = 'Y'
+                                         order by up.profile_id asc
+                                         limit 1
+                                      ) as cp_nickname
                                     , a.paid_open_date as paid_setting_date
                                     , a.paid_episode_no
                                     , a.price_type
                                     , a.product_type
+                                    , (
+                                        select ppa.status_code
+                                          from tb_product_paid_apply ppa
+                                         where ppa.product_id = a.product_id
+                                           and ppa.use_yn = 'Y'
+                                         order by ppa.id desc
+                                         limit 1
+                                      ) as paid_apply_status
                                     , case when exists (
                                         select 1
                                           from tb_product_paid_apply ppa
@@ -2413,9 +2465,11 @@ async def get_products_product_id_info(
                     "blindYn": db_rst[0].get("blind_yn"),
                     "monopolyYn": db_rst[0].get("monopoly_yn"),
                     "cpContractYn": db_rst[0].get("contract_yn"),
+                    "cpNickname": db_rst[0].get("cp_nickname"),
                     "paidSettingDate": db_rst[0].get("paid_setting_date"),
                     "paidEpisodeNo": db_rst[0].get("paid_episode_no"),
                     "priceType": db_rst[0].get("price_type"),
+                    "paidApplyStatus": db_rst[0].get("paid_apply_status"),
                     "paidApprovedYn": db_rst[0].get("paid_approved_yn"),
                     "productType": db_rst[0].get("product_type"),
                 }
@@ -2446,6 +2500,37 @@ async def get_products_product_id_info(
     res_body = {"data": res_data}
 
     return res_body
+
+
+async def get_products_validate_cp_nickname(
+    nickname: str, kc_user_id: str, db: AsyncSession
+):
+    if not kc_user_id:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+        )
+
+    user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
+    current_user_role = await _resolve_current_user_role(kc_user_id, db)
+    if current_user_role != "author":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
+
+    cp_info = await get_accepted_cp_info_by_nickname(nickname, db)
+    return {
+        "data": {
+            "valid": cp_info is not None,
+        }
+    }
 
 
 async def post_products(
@@ -2547,6 +2632,12 @@ async def post_products(
                     author_nickname=req_body.author_nickname,
                     db=db,
                     allow_external_author_nickname=allow_external_author_nickname,
+                )
+                cp_link_info = await _resolve_cp_link_info(
+                    req_body.cp_contract_yn,
+                    req_body.cp_nickname,
+                    db,
+                    for_update=True,
                 )
 
                 # 1李??λⅤ 寃利?
@@ -2654,8 +2745,8 @@ async def post_products(
                     product_type = None
 
                 query = text("""
-                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, blind_yn, monopoly_yn, contract_yn, series_regular_price, single_regular_price, single_rental_price, created_id, updated_id)
-                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :blind_yn, :monopoly_yn, :contract_yn, :series_regular_price, :single_regular_price, :single_rental_price, :created_id, :updated_id
+                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, blind_yn, monopoly_yn, contract_yn, cp_user_id, series_regular_price, single_regular_price, single_rental_price, created_id, updated_id)
+                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :blind_yn, :monopoly_yn, :contract_yn, :cp_user_id, :series_regular_price, :single_regular_price, :single_rental_price, :created_id, :updated_id
                                    from tb_user
                                   where kc_user_id = :kc_user_id
                                     and use_yn = 'Y'
@@ -2688,6 +2779,7 @@ async def post_products(
                         "blind_yn": requested_blind_yn,
                         "monopoly_yn": req_body.monopoly_yn,
                         "contract_yn": req_body.cp_contract_yn,
+                        "cp_user_id": cp_link_info.get("user_id") if cp_link_info else None,
                         "series_regular_price": series_regular_price,
                         "single_regular_price": single_regular_price,
                         "single_rental_price": single_rental_price,
@@ -2864,10 +2956,22 @@ async def put_products_product_id(
                 )
                 allow_external_author_nickname = current_user_role in ("admin", "CP")
                 query = text("""
-                                 select blind_yn, open_yn
+                                 select blind_yn
+                                      , open_yn
+                                      , contract_yn
+                                      , cp_user_id
+                                      , (
+                                            select ppa.status_code
+                                              from tb_product_paid_apply ppa
+                                             where ppa.product_id = tb_product.product_id
+                                               and ppa.use_yn = 'Y'
+                                             order by ppa.id desc
+                                             limit 1
+                                        ) as paid_apply_status
                                    from tb_product
                                   where product_id = :product_id
                                   limit 1
+                                  for update
                                  """)
                 result = await db.execute(query, {"product_id": product_id_to_int})
                 current_product = result.mappings().one_or_none()
@@ -2878,6 +2982,9 @@ async def put_products_product_id(
                     )
                 current_blind_yn = (current_product.get("blind_yn") or "N").upper()
                 current_open_yn = (current_product.get("open_yn") or "N").upper()
+                current_contract_yn = (current_product.get("contract_yn") or "N").upper()
+                current_cp_user_id = current_product.get("cp_user_id")
+                current_paid_apply_status = current_product.get("paid_apply_status")
                 fields_set = getattr(req_body, "model_fields_set", set()) or set()
                 blind_yn_in_request = "blind_yn" in fields_set
                 requested_blind_yn = (
@@ -2900,6 +3007,38 @@ async def put_products_product_id(
                             status_code=status.HTTP_403_FORBIDDEN,
                             message="관리자 블라인드된 작품은 공개 상태를 변경할 수 없습니다.",
                         )
+                is_contract_locked = current_paid_apply_status in ("review", "accepted")
+                current_cp_info = await get_accepted_cp_info_by_user_id(
+                    current_cp_user_id, db
+                )
+                current_cp_nickname = (
+                    current_cp_info.get("nickname") if current_cp_info else None
+                )
+                requested_cp_link_info = await _resolve_cp_link_info(
+                    req_body.cp_contract_yn,
+                    req_body.cp_nickname,
+                    db,
+                    for_update=True,
+                )
+                requested_cp_user_id = (
+                    requested_cp_link_info.get("user_id")
+                    if requested_cp_link_info
+                    else None
+                )
+                requested_cp_nickname = (
+                    requested_cp_link_info.get("nickname")
+                    if requested_cp_link_info
+                    else None
+                )
+                if is_contract_locked and (
+                    req_body.cp_contract_yn != current_contract_yn
+                    or normalize_cp_nickname(requested_cp_nickname)
+                    != normalize_cp_nickname(current_cp_nickname)
+                ):
+                    raise CustomResponseException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        message="심사중 또는 승인된 작품은 계약 정보를 변경할 수 없습니다.",
+                    )
 
                 # ?곗옱?곹깭 寃利?
                 query = text("""
@@ -3066,6 +3205,7 @@ async def put_products_product_id(
                                           , a.blind_yn = :blind_yn
                                           , a.monopoly_yn = :monopoly_yn
                                           , a.contract_yn = :contract_yn
+                                          , a.cp_user_id = :cp_user_id
                                           , a.paid_open_date = :paid_open_date
                                           , a.paid_episode_no = :paid_episode_no
                                           , a.updated_id = a.user_id
@@ -3100,6 +3240,7 @@ async def put_products_product_id(
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": req_body.cp_contract_yn,
+                            "cp_user_id": requested_cp_user_id,
                             "paid_open_date": convert_to_kor_time(
                                 req_body.paid_setting_date
                             )
@@ -3135,6 +3276,7 @@ async def put_products_product_id(
                                           , a.blind_yn = :blind_yn
                                           , a.monopoly_yn = :monopoly_yn
                                           , a.contract_yn = :contract_yn
+                                          , a.cp_user_id = :cp_user_id
                                           , a.paid_open_date = :paid_open_date
                                           , a.paid_episode_no = :paid_episode_no
                                           , a.updated_id = a.user_id
@@ -3170,6 +3312,7 @@ async def put_products_product_id(
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": req_body.cp_contract_yn,
+                            "cp_user_id": requested_cp_user_id,
                             "paid_open_date": convert_to_kor_time(
                                 req_body.paid_setting_date
                             )
@@ -3323,6 +3466,42 @@ async def put_products_product_id_conversion(
                             "productType": "normal",
                         }
                 elif category == "paid":
+                    contract_query = text("""
+                                     select contract_yn, cp_user_id
+                                       from tb_product
+                                      where user_id = :user_id
+                                        and product_id = :product_id
+                                      limit 1
+                                      for update
+                                     """)
+                    contract_result = await db.execute(
+                        contract_query,
+                        {"user_id": user_id, "product_id": product_id_to_int},
+                    )
+                    contract_row = contract_result.mappings().one_or_none()
+                    if contract_row is None:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            message=ErrorMessages.NOT_FOUND_PRODUCT,
+                        )
+                    if (
+                        contract_row.get("contract_yn") != "Y"
+                        or contract_row.get("cp_user_id") is None
+                    ):
+                        raise CustomResponseException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            message="계약 상태 작품만 유료전환 신청이 가능합니다.",
+                        )
+                    linked_cp_info = await get_accepted_cp_info_by_user_id(
+                        contract_row.get("cp_user_id"),
+                        db,
+                        for_update=True,
+                    )
+                    if linked_cp_info is None:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            message="유효한 CP를 확인할 수 없습니다.",
+                        )
                     # ?좊즺?꾪솚: 理쒕? 2踰??좎껌 媛?? ?ъ궗 ???뱀씤?섎㈃ ?밴툒 泥섎━
                     query = text("""
                                      select a.product_id

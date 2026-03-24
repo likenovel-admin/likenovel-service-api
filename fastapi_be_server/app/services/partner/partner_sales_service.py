@@ -2,9 +2,9 @@ import logging
 import re
 from decimal import Decimal, ROUND_HALF_UP
 from fastapi import status
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime
+from datetime import date, datetime
 
 from app.exceptions import CustomResponseException
 import app.schemas.partner as partner_schema
@@ -18,6 +18,13 @@ from app.const import ErrorMessages
 
 logger = logging.getLogger("partner_app")  # 커스텀 로거 생성
 
+PRODUCT_WEB_FEE_RATE = Decimal("0")
+PRODUCT_PLATFORM_SERVICE_RATE = Decimal("30")
+PRODUCT_COMPED_FEE_RATE = Decimal("0")
+GLOBAL_PLATFORM_SERVICE_SCOPE = "global"
+PRODUCT_PLATFORM_SERVICE_SCOPE = "product"
+GLOBAL_PLATFORM_SERVICE_PRODUCT_ID = 0
+
 """
 partner 파트너 매출/정산 관련 서비스 함수 모음
 """
@@ -27,6 +34,423 @@ def _normalize_episode_title(title):
     if title is None:
         return None
     return re.sub(r"\.epub$", "", str(title).strip(), flags=re.IGNORECASE)
+
+
+def _cp_owned_product_ids_subquery(user_id: int) -> str:
+    return f"""
+        SELECT product_id
+        FROM tb_product
+        WHERE cp_user_id = {user_id}
+           OR user_id = {user_id}
+    """
+
+
+def _cp_company_name_product_ids_subquery(search_word: str) -> str:
+    return f"""
+        SELECT p.product_id
+        FROM tb_product p
+        INNER JOIN tb_user_profile_apply y ON p.cp_user_id = y.user_id
+            AND y.apply_type = 'cp'
+            AND y.approval_code = 'accepted'
+            AND y.approval_date IS NOT NULL
+        WHERE y.company_name LIKE '%{search_word}%'
+    """
+
+
+def _cp_company_name_lookup_subquery(product_id_column: str) -> str:
+    return f"""
+        (
+            SELECT y.company_name
+            FROM tb_product p
+            INNER JOIN tb_user_profile_apply y ON p.cp_user_id = y.user_id
+                AND y.apply_type = 'cp'
+                AND y.approval_code = 'accepted'
+                AND y.approval_date IS NOT NULL
+            WHERE p.product_id = {product_id_column}
+            LIMIT 1
+        )
+    """
+
+
+async def _get_cp_metadata_map_by_product_ids(
+    product_ids: list[int], db: AsyncSession
+) -> dict[int, dict[str, str | None]]:
+    normalized_product_ids = sorted(
+        {product_id for product_id in product_ids if product_id is not None}
+    )
+    if not normalized_product_ids:
+        return {}
+
+    query = (
+        text(
+            """
+            WITH ranked_cp_summary AS (
+                SELECT ranked.user_id,
+                       ranked.company_name
+                  FROM (
+                        SELECT user_id,
+                               company_name,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY user_id
+                                   ORDER BY approval_date DESC, id DESC
+                               ) AS rn
+                          FROM tb_user_profile_apply
+                         WHERE apply_type = 'cp'
+                           AND approval_code = 'accepted'
+                           AND approval_date IS NOT NULL
+                  ) ranked
+                 WHERE ranked.rn = 1
+            )
+            SELECT p.product_id,
+                   cp.company_name AS cp_company_name
+              FROM tb_product p
+              LEFT JOIN ranked_cp_summary cp ON p.cp_user_id = cp.user_id
+             WHERE p.product_id IN :product_ids
+            """
+        ).bindparams(bindparam("product_ids", expanding=True))
+    )
+    result = await db.execute(query, {"product_ids": normalized_product_ids})
+    metadata_map: dict[int, dict[str, str | None]] = {}
+    for row in result.mappings().all():
+        cp_company_name = row.get("cp_company_name")
+        if cp_company_name is None:
+            contract_type = None
+        elif cp_company_name == CommonConstants.COMPANY_LIKENOVEL:
+            contract_type = "일반"
+        else:
+            contract_type = "cp"
+        metadata_map[row["product_id"]] = {
+            "cp_company_name": cp_company_name,
+            "contract_type": contract_type,
+        }
+    return metadata_map
+
+
+def _to_decimal(value) -> Decimal:
+    return Decimal(str(value)) if value is not None else Decimal("0")
+
+
+def _to_int(decimal_value: Decimal) -> int:
+    return int(decimal_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _calculate_channel_payout(gross_sales: Decimal, fee: Decimal, payout_rate: Decimal) -> Decimal:
+    if gross_sales <= 0:
+        return Decimal("0")
+    return max(
+        Decimal("0"),
+        (gross_sales - fee) * (payout_rate / Decimal("100")),
+    )
+
+
+def _calculate_product_sales_totals(data: dict) -> dict[str, Decimal]:
+    gross_sales_web = (
+        _to_decimal(data.get("sum_normal_price_web"))
+        + _to_decimal(data.get("sum_ticket_price_web"))
+        - _to_decimal(data.get("sum_refund_price_web"))
+    )
+    gross_sales_playstore = (
+        _to_decimal(data.get("sum_normal_price_playstore"))
+        + _to_decimal(data.get("sum_ticket_price_playstore"))
+        - _to_decimal(data.get("sum_refund_price_playstore"))
+    )
+    gross_sales_ios = (
+        _to_decimal(data.get("sum_normal_price_ios"))
+        + _to_decimal(data.get("sum_ticket_price_ios"))
+        - _to_decimal(data.get("sum_refund_price_ios"))
+    )
+    gross_sales_onestore = (
+        _to_decimal(data.get("sum_normal_price_onestore"))
+        + _to_decimal(data.get("sum_ticket_price_onestore"))
+        - _to_decimal(data.get("sum_refund_price_onestore"))
+    )
+    gross_comped_ticket = _to_decimal(data.get("sum_comped_ticket_price")) - _to_decimal(
+        data.get("sum_refund_comped_ticket_price")
+    )
+
+    fee_web = _to_decimal(data.get("fee_web")) if gross_sales_web > 0 else Decimal("0")
+    fee_playstore = (
+        _to_decimal(data.get("fee_playstore"))
+        if gross_sales_playstore > 0
+        else Decimal("0")
+    )
+    fee_ios = _to_decimal(data.get("fee_ios")) if gross_sales_ios > 0 else Decimal("0")
+    fee_onestore = (
+        _to_decimal(data.get("fee_onestore"))
+        if gross_sales_onestore > 0
+        else Decimal("0")
+    )
+    fee_comped_ticket = (
+        _to_decimal(data.get("fee_comped_ticket"))
+        if gross_comped_ticket > 0
+        else Decimal("0")
+    )
+
+    paid_price_web = _calculate_channel_payout(
+        gross_sales_web,
+        fee_web,
+        _to_decimal(data.get("settlement_rate_web")),
+    )
+    paid_price_playstore = _calculate_channel_payout(
+        gross_sales_playstore,
+        fee_playstore,
+        _to_decimal(data.get("settlement_rate_playstore")),
+    )
+    paid_price_ios = _calculate_channel_payout(
+        gross_sales_ios,
+        fee_ios,
+        _to_decimal(data.get("settlement_rate_ios")),
+    )
+    paid_price_onestore = _calculate_channel_payout(
+        gross_sales_onestore,
+        fee_onestore,
+        _to_decimal(data.get("settlement_rate_onestore")),
+    )
+    free_price = _calculate_channel_payout(
+        gross_comped_ticket,
+        fee_comped_ticket,
+        _to_decimal(data.get("settlement_rate_comped_ticket")),
+    )
+
+    paid_price = (
+        paid_price_web
+        + paid_price_playstore
+        + paid_price_ios
+        + paid_price_onestore
+    )
+    gross_paid_price = (
+        gross_sales_web
+        + gross_sales_playstore
+        + gross_sales_ios
+        + gross_sales_onestore
+    )
+    gross_free_price = gross_comped_ticket
+    gross_total = (
+        gross_paid_price + gross_free_price
+    )
+    sum_price = paid_price + free_price
+
+    return {
+        "gross_total": gross_total,
+        "gross_paid_price": gross_paid_price,
+        "gross_free_price": gross_free_price,
+        "paid_price": paid_price,
+        "free_price": free_price,
+        "sum_price": sum_price,
+    }
+
+
+def _apply_author_settlement(
+    amount: Decimal, author_profit: Decimal | None
+) -> Decimal | None:
+    if author_profit is None or author_profit <= 0:
+        return None
+    return _calculate_channel_payout(amount, Decimal("0"), author_profit)
+
+
+async def _get_author_profit_map(product_ids: list[int], db: AsyncSession) -> dict[int, Decimal]:
+    normalized_product_ids = sorted({product_id for product_id in product_ids if product_id is not None})
+    if not normalized_product_ids:
+        return {}
+
+    query = (
+        text(
+            """
+            SELECT ranked.product_id, ranked.author_profit
+              FROM (
+                    SELECT z.product_id,
+                           z.author_profit,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY z.product_id
+                               ORDER BY COALESCE(z.updated_date, z.created_date) DESC, z.offer_id DESC
+                           ) AS rn
+                      FROM tb_product_contract_offer z
+                      INNER JOIN tb_product p ON p.product_id = z.product_id
+                     WHERE z.use_yn = 'Y'
+                       AND z.offer_user_id = p.cp_user_id
+                       AND z.author_profit IS NOT NULL
+                       AND z.author_profit > 0
+                       AND z.product_id IN :product_ids
+              ) ranked
+             WHERE ranked.rn = 1
+            """
+        ).bindparams(bindparam("product_ids", expanding=True))
+    )
+    result = await db.execute(query, {"product_ids": normalized_product_ids})
+    rows = result.mappings().all()
+    return {
+        row["product_id"]: _to_decimal(row["author_profit"])
+        for row in rows
+        if row.get("author_profit") is not None
+        and _to_decimal(row["author_profit"]) > 0
+    }
+
+
+async def _get_product_sales_app_fee_rate(db: AsyncSession) -> Decimal:
+    query = text(
+        """
+        SELECT code_value
+          FROM tb_common_code
+         WHERE code_group = 'common_rate'
+           AND code_key = 'payment_fee_rate'
+           AND use_yn = 'Y'
+         LIMIT 1
+        """
+    )
+    result = await db.execute(query, {})
+    row = result.mappings().one_or_none()
+    if row is None or row.get("code_value") is None:
+        return Decimal("30")
+    return _to_decimal(row["code_value"]) * Decimal("100")
+
+
+def _month_start(value) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return date(value.year, value.month, 1)
+    if isinstance(value, date):
+        return date(value.year, value.month, 1)
+    value_str = str(value)
+    try:
+        parsed = datetime.fromisoformat(value_str.replace("Z", "+00:00"))
+        return date(parsed.year, parsed.month, 1)
+    except ValueError:
+        if len(value_str) >= 10:
+            parsed_date = date.fromisoformat(value_str[:10])
+            return date(parsed_date.year, parsed_date.month, 1)
+    return None
+
+
+async def _get_platform_service_rate_context(
+    product_ids: list[int], db: AsyncSession
+) -> dict:
+    normalized_product_ids = sorted(
+        {product_id for product_id in product_ids if product_id is not None}
+    )
+
+    if normalized_product_ids:
+        query = (
+            text(
+                """
+                SELECT scope_type, product_id, rate, effective_month, id
+                  FROM tb_platform_service_rate_history
+                 WHERE use_yn = 'Y'
+                   AND (
+                        scope_type = :global_scope
+                        OR product_id IN :product_ids
+                   )
+                 ORDER BY effective_month DESC, id DESC
+                """
+            ).bindparams(bindparam("product_ids", expanding=True))
+        )
+        result = await db.execute(
+            query,
+            {
+                "global_scope": GLOBAL_PLATFORM_SERVICE_SCOPE,
+                "product_ids": normalized_product_ids,
+            },
+        )
+    else:
+        query = text(
+            """
+            SELECT scope_type, product_id, rate, effective_month, id
+              FROM tb_platform_service_rate_history
+             WHERE use_yn = 'Y'
+               AND scope_type = :global_scope
+             ORDER BY effective_month DESC, id DESC
+            """
+        )
+        result = await db.execute(query, {"global_scope": GLOBAL_PLATFORM_SERVICE_SCOPE})
+
+    global_rows: list[dict] = []
+    product_rows: dict[int, list[dict]] = {}
+    for row in result.mappings().all():
+        row_dict = dict(row)
+        if (
+            row_dict["scope_type"] == GLOBAL_PLATFORM_SERVICE_SCOPE
+            and row_dict["product_id"] == GLOBAL_PLATFORM_SERVICE_PRODUCT_ID
+        ):
+            global_rows.append(row_dict)
+            continue
+        product_rows.setdefault(row_dict["product_id"], []).append(row_dict)
+
+    return {
+        "global_rows": global_rows,
+        "product_rows": product_rows,
+    }
+
+
+def _resolve_platform_service_rate(
+    product_id: int | None, created_date_value, context: dict
+) -> Decimal:
+    target_month = _month_start(created_date_value)
+    if target_month is None:
+        return PRODUCT_PLATFORM_SERVICE_RATE
+
+    for row in context.get("product_rows", {}).get(product_id, []):
+        effective_month = row.get("effective_month")
+        if effective_month is None or effective_month > target_month:
+            continue
+        if row.get("rate") is None:
+            break
+        return _to_decimal(row["rate"])
+
+    for row in context.get("global_rows", []):
+        effective_month = row.get("effective_month")
+        if effective_month is None or effective_month > target_month:
+            continue
+        if row.get("rate") is None:
+            continue
+        return _to_decimal(row["rate"])
+
+    return PRODUCT_PLATFORM_SERVICE_RATE
+
+
+def _normalize_product_sales_row(
+    data: dict, app_fee_rate: Decimal, platform_service_rate: Decimal
+) -> dict:
+    normalized = dict(data)
+    normalized["fee_web"] = _to_int(PRODUCT_WEB_FEE_RATE)
+    normalized["fee_playstore"] = _to_int(app_fee_rate)
+    normalized["fee_ios"] = _to_int(app_fee_rate)
+    normalized["fee_onestore"] = _to_int(app_fee_rate)
+    normalized["fee_comped_ticket"] = _to_int(PRODUCT_COMPED_FEE_RATE)
+    payout_rate = Decimal("100") - platform_service_rate
+    normalized["settlement_rate_web"] = _to_int(payout_rate)
+    normalized["settlement_rate_playstore"] = _to_int(payout_rate)
+    normalized["settlement_rate_ios"] = _to_int(payout_rate)
+    normalized["settlement_rate_onestore"] = _to_int(payout_rate)
+    normalized["settlement_rate_comped_ticket"] = _to_int(payout_rate)
+    return normalized
+
+
+def _normalize_monthly_settlement_row(
+    data: dict, app_fee_rate: Decimal, platform_service_rate: Decimal
+) -> dict:
+    normalized = dict(data)
+    gross_sales = _to_decimal(normalized.get("sum_total_sales_price"))
+    if normalized.get("item_type") == "comped":
+        fee_rate = PRODUCT_COMPED_FEE_RATE
+    elif normalized.get("device_type") == "web":
+        fee_rate = PRODUCT_WEB_FEE_RATE
+    else:
+        fee_rate = app_fee_rate
+
+    fee = _calculate_channel_payout(gross_sales, Decimal("0"), fee_rate)
+    net_sales_price = gross_sales - fee
+    platform_revenue = _calculate_channel_payout(
+        net_sales_price, Decimal("0"), platform_service_rate
+    )
+    settlement_price = max(Decimal("0"), net_sales_price - platform_revenue)
+
+    normalized["fee"] = _to_int(fee)
+    normalized["net_sales_price"] = _to_int(net_sales_price)
+    normalized["taxable_price"] = _to_int(settlement_price)
+    normalized["vat_price"] = 0
+    normalized["settlement_price"] = _to_int(settlement_price)
+    normalized["platform_revenue"] = _to_int(platform_revenue)
+    return normalized
 
 
 async def monthly_sales_by_product_list(
@@ -71,16 +495,8 @@ async def monthly_sales_by_product_list(
             INNER JOIN tb_product p ON pps.product_id = p.product_id
         """
         where += f"""
-            AND (p.product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            ) OR p.user_id = {user_data["user_id"]})
+            AND (p.cp_user_id = {user_data["user_id"]}
+                 OR p.user_id = {user_data["user_id"]})
         """
 
     if search_word != "":
@@ -107,16 +523,10 @@ async def monthly_sales_by_product_list(
                           AND pps.author_nickname LIKE '%{search_word}%'
                           """
         elif search_target == CommonConstants.SEARCH_CP_NAME:
-            additional_joins += """
-                INNER JOIN tb_product_contract_offer z ON pps.product_id = z.product_id
-                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
-            """
             where += f"""
-                          AND y.apply_type = 'cp'
-                          AND y.approval_date IS NOT NULL
-                          AND z.use_yn = 'Y'
-                          AND z.author_accept_yn = 'Y'
-                          AND y.company_name LIKE '%{search_word}%'
+                          AND pps.product_id IN (
+                              {_cp_company_name_product_ids_subquery(search_word)}
+                          )
                           """
 
     if search_start_date != "":
@@ -152,11 +562,50 @@ async def monthly_sales_by_product_list(
     """)
     result = await db.execute(query, limit_params)
     rows = result.mappings().all()
+    app_fee_rate = await _get_product_sales_app_fee_rate(db)
+    platform_rate_context = await _get_platform_service_rate_context(
+        [row["product_id"] for row in rows], db
+    )
+    cp_metadata_map = await _get_cp_metadata_map_by_product_ids(
+        [row["product_id"] for row in rows], db
+    )
 
-    return build_paginated_response(rows, total_count, page, count_per_page)
+    author_profit_map = {}
+    if rows and user_data["role"] == "author":
+        author_profit_map = await _get_author_profit_map(
+            [row["product_id"] for row in rows], db
+        )
+
+    normalized_rows = []
+    for row in rows:
+        platform_service_rate = _resolve_platform_service_rate(
+            row["product_id"], row.get("created_date"), platform_rate_context
+        )
+        data = _normalize_product_sales_row(
+            dict(row), app_fee_rate, platform_service_rate
+        )
+        totals = _calculate_product_sales_totals(data)
+        data["gross_total_price"] = _to_int(totals["gross_total"])
+        cp_metadata = cp_metadata_map.get(data["product_id"], {})
+        data["cp_company_name"] = cp_metadata.get("cp_company_name")
+        data["contract_type"] = cp_metadata.get("contract_type")
+        if user_data["role"] == "author":
+            author_settlement = _apply_author_settlement(
+                totals["sum_price"], author_profit_map.get(data["product_id"])
+            )
+            data["settlement_price"] = (
+                _to_int(author_settlement) if author_settlement is not None else None
+            )
+        else:
+            data["settlement_price"] = _to_int(totals["sum_price"])
+        normalized_rows.append(data)
+
+    return build_paginated_response(normalized_rows, total_count, page, count_per_page)
 
 
-async def monthly_sales_by_product_detail_by_product_id(id: int, db: AsyncSession):
+async def monthly_sales_by_product_detail_by_product_id(
+    id: int, db: AsyncSession, user_data: dict
+):
     """
     특정 작품의 월매출 상세 정보를 조회
 
@@ -167,6 +616,29 @@ async def monthly_sales_by_product_detail_by_product_id(id: int, db: AsyncSessio
     Returns:
         dict: 해당 작품의 월매출 상세 데이터
     """
+    access_where = ""
+    if user_data["role"] == "author":
+        access_where = "AND author_id = :user_id"
+    elif user_data["role"] == "CP":
+        access_where = "AND (cp_user_id = :user_id OR user_id = :user_id)"
+
+    if access_where:
+        access_query = text(f"""
+            SELECT 1
+              FROM tb_product
+             WHERE product_id = :product_id
+               {access_where}
+             LIMIT 1
+        """)
+        access_result = await db.execute(
+            access_query,
+            {"product_id": id, "user_id": user_data["user_id"]},
+        )
+        if access_result.scalar() is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                message=ErrorMessages.PERMISSION_DENIED,
+            )
 
     query = text("""
         SELECT
@@ -180,115 +652,101 @@ async def monthly_sales_by_product_detail_by_product_id(id: int, db: AsyncSessio
     check_exists_or_404(rows, ErrorMessages.NOT_FOUND_PRODUCT)
 
     data = dict(rows[0])
+    app_fee_rate = await _get_product_sales_app_fee_rate(db)
+    platform_rate_context = await _get_platform_service_rate_context([id], db)
+    platform_service_rate = _resolve_platform_service_rate(
+        id, data.get("created_date"), platform_rate_context
+    )
+    data = _normalize_product_sales_row(data, app_fee_rate, platform_service_rate)
+    cp_metadata = (await _get_cp_metadata_map_by_product_ids([id], db)).get(id, {})
+    data["cp_company_name"] = cp_metadata.get("cp_company_name")
+    data["contract_type"] = cp_metadata.get("contract_type")
+    totals = _calculate_product_sales_totals(data)
 
-    # Decimal로 변환하여 정확한 금액 계산
-    def to_decimal(value):
-        """값을 Decimal로 변환. None이면 0 반환"""
-        return Decimal(str(value)) if value is not None else Decimal("0")
+    gross_paid_price = totals["gross_paid_price"]
+    gross_free_price = totals["gross_free_price"]
+    gross_total_price = totals["gross_total"]
+    tax_price = Decimal("0")
+    paid_settlement_price = totals["paid_price"]
+    free_settlement_price = totals["free_price"]
+    settlement_price = totals["sum_price"]
 
-    def to_int(decimal_value):
-        """Decimal을 반올림하여 정수로 변환"""
-        return int(decimal_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if user_data["role"] == "author":
+        author_profit_map = await _get_author_profit_map([id], db)
+        author_profit = author_profit_map.get(id)
+        if author_profit is None:
+            paid_settlement_price = None
+            free_settlement_price = None
+            settlement_price = None
+        else:
+            paid_settlement_price = _apply_author_settlement(
+                paid_settlement_price, author_profit
+            )
+            free_settlement_price = _apply_author_settlement(
+                free_settlement_price, author_profit
+            )
+            settlement_price = _apply_author_settlement(
+                settlement_price, author_profit
+            )
 
-    # 유상 : (일반구매 + 대여권에서 무상 대여권을 제외한 값의 합 - 취소액 - 각각의 결제 수수료) * 정산율
-    # 매출이 없으면 수수료도 0으로 처리
-    gross_sales_web = (
-        to_decimal(data.get("sum_normal_price_web"))
-        + to_decimal(data.get("sum_ticket_price_web"))
-        - to_decimal(data.get("sum_refund_price_web"))
+    data["gross_paid_price"] = (
+        _to_int(gross_paid_price) if gross_paid_price is not None else None
     )
-    fee_web = to_decimal(data.get("fee_web")) if gross_sales_web > 0 else Decimal("0")
-    paid_price_web = max(
-        Decimal("0"),
-        (gross_sales_web - fee_web)
-        * (to_decimal(data.get("settlement_rate_web")) / Decimal("100")),
+    data["gross_free_price"] = (
+        _to_int(gross_free_price) if gross_free_price is not None else None
     )
-
-    gross_sales_playstore = (
-        to_decimal(data.get("sum_normal_price_playstore"))
-        + to_decimal(data.get("sum_ticket_price_playstore"))
-        - to_decimal(data.get("sum_refund_price_playstore"))
+    data["gross_total_price"] = (
+        _to_int(gross_total_price) if gross_total_price is not None else None
     )
-    fee_playstore = (
-        to_decimal(data.get("fee_playstore"))
-        if gross_sales_playstore > 0
-        else Decimal("0")
-    )
-    paid_price_playstore = max(
-        Decimal("0"),
-        (gross_sales_playstore - fee_playstore)
-        * (to_decimal(data.get("settlement_rate_playstore")) / Decimal("100")),
-    )
-
-    gross_sales_ios = (
-        to_decimal(data.get("sum_normal_price_ios"))
-        + to_decimal(data.get("sum_ticket_price_ios"))
-        - to_decimal(data.get("sum_refund_price_ios"))
-    )
-    fee_ios = to_decimal(data.get("fee_ios")) if gross_sales_ios > 0 else Decimal("0")
-    paid_price_ios = max(
-        Decimal("0"),
-        (gross_sales_ios - fee_ios)
-        * (to_decimal(data.get("settlement_rate_ios")) / Decimal("100")),
-    )
-
-    gross_sales_onestore = (
-        to_decimal(data.get("sum_normal_price_onestore"))
-        + to_decimal(data.get("sum_ticket_price_onestore"))
-        - to_decimal(data.get("sum_refund_price_onestore"))
-    )
-    fee_onestore = (
-        to_decimal(data.get("fee_onestore"))
-        if gross_sales_onestore > 0
-        else Decimal("0")
-    )
-    paid_price_onestore = max(
-        Decimal("0"),
-        (gross_sales_onestore - fee_onestore)
-        * (to_decimal(data.get("settlement_rate_onestore")) / Decimal("100")),
-    )
-
-    paid_price = (
-        paid_price_web + paid_price_playstore + paid_price_ios + paid_price_onestore
-    )
-
-    # 무상 : 무상 대여권 - 결제 수수료 - 취소액 - 정산율
-    # 매출이 없으면 수수료도 0으로 처리
-    gross_comped_ticket = to_decimal(data.get("sum_comped_ticket_price")) - to_decimal(
-        data.get("sum_refund_comped_ticket_price")
-    )
-    fee_comped_ticket = (
-        to_decimal(data.get("fee_comped_ticket"))
-        if gross_comped_ticket > 0
-        else Decimal("0")
-    )
-    free_price = max(
-        Decimal("0"),
-        (gross_comped_ticket - fee_comped_ticket)
-        * (to_decimal(data.get("settlement_rate_comped_ticket")) / Decimal("100")),
-    )
-
-    # 전체 : 유상 + 무상
-    sum_price = paid_price + free_price
-
-    # 세액 : 기본 = 전체 * 세율(3.3% 고정)
-    # 관리자가 파트너 사이트 세액 부분에서 직접 입력 가능(직접 입력했을 시 자동으로 다른 값으로 편집되지 않음)
-    tax_rate = (
-        to_decimal(data.get("tax_rate")) if data.get("tax_rate") else Decimal("3.3")
-    )
-    tax_price = max(Decimal("0"), sum_price * (tax_rate / Decimal("100")))
-
-    # 합계 : 전체 - 세액
-    total_price = max(Decimal("0"), sum_price - tax_price)
 
     return {
         "result": data,
         "summary": {
-            "paid_price": to_int(paid_price),
-            "free_price": to_int(free_price),
-            "sum_price": to_int(sum_price),
-            "tax_price": to_int(tax_price),
-            "total_price": to_int(total_price),
+            "paid_price": (
+                _to_int(totals["paid_price"])
+                if totals["paid_price"] is not None
+                else None
+            ),
+            "free_price": (
+                _to_int(totals["free_price"])
+                if totals["free_price"] is not None
+                else None
+            ),
+            "sum_price": (
+                _to_int(totals["sum_price"])
+                if totals["sum_price"] is not None
+                else None
+            ),
+            "tax_price": _to_int(tax_price) if tax_price is not None else None,
+            "total_price": (
+                _to_int(_to_decimal(data.get("total_price")))
+                if data.get("total_price") is not None
+                else None
+            ),
+            "gross_paid_price": (
+                _to_int(gross_paid_price) if gross_paid_price is not None else None
+            ),
+            "gross_free_price": (
+                _to_int(gross_free_price) if gross_free_price is not None else None
+            ),
+            "gross_total_price": (
+                _to_int(gross_total_price) if gross_total_price is not None else None
+            ),
+            "paid_settlement_price": (
+                _to_int(paid_settlement_price)
+                if paid_settlement_price is not None
+                else None
+            ),
+            "free_settlement_price": (
+                _to_int(free_settlement_price)
+                if free_settlement_price is not None
+                else None
+            ),
+            "settlement_price": (
+                _to_int(settlement_price)
+                if settlement_price is not None
+                else None
+            ),
         },
     }
 
@@ -460,18 +918,9 @@ async def sales_by_episode_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
-            ))
+            AND product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
         """
 
     if search_word != "":
@@ -496,14 +945,7 @@ async def sales_by_episode_list(
         elif search_target == CommonConstants.SEARCH_CP_NAME:
             where += f"""
                           AND product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
+                                {_cp_company_name_product_ids_subquery(search_word)}
                           )
                           """
 
@@ -710,18 +1152,9 @@ async def daily_ticket_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
-            ))
+            AND product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
         """
 
     if search_word != "":
@@ -746,14 +1179,7 @@ async def daily_ticket_list(
         elif search_target == CommonConstants.SEARCH_CP_NAME:
             where += f"""
                           AND product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
+                                {_cp_company_name_product_ids_subquery(search_word)}
                           )
                           """
 
@@ -826,18 +1252,9 @@ async def monthly_settlement_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
-            ))
+            AND product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
         """
 
     if search_word != "":
@@ -848,14 +1265,7 @@ async def monthly_settlement_list(
         elif search_target == CommonConstants.SEARCH_CP_NAME:
             where += f"""
                           AND product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
+                                {_cp_company_name_product_ids_subquery(search_word)}
                           )
                           """
 
@@ -888,16 +1298,7 @@ async def monthly_settlement_list(
                 from tb_product
                 where product_id = pps.product_id
             ) as author_name,
-            (
-                select y.company_name
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and z.product_id = pps.product_id
-            ) as cp_name
+            {_cp_company_name_lookup_subquery("pps.product_id")} as cp_name
         from tb_ptn_product_settlement pps
         WHERE 1=1 {where}
         ORDER BY created_date DESC
@@ -905,8 +1306,40 @@ async def monthly_settlement_list(
     """)
     result = await db.execute(query, limit_params)
     rows = result.mappings().all()
+    app_fee_rate = await _get_product_sales_app_fee_rate(db)
+    platform_rate_context = await _get_platform_service_rate_context(
+        [row["product_id"] for row in rows], db
+    )
 
-    return build_paginated_response(rows, total_count, page, count_per_page)
+    author_profit_map = {}
+    if rows and user_data["role"] == "author":
+        author_profit_map = await _get_author_profit_map(
+            [row["product_id"] for row in rows], db
+        )
+
+    normalized_rows = []
+    for row in rows:
+        platform_service_rate = _resolve_platform_service_rate(
+            row["product_id"], row.get("created_date"), platform_rate_context
+        )
+        data = _normalize_monthly_settlement_row(
+            dict(row), app_fee_rate, platform_service_rate
+        )
+        if user_data["role"] == "author":
+            author_settlement = _apply_author_settlement(
+                _to_decimal(data.get("settlement_price")),
+                author_profit_map.get(data["product_id"]),
+            )
+            data["settlement_price"] = (
+                _to_int(author_settlement) if author_settlement is not None else None
+            )
+            if data["settlement_price"] is None:
+                data["final_settlement_price"] = None
+            else:
+                data["final_settlement_price"] = data["settlement_price"]
+        normalized_rows.append(data)
+
+    return build_paginated_response(normalized_rows, total_count, page, count_per_page)
 
 
 async def product_contract_offer_deduction_list(
@@ -942,18 +1375,9 @@ async def product_contract_offer_deduction_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
-            ))
+            AND product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
         """
 
     if search_word != "":
@@ -978,14 +1402,7 @@ async def product_contract_offer_deduction_list(
         elif search_target == CommonConstants.SEARCH_CP_NAME:
             where += f"""
                           AND product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
+                                {_cp_company_name_product_ids_subquery(search_word)}
                           )
                           """
 

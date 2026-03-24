@@ -532,6 +532,25 @@ class PostCommonRateReqBody(AdminBase):
     tax_amount_rate: float = Field(examples=[0.05], description="세액")
 
 
+class PostPlatformServiceRateGlobalReqBody(AdminBase):
+    rate: float = Field(
+        ge=0,
+        le=100,
+        examples=[30],
+        description="다음 달부터 적용할 전역 플랫폼 수수료율(0~100)",
+    )
+
+
+class PostPlatformServiceRateProductReqBody(AdminBase):
+    product_id: int = Field(examples=[1], description="작품 ID")
+    rate: float = Field(
+        ge=0,
+        le=100,
+        examples=[25],
+        description="다음 달부터 적용할 작품 예외 플랫폼 수수료율(0~100)",
+    )
+
+
 class PostNoticeReqBody(AdminBase):
     # 공지사항 등록 요청 시 클라이언트에서 보내는 request body
     subject: str = Field(examples=["subject"], description="공지 제목")
