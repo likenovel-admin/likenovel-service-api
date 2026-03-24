@@ -82,7 +82,25 @@ async def get_genre_list(db: AsyncSession):
                  FROM tb_standard_keyword
                  WHERE use_yn = 'Y'
                    AND category_id = 1
-                 ORDER BY major_genre_yn DESC, keyword_id ASC
+                 ORDER BY CASE keyword_name
+                    WHEN '무협' THEN 1
+                    WHEN '판타지' THEN 2
+                    WHEN '퓨전' THEN 3
+                    WHEN '게임' THEN 4
+                    WHEN '스포츠' THEN 5
+                    WHEN '로맨스' THEN 6
+                    WHEN '라이트노벨' THEN 7
+                    WHEN '현대판타지' THEN 8
+                    WHEN '대체역사' THEN 9
+                    WHEN '전쟁·밀리터리' THEN 10
+                    WHEN 'SF' THEN 11
+                    WHEN '추리' THEN 12
+                    WHEN '공포·미스테리' THEN 13
+                    WHEN '일반소설' THEN 14
+                    WHEN '드라마' THEN 15
+                    WHEN '팬픽·패러디' THEN 16
+                    ELSE 999
+                 END, keyword_id ASC
                  """)
     result = await db.execute(query, {})
     rows = result.mappings().all()
