@@ -47,6 +47,9 @@ class PostProductsReqBody(ProductsBase):
     blind_yn: Optional[str] = Field(default=None, examples=["N"], description="블라인드 여부")
     monopoly_yn: str = Field(examples=["N"], description="독점여부")
     cp_contract_yn: str = Field(examples=["N"], description="계약여부")
+    cp_nickname: Optional[str] = Field(
+        default=None, examples=["likenovelcp"], description="담당 CP 기본 닉네임"
+    )
     product_type: Optional[str] = Field(
         default=None, examples=["normal"], description="연재 유형(normal: 일반연재, null: 자유연재)"
     )
@@ -94,6 +97,9 @@ class PutProductsProductIdReqBody(ProductsBase):
     blind_yn: Optional[str] = Field(default=None, examples=["N"], description="블라인드 여부")
     monopoly_yn: str = Field(examples=["N"], description="독점여부")
     cp_contract_yn: str = Field(examples=["N"], description="계약여부")
+    cp_nickname: Optional[str] = Field(
+        default=None, examples=["likenovelcp"], description="담당 CP 기본 닉네임"
+    )
     paid_setting_date: Optional[datetime] = Field(
         default=None,
         examples=["2024-12-31T23:59:59"],
@@ -211,6 +217,10 @@ class ProductsSchema(BaseModel):
     model_config = ConfigDict(
         alias_generator=to_camel, populate_by_name=True, from_attributes=True
     )
+
+
+class GetProductsValidateCpNicknameToCamel(ProductsSchema):
+    valid: bool
 
 
 class GetProductsProductIdCommentsToCamel(ProductsSchema):

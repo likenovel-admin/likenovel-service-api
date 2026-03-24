@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, String, TIMESTAMP, text
+from sqlalchemy import Date, Double, Integer, String, TIMESTAMP, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from datetime import datetime
@@ -217,6 +217,53 @@ class PublisherPromotionConfig(Base):
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
     updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class PlatformServiceRateHistory(Base):
+    __tablename__ = "tb_platform_service_rate_history"
+    __table_args__ = (
+        UniqueConstraint(
+            "scope_type",
+            "product_id",
+            "effective_month",
+            name="uq_platform_service_rate_history_scope_product_month",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, comment="적용 범위(global|product)"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="작품 ID(global은 0)"
+    )
+    rate: Mapped[float | None] = mapped_column(
+        Double,
+        nullable=True, comment="플랫폼 수수료율(0~100, NULL이면 글로벌 복귀)"
+    )
+    effective_month: Mapped[date] = mapped_column(
+        Date, nullable=False, comment="적용 시작 월(항상 해당 월 1일)"
+    )
+    use_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE),
+        nullable=False,
+        server_default="Y",
+        comment="사용 여부",
+    )
+    created_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="row를 갱신한 id"
     )
     updated_date: Mapped[datetime] = mapped_column(

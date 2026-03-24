@@ -205,7 +205,7 @@ async def order_cash_payment_complete_with_payment_id(
             user_cash_query,
             {
                 "user_id": user_id,
-                "cash_amount": total_price * 1.1,
+                "cash_amount": total_price,
                 "created_id": user_id or settings.DB_DML_PORTONE_ID,
                 "updated_id": user_id or settings.DB_DML_PORTONE_ID,
             },
@@ -222,7 +222,7 @@ async def order_cash_payment_complete_with_payment_id(
             {
                 "from_user_id": user_id,
                 "to_user_id": user_id,
-                "amount": total_price * 1.1,
+                "amount": total_price,
                 "created_id": user_id or settings.DB_DML_PORTONE_ID,
                 "updated_id": user_id or settings.DB_DML_PORTONE_ID,
             },

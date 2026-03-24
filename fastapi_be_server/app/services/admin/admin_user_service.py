@@ -16,6 +16,7 @@ from app.utils.response import build_paginated_response, check_exists_or_404
 from app.utils.common import handle_exceptions
 from app.const import CommonConstants
 from app.services.common import comm_service
+from app.services.common.cp_link_service import get_accepted_cp_info_by_user_id
 from app.const import ErrorMessages
 
 logger = logging.getLogger("admin_app")
@@ -510,6 +511,14 @@ async def apply_rank_up(
             SELECT * FROM (
                 SELECT
                     p.*,
+                    (
+                        SELECT up.nickname
+                          FROM tb_user_profile up
+                         WHERE up.user_id = p.cp_user_id
+                           AND up.default_yn = 'Y'
+                         ORDER BY up.profile_id ASC
+                         LIMIT 1
+                    ) AS cp_nickname,
                     'accepted' AS `status`,
                     'rank-up' AS `type`,
                     COALESCE(pe.episode_count, 0) AS `count_episode`,
@@ -529,6 +538,14 @@ async def apply_rank_up(
 
                 SELECT
                     p.*,
+                    (
+                        SELECT up.nickname
+                          FROM tb_user_profile up
+                         WHERE up.user_id = p.cp_user_id
+                           AND up.default_yn = 'Y'
+                         ORDER BY up.profile_id ASC
+                         LIMIT 1
+                    ) AS cp_nickname,
                     ppa.status_code AS `status`,
                     'paid' AS `type`,
                     COALESCE(pe.episode_count, 0) AS `count_episode`,
@@ -566,6 +583,14 @@ async def apply_rank_up(
         query = text(f"""
             SELECT
                 p.*,
+                (
+                    SELECT up.nickname
+                      FROM tb_user_profile up
+                     WHERE up.user_id = p.cp_user_id
+                       AND up.default_yn = 'Y'
+                     ORDER BY up.profile_id ASC
+                     LIMIT 1
+                ) AS cp_nickname,
                 'accepted' AS `status`,
                 'rank-up' AS `type`,
                 COALESCE(pe.episode_count, 0) AS `count_episode`,
@@ -586,6 +611,14 @@ async def apply_rank_up(
         query = text(f"""
             SELECT
                 p.*,
+                (
+                    SELECT up.nickname
+                      FROM tb_user_profile up
+                     WHERE up.user_id = p.cp_user_id
+                       AND up.default_yn = 'Y'
+                     ORDER BY up.profile_id ASC
+                     LIMIT 1
+                ) AS cp_nickname,
                 ppa.status_code AS `status`,
                 'paid' AS `type`,
                 COALESCE(pe.episode_count, 0) AS `count_episode`,
@@ -863,6 +896,31 @@ async def accept_apply_rank_up(apply_id: int, db: AsyncSession):
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.ALREADY_APPROVED,
+        )
+
+    product_query = text("""
+                 SELECT contract_yn, cp_user_id
+                   FROM tb_product
+                  WHERE product_id = :product_id
+                  LIMIT 1
+                 """)
+    product_result = await db.execute(product_query, {"product_id": row["product_id"]})
+    product_row = product_result.mappings().one_or_none()
+    check_exists_or_404([product_row] if product_row else [], ErrorMessages.NOT_FOUND_PRODUCT)
+
+    if product_row["contract_yn"] != "Y" or product_row["cp_user_id"] is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="유효한 CP 계약 정보를 확인할 수 없습니다.",
+        )
+
+    linked_cp_info = await get_accepted_cp_info_by_user_id(
+        product_row["cp_user_id"], db, for_update=True
+    )
+    if linked_cp_info is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="유효한 CP 계약 정보를 확인할 수 없습니다.",
         )
 
     # TODO: cleaned garbled comment (encoding issue).
@@ -1166,4 +1224,3 @@ async def put_auth_signoff(user_id: int, db: AsyncSession):
                 raise e
 
     return
-

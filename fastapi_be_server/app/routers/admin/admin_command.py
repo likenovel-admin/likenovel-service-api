@@ -1084,6 +1084,69 @@ async def save_common_rate_data(
     return await admin_basic_service.save_common_rate_data(req_body, db=db)
 
 
+@router.post(
+    "/platform-service-rate/global",
+    tags=["CMS - 플랫폼 수수료"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def save_platform_service_rate_global(
+    req_body: admin_schema.PostPlatformServiceRateGlobalReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    다음 달부터 적용될 전역 플랫폼 수수료율 저장
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_basic_service.save_platform_service_rate_global(req_body, db=db)
+
+
+@router.post(
+    "/platform-service-rate/product",
+    tags=["CMS - 플랫폼 수수료"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def upsert_platform_service_rate_product(
+    req_body: admin_schema.PostPlatformServiceRateProductReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    다음 달부터 적용될 작품 예외 플랫폼 수수료율 저장
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_basic_service.upsert_platform_service_rate_product(req_body, db=db)
+
+
+@router.delete(
+    "/platform-service-rate/product/{product_id}",
+    tags=["CMS - 플랫폼 수수료"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def delete_platform_service_rate_product(
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    다음 달부터 작품 예외 플랫폼 수수료율 제거(글로벌 복귀)
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_basic_service.delete_platform_service_rate_product(product_id, db=db)
+
+
 @router.put(
     "/users/{user_id}/password/reset",
     tags=["CMS - 회원"],

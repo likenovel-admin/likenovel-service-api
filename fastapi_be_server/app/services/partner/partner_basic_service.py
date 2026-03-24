@@ -89,19 +89,39 @@ async def get_genre_list(db: AsyncSession):
     return [dict(row) for row in rows]
 
 
-async def get_cp_company_name_list(db: AsyncSession):
+async def get_cp_company_name_list(db: AsyncSession, user_data: dict):
     """
     CP 회사명 리스트 조회
 
     Args:
         db: 데이터베이스 세션
+        user_data: 사용자 정보 딕셔너리 (user_id, role)
 
     Returns:
         CP 회사명 리스트
     """
-    query = text("""
-                 SELECT DISTINCT company_name FROM tb_user_profile_apply ORDER BY company_name ASC
+    if user_data["role"] == "CP":
+        query = text("""
+                 SELECT DISTINCT company_name
+                   FROM tb_user_profile_apply
+                  WHERE apply_type = 'cp'
+                    AND approval_code = 'accepted'
+                    AND approval_date IS NOT NULL
+                    AND user_id = :user_id
+                  ORDER BY company_name ASC
                  """)
-    result = await db.execute(query, {})
+        params = {"user_id": user_data["user_id"]}
+    else:
+        query = text("""
+                 SELECT DISTINCT company_name
+                   FROM tb_user_profile_apply
+                  WHERE apply_type = 'cp'
+                    AND approval_code = 'accepted'
+                    AND approval_date IS NOT NULL
+                  ORDER BY company_name ASC
+                 """)
+        params = {}
+
+    result = await db.execute(query, params)
     rows = result.mappings().all()
     return [dict(row) for row in rows]

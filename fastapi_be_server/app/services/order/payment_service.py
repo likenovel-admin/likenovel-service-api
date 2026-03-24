@@ -289,7 +289,7 @@ async def _create_cash_charge_order_for_virtual_account_paid(
         return existing
 
     total_price = payment.amount.total
-    charge_cash_amount = total_price * 1.1
+    charge_cash_amount = total_price
     order_no = _build_order_no()
     order_item_name = payment.order_name
 

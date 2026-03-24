@@ -1,4 +1,5 @@
 import logging
+from datetime import date
 from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,10 @@ from app.utils.response import check_exists_or_404
 
 logger = logging.getLogger("admin_app")
 portone_client = portone.PortOneClient(secret=settings.PORTONE_SECRET_KEY)
+
+DEFAULT_PLATFORM_SERVICE_RATE = 30.0
+GLOBAL_SCOPE_TYPE = "global"
+PRODUCT_SCOPE_TYPE = "product"
 
 """
 관리자 기본 서비스 함수 모음
@@ -303,6 +308,223 @@ async def save_common_rate_data(
         "donation_settlement_rate": req_body.donation_settlement_rate,
         "payment_fee_rate": req_body.payment_fee_rate,
         "tax_amount_rate": req_body.tax_amount_rate,
+    }
+
+
+def _first_day_of_current_month() -> date:
+    today = date.today()
+    return date(today.year, today.month, 1)
+
+
+def _first_day_of_next_month() -> date:
+    current_month = _first_day_of_current_month()
+    if current_month.month == 12:
+        return date(current_month.year + 1, 1, 1)
+    return date(current_month.year, current_month.month + 1, 1)
+
+
+def _find_latest_rate(rows: list[dict], target_month: date) -> float | None:
+    latest_rate = None
+    latest_month = None
+    for row in rows:
+        effective_month = row["effective_month"]
+        if effective_month is None or effective_month > target_month:
+            continue
+        if latest_month is None or effective_month > latest_month:
+            latest_month = effective_month
+            latest_rate = (
+                float(row["rate"]) if row.get("rate") is not None else None
+            )
+    return latest_rate
+
+
+async def get_platform_service_rate_config(db: AsyncSession):
+    current_month = _first_day_of_current_month()
+    next_month = _first_day_of_next_month()
+    payment_fee_rate = 0.0
+
+    policy_query = text(
+        """
+        SELECT h.id,
+               h.scope_type,
+               h.product_id,
+               h.rate,
+               h.effective_month,
+               p.title
+          FROM tb_platform_service_rate_history h
+          LEFT JOIN tb_product p ON h.product_id = p.product_id
+         WHERE h.use_yn = 'Y'
+         ORDER BY h.product_id ASC, h.effective_month DESC, h.id DESC
+        """
+    )
+    policy_result = await db.execute(policy_query, {})
+    policy_rows = [dict(row) for row in policy_result.mappings().all()]
+
+    global_rows = [
+        row for row in policy_rows if row["scope_type"] == GLOBAL_SCOPE_TYPE and row["product_id"] == 0
+    ]
+    current_global_rate = _find_latest_rate(global_rows, current_month)
+    if current_global_rate is None:
+        current_global_rate = DEFAULT_PLATFORM_SERVICE_RATE
+
+    next_global_rate = _find_latest_rate(global_rows, next_month)
+    if next_global_rate is None:
+        next_global_rate = current_global_rate
+
+    product_rows_by_id: dict[int, list[dict]] = {}
+    for row in policy_rows:
+        if row["scope_type"] != PRODUCT_SCOPE_TYPE or row["product_id"] == 0:
+            continue
+        product_rows_by_id.setdefault(row["product_id"], []).append(row)
+
+    overrides = []
+    for product_id, rows in product_rows_by_id.items():
+        next_rate = _find_latest_rate(rows, next_month)
+        if next_rate is None:
+            continue
+        current_rate = _find_latest_rate(rows, current_month)
+        latest_row = max(
+            (
+                row
+                for row in rows
+                if row["effective_month"] is not None
+                and row["effective_month"] <= next_month
+            ),
+            key=lambda row: (row["effective_month"], row["id"]),
+            default=None,
+        )
+        if latest_row is None:
+            continue
+        overrides.append(
+            {
+                "product_id": product_id,
+                "title": latest_row.get("title"),
+                "current_rate": current_rate,
+                "next_rate": next_rate,
+                "effective_month": latest_row["effective_month"],
+            }
+        )
+
+    overrides.sort(key=lambda row: (row["title"] or "", row["product_id"]))
+
+    return {
+        "current_global_rate": current_global_rate,
+        "next_global_rate": next_global_rate,
+        "next_effective_month": next_month.isoformat(),
+        "payment_fee_rate": payment_fee_rate,
+        "overrides": overrides,
+    }
+
+
+async def save_platform_service_rate_global(
+    req_body: admin_schema.PostPlatformServiceRateGlobalReqBody, db: AsyncSession
+):
+    next_month = _first_day_of_next_month()
+    upsert_query = text(
+        """
+        INSERT INTO tb_platform_service_rate_history
+            (scope_type, product_id, rate, effective_month, created_id, updated_id)
+        VALUES
+            (:scope_type, 0, :rate, :effective_month, -1, -1)
+        ON DUPLICATE KEY UPDATE
+            rate = VALUES(rate),
+            updated_id = -1
+        """
+    )
+    await db.execute(
+        upsert_query,
+        {
+            "scope_type": GLOBAL_SCOPE_TYPE,
+            "rate": req_body.rate,
+            "effective_month": next_month,
+        },
+    )
+    return {
+        "rate": req_body.rate,
+        "effective_month": next_month.isoformat(),
+    }
+
+
+async def upsert_platform_service_rate_product(
+    req_body: admin_schema.PostPlatformServiceRateProductReqBody, db: AsyncSession
+):
+    product_query = text(
+        """
+        SELECT product_id, title
+          FROM tb_product
+         WHERE product_id = :product_id
+         LIMIT 1
+        """
+    )
+    product_result = await db.execute(product_query, {"product_id": req_body.product_id})
+    product_row = product_result.mappings().one_or_none()
+    check_exists_or_404([product_row] if product_row else [], ErrorMessages.NOT_FOUND_PRODUCT)
+
+    next_month = _first_day_of_next_month()
+    upsert_query = text(
+        """
+        INSERT INTO tb_platform_service_rate_history
+            (scope_type, product_id, rate, effective_month, created_id, updated_id)
+        VALUES
+            (:scope_type, :product_id, :rate, :effective_month, -1, -1)
+        ON DUPLICATE KEY UPDATE
+            rate = VALUES(rate),
+            updated_id = -1
+        """
+    )
+    await db.execute(
+        upsert_query,
+        {
+            "scope_type": PRODUCT_SCOPE_TYPE,
+            "product_id": req_body.product_id,
+            "rate": req_body.rate,
+            "effective_month": next_month,
+        },
+    )
+    return {
+        "product_id": req_body.product_id,
+        "title": product_row["title"],
+        "rate": req_body.rate,
+        "effective_month": next_month.isoformat(),
+    }
+
+
+async def delete_platform_service_rate_product(product_id: int, db: AsyncSession):
+    product_query = text(
+        """
+        SELECT product_id, title
+          FROM tb_product
+         WHERE product_id = :product_id
+         LIMIT 1
+        """
+    )
+    product_result = await db.execute(product_query, {"product_id": product_id})
+    product_row = product_result.mappings().one_or_none()
+    check_exists_or_404([product_row] if product_row else [], ErrorMessages.NOT_FOUND_PRODUCT)
+
+    next_month = _first_day_of_next_month()
+    delete_query = text(
+        """
+        INSERT INTO tb_platform_service_rate_history
+            (scope_type, product_id, rate, effective_month, created_id, updated_id)
+        VALUES
+            (:scope_type, :product_id, NULL, :effective_month, -1, -1)
+        ON DUPLICATE KEY UPDATE
+            rate = VALUES(rate),
+            updated_id = -1
+        """
+    )
+    await db.execute(
+        delete_query,
+        {
+            "scope_type": PRODUCT_SCOPE_TYPE,
+            "product_id": product_id,
+            "effective_month": next_month,
+        },
+    )
+    return {
+        "product_id": product_id,
+        "effective_month": next_month.isoformat(),
     }
 
 

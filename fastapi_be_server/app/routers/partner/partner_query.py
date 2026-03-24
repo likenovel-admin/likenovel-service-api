@@ -545,11 +545,11 @@ async def get_cp_company_name_list(
     파트너 - 작품 관리 / 작품 리스트 - cp사명
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        user_data = await check_user(kc_user_id=user.get("sub"), db=db)
     except Exception as e:
         raise e
 
-    return await partner_basic_service.get_cp_company_name_list(db)
+    return await partner_basic_service.get_cp_company_name_list(db, user_data)
 
 
 @router.get(
@@ -1912,12 +1912,12 @@ async def monthly_sales_by_product_detail_by_product_id(
     파트너 - 매출 및 정산 > 작품별 월매출
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        user_data = await check_user(kc_user_id=user.get("sub"), db=db)
     except Exception as e:
         raise e
 
     return await partner_sales_service.monthly_sales_by_product_detail_by_product_id(
-        id, db
+        id, db, user_data
     )
 
 

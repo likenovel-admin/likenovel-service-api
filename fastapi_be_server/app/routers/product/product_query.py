@@ -127,6 +127,22 @@ async def get_can_create_normal(
 
 
 @router.get(
+    "/cp-nickname/validate",
+    tags=["작품"],
+    responses={200: {"description": "CP 닉네임 검증"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_products_validate_cp_nickname(
+    nickname: str = Query(..., description="CP 기본 닉네임"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await product_service.get_products_validate_cp_nickname(
+        nickname=nickname, kc_user_id=user.get("sub"), db=db
+    )
+
+
+@router.get(
     "/all",
     tags=["작품"],
     responses={

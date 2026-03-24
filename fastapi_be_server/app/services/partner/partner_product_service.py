@@ -23,6 +23,24 @@ partner 작품 관리 서비스 함수 모음
 """
 
 
+async def get_approved_cp_company_name_by_user_id(
+    user_id: int, db: AsyncSession
+) -> Optional[str]:
+    query = text("""
+        SELECT company_name
+         FROM tb_user_profile_apply
+         WHERE apply_type = 'cp'
+           AND user_id = :user_id
+           AND approval_code = 'accepted'
+           AND approval_date IS NOT NULL
+         ORDER BY approval_date DESC, id DESC
+         LIMIT 1
+    """)
+    result = await db.execute(query, {"user_id": user_id})
+    row = result.mappings().one_or_none()
+    return row["company_name"] if row else None
+
+
 async def product_list(
     contract_type: str,
     status_code: str,
@@ -94,16 +112,7 @@ async def product_list(
     elif user_data["role"] == "CP":
         where += f"""
             AND (a.user_id = {user_data["user_id"]}
-                 OR a.product_id IN (
-                    select z.product_id
-                    from tb_product_contract_offer z
-                    inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                    and y.apply_type = 'cp'
-                    and y.approval_date is not null
-                    where z.use_yn = 'Y'
-                    and z.author_accept_yn = 'Y'
-                    and y.user_id = {user_data["user_id"]}
-                ))
+                 OR a.cp_user_id = {user_data["user_id"]})
         """
 
     if contract_type == CommonConstants.CONTRACT_NORMAL:
@@ -155,16 +164,7 @@ async def product_list(
                           """
         elif search_target == CommonConstants.SEARCH_CP_NAME:
             where += f"""
-                          AND a.product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
-                          )
+                          AND d.cp_company_name LIKE '%{search_word}%'
                           """
 
     sales_summary_cte = ""
@@ -199,21 +199,28 @@ async def product_list(
 
     # 전체 개수 구하기
     count_query = text(f"""
-        with tmp_contract_offer_summary as (
-            select z.product_id
-                , y.company_name as cp_company_name
-            from tb_product_contract_offer z
-            inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-            and y.apply_type = 'cp'
-            and y.approval_date is not null
-            where z.use_yn = 'Y'
-            and z.author_accept_yn = 'Y'
+        with tmp_cp_summary as (
+            select ranked.user_id
+                 , ranked.company_name as cp_company_name
+            from (
+                select user_id
+                     , company_name
+                     , row_number() over (
+                         partition by user_id
+                         order by approval_date desc, id desc
+                     ) as rn
+                  from tb_user_profile_apply
+                 where apply_type = 'cp'
+                   and approval_code = 'accepted'
+                   and approval_date is not null
+            ) ranked
+            where ranked.rn = 1
         )
         {sales_summary_cte}
         select count(a.product_id) as total_count
         from tb_product a
         {sales_summary_join}
-        left join tmp_contract_offer_summary d on a.product_id = d.product_id
+        left join tmp_cp_summary d on a.cp_user_id = d.user_id
         WHERE 1=1 {where}
         ;
     """)
@@ -229,16 +236,22 @@ async def product_list(
             where use_yn = 'Y'
             group by product_id
         ),
-        tmp_contract_offer_summary as (
-            select z.product_id
-                , MAX(y.company_name) as cp_company_name
-            from tb_product_contract_offer z
-            inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-            and y.apply_type = 'cp'
-            and y.approval_date is not null
-            where z.use_yn = 'Y'
-            and z.author_accept_yn = 'Y'
-            GROUP BY z.product_id
+        tmp_cp_summary as (
+            select ranked.user_id
+                , ranked.company_name as cp_company_name
+            from (
+                select user_id
+                    , company_name
+                    , row_number() over (
+                        partition by user_id
+                        order by approval_date desc, id desc
+                    ) as rn
+                from tb_user_profile_apply
+                where apply_type = 'cp'
+                  and approval_code = 'accepted'
+                  and approval_date is not null
+            ) ranked
+            where ranked.rn = 1
         )
         {sales_summary_cte}
         ,
@@ -247,7 +260,7 @@ async def product_list(
                 , a.created_date
             from tb_product a
             {sales_summary_join}
-            left join tmp_contract_offer_summary d on a.product_id = d.product_id
+            left join tmp_cp_summary d on a.cp_user_id = d.user_id
             WHERE 1=1 {where}
             ORDER BY a.created_date DESC
             {limit_clause}
@@ -255,7 +268,7 @@ async def product_list(
         select a.product_id
             , a.title
             , a.author_name as author_nickname
-            , a.user_id as author_user_id
+            , a.contract_yn
             , a.synopsis_text as synopsis
             , coalesce(b.count_episode, 0) as count_episode
             , case when d.cp_company_name is null then null
@@ -288,11 +301,14 @@ async def product_list(
         from filtered_products fp
         inner join tb_product a on a.product_id = fp.product_id
         left join tmp_product_episode_summary b on a.product_id = b.product_id
-        left join tmp_contract_offer_summary d on a.product_id = d.product_id
+        left join tmp_cp_summary d on a.cp_user_id = d.user_id
         ORDER BY fp.created_date DESC
     """)
     result = await db.execute(query, limit_params)
-    rows = result.mappings().all()
+    rows = [dict(row) for row in result.mappings().all()]
+
+    for row in rows:
+        row.pop("contract_yn", None)
 
     return build_paginated_response(rows, total_count, page, count_per_page)
 
@@ -318,15 +334,28 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
             where use_yn = 'Y'
             group by product_id
         ),
+        tmp_cp_summary as (
+            select ranked.user_id
+                , ranked.company_name as cp_company_name
+            from (
+                select user_id
+                    , company_name
+                    , row_number() over (
+                        partition by user_id
+                        order by approval_date desc, id desc
+                    ) as rn
+                from tb_user_profile_apply
+                where apply_type = 'cp'
+                  and approval_code = 'accepted'
+                  and approval_date is not null
+            ) ranked
+            where ranked.rn = 1
+        ),
         tmp_contract_offer_summary as (
             select z.product_id
-                , MAX(y.company_name) as cp_company_name
                 , MAX(z.author_profit) as cp_author_profit
                 , MAX(z.offer_price) as cp_offer_price
             from tb_product_contract_offer z
-            inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-            and y.apply_type = 'cp'
-            and y.approval_date is not null
             where z.use_yn = 'Y'
             and z.author_accept_yn = 'Y'
             GROUP BY z.product_id
@@ -335,12 +364,13 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
             , a.title
             , a.synopsis_text as synopsis
             , a.author_name as author_nickname
+            , a.contract_yn
             , coalesce(b.count_episode, 0) as count_episode
-            , case when d.cp_company_name is null then null
-                    when d.cp_company_name = '라이크노벨' then '일반'
+            , case when cp.cp_company_name is null then null
+                    when cp.cp_company_name = '라이크노벨' then '일반'
                     else 'cp'
             end as contract_type
-            , d.cp_company_name
+            , cp.cp_company_name
             , a.created_date
             , a.paid_open_date
             , a.isbn
@@ -383,6 +413,7 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
     }
         from tb_product a
         left join tmp_product_episode_summary b on a.product_id = b.product_id
+        left join tmp_cp_summary cp on a.cp_user_id = cp.user_id
         left join tmp_contract_offer_summary d on a.product_id = d.product_id
         WHERE a.product_id = :product_id
         ORDER BY created_date DESC LIMIT 1
@@ -392,7 +423,9 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
 
     check_exists_or_404(rows, ErrorMessages.NOT_FOUND_PRODUCT)
 
-    return dict(rows[0])
+    product = dict(rows[0])
+    product.pop("contract_yn", None)
+    return product
 
 
 async def put_product(
@@ -433,14 +466,7 @@ async def put_product(
                 WHERE p.product_id = :product_id
                   AND (p.author_id = :user_id
                        OR p.user_id = :user_id
-                       OR EXISTS (
-                           SELECT 1 FROM tb_product_contract_offer co
-                           INNER JOIN tb_user_profile_apply upa ON co.offer_user_id = upa.user_id
-                             AND upa.apply_type = 'cp' AND upa.approval_date IS NOT NULL
-                           WHERE co.product_id = p.product_id
-                             AND co.use_yn = 'Y' AND co.author_accept_yn = 'Y'
-                             AND co.offer_user_id = :user_id
-                       ))
+                       OR p.cp_user_id = :user_id)
             """)
             result = await db.execute(check_query, {"product_id": product_id, "user_id": user_id})
             if result.scalar() is None:
@@ -675,13 +701,22 @@ async def put_product(
                 message="무료회차 종료 번호는 현재 등록된 마지막 회차를 초과할 수 없습니다.",
             )
 
+    cp_user_id = None
     if req_body.cp_company_name is not None:
+        if (
+            (req_body.cp_offered_price is None) !=
+            (req_body.cp_settlement_rate is None)
+        ):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="CP 계약 금액과 작가 정산비를 모두 입력해주세요.",
+            )
         if req_body.cp_offered_price is not None and req_body.cp_offered_price < 0:
             raise CustomResponseException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 message=ErrorMessages.CP_PROPOSE_AMOUNT_POSITIVE,
             )
-        if req_body.cp_settlement_rate is not None and req_body.cp_settlement_rate < 0:
+        if req_body.cp_settlement_rate is not None and req_body.cp_settlement_rate <= 0:
             raise CustomResponseException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 message=ErrorMessages.CP_WRITER_SETTLEMENT_POSITIVE,
@@ -695,9 +730,12 @@ async def put_product(
                 message=ErrorMessages.CP_WRITER_SETTLEMENT_MAX100,
             )
         query = text("""
-                    select id
+                    select user_id
                         from tb_user_profile_apply
-                        where apply_type = 'cp' and company_name = :cp_company_name
+                        where apply_type = 'cp'
+                          and company_name = :cp_company_name
+                          and approval_code = 'accepted'
+                          and approval_date is not null
                     """)
         result = await db.execute(query, {"cp_company_name": req_body.cp_company_name})
         rows = result.mappings().all()
@@ -705,6 +743,56 @@ async def put_product(
             raise CustomResponseException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 message=f"유효하지 않은 cp사명입니다. ({req_body.cp_company_name})",
+            )
+        cp_user_id = rows[0]["user_id"]
+    elif req_body.cp_offered_price is not None or req_body.cp_settlement_rate is not None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="CP사 선택 후 계약 정보를 입력해주세요.",
+        )
+
+    has_cp_contract_input = (
+        req_body.cp_offered_price is not None or req_body.cp_settlement_rate is not None
+    )
+
+    should_defer_cp_contract_offer = False
+    if req_body.cp_company_name is not None and not has_cp_contract_input:
+        if user_data and user_data["role"] == "CP":
+            current_cp_company_name = await get_approved_cp_company_name_by_user_id(
+                user_data["user_id"], db
+            )
+            if current_cp_company_name is None:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="승인된 CP 계정 정보가 없어 CP 작품으로 저장할 수 없습니다.",
+                )
+            if req_body.cp_company_name != current_cp_company_name:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="본인 승인된 CP사만 선택할 수 있습니다.",
+                )
+            query = text("""
+                        select user_id
+                          from tb_product
+                         where product_id = :product_id
+                        """)
+            result = await db.execute(query, {"product_id": product_id})
+            owner_row = result.mappings().one_or_none()
+            if owner_row is None:
+                raise CustomResponseException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    message=ErrorMessages.NOT_FOUND_PRODUCT,
+                )
+            if owner_row["user_id"] != user_data["user_id"]:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="본인 소유 작품만 신규생성 단계에서 CP 설정을 유지할 수 있습니다.",
+                )
+            should_defer_cp_contract_offer = True
+        else:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="CP 계약 정보는 작품 상세에서 설정해주세요.",
             )
 
     set_clause, params = build_update_query(
@@ -741,6 +829,10 @@ async def put_product(
         else:
             set_clause = f"{set_clause}, open_yn = 'N'"
 
+    set_clause = f"{set_clause}, contract_yn = :contract_yn"
+    params["contract_yn"] = "Y" if req_body.cp_company_name is not None else "N"
+    set_clause = f"{set_clause}, cp_user_id = :cp_user_id"
+    params["cp_user_id"] = cp_user_id
     set_clause = f"{set_clause}, price_type = :price_type"
     params["price_type"] = next_price_type
     if has_free_episode_range or clear_free_episode_range:
@@ -758,55 +850,63 @@ async def put_product(
     await db.execute(query, params)
 
     if req_body.cp_company_name is not None:
-        # cp사 선택한 상태
-        query = text("""
-                         select * from tb_product_contract_offer where product_id = :product_id
-                         """)
-        result = await db.execute(query, {"product_id": product_id})
-        rows = result.mappings().all()
-        if len(rows) == 0:
-            # 기존 데이터가 없음 -> insert
-            query = text("""
-                             insert into tb_product_contract_offer (
-                                 product_id,
-                                 profit_type, author_profit, offer_profit,
-                                 use_yn,
-                                 author_user_id,
-                                 author_accept_yn,
-                                 offer_user_id,
-                                 offer_type, offer_code, offer_price, offer_date,
-                                 created_date
-                             ) values (
-                                 :product_id,
-                                 'percent', :cp_settlement_rate, 100 - :cp_settlement_rate,
-                                 'Y',
-                                 (select author_id from tb_product where product_id = :product_id),
-                                 NULL,
-                                 (select user_id from tb_user_profile_apply where apply_type = 'cp' and company_name = :cp_company_name),
-                                 'input', '', :cp_offered_price, now(),
-                                 now()
-                             )
-                             """)
+        if should_defer_cp_contract_offer:
+            logger.info(
+                "defer contract_offer write for own CP product: product_id=%s, user_id=%s, cp_company_name=%s",
+                product_id,
+                user_data["user_id"] if user_data else None,
+                req_body.cp_company_name,
+            )
         else:
-            # 기존 데이터가 있음 -> use_yn을 Y로 바꿔줌
+            # cp사 선택한 상태
             query = text("""
-                             update tb_product_contract_offer set
-                             use_yn = 'Y',
-                             profit_type = 'percent', author_profit = :cp_settlement_rate, offer_profit = 100 - :cp_settlement_rate,
-                             offer_user_id = (select user_id from tb_user_profile_apply where apply_type = 'cp' and company_name = :cp_company_name),
-                             offer_type = 'input', offer_code = '', offer_price = :cp_offered_price, offer_date = now(),
-                             updated_date = now()
-                             where product_id = :product_id
+                             select * from tb_product_contract_offer where product_id = :product_id
                              """)
-        await db.execute(
-            query,
-            {
-                "cp_settlement_rate": req_body.cp_settlement_rate,
-                "cp_offered_price": req_body.cp_offered_price,
-                "product_id": product_id,
-                "cp_company_name": req_body.cp_company_name,
-            },
-        )
+            result = await db.execute(query, {"product_id": product_id})
+            rows = result.mappings().all()
+            if len(rows) == 0:
+                # 기존 데이터가 없음 -> insert
+                query = text("""
+                                 insert into tb_product_contract_offer (
+                                     product_id,
+                                     profit_type, author_profit, offer_profit,
+                                     use_yn,
+                                     author_user_id,
+                                     author_accept_yn,
+                                     offer_user_id,
+                                     offer_type, offer_code, offer_price, offer_date,
+                                     created_date
+                                 ) values (
+                                     :product_id,
+                                     'percent', :cp_settlement_rate, 100 - :cp_settlement_rate,
+                                     'Y',
+                                     (select author_id from tb_product where product_id = :product_id),
+                                     NULL,
+                                     (select user_id from tb_user_profile_apply where apply_type = 'cp' and company_name = :cp_company_name),
+                                     'input', '', :cp_offered_price, now(),
+                                     now()
+                                 )
+                                 """)
+            else:
+                # 기존 데이터가 있음 -> use_yn을 Y로 바꿔줌
+                query = text("""
+                                 update tb_product_contract_offer set
+                                 use_yn = 'Y',
+                                 profit_type = 'percent', author_profit = :cp_settlement_rate, offer_profit = 100 - :cp_settlement_rate,
+                                 offer_user_id = (select user_id from tb_user_profile_apply where apply_type = 'cp' and company_name = :cp_company_name),
+                                 offer_type = 'input', offer_code = '', offer_price = :cp_offered_price, offer_date = now(),
+                                 updated_date = now()
+                                 where product_id = :product_id
+                                 """)
+            await db.execute(
+                query,
+                {
+                    "cp_settlement_rate": req_body.cp_settlement_rate,
+                    "cp_offered_price": req_body.cp_offered_price,
+                    "product_id": product_id,
+                    "cp_company_name": req_body.cp_company_name,
+                },
+            )
     else:
         # 설정 안함 선택한 상태
         query = text("""

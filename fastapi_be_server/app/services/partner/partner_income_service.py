@@ -17,6 +17,24 @@ partner 파트너 수익/후원 관련 서비스 함수 모음
 """
 
 
+def _cp_owned_product_ids_subquery(user_id: int) -> str:
+    return f"""
+        SELECT product_id
+        FROM tb_product
+        WHERE cp_user_id = {user_id}
+           OR user_id = {user_id}
+    """
+
+
+def _cp_owned_author_ids_subquery(user_id: int) -> str:
+    return f"""
+        SELECT DISTINCT author_id
+        FROM tb_product
+        WHERE cp_user_id = {user_id}
+           OR user_id = {user_id}
+    """
+
+
 async def sponsorship_recodes_list(
     search_target: str,
     search_word: str,
@@ -56,28 +74,10 @@ async def sponsorship_recodes_list(
         where += f"""
             AND (
                 sr.product_id IN (
-                    select z.product_id
-                    from tb_product_contract_offer z
-                    inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                    and y.apply_type = 'cp'
-                    and y.approval_date is not null
-                    where z.use_yn = 'Y'
-                    and z.author_accept_yn = 'Y'
-                    and y.user_id = {user_data["user_id"]}
+                    {_cp_owned_product_ids_subquery(user_data["user_id"])}
                 )
                 OR sr.author_id IN (
-                    select p.author_id
-                    from tb_product_contract_offer z
-                    inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                    inner join tb_product p on z.product_id = p.product_id
-                    and y.apply_type = 'cp'
-                    and y.approval_date is not null
-                    where z.use_yn = 'Y'
-                    and z.author_accept_yn = 'Y'
-                    and y.user_id = {user_data["user_id"]}
-                )
-                OR sr.product_id IN (
-                    SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
+                    {_cp_owned_author_ids_subquery(user_data["user_id"])}
                 )
             )
         """
@@ -331,18 +331,9 @@ async def income_recodes_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
-            ))
+            AND product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
         """
 
     if search_word != "":
@@ -448,32 +439,18 @@ async def income_settlement_list(
         """
     elif user_data["role"] == "CP":
         where += f"""
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = {user_data["user_id"]}
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
-            ))
+            AND product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
         """
         sponsorship_where = f"""
             AND (
                 product_id = pis.product_id
                 OR (sponsor_type = 'author' AND author_nickname IN (
-                    select p.author_name
-                    from tb_product_contract_offer z
-                    inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                    inner join tb_product p on z.product_id = p.product_id
-                    and y.apply_type = 'cp'
-                    and y.approval_date is not null
-                    where z.use_yn = 'Y'
-                    and z.author_accept_yn = 'Y'
-                    and y.user_id = {user_data["user_id"]}
+                    SELECT DISTINCT author_name
+                    FROM tb_product
+                    WHERE cp_user_id = {user_data["user_id"]}
+                       OR user_id = {user_data["user_id"]}
                 ))
             )
         """
@@ -612,28 +589,16 @@ async def income_settlement_summary(
         sponsorship_where = """
             AND (
                 product_id IN (
-                    select z.product_id
-                    from tb_product_contract_offer z
-                    inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                    and y.apply_type = 'cp'
-                    and y.approval_date is not null
-                    where z.use_yn = 'Y'
-                    and z.author_accept_yn = 'Y'
-                    and y.user_id = :user_id
+                    SELECT product_id
+                    FROM tb_product
+                    WHERE cp_user_id = :user_id
+                       OR user_id = :user_id
                 )
                 OR author_id IN (
-                    select p.author_id
-                    from tb_product_contract_offer z
-                    inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                    inner join tb_product p on z.product_id = p.product_id
-                    and y.apply_type = 'cp'
-                    and y.approval_date is not null
-                    where z.use_yn = 'Y'
-                    and z.author_accept_yn = 'Y'
-                    and y.user_id = :user_id
-                )
-                OR product_id IN (
-                    SELECT product_id FROM tb_product WHERE user_id = :user_id
+                    SELECT DISTINCT author_id
+                    FROM tb_product
+                    WHERE cp_user_id = :user_id
+                       OR user_id = :user_id
                 )
             )
         """
@@ -702,18 +667,12 @@ async def income_settlement_summary(
         """
     elif user_data["role"] == "CP":
         settlement_where = """
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = :user_id
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = :user_id
-            ))
+            AND product_id IN (
+                SELECT product_id
+                FROM tb_product
+                WHERE cp_user_id = :user_id
+                   OR user_id = :user_id
+            )
         """
 
     query = text(f"""
@@ -741,18 +700,12 @@ async def income_settlement_summary(
         """
     elif user_data["role"] == "CP":
         addictive_where = """
-            AND (product_id IN (
-                select z.product_id
-                from tb_product_contract_offer z
-                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                and y.apply_type = 'cp'
-                and y.approval_date is not null
-                where z.use_yn = 'Y'
-                and z.author_accept_yn = 'Y'
-                and y.user_id = :user_id
-            ) OR product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = :user_id
-            ))
+            AND product_id IN (
+                SELECT product_id
+                FROM tb_product
+                WHERE cp_user_id = :user_id
+                   OR user_id = :user_id
+            )
         """
 
     # 기타 수익 (광고 등) 조회

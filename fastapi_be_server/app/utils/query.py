@@ -289,14 +289,9 @@ def build_role_where_clause(
     elif user_data["role"] == "CP":
         return f"""
             AND ({product_id_column} IN (
-                SELECT z.product_id
-                FROM tb_product_contract_offer z
-                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
-                AND y.apply_type = 'cp'
-                AND y.approval_date IS NOT NULL
-                WHERE z.use_yn = 'Y'
-                AND z.author_accept_yn = 'Y'
-                AND y.user_id = {user_data["user_id"]}
+                SELECT product_id
+                  FROM tb_product
+                 WHERE cp_user_id = {user_data["user_id"]}
             ) OR {product_id_column} IN (
                 SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
             ))
