@@ -496,7 +496,7 @@ async def put_product(
         query = text("""
                     select z.keyword_name from tb_standard_keyword z
                         where z.use_yn = 'Y'
-                        and z.major_genre_yn = 'Y'
+                        and z.category_id = 1
                         and :primary_genre_id = z.keyword_id
                     """)
         result = await db.execute(
@@ -513,7 +513,7 @@ async def put_product(
         query = text("""
                     select z.keyword_name from tb_standard_keyword z
                         where z.use_yn = 'Y'
-                        and z.major_genre_yn = 'N'
+                        and z.category_id = 1
                         and :sub_genre_id = z.keyword_id
                     """)
         result = await db.execute(query, {"sub_genre_id": req_body.sub_genre_id})

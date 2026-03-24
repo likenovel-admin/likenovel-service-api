@@ -2176,7 +2176,26 @@ async def get_products_genres(kc_user_id: str, db: AsyncSession):
                                 , keyword_name as genre
                             from tb_standard_keyword
                             where use_yn = 'Y'
-                                and major_genre_yn = 'Y'
+                                and category_id = 1
+                            order by case keyword_name
+                                when '무협' then 1
+                                when '판타지' then 2
+                                when '퓨전' then 3
+                                when '게임' then 4
+                                when '스포츠' then 5
+                                when '로맨스' then 6
+                                when '라이트노벨' then 7
+                                when '현대판타지' then 8
+                                when '대체역사' then 9
+                                when '전쟁·밀리터리' then 10
+                                when 'SF' then 11
+                                when '추리' then 12
+                                when '공포·미스테리' then 13
+                                when '일반소설' then 14
+                                when '드라마' then 15
+                                when '팬픽·패러디' then 16
+                                else 999
+                            end, keyword_id asc
                             """)
 
             result = await db.execute(query)
@@ -2646,7 +2665,7 @@ async def post_products(
                                       , keyword_name
                                    from tb_standard_keyword
                                   where use_yn = 'Y'
-                                    and major_genre_yn = 'Y'
+                                    and category_id = 1
                                  """)
 
                 result = await db.execute(query)
@@ -2673,12 +2692,17 @@ async def post_products(
                 # 2李??λⅤ 寃利?
                 sub_genre_id = None
                 if req_body.sub_genre is not None and req_body.sub_genre != "":
+                    if req_body.primary_genre == req_body.sub_genre:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.PRIMARY_SECONDARY_GENRE_SAME,
+                        )
                     sub_genre_query = text("""
                                      select keyword_id
                                           , keyword_name
                                        from tb_standard_keyword
                                       where use_yn = 'Y'
-                                        and major_genre_yn != 'Y'
+                                        and category_id = 1
                                      """)
                     sub_genre_result = await db.execute(sub_genre_query)
                     sub_genre_rst = sub_genre_result.mappings().all()
@@ -3073,7 +3097,7 @@ async def put_products_product_id(
                                       , keyword_name
                                    from tb_standard_keyword
                                   where use_yn = 'Y'
-                                    and major_genre_yn = 'Y'
+                                    and category_id = 1
                                  """)
 
                 result = await db.execute(query)
@@ -3100,12 +3124,17 @@ async def put_products_product_id(
                 # 2李??λⅤ 寃利?
                 sub_genre_id = None
                 if req_body.sub_genre is not None and req_body.sub_genre != "":
+                    if req_body.primary_genre == req_body.sub_genre:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.PRIMARY_SECONDARY_GENRE_SAME,
+                        )
                     sub_genre_query = text("""
                                      select keyword_id
                                           , keyword_name
                                        from tb_standard_keyword
                                       where use_yn = 'Y'
-                                        and major_genre_yn != 'Y'
+                                        and category_id = 1
                                      """)
                     sub_genre_result = await db.execute(sub_genre_query)
                     sub_genre_rst = sub_genre_result.mappings().all()
