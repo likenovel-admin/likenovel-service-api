@@ -104,6 +104,9 @@ class Product(Base):
     contract_yn: Mapped[str] = mapped_column(
         String(settings.VARCHAR_YN_SIZE), server_default="N", comment="계약 여부"
     )
+    cp_user_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=True, comment="담당 CP 사용자 ID"
+    )
     paid_open_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=True, comment="유료회차 시작 일시"
     )

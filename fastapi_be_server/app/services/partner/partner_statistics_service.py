@@ -30,6 +30,49 @@ def _normalize_episode_title(title):
     return re.sub(r"\.epub$", "", str(title).strip(), flags=re.IGNORECASE)
 
 
+def _cp_owned_product_ids_subquery(user_id: int) -> str:
+    return f"""
+        SELECT product_id
+        FROM tb_product
+        WHERE cp_user_id = {user_id}
+           OR user_id = {user_id}
+    """
+
+
+def _cp_company_name_product_ids_subquery(search_word: str) -> str:
+    return f"""
+        SELECT p.product_id
+        FROM tb_product p
+        INNER JOIN tb_user_profile_apply y ON p.cp_user_id = y.user_id
+            AND y.apply_type = 'cp'
+            AND y.approval_code = 'accepted'
+            AND y.approval_date IS NOT NULL
+        WHERE y.company_name LIKE '%{search_word}%'
+    """
+
+
+async def _get_cp_company_name_map_by_product_ids(
+    product_ids: list[int], db: AsyncSession
+) -> dict[int, str]:
+    if not product_ids:
+        return {}
+
+    cp_query = text("""
+        SELECT p.product_id, y.company_name AS cp_company_name
+        FROM tb_product p
+        INNER JOIN tb_user_profile_apply y ON p.cp_user_id = y.user_id
+            AND y.apply_type = 'cp'
+            AND y.approval_code = 'accepted'
+            AND y.approval_date IS NOT NULL
+        WHERE p.product_id IN :product_ids
+    """).bindparams(bindparam("product_ids", expanding=True))
+    cp_result = await db.execute(cp_query, {"product_ids": product_ids})
+    return {
+        row["product_id"]: row["cp_company_name"]
+        for row in cp_result.mappings().all()
+    }
+
+
 async def product_statistics_list(
     search_target: str,
     search_word: str,
@@ -66,18 +109,9 @@ async def product_statistics_list(
         """
     elif user_data["role"] == "CP":
         where = f"""
-            AND (s.product_id IN (
-                SELECT z.product_id
-                FROM tb_product_contract_offer z
-                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
-                AND y.apply_type = 'cp'
-                AND y.approval_date IS NOT NULL
-                WHERE z.use_yn = 'Y'
-                AND z.author_accept_yn = 'Y'
-                AND y.user_id = {user_data["user_id"]}
-            ) OR s.product_id IN (
-                SELECT product_id FROM tb_product WHERE user_id = {user_data["user_id"]}
-            ))
+            AND s.product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
         """
     else:
         where = ""
@@ -104,14 +138,7 @@ async def product_statistics_list(
         elif search_target == CommonConstants.SEARCH_CP_NAME:
             where += f"""
                           AND s.product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
+                                {_cp_company_name_product_ids_subquery(search_word)}
                           )
                           """
 
@@ -154,28 +181,7 @@ async def product_statistics_list(
 
     # 2단계: product_id 목록 추출 후 cp_company_name 일괄 조회
     product_ids = list({row["product_id"] for row in results})
-    cp_map = {}
-    if product_ids:
-        cp_query = text("""
-            SELECT t.product_id, t.company_name as cp_company_name
-            FROM (
-                SELECT z.product_id, y.company_name,
-                    ROW_NUMBER() OVER (PARTITION BY z.product_id ORDER BY z.updated_date DESC) as rn
-                FROM tb_product_contract_offer z
-                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
-                    AND y.apply_type = 'cp'
-                    AND y.approval_date is not null
-                WHERE z.product_id IN :product_ids
-                    AND z.use_yn = 'Y'
-                    AND z.author_accept_yn = 'Y'
-            ) t
-            WHERE t.rn = 1
-        """)
-        cp_result = await db.execute(cp_query, {"product_ids": tuple(product_ids)})
-        cp_map = {
-            row["product_id"]: row["cp_company_name"]
-            for row in cp_result.mappings().all()
-        }
+    cp_map = await _get_cp_company_name_map_by_product_ids(product_ids, db)
 
     # 3단계: 결과에 cp_company_name 매핑
     for row in results:
@@ -250,14 +256,7 @@ async def product_episode_statistics_list(
         ):
             where += f"""
                           AND s.product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
+                                {_cp_company_name_product_ids_subquery(search_word)}
                           )
                           """
 
@@ -325,28 +324,7 @@ async def product_episode_statistics_list(
 
     # 2단계: product_id 목록 추출 후 cp_company_name 일괄 조회
     product_ids = list({row["product_id"] for row in results})
-    cp_map = {}
-    if product_ids:
-        cp_query = text("""
-            SELECT t.product_id, t.company_name as cp_company_name
-            FROM (
-                SELECT z.product_id, y.company_name,
-                    ROW_NUMBER() OVER (PARTITION BY z.product_id ORDER BY z.updated_date DESC) as rn
-                FROM tb_product_contract_offer z
-                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
-                    AND y.apply_type = 'cp'
-                    AND y.approval_date is not null
-                WHERE z.product_id IN :product_ids
-                    AND z.use_yn = 'Y'
-                    AND z.author_accept_yn = 'Y'
-            ) t
-            WHERE t.rn = 1
-        """).bindparams(bindparam("product_ids", expanding=True))
-        cp_result = await db.execute(cp_query, {"product_ids": product_ids})
-        cp_map = {
-            row["product_id"]: row["cp_company_name"]
-            for row in cp_result.mappings().all()
-        }
+    cp_map = await _get_cp_company_name_map_by_product_ids(product_ids, db)
 
     # 3단계: 결과에 cp_company_name 매핑
     for row in results:
@@ -468,14 +446,7 @@ async def cart_analysis_list(
         if search_target == "cp-name":
             where += f"""
                           AND product_id IN (
-                                select z.product_id
-                                from tb_product_contract_offer z
-                                inner join tb_user_profile_apply y on z.offer_user_id = y.user_id
-                                and y.apply_type = 'cp'
-                                and y.approval_date is not null
-                                where z.use_yn = 'Y'
-                                and z.author_accept_yn = 'Y'
-                                and y.company_name LIKE '%{search_word}%'
+                                {_cp_company_name_product_ids_subquery(search_word)}
                           )
                           """
 
@@ -811,16 +782,9 @@ async def _discovery_statistics_list_summary(
         where += f" AND p.author_id = {user_data['user_id']}"
     elif user_data["role"] == "CP" and scope == "contracted":
         where += f"""
-            AND (p.product_id IN (
-                SELECT z.product_id
-                FROM tb_product_contract_offer z
-                INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
-                    AND y.apply_type = 'cp'
-                    AND y.approval_date IS NOT NULL
-                WHERE z.use_yn = 'Y'
-                    AND z.author_accept_yn = 'Y'
-                    AND y.user_id = {user_data['user_id']}
-            ) OR p.user_id = {user_data['user_id']})
+            AND p.product_id IN (
+                {_cp_owned_product_ids_subquery(user_data['user_id'])}
+            )
         """
 
     if search_word != "":
@@ -1009,18 +973,12 @@ async def product_discovery_statistics_detail_by_id(
         params["user_id"] = user_data["user_id"]
     elif user_data["role"] == "CP" and scope == "contracted":
         detail_where += """
-        AND (ppds.product_id IN (
-            SELECT z.product_id
-            FROM tb_product_contract_offer z
-            INNER JOIN tb_user_profile_apply y ON z.offer_user_id = y.user_id
-            AND y.apply_type = 'cp'
-            AND y.approval_date IS NOT NULL
-            WHERE z.use_yn = 'Y'
-            AND z.author_accept_yn = 'Y'
-            AND y.user_id = :user_id
-        ) OR ppds.product_id IN (
-            SELECT product_id FROM tb_product WHERE user_id = :user_id
-        ))
+        AND ppds.product_id IN (
+            SELECT product_id
+            FROM tb_product
+            WHERE cp_user_id = :user_id
+               OR user_id = :user_id
+        )
         """
         params["user_id"] = user_data["user_id"]
 
