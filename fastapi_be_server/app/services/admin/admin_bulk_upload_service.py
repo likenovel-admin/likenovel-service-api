@@ -6,11 +6,14 @@
 import io
 import json
 import logging
+import random
+import re
 import secrets
 import string
 import tempfile
 import zipfile
 from datetime import datetime, timedelta
+from html import escape as html_escape
 from pathlib import Path
 from uuid import uuid4
 
@@ -36,8 +39,22 @@ DAY_INDEX = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 
 # ─── 헬퍼 ─────────────────────────────────────────────────────
 
 def _generate_password(length: int = 12) -> str:
-    chars = string.ascii_letters + string.digits + "!@#$%"
-    return "".join(secrets.choice(chars) for _ in range(length))
+    if length < 8:
+        length = 8
+
+    letters = string.ascii_letters
+    digits = string.digits
+    specials = "!@#$%"
+    chars = letters + digits + specials
+
+    password_chars = [
+        secrets.choice(letters),
+        secrets.choice(digits),
+        secrets.choice(specials),
+    ]
+    password_chars.extend(secrets.choice(chars) for _ in range(length - len(password_chars)))
+    random.SystemRandom().shuffle(password_chars)
+    return "".join(password_chars)
 
 
 def _parse_publish_days(raw: str) -> dict:
@@ -68,15 +85,24 @@ def _next_publish_date(base: datetime, active_weekdays: list[int], offset: int) 
 
 
 def _txt_to_html(txt: str) -> str:
-    """txt 본문을 간단한 HTML로 변환."""
-    paragraphs = txt.split("\n")
-    parts = []
-    for p in paragraphs:
-        stripped = p.strip()
-        if stripped:
-            parts.append(f"<p>{stripped}</p>")
-        else:
-            parts.append("<p><br/></p>")
+    """txt 본문을 문단 기준 HTML로 변환.
+
+    규칙
+    - 빈 줄 1개 이상: 새 문단 구분
+    - 문단 내부 단일 줄바꿈: <br/>
+    - 문단 사이 구분: 기존 뷰어 데이터에 맞춰 빈 <p></p> 3개
+    """
+    normalized = txt.replace("\r\n", "\n").replace("\r", "\n")
+    raw_paragraphs = [chunk for chunk in re.split(r"\n\s*\n+", normalized) if chunk.strip()]
+
+    parts: list[str] = []
+    for index, paragraph in enumerate(raw_paragraphs):
+        lines = [html_escape(line.strip()) for line in paragraph.split("\n") if line.strip()]
+        if not lines:
+            continue
+        parts.append(f"<p>{'<br/>'.join(lines)}</p>")
+        if index < len(raw_paragraphs) - 1:
+            parts.extend(["<p></p>", "<p></p>", "<p></p>"])
     return "".join(parts)
 
 
@@ -421,7 +447,7 @@ async def _create_product(
     publish_days = _parse_publish_days(row["schedule_days"])
 
     # 표지 업로드 (있으면)
-    thumbnail_file_id = None
+    thumbnail_file_id = settings.R2_COVER_DEFAULT_IMAGE
     if cover_bytes:
         try:
             thumbnail_file_id = await _upload_cover_image(cover_bytes, db)
