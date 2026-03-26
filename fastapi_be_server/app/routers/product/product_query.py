@@ -1,14 +1,15 @@
-from fastapi import APIRouter, Depends, Query, Path
+from fastapi import APIRouter, Depends, Query, Path, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any, List, Optional
 
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger, chk_cur_user
+from app.exceptions import CustomResponseException
 import app.services.product.product_service as product_service
 import app.services.product.product_comment_service as product_comment_service
 import app.services.product.product_bookmark_service as product_bookmark_service
 import app.services.product.product_notice_service as product_notice_service
-from app.const import LOGGER_TYPE
+from app.const import LOGGER_TYPE, ErrorMessages
 from app.config.log_config import service_error_logger
 
 router = APIRouter(prefix="/products")
@@ -2153,7 +2154,10 @@ async def products_bookmark_by_user_id(
 
 
 @router.get(
-    "/interest-drop-products", tags=["작품"], dependencies=[Depends(analysis_logger)]
+    "/interest-drop-products",
+    tags=["작품"],
+    responses={401: {"description": "로그인 필요"}},
+    dependencies=[Depends(analysis_logger)],
 )
 async def get_user_interest_drop_products(
     user: Dict[str, Any] = Depends(chk_cur_user),
@@ -2162,6 +2166,11 @@ async def get_user_interest_drop_products(
     """
     관심 끊기기 목록 조회
     """
+    if not user.get("sub"):
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
 
     return await product_service.get_user_interest_drop_products(
         kc_user_id=user.get("sub"), db=db
@@ -2171,6 +2180,7 @@ async def get_user_interest_drop_products(
 @router.get(
     "/interest-drop-products-soon",
     tags=["작품"],
+    responses={401: {"description": "로그인 필요"}},
     dependencies=[Depends(analysis_logger)],
 )
 async def get_user_interest_drop_products_soon(
@@ -2181,6 +2191,11 @@ async def get_user_interest_drop_products_soon(
     """
     관심 끊기기 임박 목록 조회
     """
+    if not user.get("sub"):
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
 
     return await product_service.get_user_interest_drop_products_soon(
         kc_user_id=user.get("sub"), db=db, adult_yn=adult_yn
