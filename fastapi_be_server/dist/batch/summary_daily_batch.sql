@@ -118,7 +118,8 @@ update tb_product_trend_index a
         select z.product_id
                , (select count(1) from tb_product_episode x
                    where z.product_id = x.product_id
-                     and x.use_yn = 'Y') as count_write
+                     and x.use_yn = 'Y'
+                     and x.open_yn = 'Y') as count_write
                , y.created_date
             from tb_product z
            inner join tb_product_episode y on z.product_id = y.product_id
