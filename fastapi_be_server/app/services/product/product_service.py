@@ -151,8 +151,11 @@ async def _resolve_cp_link_info(
 
 
 def get_select_fields_and_joins_for_product(
-    user_id: int | None = None, join_rank: bool = False
+    user_id: int | None = None,
+    join_rank: bool = False,
+    rank_area_code: str | None = None,
 ):
+    join_rank_enabled = join_rank or rank_area_code is not None
     return {
         "select_fields": ",".join(
             [
@@ -173,9 +176,11 @@ def get_select_fields_and_joins_for_product(
                 "(SELECT GROUP_CONCAT(DISTINCT sk2.keyword_name SEPARATOR '|') FROM tb_mapped_product_keyword mpk2 LEFT JOIN tb_standard_keyword sk2 ON sk2.keyword_id = mpk2.keyword_id WHERE mpk2.product_id = p.product_id) as keywords",
                 "pg.keyword_name as primary_genre",
                 "sg.keyword_name as sub_genre",
-                "pr.current_rank" if join_rank else "NULL as current_rank",
+                "pr.current_rank" if join_rank_enabled else "NULL as current_rank",
                 "(pr.privious_rank - pr.current_rank) as rank_indicator"
                 if join_rank
+                else "(pr.previous_rank - pr.current_rank) as rank_indicator"
+                if rank_area_code is not None
                 else "NULL as rank_indicator",
                 "cf.file_path as coverImagePath",
                 "p.count_hit",
@@ -262,6 +267,22 @@ def get_select_fields_and_joins_for_product(
         + (
             "INNER JOIN tb_product_rank pr ON pr.product_id = p.product_id"
             if join_rank
+            else f"""
+            INNER JOIN (
+                SELECT r1.product_id, r1.current_rank, r1.previous_rank
+                FROM tb_product_rank_area r1
+                INNER JOIN (
+                    SELECT product_id, MAX(created_date) AS max_created_date
+                    FROM tb_product_rank_area
+                    WHERE area_code = '{rank_area_code}'
+                    GROUP BY product_id
+                ) r2
+                  ON r1.product_id = r2.product_id
+                 AND r1.created_date = r2.max_created_date
+                WHERE r1.area_code = '{rank_area_code}'
+            ) pr ON pr.product_id = p.product_id
+            """
+            if rank_area_code is not None
             else ""
         )
         + """
@@ -432,6 +453,58 @@ def get_select_fields_and_joins_for_product(
         + """
         """,
     }
+
+
+TOP_MANAGED_AREA_ALIASES = {
+    "freeTop": "freeSerialTop",
+    "paidTop": "paidSerialTop",
+}
+
+TOP_MANAGED_AREA_RULES = {
+    "freeSerialTop": {
+        "rank_area_code": "freeSerialTop",
+        "area_label": "freeSerialTop",
+        "filters": [
+            'p.price_type = "free"',
+            'p.status_code IN ("ongoing", "rest")',
+        ],
+    },
+    "paidSerialTop": {
+        "rank_area_code": "paidSerialTop",
+        "area_label": "paidSerialTop",
+        "filters": [
+            'p.price_type = "paid"',
+            'p.publish_regular_yn = "Y"',
+            'p.status_code IN ("ongoing", "rest")',
+        ],
+    },
+    "paidEndTop": {
+        "rank_area_code": "paidEndTop",
+        "area_label": "paidEndTop",
+        "filters": [
+            'p.price_type = "paid"',
+            'p.publish_regular_yn = "Y"',
+            'p.status_code = "end"',
+        ],
+    },
+    "paidStandaloneTop": {
+        "rank_area_code": "paidStandaloneTop",
+        "area_label": "paidStandaloneTop",
+        "filters": [
+            'p.price_type = "paid"',
+            'p.publish_regular_yn = "N"',
+        ],
+    },
+    "paidMainTop": {
+        "rank_area_code": "paidMainTop",
+        "area_label": "paidMainTop",
+        "filters": [
+            'p.price_type = "paid"',
+            'p.publish_regular_yn = "Y"',
+            'p.status_code IN ("ongoing", "rest", "end")',
+        ],
+    },
+}
 
 
 def convert_product_data(row: RowMapping):
@@ -664,21 +737,19 @@ async def products_of_managed(
     #     filter_option.append(f'division = "{division}"')
     order_by = "p.product_id DESC"
     join_rank = False
-    if area is not None:
-        if area == "freeTop":
-            filter_option.append('p.price_type = "free"')
-            order_by = "pr.current_rank ASC"
-            join_rank = True
-        elif area == "paidTop":
-            filter_option.append('p.price_type = "paid"')
-            order_by = "pr.current_rank ASC"
-            join_rank = True
+    rank_area_code = None
+    resolved_area = TOP_MANAGED_AREA_ALIASES.get(area, area)
+    if resolved_area in TOP_MANAGED_AREA_RULES:
+        rule = TOP_MANAGED_AREA_RULES[resolved_area]
+        filter_option.extend(rule["filters"])
+        order_by = "pr.current_rank ASC"
+        rank_area_code = rule["rank_area_code"]
 
     query_parts = get_select_fields_and_joins_for_product(
-        user_id=user_id, join_rank=join_rank
+        user_id=user_id, join_rank=join_rank, rank_area_code=rank_area_code
     )
     query = text(f"""
-        SELECT {query_parts["select_fields"]}, concat(p.price_type, 'Top') as area
+        SELECT {query_parts["select_fields"]}, "{resolved_area}" as area
         FROM tb_product p
         {query_parts["joins"]}
         {f"WHERE {' AND '.join(filter_option)}" if len(filter_option) > 0 else ""}
@@ -692,7 +763,7 @@ async def products_of_managed(
     res_data = [convert_product_data(row) for row in rows]
 
     # 鍮꾧났媛??묓뭹 ?꾪꽣留????쒖쐞 ?ы븷??(freeTop, paidTop??寃쎌슦)
-    if join_rank:
+    if join_rank or rank_area_code is not None:
         for idx, item in enumerate(res_data, start=1):
             if "rank" in item:
                 item["rank"]["currentRank"] = idx

@@ -166,8 +166,194 @@ select t.product_id
   ) t
 ;
 
+-- 영역별 Top 랭킹 이전값 저장
+DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank_area;
+CREATE TEMPORARY TABLE tmp_previous_rank_area AS
+SELECT r1.area_code, r1.product_id, r1.current_rank
+  FROM tb_product_rank_area r1
+ INNER JOIN (
+    SELECT area_code, product_id, MAX(created_date) AS max_created_date
+      FROM tb_product_rank_area
+     GROUP BY area_code, product_id
+ ) r2
+    ON r1.area_code = r2.area_code
+   AND r1.product_id = r2.product_id
+   AND r1.created_date = r2.max_created_date
+;
+
+DELETE FROM tb_product_rank_area;
+
+-- 무료연재 Top 랭킹 재계산
+insert into tb_product_rank_area (area_code, product_id, current_rank, previous_rank, created_id, updated_id)
+select 'freeSerialTop'
+     , t.product_id
+     , t.current_rank
+     , t.previous_rank
+     , 0 as created_id
+     , 0 as updated_id
+  from (
+    select z.product_id
+         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , w.current_rank as previous_rank
+      from (
+        select a.product_id
+             , a.count_hit
+             , max(a.count_hit) over() as max_count_hit
+          from tb_product a
+         where exists (select 1 from tb_product_episode b
+                        where a.product_id = b.product_id
+                          and b.episode_no >= 5
+                          and b.use_yn = 'Y')
+      ) z
+     inner join tb_product y on z.product_id = y.product_id
+       and y.price_type = 'free'
+       and y.status_code in ('ongoing', 'rest')
+      left join tb_cms_product_evaluation x on z.product_id = x.product_id
+       and x.evaluation_yn = 'Y'
+      left join tmp_previous_rank_area w on z.product_id = w.product_id
+       and w.area_code = 'freeSerialTop'
+     limit 50 offset 0
+  ) t
+;
+
+-- 유료연재 Top 랭킹 재계산
+insert into tb_product_rank_area (area_code, product_id, current_rank, previous_rank, created_id, updated_id)
+select 'paidSerialTop'
+     , t.product_id
+     , t.current_rank
+     , t.previous_rank
+     , 0 as created_id
+     , 0 as updated_id
+  from (
+    select z.product_id
+         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , w.current_rank as previous_rank
+      from (
+        select a.product_id
+             , a.count_hit
+             , max(a.count_hit) over() as max_count_hit
+          from tb_product a
+         where exists (select 1 from tb_product_episode b
+                        where a.product_id = b.product_id
+                          and b.episode_no >= 5
+                          and b.use_yn = 'Y')
+      ) z
+     inner join tb_product y on z.product_id = y.product_id
+       and y.price_type = 'paid'
+       and y.publish_regular_yn = 'Y'
+       and y.status_code in ('ongoing', 'rest')
+      left join tb_cms_product_evaluation x on z.product_id = x.product_id
+       and x.evaluation_yn = 'Y'
+      left join tmp_previous_rank_area w on z.product_id = w.product_id
+       and w.area_code = 'paidSerialTop'
+     limit 50 offset 0
+  ) t
+;
+
+-- 연재완결 Top 랭킹 재계산
+insert into tb_product_rank_area (area_code, product_id, current_rank, previous_rank, created_id, updated_id)
+select 'paidEndTop'
+     , t.product_id
+     , t.current_rank
+     , t.previous_rank
+     , 0 as created_id
+     , 0 as updated_id
+  from (
+    select z.product_id
+         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , w.current_rank as previous_rank
+      from (
+        select a.product_id
+             , a.count_hit
+             , max(a.count_hit) over() as max_count_hit
+          from tb_product a
+         where exists (select 1 from tb_product_episode b
+                        where a.product_id = b.product_id
+                          and b.episode_no >= 5
+                          and b.use_yn = 'Y')
+      ) z
+     inner join tb_product y on z.product_id = y.product_id
+       and y.price_type = 'paid'
+       and y.publish_regular_yn = 'Y'
+       and y.status_code = 'end'
+      left join tb_cms_product_evaluation x on z.product_id = x.product_id
+       and x.evaluation_yn = 'Y'
+      left join tmp_previous_rank_area w on z.product_id = w.product_id
+       and w.area_code = 'paidEndTop'
+     limit 50 offset 0
+  ) t
+;
+
+-- 단행본 Top 랭킹 재계산
+insert into tb_product_rank_area (area_code, product_id, current_rank, previous_rank, created_id, updated_id)
+select 'paidStandaloneTop'
+     , t.product_id
+     , t.current_rank
+     , t.previous_rank
+     , 0 as created_id
+     , 0 as updated_id
+  from (
+    select z.product_id
+         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , w.current_rank as previous_rank
+      from (
+        select a.product_id
+             , a.count_hit
+             , max(a.count_hit) over() as max_count_hit
+          from tb_product a
+         where exists (select 1 from tb_product_episode b
+                        where a.product_id = b.product_id
+                          and b.episode_no >= 5
+                          and b.use_yn = 'Y')
+      ) z
+     inner join tb_product y on z.product_id = y.product_id
+       and y.price_type = 'paid'
+       and y.publish_regular_yn = 'N'
+      left join tb_cms_product_evaluation x on z.product_id = x.product_id
+       and x.evaluation_yn = 'Y'
+      left join tmp_previous_rank_area w on z.product_id = w.product_id
+       and w.area_code = 'paidStandaloneTop'
+     limit 50 offset 0
+  ) t
+;
+
+-- 메인 유료 Top 랭킹 재계산 (유료연재 + 연재완결)
+insert into tb_product_rank_area (area_code, product_id, current_rank, previous_rank, created_id, updated_id)
+select 'paidMainTop'
+     , t.product_id
+     , t.current_rank
+     , t.previous_rank
+     , 0 as created_id
+     , 0 as updated_id
+  from (
+    select z.product_id
+         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , w.current_rank as previous_rank
+      from (
+        select a.product_id
+             , a.count_hit
+             , max(a.count_hit) over() as max_count_hit
+          from tb_product a
+         where exists (select 1 from tb_product_episode b
+                        where a.product_id = b.product_id
+                          and b.episode_no >= 5
+                          and b.use_yn = 'Y')
+      ) z
+     inner join tb_product y on z.product_id = y.product_id
+       and y.price_type = 'paid'
+       and y.publish_regular_yn = 'Y'
+       and y.status_code in ('ongoing', 'rest', 'end')
+      left join tb_cms_product_evaluation x on z.product_id = x.product_id
+       and x.evaluation_yn = 'Y'
+      left join tmp_previous_rank_area w on z.product_id = w.product_id
+       and w.area_code = 'paidMainTop'
+     limit 50 offset 0
+  ) t
+;
+
 -- 임시 테이블 삭제
 DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank;
+DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank_area;
 
 update tb_cms_batch_job_process a
    set a.completed_yn = 'Y'
