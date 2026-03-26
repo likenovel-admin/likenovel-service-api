@@ -399,6 +399,15 @@ async def _ensure_user(
     user_id_result = await db.execute(text("SELECT LAST_INSERT_ID() AS id"))
     user_id = user_id_result.scalar()
 
+    # tb_user_social (일반 가입 경로와 동일한 최소 social row)
+    await db.execute(
+        text("""
+            INSERT INTO tb_user_social (user_id, sns_type, sns_link_id, created_id, updated_id)
+            VALUES (:user_id, 'likenovel', '', 0, 0)
+        """),
+        {"user_id": user_id},
+    )
+
     # tb_user_profile (작가 역할)
     nick = nickname or comm_service.make_rand_nickname()
     await db.execute(
