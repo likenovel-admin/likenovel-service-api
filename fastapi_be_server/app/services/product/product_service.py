@@ -893,7 +893,7 @@ async def products_all(
         FROM tb_product p
         {query_parts["joins"]}
         WHERE {" and ".join(filter_option)}
-        ORDER BY p.last_episode_date DESC
+        ORDER BY p.last_episode_date DESC, p.product_id DESC
         LIMIT {limit} OFFSET {(page - 1) * limit}
     """)
     result = await db.execute(query, {})
