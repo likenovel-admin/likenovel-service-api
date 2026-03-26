@@ -603,6 +603,43 @@ class ProductRank(Base):
     )
 
 
+class ProductRankArea(Base):
+    __tablename__ = "tb_product_rank_area"  # 작품 랭킹(영역별 top 50)
+
+    rank_area_id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    area_code: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_COMM_SIZE),
+        index=True,
+        nullable=False,
+        comment="랭킹 영역 코드",
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, index=True, nullable=False, comment="작품 아이디"
+    )
+    current_rank: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="현재 랭킹"
+    )
+    previous_rank: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="이전 랭킹"
+    )
+    created_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
 class ProductTrendIndex(Base):
     __tablename__ = "tb_product_trend_index"  # 작품 지표 (작품 등록에서 ins)
 
