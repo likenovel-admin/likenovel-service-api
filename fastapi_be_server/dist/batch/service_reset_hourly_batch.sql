@@ -208,6 +208,7 @@ select 'freeSerialTop'
      inner join tb_product y on z.product_id = y.product_id
        and y.price_type = 'free'
        and y.status_code in ('ongoing', 'rest')
+       and y.open_yn = 'Y'
       left join tb_cms_product_evaluation x on z.product_id = x.product_id
        and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
@@ -242,6 +243,7 @@ select 'paidSerialTop'
        and y.price_type = 'paid'
        and y.publish_regular_yn = 'Y'
        and y.status_code in ('ongoing', 'rest')
+       and y.open_yn = 'Y'
       left join tb_cms_product_evaluation x on z.product_id = x.product_id
        and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
@@ -276,6 +278,7 @@ select 'paidEndTop'
        and y.price_type = 'paid'
        and y.publish_regular_yn = 'Y'
        and y.status_code = 'end'
+       and y.open_yn = 'Y'
       left join tb_cms_product_evaluation x on z.product_id = x.product_id
        and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
@@ -309,6 +312,7 @@ select 'paidStandaloneTop'
      inner join tb_product y on z.product_id = y.product_id
        and y.price_type = 'paid'
        and y.publish_regular_yn = 'N'
+       and y.open_yn = 'Y'
       left join tb_cms_product_evaluation x on z.product_id = x.product_id
        and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
@@ -343,6 +347,7 @@ select 'paidMainTop'
        and y.price_type = 'paid'
        and y.publish_regular_yn = 'Y'
        and y.status_code in ('ongoing', 'rest', 'end')
+       and y.open_yn = 'Y'
       left join tb_cms_product_evaluation x on z.product_id = x.product_id
        and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id

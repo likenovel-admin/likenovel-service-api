@@ -972,6 +972,8 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 message=ErrorMessages.DB_OPERATION_ERROR,
             )
+        except CustomResponseException:
+            raise
         except Exception as e:
             logger.error(e)
             raise CustomResponseException(
@@ -1146,6 +1148,8 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 message=ErrorMessages.DB_OPERATION_ERROR,
             )
+        except CustomResponseException:
+            raise
         except Exception as e:
             logger.error(e)
             raise CustomResponseException(
