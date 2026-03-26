@@ -64,7 +64,110 @@ SELECT COUNT(DISTINCT CONCAT(slot_key, ':', adult_yn))
  WHERE snapshot_start_date = @snapshot_start_date
    AND snapshot_end_date = @snapshot_end_date;
 
-SET @should_build = IF(@current_snapshot_slot_count >= 4, 0, 1);
+SELECT (
+    CASE WHEN EXISTS (
+        SELECT 1
+          FROM tb_main_rule_slot_snapshot s
+         WHERE s.snapshot_start_date = @snapshot_start_date
+           AND s.snapshot_end_date = @snapshot_end_date
+           AND s.slot_key = 'free-new-3up'
+           AND s.adult_yn = 'N'
+           AND s.product_id IS NULL
+    ) AND EXISTS (
+        SELECT 1
+          FROM tb_product p
+          LEFT JOIN (
+              SELECT product_id, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) AS open_episode_count
+              FROM tb_product_episode
+              WHERE use_yn = 'Y'
+              GROUP BY product_id
+          ) ep_count ON ep_count.product_id = p.product_id
+         WHERE p.price_type = 'free'
+           AND p.open_yn = 'Y'
+           AND p.blind_yn = 'N'
+           AND p.status_code IN ('ongoing', 'rest')
+           AND p.ratings_code = 'all'
+           AND COALESCE(ep_count.open_episode_count, 0) >= 3
+           AND p.created_date >= DATE_SUB(@snapshot_ref_at, INTERVAL 3 DAY)
+    ) THEN 1 ELSE 0 END
+  + CASE WHEN EXISTS (
+        SELECT 1
+          FROM tb_main_rule_slot_snapshot s
+         WHERE s.snapshot_start_date = @snapshot_start_date
+           AND s.snapshot_end_date = @snapshot_end_date
+           AND s.slot_key = 'free-binge-10up'
+           AND s.adult_yn = 'N'
+           AND s.product_id IS NULL
+    ) AND EXISTS (
+        SELECT 1
+          FROM tb_product p
+          LEFT JOIN (
+              SELECT product_id, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) AS open_episode_count
+              FROM tb_product_episode
+              WHERE use_yn = 'Y'
+              GROUP BY product_id
+          ) ep_count ON ep_count.product_id = p.product_id
+         WHERE p.price_type = 'free'
+           AND p.open_yn = 'Y'
+           AND p.blind_yn = 'N'
+           AND p.status_code IN ('ongoing', 'rest')
+           AND p.ratings_code = 'all'
+           AND COALESCE(ep_count.open_episode_count, 0) >= 10
+           AND p.last_episode_date >= DATE_SUB(@snapshot_ref_at, INTERVAL 7 DAY)
+    ) THEN 1 ELSE 0 END
+  + CASE WHEN EXISTS (
+        SELECT 1
+          FROM tb_main_rule_slot_snapshot s
+         WHERE s.snapshot_start_date = @snapshot_start_date
+           AND s.snapshot_end_date = @snapshot_end_date
+           AND s.slot_key = 'free-new-3up'
+           AND s.adult_yn = 'Y'
+           AND s.product_id IS NULL
+    ) AND EXISTS (
+        SELECT 1
+          FROM tb_product p
+          LEFT JOIN (
+              SELECT product_id, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) AS open_episode_count
+              FROM tb_product_episode
+              WHERE use_yn = 'Y'
+              GROUP BY product_id
+          ) ep_count ON ep_count.product_id = p.product_id
+         WHERE p.price_type = 'free'
+           AND p.open_yn = 'Y'
+           AND p.blind_yn = 'N'
+           AND p.status_code IN ('ongoing', 'rest')
+           AND p.ratings_code IN ('all', 'adult')
+           AND COALESCE(ep_count.open_episode_count, 0) >= 3
+           AND p.created_date >= DATE_SUB(@snapshot_ref_at, INTERVAL 3 DAY)
+    ) THEN 1 ELSE 0 END
+  + CASE WHEN EXISTS (
+        SELECT 1
+          FROM tb_main_rule_slot_snapshot s
+         WHERE s.snapshot_start_date = @snapshot_start_date
+           AND s.snapshot_end_date = @snapshot_end_date
+           AND s.slot_key = 'free-binge-10up'
+           AND s.adult_yn = 'Y'
+           AND s.product_id IS NULL
+    ) AND EXISTS (
+        SELECT 1
+          FROM tb_product p
+          LEFT JOIN (
+              SELECT product_id, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) AS open_episode_count
+              FROM tb_product_episode
+              WHERE use_yn = 'Y'
+              GROUP BY product_id
+          ) ep_count ON ep_count.product_id = p.product_id
+         WHERE p.price_type = 'free'
+           AND p.open_yn = 'Y'
+           AND p.blind_yn = 'N'
+           AND p.status_code IN ('ongoing', 'rest')
+           AND p.ratings_code IN ('all', 'adult')
+           AND COALESCE(ep_count.open_episode_count, 0) >= 10
+           AND p.last_episode_date >= DATE_SUB(@snapshot_ref_at, INTERVAL 7 DAY)
+    ) THEN 1 ELSE 0 END
+) INTO @stale_placeholder_slot_count;
+
+SET @should_build = IF(@current_snapshot_slot_count >= 4 AND @stale_placeholder_slot_count = 0, 0, 1);
 
 DELETE FROM tb_main_rule_slot_snapshot
  WHERE snapshot_start_date = @snapshot_start_date
