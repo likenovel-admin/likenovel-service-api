@@ -12,6 +12,7 @@ from app.services.admin import (
     admin_basic_service,
     admin_blind_service,
     admin_bulk_upload_service,
+    admin_free_serial_schedule_service,
     admin_content_service,
     admin_event_service,
     admin_faq_service,
@@ -1676,3 +1677,42 @@ async def post_bulk_upload_execute(
     excel_bytes = await excel.read()
     zip_bytes = await zip_file.read()
     return await admin_bulk_upload_service.execute_bulk_upload(excel_bytes, zip_bytes, db)
+
+
+@router.post(
+    "/free-serial-schedule/preview",
+    tags=["CMS - 무료연재 예약 스케줄"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_free_serial_schedule_preview(
+    excel: UploadFile = File(...),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """무료연재 예약 스케줄 시트 미리보기"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    excel_bytes = await excel.read()
+    return await admin_free_serial_schedule_service.preview_free_serial_schedule_upload(
+        excel_bytes=excel_bytes,
+        db=db,
+    )
+
+
+@router.post(
+    "/free-serial-schedule/apply",
+    tags=["CMS - 무료연재 예약 스케줄"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_free_serial_schedule_apply(
+    excel: UploadFile = File(...),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """무료연재 예약 스케줄 시트 적용"""
+    current_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    excel_bytes = await excel.read()
+    return await admin_free_serial_schedule_service.apply_free_serial_schedule_upload(
+        excel_bytes=excel_bytes,
+        db=db,
+        admin_user_id=current_user["user_id"],
+    )

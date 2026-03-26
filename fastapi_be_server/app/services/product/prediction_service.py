@@ -1,4 +1,5 @@
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import status
 from sqlalchemy import text
@@ -9,6 +10,19 @@ from app.const import ErrorMessages
 from app.exceptions import CustomResponseException
 import app.schemas.prediction as prediction_schema
 import app.services.common.comm_service as comm_service
+
+
+@asynccontextmanager
+async def _transaction_scope(db: AsyncSession):
+    """
+    Avoid nested transaction begin() errors when the session already has a transaction.
+    """
+    if db.in_transaction():
+        yield
+        return
+
+    async with db.begin():
+        yield
 
 
 async def post_author_episode_prediction(
@@ -23,7 +37,7 @@ async def post_author_episode_prediction(
         )
 
     try:
-        async with db.begin():
+        async with _transaction_scope(db):
             user_id = await comm_service.get_user_from_kc(kc_user_id, db)
             if user_id == -1:
                 raise CustomResponseException(
@@ -35,7 +49,6 @@ async def post_author_episode_prediction(
                 select author_id
                   from tb_product
                  where product_id = :product_id
-                   and use_yn = 'Y'
             """)
             product_owner_result = await db.execute(
                 product_owner_query, {"product_id": req_body.product_id}

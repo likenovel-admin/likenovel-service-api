@@ -19,6 +19,6 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 50 * * * * ln-admin bash /home/ln-admin/likenovel/batch-dev/summary_hourly_batch.sh >> /home/ln-admin/likenovel/batch-dev/summary_hourly_batch.log 2>&1
 0 0 * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/statistics_aggregation_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/statistics_aggregation_daily_batch.log 2>&1
-0 3 * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_dna_extract_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_dna_extract_daily_batch.log 2>&1
+# 0 3 * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_dna_extract_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_dna_extract_daily_batch.log 2>&1
 * * * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/paid_episode_convert_batch.sh >> /home/ln-admin/likenovel/batch-dev/paid_episode_convert_batch.log 2>&1
 * * * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/scheduled_open_batch.sh >> /home/ln-admin/likenovel/batch-dev/scheduled_open_batch.log 2>&1

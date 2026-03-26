@@ -126,6 +126,25 @@ class PostEpisodesSaleReserveReqBody(EpisodesBase):
         return value
 
 
+class EpisodePublishReserveBulkItem(EpisodesBase):
+    episode_id: int = Field(description="예약 설정할 회차 ID")
+    publish_reserve_date: Optional[datetime] = Field(
+        default=None, examples=["2026-12-31T23:59:59"], description="예약 공개 일시"
+    )
+
+    @field_validator("publish_reserve_date", mode="before")
+    def validate_publish_reserve_date(cls, value):
+        if value == "Invalid Date" or not value:
+            return None
+        return value
+
+
+class PostEpisodesPublishReserveBulkReqBody(EpisodesBase):
+    schedules: List[EpisodePublishReserveBulkItem] = Field(
+        default_factory=list, description="회차별 예약 공개 설정 목록"
+    )
+
+
 class PostEpisodesSaleReserveCancelReqBody(EpisodesBase):
     episode_ids: List[int] = Field(
         default_factory=list, description="판매 예약 취소할 회차 ID 목록"
