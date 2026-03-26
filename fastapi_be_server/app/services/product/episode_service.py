@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import posixpath
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from fastapi import status
 from sqlalchemy import text
@@ -36,6 +36,7 @@ Episodes service
 _EPUB_XHTML_EXTENSIONS = (".xhtml", ".html", ".htm")
 _COPYRIGHT_KEYWORDS = ("발행일", "발행인", "isbn", "uci", "ⓒ", "©", "copyright")
 _COPYRIGHT_FILE_NAMES = {"copy", "right", "rights", "colophon"}
+_MIN_RESERVE_LEAD_MINUTES = 5
 
 
 @asynccontextmanager
@@ -59,6 +60,42 @@ def _to_kst_naive(dt: Optional[datetime]) -> Optional[datetime]:
         return dt.astimezone(ZoneInfo(settings.KOREA_TIMEZONE)).replace(tzinfo=None)
 
     return dt
+
+
+def _minimum_reserve_datetime_kst() -> datetime:
+    base = datetime.now(ZoneInfo(settings.KOREA_TIMEZONE)).replace(
+        tzinfo=None
+    ) + timedelta(minutes=_MIN_RESERVE_LEAD_MINUTES)
+
+    if base.second > 0 or base.microsecond > 0:
+        base += timedelta(minutes=1)
+
+    return base.replace(second=0, microsecond=0)
+
+
+def _normalize_publish_reserve_datetime(
+    dt: Optional[datetime],
+    *,
+    message: Optional[str] = None,
+) -> datetime:
+    reserve_at = convert_to_kor_time(dt)
+    if reserve_at is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_EPISODE_INFO,
+        )
+
+    if getattr(reserve_at, "tzinfo", None) is not None:
+        reserve_at = reserve_at.replace(tzinfo=None)
+
+    if reserve_at < _minimum_reserve_datetime_kst():
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=message
+            or f"예약일시는 현재 시각 기준 {_MIN_RESERVE_LEAD_MINUTES}분 이후만 설정할 수 있습니다.",
+        )
+
+    return reserve_at
 
 
 def _is_paid_conversion_effective(
@@ -1764,7 +1801,7 @@ async def post_episodes_products_product_id(
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,
-                            "publish_reserve_date": convert_to_kor_time(
+                            "publish_reserve_date": _normalize_publish_reserve_datetime(
                                 req_body.publish_reserve_date
                             )
                             if req_body.publish_reserve_yn == "Y"
@@ -1820,7 +1857,7 @@ async def post_episodes_products_product_id(
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,
-                            "publish_reserve_date": convert_to_kor_time(
+                            "publish_reserve_date": _normalize_publish_reserve_datetime(
                                 req_body.publish_reserve_date
                             )
                             if req_body.publish_reserve_yn == "Y"
@@ -2236,7 +2273,7 @@ async def post_episodes_products_product_id_epub(
                         "author_comment": req_body.author_comment,
                         "comment_open_yn": req_body.comment_open_yn,
                         "evaluation_open_yn": req_body.evaluation_open_yn,
-                        "publish_reserve_date": convert_to_kor_time(
+                        "publish_reserve_date": _normalize_publish_reserve_datetime(
                             req_body.publish_reserve_date
                         )
                         if req_body.publish_reserve_yn == "Y"
@@ -2498,7 +2535,7 @@ async def post_episodes_products_product_id_epub_batch(
                             "author_comment": episode.author_comment,
                             "comment_open_yn": episode.comment_open_yn,
                             "evaluation_open_yn": episode.evaluation_open_yn,
-                            "publish_reserve_date": convert_to_kor_time(
+                            "publish_reserve_date": _normalize_publish_reserve_datetime(
                                 episode.publish_reserve_date
                             )
                             if episode.publish_reserve_yn == "Y"
@@ -3559,18 +3596,10 @@ async def post_episodes_sale_reserve(
                         message=ErrorMessages.INVALID_EPISODE_INFO,
                     )
 
-                publish_reserve_date = convert_to_kor_time(req_body.publish_reserve_date)
-                if getattr(publish_reserve_date, "tzinfo", None) is not None:
-                    publish_reserve_date = publish_reserve_date.replace(tzinfo=None)
-
-                now_kst = datetime.now(ZoneInfo(settings.KOREA_TIMEZONE)).replace(
-                    tzinfo=None
+                publish_reserve_date = _normalize_publish_reserve_datetime(
+                    req_body.publish_reserve_date,
+                    message=f"예약일시는 현재 시각 기준 {_MIN_RESERVE_LEAD_MINUTES}분 이후만 설정할 수 있습니다.",
                 )
-                if publish_reserve_date <= now_kst:
-                    raise CustomResponseException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        message=ErrorMessages.INVALID_EPISODE_INFO,
-                    )
 
                 update_params = {
                     "updated_id": user_id,
@@ -3599,6 +3628,178 @@ async def post_episodes_sale_reserve(
                     "count": len(eligible_episode_ids),
                     "episodeIds": eligible_episode_ids,
                     "skippedEpisodeIds": skipped_episode_ids,
+                }
+        except CustomResponseException as e:
+            logger.error(e)
+            raise
+        except OperationalError as e:
+            logger.error(e)
+            raise CustomResponseException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                message=ErrorMessages.DB_CONNECTION_ERROR,
+            )
+        except SQLAlchemyError as e:
+            logger.error(e)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message=ErrorMessages.DB_OPERATION_ERROR,
+            )
+        except Exception as e:
+            logger.error(e)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    else:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
+        )
+
+    res_body = {"data": res_data}
+    return res_body
+
+
+async def post_episodes_publish_reserve_bulk(
+    req_body: episode_schema.PostEpisodesPublishReserveBulkReqBody,
+    kc_user_id: str,
+    db: AsyncSession,
+):
+    res_data = {}
+
+    if kc_user_id:
+        try:
+            async with _transaction_scope(db):
+                user_id, user_info = await comm_service.get_user_from_kc(
+                    kc_user_id, db, addUserInfo=["role_type"]
+                )
+                if user_id == -1:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        message=ErrorMessages.LOGIN_REQUIRED,
+                    )
+
+                schedule_items = req_body.schedules or []
+                if not schedule_items:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                normalized_schedule_map: dict[int, datetime] = {}
+
+                for item in schedule_items:
+                    episode_id = int(item.episode_id) if int(item.episode_id) > 0 else 0
+                    if episode_id <= 0 or item.publish_reserve_date is None:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.INVALID_EPISODE_INFO,
+                        )
+
+                    if episode_id in normalized_schedule_map:
+                        raise CustomResponseException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            message=ErrorMessages.INVALID_EPISODE_INFO,
+                        )
+
+                    publish_reserve_date = _normalize_publish_reserve_datetime(
+                        item.publish_reserve_date,
+                        message=f"예약일시는 현재 시각 기준 {_MIN_RESERVE_LEAD_MINUTES}분 이후만 설정할 수 있습니다.",
+                    )
+
+                    normalized_schedule_map[episode_id] = publish_reserve_date
+
+                episode_ids = sorted(normalized_schedule_map.keys())
+                is_admin = (user_info or {}).get("role_type") == "admin"
+                params = {"user_id": user_id, "is_admin": 1 if is_admin else 0}
+                placeholders = []
+                for idx, episode_id in enumerate(episode_ids):
+                    key = f"episode_id_{idx}"
+                    params[key] = episode_id
+                    placeholders.append(f":{key}")
+                in_clause = ", ".join(placeholders)
+
+                query = text(
+                    f"""
+                    select
+                        e.episode_id,
+                        e.product_id,
+                        e.episode_no,
+                        e.open_yn,
+                        p.price_type,
+                        p.product_type
+                    from tb_product_episode e
+                    inner join tb_product p
+                       on p.product_id = e.product_id
+                    where e.use_yn = 'Y'
+                      and e.episode_id in ({in_clause})
+                      and (:is_admin = 1 or p.user_id = :user_id)
+                    for update
+                    """
+                )
+                result = await db.execute(query, params)
+                rows = result.mappings().all()
+
+                if len(rows) != len(episode_ids):
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                product_ids = {int(row.get("product_id")) for row in rows}
+                if len(product_ids) != 1:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        message=ErrorMessages.INVALID_EPISODE_INFO,
+                    )
+
+                sample_row = rows[0]
+                if (
+                    sample_row.get("price_type") != "free"
+                    or sample_row.get("product_type") != "normal"
+                ):
+                    raise CustomResponseException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        message="무료 일반연재 작품만 일괄 예약할 수 있습니다.",
+                    )
+
+                opened_episode_ids = [
+                    int(row.get("episode_id"))
+                    for row in rows
+                    if row.get("open_yn") == "Y"
+                ]
+                if opened_episode_ids:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        message="이미 공개된 회차는 일괄 예약할 수 없습니다.",
+                    )
+
+                update_rows = [
+                    {
+                        "episode_id": int(row.get("episode_id")),
+                        "publish_reserve_date": normalized_schedule_map[
+                            int(row.get("episode_id"))
+                        ],
+                        "updated_id": user_id,
+                    }
+                    for row in sorted(rows, key=lambda row: int(row.get("episode_no")))
+                ]
+
+                query = text(
+                    """
+                    update tb_product_episode
+                       set open_yn = 'N',
+                           publish_reserve_date = :publish_reserve_date,
+                           updated_id = :updated_id
+                     where use_yn = 'Y'
+                       and episode_id = :episode_id
+                    """
+                )
+                await db.execute(query, update_rows)
+
+                res_data = {
+                    "count": len(update_rows),
+                    "productId": int(sample_row.get("product_id")),
+                    "episodeIds": [row["episode_id"] for row in update_rows],
                 }
         except CustomResponseException as e:
             logger.error(e)
@@ -3902,7 +4103,7 @@ async def put_episodes_episode_id(
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,
-                            "publish_reserve_date": convert_to_kor_time(
+                            "publish_reserve_date": _normalize_publish_reserve_datetime(
                                 req_body.publish_reserve_date
                             )
                             if req_body.publish_reserve_yn == "Y"
@@ -3938,7 +4139,7 @@ async def put_episodes_episode_id(
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,
-                            "publish_reserve_date": convert_to_kor_time(
+                            "publish_reserve_date": _normalize_publish_reserve_datetime(
                                 req_body.publish_reserve_date
                             )
                             if req_body.publish_reserve_yn == "Y"
