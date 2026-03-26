@@ -90,7 +90,8 @@ error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERR
 async def products_of_managed(
     division: str = Query(None, description="작품 노출 영역 : 메인(main)"),
     area: str = Query(
-        None, description="작품 종류: 유료 Top50(paidTop), 무료 Top50(freeTop))"
+        None,
+        description="작품 종류: 무료연재 Top50(freeSerialTop), 유료연재 Top50(paidSerialTop), 연재완결 Top50(paidEndTop), 단행본 Top50(paidStandaloneTop), 메인 유료 Top 혼합(paidMainTop)",
     ),
     limit: int = Query(None, description="출력 개수"),
     adult_yn: str = Query("N", description="성인등급 작품 포함 여부 (Y/N)"),
@@ -98,7 +99,7 @@ async def products_of_managed(
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     """
-    작품 목록 전체 조회(메인, 유료, 무료)
+    작품 목록 전체 조회(메인, 무료연재 TOP50, 유료연재 TOP50, 연재완결 TOP50, 단행본 TOP50)
     """
     return await product_service.products_of_managed(
         division=division,
