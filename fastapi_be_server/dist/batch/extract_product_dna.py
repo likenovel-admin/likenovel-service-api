@@ -248,18 +248,18 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
                 )
                 OR (
                     COALESCE(m.analysis_status, 'pending') = 'success'
-                    AND (
-                        SELECT COUNT(*)
+                    AND EXISTS (
+                        SELECT 1
                         FROM tb_product_episode le
                         WHERE le.product_id = p.product_id
+                          AND le.episode_no = {MAX_ANALYZE_EPISODES}
                           AND le.use_yn = 'Y'
                           AND le.open_yn = 'Y'
-                    ) < {MAX_ANALYZE_EPISODES}
-                    AND COALESCE(m.analyzed_at, m.updated_date, m.created_date, '1970-01-01 00:00:00')
-                        < DATE_SUB(NOW(), INTERVAL {INCOMPLETE_RETRY_COOLDOWN_DAYS} DAY)
+                          AND le.updated_date > m.analyzed_at
+                    )
                 )
             )
-            """  # 미분석 즉시, 실패는 cooldown 뒤, 10화 미만 성공작은 3일 간격 재분석
+            """  # 미분석 즉시, 실패는 cooldown 뒤, 10화 공개/수정 시 최종 1회 재분석
             params.extend([CURRENT_ANALYSIS_VERSION, f"{UNSUPPORTED_LABEL_ERROR_PREFIX}%"])
 
         cur.execute(
