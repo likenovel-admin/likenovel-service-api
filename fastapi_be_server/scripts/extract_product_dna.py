@@ -180,15 +180,17 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
             AND (
                 m.id IS NULL
                 OR m.analyzed_at IS NULL
-                OR (
-                    SELECT COUNT(*)
+                OR EXISTS (
+                    SELECT 1
                     FROM tb_product_episode le
                     WHERE le.product_id = p.product_id
+                      AND le.episode_no = {MAX_ANALYZE_EPISODES}
                       AND le.use_yn = 'Y'
                       AND le.open_yn = 'Y'
-                ) < {MAX_ANALYZE_EPISODES}
+                      AND le.updated_date > m.analyzed_at
+                )
             )
-            """  # 미분석 또는 10화 미만(완결 전) 작품은 매 배치 갱신
+            """  # 미분석 작품은 최초 1회, 10화 공개/수정 시 최종 1회 재분석
 
         cur.execute(
             f"""
