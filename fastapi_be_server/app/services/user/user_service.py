@@ -111,7 +111,7 @@ async def get_user(kc_user_id: str, db: AsyncSession):
                     user_role = "user"
 
                 adult_yn = (
-                    "Y" if get_full_age(date=db_rst[0].get("birthdate")) >= 19 else "N"
+                    "Y" if birthdate and get_full_age(date=birthdate) >= 19 else "N"
                 )
                 # TODO: 내 정보 수정, 캐시 모듈 구현 후 수정 및 최종 테스트 필(현재 초안 개발 완료. 추가된 정보(본인인증여부, 이메일, 연동내용, 보유캐시) 활용하여 구현 필)
                 # 추후 주석 제거 요망
