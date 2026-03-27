@@ -431,8 +431,14 @@ async def _ensure_user(
     # tb_algorithm_recommend_user
     await db.execute(
         text("""
-            INSERT IGNORE INTO tb_algorithm_recommend_user (user_id, created_id, updated_id)
-            VALUES (:user_id, 0, 0)
+            INSERT INTO tb_algorithm_recommend_user (user_id, created_id, updated_id)
+            SELECT :user_id, 0, 0
+            FROM DUAL
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM tb_algorithm_recommend_user
+                WHERE user_id = :user_id
+            )
         """),
         {"user_id": user_id},
     )

@@ -1824,9 +1824,11 @@ async def suggest_managed_products(
                        feature_6, feature_7, feature_8, feature_9, feature_10, feature_basic
                 FROM tb_algorithm_recommend_user
                 WHERE user_id = :user_id
+                ORDER BY updated_date DESC, id DESC
+                LIMIT 1
             """)
             result = await db.execute(query, {"user_id": user_id})
-            user_feature_row = result.mappings().one_or_none()
+            user_feature_row = result.mappings().first()
 
             if user_feature_row:
                 # ?ъ슜?먯쓽 feature 媛믪씠 ?덈뒗 寃쎌슦

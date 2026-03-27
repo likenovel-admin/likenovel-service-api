@@ -245,7 +245,11 @@ async def algorithm_recommend_user_csv_upload(file: UploadFile, db: AsyncSession
     for row in reader:
         # 기존 데이터가 있는지 체크
         query = text("""
-                        SELECT id FROM tb_algorithm_recommend_user WHERE user_id = :user_id
+                        SELECT id
+                          FROM tb_algorithm_recommend_user
+                         WHERE user_id = :user_id
+                         ORDER BY updated_date DESC, id DESC
+                         LIMIT 1
                      """)
         result = await db.execute(
             query,
@@ -253,7 +257,7 @@ async def algorithm_recommend_user_csv_upload(file: UploadFile, db: AsyncSession
                 "user_id": row["user_id"],
             },
         )
-        data = result.mappings().one_or_none()  # 있으면 데이터가 조회되고 없으면 None
+        data = result.mappings().first()  # 있으면 데이터가 조회되고 없으면 None
         if data is None:
             # 없으면 insert
             query = text("""
@@ -270,7 +274,8 @@ async def algorithm_recommend_user_csv_upload(file: UploadFile, db: AsyncSession
                                 feature_9,
                                 feature_10,
                                 user_id
-                            ) VALUES (
+                            )
+                            SELECT
                                 :feature_basic,
                                 :feature_1,
                                 :feature_2,
@@ -283,6 +288,11 @@ async def algorithm_recommend_user_csv_upload(file: UploadFile, db: AsyncSession
                                 :feature_9,
                                 :feature_10,
                                 :user_id
+                            FROM DUAL
+                            WHERE NOT EXISTS (
+                                SELECT 1
+                                  FROM tb_algorithm_recommend_user
+                                 WHERE user_id = :user_id
                             )
                         """)
         else:
