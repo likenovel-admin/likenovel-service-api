@@ -376,6 +376,7 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
             , a.isbn
             , a.uci
             , a.status_code
+            , a.open_yn as openYn
             , a.ratings_code
             , a.price_type
             , (select z.keyword_name from tb_standard_keyword z
