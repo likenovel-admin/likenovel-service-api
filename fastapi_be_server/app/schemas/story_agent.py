@@ -1,0 +1,71 @@
+from typing import Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class StoryAgentProductItem(BaseModel):
+    productId: int
+    title: str
+    authorNickname: str | None = None
+    coverImagePath: str | None = None
+    statusCode: str | None = None
+    latestEpisodeNo: int = 0
+
+
+class StoryAgentSessionItem(BaseModel):
+    sessionId: int
+    productId: int
+    title: str
+    updatedDate: str
+    createdDate: str
+
+
+class StoryAgentMessageItem(BaseModel):
+    messageId: int
+    role: str
+    content: str
+    createdDate: str
+
+
+class PostStoryAgentSessionReqBody(BaseModel):
+    product_id: int = Field(..., gt=0)
+    guest_key: Optional[str] = Field(default=None, max_length=64)
+    title: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class PatchStoryAgentSessionReqBody(BaseModel):
+    guest_key: Optional[str] = Field(default=None, max_length=64)
+    title: str = Field(..., min_length=1, max_length=120)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("title은 비어 있을 수 없습니다.")
+        return normalized
+
+
+class DeleteStoryAgentSessionReqBody(BaseModel):
+    guest_key: Optional[str] = Field(default=None, max_length=64)
+
+
+class PostStoryAgentMessageReqBody(BaseModel):
+    guest_key: Optional[str] = Field(default=None, max_length=64)
+    content: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("content는 비어 있을 수 없습니다.")
+        return normalized
