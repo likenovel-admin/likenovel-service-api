@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -20,11 +21,13 @@ from app.utils.query import get_file_path_sub_query
 from app.utils.time import get_full_age
 
 STORY_AGENT_DEFAULT_TITLE = "새 대화"
+STORY_AGENT_SESSION_LOCK_TIMEOUT_SECONDS = 0
 STORY_AGENT_PLACEHOLDER_TEMPLATE = (
     "현재 [{title}] 전용 세션의 메시지 저장만 먼저 연결된 상태입니다. "
     "원문 기반 컨텍스트/T2T/T2I 오케스트레이션은 다음 단계에서 붙습니다.\n\n"
     "방금 요청: {user_prompt}"
 )
+logger = logging.getLogger(__name__)
 
 
 async def _resolve_actor(kc_user_id: str | None, guest_key: str | None, db: AsyncSession) -> tuple[int | None, str | None]:
@@ -100,6 +103,63 @@ async def _get_story_agent_product(product_id: int, adult_yn: str, db: AsyncSess
     result = await db.execute(query, {"product_id": product_id})
     row = result.mappings().one_or_none()
     return dict(row) if row else None
+
+
+async def _acquire_story_agent_session_lock(session_id: int, db: AsyncSession) -> bool:
+    result = await db.execute(
+        text("SELECT GET_LOCK(:lock_name, :timeout) AS locked"),
+        {
+            "lock_name": f"story-agent-session:{session_id}",
+            "timeout": STORY_AGENT_SESSION_LOCK_TIMEOUT_SECONDS,
+        },
+    )
+    row = result.mappings().one()
+    return bool(row.get("locked"))
+
+
+async def _release_story_agent_session_lock(session_id: int, db: AsyncSession) -> None:
+    try:
+        await db.execute(
+            text("SELECT RELEASE_LOCK(:lock_name)"),
+            {"lock_name": f"story-agent-session:{session_id}"},
+        )
+    except Exception as exc:
+        logger.warning("failed to release story agent session lock: %s", exc)
+
+
+async def _get_existing_turn_messages(
+    session_id: int,
+    client_message_id: str,
+    db: AsyncSession,
+) -> list[dict[str, Any]] | None:
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                message_id AS messageId,
+                role,
+                content,
+                DATE_FORMAT(created_date, '%Y-%m-%d %H:%i:%s') AS createdDate
+            FROM tb_story_agent_message
+            WHERE session_id = :session_id
+              AND client_message_id = :client_message_id
+            ORDER BY message_id ASC
+            """
+        ),
+        {
+            "session_id": session_id,
+            "client_message_id": client_message_id,
+        },
+    )
+    rows = [dict(row) for row in result.mappings().all()]
+    if not rows:
+        return None
+    if len(rows) != 2:
+        raise CustomResponseException(
+            status_code=status.HTTP_409_CONFLICT,
+            message="이전 메시지가 아직 처리 중입니다. 잠시 후 다시 시도해주세요.",
+        )
+    return rows
 
 
 async def _get_session_row(
@@ -316,27 +376,26 @@ async def create_session(
         )
 
     title = (req_body.title or STORY_AGENT_DEFAULT_TITLE).strip()[:120]
-    async with db.begin():
-        query = text(
-            """
-            INSERT INTO tb_story_agent_session
-            (product_id, user_id, guest_key, title, deleted_yn, created_id, updated_id)
-            VALUES (:product_id, :user_id, :guest_key, :title, 'N', :created_id, :updated_id)
-            """
-        )
-        created_id = user_id if user_id is not None else settings.DB_DML_DEFAULT_ID
-        result = await db.execute(
-            query,
-            {
-                "product_id": req_body.product_id,
-                "user_id": user_id,
-                "guest_key": resolved_guest_key,
-                "title": title,
-                "created_id": created_id,
-                "updated_id": created_id,
-            },
-        )
-        session_id = result.lastrowid
+    query = text(
+        """
+        INSERT INTO tb_story_agent_session
+        (product_id, user_id, guest_key, title, deleted_yn, created_id, updated_id)
+        VALUES (:product_id, :user_id, :guest_key, :title, 'N', :created_id, :updated_id)
+        """
+    )
+    created_id = user_id if user_id is not None else settings.DB_DML_DEFAULT_ID
+    result = await db.execute(
+        query,
+        {
+            "product_id": req_body.product_id,
+            "user_id": user_id,
+            "guest_key": resolved_guest_key,
+            "title": title,
+            "created_id": created_id,
+            "updated_id": created_id,
+        },
+    )
+    session_id = result.lastrowid
 
     return {
         "data": {
@@ -358,24 +417,23 @@ async def patch_session(
     user_id, resolved_guest_key = await _resolve_actor(kc_user_id, req_body.guest_key, db)
     await _get_session_row(session_id, user_id, resolved_guest_key, db)
 
-    async with db.begin():
-        query = text(
-            """
-            UPDATE tb_story_agent_session
-            SET title = :title,
-                updated_id = :updated_id,
-                updated_date = NOW()
-            WHERE session_id = :session_id
-            """
-        )
-        await db.execute(
-            query,
-            {
-                "title": req_body.title,
-                "updated_id": user_id if user_id is not None else settings.DB_DML_DEFAULT_ID,
-                "session_id": session_id,
-            },
-        )
+    query = text(
+        """
+        UPDATE tb_story_agent_session
+        SET title = :title,
+            updated_id = :updated_id,
+            updated_date = NOW()
+        WHERE session_id = :session_id
+        """
+    )
+    await db.execute(
+        query,
+        {
+            "title": req_body.title,
+            "updated_id": user_id if user_id is not None else settings.DB_DML_DEFAULT_ID,
+            "session_id": session_id,
+        },
+    )
 
     return {"data": {"sessionId": session_id, "title": req_body.title}}
 
@@ -390,23 +448,22 @@ async def delete_session(
     user_id, resolved_guest_key = await _resolve_actor(kc_user_id, guest_key, db)
     await _get_session_row(session_id, user_id, resolved_guest_key, db)
 
-    async with db.begin():
-        query = text(
-            """
-            UPDATE tb_story_agent_session
-            SET deleted_yn = 'Y',
-                updated_id = :updated_id,
-                updated_date = NOW()
-            WHERE session_id = :session_id
-            """
-        )
-        await db.execute(
-            query,
-            {
-                "updated_id": user_id if user_id is not None else settings.DB_DML_DEFAULT_ID,
-                "session_id": session_id,
-            },
-        )
+    query = text(
+        """
+        UPDATE tb_story_agent_session
+        SET deleted_yn = 'Y',
+            updated_id = :updated_id,
+            updated_date = NOW()
+        WHERE session_id = :session_id
+        """
+    )
+    await db.execute(
+        query,
+        {
+            "updated_id": user_id if user_id is not None else settings.DB_DML_DEFAULT_ID,
+            "session_id": session_id,
+        },
+    )
     return {"data": {"sessionId": session_id, "deletedYn": "Y"}}
 
 
@@ -441,11 +498,36 @@ async def post_message(
     )
     created_id = user_id if user_id is not None else settings.DB_DML_DEFAULT_ID
 
-    async with db.begin():
+    lock_acquired = False
+    try:
+        lock_acquired = await _acquire_story_agent_session_lock(session_id=session_id, db=db)
+        if not lock_acquired:
+            raise CustomResponseException(
+                status_code=status.HTTP_409_CONFLICT,
+                message="같은 세션에서 다른 메시지를 처리 중입니다. 잠시 후 다시 시도해주세요.",
+            )
+
+        existing_messages = await _get_existing_turn_messages(
+            session_id=session_id,
+            client_message_id=req_body.client_message_id,
+            db=db,
+        )
+        if existing_messages:
+            return {
+                "data": {
+                    "sessionId": session_id,
+                    "messages": existing_messages,
+                }
+            }
+
         insert_query = text(
             """
-            INSERT INTO tb_story_agent_message (session_id, role, content, created_id)
-            VALUES (:session_id, :role, :content, :created_id)
+            INSERT INTO tb_story_agent_message (
+                session_id, role, client_message_id, content, created_id
+            )
+            VALUES (
+                :session_id, :role, :client_message_id, :content, :created_id
+            )
             """
         )
         user_result = await db.execute(
@@ -453,6 +535,7 @@ async def post_message(
             {
                 "session_id": session_id,
                 "role": "user",
+                "client_message_id": req_body.client_message_id,
                 "content": req_body.content,
                 "created_id": created_id,
             },
@@ -462,6 +545,7 @@ async def post_message(
             {
                 "session_id": session_id,
                 "role": "assistant",
+                "client_message_id": req_body.client_message_id,
                 "content": assistant_reply,
                 "created_id": settings.DB_DML_DEFAULT_ID,
             },
@@ -489,20 +573,23 @@ async def post_message(
             },
         )
 
-    return {
-        "data": {
-            "sessionId": session_id,
-            "messages": [
-                {
-                    "messageId": int(user_result.lastrowid),
-                    "role": "user",
-                    "content": req_body.content,
-                },
-                {
-                    "messageId": int(assistant_result.lastrowid),
-                    "role": "assistant",
-                    "content": assistant_reply,
-                },
-            ],
+        return {
+            "data": {
+                "sessionId": session_id,
+                "messages": [
+                    {
+                        "messageId": int(user_result.lastrowid),
+                        "role": "user",
+                        "content": req_body.content,
+                    },
+                    {
+                        "messageId": int(assistant_result.lastrowid),
+                        "role": "assistant",
+                        "content": assistant_reply,
+                    },
+                ],
+            }
         }
-    }
+    finally:
+        if lock_acquired:
+            await _release_story_agent_session_lock(session_id=session_id, db=db)

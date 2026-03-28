@@ -31,6 +31,11 @@ class StoryAgentMessage(Base):
     message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     session_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False, comment="세션 ID")
     role: Mapped[str] = mapped_column(String(20), nullable=False, comment="user | assistant")
+    client_message_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="클라이언트 메시지 ID",
+    )
     content: Mapped[str] = mapped_column(Text, nullable=False, comment="메시지 본문")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
     created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
