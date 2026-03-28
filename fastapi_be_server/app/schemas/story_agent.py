@@ -60,7 +60,16 @@ class DeleteStoryAgentSessionReqBody(BaseModel):
 
 class PostStoryAgentMessageReqBody(BaseModel):
     guest_key: Optional[str] = Field(default=None, max_length=64)
+    client_message_id: str = Field(..., min_length=1, max_length=64)
     content: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("client_message_id")
+    @classmethod
+    def normalize_client_message_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("client_message_id는 비어 있을 수 없습니다.")
+        return normalized
 
     @field_validator("content")
     @classmethod
