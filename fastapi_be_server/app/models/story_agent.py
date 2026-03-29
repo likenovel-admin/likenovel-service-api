@@ -15,6 +15,7 @@ class StoryAgentSession(Base):
     guest_key: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True, comment="비로그인 식별 키")
     title: Mapped[str] = mapped_column(String(120), nullable=False, server_default="새 대화", comment="세션 제목")
     deleted_yn: Mapped[str] = mapped_column(String(1), nullable=False, server_default="N", comment="삭제 여부")
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, comment="세션 만료 시각")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
     created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 갱신한 id")

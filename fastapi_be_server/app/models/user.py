@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, String, TIMESTAMP, text
+from sqlalchemy import BigInteger, Integer, String, TIMESTAMP, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from datetime import datetime
@@ -543,6 +543,9 @@ class UserCashbookTransaction(Base):
     )
     product_id: Mapped[int] = mapped_column(
         Integer, nullable=True, comment="후원 대상 작품 ID (작품 후원인 경우)"
+    )
+    story_agent_session_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=True, comment="스토리 에이전트 세션 ID"
     )
     use_yn: Mapped[str] = mapped_column(
         String(settings.VARCHAR_YN_SIZE), server_default="Y", comment="사용 여부"

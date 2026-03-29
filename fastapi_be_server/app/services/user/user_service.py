@@ -599,12 +599,23 @@ async def get_user_cash(kc_user_id: str, db: AsyncSession):
         query = text("""
                             select t.*
                             from (
-                                select case when a.amount > 0 then 'charge' else 'use' end as category
+                                select case when a.sponsor_type = 'story_agent' then 'used'
+                                            when a.amount > 0 then 'charge'
+                                            else 'use'
+                                        end as category
                                     , a.amount
-                                    , '캐시 지급' as product_title
-                                    , null as episode_title
+                                    , case when a.sponsor_type = 'story_agent'
+                                            then coalesce(p.title, '스토리 에이전트')
+                                            else '캐시 지급'
+                                        end as product_title
+                                    , case when a.sponsor_type = 'story_agent'
+                                            then concat('스토리 에이전트 · ', coalesce(s.title, '세션'))
+                                            else null
+                                        end as episode_title
                                     , a.created_date
                                 from tb_user_cashbook_transaction a
+                                left join tb_story_agent_session s on a.story_agent_session_id = s.session_id
+                                left join tb_product p on p.product_id = coalesce(a.product_id, s.product_id)
                                 where a.from_user_id = :user_id
                                 and a.use_yn = 'Y'
                                 union all
