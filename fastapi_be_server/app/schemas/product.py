@@ -92,6 +92,11 @@ class PutProductsProductIdReqBody(ProductsBase):
         default=None, examples=[[""]], description="직접입력태그"
     )
     synopsis: str = Field(examples=["작품에 대한 소개입니다."], description="작품소개")
+    story_agent_setting: Optional[str] = Field(
+        default=None,
+        examples=["캐릭터/세계관/전력/IF 보조 설정"],
+        description="스토리 에이전트 보조 설정",
+    )
     adult_yn: str = Field(examples=["N"], description="연령등급(전체이용가 n, 성인 y)")
     open_yn: str = Field(examples=["Y"], description="공개설정")
     blind_yn: Optional[str] = Field(default=None, examples=["N"], description="블라인드 여부")

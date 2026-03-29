@@ -2483,6 +2483,7 @@ async def get_products_product_id_info(
                                         and z.major_genre_yn = 'Y'
                                         and a.sub_genre_id = z.keyword_id) as sub_genre_name
                                     , a.synopsis_text
+                                    , a.story_agent_setting_text
                                     , case when a.ratings_code = 'adult' then 'Y'
                                             else 'N'
                                     end as adult_yn
@@ -2552,6 +2553,7 @@ async def get_products_product_id_info(
                     "keywords": keywords,
                     "customKeywords": custom_keywords,
                     "synopsis": db_rst[0].get("synopsis_text"),
+                    "storyAgentSetting": db_rst[0].get("story_agent_setting_text"),
                     "adultYn": db_rst[0].get("adult_yn"),
                     "openYn": db_rst[0].get("open_yn"),
                     "blindYn": db_rst[0].get("blind_yn"),
@@ -3057,6 +3059,8 @@ async def put_products_product_id(
                                       , open_yn
                                       , contract_yn
                                       , cp_user_id
+                                      , price_type
+                                      , story_agent_setting_text
                                       , (
                                             select ppa.status_code
                                               from tb_product_paid_apply ppa
@@ -3082,6 +3086,8 @@ async def put_products_product_id(
                 current_contract_yn = (current_product.get("contract_yn") or "N").upper()
                 current_cp_user_id = current_product.get("cp_user_id")
                 current_paid_apply_status = current_product.get("paid_apply_status")
+                current_price_type = current_product.get("price_type")
+                current_story_agent_setting_text = current_product.get("story_agent_setting_text")
                 fields_set = getattr(req_body, "model_fields_set", set()) or set()
                 blind_yn_in_request = "blind_yn" in fields_set
                 requested_blind_yn = (
@@ -3135,6 +3141,27 @@ async def put_products_product_id(
                     raise CustomResponseException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         message="심사중 또는 승인된 작품은 계약 정보를 변경할 수 없습니다.",
+                    )
+
+                story_agent_setting_text = (
+                    req_body.story_agent_setting.strip()
+                    if isinstance(req_body.story_agent_setting, str)
+                    else None
+                )
+                if "story_agent_setting" in fields_set:
+                    req_body.story_agent_setting = story_agent_setting_text
+                else:
+                    req_body.story_agent_setting = current_story_agent_setting_text
+                    story_agent_setting_text = current_story_agent_setting_text
+                if story_agent_setting_text is not None and len(story_agent_setting_text) > 1000:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        message="스토리 에이전트 보조 설정은 1000자 이하로 입력해주세요.",
+                    )
+                if story_agent_setting_text is not None and current_price_type != "free":
+                    raise CustomResponseException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        message="스토리 에이전트 보조 설정은 무료 작품에서만 저장할 수 있습니다.",
                     )
 
                 # ?곗옱?곹깭 寃利?
@@ -3295,6 +3322,7 @@ async def put_products_product_id(
                                         set a.title = :title
                                           , a.status_code = :status_code
                                           , a.synopsis_text = :synopsis_text
+                                          , a.story_agent_setting_text = :story_agent_setting_text
                                           , a.author_id = :author_id
                                           , a.author_name = :author_name
                                           , a.illustrator_name = :illustrator_name
@@ -3335,6 +3363,7 @@ async def put_products_product_id(
                             "primary_genre_id": primary_genre_id,
                             "sub_genre_id": sub_genre_id,
                             "synopsis_text": req_body.synopsis,
+                            "story_agent_setting_text": req_body.story_agent_setting,
                             "ratings_code": "adult"
                             if req_body.adult_yn == "Y"
                             else "all",
@@ -3365,6 +3394,7 @@ async def put_products_product_id(
                                         set a.title = :title
                                           , a.status_code = :status_code
                                           , a.synopsis_text = :synopsis_text
+                                          , a.story_agent_setting_text = :story_agent_setting_text
                                           , a.author_id = :author_id
                                           , a.author_name = :author_name
                                           , a.illustrator_name = :illustrator_name
@@ -3407,6 +3437,7 @@ async def put_products_product_id(
                             "primary_genre_id": primary_genre_id,
                             "sub_genre_id": sub_genre_id,
                             "synopsis_text": req_body.synopsis,
+                            "story_agent_setting_text": req_body.story_agent_setting,
                             "ratings_code": "adult"
                             if req_body.adult_yn == "Y"
                             else "all",

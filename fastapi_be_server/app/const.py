@@ -211,6 +211,11 @@ class Settings(BaseSettings):
     # anthropic (AI 추천)
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    STORY_AGENT_GEMINI_MODEL: str = os.getenv(
+        "STORY_AGENT_GEMINI_MODEL",
+        os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"),
+    )
 
 
 settings = Settings()

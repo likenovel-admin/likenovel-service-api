@@ -10,6 +10,7 @@ class StoryAgentProductItem(BaseModel):
     coverImagePath: str | None = None
     statusCode: str | None = None
     latestEpisodeNo: int = 0
+    contextStatus: str | None = None
 
 
 class StoryAgentSessionItem(BaseModel):

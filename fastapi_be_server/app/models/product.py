@@ -42,6 +42,9 @@ class Product(Base):
     synopsis_text: Mapped[str] = mapped_column(
         String(3000), nullable=True, comment="작품 소개"
     )
+    story_agent_setting_text: Mapped[str] = mapped_column(
+        String(1000), nullable=True, comment="스토리 에이전트 보조 설정"
+    )
     user_id: Mapped[int] = mapped_column(
         Integer, index=True, nullable=False, comment="유저 아이디"
     )
