@@ -533,7 +533,7 @@ async def put_product(
 
     query = text("""
                 SELECT uci, isbn, series_regular_price, single_regular_price, single_rental_price,
-                       blind_yn, open_yn
+                       blind_yn, open_yn, price_type
                   FROM tb_product
                  WHERE product_id = :product_id
                  LIMIT 1
