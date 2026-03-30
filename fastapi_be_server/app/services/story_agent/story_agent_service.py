@@ -42,31 +42,19 @@ STORY_AGENT_MAX_TOOL_ROUNDS = 4
 STORY_AGENT_MAX_HISTORY_MESSAGES = 10
 STORY_AGENT_MAX_EPISODE_CONTENT_CHARS = 6000
 STORY_AGENT_PREFETCH_CONTEXT_CHARS = 3000
+STORY_AGENT_BROAD_SUMMARY_CONTEXT_LIMIT = 6
 STORY_AGENT_GEMINI_TIMEOUT_SECONDS = 35.0
 STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT = 2
-STORY_AGENT_GEMINI_ROUTE_CUES = (
-    "만약",
-    "라면",
-    "내가 ",
-    "내가 주인공",
-    "들어가면",
-    "빙의",
-    "대화해",
-    "말투로",
-    "역할극",
-    "붙으면",
-    "누가 더",
-    "누가 이겨",
-    "최강",
-    "vs",
-    "월드컵",
-    "이상형",
-    "랭킹",
-    "시뮬",
-    "시뮬레이션",
-    "어떻게 될까",
-    "어떻게 돼",
-)
+STORY_AGENT_REFERENCE_RESOLUTION_MAX_TOKENS = 220
+STORY_AGENT_INTENT_MAX_TOKENS = 120
+STORY_AGENT_ALLOWED_INTENTS = {
+    "factual",
+    "comparative",
+    "playful",
+    "self_insert",
+    "simulation",
+}
+STORY_AGENT_ALLOWED_SUMMARY_MODES = {"exact", "early", "latest", "general"}
 STORY_AGENT_TOOLS = [
     {
         "name": "get_product_context",
@@ -138,6 +126,18 @@ STORY_AGENT_EARLY_QUESTION_KEYWORDS = (
 )
 STORY_AGENT_BROAD_QUESTION_KEYWORDS = (
     "최신", "현재", "지금", "최근", "갈등", "관계", "떡밥", "미해결", "변화",
+)
+STORY_AGENT_AMBIGUOUS_REFERENCE_PATTERNS = (
+    "저 선택",
+    "그 선택",
+    "이 선택",
+    "저 장면",
+    "그 장면",
+    "이 장면",
+    "그때",
+    "그거",
+    "저거",
+    "이거",
 )
 logger = logging.getLogger(__name__)
 
@@ -350,12 +350,15 @@ def _resolve_story_agent_summary_mode(
             normalized_mode = "general"
 
     if normalized_mode == "exact":
-        exact_match = STORY_AGENT_EXACT_EPISODE_RE.search(normalized_query)
-        if exact_match and not exact_episode_no:
-            exact_episode_no = int(exact_match.group(1))
-        if not exact_episode_no:
+        label_episode_no, ordinal_index = _extract_story_agent_episode_reference(
+            query_text=normalized_query,
+            fallback_episode_no=exact_episode_no,
+        )
+        if label_episode_no is not None:
+            exact_episode_no = label_episode_no
+        if exact_episode_no is None and ordinal_index is None:
             normalized_mode = "general"
-        else:
+        elif exact_episode_no is not None:
             exact_episode_no = max(1, min(int(exact_episode_no), latest_episode_no))
 
     if normalized_mode == "early":
@@ -556,6 +559,120 @@ async def _get_story_agent_summary_candidates(
     return [dict(row) for row in result.mappings().all()]
 
 
+def _merge_story_agent_summary_rows(
+    *groups: list[dict[str, Any]],
+    limit: int = STORY_AGENT_BROAD_SUMMARY_CONTEXT_LIMIT,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_keys: set[tuple[int, int]] = set()
+    for rows in groups:
+        for row in rows:
+            episode_from = int(row.get("episodeFrom") or 0)
+            episode_to = int(row.get("episodeTo") or 0)
+            key = (episode_from, episode_to)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append(row)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+async def _get_story_agent_broad_summary_context_rows(
+    *,
+    product_id: int,
+    query_text: str,
+    latest_episode_no: int,
+    resolved_mode: str,
+    db: AsyncSession,
+) -> list[dict[str, Any]]:
+    keywords = _extract_story_agent_keywords(query_text)
+
+    if resolved_mode == "exact":
+        return []
+
+    if resolved_mode == "early":
+        return await _get_story_agent_summary_candidates(
+            product_id=product_id,
+            keywords=keywords,
+            query_text=query_text,
+            latest_episode_no=latest_episode_no,
+            mode="early",
+            episode_no=None,
+            db=db,
+        )
+
+    if resolved_mode == "latest":
+        return await _get_story_agent_summary_candidates(
+            product_id=product_id,
+            keywords=keywords,
+            query_text=query_text,
+            latest_episode_no=latest_episode_no,
+            mode="latest",
+            episode_no=None,
+            db=db,
+        )
+
+    general_rows = await _get_story_agent_summary_candidates(
+        product_id=product_id,
+        keywords=keywords,
+        query_text=query_text,
+        latest_episode_no=latest_episode_no,
+        mode="general",
+        episode_no=None,
+        db=db,
+    )
+    early_rows = await _get_story_agent_summary_candidates(
+        product_id=product_id,
+        keywords=keywords,
+        query_text=query_text,
+        latest_episode_no=latest_episode_no,
+        mode="early",
+        episode_no=None,
+        db=db,
+    )
+    latest_rows = await _get_story_agent_summary_candidates(
+        product_id=product_id,
+        keywords=keywords,
+        query_text=query_text,
+        latest_episode_no=latest_episode_no,
+        mode="latest",
+        episode_no=None,
+        db=db,
+    )
+    return _merge_story_agent_summary_rows(
+        general_rows[:2],
+        early_rows[:2],
+        latest_rows[:2],
+    )
+
+
+def _build_story_agent_summary_context_message(summary_rows: list[dict[str, Any]]) -> str:
+    if not summary_rows:
+        return ""
+
+    blocks: list[str] = []
+    for row in summary_rows:
+        summary_text = str(row.get("summaryText") or "").strip()
+        if not summary_text:
+            continue
+        episode_from = int(row.get("episodeFrom") or 0)
+        episode_to = int(row.get("episodeTo") or 0)
+        label = f"{episode_from}화" if episode_from == episode_to else f"{episode_from}~{episode_to}화"
+        blocks.append(f"[{label} 요약]\n{summary_text}")
+
+    if not blocks:
+        return ""
+
+    return (
+        "아래는 이번 질문과 관련해 먼저 참고할 공개 회차 요약이다. "
+        "넓거나 모호한 질문이면 여기서 확인되는 핵심 2~3가지를 먼저 짚고, "
+        "마지막에 어떤 축이 더 궁금한지 한 문장으로 좁혀 물어라.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
 async def _get_story_agent_product_context(product_id: int, db: AsyncSession) -> dict[str, Any]:
     result = await db.execute(
         text(
@@ -734,9 +851,160 @@ def _build_story_agent_system_prompt(product_row: dict[str, Any]) -> str:
         "도구 내부의 회차 해석 과정이나 episode_no 매핑은 사용자에게 설명하지 마라. 질문에 맞는 회차 원문이 이미 조회되었다면 그 원문을 사용자가 지칭한 회차의 근거로 자연스럽게 답하라. "
         "주인공 소개나 인물 역할극 질문이면 먼저 초반 구간 요약을 찾고, 필요하면 그 회차 원문을 조회해 이름, 목표, 현재 상황을 확인하라. "
         "최신 갈등, 최신 관계, 떡밥 질문이면 최신 공개 회차 쪽 요약과 원문을 먼저 확인하라. "
+        "질문이 넓거나 모호하면 거절하거나 '질문을 좁혀 달라'로 끝내지 마라. 먼저 공개 범위에서 확인되는 핵심 2~3가지를 짧게 답하고, 마지막에 어떤 축으로 더 좁혀서 볼지 한 문장으로 되물어라. "
+        "예를 들면 능력 규칙, 세력 질서, 인물 관계, 전투 상성 중 무엇이 궁금한지 되묻는 식으로 대화를 이어가라. "
+        "사용자가 '저/그/이 선택', '저/그/이 장면', '그때', '그거'처럼 지시대명사로 모호하게 물으면 최근 대화와 이번 질문 관련 요약을 기준으로 가장 가능성 높은 장면이나 선택을 먼저 해석하라. "
+        "가능한 해석이 있으면 답변 첫 줄에 어떤 장면/선택으로 이해했는지 짧게 밝힌 뒤 설명하고, 마지막에 혹시 다른 장면이면 알려달라고 덧붙여라. "
+        "단서가 약해도 무작정 '어떤 선택인지 말해 달라'고만 하지 말고, 유력한 후보가 1~2개면 그 후보를 짧게 제시하며 어느 쪽인지 물어라. "
         "도구를 1~2번 조회한 뒤에도 근거가 부족하면, 공개 범위에서 확인되는 부분만 짧게 답하고 더 이상의 tool 호출은 멈춰라. "
         "답변은 한국어로, 불필요한 군더더기 없이 바로 답하라. 관련 회차 번호가 있으면 자연스럽게 포함하라."
     )
+
+
+def _is_story_agent_ambiguous_reference_query(query_text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(query_text or "")).strip()
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in STORY_AGENT_AMBIGUOUS_REFERENCE_PATTERNS)
+
+
+def _build_story_agent_recent_context_message(
+    recent_messages: list[dict[str, str]],
+) -> str:
+    if not recent_messages:
+        return ""
+
+    lines: list[str] = []
+    for message in recent_messages[-4:]:
+        role = "사용자" if str(message.get("role") or "").strip() == "user" else "이전 답변"
+        content = re.sub(r"\s+", " ", str(message.get("content") or "")).strip()
+        if not content:
+            continue
+        lines.append(f"- {role}: {content[:220]}")
+
+    if not lines:
+        return ""
+
+    return (
+        "아래는 이번 질문 직전까지의 최근 대화 핵심이다. "
+        "지시대명사 질문이면 가장 최근에 언급된 장면·선택·인물을 우선 참조하라.\n"
+        + "\n".join(lines)
+    )
+
+
+def _extract_story_agent_json_object(text_value: str) -> dict[str, Any] | None:
+    raw = str(text_value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+async def _resolve_story_agent_reference(
+    *,
+    product_row: dict[str, Any],
+    user_prompt: str,
+    recent_messages: list[dict[str, str]],
+    summary_rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not _is_story_agent_ambiguous_reference_query(user_prompt):
+        return None
+
+    recent_context_message = _build_story_agent_recent_context_message(recent_messages)
+    summary_context_message = _build_story_agent_summary_context_message(summary_rows[:3])
+
+    context_parts = [
+        "너는 스토리 에이전트 내부 해석기다.",
+        "사용자에게 보여줄 답변을 쓰지 말고 JSON만 반환하라.",
+        "지시대명사 질문이 최근 대화에서 무엇을 가리키는지 해석하라.",
+        "JSON 스키마:",
+        '{"reference_status":"resolved|ambiguous","resolved_target":"...", "confidence":0.0, "alternate_targets":["..."]}',
+        "resolved_target은 1문장으로 구체적인 장면/선택을 적어라.",
+        "alternate_targets는 최대 2개까지만 넣어라.",
+        "근거가 충분하면 resolved, 부족하면 ambiguous로 하라.",
+    ]
+    if recent_context_message:
+        context_parts.append(recent_context_message)
+    if summary_context_message:
+        context_parts.append(summary_context_message)
+    context_parts.append(f"현재 질문: {user_prompt}")
+
+    response = await _call_claude_messages(
+        system_prompt="\n\n".join(context_parts),
+        messages=[{"role": "user", "content": "JSON만 반환해."}],
+        max_tokens=STORY_AGENT_REFERENCE_RESOLUTION_MAX_TOKENS,
+    )
+    content = response.get("content") or []
+    parsed = _extract_story_agent_json_object(_extract_text(content))
+    if not parsed:
+        return None
+
+    reference_status = str(parsed.get("reference_status") or "").strip().lower()
+    if reference_status not in {"resolved", "ambiguous"}:
+        return None
+
+    resolved_target = str(parsed.get("resolved_target") or "").strip()
+    alternate_targets = [
+        str(item).strip()
+        for item in (parsed.get("alternate_targets") or [])
+        if str(item).strip()
+    ][:2]
+    try:
+        confidence = float(parsed.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+
+    return {
+        "reference_status": reference_status,
+        "resolved_target": resolved_target,
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "alternate_targets": alternate_targets,
+    }
+
+
+def _build_story_agent_reference_resolution_message(reference_resolution: dict[str, Any]) -> str:
+    status = str(reference_resolution.get("reference_status") or "").strip().lower()
+    resolved_target = str(reference_resolution.get("resolved_target") or "").strip()
+    alternate_targets = [
+        str(item).strip()
+        for item in (reference_resolution.get("alternate_targets") or [])
+        if str(item).strip()
+    ][:2]
+
+    if status == "resolved" and resolved_target:
+        return (
+            "[지시대명사 해석 결과]\n"
+            f"- 이 질문은 '{resolved_target}'을 가리키는 것으로 해석했다.\n"
+            "- 답변 첫 줄에 이 해석을 한 문장으로 밝힌 뒤 이유를 설명하라.\n"
+            "- 마지막에는 다른 장면을 뜻했다면 알려달라고 짧게 덧붙여라."
+        )
+
+    if status == "ambiguous" and alternate_targets:
+        primary_target = resolved_target or alternate_targets[0]
+        secondary_targets = [item for item in alternate_targets if item != primary_target][:2]
+        bullet_lines = "\n".join(f"- {item}" for item in secondary_targets)
+        return (
+            "[지시대명사 해석 결과]\n"
+            f"- 질문이 모호하지만 우선 '{primary_target}'을(를) 가리키는 것으로 가정하고 먼저 답하라.\n"
+            "- 답변 첫 줄에 어떤 장면/선택으로 이해했는지 짧게 밝힌 뒤, 그 가정 아래에서 이유를 설명하라.\n"
+            + (f"{bullet_lines}\n" if bullet_lines else "")
+            + "- 마지막에는 혹시 다른 장면이라면 알려달라고 덧붙여라."
+            + (" 다른 후보가 있으면 그 후보를 1~2개만 짧게 함께 제시하라." if secondary_targets else "")
+        )
+
+    return ""
 
 
 async def _dispatch_story_agent_tool(
@@ -784,67 +1052,147 @@ async def _dispatch_story_agent_tool(
     return {"error": f"지원하지 않는 tool입니다: {tool_name}"}
 
 
+def _build_story_agent_prompt_preview(user_prompt: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(user_prompt or "")).strip()
+    return normalized[:80]
+
+
+async def _resolve_story_agent_intent(
+    *,
+    user_prompt: str,
+    recent_messages: list[dict[str, str]],
+) -> tuple[str, bool, str]:
+    recent_context_message = _build_story_agent_recent_context_message(recent_messages)
+    system_prompt_parts = [
+        "너는 스토리 에이전트 라우팅 전용 분류기다.",
+        "사용자에게 보여줄 답변을 쓰지 말고 JSON만 반환하라.",
+        "intent는 factual, comparative, playful, self_insert, simulation 중 하나만 고르라.",
+        "mode는 exact, early, latest, general 중 하나만 고르라.",
+        "exact: 특정 회차, 특정 장면, 특정 선택처럼 정확한 대상이 분명할 때",
+        "early: 작품의 초반부나 도입부 전체를 묻는 질문일 때",
+        "latest: 최신 공개분, 최근 갈등, 지금 상황을 묻는 질문일 때",
+        "general: 작품 전체, 넓은 설정, 특정 구간이 확정되지 않은 질문일 때",
+        "질문에 '처음'이 있어도 이야기 도입부가 아니라 '가장 처음 발생한 사건/각성/등장'을 묻는 것일 수 있다. 이런 경우 구간이 특정되지 않으면 early가 아니라 general로 두어라.",
+        "needs_creative는 이 질문에 답하려면 작품에 없는 결과, 대화, 상황을 새로 만들어야 하는지 여부다.",
+        "작품 내 정보를 정리, 설명, 비교, 해석해서 답할 수 있으면 needs_creative=false다.",
+        "작품에 없는 대결 결과, 역할극 대사, 자기투영 시나리오, IF 전개, 창작적 놀이 답변을 새로 만들어야 하면 needs_creative=true다.",
+        "factual: 사실 확인, 줄거리, 회차 사건, 설정 설명, 최신 갈등 같은 질문",
+        "comparative: 누가 더 강한지, 상성, 비교, 랭킹, 월드컵처럼 비교 판단이 핵심인 질문",
+        "playful: 인물 대화, 캐릭터 몰입, 호감형/밈/놀아주는 톤이 핵심인 질문",
+        "self_insert: 내가 들어가면, 내가 주인공이면, 내 포지션 같은 자기투영 질문",
+        "simulation: 만약, IF, 세계가 어떻게 반응하는지, 누가 대신 움직이는지 같은 가정/전개 시뮬레이션 질문",
+        "비교 질문이라도 작품 내 명시된 사실만으로 바로 답할 수 있으면 factual로 분류하라.",
+        "작품에 직접 근거가 없고 추론이나 상상이 필요할 때만 comparative로 분류하라.",
+        "예시:",
+        '- "한스 능력이 존보다 강해?" -> {"intent":"factual","needs_creative":false,"mode":"general"}',
+        '- "한스랑 존이 붙으면 누가 이겨?" -> {"intent":"comparative","needs_creative":true,"mode":"general"}',
+        '- "주인공 능력이 뭐야?" -> {"intent":"factual","needs_creative":false,"mode":"general"}',
+        '- "주인공이랑 악당이 성격이 왜 비슷해?" -> {"intent":"factual","needs_creative":false,"mode":"general"}',
+        '- "이 세계관에서 최강자 랭킹 매겨봐" -> {"intent":"comparative","needs_creative":true,"mode":"general"}',
+        '- "내가 들어가면 살아남을 수 있어?" -> {"intent":"self_insert","needs_creative":true,"mode":"general"}',
+        '- "1화에서 벌어진 가장 중요한 사건 3가지를 꼽아줘" -> {"intent":"factual","needs_creative":false,"mode":"exact"}',
+        '- "최신 갈등이 뭐야?" -> {"intent":"factual","needs_creative":false,"mode":"latest"}',
+        '- "초반 분위기가 어때?" -> {"intent":"factual","needs_creative":false,"mode":"early"}',
+        '- "주인공이 처음 각성한 건 어디야?" -> {"intent":"factual","needs_creative":false,"mode":"general"}',
+        'JSON 스키마: {"intent":"factual|comparative|playful|self_insert|simulation","needs_creative":true|false,"mode":"exact|early|latest|general"}',
+    ]
+    if recent_context_message:
+        system_prompt_parts.append(recent_context_message)
+
+    response = await _call_claude_messages(
+        system_prompt="\n\n".join(system_prompt_parts),
+        messages=[
+            {
+                "role": "user",
+                "content": f"질문: {user_prompt}\n\nJSON만 반환해.",
+            }
+        ],
+        max_tokens=STORY_AGENT_INTENT_MAX_TOKENS,
+    )
+    parsed = _extract_story_agent_json_object(_extract_text(response.get("content") or [])) or {}
+    intent = str(parsed.get("intent") or "").strip().lower()
+    if intent not in STORY_AGENT_ALLOWED_INTENTS:
+        intent = "factual"
+    mode = str(parsed.get("mode") or "").strip().lower()
+    if mode not in STORY_AGENT_ALLOWED_SUMMARY_MODES:
+        mode = "general"
+    raw_needs_creative = parsed.get("needs_creative")
+    if isinstance(raw_needs_creative, bool):
+        needs_creative = raw_needs_creative
+    else:
+        needs_creative = str(raw_needs_creative or "").strip().lower() == "true"
+    return intent, needs_creative, mode
+
+
 async def _generate_story_agent_reply(
     *,
     session_id: int,
     product_row: dict[str, Any],
     user_prompt: str,
     db: AsyncSession,
-) -> str:
+) -> tuple[str, str, str, bool, str]:
+    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
+    intent, needs_creative, routed_mode = await _resolve_story_agent_intent(
+        user_prompt=user_prompt,
+        recent_messages=recent_messages,
+    )
     resolved_mode, _, _, _ = _resolve_story_agent_summary_mode(
         query_text=user_prompt,
         latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+        mode=routed_mode,
     )
-    if settings.GEMINI_API_KEY and _should_route_story_agent_to_gemini(
-        user_prompt=user_prompt,
-        resolved_mode=resolved_mode,
-    ):
+    prompt_preview = _build_story_agent_prompt_preview(user_prompt)
+    fallback_used = False
+    if settings.GEMINI_API_KEY and needs_creative:
         try:
             logger.info(
-                "story-agent model route: gemini product_id=%s session_id=%s",
+                "story-agent route_selected model_used=gemini intent=%s needs_creative=true route_mode=%s fallback_used=false product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r",
+                intent,
+                resolved_mode,
                 product_row.get("productId"),
                 session_id,
+                int(product_row.get("latestEpisodeNo") or 0),
+                prompt_preview,
             )
-            return await _generate_story_agent_reply_with_gemini(
+            reply = await _generate_story_agent_reply_with_gemini(
                 session_id=session_id,
                 product_row=product_row,
                 user_prompt=user_prompt,
+                resolved_mode=resolved_mode,
                 db=db,
             )
+            return reply, "gemini", resolved_mode, False, intent
         except Exception as exc:
+            fallback_used = True
             logger.warning(
-                "story-agent gemini route failed; fallback to haiku. product_id=%s session_id=%s error=%s",
+                "story-agent route_selected model_used=gemini intent=%s needs_creative=true route_mode=%s fallback_used=true product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r error=%s",
+                intent,
+                resolved_mode,
                 product_row.get("productId"),
                 session_id,
+                int(product_row.get("latestEpisodeNo") or 0),
+                prompt_preview,
                 exc,
             )
 
     logger.info(
-        "story-agent model route: haiku product_id=%s session_id=%s",
+        "story-agent route_selected model_used=haiku intent=%s needs_creative=%s route_mode=%s fallback_used=false product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r",
+        intent,
+        "true" if needs_creative else "false",
+        resolved_mode,
         product_row.get("productId"),
         session_id,
+        int(product_row.get("latestEpisodeNo") or 0),
+        prompt_preview,
     )
-    return await _generate_story_agent_reply_with_claude(
+    reply = await _generate_story_agent_reply_with_claude(
         session_id=session_id,
         product_row=product_row,
         user_prompt=user_prompt,
+        resolved_mode=resolved_mode,
         db=db,
     )
-
-
-def _should_route_story_agent_to_gemini(
-    *,
-    user_prompt: str,
-    resolved_mode: str,
-) -> bool:
-    normalized = str(user_prompt or "").strip().lower()
-    if not normalized:
-        return False
-
-    if resolved_mode == "exact":
-        return False
-
-    return any(cue in normalized for cue in STORY_AGENT_GEMINI_ROUTE_CUES)
+    return reply, "haiku", resolved_mode, fallback_used, intent
 
 
 def _to_story_agent_gemini_contents(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -900,8 +1248,10 @@ async def _call_story_agent_gemini(
     async with httpx.AsyncClient(timeout=STORY_AGENT_GEMINI_TIMEOUT_SECONDS) as client:
         response = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{settings.STORY_AGENT_GEMINI_MODEL}:generateContent",
-            params={"key": settings.GEMINI_API_KEY},
-            headers={"content-type": "application/json"},
+            headers={
+                "content-type": "application/json",
+                "x-goog-api-key": settings.GEMINI_API_KEY,
+            },
             json=payload,
         )
 
@@ -967,12 +1317,15 @@ async def _generate_story_agent_reply_with_gemini(
     session_id: int,
     product_row: dict[str, Any],
     user_prompt: str,
+    resolved_mode: str,
     db: AsyncSession,
 ) -> str:
     latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
+    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
     resolved_mode, exact_episode_no, _, _ = _resolve_story_agent_summary_mode(
         query_text=user_prompt,
         latest_episode_no=latest_episode_no,
+        mode=resolved_mode,
     )
     resolved_episode_no = None
     if resolved_mode == "exact":
@@ -985,14 +1338,30 @@ async def _generate_story_agent_reply_with_gemini(
         )
 
     keywords = _extract_story_agent_keywords(user_prompt)
-    summary_rows = await _get_story_agent_summary_candidates(
-        product_id=int(product_row.get("productId") or 0),
-        keywords=keywords,
-        query_text=user_prompt,
-        latest_episode_no=latest_episode_no,
-        mode=resolved_mode,
-        episode_no=resolved_episode_no,
-        db=db,
+    if resolved_mode == "exact":
+        summary_rows = await _get_story_agent_summary_candidates(
+            product_id=int(product_row.get("productId") or 0),
+            keywords=keywords,
+            query_text=user_prompt,
+            latest_episode_no=latest_episode_no,
+            mode=resolved_mode,
+            episode_no=resolved_episode_no,
+            db=db,
+        )
+    else:
+        summary_rows = await _get_story_agent_broad_summary_context_rows(
+            product_id=int(product_row.get("productId") or 0),
+            query_text=user_prompt,
+            latest_episode_no=latest_episode_no,
+            resolved_mode=resolved_mode,
+            db=db,
+        )
+
+    reference_resolution = await _resolve_story_agent_reference(
+        product_row=product_row,
+        user_prompt=user_prompt,
+        recent_messages=recent_messages,
+        summary_rows=summary_rows,
     )
 
     episode_rows: list[dict[str, Any]] = []
@@ -1031,6 +1400,9 @@ async def _generate_story_agent_reply_with_gemini(
     system_prompt = (
         _build_story_agent_system_prompt(product_row)
         + " 이번 응답은 확장형 질문용 응답이다. 제공된 공개 컨텍스트만으로 잘 놀아주되, 근거 없는 설정을 단정하지 마라."
+        + " 비교/시뮬레이션 답변이라도 근거가 되는 회차나 장면을 1개 이상 자연스럽게 인용하라."
+        + " 원문에 없는 추론은 '작품 내 직접 묘사는 없지만'처럼 추론임을 분명히 밝혀라."
+        + " 능력, 범위, 지속시간, 거리, 숫자 같은 수치 정보가 공개 범위에 있으면 가능한 한 포함하라."
     )
     context_block = _build_story_agent_gemini_context_block(
         product_row=product_row,
@@ -1038,7 +1410,24 @@ async def _generate_story_agent_reply_with_gemini(
         episode_rows=episode_rows,
         search_rows=search_rows,
     )
-    messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
+    messages = list(recent_messages)
+    if _is_story_agent_ambiguous_reference_query(user_prompt):
+        recent_context_message = _build_story_agent_recent_context_message(recent_messages)
+        if recent_context_message:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": recent_context_message,
+                }
+            )
+        reference_message = _build_story_agent_reference_resolution_message(reference_resolution or {})
+        if reference_message:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": reference_message,
+                }
+            )
     messages.append(
         {
             "role": "user",
@@ -1061,13 +1450,16 @@ async def _generate_story_agent_reply_with_claude(
     session_id: int,
     product_row: dict[str, Any],
     user_prompt: str,
+    resolved_mode: str,
     db: AsyncSession,
 ) -> str:
     system_prompt = _build_story_agent_system_prompt(product_row)
-    messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
+    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
+    messages = list(recent_messages)
     resolved_mode, exact_episode_no, _, _ = _resolve_story_agent_summary_mode(
         query_text=user_prompt,
         latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+        mode=resolved_mode,
     )
     if resolved_mode == "exact":
         resolved_episode_no = await _resolve_story_agent_exact_episode_no(
@@ -1079,6 +1471,48 @@ async def _generate_story_agent_reply_with_claude(
         )
     else:
         resolved_episode_no = None
+
+    prefetched_summary_rows: list[dict[str, Any]] = []
+    if resolved_mode != "exact":
+        prefetched_summary_rows = await _get_story_agent_broad_summary_context_rows(
+            product_id=int(product_row.get("productId") or 0),
+            query_text=user_prompt,
+            latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+            resolved_mode=resolved_mode,
+            db=db,
+        )
+        summary_context_message = _build_story_agent_summary_context_message(prefetched_summary_rows)
+        if summary_context_message:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": summary_context_message,
+                }
+            )
+
+    reference_resolution = await _resolve_story_agent_reference(
+        product_row=product_row,
+        user_prompt=user_prompt,
+        recent_messages=recent_messages,
+        summary_rows=prefetched_summary_rows,
+    )
+    if _is_story_agent_ambiguous_reference_query(user_prompt):
+        recent_context_message = _build_story_agent_recent_context_message(recent_messages)
+        if recent_context_message:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": recent_context_message,
+                }
+            )
+        reference_message = _build_story_agent_reference_resolution_message(reference_resolution or {})
+        if reference_message:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": reference_message,
+                }
+            )
 
     if resolved_mode == "exact" and resolved_episode_no:
         prefetched_rows = await _get_story_agent_episode_contents(
@@ -1120,7 +1554,7 @@ async def _generate_story_agent_reply_with_claude(
         text_reply = _extract_text(content)
         tool_uses = _extract_tool_use_blocks(content)
         if not tool_uses:
-            return text_reply.strip() or "지금 공개된 회차 기준으로는 바로 답을 정리하지 못했습니다. 질문을 조금만 더 구체적으로 말씀해 주세요."
+            return text_reply.strip() or "지금 공개 범위에서 바로 짚을 수 있는 핵심은 아직 제한적입니다. 우선 어떤 축이 궁금한지 말씀해 주세요. 예를 들면 능력 규칙, 세력 질서, 인물 관계, 전투 상성 중 하나로 좁히면 더 정확하게 이어서 답할 수 있습니다."
 
         messages.append({"role": "assistant", "content": content})
         tool_results: list[dict[str, Any]] = []
@@ -1146,7 +1580,7 @@ async def _generate_story_agent_reply_with_claude(
             )
         messages.append({"role": "user", "content": tool_results})
 
-    return "지금 공개된 회차 기준으로 필요한 원문을 다 확인하지 못했습니다. 질문을 조금 더 좁혀서 다시 보내주세요."
+    return "지금 공개 범위에서 바로 단정할 수 있는 근거는 충분하지 않습니다. 다만 질문을 더 잘게 나누면 바로 이어서 볼 수 있습니다. 능력 규칙, 세력 질서, 인물 관계, 전투 상성 중 어느 쪽이 궁금한지 한 가지로 좁혀 주세요."
 
 
 async def _get_story_agent_chunk_previews(
@@ -1892,7 +2326,7 @@ async def post_message(
             db=db,
         )
 
-        assistant_reply = await _generate_story_agent_reply(
+        assistant_reply, model_used, route_mode, fallback_used, intent = await _generate_story_agent_reply(
             session_id=session_id,
             product_row=product_row,
             user_prompt=req_body.content,
@@ -1962,6 +2396,17 @@ async def post_message(
         )
 
         await db.commit()
+        logger.info(
+            "story-agent reply_completed model_used=%s intent=%s route_mode=%s fallback_used=%s product_id=%s session_id=%s charged_cash=%s prompt_preview=%r",
+            model_used,
+            intent,
+            route_mode,
+            "true" if fallback_used else "false",
+            int(session_row["product_id"]),
+            session_id,
+            "true" if should_charge_cash else "false",
+            _build_story_agent_prompt_preview(req_body.content),
+        )
 
         return {
             "data": {
