@@ -47,6 +47,9 @@ STORY_AGENT_GEMINI_TIMEOUT_SECONDS = 35.0
 STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT = 2
 STORY_AGENT_REFERENCE_RESOLUTION_MAX_TOKENS = 220
 STORY_AGENT_INTENT_MAX_TOKENS = 120
+STORY_AGENT_REPLY_MAX_TOKENS = 3072
+STORY_AGENT_ALLOWED_RP_MODES = {"free", "scene"}
+STORY_AGENT_RP_RECENT_FACT_LIMIT = 6
 STORY_AGENT_ALLOWED_INTENTS = {
     "factual",
     "comparative",
@@ -861,6 +864,76 @@ def _build_story_agent_system_prompt(product_row: dict[str, Any]) -> str:
     )
 
 
+def _build_story_agent_rp_system_prompt(
+    *,
+    product_row: dict[str, Any],
+    rp_context: dict[str, Any],
+) -> str:
+    display_name = str(rp_context.get("display_name") or "캐릭터").strip()
+    speech_style = rp_context.get("speech_style") or {}
+    personality_core = [
+        str(item).strip()
+        for item in (rp_context.get("personality_core") or [])
+        if str(item).strip()
+    ]
+    examples = [
+        str(item.get("text") or "").strip()
+        for item in (rp_context.get("examples") or [])
+        if str(item.get("text") or "").strip()
+    ][:5]
+    session_memory = _normalize_story_agent_session_memory(rp_context.get("session_memory") or {})
+    memory_lines: list[str] = []
+    if str(session_memory.get("relationship_stage") or "").strip():
+        memory_lines.append(f"- 관계 단계: {session_memory['relationship_stage']}")
+    for item in session_memory.get("recent_rp_facts") or []:
+        memory_lines.append(f"- {item}")
+
+    speech_lines = [
+        f"- tone: {', '.join(str(item) for item in (speech_style.get('tone') or []) if str(item).strip())}",
+        f"- formality: {str(speech_style.get('formality') or '').strip()}",
+        f"- sentence_length: {str(speech_style.get('sentence_length') or '').strip()}",
+        f"- habit: {', '.join(str(item) for item in (speech_style.get('habit') or []) if str(item).strip())}",
+        f"- address: {str(speech_style.get('address') or '').strip()}",
+    ]
+    speech_block = "\n".join(line for line in speech_lines if not line.endswith(": "))
+    personality_block = "\n".join(f"- {item}" for item in personality_core)
+    example_block = "\n".join(f"- {item}" for item in examples)
+    memory_block = "\n".join(memory_lines)
+
+    scene_block = ""
+    if str(rp_context.get("rp_mode") or "") == "scene":
+        scene_summary = str(rp_context.get("scene_summary_text") or "").strip()
+        scene_source = str(rp_context.get("scene_source_text") or "").strip()
+        scene_state = str(rp_context.get("scene_state") or "").strip()
+        parts = []
+        if scene_summary:
+            parts.append(f"현재 상황: {scene_summary}")
+        if scene_state:
+            parts.append(f"이 시점에서 {display_name}은 {scene_state}")
+        if scene_source:
+            parts.append(f"참고 원문:\n{scene_source}")
+        if parts:
+            scene_block = "\n\n[장면 컨텍스트]\n" + "\n".join(parts)
+
+    return (
+        f"너는 {display_name}이다.\n\n"
+        "[절대 규칙]\n"
+        f"- 항상 {display_name}으로 말하라. 3인칭 서술, 해설, 메타 설명 금지.\n"
+        "- 사용자가 제시하는 상황은 수용하라. 시대나 장소가 원작과 달라도 거부하지 마라.\n"
+        "- 대신 말투, 성격, 반응 방식은 유지하라.\n"
+        "- 답변 끝에는 행동 또는 감정 묘사 1줄과, 대화를 이어가는 짧은 말 1마디를 붙여라.\n"
+        "- 사용자가 끝내려는 뜻이 아니면 먼저 대화를 닫지 마라.\n"
+        "- 원작 공개 범위를 넘는 사실은 단정하지 마라.\n\n"
+        f"[작품]\n- 제목: {str(product_row.get('title') or '').strip()}\n"
+        f"- 최신 공개 회차: {int(product_row.get('latestEpisodeNo') or 0)}화\n\n"
+        f"[말투]\n{speech_block or '- 정보 없음'}\n\n"
+        f"[성격]\n{personality_block or '- 정보 없음'}\n\n"
+        f"[참고 대사]\n{example_block or '- 정보 없음'}"
+        + (f"\n\n[세션 메모리]\n{memory_block}" if memory_block else "")
+        + scene_block
+    )
+
+
 def _is_story_agent_ambiguous_reference_query(query_text: str) -> bool:
     normalized = re.sub(r"\s+", " ", str(query_text or "")).strip()
     if not normalized:
@@ -892,6 +965,101 @@ def _build_story_agent_recent_context_message(
     )
 
 
+def _normalize_story_agent_session_memory(raw_value: Any) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    if isinstance(raw_value, str) and raw_value.strip():
+        try:
+            loaded = json.loads(raw_value)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except Exception:
+            parsed = {}
+    elif isinstance(raw_value, dict):
+        parsed = raw_value
+
+    rp_mode = str(parsed.get("rp_mode") or "").strip().lower()
+    if rp_mode not in STORY_AGENT_ALLOWED_RP_MODES:
+        rp_mode = None
+    active_character = str(parsed.get("active_character") or "").strip() or None
+    try:
+        scene_episode_no = int(parsed.get("scene_episode_no") or 0) or None
+    except Exception:
+        scene_episode_no = None
+    relationship_stage = str(parsed.get("relationship_stage") or "").strip() or "neutral"
+    recent_rp_facts = [
+        str(item).strip()
+        for item in (parsed.get("recent_rp_facts") or [])
+        if str(item).strip()
+    ][:STORY_AGENT_RP_RECENT_FACT_LIMIT]
+    return {
+        "active_character": active_character,
+        "rp_mode": rp_mode,
+        "scene_episode_no": scene_episode_no,
+        "relationship_stage": relationship_stage,
+        "recent_rp_facts": recent_rp_facts,
+    }
+
+
+def _merge_story_agent_session_memory(
+    *,
+    base_memory: dict[str, Any],
+    rp_mode: str | None,
+    active_character: str | None,
+    scene_episode_no: int | None,
+) -> dict[str, Any]:
+    next_memory = _normalize_story_agent_session_memory(base_memory)
+
+    normalized_active_character = str(active_character or "").strip() or None
+    if normalized_active_character is not None:
+        next_memory["active_character"] = normalized_active_character
+
+    normalized_scene_episode_no = int(scene_episode_no or 0) or None
+    requested_mode = str(rp_mode or "").strip().lower()
+    if normalized_scene_episode_no:
+        next_memory["scene_episode_no"] = normalized_scene_episode_no
+        next_memory["rp_mode"] = "scene"
+    elif requested_mode in STORY_AGENT_ALLOWED_RP_MODES:
+        next_memory["rp_mode"] = requested_mode
+        if requested_mode != "scene":
+            next_memory["scene_episode_no"] = None
+
+    if next_memory.get("rp_mode") == "scene" and not next_memory.get("scene_episode_no"):
+        next_memory["rp_mode"] = "free"
+    if not next_memory.get("active_character"):
+        next_memory["rp_mode"] = None
+        next_memory["scene_episode_no"] = None
+
+    return next_memory
+
+
+def _update_story_agent_session_memory_after_reply(
+    session_memory: dict[str, Any],
+    *,
+    user_prompt: str,
+    assistant_reply: str,
+) -> dict[str, Any]:
+    next_memory = _normalize_story_agent_session_memory(session_memory)
+    if not next_memory.get("active_character") or not next_memory.get("rp_mode"):
+        return next_memory
+
+    facts = list(next_memory.get("recent_rp_facts") or [])
+    prompt_preview = re.sub(r"\s+", " ", str(user_prompt or "")).strip()[:80]
+    reply_preview = re.sub(r"\s+", " ", str(assistant_reply or "")).strip()[:80]
+    if prompt_preview:
+        facts.append(f"유저: {prompt_preview}")
+    if reply_preview:
+        facts.append(f"캐릭터: {reply_preview}")
+    next_memory["recent_rp_facts"] = facts[-STORY_AGENT_RP_RECENT_FACT_LIMIT:]
+    return next_memory
+
+
+def _serialize_story_agent_session_memory(session_memory: dict[str, Any]) -> str | None:
+    normalized = _normalize_story_agent_session_memory(session_memory)
+    if not normalized.get("active_character") or not normalized.get("rp_mode"):
+        return None
+    return json.dumps(normalized, ensure_ascii=False)
+
+
 def _extract_story_agent_json_object(text_value: str) -> dict[str, Any] | None:
     raw = str(text_value or "").strip()
     if not raw:
@@ -910,6 +1078,179 @@ def _extract_story_agent_json_object(text_value: str) -> dict[str, Any] | None:
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         return None
+
+
+def _normalize_story_agent_character_name(value: str) -> str:
+    normalized = re.sub(r"\s+", "", str(value or "")).strip().lower()
+    return normalized
+
+
+async def _get_story_agent_exact_summary_row(
+    *,
+    product_id: int,
+    summary_type: str,
+    scope_key: str,
+    db: AsyncSession,
+) -> dict[str, Any] | None:
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                summary_id AS summaryId,
+                summary_text AS summaryText,
+                episode_from AS episodeFrom,
+                episode_to AS episodeTo
+            FROM tb_story_agent_context_summary
+            WHERE product_id = :product_id
+              AND summary_type = :summary_type
+              AND scope_key = :scope_key
+              AND is_active = 'Y'
+            ORDER BY summary_id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "product_id": product_id,
+            "summary_type": summary_type,
+            "scope_key": scope_key,
+        },
+    )
+    row = result.mappings().one_or_none()
+    return dict(row) if row else None
+
+
+async def _resolve_story_agent_active_character_scope_key(
+    *,
+    product_id: int,
+    active_character: str | None,
+    db: AsyncSession,
+) -> str | None:
+    raw_value = str(active_character or "").strip()
+    if not raw_value:
+        return None
+    if ":" in raw_value:
+        return raw_value
+
+    result = await db.execute(
+        text(
+            """
+            SELECT scope_key AS scopeKey, summary_text AS summaryText
+            FROM tb_story_agent_context_summary
+            WHERE product_id = :product_id
+              AND summary_type = 'character_rp_profile'
+              AND is_active = 'Y'
+            ORDER BY summary_id DESC
+            """
+        ),
+        {"product_id": product_id},
+    )
+    target_name = _normalize_story_agent_character_name(raw_value)
+    matched_scope_keys: list[str] = []
+    for row in result.mappings().all():
+        scope_key = str(row.get("scopeKey") or "").strip()
+        if not scope_key:
+            continue
+        payload = _extract_story_agent_json_object(str(row.get("summaryText") or "")) or {}
+        candidate_names = [scope_key]
+        display_name = str(payload.get("display_name") or "").strip()
+        if display_name:
+            candidate_names.append(display_name)
+        for alias in payload.get("aliases") or []:
+            alias_text = str(alias or "").strip()
+            if alias_text:
+                candidate_names.append(alias_text)
+        if any(_normalize_story_agent_character_name(name) == target_name for name in candidate_names if str(name).strip()):
+            matched_scope_keys.append(scope_key)
+
+    unique_scope_keys = sorted(set(matched_scope_keys))
+    if not unique_scope_keys:
+        return None
+    if len(unique_scope_keys) > 1:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="같은 이름으로 여러 RP 캐릭터가 잡혀서 누구와 대화할지 정하기 어렵습니다. 캐릭터를 더 구체적으로 지정해주세요.",
+        )
+    return unique_scope_keys[0]
+
+
+async def _load_story_agent_rp_context(
+    *,
+    product_row: dict[str, Any],
+    session_memory: dict[str, Any],
+    db: AsyncSession,
+) -> dict[str, Any] | None:
+    normalized_memory = _normalize_story_agent_session_memory(session_memory)
+    active_character = str(normalized_memory.get("active_character") or "").strip()
+    rp_mode = str(normalized_memory.get("rp_mode") or "").strip().lower()
+    if not active_character or rp_mode not in STORY_AGENT_ALLOWED_RP_MODES:
+        return None
+
+    product_id = int(product_row.get("productId") or 0)
+    resolved_active_character = await _resolve_story_agent_active_character_scope_key(
+        product_id=product_id,
+        active_character=active_character,
+        db=db,
+    )
+    if not resolved_active_character:
+        return None
+    profile_row = await _get_story_agent_exact_summary_row(
+        product_id=product_id,
+        summary_type="character_rp_profile",
+        scope_key=resolved_active_character,
+        db=db,
+    )
+    examples_row = await _get_story_agent_exact_summary_row(
+        product_id=product_id,
+        summary_type="character_rp_examples",
+        scope_key=resolved_active_character,
+        db=db,
+    )
+    profile = _extract_story_agent_json_object(str((profile_row or {}).get("summaryText") or ""))
+    examples_payload = _extract_story_agent_json_object(str((examples_row or {}).get("summaryText") or ""))
+    if not profile or not examples_payload:
+        return None
+
+    context: dict[str, Any] = {
+        "active_character": resolved_active_character,
+        "rp_mode": rp_mode,
+        "display_name": str(profile.get("display_name") or resolved_active_character).strip(),
+        "speech_style": profile.get("speech_style") or {},
+        "personality_core": profile.get("personality_core") or [],
+        "baseline_attitude": str(profile.get("baseline_attitude") or "").strip(),
+        "examples": list(examples_payload.get("examples") or []),
+        "session_memory": normalized_memory,
+    }
+
+    if rp_mode == "scene":
+        scene_episode_no = int(normalized_memory.get("scene_episode_no") or 0) or None
+        if scene_episode_no:
+            summary_rows = await _get_story_agent_summary_candidates(
+                product_id=product_id,
+                keywords=[],
+                query_text=f"{scene_episode_no}화",
+                latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+                mode="exact",
+                episode_no=scene_episode_no,
+                db=db,
+            )
+            scene_summary_text = str((summary_rows[0] if summary_rows else {}).get("summaryText") or "").strip()
+            episode_rows = await _get_story_agent_episode_contents(
+                product_id=product_id,
+                episode_from=scene_episode_no,
+                episode_to=scene_episode_no,
+                latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+                db=db,
+            )
+            scene_source_text = "\n".join(
+                str(row.get("content") or "").strip()
+                for row in episode_rows[:1]
+                if str(row.get("content") or "").strip()
+            )[:STORY_AGENT_PREFETCH_CONTEXT_CHARS]
+            context["scene_episode_no"] = scene_episode_no
+            context["scene_summary_text"] = scene_summary_text
+            context["scene_source_text"] = scene_source_text
+            context["scene_state"] = scene_summary_text.split("\n", 1)[0] if scene_summary_text else ""
+    return context
 
 
 async def _resolve_story_agent_reference(
@@ -1124,13 +1465,84 @@ async def _resolve_story_agent_intent(
     return intent, needs_creative, mode
 
 
-async def _generate_story_agent_reply(
+async def _generate_story_agent_rp_reply_with_gemini(
     *,
     session_id: int,
     product_row: dict[str, Any],
     user_prompt: str,
+    rp_context: dict[str, Any],
+    db: AsyncSession,
+) -> str:
+    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
+    messages = list(recent_messages)
+    messages.append({"role": "user", "content": user_prompt})
+    return await _call_story_agent_gemini(
+        system_prompt=_build_story_agent_rp_system_prompt(product_row=product_row, rp_context=rp_context),
+        messages=_to_story_agent_gemini_contents(messages),
+        max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
+    )
+
+
+async def _generate_story_agent_rp_reply_with_claude(
+    *,
+    session_id: int,
+    product_row: dict[str, Any],
+    user_prompt: str,
+    rp_context: dict[str, Any],
+    db: AsyncSession,
+) -> str:
+    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
+    messages = list(recent_messages)
+    messages.append({"role": "user", "content": user_prompt})
+    response = await _call_claude_messages(
+        system_prompt=_build_story_agent_rp_system_prompt(product_row=product_row, rp_context=rp_context),
+        messages=messages,
+        max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
+    )
+    return _extract_text(response.get("content") or []).strip()
+
+
+async def _generate_story_agent_reply(
+    *,
+    session_id: int,
+    session_memory: dict[str, Any],
+    product_row: dict[str, Any],
+    user_prompt: str,
     db: AsyncSession,
 ) -> tuple[str, str, str, bool, str]:
+    rp_context = await _load_story_agent_rp_context(
+        product_row=product_row,
+        session_memory=session_memory,
+        db=db,
+    )
+    if rp_context:
+        if settings.GEMINI_API_KEY:
+            try:
+                reply = await _generate_story_agent_rp_reply_with_gemini(
+                    session_id=session_id,
+                    product_row=product_row,
+                    user_prompt=user_prompt,
+                    rp_context=rp_context,
+                    db=db,
+                )
+                return reply, "gemini", f"rp:{rp_context['rp_mode']}", False, "playful"
+            except Exception as exc:
+                logger.warning(
+                    "story-agent rp_route_selected model_used=gemini fallback_used=true product_id=%s session_id=%s active_character=%s error=%s",
+                    product_row.get("productId"),
+                    session_id,
+                    rp_context.get("active_character"),
+                    exc,
+                )
+        reply = await _generate_story_agent_rp_reply_with_claude(
+            session_id=session_id,
+            product_row=product_row,
+            user_prompt=user_prompt,
+            rp_context=rp_context,
+            db=db,
+        )
+        return reply, "haiku", f"rp:{rp_context['rp_mode']}", bool(settings.GEMINI_API_KEY), "playful"
+
     recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
     intent, needs_creative, routed_mode = await _resolve_story_agent_intent(
         user_prompt=user_prompt,
@@ -1226,7 +1638,7 @@ async def _call_story_agent_gemini(
     *,
     system_prompt: str,
     messages: list[dict[str, Any]],
-    max_tokens: int = 1024,
+    max_tokens: int = STORY_AGENT_REPLY_MAX_TOKENS,
 ) -> str:
     if not settings.GEMINI_API_KEY:
         raise CustomResponseException(
@@ -1441,7 +1853,7 @@ async def _generate_story_agent_reply_with_gemini(
     return await _call_story_agent_gemini(
         system_prompt=system_prompt,
         messages=_to_story_agent_gemini_contents(messages),
-        max_tokens=1024,
+        max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
     )
 
 
@@ -1548,7 +1960,7 @@ async def _generate_story_agent_reply_with_claude(
             system_prompt=system_prompt,
             messages=messages,
             tools=STORY_AGENT_TOOLS,
-            max_tokens=1024,
+            max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
         )
         content = response.get("content") or []
         text_reply = _extract_text(content)
@@ -1939,7 +2351,7 @@ async def _get_session_row(
 
     query = text(
         f"""
-        SELECT session_id, product_id, title, created_date, updated_date
+        SELECT session_id, product_id, title, session_memory_json, created_date, updated_date
         FROM tb_story_agent_session
         WHERE session_id = :session_id
           AND deleted_yn = 'N'
@@ -2160,15 +2572,33 @@ async def create_session(
         )
 
     title = (req_body.title or STORY_AGENT_DEFAULT_TITLE).strip()[:120]
+    resolved_active_character = await _resolve_story_agent_active_character_scope_key(
+        product_id=req_body.product_id,
+        active_character=req_body.active_character,
+        db=db,
+    )
+    if req_body.active_character and not resolved_active_character:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="RP 캐릭터를 찾지 못했습니다. 표시 이름이나 내부 키를 다시 확인해주세요.",
+        )
+    session_memory = _merge_story_agent_session_memory(
+        base_memory={},
+        rp_mode=req_body.rp_mode,
+        active_character=resolved_active_character,
+        scene_episode_no=req_body.scene_episode_no,
+    )
+    session_memory_json = _serialize_story_agent_session_memory(session_memory)
     query = text(
         f"""
         INSERT INTO tb_story_agent_session
-        (product_id, user_id, guest_key, title, deleted_yn, expires_at, created_id, updated_id)
+        (product_id, user_id, guest_key, title, session_memory_json, deleted_yn, expires_at, created_id, updated_id)
         VALUES (
             :product_id,
             :user_id,
             :guest_key,
             :title,
+            :session_memory_json,
             'N',
             DATE_ADD(NOW(), INTERVAL {STORY_AGENT_SESSION_TTL_DAYS} DAY),
             :created_id,
@@ -2184,6 +2614,7 @@ async def create_session(
             "user_id": user_id,
             "guest_key": resolved_guest_key,
             "title": title,
+            "session_memory_json": session_memory_json,
             "created_id": created_id,
             "updated_id": created_id,
         },
@@ -2270,6 +2701,23 @@ async def post_message(
 ):
     user_id, resolved_guest_key = await _resolve_actor(kc_user_id, req_body.guest_key, db)
     session_row = await _get_session_row(session_id, user_id, resolved_guest_key, db)
+    current_session_memory = _normalize_story_agent_session_memory(session_row.get("session_memory_json"))
+    resolved_active_character = await _resolve_story_agent_active_character_scope_key(
+        product_id=int(session_row["product_id"]),
+        active_character=req_body.active_character,
+        db=db,
+    )
+    if req_body.active_character and not resolved_active_character:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="RP 캐릭터를 찾지 못했습니다. 표시 이름이나 내부 키를 다시 확인해주세요.",
+        )
+    next_session_memory = _merge_story_agent_session_memory(
+        base_memory=current_session_memory,
+        rp_mode=req_body.rp_mode,
+        active_character=resolved_active_character,
+        scene_episode_no=req_body.scene_episode_no,
+    )
     effective_adult_yn = await _resolve_effective_adult_yn(
         kc_user_id=kc_user_id,
         adult_yn="Y",
@@ -2328,9 +2776,15 @@ async def post_message(
 
         assistant_reply, model_used, route_mode, fallback_used, intent = await _generate_story_agent_reply(
             session_id=session_id,
+            session_memory=next_session_memory,
             product_row=product_row,
             user_prompt=req_body.content,
             db=db,
+        )
+        next_session_memory = _update_story_agent_session_memory_after_reply(
+            next_session_memory,
+            user_prompt=req_body.content,
+            assistant_reply=assistant_reply,
         )
 
         insert_query = text(
@@ -2379,6 +2833,7 @@ async def post_message(
                     WHEN title = :default_title THEN :next_title
                     ELSE title
                 END,
+                session_memory_json = :session_memory_json,
                 expires_at = DATE_ADD(NOW(), INTERVAL {STORY_AGENT_SESSION_TTL_DAYS} DAY),
                 updated_id = :updated_id,
                 updated_date = NOW()
@@ -2390,6 +2845,7 @@ async def post_message(
             {
                 "default_title": STORY_AGENT_DEFAULT_TITLE,
                 "next_title": req_body.content[:40],
+                "session_memory_json": _serialize_story_agent_session_memory(next_session_memory),
                 "updated_id": created_id,
                 "session_id": session_id,
             },
