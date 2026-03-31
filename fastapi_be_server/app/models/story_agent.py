@@ -14,6 +14,7 @@ class StoryAgentSession(Base):
     user_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True, comment="로그인 사용자 ID")
     guest_key: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True, comment="비로그인 식별 키")
     title: Mapped[str] = mapped_column(String(120), nullable=False, server_default="새 대화", comment="세션 제목")
+    session_memory_json: Mapped[str | None] = mapped_column(Text, nullable=True, comment="RP/세션 메모리 JSON")
     deleted_yn: Mapped[str] = mapped_column(String(1), nullable=False, server_default="N", comment="삭제 여부")
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, comment="세션 만료 시각")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
@@ -144,7 +145,7 @@ class StoryAgentContextSummary(Base):
     summary_type: Mapped[str] = mapped_column(
         String(30),
         nullable=False,
-        comment="episode_summary | range_summary | product_summary | character_snapshot | relation_snapshot | world_snapshot",
+        comment="episode_summary | range_summary | product_summary | character_snapshot | relation_snapshot | world_snapshot | character_rp_profile | character_rp_examples",
     )
     scope_key: Mapped[str] = mapped_column(String(80), nullable=False, comment="요약 scope key")
     episode_from: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="시작 회차")
