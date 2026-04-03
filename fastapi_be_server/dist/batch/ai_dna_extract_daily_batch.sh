@@ -10,12 +10,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JOB_FILE_ID="ai_dna_extract_daily_batch.sh"
 
 LOCK_DIR="/tmp/ai-dna-extract-daily-batch.lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
+MAX_LOCK_AGE_SECONDS="${MAX_LOCK_AGE_SECONDS:-21600}"
 
 # 동시실행 방지 락
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "[WARN] ai_dna_extract_daily_batch already running ($LOCK_DIR exists), skipping." 1>&2
-  exit 0
+  STALE_LOCK=0
+  NOW_TS="$(date +%s)"
+  LOCK_TS="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)"
+
+  if [ -f "$LOCK_PID_FILE" ]; then
+    EXISTING_PID="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    if ! [[ "$EXISTING_PID" =~ ^[0-9]+$ ]] || ! kill -0 "$EXISTING_PID" 2>/dev/null; then
+      STALE_LOCK=1
+    fi
+  elif [ "$LOCK_TS" -gt 0 ] && [ $((NOW_TS - LOCK_TS)) -gt "$MAX_LOCK_AGE_SECONDS" ]; then
+    STALE_LOCK=1
+  fi
+
+  if [ "$STALE_LOCK" -eq 1 ]; then
+    echo "[WARN] stale lock detected. removing $LOCK_DIR and retrying lock acquisition." 1>&2
+    rm -rf "$LOCK_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo "[ERROR] failed to reacquire lock after stale lock cleanup: $LOCK_DIR" 1>&2
+      exit 1
+    fi
+  else
+    echo "[WARN] ai_dna_extract_daily_batch already running ($LOCK_DIR exists), skipping." 1>&2
+    exit 0
+  fi
 fi
+echo "$$" > "$LOCK_PID_FILE"
 
 # PID 1에서 환경변수 로딩 (cron_env.sh가 DB만 로드하므로 ANTHROPIC 키도 가져옴)
 if [ -r /proc/1/environ ]; then
@@ -101,6 +126,7 @@ mark_job_success() {
   "${MYSQL_CMD[@]}" <<SQL
 UPDATE tb_cms_batch_job_process
    SET completed_yn = 'Y',
+       last_processed_date = NOW(),
        updated_date = NOW(),
        created_id = 0,
        updated_id = 0
