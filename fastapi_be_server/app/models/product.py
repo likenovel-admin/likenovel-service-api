@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Date, Double, Integer, String, Text, TIMESTAMP, UniqueConstraint, text
+from sqlalchemy import BigInteger, Date, Double, Index, Integer, String, Text, TIMESTAMP, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from datetime import date, datetime
@@ -154,6 +154,15 @@ class Product(Base):
 
 class ProductEpisode(Base):
     __tablename__ = "tb_product_episode"  # 회차 마스터 (회차 저장/등록에서 ins)
+    __table_args__ = (
+        Index(
+            "idx_product_episode_paid_convert",
+            "product_id",
+            "use_yn",
+            "price_type",
+            "episode_no",
+        ),
+    )
 
     # column
     episode_id: Mapped[int] = mapped_column(

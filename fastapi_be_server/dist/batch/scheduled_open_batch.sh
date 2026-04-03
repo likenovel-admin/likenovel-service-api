@@ -3,17 +3,15 @@
 # 예약 공개 배치 (1분 주기)
 # - publish_reserve_date가 도래한 회차를 공개 전환
 # - 비공개 작품의 공개 전환 및 last_episode_date 갱신
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/batch_advisory_lock.sh"
 
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-}"
 DB_PW="${DB_PW:-}"
 DB_NAME="${DB_NAME:-likenovel}"
-LOCK_NAME="${LOCK_NAME:-likenovel_batch_episode_release}"
 
 # SSL: MariaDB(--skip-ssl) vs MySQL 8.0+(--ssl-mode=DISABLED)
 if [ -z "${MYSQL_SSL_OPT:-}" ]; then
@@ -26,9 +24,4 @@ if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   exit 1
 fi
 
-run_sql_with_advisory_lock "$LOCK_NAME" "$SQL_FILE" "scheduled_open_batch"
-rc=$?
-if [ "$rc" -eq 2 ]; then
-  exit 0
-fi
-exit "$rc"
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < "$SQL_FILE"

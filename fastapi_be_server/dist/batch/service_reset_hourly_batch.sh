@@ -6,6 +6,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCK_FILE="${LOCK_FILE:-/tmp/likenovel_service_reset_hourly_batch.lock}"
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "[INFO] service_reset_hourly_batch skip: self lock busy" 1>&2
+  exit 0
+fi
 
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"

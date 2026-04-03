@@ -23,7 +23,7 @@ if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   exit 1
 fi
 
-MAX_RETRIES=3
+MAX_RETRIES=5
 RETRY_DELAY=10
 BATCH_FAILED=0
 
