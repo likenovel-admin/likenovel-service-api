@@ -948,6 +948,7 @@ async def episodes_by_product_id(
                 count_hit as countHit,
                 count_recommend as countRecommend,
                 open_yn as episodeOpenYn,
+                open_changed_date as openChangedDate,
                 (select count(*) from tb_product_episode_like where episode_id = e.episode_id) as countLike,
                 created_date as createdDate,
                 (select own_type from tb_user_productbook where (
