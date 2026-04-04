@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Query, Path
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger, chk_cur_user
@@ -3887,6 +3887,7 @@ async def get_current_popup_data(
 async def faq_list(
     page: int = Query(1, description="페이지"),
     count_per_page: int = Query(8, description="한 페이지 내 갯수"),
+    faq_type: Optional[str] = Query(None, description="FAQ 카테고리 코드"),
     db: AsyncSession = Depends(get_likenovel_db),
     user: Dict[str, Any] = Depends(chk_cur_user),
 ):
@@ -3898,7 +3899,19 @@ async def faq_list(
     except Exception as e:
         raise e
 
-    return await admin_faq_service.faq_list(page, count_per_page, db)
+    return await admin_faq_service.faq_list(page, count_per_page, db, faq_type=faq_type)
+
+
+@router.get("/faq-categories", tags=["CMS - FAQ"], dependencies=[Depends(analysis_logger)])
+async def faq_category_list(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+    return await admin_faq_service.faq_category_list(db)
 
 
 @router.get(

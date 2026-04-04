@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import status
-import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
@@ -19,6 +18,90 @@ from app.schemas.story_agent import (
     PostStoryAgentSessionReqBody,
     PatchStoryAgentSessionReqBody,
 )
+from app.services.story_agent.story_agent_compare import (
+    _build_story_agent_pair_key,
+    _build_story_agent_worldcup_round,
+    _extract_story_agent_direct_match_scope_keys,
+    _filter_story_agent_worldcup_candidates_by_read_scope,
+    _infer_story_agent_game_category_from_prompt,
+    _pick_story_agent_unused_pair,
+    _resolve_story_agent_pair_choice,
+    _resolve_story_agent_worldcup_bracket_size,
+)
+from app.services.story_agent.story_agent_compare_runtime import (
+    get_story_agent_game_candidate_profiles,
+    select_story_agent_game_candidates,
+)
+from app.services.story_agent.story_agent_concierge import (
+    build_story_agent_concierge_payload,
+)
+from app.services.story_agent.story_agent_context_assembler import assemble_story_agent_scope_context
+from app.services.story_agent.story_agent_contracts import (
+    StoryAgentCtaCard,
+    StoryAgentEvidenceBundle,
+    StoryAgentPromptReadScopeDecision,
+    StoryAgentQaExecutionResult,
+    StoryAgentReasonCard,
+    StoryAgentScopeState,
+    StoryAgentStarterAction,
+)
+from app.services.story_agent.story_agent_game_adapter import (
+    apply_story_agent_implicit_game_inputs,
+    build_story_agent_game_dispatch_plan,
+    has_story_agent_worldcup_followup_signal,
+    resolve_story_agent_worldcup_followup,
+)
+from app.services.story_agent.story_agent_game_memory import (
+    STORY_AGENT_ALLOWED_GAME_CATEGORIES,
+    STORY_AGENT_ALLOWED_GAME_GENDER_SCOPES,
+    STORY_AGENT_ALLOWED_GAME_MODES,
+    STORY_AGENT_ALLOWED_READ_SCOPE_STATES,
+    STORY_AGENT_ALLOWED_RP_MODES,
+    STORY_AGENT_ALLOWED_VS_GAME_MATCH_MODES,
+    STORY_AGENT_PENDING_GAME_CATEGORY,
+    STORY_AGENT_RP_RECENT_FACT_LIMIT,
+    _build_story_agent_game_context,
+    _clear_story_agent_game_context,
+    _merge_story_agent_session_memory,
+    _normalize_story_agent_game_state,
+    _normalize_story_agent_games_memory,
+    _normalize_story_agent_session_memory,
+    _normalize_story_agent_string_list,
+    _serialize_story_agent_session_memory,
+    _update_story_agent_session_memory_after_reply,
+)
+from app.services.story_agent.story_agent_context_loader import (
+    build_story_agent_scope_context_message,
+)
+from app.services.story_agent.story_agent_planner import (
+    _build_story_agent_qa_plan,
+    _build_story_agent_rp_plan,
+    _resolve_story_agent_response_route,
+)
+from app.services.story_agent.story_agent_qa_executor import (
+    StoryAgentQaExecutionHooks,
+    execute_story_agent_qa,
+)
+from app.services.story_agent.story_agent_qa_renderer import build_story_agent_recent_context_message
+from app.services.story_agent.story_agent_rp_renderer import (
+    generate_story_agent_rp_reply_with_claude,
+    generate_story_agent_rp_reply_with_gemini,
+)
+from app.services.story_agent.story_agent_renderers import generate_story_agent_vs_comparison
+from app.services.story_agent.story_agent_renderers import (
+    build_story_agent_game_guide_reply,
+    build_story_agent_vs_disabled_reply,
+)
+from app.services.story_agent.story_agent_scope_resolver import (
+    STORY_AGENT_EXACT_EPISODE_RE,
+    STORY_AGENT_KOREAN_ORDINAL_MAP,
+    STORY_AGENT_ORDINAL_EPISODE_RE,
+    _infer_story_agent_read_episode_to_from_prompt,
+    _is_story_agent_unread_scope_prompt,
+    _resolve_story_agent_prompt_read_scope_decision,
+    _resolve_story_agent_scope_read_episode_to,
+)
+from app.services.story_agent.story_agent_utils import _extract_story_agent_json_object
 from app.services.ai.ai_chat_service import _call_claude_messages, _extract_text, _extract_tool_use_blocks, _to_json_safe
 from app.services.common.comm_service import get_user_from_kc
 from app.utils.common import handle_exceptions
@@ -43,13 +126,9 @@ STORY_AGENT_MAX_HISTORY_MESSAGES = 10
 STORY_AGENT_MAX_EPISODE_CONTENT_CHARS = 6000
 STORY_AGENT_PREFETCH_CONTEXT_CHARS = 3000
 STORY_AGENT_BROAD_SUMMARY_CONTEXT_LIMIT = 6
-STORY_AGENT_GEMINI_TIMEOUT_SECONDS = 35.0
 STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT = 2
 STORY_AGENT_REFERENCE_RESOLUTION_MAX_TOKENS = 220
 STORY_AGENT_INTENT_MAX_TOKENS = 120
-STORY_AGENT_REPLY_MAX_TOKENS = 3072
-STORY_AGENT_ALLOWED_RP_MODES = {"free", "scene"}
-STORY_AGENT_RP_RECENT_FACT_LIMIT = 6
 STORY_AGENT_ALLOWED_INTENTS = {
     "factual",
     "comparative",
@@ -57,6 +136,8 @@ STORY_AGENT_ALLOWED_INTENTS = {
     "self_insert",
     "simulation",
 }
+STORY_AGENT_EPISODE_RANGE_RE = re.compile(r"(\d{1,4})\s*(?:~|-|–|—)\s*(\d{1,4})\s*화")
+STORY_AGENT_EPISODE_SINGLE_RE = re.compile(r"(\d{1,4})\s*화")
 STORY_AGENT_ALLOWED_SUMMARY_MODES = {"exact", "early", "latest", "general"}
 STORY_AGENT_TOOLS = [
     {
@@ -110,20 +191,6 @@ STORY_AGENT_KEYWORD_STOPWORDS = {
     "에게", "에서", "한다", "했다", "했다는", "있다", "있는", "없다", "없고", "정도", "처럼",
     "위해", "통해", "이후", "이전", "장면", "회차", "작품", "내용", "상태", "주인공", "분석",
 }
-STORY_AGENT_EXACT_EPISODE_RE = re.compile(r"(\d{1,4})\s*화")
-STORY_AGENT_ORDINAL_EPISODE_RE = re.compile(r"(\d{1,4})\s*번째(?:\s*화|\s*회차)?")
-STORY_AGENT_KOREAN_ORDINAL_MAP = {
-    "첫": 1,
-    "두": 2,
-    "세": 3,
-    "네": 4,
-    "다섯": 5,
-    "여섯": 6,
-    "일곱": 7,
-    "여덟": 8,
-    "아홉": 9,
-    "열": 10,
-}
 STORY_AGENT_EARLY_QUESTION_KEYWORDS = (
     "초반", "처음", "첫 ", "첫등장", "첫 등장", "첫발현", "첫 발현", "첫 각성", "처음 각성",
 )
@@ -143,6 +210,145 @@ STORY_AGENT_AMBIGUOUS_REFERENCE_PATTERNS = (
     "이거",
 )
 logger = logging.getLogger(__name__)
+
+
+def _resolve_story_agent_read_scope_state(
+    session_memory: dict[str, Any],
+) -> StoryAgentScopeState:
+    normalized_state = str(session_memory.get("read_scope_state") or "").strip().lower()
+    if normalized_state in STORY_AGENT_ALLOWED_READ_SCOPE_STATES:
+        return normalized_state  # type: ignore[return-value]
+    if int(session_memory.get("read_episode_to") or 0) > 0:
+        return "known"
+    return "unknown"
+
+
+def _build_story_agent_cta_cards(
+    cta_cards: list[StoryAgentCtaCard] | None,
+) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for card in cta_cards or []:
+        card_type = str(card.get("type") or "").strip()
+        label = str(card.get("label") or "").strip()
+        product_id = int(card.get("product_id") or 0)
+        if not card_type or not label or product_id <= 0:
+            continue
+        cards.append(
+            {
+                "type": card_type,
+                "label": label,
+                "productId": product_id,
+            }
+        )
+    return cards
+
+
+def _attach_story_agent_concierge_cards(
+    message: dict[str, Any],
+    concierge_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if message.get("role") != "assistant" or not concierge_payload:
+        return message
+    return {
+        **message,
+        "reasonCards": list(concierge_payload.get("reasonCards") or []),
+        "actionCards": list(concierge_payload.get("actions") or []),
+        "ctaCards": _build_story_agent_cta_cards(concierge_payload.get("ctaCards") or []),
+    }
+
+
+def _attach_story_agent_concierge_to_last_assistant_message(
+    messages: list[dict[str, Any]],
+    concierge_payload: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not concierge_payload:
+        return messages
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") != "assistant":
+            continue
+        enriched = list(messages)
+        enriched[index] = _attach_story_agent_concierge_cards(enriched[index], concierge_payload)
+        return enriched
+    return messages
+
+
+def _build_story_agent_starter(
+    *,
+    product_title: str,
+    scope_state: StoryAgentScopeState,
+    read_episode_to: int | None,
+    read_episode_title: str | None,
+    latest_episode_no: int,
+    can_send_message: bool,
+    concierge_payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not can_send_message:
+        return None
+
+    normalized_title = str(product_title or "").strip() or "이 작품"
+    resolved_read_episode_to = max(min(int(read_episode_to or 0), max(latest_episode_no, 0)), 0) or None
+    prompt_prefix = f"{resolved_read_episode_to}화까지 기준으로 " if resolved_read_episode_to else ""
+    default_actions: list[StoryAgentStarterAction] = [
+        {
+            "label": "작품 얘기",
+            "prompt": f"{prompt_prefix}작품 핵심 포인트를 이야기해줘",
+        },
+        {
+            "label": "캐릭터와 대화",
+            "prompt": f"{prompt_prefix}인상적인 캐릭터 한 명을 골라 그 말투로 인사해줘",
+        },
+        {
+            "label": "다음 전개 예상",
+            "prompt": f"{prompt_prefix}앞으로 전개를 예상해줘",
+        },
+        {
+            "label": "인물 비교",
+            "prompt": f"{prompt_prefix}인물 둘을 비교해줘",
+        },
+    ]
+    starter_actions = (
+        list(concierge_payload.get("actions") or [])
+        if scope_state == "none" and concierge_payload
+        else default_actions
+    )
+
+    return {
+        "productTitle": normalized_title,
+        "scopeState": scope_state,
+        "readEpisodeNo": resolved_read_episode_to,
+        "readEpisodeTitle": str(read_episode_title or "").strip() or None,
+        "latestEpisodeNo": max(latest_episode_no, 0),
+        "reasonCards": list(concierge_payload.get("reasonCards") or []) if concierge_payload else [],
+        "ctaCards": _build_story_agent_cta_cards(concierge_payload.get("ctaCards") or []) if concierge_payload else [],
+        "actions": starter_actions,
+    }
+
+
+def _build_story_agent_read_scope_required_reply() -> str:
+    return (
+        "읽은 회차가 아직 안 잡혔어.\n"
+        "스포일러 안 섞이게 어디까지 읽었는지 먼저 알려줘.\n"
+        "예: 프롤로그까지 읽었어 / 습격까지 읽었어 / 아직 시작 안 했어"
+    )
+
+
+async def _build_story_agent_read_scope_confirm_reply(
+    *,
+    product_id: int,
+    read_episode_to: int | None,
+    db: AsyncSession,
+) -> str:
+    read_scope_label = await _build_story_agent_read_scope_label(
+        product_id=product_id,
+        read_episode_to=read_episode_to,
+        db=db,
+    )
+    if not read_scope_label:
+        return "좋아. 읽은 범위를 잡아둘게. 이 범위 안에서만 이야기할게."
+    return (
+        f"좋아. 읽은 범위는 {read_scope_label}까지로 잡아둘게.\n"
+        "이 범위 안에서만 이야기할게."
+    )
 
 
 async def _resolve_actor(kc_user_id: str | None, guest_key: str | None, db: AsyncSession) -> tuple[int | None, str | None]:
@@ -299,6 +505,196 @@ async def _get_story_agent_product_session_state(
         "canSendMessage": can_send_message,
         "unavailableMessage": unavailable_message,
     }
+
+
+async def _get_story_agent_latest_visible_episode_no(
+    product_id: int,
+    db: AsyncSession,
+) -> int:
+    result = await db.execute(
+        text(
+            """
+            SELECT COALESCE(MAX(episode_no), 0) AS latestEpisodeNo
+            FROM tb_product_episode
+            WHERE product_id = :product_id
+              AND use_yn = 'Y'
+              AND open_yn = 'Y'
+            """
+        ),
+        {"product_id": product_id},
+    )
+    row = result.mappings().one_or_none()
+    return int((row or {}).get("latestEpisodeNo") or 0)
+
+
+def _resolve_story_agent_episode_ref_ceiling(
+    latest_episode_no: int | None,
+    read_episode_to: int | None,
+) -> int:
+    latest_visible = max(0, int(latest_episode_no or 0))
+    read_scope = max(0, int(read_episode_to or 0))
+    if latest_visible <= 0:
+        return 0
+    if read_scope <= 0:
+        return latest_visible
+    return min(latest_visible, read_scope)
+
+
+async def _get_story_agent_visible_episode_title(
+    product_id: int,
+    episode_no: int | None,
+    db: AsyncSession,
+) -> str | None:
+    if not episode_no or episode_no <= 0:
+        return None
+    result = await db.execute(
+        text(
+            """
+            SELECT COALESCE(episode_title, '') AS episodeTitle
+            FROM tb_product_episode
+            WHERE product_id = :product_id
+              AND episode_no = :episode_no
+              AND use_yn = 'Y'
+              AND open_yn = 'Y'
+            LIMIT 1
+            """
+        ),
+        {"product_id": product_id, "episode_no": int(episode_no)},
+    )
+    row = result.mappings().one_or_none()
+    title = str((row or {}).get("episodeTitle") or "").strip()
+    return title or None
+
+
+async def _build_story_agent_read_scope_label(
+    *,
+    product_id: int,
+    read_episode_to: int | None,
+    db: AsyncSession,
+) -> str | None:
+    resolved_read_episode_to = max(int(read_episode_to or 0), 0)
+    if resolved_read_episode_to <= 0:
+        return None
+    episode_title = await _get_story_agent_visible_episode_title(
+        product_id=product_id,
+        episode_no=resolved_read_episode_to,
+        db=db,
+    )
+    if episode_title:
+        return f"{resolved_read_episode_to}화({episode_title})"
+    return f"{resolved_read_episode_to}화"
+
+
+def _normalize_story_agent_scope_lookup_text(raw_text: str | None) -> str:
+    normalized = re.sub(r"\s+", "", str(raw_text or "").strip().lower())
+    return re.sub(r"[^0-9a-z가-힣]", "", normalized)
+
+
+def _extract_story_agent_episode_title_aliases(episode_title: str | None) -> list[str]:
+    aliases: list[str] = []
+
+    def append_alias(raw_value: str | None) -> None:
+        normalized = _normalize_story_agent_scope_lookup_text(raw_value)
+        if len(normalized) < 2 or normalized in aliases:
+            return
+        aliases.append(normalized)
+
+    normalized_title = str(episode_title or "").strip()
+    if not normalized_title:
+        return aliases
+
+    append_alias(normalized_title)
+    prefix_match = re.match(r"^(프롤로그|\d+\s*화)\s*[\.\-:：·\)\]]*\s*(.*)$", normalized_title, re.IGNORECASE)
+    if prefix_match:
+        append_alias(prefix_match.group(1))
+        append_alias(prefix_match.group(2))
+
+    return aliases
+
+
+def _augment_story_agent_episode_title_aliases(
+    *,
+    episode_no: int,
+    episode_title: str | None,
+) -> list[str]:
+    aliases = _extract_story_agent_episode_title_aliases(episode_title)
+    if episode_no == 1:
+        for alias in ("프롤로그", "prologue"):
+            normalized = _normalize_story_agent_scope_lookup_text(alias)
+            if normalized and normalized not in aliases:
+                aliases.append(normalized)
+    return aliases
+
+
+async def _resolve_story_agent_prompt_episode_title_scope(
+    *,
+    product_id: int,
+    latest_episode_no: int,
+    user_prompt: str,
+    db: AsyncSession,
+) -> int | None:
+    prompt_lookup = _normalize_story_agent_scope_lookup_text(user_prompt)
+    if not prompt_lookup or latest_episode_no <= 0:
+        return None
+
+    episode_rows = await _get_story_agent_public_episode_refs(
+        product_id=product_id,
+        latest_episode_no=latest_episode_no,
+        db=db,
+    )
+    matched_scores: list[tuple[int, int]] = []
+    for row in episode_rows:
+        episode_no = int(row.get("episodeNo") or 0)
+        if episode_no <= 0:
+            continue
+        matched_length = max(
+            (
+                len(alias)
+                for alias in _augment_story_agent_episode_title_aliases(
+                    episode_no=episode_no,
+                    episode_title=row.get("episodeTitle"),
+                )
+                if alias in prompt_lookup
+            ),
+            default=0,
+        )
+        if matched_length > 0:
+            matched_scores.append((episode_no, matched_length))
+
+    if not matched_scores:
+        return None
+
+    best_length = max(score for _, score in matched_scores)
+    best_episode_nos = sorted({episode_no for episode_no, score in matched_scores if score == best_length})
+    if len(best_episode_nos) != 1:
+        return None
+
+    return best_episode_nos[0]
+
+
+async def _resolve_story_agent_prompt_read_episode_to(
+    *,
+    product_id: int,
+    latest_episode_no: int,
+    user_prompt: str,
+    db: AsyncSession,
+) -> int | None:
+    if _is_story_agent_unread_scope_prompt(user_prompt):
+        return 0
+
+    resolved_from_title = await _resolve_story_agent_prompt_episode_title_scope(
+        product_id=product_id,
+        latest_episode_no=latest_episode_no,
+        user_prompt=user_prompt,
+        db=db,
+    )
+    if resolved_from_title is not None:
+        return resolved_from_title
+
+    return _infer_story_agent_read_episode_to_from_prompt(
+        user_prompt,
+        latest_episode_no=latest_episode_no,
+    )
 
 
 def _extract_story_agent_keywords(content: str) -> list[str]:
@@ -856,81 +1252,12 @@ def _build_story_agent_system_prompt(product_row: dict[str, Any]) -> str:
         "최신 갈등, 최신 관계, 떡밥 질문이면 최신 공개 회차 쪽 요약과 원문을 먼저 확인하라. "
         "질문이 넓거나 모호하면 거절하거나 '질문을 좁혀 달라'로 끝내지 마라. 먼저 공개 범위에서 확인되는 핵심 2~3가지를 짧게 답하고, 마지막에 어떤 축으로 더 좁혀서 볼지 한 문장으로 되물어라. "
         "예를 들면 능력 규칙, 세력 질서, 인물 관계, 전투 상성 중 무엇이 궁금한지 되묻는 식으로 대화를 이어가라. "
-        "사용자가 '저/그/이 선택', '저/그/이 장면', '그때', '그거'처럼 지시대명사로 모호하게 물으면 최근 대화와 이번 질문 관련 요약을 기준으로 가장 가능성 높은 장면이나 선택을 먼저 해석하라. "
-        "가능한 해석이 있으면 답변 첫 줄에 어떤 장면/선택으로 이해했는지 짧게 밝힌 뒤 설명하고, 마지막에 혹시 다른 장면이면 알려달라고 덧붙여라. "
-        "단서가 약해도 무작정 '어떤 선택인지 말해 달라'고만 하지 말고, 유력한 후보가 1~2개면 그 후보를 짧게 제시하며 어느 쪽인지 물어라. "
+        "사용자가 '저/그/이 선택', '저/그/이 장면', '그때', '그거'처럼 지시대명사로 모호하게 물으면 섣불리 하나를 확정하지 마라. "
+        "최근 대화와 이번 질문 관련 요약을 기준으로 유력한 후보가 1~2개면 짧게 제시하되, 먼저 한 번의 질문으로 범위를 좁혀라. "
+        "이때 몇 번째 회차인지, 언제 공개된 회차인지, 초반/중반/최신 중 어디쯤인지, 기억나는 회차명이나 장면 키워드가 있는지를 한 번에 함께 물어라. "
+        "사용자가 추가 단서를 주기 전에는 특정 장면이나 선택을 사실처럼 단정하지 마라. "
         "도구를 1~2번 조회한 뒤에도 근거가 부족하면, 공개 범위에서 확인되는 부분만 짧게 답하고 더 이상의 tool 호출은 멈춰라. "
         "답변은 한국어로, 불필요한 군더더기 없이 바로 답하라. 관련 회차 번호가 있으면 자연스럽게 포함하라."
-    )
-
-
-def _build_story_agent_rp_system_prompt(
-    *,
-    product_row: dict[str, Any],
-    rp_context: dict[str, Any],
-) -> str:
-    display_name = str(rp_context.get("display_name") or "캐릭터").strip()
-    speech_style = rp_context.get("speech_style") or {}
-    personality_core = [
-        str(item).strip()
-        for item in (rp_context.get("personality_core") or [])
-        if str(item).strip()
-    ]
-    examples = [
-        str(item.get("text") or "").strip()
-        for item in (rp_context.get("examples") or [])
-        if str(item.get("text") or "").strip()
-    ][:5]
-    session_memory = _normalize_story_agent_session_memory(rp_context.get("session_memory") or {})
-    memory_lines: list[str] = []
-    if str(session_memory.get("relationship_stage") or "").strip():
-        memory_lines.append(f"- 관계 단계: {session_memory['relationship_stage']}")
-    for item in session_memory.get("recent_rp_facts") or []:
-        memory_lines.append(f"- {item}")
-
-    speech_lines = [
-        f"- tone: {', '.join(str(item) for item in (speech_style.get('tone') or []) if str(item).strip())}",
-        f"- formality: {str(speech_style.get('formality') or '').strip()}",
-        f"- sentence_length: {str(speech_style.get('sentence_length') or '').strip()}",
-        f"- habit: {', '.join(str(item) for item in (speech_style.get('habit') or []) if str(item).strip())}",
-        f"- address: {str(speech_style.get('address') or '').strip()}",
-    ]
-    speech_block = "\n".join(line for line in speech_lines if not line.endswith(": "))
-    personality_block = "\n".join(f"- {item}" for item in personality_core)
-    example_block = "\n".join(f"- {item}" for item in examples)
-    memory_block = "\n".join(memory_lines)
-
-    scene_block = ""
-    if str(rp_context.get("rp_mode") or "") == "scene":
-        scene_summary = str(rp_context.get("scene_summary_text") or "").strip()
-        scene_source = str(rp_context.get("scene_source_text") or "").strip()
-        scene_state = str(rp_context.get("scene_state") or "").strip()
-        parts = []
-        if scene_summary:
-            parts.append(f"현재 상황: {scene_summary}")
-        if scene_state:
-            parts.append(f"이 시점에서 {display_name}은 {scene_state}")
-        if scene_source:
-            parts.append(f"참고 원문:\n{scene_source}")
-        if parts:
-            scene_block = "\n\n[장면 컨텍스트]\n" + "\n".join(parts)
-
-    return (
-        f"너는 {display_name}이다.\n\n"
-        "[절대 규칙]\n"
-        f"- 항상 {display_name}으로 말하라. 3인칭 서술, 해설, 메타 설명 금지.\n"
-        "- 사용자가 제시하는 상황은 수용하라. 시대나 장소가 원작과 달라도 거부하지 마라.\n"
-        "- 대신 말투, 성격, 반응 방식은 유지하라.\n"
-        "- 답변 끝에는 행동 또는 감정 묘사 1줄과, 대화를 이어가는 짧은 말 1마디를 붙여라.\n"
-        "- 사용자가 끝내려는 뜻이 아니면 먼저 대화를 닫지 마라.\n"
-        "- 원작 공개 범위를 넘는 사실은 단정하지 마라.\n\n"
-        f"[작품]\n- 제목: {str(product_row.get('title') or '').strip()}\n"
-        f"- 최신 공개 회차: {int(product_row.get('latestEpisodeNo') or 0)}화\n\n"
-        f"[말투]\n{speech_block or '- 정보 없음'}\n\n"
-        f"[성격]\n{personality_block or '- 정보 없음'}\n\n"
-        f"[참고 대사]\n{example_block or '- 정보 없음'}"
-        + (f"\n\n[세션 메모리]\n{memory_block}" if memory_block else "")
-        + scene_block
     )
 
 
@@ -941,143 +1268,786 @@ def _is_story_agent_ambiguous_reference_query(query_text: str) -> bool:
     return any(pattern in normalized for pattern in STORY_AGENT_AMBIGUOUS_REFERENCE_PATTERNS)
 
 
-def _build_story_agent_recent_context_message(
-    recent_messages: list[dict[str, str]],
-) -> str:
-    if not recent_messages:
-        return ""
-
-    lines: list[str] = []
-    for message in recent_messages[-4:]:
-        role = "사용자" if str(message.get("role") or "").strip() == "user" else "이전 답변"
-        content = re.sub(r"\s+", " ", str(message.get("content") or "")).strip()
-        if not content:
-            continue
-        lines.append(f"- {role}: {content[:220]}")
-
-    if not lines:
-        return ""
-
-    return (
-        "아래는 이번 질문 직전까지의 최근 대화 핵심이다. "
-        "지시대명사 질문이면 가장 최근에 언급된 장면·선택·인물을 우선 참조하라.\n"
-        + "\n".join(lines)
+def _get_story_agent_game_state(
+    session_memory: dict[str, Any],
+    *,
+    game_mode: str,
+    gender_scope: str,
+    category: str,
+) -> dict[str, Any]:
+    normalized = _normalize_story_agent_session_memory(session_memory)
+    return _normalize_story_agent_game_state(
+        game_mode,
+        ((((normalized.get("games") or {}).get(game_mode) or {}).get(gender_scope) or {}).get(category) or {}),
     )
 
 
-def _normalize_story_agent_session_memory(raw_value: Any) -> dict[str, Any]:
-    parsed: dict[str, Any] = {}
-    if isinstance(raw_value, str) and raw_value.strip():
-        try:
-            loaded = json.loads(raw_value)
-            if isinstance(loaded, dict):
-                parsed = loaded
-        except Exception:
-            parsed = {}
-    elif isinstance(raw_value, dict):
-        parsed = raw_value
-
-    rp_mode = str(parsed.get("rp_mode") or "").strip().lower()
-    if rp_mode not in STORY_AGENT_ALLOWED_RP_MODES:
-        rp_mode = None
-    active_character = str(parsed.get("active_character") or "").strip() or None
-    try:
-        scene_episode_no = int(parsed.get("scene_episode_no") or 0) or None
-    except Exception:
-        scene_episode_no = None
-    relationship_stage = str(parsed.get("relationship_stage") or "").strip() or "neutral"
-    recent_rp_facts = [
-        str(item).strip()
-        for item in (parsed.get("recent_rp_facts") or [])
-        if str(item).strip()
-    ][:STORY_AGENT_RP_RECENT_FACT_LIMIT]
-    return {
-        "active_character": active_character,
-        "rp_mode": rp_mode,
-        "scene_episode_no": scene_episode_no,
-        "relationship_stage": relationship_stage,
-        "recent_rp_facts": recent_rp_facts,
-    }
-
-
-def _merge_story_agent_session_memory(
-    *,
-    base_memory: dict[str, Any],
-    rp_mode: str | None,
-    active_character: str | None,
-    scene_episode_no: int | None,
-) -> dict[str, Any]:
-    next_memory = _normalize_story_agent_session_memory(base_memory)
-
-    normalized_active_character = str(active_character or "").strip() or None
-    if normalized_active_character is not None:
-        next_memory["active_character"] = normalized_active_character
-
-    normalized_scene_episode_no = int(scene_episode_no or 0) or None
-    requested_mode = str(rp_mode or "").strip().lower()
-    if normalized_scene_episode_no:
-        next_memory["scene_episode_no"] = normalized_scene_episode_no
-        next_memory["rp_mode"] = "scene"
-    elif requested_mode in STORY_AGENT_ALLOWED_RP_MODES:
-        next_memory["rp_mode"] = requested_mode
-        if requested_mode != "scene":
-            next_memory["scene_episode_no"] = None
-
-    if next_memory.get("rp_mode") == "scene" and not next_memory.get("scene_episode_no"):
-        next_memory["rp_mode"] = "free"
-    if not next_memory.get("active_character"):
-        next_memory["rp_mode"] = None
-        next_memory["scene_episode_no"] = None
-
-    return next_memory
-
-
-def _update_story_agent_session_memory_after_reply(
+def _set_story_agent_game_state(
     session_memory: dict[str, Any],
     *,
-    user_prompt: str,
-    assistant_reply: str,
+    game_mode: str,
+    gender_scope: str,
+    category: str,
+    state: dict[str, Any],
 ) -> dict[str, Any]:
-    next_memory = _normalize_story_agent_session_memory(session_memory)
-    if not next_memory.get("active_character") or not next_memory.get("rp_mode"):
-        return next_memory
-
-    facts = list(next_memory.get("recent_rp_facts") or [])
-    prompt_preview = re.sub(r"\s+", " ", str(user_prompt or "")).strip()[:80]
-    reply_preview = re.sub(r"\s+", " ", str(assistant_reply or "")).strip()[:80]
-    if prompt_preview:
-        facts.append(f"유저: {prompt_preview}")
-    if reply_preview:
-        facts.append(f"캐릭터: {reply_preview}")
-    next_memory["recent_rp_facts"] = facts[-STORY_AGENT_RP_RECENT_FACT_LIMIT:]
-    return next_memory
-
-
-def _serialize_story_agent_session_memory(session_memory: dict[str, Any]) -> str | None:
     normalized = _normalize_story_agent_session_memory(session_memory)
-    if not normalized.get("active_character") or not normalized.get("rp_mode"):
-        return None
-    return json.dumps(normalized, ensure_ascii=False)
+    games = dict(normalized.get("games") or {})
+    scope_map = dict((games.get(game_mode) or {}))
+    category_map = dict((scope_map.get(gender_scope) or {}))
+    category_map[category] = _normalize_story_agent_game_state(game_mode, state)
+    scope_map[gender_scope] = category_map
+    games[game_mode] = scope_map
+    normalized["games"] = _normalize_story_agent_games_memory(games)
+    normalized["active_mode"] = game_mode
+    normalized["game_context"] = _build_story_agent_game_context(
+        game_mode=game_mode,
+        game_gender_scope=gender_scope,
+        game_category=category if category in STORY_AGENT_ALLOWED_GAME_CATEGORIES else None,
+        game_match_mode=(state or {}).get("mode") if game_mode == "vs_game" else None,
+    )
+    return normalized
 
 
-def _extract_story_agent_json_object(text_value: str) -> dict[str, Any] | None:
-    raw = str(text_value or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        pass
+def _build_story_agent_worldcup_meta_reply(
+    *,
+    product_row: dict[str, Any],
+    gender_scope: str,
+    category: str,
+    state: dict[str, Any],
+    read_scope_label: str | None = None,
+    current_pair: list[str] | None = None,
+) -> str:
+    gender_label = {
+        "male": "남성 버전",
+        "female": "여성 버전",
+        "mixed": "섞어서",
+    }.get(gender_scope, gender_scope or "미정")
+    category_label = {
+        "romance": "연애/호감",
+        "date": "데이트 상대로 끌리는 기준",
+        "narrative": "서사적으로 제일 꽂히는 기준",
+        "power": "파워",
+        "intelligence": "지능",
+        "charm": "매력",
+        "mental": "멘탈",
+        "survival": "생존력",
+        "personality": "성격",
+    }.get(category, category or "미정")
+    read_episode_to = max(int(state.get("read_episode_to") or 0), 0)
+    resolved_read_scope_label = str(read_scope_label or "").strip()
+    if not resolved_read_scope_label and read_episode_to > 0:
+        resolved_read_scope_label = f"{read_episode_to}화"
+    current_round = str(state.get("current_round") or "").strip() or "현재 라운드"
+    candidate_count = len(list(state.get("current_candidates") or []))
+    reply_lines = [
+        f"{str(product_row.get('title') or '').strip()} 월드컵은 지금 {gender_label} / {category_label} 기준이야.",
+    ]
+    if resolved_read_scope_label:
+        reply_lines.append(f"읽은 범위는 {resolved_read_scope_label}까지로 잡혀 있어.")
+    if candidate_count > 0:
+        reply_lines.append(f"후보는 현재 {candidate_count}명 기준으로 묶여 있어.")
+    if current_pair and len(current_pair) == 2:
+        reply_lines.append(f"지금 대진은 {current_round}의 {current_pair[0]} vs {current_pair[1]}야.")
+    else:
+        reply_lines.append(f"지금 단계는 {current_round} 준비 상태야.")
+    reply_lines.append("원하면 그대로 진행하거나, 읽은 범위/성별/기준을 바꿔서 다시 잡을 수 있어.")
+    return "\n".join(reply_lines)
 
-    match = re.search(r"\{[\s\S]*\}", raw)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(0))
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
+
+def _build_story_agent_worldcup_setup_meta_reply(
+    *,
+    product_row: dict[str, Any],
+    gender_scope: str | None,
+    category: str | None,
+    read_scope_label: str | None = None,
+) -> str:
+    gender_label = {
+        "male": "남성 버전",
+        "female": "여성 버전",
+        "mixed": "섞어서",
+    }.get(str(gender_scope or "").strip().lower(), "미정")
+    category_label = {
+        "romance": "연애/호감",
+        "date": "데이트 상대로 끌리는 기준",
+        "narrative": "서사적으로 제일 꽂히는 기준",
+        "power": "파워",
+        "intelligence": "지능",
+        "charm": "매력",
+        "mental": "멘탈",
+        "survival": "생존력",
+        "personality": "성격",
+    }.get(str(category or "").strip().lower(), "미정")
+    reply_lines = [
+        f"{str(product_row.get('title') or '').strip()} 월드컵은 아직 준비 단계야.",
+    ]
+    if read_scope_label:
+        reply_lines.append(f"읽은 범위는 {read_scope_label}까지로 잡혀 있어.")
+    reply_lines.append(f"성별 범위는 {gender_label}, 기준은 {category_label} 상태야.")
+    reply_lines.append("아직 대진을 짜기 전이라, 먼저 남성/여성/섞어서와 기준을 정하면 바로 후보를 붙일 수 있어.")
+    return "\n".join(reply_lines)
+
+
+async def _generate_story_agent_worldcup_reply(
+    *,
+    session_memory: dict[str, Any],
+    product_row: dict[str, Any],
+    user_prompt: str,
+    db: AsyncSession,
+) -> tuple[str, dict[str, Any]]:
+    normalized = _normalize_story_agent_session_memory(session_memory)
+    game_context = normalized.get("game_context") or {}
+    gender_scope = str(game_context.get("gender_scope") or "").strip().lower()
+    category = str(game_context.get("category") or "").strip().lower()
+    product_id = int(product_row.get("productId") or 0)
+    if not gender_scope or not category:
+        read_scope_label = await _build_story_agent_read_scope_label(
+            product_id=product_id,
+            read_episode_to=normalized.get("read_episode_to"),
+            db=db,
+        )
+        return (
+            build_story_agent_game_guide_reply(
+                session_memory=normalized,
+                product_row=product_row,
+                read_scope_label=read_scope_label,
+            )
+            or "",
+            normalized,
+        )
+
+    state = _get_story_agent_game_state(
+        normalized,
+        game_mode="ideal_worldcup",
+        gender_scope=gender_scope,
+        category=category,
+    )
+    followup = resolve_story_agent_worldcup_followup(user_prompt=user_prompt)
+    if followup["exit_requested"]:
+        reply = "좋아. 월드컵은 여기서 멈추고 일반 모드로 돌아갈게. 이제 작품 얘기나 분석으로 이어가면 돼."
+        return reply, _clear_story_agent_game_context(normalized)
+    latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
+    inferred_read_episode_to = await _resolve_story_agent_prompt_read_episode_to(
+        product_id=int(product_row.get("productId") or 0),
+        latest_episode_no=latest_episode_no,
+        user_prompt=user_prompt,
+        db=db,
+    )
+    inferred_requested_size = int(followup["requested_size"] or 0) or None
+    requested_gender_scope = str(followup["gender_scope"] or "").strip().lower() or None
+    requested_category = str(followup["category"] or "").strip().lower() or None
+    previous_gender_scope = gender_scope
+    previous_category = category
+    previous_read_episode_to = max(int(state.get("read_episode_to") or 0), 0) or None
+    previous_requested_size = int(state.get("requested_bracket_size") or 0) or None
+
+    if requested_gender_scope or requested_category:
+        normalized = _merge_story_agent_session_memory(
+            base_memory=normalized,
+            rp_mode=None,
+            active_character=None,
+            scene_episode_no=None,
+            game_mode="ideal_worldcup",
+            game_gender_scope=requested_gender_scope or gender_scope,
+            game_category=requested_category or category,
+            game_read_episode_to=inferred_read_episode_to or previous_read_episode_to,
+        )
+        game_context = normalized.get("game_context") or {}
+        gender_scope = str(game_context.get("gender_scope") or "").strip().lower()
+        category = str(game_context.get("category") or "").strip().lower()
+        state = _get_story_agent_game_state(
+            normalized,
+            game_mode="ideal_worldcup",
+            gender_scope=gender_scope,
+            category=category,
+        )
+
+    if inferred_read_episode_to is not None:
+        state["read_episode_to"] = inferred_read_episode_to
+    if inferred_requested_size:
+        state["requested_bracket_size"] = inferred_requested_size
+
+    has_constraint_update = any(
+        [
+            inferred_read_episode_to is not None and inferred_read_episode_to != previous_read_episode_to,
+            bool(inferred_requested_size and inferred_requested_size != previous_requested_size),
+            bool(requested_gender_scope and requested_gender_scope != previous_gender_scope),
+            bool(requested_category and requested_category != previous_category),
+        ]
+    )
+
+    if followup["restart_requested"] or has_constraint_update:
+        state["current_bracket"] = []
+        state["current_round"] = None
+        state["current_match_index"] = 0
+        state["picks"] = []
+        state["last_winner"] = None
+
+    read_scope_label = await _build_story_agent_read_scope_label(
+        product_id=product_id,
+        read_episode_to=state.get("read_episode_to"),
+        db=db,
+    )
+
+    if not state.get("read_episode_to"):
+        reply = (
+            "월드컵은 읽은 범위 기준으로만 돌릴게.\n"
+            "어디까지 읽었는지 말해줘. 예: 3화까지 읽었어 / 프롤로그까지 읽었어"
+        )
+        return reply, _set_story_agent_game_state(
+            normalized,
+            game_mode="ideal_worldcup",
+            gender_scope=gender_scope,
+            category=category,
+            state=state,
+        )
+
+    current_bracket = [pair for pair in state.get("current_bracket") or [] if len(pair) == 2]
+    current_match_index = max(int(state.get("current_match_index") or 0), 0)
+    if current_bracket and current_match_index < len(current_bracket):
+        current_pair = current_bracket[current_match_index]
+        if followup["meta_requested"]:
+            reply = _build_story_agent_worldcup_meta_reply(
+                product_row=product_row,
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+                read_scope_label=read_scope_label,
+                current_pair=current_pair,
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="ideal_worldcup",
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+            )
+        chosen = _resolve_story_agent_pair_choice(user_prompt, current_pair)
+        if chosen is None and not followup["resume_requested"]:
+            reply = (
+                f"지금 매치업은 {current_pair[0]} vs {current_pair[1]}야.\n"
+                "둘 중 하나만 골라줘. 이름을 그대로 말하거나 1번/2번으로 골라도 돼."
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="ideal_worldcup",
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+            )
+        if chosen is not None:
+            pair_key = _build_story_agent_pair_key(current_pair[0], current_pair[1])
+            state["used_pair_keys"] = _normalize_story_agent_string_list(
+                [*(state.get("used_pair_keys") or []), pair_key],
+                limit=128,
+            )
+            state["picks"] = _normalize_story_agent_string_list([*(state.get("picks") or []), chosen], limit=16)
+            state["current_match_index"] = current_match_index + 1
+            current_match_index = state["current_match_index"]
+
+        if current_match_index < len(current_bracket):
+            next_pair = current_bracket[current_match_index]
+            reply = (
+                f"{chosen} 선택이네.\n\n"
+                f"{state.get('current_round') or '현재 라운드'}\n"
+                f"{next_pair[0]} vs {next_pair[1]}\n"
+                "둘 중 하나만 골라줘."
+            ) if chosen else (
+                f"{state.get('current_round') or '현재 라운드'}\n"
+                f"{current_pair[0]} vs {current_pair[1]}\n"
+                "둘 중 하나만 골라줘."
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="ideal_worldcup",
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+            )
+
+        winners = _normalize_story_agent_string_list(state.get("picks"), limit=8)
+        if len(winners) == 1 and len(current_bracket) == 1:
+            winner = winners[0]
+            state["last_winner"] = winner
+            state["current_bracket"] = []
+            state["current_round"] = None
+            state["current_match_index"] = 0
+            state["picks"] = []
+            reply = (
+                f"우승은 {winner}.\n"
+                "이번 판 결과를 보면 네 취향 축이 어느 정도 잡혔어.\n"
+                "원하면 같은 세션에서 다시 이상형월드컵을 하거나, 바로 VS게임으로 넘어갈 수 있어."
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="ideal_worldcup",
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+            )
+
+        next_round, round_label = _build_story_agent_worldcup_round(winners, [])
+        if not next_round:
+            state["last_winner"] = winners[0] if winners else None
+            state["current_bracket"] = []
+            state["current_round"] = None
+            state["current_match_index"] = 0
+            state["picks"] = []
+            reply = (
+                f"이번 판은 여기까지 정리할게. 현재 가장 앞선 후보는 {state.get('last_winner') or '없음'}이야.\n"
+                "원하면 새로 다시 돌리거나 다른 기준으로 갈 수 있어."
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="ideal_worldcup",
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+            )
+
+        state["current_candidates"] = winners
+        state["current_bracket"] = next_round
+        state["current_round"] = round_label
+        state["current_match_index"] = 0
+        state["picks"] = []
+        final_pair = next_round[0]
+        reply = (
+            f"{state.get('current_round') or round_label}\n"
+            f"{final_pair[0]} vs {final_pair[1]}\n"
+            "이제 결승이야. 둘 중 하나만 골라줘."
+        )
+        return reply, _set_story_agent_game_state(
+            normalized,
+            game_mode="ideal_worldcup",
+            gender_scope=gender_scope,
+            category=category,
+            state=state,
+        )
+
+    candidates = await get_story_agent_game_candidate_profiles(
+        product_id=int(product_row.get("productId") or 0),
+        db=db,
+    )
+    visible_candidates = _filter_story_agent_worldcup_candidates_by_read_scope(
+        candidates,
+        read_episode_to=int(state.get("read_episode_to") or 0),
+    )
+    bracket_size, bracket_reason = _resolve_story_agent_worldcup_bracket_size(
+        read_episode_to=int(state.get("read_episode_to") or 0),
+        requested_size=int(state.get("requested_bracket_size") or 0) or None,
+        stable_candidate_count=len(visible_candidates),
+    )
+    if bracket_size == 0:
+        reply = (
+            f"{read_scope_label or f'{int(state.get('read_episode_to') or 0)}화'} 기준으로는 월드컵으로 돌릴 후보가 아직 부족해.\n"
+            "더 읽은 범위로 넓혀주면 다시 잡아볼게."
+        )
+        return reply, _set_story_agent_game_state(
+            normalized,
+            game_mode="ideal_worldcup",
+            gender_scope=gender_scope,
+            category=category,
+            state=state,
+        )
+    if bracket_reason == "2인비교권장" and not inferred_requested_size:
+        if followup["confirm_requested"]:
+            state["requested_bracket_size"] = 2
+        else:
+            reply = (
+                f"{read_scope_label or f'{int(state.get('read_episode_to') or 0)}화'} 기준으로는 아직 4강을 돌리기엔 후보 풀이 좁아.\n"
+                "지금은\n"
+                "1. 2인 비교로 가기\n"
+                "2. 더 읽은 범위로 넓히기\n"
+                "중에 골라줘."
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="ideal_worldcup",
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+            )
+    if bracket_reason in {"4강불가", "8강불가"}:
+        if followup["confirm_requested"]:
+            state["requested_bracket_size"] = bracket_size
+        else:
+            requested_label = "8강" if int(state.get("requested_bracket_size") or 0) == 8 else "4강"
+            fallback_label = "4강" if bracket_size == 4 else "2인 비교"
+            reply = (
+                f"{read_scope_label or f'{int(state.get('read_episode_to') or 0)}화'} 기준으로는 {requested_label}을 돌릴 만큼 후보가 아직 부족해.\n"
+                f"지금은 {fallback_label}까지가 자연스러워.\n"
+                "1. 지금 가능한 크기로 진행하기\n"
+                "2. 더 읽은 범위로 넓히기"
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="ideal_worldcup",
+                gender_scope=gender_scope,
+                category=category,
+                state=state,
+            )
+    selected_candidates = visible_candidates[:bracket_size]
+    selected_names = [item["display_name"] for item in selected_candidates]
+    next_round, round_label = _build_story_agent_worldcup_round(selected_names, state.get("used_pair_keys") or [])
+    if not next_round:
+        reply = (
+            f"{read_scope_label or f'{int(state.get('read_episode_to') or 0)}화'} 기준에선 지금 바로 월드컵으로 돌릴 후보가 부족해.\n"
+            "더 읽은 범위로 넓히거나, 지금은 2인 비교로 가는 쪽이 자연스러워."
+        )
+        return reply, _set_story_agent_game_state(
+            normalized,
+            game_mode="ideal_worldcup",
+            gender_scope=gender_scope,
+            category=category,
+            state=state,
+        )
+
+    state["current_candidates"] = selected_names
+    state["current_bracket"] = next_round
+    state["current_round"] = round_label
+    state["current_match_index"] = 0
+    state["picks"] = []
+    first_pair = next_round[0]
+    reply = (
+        f"좋아. {str(product_row.get('title') or '').strip()} {gender_scope} / {category} 기준으로 갈게.\n\n"
+        f"{f'읽은 범위는 {read_scope_label}까지로 잡아둘게.\\n\\n' if read_scope_label else ''}"
+        f"{round_label}\n"
+        f"{first_pair[0]} vs {first_pair[1]}\n"
+        "둘 중 하나만 골라줘."
+    )
+    return reply, _set_story_agent_game_state(
+        normalized,
+        game_mode="ideal_worldcup",
+        gender_scope=gender_scope,
+        category=category,
+        state=state,
+    )
+
+
+async def _generate_story_agent_vs_reply(
+    *,
+    session_memory: dict[str, Any],
+    product_row: dict[str, Any],
+    user_prompt: str,
+    db: AsyncSession,
+) -> tuple[str, dict[str, Any]]:
+    normalized = _normalize_story_agent_session_memory(session_memory)
+    game_context = normalized.get("game_context") or {}
+    gender_scope = str(game_context.get("gender_scope") or "").strip().lower()
+    category = str(game_context.get("category") or "").strip().lower()
+    match_mode = str(game_context.get("match_mode") or "").strip().lower()
+    read_scope_label = await _build_story_agent_read_scope_label(
+        product_id=int(product_row.get("productId") or 0),
+        read_episode_to=normalized.get("read_episode_to"),
+        db=db,
+    )
+    if not gender_scope or not match_mode:
+        return (
+            build_story_agent_game_guide_reply(
+                session_memory=normalized,
+                product_row=product_row,
+                read_scope_label=read_scope_label,
+            )
+            or "",
+            normalized,
+        )
+
+    inferred_category = _infer_story_agent_game_category_from_prompt(user_prompt)
+    effective_category = category or inferred_category or None
+
+    state_category = effective_category or STORY_AGENT_PENDING_GAME_CATEGORY
+    state = _get_story_agent_game_state(
+        normalized,
+        game_mode="vs_game",
+        gender_scope=gender_scope,
+        category=state_category,
+    )
+    state["mode"] = match_mode
+    candidates = await get_story_agent_game_candidate_profiles(
+        product_id=int(product_row.get("productId") or 0),
+        db=db,
+    )
+
+    if match_mode == "direct_match":
+        matched_scope_keys = _extract_story_agent_direct_match_scope_keys(
+            user_prompt=user_prompt,
+            candidates=candidates,
+        )
+        candidate_map = {item["scope_key"]: item for item in candidates}
+        if len(matched_scope_keys) == 2:
+            state["current_match"] = matched_scope_keys
+        if len(state.get("current_match") or []) < 2:
+            reply = (
+                f"좋아. {str(product_row.get('title') or '').strip()} {gender_scope} 직접 매치업으로 갈게.\n"
+                "붙여볼 두 캐릭터를 말해줘. 예: 엔데온트라 vs 펜데"
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="vs_game",
+                gender_scope=gender_scope,
+                category=state_category,
+                state=state,
+            )
+        if not effective_category:
+            reply = (
+                "좋아. 이제 기준을 골라줘.\n\n"
+                "1. 파워\n"
+                "2. 지능\n"
+                "3. 매력\n"
+                "4. 멘탈\n"
+                "5. 생존력\n"
+                "6. 연애형\n"
+                "7. 데이트형\n"
+                "8. 성격형"
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="vs_game",
+                gender_scope=gender_scope,
+                category=state_category,
+                state=state,
+            )
+        left = candidate_map.get(state["current_match"][0])
+        right = candidate_map.get(state["current_match"][1])
+        if not left or not right:
+            state["current_match"] = []
+            reply = "지금 매치업 후보를 다시 잡아야 해. 붙일 두 캐릭터를 다시 말해줘."
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="vs_game",
+                gender_scope=gender_scope,
+                category=state_category,
+                state=state,
+            )
+        repeated_match_key = _build_story_agent_pair_key(left["display_name"], right["display_name"])
+        if repeated_match_key in set(_normalize_story_agent_string_list(state.get("used_match_keys"), limit=128)):
+            state["current_match"] = []
+            reply = (
+                f"{left['display_name']} vs {right['display_name']}는 이 세션에서 이미 한번 붙였어.\n"
+                "다른 두 캐릭터를 붙이거나, 다른 기준으로 가자."
+            )
+            return reply, _set_story_agent_game_state(
+                normalized,
+                game_mode="vs_game",
+                gender_scope=gender_scope,
+                category=effective_category or state_category,
+                state=state,
+            )
+        comparison = await generate_story_agent_vs_comparison(
+            product_row=product_row,
+            category=effective_category or state_category,
+            match_pair=[left, right],
+        )
+        match_key = _build_story_agent_pair_key(left["display_name"], right["display_name"])
+        state["used_match_keys"] = _normalize_story_agent_string_list([*(state.get("used_match_keys") or []), match_key], limit=128)
+        state["current_match"] = []
+        state["last_result_summary"] = comparison[:200]
+        return comparison, _set_story_agent_game_state(
+            normalized,
+            game_mode="vs_game",
+            gender_scope=gender_scope,
+            category=effective_category or state_category,
+            state=state,
+        )
+
+    if not effective_category:
+        return (
+            build_story_agent_game_guide_reply(
+                session_memory=normalized,
+                product_row=product_row,
+                read_scope_label=read_scope_label,
+            )
+            or "",
+            normalized,
+        )
+
+    if effective_category:
+        pending_state = _get_story_agent_game_state(
+            normalized,
+            game_mode="vs_game",
+            gender_scope=gender_scope,
+            category=STORY_AGENT_PENDING_GAME_CATEGORY,
+        )
+        if pending_state.get("current_match") and not state.get("current_match"):
+            state["current_match"] = list(pending_state.get("current_match") or [])
+            pending_state["current_match"] = []
+            normalized = _set_story_agent_game_state(
+                normalized,
+                game_mode="vs_game",
+                gender_scope=gender_scope,
+                category=STORY_AGENT_PENDING_GAME_CATEGORY,
+                state=pending_state,
+            )
+
+    selected_candidates = await select_story_agent_game_candidates(
+        product_row=product_row,
+        candidates=candidates,
+        game_mode="vs_game",
+        gender_scope=gender_scope,
+        category=effective_category,
+        desired_count=4,
+    )
+    selected_pair = _pick_story_agent_unused_pair(
+        selected_candidates,
+        state.get("used_match_keys") or [],
+    )
+    if len(selected_pair) < 2:
+        reply = (
+            f"{str(product_row.get('title') or '').strip()} {gender_scope} / {category} 기준으로 바로 붙일 후보가 부족해.\n"
+            "다른 기준으로 바꾸거나 직접 매치업으로 가면 이어갈 수 있어."
+        )
+        return reply, _set_story_agent_game_state(
+            normalized,
+            game_mode="vs_game",
+            gender_scope=gender_scope,
+            category=category,
+            state=state,
+        )
+    comparison = await generate_story_agent_vs_comparison(
+        product_row=product_row,
+        category=effective_category,
+        match_pair=selected_pair,
+    )
+    match_key = _build_story_agent_pair_key(
+        selected_pair[0]["display_name"],
+        selected_pair[1]["display_name"],
+    )
+    state["used_match_keys"] = _normalize_story_agent_string_list([*(state.get("used_match_keys") or []), match_key], limit=128)
+    state["current_match"] = [selected_pair[0]["scope_key"], selected_pair[1]["scope_key"]]
+    state["last_result_summary"] = comparison[:200]
+    return comparison, _set_story_agent_game_state(
+        normalized,
+        game_mode="vs_game",
+        gender_scope=gender_scope,
+        category=effective_category,
+        state=state,
+    )
+
+
+async def _generate_story_agent_game_reply(
+    *,
+    session_id: int,
+    session_memory: dict[str, Any],
+    product_row: dict[str, Any],
+    user_prompt: str,
+    db: AsyncSession,
+) -> tuple[str, str, str, bool, str, dict[str, Any]]:
+    normalized = _normalize_story_agent_session_memory(session_memory)
+    dispatch_plan = build_story_agent_game_dispatch_plan(normalized)
+    if dispatch_plan["route"] == "guide":
+        game_context = normalized.get("game_context") or {}
+        active_game_mode = str(game_context.get("mode") or "").strip().lower()
+        read_scope_label = await _build_story_agent_read_scope_label(
+            product_id=int(product_row.get("productId") or 0),
+            read_episode_to=normalized.get("read_episode_to"),
+            db=db,
+        )
+        if active_game_mode == "ideal_worldcup":
+            followup = resolve_story_agent_worldcup_followup(user_prompt=user_prompt)
+            if followup["exit_requested"]:
+                reply = "좋아. 월드컵은 여기서 멈추고 일반 모드로 돌아갈게. 이제 작품 얘기나 분석으로 이어가면 돼."
+                return (
+                    reply,
+                    dispatch_plan["model_used"],
+                    dispatch_plan["route_mode"],
+                    False,
+                    dispatch_plan["intent"],
+                    _clear_story_agent_game_context(normalized),
+                )
+            if followup["meta_requested"]:
+                reply = _build_story_agent_worldcup_setup_meta_reply(
+                    product_row=product_row,
+                    gender_scope=game_context.get("gender_scope"),
+                    category=game_context.get("category"),
+                    read_scope_label=read_scope_label,
+                )
+                return (
+                    reply,
+                    dispatch_plan["model_used"],
+                    dispatch_plan["route_mode"],
+                    False,
+                    dispatch_plan["intent"],
+                    normalized,
+                )
+            if not has_story_agent_worldcup_followup_signal(
+                user_prompt=user_prompt,
+                followup=followup,
+            ):
+                cleared_memory = _clear_story_agent_game_context(normalized)
+                return await _generate_story_agent_reply(
+                    session_id=session_id,
+                    session_memory=cleared_memory,
+                    product_row=product_row,
+                    user_prompt=user_prompt,
+                    user_id=None,
+                    db=db,
+                )
+        guide = (
+            build_story_agent_game_guide_reply(
+                session_memory=normalized,
+                product_row=product_row,
+                read_scope_label=read_scope_label,
+            )
+            or ""
+        )
+        return guide, dispatch_plan["model_used"], dispatch_plan["route_mode"], False, dispatch_plan["intent"], normalized
+    if dispatch_plan["route"] == "ideal_worldcup":
+        game_context = normalized.get("game_context") or {}
+        active_gender_scope = str(game_context.get("gender_scope") or "").strip().lower()
+        active_category = str(game_context.get("category") or "").strip().lower()
+        if not active_gender_scope or not active_category:
+            read_scope_label = await _build_story_agent_read_scope_label(
+                product_id=int(product_row.get("productId") or 0),
+                read_episode_to=normalized.get("read_episode_to"),
+                db=db,
+            )
+            followup = resolve_story_agent_worldcup_followup(user_prompt=user_prompt)
+            if followup["exit_requested"]:
+                reply = "좋아. 월드컵은 여기서 멈추고 일반 모드로 돌아갈게. 이제 작품 얘기나 분석으로 이어가면 돼."
+                return (
+                    reply,
+                    dispatch_plan["model_used"],
+                    dispatch_plan["route_mode"],
+                    False,
+                    dispatch_plan["intent"],
+                    _clear_story_agent_game_context(normalized),
+                )
+            if followup["meta_requested"]:
+                reply = _build_story_agent_worldcup_setup_meta_reply(
+                    product_row=product_row,
+                    gender_scope=active_gender_scope or None,
+                    category=active_category or None,
+                    read_scope_label=read_scope_label,
+                )
+                return (
+                    reply,
+                    dispatch_plan["model_used"],
+                    dispatch_plan["route_mode"],
+                    False,
+                    dispatch_plan["intent"],
+                    normalized,
+                )
+            if not has_story_agent_worldcup_followup_signal(
+                user_prompt=user_prompt,
+                followup=followup,
+            ):
+                cleared_memory = _clear_story_agent_game_context(normalized)
+                return await _generate_story_agent_reply(
+                    session_id=session_id,
+                    session_memory=cleared_memory,
+                    product_row=product_row,
+                    user_prompt=user_prompt,
+                    user_id=None,
+                    db=db,
+                )
+        reply, next_memory = await _generate_story_agent_worldcup_reply(
+            session_memory=normalized,
+            product_row=product_row,
+            user_prompt=user_prompt,
+            db=db,
+        )
+        return reply, dispatch_plan["model_used"], dispatch_plan["route_mode"], False, dispatch_plan["intent"], next_memory
+    reply = build_story_agent_vs_disabled_reply()
+    return reply, dispatch_plan["model_used"], dispatch_plan["route_mode"], False, dispatch_plan["intent"], _clear_story_agent_game_context(normalized)
 
 
 def _normalize_story_agent_character_name(value: str) -> str:
@@ -1205,8 +2175,15 @@ async def _load_story_agent_rp_context(
         scope_key=resolved_active_character,
         db=db,
     )
+    inventory_row = await _get_story_agent_exact_summary_row(
+        product_id=product_id,
+        summary_type="character_inventory",
+        scope_key=resolved_active_character,
+        db=db,
+    )
     profile = _extract_story_agent_json_object(str((profile_row or {}).get("summaryText") or ""))
     examples_payload = _extract_story_agent_json_object(str((examples_row or {}).get("summaryText") or ""))
+    inventory_payload = _extract_story_agent_json_object(str((inventory_row or {}).get("summaryText") or ""))
     if not profile or not examples_payload:
         return None
 
@@ -1218,6 +2195,7 @@ async def _load_story_agent_rp_context(
         "personality_core": profile.get("personality_core") or [],
         "baseline_attitude": str(profile.get("baseline_attitude") or "").strip(),
         "examples": list(examples_payload.get("examples") or []),
+        "inventory": inventory_payload or {},
         "session_memory": normalized_memory,
     }
 
@@ -1263,7 +2241,7 @@ async def _resolve_story_agent_reference(
     if not _is_story_agent_ambiguous_reference_query(user_prompt):
         return None
 
-    recent_context_message = _build_story_agent_recent_context_message(recent_messages)
+    recent_context_message = build_story_agent_recent_context_message(recent_messages)
     summary_context_message = _build_story_agent_summary_context_message(summary_rows[:3])
 
     context_parts = [
@@ -1338,11 +2316,12 @@ def _build_story_agent_reference_resolution_message(reference_resolution: dict[s
         bullet_lines = "\n".join(f"- {item}" for item in secondary_targets)
         return (
             "[지시대명사 해석 결과]\n"
-            f"- 질문이 모호하지만 우선 '{primary_target}'을(를) 가리키는 것으로 가정하고 먼저 답하라.\n"
-            "- 답변 첫 줄에 어떤 장면/선택으로 이해했는지 짧게 밝힌 뒤, 그 가정 아래에서 이유를 설명하라.\n"
+            "- 질문이 아직 모호하니 하나를 확정해서 먼저 답하지 마라.\n"
+            f"- 현재 유력한 후보는 '{primary_target}'이다.\n"
             + (f"{bullet_lines}\n" if bullet_lines else "")
-            + "- 마지막에는 혹시 다른 장면이라면 알려달라고 덧붙여라."
-            + (" 다른 후보가 있으면 그 후보를 1~2개만 짧게 함께 제시하라." if secondary_targets else "")
+            + "- 먼저 한 번의 clarifying question으로 범위를 좁혀라.\n"
+            + "- 질문에는 가능한 경우 다음 축을 함께 넣어라: 몇 번째 회차인지, 언제 공개된 회차인지, 초반/중반/최신 중 어디쯤인지, 기억나는 회차명이나 장면 키워드.\n"
+            + "- 다른 후보가 있으면 1~2개만 짧게 제시하고, 추가 단서가 오기 전에는 특정 장면을 사실처럼 단정하지 마라."
         )
 
     return ""
@@ -1403,7 +2382,7 @@ async def _resolve_story_agent_intent(
     user_prompt: str,
     recent_messages: list[dict[str, str]],
 ) -> tuple[str, bool, str]:
-    recent_context_message = _build_story_agent_recent_context_message(recent_messages)
+    recent_context_message = build_story_agent_recent_context_message(recent_messages)
     system_prompt_parts = [
         "너는 스토리 에이전트 라우팅 전용 분류기다.",
         "사용자에게 보여줄 답변을 쓰지 말고 JSON만 반환하라.",
@@ -1465,67 +2444,82 @@ async def _resolve_story_agent_intent(
     return intent, needs_creative, mode
 
 
-async def _generate_story_agent_rp_reply_with_gemini(
-    *,
-    session_id: int,
-    product_row: dict[str, Any],
-    user_prompt: str,
-    rp_context: dict[str, Any],
-    db: AsyncSession,
-) -> str:
-    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
-    messages = list(recent_messages)
-    messages.append({"role": "user", "content": user_prompt})
-    return await _call_story_agent_gemini(
-        system_prompt=_build_story_agent_rp_system_prompt(product_row=product_row, rp_context=rp_context),
-        messages=_to_story_agent_gemini_contents(messages),
-        max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
-    )
-
-
-async def _generate_story_agent_rp_reply_with_claude(
-    *,
-    session_id: int,
-    product_row: dict[str, Any],
-    user_prompt: str,
-    rp_context: dict[str, Any],
-    db: AsyncSession,
-) -> str:
-    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
-    messages = list(recent_messages)
-    messages.append({"role": "user", "content": user_prompt})
-    response = await _call_claude_messages(
-        system_prompt=_build_story_agent_rp_system_prompt(product_row=product_row, rp_context=rp_context),
-        messages=messages,
-        max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
-    )
-    return _extract_text(response.get("content") or []).strip()
-
-
 async def _generate_story_agent_reply(
     *,
     session_id: int,
     session_memory: dict[str, Any],
     product_row: dict[str, Any],
     user_prompt: str,
+    user_id: int | None,
     db: AsyncSession,
-) -> tuple[str, str, str, bool, str]:
+) -> tuple[str, str, str, bool, str, dict[str, Any] | None]:
+    normalized_memory = _normalize_story_agent_session_memory(session_memory)
+    gemini_enabled = bool(settings.GEMINI_API_KEY)
+    scope_state = _resolve_story_agent_read_scope_state(normalized_memory)
+
+    initial_route = _resolve_story_agent_response_route(
+        normalized_memory=normalized_memory,
+        rp_context=None,
+    )
+    if initial_route == "game":
+        return await _generate_story_agent_game_reply(
+            session_id=session_id,
+            session_memory=normalized_memory,
+            product_row=product_row,
+            user_prompt=user_prompt,
+            db=db,
+        )
+
+    if scope_state == "none":
+        concierge_payload = await build_story_agent_concierge_payload(
+            product_row=product_row,
+            user_id=user_id,
+            db=db,
+            user_prompt=user_prompt,
+        )
+        return (
+            str(concierge_payload.get("reply") or "").strip(),
+            "system",
+            "qa:concierge",
+            False,
+            "concierge",
+            normalized_memory,
+        )
+
+    if not int(normalized_memory.get("read_episode_to") or 0):
+        return (
+            _build_story_agent_read_scope_required_reply(),
+            "guard",
+            "guard:read_scope_required",
+            False,
+            "read_scope_required",
+            None,
+        )
+
     rp_context = await _load_story_agent_rp_context(
         product_row=product_row,
-        session_memory=session_memory,
+        session_memory=normalized_memory,
         db=db,
     )
-    if rp_context:
-        if settings.GEMINI_API_KEY:
+    active_route = _resolve_story_agent_response_route(
+        normalized_memory=normalized_memory,
+        rp_context=rp_context,
+    )
+    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
+    if active_route == "rp" and rp_context:
+        rp_plan = _build_story_agent_rp_plan(
+            rp_context=rp_context,
+            gemini_enabled=gemini_enabled,
+        )
+        if rp_plan["preferred_model"] == "gemini":
             try:
                 reply = await _generate_story_agent_rp_reply_with_gemini(
-                    session_id=session_id,
                     product_row=product_row,
                     user_prompt=user_prompt,
                     rp_context=rp_context,
-                    db=db,
+                    recent_messages=recent_messages,
                 )
-                return reply, "gemini", f"rp:{rp_context['rp_mode']}", False, "playful"
+                return reply, "gemini", rp_plan["route_mode"], False, rp_plan["intent"], None
             except Exception as exc:
                 logger.warning(
                     "story-agent rp_route_selected model_used=gemini fallback_used=true product_id=%s session_id=%s active_character=%s error=%s",
@@ -1535,464 +2529,81 @@ async def _generate_story_agent_reply(
                     exc,
                 )
         reply = await _generate_story_agent_rp_reply_with_claude(
-            session_id=session_id,
             product_row=product_row,
             user_prompt=user_prompt,
             rp_context=rp_context,
-            db=db,
+            recent_messages=recent_messages,
         )
-        return reply, "haiku", f"rp:{rp_context['rp_mode']}", bool(settings.GEMINI_API_KEY), "playful"
+        return reply, "haiku", rp_plan["route_mode"], gemini_enabled, rp_plan["intent"], None
 
-    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
     intent, needs_creative, routed_mode = await _resolve_story_agent_intent(
         user_prompt=user_prompt,
         recent_messages=recent_messages,
     )
+    latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
+    evidence_bundle: StoryAgentEvidenceBundle = await assemble_story_agent_scope_context(
+        product_row=product_row,
+        session_memory=normalized_memory,
+        user_prompt=user_prompt,
+        db=db,
+    )
+    scoped_product_row = evidence_bundle["product_row"]
     resolved_mode, _, _, _ = _resolve_story_agent_summary_mode(
         query_text=user_prompt,
-        latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+        latest_episode_no=latest_episode_no,
         mode=routed_mode,
     )
+    qa_plan = _build_story_agent_qa_plan(
+        intent=intent,
+        needs_creative=needs_creative,
+        resolved_mode=resolved_mode,
+        gemini_enabled=gemini_enabled,
+        scope_state=scope_state,
+    )
     prompt_preview = _build_story_agent_prompt_preview(user_prompt)
-    fallback_used = False
-    if settings.GEMINI_API_KEY and needs_creative:
-        try:
-            logger.info(
-                "story-agent route_selected model_used=gemini intent=%s needs_creative=true route_mode=%s fallback_used=false product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r",
-                intent,
-                resolved_mode,
-                product_row.get("productId"),
-                session_id,
-                int(product_row.get("latestEpisodeNo") or 0),
-                prompt_preview,
-            )
-            reply = await _generate_story_agent_reply_with_gemini(
-                session_id=session_id,
-                product_row=product_row,
-                user_prompt=user_prompt,
-                resolved_mode=resolved_mode,
-                db=db,
-            )
-            return reply, "gemini", resolved_mode, False, intent
-        except Exception as exc:
-            fallback_used = True
-            logger.warning(
-                "story-agent route_selected model_used=gemini intent=%s needs_creative=true route_mode=%s fallback_used=true product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r error=%s",
-                intent,
-                resolved_mode,
-                product_row.get("productId"),
-                session_id,
-                int(product_row.get("latestEpisodeNo") or 0),
-                prompt_preview,
-                exc,
-            )
-
+    qa_hooks: StoryAgentQaExecutionHooks = {
+        "resolve_summary_mode": _resolve_story_agent_summary_mode,
+        "resolve_exact_episode_no": _resolve_story_agent_exact_episode_no,
+        "extract_keywords": _extract_story_agent_keywords,
+        "get_summary_candidates": _get_story_agent_summary_candidates,
+        "get_broad_summary_context_rows": _get_story_agent_broad_summary_context_rows,
+        "resolve_reference": _resolve_story_agent_reference,
+        "build_reference_resolution_message": _build_story_agent_reference_resolution_message,
+        "get_episode_contents": _get_story_agent_episode_contents,
+        "search_episode_contents": _search_story_agent_episode_contents,
+        "build_system_prompt": _build_story_agent_system_prompt,
+        "build_summary_context_message": _build_story_agent_summary_context_message,
+        "is_ambiguous_reference_query": _is_story_agent_ambiguous_reference_query,
+        "dispatch_tool": _dispatch_story_agent_tool,
+    }
+    result: StoryAgentQaExecutionResult = await execute_story_agent_qa(
+        product_row=scoped_product_row,
+        user_prompt=user_prompt,
+        qa_plan=qa_plan,
+        evidence_bundle=evidence_bundle,
+        recent_messages=recent_messages,
+        db=db,
+        hooks=qa_hooks,
+        max_tool_rounds=STORY_AGENT_MAX_TOOL_ROUNDS,
+        gemini_context_episode_limit=STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT,
+        prefetch_context_chars=STORY_AGENT_PREFETCH_CONTEXT_CHARS,
+        tools=STORY_AGENT_TOOLS,
+    )
     logger.info(
-        "story-agent route_selected model_used=haiku intent=%s needs_creative=%s route_mode=%s fallback_used=false product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r",
-        intent,
+        "story-agent route_selected model_used=%s intent=%s needs_creative=%s route_mode=%s fallback_used=%s product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r",
+        result["model_used"],
+        result["intent"],
         "true" if needs_creative else "false",
-        resolved_mode,
+        result["route_mode"],
+        "true" if result["fallback_used"] else "false",
         product_row.get("productId"),
         session_id,
         int(product_row.get("latestEpisodeNo") or 0),
         prompt_preview,
     )
-    reply = await _generate_story_agent_reply_with_claude(
-        session_id=session_id,
-        product_row=product_row,
-        user_prompt=user_prompt,
-        resolved_mode=resolved_mode,
-        db=db,
-    )
-    return reply, "haiku", resolved_mode, fallback_used, intent
+    return result["reply"], result["model_used"], result["route_mode"], result["fallback_used"], result["intent"], None
 
 
-def _to_story_agent_gemini_contents(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
-    contents: list[dict[str, Any]] = []
-    for message in messages:
-        text_value = str(message.get("content") or "").strip()
-        if not text_value:
-            continue
-        role = "model" if str(message.get("role") or "").strip().lower() == "assistant" else "user"
-        contents.append(
-            {
-                "role": role,
-                "parts": [{"text": text_value}],
-            }
-        )
-    return contents
-
-
-def _extract_story_agent_gemini_text(response_json: dict[str, Any]) -> str:
-    texts: list[str] = []
-    for candidate in response_json.get("candidates") or []:
-        content = candidate.get("content") or {}
-        for part in content.get("parts") or []:
-            text_value = str(part.get("text") or "").strip()
-            if text_value:
-                texts.append(text_value)
-    return "\n".join(texts).strip()
-
-
-async def _call_story_agent_gemini(
-    *,
-    system_prompt: str,
-    messages: list[dict[str, Any]],
-    max_tokens: int = STORY_AGENT_REPLY_MAX_TOKENS,
-) -> str:
-    if not settings.GEMINI_API_KEY:
-        raise CustomResponseException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            message="Gemini AI 서비스가 설정되지 않았습니다.",
-        )
-
-    payload: dict[str, Any] = {
-        "systemInstruction": {
-            "parts": [{"text": system_prompt}],
-        },
-        "contents": messages,
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": max_tokens,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=STORY_AGENT_GEMINI_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.STORY_AGENT_GEMINI_MODEL}:generateContent",
-            headers={
-                "content-type": "application/json",
-                "x-goog-api-key": settings.GEMINI_API_KEY,
-            },
-            json=payload,
-        )
-
-    if response.status_code != 200:
-        logger.error("Gemini generateContent API error: %s %s", response.status_code, response.text)
-        raise CustomResponseException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            message="AI 서비스 호출에 실패했습니다.",
-        )
-
-    reply = _extract_story_agent_gemini_text(response.json())
-    if not reply:
-        raise CustomResponseException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            message="AI 서비스 호출에 실패했습니다.",
-        )
-    return reply
-
-
-def _build_story_agent_gemini_context_block(
-    *,
-    product_row: dict[str, Any],
-    summary_rows: list[dict[str, Any]],
-    episode_rows: list[dict[str, Any]],
-    search_rows: list[dict[str, Any]],
-) -> str:
-    lines: list[str] = [
-        "[작품 정보]",
-        f"- 제목: {str(product_row.get('title') or '').strip()}",
-        f"- 작가: {str(product_row.get('authorNickname') or '').strip()}",
-        f"- 최신 공개 회차: {int(product_row.get('latestEpisodeNo') or 0)}화",
-    ]
-
-    if summary_rows:
-        lines.append("[관련 회차 요약]")
-        for row in summary_rows[:3]:
-            summary_text = str(row.get("summaryText") or "").strip()
-            if summary_text:
-                lines.append(summary_text)
-
-    if episode_rows:
-        lines.append("[관련 공개 원문]")
-        for row in episode_rows[:STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT]:
-            content = str(row.get("content") or "").strip()
-            if not content:
-                continue
-            lines.append(
-                f"{int(row.get('episodeNo') or 0)}화 원문:\n{content[:STORY_AGENT_PREFETCH_CONTEXT_CHARS]}"
-            )
-
-    if search_rows:
-        lines.append("[추가 원문 단서]")
-        for row in search_rows[:4]:
-            preview = re.sub(r"\s+", " ", str(row.get("chunkText") or "")).strip()
-            if preview:
-                lines.append(f"- {int(row.get('episodeNo') or 0)}화 일부: {preview[:220]}")
-
-    return "\n".join(lines)
-
-
-async def _generate_story_agent_reply_with_gemini(
-    *,
-    session_id: int,
-    product_row: dict[str, Any],
-    user_prompt: str,
-    resolved_mode: str,
-    db: AsyncSession,
-) -> str:
-    latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
-    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
-    resolved_mode, exact_episode_no, _, _ = _resolve_story_agent_summary_mode(
-        query_text=user_prompt,
-        latest_episode_no=latest_episode_no,
-        mode=resolved_mode,
-    )
-    resolved_episode_no = None
-    if resolved_mode == "exact":
-        resolved_episode_no = await _resolve_story_agent_exact_episode_no(
-            product_id=int(product_row.get("productId") or 0),
-            latest_episode_no=latest_episode_no,
-            query_text=user_prompt,
-            fallback_episode_no=exact_episode_no,
-            db=db,
-        )
-
-    keywords = _extract_story_agent_keywords(user_prompt)
-    if resolved_mode == "exact":
-        summary_rows = await _get_story_agent_summary_candidates(
-            product_id=int(product_row.get("productId") or 0),
-            keywords=keywords,
-            query_text=user_prompt,
-            latest_episode_no=latest_episode_no,
-            mode=resolved_mode,
-            episode_no=resolved_episode_no,
-            db=db,
-        )
-    else:
-        summary_rows = await _get_story_agent_broad_summary_context_rows(
-            product_id=int(product_row.get("productId") or 0),
-            query_text=user_prompt,
-            latest_episode_no=latest_episode_no,
-            resolved_mode=resolved_mode,
-            db=db,
-        )
-
-    reference_resolution = await _resolve_story_agent_reference(
-        product_row=product_row,
-        user_prompt=user_prompt,
-        recent_messages=recent_messages,
-        summary_rows=summary_rows,
-    )
-
-    episode_rows: list[dict[str, Any]] = []
-    search_rows: list[dict[str, Any]] = []
-    if resolved_episode_no:
-        episode_rows = await _get_story_agent_episode_contents(
-            product_id=int(product_row.get("productId") or 0),
-            episode_from=resolved_episode_no,
-            episode_to=resolved_episode_no,
-            latest_episode_no=latest_episode_no,
-            db=db,
-        )
-    else:
-        target_episode_nos: list[int] = []
-        for row in summary_rows[:STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT]:
-            episode_no = int(row.get("episodeTo") or row.get("episodeFrom") or 0)
-            if episode_no > 0 and episode_no not in target_episode_nos:
-                target_episode_nos.append(episode_no)
-        for episode_no in target_episode_nos[:STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT]:
-            episode_rows.extend(
-                await _get_story_agent_episode_contents(
-                    product_id=int(product_row.get("productId") or 0),
-                    episode_from=episode_no,
-                    episode_to=episode_no,
-                    latest_episode_no=latest_episode_no,
-                    db=db,
-                )
-            )
-        search_rows = await _search_story_agent_episode_contents(
-            product_id=int(product_row.get("productId") or 0),
-            query_text=user_prompt,
-            latest_episode_no=latest_episode_no,
-            db=db,
-        )
-
-    system_prompt = (
-        _build_story_agent_system_prompt(product_row)
-        + " 이번 응답은 확장형 질문용 응답이다. 제공된 공개 컨텍스트만으로 잘 놀아주되, 근거 없는 설정을 단정하지 마라."
-        + " 비교/시뮬레이션 답변이라도 근거가 되는 회차나 장면을 1개 이상 자연스럽게 인용하라."
-        + " 원문에 없는 추론은 '작품 내 직접 묘사는 없지만'처럼 추론임을 분명히 밝혀라."
-        + " 능력, 범위, 지속시간, 거리, 숫자 같은 수치 정보가 공개 범위에 있으면 가능한 한 포함하라."
-    )
-    context_block = _build_story_agent_gemini_context_block(
-        product_row=product_row,
-        summary_rows=summary_rows,
-        episode_rows=episode_rows,
-        search_rows=search_rows,
-    )
-    messages = list(recent_messages)
-    if _is_story_agent_ambiguous_reference_query(user_prompt):
-        recent_context_message = _build_story_agent_recent_context_message(recent_messages)
-        if recent_context_message:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": recent_context_message,
-                }
-            )
-        reference_message = _build_story_agent_reference_resolution_message(reference_resolution or {})
-        if reference_message:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": reference_message,
-                }
-            )
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                "아래 공개 컨텍스트를 우선 참고해 답하라.\n\n"
-                f"{context_block}\n\n"
-                f"질문: {user_prompt}"
-            ),
-        }
-    )
-    return await _call_story_agent_gemini(
-        system_prompt=system_prompt,
-        messages=_to_story_agent_gemini_contents(messages),
-        max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
-    )
-
-
-async def _generate_story_agent_reply_with_claude(
-    *,
-    session_id: int,
-    product_row: dict[str, Any],
-    user_prompt: str,
-    resolved_mode: str,
-    db: AsyncSession,
-) -> str:
-    system_prompt = _build_story_agent_system_prompt(product_row)
-    recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
-    messages = list(recent_messages)
-    resolved_mode, exact_episode_no, _, _ = _resolve_story_agent_summary_mode(
-        query_text=user_prompt,
-        latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
-        mode=resolved_mode,
-    )
-    if resolved_mode == "exact":
-        resolved_episode_no = await _resolve_story_agent_exact_episode_no(
-            product_id=int(product_row.get("productId") or 0),
-            latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
-            query_text=user_prompt,
-            fallback_episode_no=exact_episode_no,
-            db=db,
-        )
-    else:
-        resolved_episode_no = None
-
-    prefetched_summary_rows: list[dict[str, Any]] = []
-    if resolved_mode != "exact":
-        prefetched_summary_rows = await _get_story_agent_broad_summary_context_rows(
-            product_id=int(product_row.get("productId") or 0),
-            query_text=user_prompt,
-            latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
-            resolved_mode=resolved_mode,
-            db=db,
-        )
-        summary_context_message = _build_story_agent_summary_context_message(prefetched_summary_rows)
-        if summary_context_message:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": summary_context_message,
-                }
-            )
-
-    reference_resolution = await _resolve_story_agent_reference(
-        product_row=product_row,
-        user_prompt=user_prompt,
-        recent_messages=recent_messages,
-        summary_rows=prefetched_summary_rows,
-    )
-    if _is_story_agent_ambiguous_reference_query(user_prompt):
-        recent_context_message = _build_story_agent_recent_context_message(recent_messages)
-        if recent_context_message:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": recent_context_message,
-                }
-            )
-        reference_message = _build_story_agent_reference_resolution_message(reference_resolution or {})
-        if reference_message:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": reference_message,
-                }
-            )
-
-    if resolved_mode == "exact" and resolved_episode_no:
-        prefetched_rows = await _get_story_agent_episode_contents(
-            product_id=int(product_row.get("productId") or 0),
-            episode_from=resolved_episode_no,
-            episode_to=resolved_episode_no,
-            latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
-            db=db,
-        )
-        prefetched_blocks: list[str] = []
-        for row in prefetched_rows:
-            content = str(row.get("content") or "").strip()
-            if not content:
-                continue
-            prefetched_blocks.append(
-                f"[질문 관련 공개 원문]\n{content[:STORY_AGENT_PREFETCH_CONTEXT_CHARS]}"
-            )
-        if prefetched_blocks:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "아래는 이번 질문과 직접 관련된 공개 원문이다. "
-                        "명시된 회차 사실 질문에서는 이 원문을 최우선 근거로 사용하고, 내부 회차 매핑 과정은 설명하지 마라.\n\n"
-                        + "\n\n".join(prefetched_blocks)
-                    ),
-                }
-            )
-    messages.append({"role": "user", "content": user_prompt})
-
-    for _ in range(STORY_AGENT_MAX_TOOL_ROUNDS):
-        response = await _call_claude_messages(
-            system_prompt=system_prompt,
-            messages=messages,
-            tools=STORY_AGENT_TOOLS,
-            max_tokens=STORY_AGENT_REPLY_MAX_TOKENS,
-        )
-        content = response.get("content") or []
-        text_reply = _extract_text(content)
-        tool_uses = _extract_tool_use_blocks(content)
-        if not tool_uses:
-            return text_reply.strip() or "지금 공개 범위에서 바로 짚을 수 있는 핵심은 아직 제한적입니다. 우선 어떤 축이 궁금한지 말씀해 주세요. 예를 들면 능력 규칙, 세력 질서, 인물 관계, 전투 상성 중 하나로 좁히면 더 정확하게 이어서 답할 수 있습니다."
-
-        messages.append({"role": "assistant", "content": content})
-        tool_results: list[dict[str, Any]] = []
-        for block in tool_uses:
-            tool_name = str(block.get("name") or "")
-            tool_input = block.get("input") or {}
-            try:
-                tool_result = await _dispatch_story_agent_tool(
-                    tool_name=tool_name,
-                    tool_input=tool_input if isinstance(tool_input, dict) else {},
-                    product_id=int(product_row.get("productId") or 0),
-                    product_row=product_row,
-                    db=db,
-                )
-            except Exception as exc:
-                tool_result = {"error": str(exc)}
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.get("id"),
-                    "content": json.dumps(_to_json_safe(tool_result), ensure_ascii=False),
-                }
-            )
-        messages.append({"role": "user", "content": tool_results})
-
-    return "지금 공개 범위에서 바로 단정할 수 있는 근거는 충분하지 않습니다. 다만 질문을 더 잘게 나누면 바로 이어서 볼 수 있습니다. 능력 규칙, 세력 질서, 인물 관계, 전투 상성 중 어느 쪽이 궁금한지 한 가지로 좁혀 주세요."
 
 
 async def _get_story_agent_chunk_previews(
@@ -2058,33 +2669,6 @@ async def _get_story_agent_chunk_previews(
     )
     fallback_result = await db.execute(fallback_query, params)
     return [dict(row) for row in fallback_result.mappings().all()]
-
-
-def _build_story_agent_context_block(
-    summary_rows: list[dict[str, Any]],
-    chunk_rows: list[dict[str, Any]],
-) -> str:
-    lines: list[str] = []
-    if summary_rows:
-        lines.append("관련 회차 요약:")
-        for row in summary_rows[:3]:
-            summary_text = str(row.get("summaryText") or "").strip()
-            if not summary_text:
-                continue
-            lines.append(summary_text)
-
-    if chunk_rows:
-        lines.append("원문 미리보기:")
-        for row in chunk_rows[:3]:
-            preview = re.sub(r"\s+", " ", str(row.get("chunkText") or "")).strip()
-            if not preview:
-                continue
-            preview = preview[:180]
-            lines.append(f"- {int(row.get('episodeNo') or 0)}화 일부: {preview}")
-
-    if not lines:
-        return "아직 관련 회차 요약이나 원문 미리보기를 찾지 못했습니다."
-    return "\n".join(lines)
 
 
 async def _acquire_named_lock(lock_name: str) -> AsyncConnection | None:
@@ -2304,6 +2888,9 @@ async def _resolve_story_agent_message_charge_required(
 async def _get_existing_turn_messages(
     session_id: int,
     client_message_id: str,
+    latest_episode_no: int | None,
+    read_episode_to: int | None,
+    concierge_payload: dict[str, Any] | None,
     db: AsyncSession,
 ) -> list[dict[str, Any]] | None:
     result = await db.execute(
@@ -2326,6 +2913,19 @@ async def _get_existing_turn_messages(
         },
     )
     rows = [dict(row) for row in result.mappings().all()]
+    episode_ref_ceiling = _resolve_story_agent_episode_ref_ceiling(
+        latest_episode_no,
+        read_episode_to,
+    )
+    rows = [
+        (
+            {**row, "referencedEpisodeNos": []}
+            if concierge_payload and row.get("role") == "assistant"
+            else _attach_story_agent_message_episode_refs(row, latest_episode_no=episode_ref_ceiling)
+        )
+        for row in rows
+    ]
+    rows = _attach_story_agent_concierge_to_last_assistant_message(rows, concierge_payload)
     if not rows:
         return None
     if len(rows) != 2:
@@ -2334,6 +2934,61 @@ async def _get_existing_turn_messages(
             message="이전 메시지가 아직 처리 중입니다. 잠시 후 다시 시도해주세요.",
         )
     return rows
+
+
+def _extract_story_agent_referenced_episode_nos(
+    content: str,
+    latest_episode_no: int | None = None,
+) -> list[int]:
+    normalized_content = (content or "").strip()
+    if not normalized_content:
+        return []
+
+    max_episode_no = max(0, int(latest_episode_no or 0))
+    scope_only_match = re.search(r"읽은 범위는\s*(\d{1,4})화", normalized_content)
+    if scope_only_match:
+        scope_episode_no = int(scope_only_match.group(1) or 0)
+        if scope_episode_no > 0 and (max_episode_no <= 0 or scope_episode_no <= max_episode_no):
+            return [scope_episode_no]
+
+    episode_nos: set[int] = set()
+
+    for range_match in STORY_AGENT_EPISODE_RANGE_RE.finditer(normalized_content):
+        first = int(range_match.group(1) or 0)
+        second = int(range_match.group(2) or 0)
+        if not first or not second:
+            continue
+        start = max(1, min(first, second))
+        end = max(first, second)
+        if max_episode_no > 0:
+            end = min(end, max_episode_no)
+        for episode_no in range(start, end + 1):
+            episode_nos.add(episode_no)
+
+    for single_match in STORY_AGENT_EPISODE_SINGLE_RE.finditer(normalized_content):
+        episode_no = int(single_match.group(1) or 0)
+        if not episode_no:
+            continue
+        if max_episode_no > 0 and episode_no > max_episode_no:
+            continue
+        episode_nos.add(episode_no)
+
+    return sorted(episode_nos)
+
+
+def _attach_story_agent_message_episode_refs(
+    message: dict[str, Any],
+    latest_episode_no: int | None = None,
+) -> dict[str, Any]:
+    if message.get("role") != "assistant":
+        return message
+    return {
+        **message,
+        "referencedEpisodeNos": _extract_story_agent_referenced_episode_nos(
+            str(message.get("content") or ""),
+            latest_episode_no=latest_episode_no,
+        ),
+    }
 
 
 async def _get_session_row(
@@ -2509,6 +3164,46 @@ async def get_messages(
     )
     result = await db.execute(query, {"session_id": session_id})
     messages = [dict(row) for row in result.mappings().all()]
+    session_memory = _normalize_story_agent_session_memory(session_row.get("session_memory_json"))
+    scope_state = _resolve_story_agent_read_scope_state(session_memory)
+    concierge_payload = None
+    if scope_state == "none":
+        concierge_payload = await build_story_agent_concierge_payload(
+            product_row=product_state,
+            user_id=user_id,
+            db=db,
+        )
+    latest_episode_no = int(product_state.get("latestEpisodeNo") or 0)
+    episode_ref_ceiling = _resolve_story_agent_episode_ref_ceiling(
+        latest_episode_no,
+        session_memory.get("read_episode_to"),
+    )
+    messages = [
+        (
+            {**message, "referencedEpisodeNos": []}
+            if concierge_payload and message.get("role") == "assistant"
+            else _attach_story_agent_message_episode_refs(message, latest_episode_no=episode_ref_ceiling)
+        )
+        for message in messages
+    ]
+    messages = _attach_story_agent_concierge_to_last_assistant_message(messages, concierge_payload)
+    starter = None
+    if not messages:
+        read_episode_to = session_memory.get("read_episode_to")
+        starter = _build_story_agent_starter(
+            product_title=str(product_state.get("title") or session_row.get("title") or "").strip(),
+            scope_state=scope_state,
+            read_episode_to=read_episode_to,
+            read_episode_title=await _get_story_agent_visible_episode_title(
+                int(session_row["product_id"]),
+                int(read_episode_to or 0) if read_episode_to else None,
+                db,
+            ),
+            latest_episode_no=latest_episode_no,
+            can_send_message=bool(product_state.get("canSendMessage")),
+            concierge_payload=concierge_payload,
+        )
+
     return {
         "data": {
             "session": {
@@ -2517,7 +3212,8 @@ async def get_messages(
                 "title": session_row["title"],
                 "productTitle": product_state.get("title"),
                 "productAuthorNickname": product_state.get("authorNickname"),
-                "latestEpisodeNo": int(product_state.get("latestEpisodeNo") or 0),
+                "coverImagePath": product_state.get("coverImagePath"),
+                "latestEpisodeNo": latest_episode_no,
                 "contextStatus": product_state.get("contextStatus"),
                 "canSendMessage": bool(product_state.get("canSendMessage")),
                 "unavailableMessage": product_state.get("unavailableMessage"),
@@ -2533,6 +3229,7 @@ async def get_messages(
                 ),
             },
             "messages": messages,
+            "starter": starter,
         }
     }
 
@@ -2587,6 +3284,11 @@ async def create_session(
         rp_mode=req_body.rp_mode,
         active_character=resolved_active_character,
         scene_episode_no=req_body.scene_episode_no,
+        game_mode=req_body.game_mode,
+        game_gender_scope=req_body.game_gender_scope,
+        game_category=req_body.game_category,
+        game_match_mode=req_body.game_match_mode,
+        game_read_episode_to=req_body.game_read_episode_to,
     )
     session_memory_json = _serialize_story_agent_session_memory(session_memory)
     query = text(
@@ -2717,6 +3419,16 @@ async def post_message(
         rp_mode=req_body.rp_mode,
         active_character=resolved_active_character,
         scene_episode_no=req_body.scene_episode_no,
+        game_mode=req_body.game_mode,
+        game_gender_scope=req_body.game_gender_scope,
+        game_category=req_body.game_category,
+        game_match_mode=req_body.game_match_mode,
+        game_read_episode_to=req_body.game_read_episode_to,
+    )
+    next_session_memory = apply_story_agent_implicit_game_inputs(
+        session_memory=next_session_memory,
+        user_prompt=req_body.content,
+        game_read_episode_to=req_body.game_read_episode_to,
     )
     effective_adult_yn = await _resolve_effective_adult_yn(
         kc_user_id=kc_user_id,
@@ -2743,6 +3455,22 @@ async def post_message(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=STORY_AGENT_CONTEXT_PENDING_MESSAGE,
         )
+    inferred_prompt_read_episode_to = await _resolve_story_agent_prompt_read_episode_to(
+        product_id=int(session_row["product_id"]),
+        latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+        user_prompt=req_body.content,
+        db=db,
+    )
+    read_scope_decision: StoryAgentPromptReadScopeDecision = _resolve_story_agent_prompt_read_scope_decision(
+        user_prompt=req_body.content,
+        inferred_read_episode_to=inferred_prompt_read_episode_to,
+    )
+    if read_scope_decision["scope_state"] == "known" and read_scope_decision["read_episode_to"] is not None:
+        next_session_memory["read_episode_to"] = int(read_scope_decision["read_episode_to"])
+        next_session_memory["read_scope_state"] = "known"
+    elif read_scope_decision["scope_state"] == "none":
+        next_session_memory["read_episode_to"] = None
+        next_session_memory["read_scope_state"] = "none"
 
     created_id = user_id if user_id is not None else settings.DB_DML_DEFAULT_ID
 
@@ -2755,9 +3483,24 @@ async def post_message(
                 message="같은 세션에서 다른 메시지를 처리 중입니다. 잠시 후 다시 시도해주세요.",
             )
 
+        concierge_payload = None
+        if _resolve_story_agent_read_scope_state(next_session_memory) == "none":
+            concierge_payload = await build_story_agent_concierge_payload(
+                product_row=product_row,
+                user_id=user_id,
+                db=db,
+                user_prompt=req_body.content,
+            )
+
         existing_messages = await _get_existing_turn_messages(
             session_id=session_id,
             client_message_id=req_body.client_message_id,
+            latest_episode_no=await _get_story_agent_latest_visible_episode_no(
+                int(session_row["product_id"]),
+                db=db,
+            ),
+            read_episode_to=next_session_memory.get("read_episode_to"),
+            concierge_payload=concierge_payload,
             db=db,
         )
         if existing_messages:
@@ -2774,13 +3517,28 @@ async def post_message(
             db=db,
         )
 
-        assistant_reply, model_used, route_mode, fallback_used, intent = await _generate_story_agent_reply(
-            session_id=session_id,
-            session_memory=next_session_memory,
-            product_row=product_row,
-            user_prompt=req_body.content,
-            db=db,
-        )
+        if read_scope_decision["is_scope_only"]:
+            assistant_reply = await _build_story_agent_read_scope_confirm_reply(
+                product_id=int(session_row["product_id"]),
+                read_episode_to=next_session_memory.get("read_episode_to"),
+                db=db,
+            )
+            model_used = "system"
+            route_mode = "scope:set"
+            fallback_used = False
+            intent = "scope"
+            route_session_memory = None
+        else:
+            assistant_reply, model_used, route_mode, fallback_used, intent, route_session_memory = await _generate_story_agent_reply(
+                session_id=session_id,
+                session_memory=next_session_memory,
+                product_row=product_row,
+                user_prompt=req_body.content,
+                user_id=user_id,
+                db=db,
+            )
+        if route_session_memory is not None:
+            next_session_memory = _normalize_story_agent_session_memory(route_session_memory)
         next_session_memory = _update_story_agent_session_memory_after_reply(
             next_session_memory,
             user_prompt=req_body.content,
@@ -2873,11 +3631,26 @@ async def post_message(
                         "role": "user",
                         "content": req_body.content,
                     },
-                    {
-                        "messageId": int(assistant_result.lastrowid),
-                        "role": "assistant",
-                        "content": assistant_reply,
-                    },
+                    _attach_story_agent_concierge_cards(
+                        (
+                            {
+                                "messageId": int(assistant_result.lastrowid),
+                                "role": "assistant",
+                                "content": assistant_reply,
+                                "referencedEpisodeNos": [],
+                            }
+                            if route_mode == "qa:concierge"
+                            else _attach_story_agent_message_episode_refs({
+                                "messageId": int(assistant_result.lastrowid),
+                                "role": "assistant",
+                                "content": assistant_reply,
+                            }, latest_episode_no=_resolve_story_agent_episode_ref_ceiling(
+                                int(product_row.get("latestEpisodeNo") or 0),
+                                next_session_memory.get("read_episode_to"),
+                            ))
+                        ),
+                        concierge_payload if route_mode == "qa:concierge" else None,
+                    ),
                 ],
             }
         }

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Iterable
 
@@ -58,9 +59,12 @@ MAX_CHUNK_LEN = 2500
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|(?<=다\.)\s+|(?<=요\.)\s+")
 KEYWORD_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 EPISODE_SUMMARY_FORMAT_VERSION = "episode_summary_v11"
+EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION = "episode_character_signals_v2"
 RANGE_SUMMARY_FORMAT_VERSION = "range_summary_v1"
 PRODUCT_SUMMARY_FORMAT_VERSION = "product_summary_v1"
 CHARACTER_SNAPSHOT_FORMAT_VERSION = "character_snapshot_v1"
+CHARACTER_INVENTORY_FORMAT_VERSION = "character_inventory_v2"
+RELATION_INVENTORY_FORMAT_VERSION = "relation_inventory_v1"
 CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v3"
 CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
 DIALOGUE_QUOTE_RE = re.compile(r'["“](.*?)["”]', re.S)
@@ -209,6 +213,45 @@ RP_CHARACTER_PLAN_PROMPT = """너는 웹소설 episode_summary를 보고 RP용 �
 10. priority_patterns는 2~3개만 넣는다.
 """
 
+EPISODE_CHARACTER_SIGNALS_PROMPT = """너는 웹소설 회차 요약에서 캐릭터 구조화 신호를 추출하는 분석기다.
+반드시 JSON 객체만 반환하라. 원문에 없는 정보는 만들지 마라.
+
+출력 스키마:
+{
+  "mentioned_characters": [
+    {
+      "display_name": "캐릭터 표시 이름",
+      "aliases": ["같은 인물을 가리키는 호칭/별칭"],
+      "is_protagonist": false,
+      "is_first_person": false,
+      "entity_kind": "person|stable_role|collective|other",
+      "scene_weight": "high|medium|low",
+      "role_in_episode": "lead|counterpart|support|obstacle",
+      "voice_mode": "dialogue|monologue|narration_only",
+      "action_tags": ["행동/선택 태그"],
+      "affect_tags": ["태도/감정 태그"],
+      "relation_edges": [
+        {
+          "target_label": "상대 인물",
+          "relation_tag": "보호|경계|호감|집착|갈등|의존|협력|라이벌",
+          "direction": "to_target|from_target|mutual"
+        }
+      ]
+    }
+  ],
+  "cliffhanger_hooks": ["다음 전개 예측에 필요한 미해결 훅"]
+}
+
+규칙:
+1. mentioned_characters는 2명 이상 6명 이하를 목표로 하라.
+2. 실제 인물 또는 반복 역할명만 넣고, 장소/조직/사물/기술명은 넣지 마라.
+3. 이름이 없더라도 같은 인물로 반복되는 역할명은 stable_role로 넣을 수 있다.
+4. action_tags와 affect_tags는 짧은 한국어 태그 1~4개만 넣는다.
+5. relation_edges는 이 화에서 실제로 드러난 관계 방향만 넣는다.
+6. cliffhanger_hooks는 0~3개만 넣는다.
+7. 확신이 약하면 collective 또는 other로 뭉개지 말고 차라리 제외하라.
+"""
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="스토리 에이전트 원문 컨텍스트 적재")
@@ -221,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def db_connect():
+def db_connect(*, autocommit: bool = False):
     if not DB_USER or not DB_PASSWORD:
         raise RuntimeError("DB 접속 정보가 비어 있습니다. BATCH_DB_* 또는 app.const.settings를 확인하세요.")
     return pymysql.connect(
@@ -231,10 +274,35 @@ def db_connect():
         password=DB_PASSWORD,
         database=DB_NAME,
         charset="utf8mb4",
-        autocommit=False,
+        autocommit=autocommit,
         client_flag=CLIENT.MULTI_STATEMENTS,
         cursorclass=DictCursor,
     )
+
+
+@contextmanager
+def work_cursor(conn):
+    conn.ping(reconnect=True)
+    with conn.cursor() as cur:
+        yield cur
+
+
+@contextmanager
+def product_lock_connection(product_id: int):
+    lock_conn = db_connect(autocommit=True)
+    acquired = False
+    try:
+        with lock_conn.cursor() as cur:
+            acquired = acquire_product_lock(cur, product_id)
+        yield lock_conn if acquired else None
+    finally:
+        if acquired:
+            try:
+                with lock_conn.cursor() as cur:
+                    release_product_lock(cur, product_id)
+            except Exception:
+                pass
+        lock_conn.close()
 
 
 def acquire_product_lock(cur, product_id: int) -> bool:
@@ -1199,6 +1267,167 @@ def extract_json_object(raw_text: str) -> dict | None:
         return None
 
 
+def build_episode_character_signals_user_prompt(
+    row: dict[str, object],
+    summary_text: str,
+) -> str:
+    episode_no = int(row.get("episode_no") or row.get("episode_from") or 0)
+    title = str(row.get("title") or "").strip()
+    episode_title = str(row.get("episode_title") or "").strip()
+    return (
+        f"작품명: {title}\n"
+        f"episode_no: {episode_no}\n"
+        f"회차 제목: {episode_title}\n"
+        "아래는 해당 회차의 episode_summary다.\n"
+        "이 요약에서 드러나는 캐릭터/관계/행동 신호만 JSON으로 추출하라.\n\n"
+        f"{summary_text}"
+    )
+
+
+def normalize_signal_entity_label(value: str) -> str:
+    normalized = re.sub(r"\s+", "", str(value or "").strip())
+    if not normalized:
+        return ""
+    stripped = re.sub(r"[!?.…~]+$", "", normalized)
+    if stripped.endswith(("아", "야")):
+        stripped = stripped[:-1]
+    return stripped
+
+
+def normalize_episode_character_signals_payload(
+    payload: dict | None,
+    *,
+    episode_no: int,
+) -> dict[str, object]:
+    normalized_characters: list[dict[str, object]] = []
+    raw_relation_edges_by_key: dict[str, list[dict[str, str]]] = {}
+    alias_to_character_key: dict[str, str] = {}
+    seen_keys: set[str] = set()
+    for item in list((payload or {}).get("mentioned_characters") or []):
+        if not isinstance(item, dict):
+            continue
+        display_name = str(item.get("display_name") or "").strip()
+        if not display_name:
+            continue
+        is_protagonist = bool(item.get("is_protagonist"))
+        is_first_person = bool(item.get("is_first_person")) if is_protagonist else False
+        entity_kind = str(item.get("entity_kind") or "person").strip().lower() or "person"
+        if entity_kind not in {"person", "stable_role", "collective", "other"}:
+            entity_kind = "person"
+
+        character_key = (
+            build_protagonist_scope_key(display_name if not is_first_person else None, first_person=is_first_person)
+            if is_protagonist
+            else build_named_character_scope_key(display_name)
+        )
+        if not character_key or character_key in seen_keys:
+            continue
+        seen_keys.add(character_key)
+
+        aliases = []
+        for alias in [display_name, *list(item.get("aliases") or [])]:
+            alias_text = str(alias).strip()
+            if alias_text and alias_text not in aliases:
+                aliases.append(alias_text)
+
+        scene_weight = str(item.get("scene_weight") or "low").strip().lower()
+        if scene_weight not in {"high", "medium", "low"}:
+            scene_weight = "low"
+        role_in_episode = str(item.get("role_in_episode") or "support").strip().lower()
+        if role_in_episode not in {"lead", "counterpart", "support", "obstacle"}:
+            role_in_episode = "support"
+        voice_mode = str(item.get("voice_mode") or "narration_only").strip().lower()
+        if voice_mode not in {"dialogue", "monologue", "narration_only"}:
+            voice_mode = "narration_only"
+
+        relation_edges: list[dict[str, str]] = []
+        for edge in list(item.get("relation_edges") or []):
+            if not isinstance(edge, dict):
+                continue
+            target_label = str(edge.get("target_label") or "").strip()
+            relation_tag = str(edge.get("relation_tag") or "").strip()
+            direction = str(edge.get("direction") or "").strip().lower()
+            if not target_label or not relation_tag:
+                continue
+            if direction not in {"to_target", "from_target", "mutual"}:
+                direction = "to_target"
+            relation_edges.append(
+                {
+                    "target_label": target_label[:40],
+                    "relation_tag": relation_tag[:20],
+                    "direction": direction,
+                }
+            )
+            if len(relation_edges) >= 5:
+                break
+
+        normalized_characters.append(
+            {
+                "character_key": character_key,
+                "display_name": display_name,
+                "aliases": aliases[:6],
+                "is_protagonist": is_protagonist,
+                "is_first_person": is_first_person,
+                "entity_kind": entity_kind,
+                "scene_weight": scene_weight,
+                "role_in_episode": role_in_episode,
+                "voice_mode": voice_mode,
+                "action_tags": [
+                    str(tag).strip()[:20]
+                    for tag in list(item.get("action_tags") or [])
+                    if str(tag).strip()
+                ][:4],
+                "affect_tags": [
+                    str(tag).strip()[:20]
+                    for tag in list(item.get("affect_tags") or [])
+                    if str(tag).strip()
+                ][:4],
+                "relation_edges": [],
+                "episode_no": episode_no,
+            }
+        )
+        raw_relation_edges_by_key[character_key] = relation_edges
+        for alias in aliases[:6]:
+            normalized_alias = normalize_signal_entity_label(alias)
+            if normalized_alias:
+                alias_to_character_key.setdefault(normalized_alias, character_key)
+        normalized_display_name = normalize_signal_entity_label(display_name)
+        if normalized_display_name:
+            alias_to_character_key.setdefault(normalized_display_name, character_key)
+
+    for character in normalized_characters:
+        character_key = str(character.get("character_key") or "").strip()
+        normalized_relation_edges: list[dict[str, str | None]] = []
+        for edge in raw_relation_edges_by_key.get(character_key, []):
+            target_label = str(edge.get("target_label") or "").strip()
+            if not target_label:
+                continue
+            normalized_target_label = normalize_signal_entity_label(target_label)
+            normalized_relation_edges.append(
+                {
+                    "target_label": target_label[:40],
+                    "target_key": str(alias_to_character_key.get(normalized_target_label) or "").strip() or None,
+                    "relation_tag": str(edge.get("relation_tag") or "").strip()[:20],
+                    "direction": str(edge.get("direction") or "").strip().lower() or "to_target",
+                }
+            )
+            if len(normalized_relation_edges) >= 5:
+                break
+        character["relation_edges"] = normalized_relation_edges
+
+    cliffhanger_hooks = [
+        str(value).strip()[:120]
+        for value in list((payload or {}).get("cliffhanger_hooks") or [])
+        if str(value).strip()
+    ][:3]
+
+    return {
+        "episode_no": episode_no,
+        "mentioned_characters": normalized_characters[:6],
+        "cliffhanger_hooks": cliffhanger_hooks,
+    }
+
+
 def build_rp_dialogue_collection_user_prompt(target: dict[str, object], normalized_text: str) -> str:
     if bool(target.get("is_protagonist")) and bool(target.get("is_first_person")):
         role_line = "1인칭 서술 작품의 주인공이다."
@@ -1215,6 +1444,8 @@ def build_rp_profile_synthesis_user_prompt(
     target: dict[str, object],
     dialogue_items: list[dict[str, object]],
     summary_context_lines: list[str],
+    inventory_item: dict[str, object] | None = None,
+    relation_context_lines: list[str] | None = None,
 ) -> str:
     source_lines = []
     for item in dialogue_items:
@@ -1230,11 +1461,54 @@ def build_rp_profile_synthesis_user_prompt(
         if not text_value:
             continue
         source_lines.append(f"- {source_type} | {kind} | {context} | {text_value}")
+    inventory_lines: list[str] = []
+    if inventory_item:
+        first_seen_episode_no = int(inventory_item.get("first_seen_episode_no") or 0)
+        distinct_episode_count = int(inventory_item.get("distinct_episode_count") or 0)
+        summary_mention_count = int(inventory_item.get("summary_mention_count") or 0)
+        voice_evidence_count = int(inventory_item.get("voice_evidence_count") or 0)
+        if first_seen_episode_no > 0:
+            inventory_lines.append(f"- 최초 등장: {first_seen_episode_no}화")
+        if distinct_episode_count > 0:
+            inventory_lines.append(f"- 반복 등장도: {distinct_episode_count}화")
+        if summary_mention_count > 0:
+            inventory_lines.append(f"- summary 언급 수: {summary_mention_count}")
+        if voice_evidence_count > 0:
+            inventory_lines.append(f"- 보이스 근거 수: {voice_evidence_count}")
+        for field_label, field_name in [
+            ("장면 중심성", "scene_centrality"),
+            ("별칭 안정성", "alias_stability"),
+            ("행동 존재감", "action_presence"),
+            ("관계 존재감", "relation_presence"),
+        ]:
+            field_value = str(inventory_item.get(field_name) or "").strip()
+            if field_value:
+                inventory_lines.append(f"- {field_label}: {field_value}")
+        dominant_action_tags = [str(value).strip() for value in (inventory_item.get("dominant_action_tags") or []) if str(value).strip()]
+        dominant_affect_tags = [str(value).strip() for value in (inventory_item.get("dominant_affect_tags") or []) if str(value).strip()]
+        if dominant_action_tags:
+            inventory_lines.append(f"- 주요 행동 태그: {', '.join(dominant_action_tags[:5])}")
+        if dominant_affect_tags:
+            inventory_lines.append(f"- 주요 정서 태그: {', '.join(dominant_affect_tags[:5])}")
     return (
         f"캐릭터명: {str(target.get('display_name') or '').strip()}\n"
         f"aliases: {', '.join(str(alias).strip() for alias in (target.get('aliases') or []) if str(alias).strip())}\n\n"
         f"is_protagonist: {'Y' if bool(target.get('is_protagonist')) else 'N'}\n"
         f"is_first_person: {'Y' if bool(target.get('is_first_person')) else 'N'}\n\n"
+        + (
+            "inventory_context:\n"
+            + "\n".join(inventory_lines)
+            + "\n\n"
+            if inventory_lines
+            else ""
+        )
+        + (
+            "relation_context:\n"
+            + "\n".join(str(line).strip() for line in (relation_context_lines or []) if str(line).strip())
+            + "\n\n"
+            if relation_context_lines
+            else ""
+        )
         + (
             "summary_plan:\n"
             + "\n".join(
@@ -1565,17 +1839,56 @@ async def request_rp_character_plan_payload(
     return extract_json_object(extract_openrouter_message_text(response.json()))
 
 
+async def request_episode_character_signals_payload(
+    client: AsyncClient,
+    *,
+    row: dict[str, object],
+    summary_text: str,
+) -> dict | None:
+    user_prompt = build_episode_character_signals_user_prompt(row, summary_text)
+
+    if not settings.ANTHROPIC_API_KEY or not RP_REASONING_MODEL:
+        raise RuntimeError("episode_character_signals requires anthropic reasoning configuration")
+
+    response = await client.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": settings.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": RP_REASONING_MODEL,
+            "max_tokens": 1400,
+            "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
+            "messages": [{"role": "user", "content": user_prompt}],
+            **build_anthropic_reasoning_options(RP_REASONING_MODEL),
+        },
+    )
+    response.raise_for_status()
+    parsed = extract_json_object(extract_anthropic_message_text(response.json()))
+    if not parsed:
+        raise ValueError(
+            f"episode_character_signals returned no parseable json: episode_no={int(row.get('episode_no') or 0)}"
+        )
+    return parsed
+
+
 async def request_rp_profile_payload(
     client: AsyncClient,
     *,
     target: dict[str, object],
     dialogue_items: list[dict[str, object]],
     summary_context_lines: list[str],
+    inventory_item: dict[str, object] | None = None,
+    relation_context_lines: list[str] | None = None,
 ) -> dict | None:
     user_prompt = build_rp_profile_synthesis_user_prompt(
         target,
         dialogue_items,
         summary_context_lines,
+        inventory_item,
+        relation_context_lines,
     )
 
     if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
@@ -1624,12 +1937,14 @@ async def request_rp_profile_payload(
 
 
 async def build_rp_summaries(
-    cur,
+    conn,
     *,
     product_id: int,
     episode_rows: list[dict],
     episode_texts_by_no: dict[int, str],
     summary_client: AsyncClient | None,
+    inventory_map: dict[str, dict[str, object]] | None = None,
+    relation_map: dict[str, list[dict[str, object]]] | None = None,
     verbose: bool = False,
 ) -> dict[str, tuple[int, int]]:
     counts = {
@@ -1658,6 +1973,7 @@ async def build_rp_summaries(
         character_key = str(target.get("character_key") or "").strip()
         if not character_key:
             continue
+        inventory_item = dict((inventory_map or {}).get(character_key) or {})
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
         dialogue_items: list[dict[str, object]] = []
         priority_episode_nos = [int(no) for no in (target.get("evidence_episodes") or []) if int(no) in episode_texts_by_no]
@@ -1679,6 +1995,10 @@ async def build_rp_summaries(
         dialogue_items = dedupe_rp_dialogue_items(dialogue_items, limit=80)
         dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
         summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
+        relation_context_lines = build_rp_relation_context_lines(
+            character_key=character_key,
+            relation_map=relation_map or {},
+        )
 
         if not dialogue_items:
             continue
@@ -1689,6 +2009,8 @@ async def build_rp_summaries(
                 target=target,
                 dialogue_items=dialogue_items,
                 summary_context_lines=summary_context_lines,
+                inventory_item=inventory_item,
+                relation_context_lines=relation_context_lines,
             )
         except Exception as exc:
             if verbose:
@@ -1742,11 +2064,22 @@ async def build_rp_summaries(
                 }
             )
 
+        inventory_signature_parts: list[str] = []
+        if inventory_item:
+            inventory_signature_parts = [
+                f"inv:first:{int(inventory_item.get('first_seen_episode_no') or 0)}",
+                f"inv:episodes:{int(inventory_item.get('distinct_episode_count') or 0)}",
+                f"inv:mentions:{int(inventory_item.get('summary_mention_count') or 0)}",
+                f"inv:voice:{int(inventory_item.get('voice_evidence_count') or 0)}",
+                f"inv:action:{str(inventory_item.get('action_presence') or '')}",
+                f"inv:relation:{str(inventory_item.get('relation_presence') or '')}",
+            ]
         profile_source_hash = build_compound_summary_source_hash(
             CHARACTER_RP_PROFILE_FORMAT_VERSION,
             [
                 character_key,
                 build_rp_reasoning_signature(),
+                *inventory_signature_parts,
                 *(f"{int(item.get('episode_no') or 0)}:{str(item.get('text') or '')}" for item in dialogue_items[:40]),
             ],
         )
@@ -1755,34 +2088,109 @@ async def build_rp_summaries(
             [
                 character_key,
                 build_rp_reasoning_signature(),
+                *inventory_signature_parts,
                 *(str(item.get("text") or "") for item in example_payload["examples"]),
             ],
         )
         valid_scope_keys.add(character_key)
-        _, profile_inserted = upsert_summary(
-            cur,
-            product_id=product_id,
-            summary_type="character_rp_profile",
-            scope_key=character_key,
-            source_hash=profile_source_hash,
-            source_doc_count=len(dialogue_items),
-            summary_text=json.dumps(profile_payload, ensure_ascii=False),
-        )
-        _, examples_inserted = upsert_summary(
-            cur,
-            product_id=product_id,
-            summary_type="character_rp_examples",
-            scope_key=character_key,
-            source_hash=examples_source_hash,
-            source_doc_count=len(example_payload["examples"]),
-            summary_text=json.dumps(example_payload, ensure_ascii=False),
-        )
+        with work_cursor(conn) as cur:
+            _, profile_inserted = upsert_summary(
+                cur,
+                product_id=product_id,
+                summary_type="character_rp_profile",
+                scope_key=character_key,
+                source_hash=profile_source_hash,
+                source_doc_count=len(dialogue_items),
+                summary_text=json.dumps(profile_payload, ensure_ascii=False),
+            )
+            _, examples_inserted = upsert_summary(
+                cur,
+                product_id=product_id,
+                summary_type="character_rp_examples",
+                scope_key=character_key,
+                source_hash=examples_source_hash,
+                source_doc_count=len(example_payload["examples"]),
+                summary_text=json.dumps(example_payload, ensure_ascii=False),
+            )
+        conn.commit()
         counts["profile"][0 if profile_inserted else 1] += 1
         counts["examples"][0 if examples_inserted else 1] += 1
 
-    deactivate_missing_active_scopes(cur, product_id, "character_rp_profile", valid_scope_keys)
-    deactivate_missing_active_scopes(cur, product_id, "character_rp_examples", valid_scope_keys)
+    with work_cursor(conn) as cur:
+        deactivate_missing_active_scopes(cur, product_id, "character_rp_profile", valid_scope_keys)
+        deactivate_missing_active_scopes(cur, product_id, "character_rp_examples", valid_scope_keys)
+    conn.commit()
     return {key: (value[0], value[1]) for key, value in counts.items()}
+
+
+async def build_episode_character_signals_summaries(
+    conn,
+    *,
+    product_id: int,
+    episode_rows: list[dict[str, object]],
+    summary_client: AsyncClient | None,
+    verbose: bool = False,
+) -> tuple[int, int]:
+    if summary_client is None:
+        return 0, 0
+
+    inserted_count = 0
+    reused_count = 0
+    valid_scope_keys: set[str] = set()
+    for row in episode_rows:
+        summary_id = int(row.get("summary_id") or 0)
+        episode_no = int(row.get("episode_from") or 0)
+        summary_text = str(row.get("summary_text") or "").strip()
+        if not summary_id or episode_no <= 0 or not summary_text:
+            continue
+        scope_key = str(row.get("scope_key") or "").strip()
+        if not scope_key:
+            continue
+        valid_scope_keys.add(scope_key)
+        source_hash = build_compound_summary_source_hash(
+            EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION,
+            [
+                f"{summary_id}:{str(row.get('source_hash') or '').strip()}",
+                build_rp_reasoning_signature(),
+            ],
+        )
+        try:
+            payload = await request_episode_character_signals_payload(
+                summary_client,
+                row={
+                    "episode_no": episode_no,
+                    "title": "",
+                    "episode_title": parse_summary_text(summary_text).get("header") or "",
+                },
+                summary_text=summary_text,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"[character-signals-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:160]}")
+            continue
+        normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
+        with work_cursor(conn) as cur:
+            _, inserted = upsert_summary(
+                cur,
+                product_id=product_id,
+                summary_type="episode_character_signals",
+                scope_key=scope_key,
+                source_hash=source_hash,
+                source_doc_count=1,
+                summary_text=json.dumps(normalized_payload, ensure_ascii=False),
+                episode_from=episode_no,
+                episode_to=episode_no,
+            )
+        conn.commit()
+        if inserted:
+            inserted_count += 1
+        else:
+            reused_count += 1
+
+    with work_cursor(conn) as cur:
+        deactivate_missing_active_scopes(cur, product_id, "episode_character_signals", valid_scope_keys)
+    conn.commit()
+    return inserted_count, reused_count
 
 
 def upsert_summary(
@@ -1850,6 +2258,467 @@ def upsert_summary(
         ),
     )
     return int(cur.lastrowid), True
+
+
+def aggregate_character_inventory_rows(signal_rows: list[dict]) -> list[dict[str, object]]:
+    inventory_map: dict[str, dict[str, object]] = {}
+    for row in signal_rows:
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
+        for item in list(payload.get("mentioned_characters") or []):
+            if not isinstance(item, dict):
+                continue
+            entity_kind = str(item.get("entity_kind") or "person").strip().lower()
+            if entity_kind not in {"person", "stable_role"}:
+                continue
+            character_key = str(item.get("character_key") or "").strip()
+            display_name = str(item.get("display_name") or "").strip()
+            if not character_key or not display_name:
+                continue
+            current = inventory_map.setdefault(
+                character_key,
+                {
+                    "character_key": character_key,
+                    "display_name": display_name,
+                    "aliases": set(),
+                    "entity_kind": entity_kind,
+                    "is_protagonist": bool(item.get("is_protagonist")),
+                    "is_first_person": bool(item.get("is_first_person")),
+                    "episode_nos": set(),
+                    "summary_mention_count": 0,
+                    "voice_evidence_count": 0,
+                    "scene_weight_high_count": 0,
+                    "scene_weight_medium_count": 0,
+                    "scene_weight_low_count": 0,
+                    "action_tag_counts": {},
+                    "affect_tag_counts": {},
+                    "relation_episode_count": 0,
+                },
+            )
+            current["display_name"] = display_name
+            current["entity_kind"] = entity_kind
+            current["is_protagonist"] = bool(current["is_protagonist"]) or bool(item.get("is_protagonist"))
+            current["is_first_person"] = bool(current["is_first_person"]) or bool(item.get("is_first_person"))
+            for alias in list(item.get("aliases") or []):
+                alias_text = str(alias).strip()
+                if alias_text:
+                    current["aliases"].add(alias_text)
+            if episode_no > 0:
+                current["episode_nos"].add(episode_no)
+            current["summary_mention_count"] += 1
+            if str(item.get("voice_mode") or "").strip().lower() in {"dialogue", "monologue"}:
+                current["voice_evidence_count"] += 1
+            scene_weight = str(item.get("scene_weight") or "").strip().lower()
+            if scene_weight == "high":
+                current["scene_weight_high_count"] += 1
+            elif scene_weight == "medium":
+                current["scene_weight_medium_count"] += 1
+            else:
+                current["scene_weight_low_count"] += 1
+            for tag in list(item.get("action_tags") or []):
+                tag_text = str(tag).strip()
+                if not tag_text:
+                    continue
+                current["action_tag_counts"][tag_text] = int(current["action_tag_counts"].get(tag_text) or 0) + 1
+            for tag in list(item.get("affect_tags") or []):
+                tag_text = str(tag).strip()
+                if not tag_text:
+                    continue
+                current["affect_tag_counts"][tag_text] = int(current["affect_tag_counts"].get(tag_text) or 0) + 1
+            if list(item.get("relation_edges") or []):
+                current["relation_episode_count"] += 1
+
+    inventory_rows: list[dict[str, object]] = []
+    for current in inventory_map.values():
+        episode_nos = sorted(int(value) for value in set(current["episode_nos"]))
+        distinct_episode_count = len(episode_nos)
+        aliases = sorted(
+            set(str(alias).strip() for alias in current["aliases"] if str(alias).strip()),
+            key=lambda value: (0 if value == str(current["display_name"]) else 1, -len(value), value),
+        )
+        alias_stability = (
+            "high"
+            if len(aliases) <= 2 and distinct_episode_count >= 3
+            else "medium"
+            if distinct_episode_count >= 2
+            else "low"
+        )
+        scene_centrality = (
+            "high"
+            if int(current["scene_weight_high_count"] or 0) >= max(2, distinct_episode_count // 2)
+            else "medium"
+            if int(current["scene_weight_high_count"] or 0) + int(current["scene_weight_medium_count"] or 0) >= 2
+            else "low"
+        )
+        action_presence = "high" if int(current["summary_mention_count"] or 0) >= 4 and current["action_tag_counts"] else "medium" if current["action_tag_counts"] else "low"
+        relation_presence = "high" if int(current["relation_episode_count"] or 0) >= 3 else "medium" if int(current["relation_episode_count"] or 0) >= 1 else "low"
+
+        inventory_rows.append(
+            {
+                "character_key": str(current["character_key"]),
+                "display_name": str(current["display_name"]),
+                "aliases": aliases[:8],
+                "entity_kind": str(current["entity_kind"]),
+                "is_protagonist": bool(current["is_protagonist"]),
+                "is_first_person": bool(current["is_first_person"]),
+                "first_seen_episode_no": episode_nos[0] if episode_nos else 0,
+                "latest_seen_episode_no": episode_nos[-1] if episode_nos else 0,
+                "evidence_episode_nos": episode_nos[:120],
+                "distinct_episode_count": distinct_episode_count,
+                "summary_mention_count": int(current["summary_mention_count"] or 0),
+                "voice_evidence_count": int(current["voice_evidence_count"] or 0),
+                "relation_episode_count": int(current["relation_episode_count"] or 0),
+                "scene_weight_counts": {
+                    "high": int(current["scene_weight_high_count"] or 0),
+                    "medium": int(current["scene_weight_medium_count"] or 0),
+                    "low": int(current["scene_weight_low_count"] or 0),
+                },
+                "scene_centrality": scene_centrality,
+                "alias_stability": alias_stability,
+                "action_presence": action_presence,
+                "relation_presence": relation_presence,
+                "dominant_action_tags": [
+                    key for key, _ in sorted(current["action_tag_counts"].items(), key=lambda item: (-item[1], item[0]))[:5]
+                ],
+                "dominant_affect_tags": [
+                    key for key, _ in sorted(current["affect_tag_counts"].items(), key=lambda item: (-item[1], item[0]))[:5]
+                ],
+            }
+        )
+    return sorted(
+        inventory_rows,
+        key=lambda item: (
+            0 if bool(item["is_protagonist"]) else 1,
+            -int(item["distinct_episode_count"] or 0),
+            -int(item["summary_mention_count"] or 0),
+            str(item["display_name"]),
+        ),
+    )
+
+
+def build_character_inventory_summaries(
+    cur,
+    *,
+    product_id: int,
+) -> tuple[int, int]:
+    signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    inventory_rows = aggregate_character_inventory_rows(signal_rows)
+    if signal_rows and not inventory_rows:
+        raise ValueError(f"character_inventory aggregation returned 0 rows despite active signals: product_id={product_id}")
+    inserted_count = 0
+    reused_count = 0
+    valid_scope_keys: set[str] = set()
+    signal_provenance_map: dict[str, list[str]] = {}
+    for row in signal_rows:
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        summary_component = f"{int(row.get('summary_id') or 0)}:{str(row.get('source_hash') or '')}"
+        for item in list(payload.get("mentioned_characters") or []):
+            if not isinstance(item, dict):
+                continue
+            character_key = str(item.get("character_key") or "").strip()
+            if not character_key:
+                continue
+            signal_provenance_map.setdefault(character_key, [])
+            if summary_component not in signal_provenance_map[character_key]:
+                signal_provenance_map[character_key].append(summary_component)
+    for item in inventory_rows:
+        scope_key = str(item.get("character_key") or "").strip()
+        if not scope_key:
+            continue
+        valid_scope_keys.add(scope_key)
+        source_hash = build_compound_summary_source_hash(
+            CHARACTER_INVENTORY_FORMAT_VERSION,
+            [
+                scope_key,
+                *signal_provenance_map.get(scope_key, []),
+                f"first:{int(item.get('first_seen_episode_no') or 0)}",
+                f"latest:{int(item.get('latest_seen_episode_no') or 0)}",
+                f"mentions:{int(item.get('summary_mention_count') or 0)}",
+                f"voice:{int(item.get('voice_evidence_count') or 0)}",
+                f"aliases:{','.join(str(value) for value in list(item.get('aliases') or []))}",
+                f"actions:{','.join(str(value) for value in list(item.get('dominant_action_tags') or []))}",
+                f"affects:{','.join(str(value) for value in list(item.get('dominant_affect_tags') or []))}",
+            ],
+        )
+        _, inserted = upsert_summary(
+            cur=cur,
+            product_id=product_id,
+            summary_type="character_inventory",
+            scope_key=scope_key,
+            source_hash=source_hash,
+            source_doc_count=max(int(item.get("distinct_episode_count") or 0), 1),
+            episode_from=int(item.get("first_seen_episode_no") or 0) or None,
+            episode_to=int(item.get("latest_seen_episode_no") or 0) or None,
+            summary_text=json.dumps(item, ensure_ascii=False),
+        )
+        if inserted:
+            inserted_count += 1
+        else:
+            reused_count += 1
+
+    deactivate_missing_active_scopes(cur, product_id, "character_inventory", valid_scope_keys)
+    return inserted_count, reused_count
+
+
+def aggregate_relation_inventory_rows(signal_rows: list[dict]) -> list[dict[str, object]]:
+    relation_map: dict[str, dict[str, object]] = {}
+
+    def _accumulate_edge(
+        *,
+        relation_key: str,
+        source_key: str,
+        source_display_name: str,
+        target_key: str,
+        target_display_name: str,
+        relation_tag: str,
+        episode_no: int,
+        summary_component: str,
+    ) -> None:
+        current = relation_map.setdefault(
+            relation_key,
+            {
+                "relation_key": relation_key,
+                "source_key": source_key,
+                "source_display_name": source_display_name,
+                "target_key": target_key,
+                "target_display_name": target_display_name,
+                "episode_nos": set(),
+                "summary_components": set(),
+                "relation_tag_counts": {},
+                "edge_count": 0,
+            },
+        )
+        if episode_no > 0:
+            current["episode_nos"].add(episode_no)
+        if summary_component:
+            current["summary_components"].add(summary_component)
+        current["edge_count"] += 1
+        if relation_tag:
+            current["relation_tag_counts"][relation_tag] = int(current["relation_tag_counts"].get(relation_tag) or 0) + 1
+
+    for row in signal_rows:
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
+        summary_component = f"{int(row.get('summary_id') or 0)}:{str(row.get('source_hash') or '')}"
+        display_name_by_key: dict[str, str] = {}
+        mentioned_characters = list(payload.get("mentioned_characters") or [])
+        for item in mentioned_characters:
+            if not isinstance(item, dict):
+                continue
+            character_key = str(item.get("character_key") or "").strip()
+            display_name = str(item.get("display_name") or "").strip()
+            if character_key and display_name:
+                display_name_by_key[character_key] = display_name
+        for item in mentioned_characters:
+            if not isinstance(item, dict):
+                continue
+            source_key = str(item.get("character_key") or "").strip()
+            source_display_name = str(item.get("display_name") or "").strip()
+            if not source_key or not source_display_name:
+                continue
+            for edge in list(item.get("relation_edges") or []):
+                if not isinstance(edge, dict):
+                    continue
+                target_key = str(edge.get("target_key") or "").strip()
+                target_label = str(edge.get("target_label") or "").strip()
+                relation_tag = str(edge.get("relation_tag") or "").strip()
+                direction = str(edge.get("direction") or "").strip().lower()
+                if not target_key or not relation_tag or target_key == source_key:
+                    continue
+                target_display_name = display_name_by_key.get(target_key) or target_label or target_key
+                if direction == "from_target":
+                    _accumulate_edge(
+                        relation_key=f"{target_key}=>{source_key}",
+                        source_key=target_key,
+                        source_display_name=target_display_name,
+                        target_key=source_key,
+                        target_display_name=source_display_name,
+                        relation_tag=relation_tag,
+                        episode_no=episode_no,
+                        summary_component=summary_component,
+                    )
+                elif direction == "mutual":
+                    _accumulate_edge(
+                        relation_key=f"{source_key}=>{target_key}",
+                        source_key=source_key,
+                        source_display_name=source_display_name,
+                        target_key=target_key,
+                        target_display_name=target_display_name,
+                        relation_tag=relation_tag,
+                        episode_no=episode_no,
+                        summary_component=summary_component,
+                    )
+                    _accumulate_edge(
+                        relation_key=f"{target_key}=>{source_key}",
+                        source_key=target_key,
+                        source_display_name=target_display_name,
+                        target_key=source_key,
+                        target_display_name=source_display_name,
+                        relation_tag=relation_tag,
+                        episode_no=episode_no,
+                        summary_component=summary_component,
+                    )
+                else:
+                    _accumulate_edge(
+                        relation_key=f"{source_key}=>{target_key}",
+                        source_key=source_key,
+                        source_display_name=source_display_name,
+                        target_key=target_key,
+                        target_display_name=target_display_name,
+                        relation_tag=relation_tag,
+                        episode_no=episode_no,
+                        summary_component=summary_component,
+                    )
+
+    relation_rows: list[dict[str, object]] = []
+    for current in relation_map.values():
+        episode_nos = sorted(int(value) for value in set(current["episode_nos"]))
+        distinct_episode_count = len(episode_nos)
+        relation_rows.append(
+            {
+                "relation_key": str(current["relation_key"]),
+                "source_key": str(current["source_key"]),
+                "source_display_name": str(current["source_display_name"]),
+                "target_key": str(current["target_key"]),
+                "target_display_name": str(current["target_display_name"]),
+                "first_seen_episode_no": episode_nos[0] if episode_nos else 0,
+                "latest_seen_episode_no": episode_nos[-1] if episode_nos else 0,
+                "distinct_episode_count": distinct_episode_count,
+                "edge_count": int(current["edge_count"] or 0),
+                "relation_intensity": (
+                    "high"
+                    if distinct_episode_count >= 4
+                    else "medium"
+                    if distinct_episode_count >= 2
+                    else "low"
+                ),
+                "dominant_relation_tags": [
+                    key
+                    for key, _ in sorted(current["relation_tag_counts"].items(), key=lambda item: (-item[1], item[0]))[:6]
+                ],
+                "summary_components": sorted(set(str(value) for value in current["summary_components"] if str(value).strip())),
+            }
+        )
+
+    return sorted(
+        relation_rows,
+        key=lambda item: (
+            -int(item["distinct_episode_count"] or 0),
+            -int(item["edge_count"] or 0),
+            str(item["source_display_name"]),
+            str(item["target_display_name"]),
+        ),
+    )
+
+
+def build_relation_inventory_summaries(
+    cur,
+    *,
+    product_id: int,
+) -> tuple[int, int]:
+    signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    relation_rows = aggregate_relation_inventory_rows(signal_rows)
+    inserted_count = 0
+    reused_count = 0
+    valid_scope_keys: set[str] = set()
+    for item in relation_rows:
+        scope_key = str(item.get("relation_key") or "").strip()
+        if not scope_key:
+            continue
+        valid_scope_keys.add(scope_key)
+        source_hash = build_compound_summary_source_hash(
+            RELATION_INVENTORY_FORMAT_VERSION,
+            [
+                scope_key,
+                *list(item.get("summary_components") or []),
+                f"first:{int(item.get('first_seen_episode_no') or 0)}",
+                f"latest:{int(item.get('latest_seen_episode_no') or 0)}",
+                f"count:{int(item.get('distinct_episode_count') or 0)}",
+                f"tags:{','.join(str(value) for value in list(item.get('dominant_relation_tags') or []))}",
+            ],
+        )
+        payload = dict(item)
+        payload.pop("summary_components", None)
+        _, inserted = upsert_summary(
+            cur=cur,
+            product_id=product_id,
+            summary_type="relation_inventory",
+            scope_key=scope_key,
+            source_hash=source_hash,
+            source_doc_count=max(int(item.get("distinct_episode_count") or 0), 1),
+            episode_from=int(item.get("first_seen_episode_no") or 0) or None,
+            episode_to=int(item.get("latest_seen_episode_no") or 0) or None,
+            summary_text=json.dumps(payload, ensure_ascii=False),
+        )
+        if inserted:
+            inserted_count += 1
+        else:
+            reused_count += 1
+
+    deactivate_missing_active_scopes(cur, product_id, "relation_inventory", valid_scope_keys)
+    return inserted_count, reused_count
+
+
+def fetch_active_character_inventory_map(cur, *, product_id: int) -> dict[str, dict[str, object]]:
+    inventory_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="character_inventory")
+    inventory_map: dict[str, dict[str, object]] = {}
+    for row in inventory_rows:
+        scope_key = str(row.get("scope_key") or "").strip()
+        if not scope_key:
+            continue
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        if not isinstance(payload, dict):
+            continue
+        inventory_map[scope_key] = payload
+    return inventory_map
+
+
+def fetch_active_relation_inventory_map(cur, *, product_id: int) -> dict[str, list[dict[str, object]]]:
+    relation_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="relation_inventory")
+    relation_map: dict[str, list[dict[str, object]]] = {}
+    for row in relation_rows:
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        if not isinstance(payload, dict):
+            continue
+        source_key = str(payload.get("source_key") or "").strip()
+        if not source_key:
+            continue
+        relation_map.setdefault(source_key, []).append(payload)
+    for source_key, items in relation_map.items():
+        relation_map[source_key] = sorted(
+            items,
+            key=lambda item: (
+                -int(item.get("distinct_episode_count") or 0),
+                -int(item.get("edge_count") or 0),
+                str(item.get("target_display_name") or ""),
+            ),
+        )
+    return relation_map
+
+
+def build_rp_relation_context_lines(
+    *,
+    character_key: str,
+    relation_map: dict[str, list[dict[str, object]]],
+    limit: int = 4,
+) -> list[str]:
+    lines: list[str] = []
+    for item in list(relation_map.get(character_key) or [])[:limit]:
+        target_display_name = str(item.get("target_display_name") or "").strip()
+        if not target_display_name:
+            continue
+        relation_tags = [str(value).strip() for value in (item.get("dominant_relation_tags") or []) if str(value).strip()]
+        distinct_episode_count = int(item.get("distinct_episode_count") or 0)
+        latest_seen_episode_no = int(item.get("latest_seen_episode_no") or 0)
+        line = f"- 대상: {target_display_name}"
+        if relation_tags:
+            line += f" | 관계 태그: {', '.join(relation_tags[:3])}"
+        if distinct_episode_count > 0:
+            line += f" | 반복 화수: {distinct_episode_count}"
+        if latest_seen_episode_no > 0:
+            line += f" | 최근: {latest_seen_episode_no}화"
+        lines.append(line)
+    return lines
 
 
 def build_compound_summaries(cur, product_id: int, product_title: str) -> dict[str, tuple[int, int]]:
@@ -2181,7 +3050,7 @@ def insert_doc_and_chunks(cur, row: dict, source: dict[str, str], normalized_tex
 
 
 async def insert_episode_summary(
-    cur,
+    conn,
     row: dict,
     source_hash: str,
     normalized_text: str,
@@ -2196,15 +3065,18 @@ async def insert_episode_summary(
     summary_type = "episode_summary"
     summary_source_hash = build_summary_source_hash(source_hash, str(row.get("episode_title") or ""))
 
-    existing = fetch_existing_summary(
-        cur=cur,
-        product_id=product_id,
-        summary_type=summary_type,
-        scope_key=scope_key,
-        source_hash=summary_source_hash,
-    )
+    with work_cursor(conn) as cur:
+        existing = fetch_existing_summary(
+            cur=cur,
+            product_id=product_id,
+            summary_type=summary_type,
+            scope_key=scope_key,
+            source_hash=summary_source_hash,
+        )
     if existing:
-        activate_existing_summary(cur, int(existing["summary_id"]), product_id, summary_type, scope_key)
+        with work_cursor(conn) as cur:
+            activate_existing_summary(cur, int(existing["summary_id"]), product_id, summary_type, scope_key)
+        conn.commit()
         return int(existing["summary_id"]), False, {
             "used_llm": False,
             "retry_count": 0,
@@ -2212,53 +3084,26 @@ async def insert_episode_summary(
             "fallback_reason": "",
         }
 
-    version_no = fetch_next_summary_version_no(cur, product_id, summary_type, scope_key)
-    cur.execute(
-        """
-        UPDATE tb_story_agent_context_summary
-           SET is_active = 'N'
-         WHERE product_id = %s
-           AND summary_type = %s
-           AND scope_key = %s
-           AND is_active = 'Y'
-        """,
-        (product_id, summary_type, scope_key),
-    )
     summary_text, summary_meta = await generate_episode_summary_text(
         client=summary_client,
         row=row,
         normalized_text=normalized_text,
         verbose=verbose,
     )
-    cur.execute(
-        """
-        INSERT INTO tb_story_agent_context_summary (
-            product_id,
-            summary_type,
-            scope_key,
-            episode_from,
-            episode_to,
-            source_hash,
-            source_doc_count,
-            version_no,
-            is_active,
-            summary_text,
-            created_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, 1, %s, 'Y', %s, %s)
-        """,
-        (
-            product_id,
-            summary_type,
-            scope_key,
-            episode_no,
-            episode_no,
-            summary_source_hash,
-            version_no,
-            summary_text,
-            settings.DB_DML_DEFAULT_ID,
-        ),
-    )
-    return int(cur.lastrowid), True, summary_meta
+    with work_cursor(conn) as cur:
+        summary_id, inserted = upsert_summary(
+            cur,
+            product_id=product_id,
+            summary_type=summary_type,
+            scope_key=scope_key,
+            source_hash=summary_source_hash,
+            source_doc_count=1,
+            summary_text=summary_text,
+            episode_from=episode_no,
+            episode_to=episode_no,
+        )
+    conn.commit()
+    return int(summary_id), inserted, summary_meta
 
 
 def refresh_product_context_status(cur, product_id: int, total_episode_count: int) -> dict[str, object]:
@@ -2319,6 +3164,35 @@ def refresh_product_context_status(cur, product_id: int, total_episode_count: in
     }
 
 
+def assert_story_agent_foundation_invariants(cur, *, product_id: int) -> None:
+    cur.execute(
+        """
+        SELECT summary_type, COUNT(*) AS cnt
+          FROM tb_story_agent_context_summary
+         WHERE product_id = %s
+           AND is_active = 'Y'
+           AND summary_type IN ('episode_summary', 'episode_character_signals', 'character_inventory')
+         GROUP BY summary_type
+        """,
+        (product_id,),
+    )
+    counts = {str(row.get("summary_type") or ""): int(row.get("cnt") or 0) for row in list(cur.fetchall() or [])}
+    episode_summary_count = int(counts.get("episode_summary") or 0)
+    signal_count = int(counts.get("episode_character_signals") or 0)
+    inventory_count = int(counts.get("character_inventory") or 0)
+
+    if episode_summary_count > 0 and signal_count != episode_summary_count:
+        raise ValueError(
+            f"story-agent foundation mismatch: product_id={product_id} "
+            f"episode_summary={episode_summary_count} episode_character_signals={signal_count}"
+        )
+    if signal_count > 0 and inventory_count <= 0:
+        raise ValueError(
+            f"story-agent foundation mismatch: product_id={product_id} "
+            f"episode_character_signals={signal_count} character_inventory={inventory_count}"
+        )
+
+
 def fetch_total_episode_count(cur, product_id: int) -> int:
     cur.execute(
         """
@@ -2337,7 +3211,56 @@ def fetch_total_episode_count(cur, product_id: int) -> int:
     return int(row.get("total_episode_count") or 0)
 
 
-async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, conn) -> dict[str, object]:
+def mark_product_context_failed(*, product_id: int, total_episode_count: int, error_message: str) -> int:
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS ready_episode_count
+                  FROM tb_story_agent_context_summary
+                 WHERE product_id = %s
+                   AND summary_type = 'episode_summary'
+                   AND is_active = 'Y'
+                """,
+                (product_id,),
+            )
+            ready_row = cur.fetchone() or {}
+            ready_episode_count = int(ready_row.get("ready_episode_count") or 0)
+            cur.execute(
+                """
+                INSERT INTO tb_story_agent_context_product (
+                    product_id,
+                    context_status,
+                    total_episode_count,
+                    ready_episode_count,
+                    last_error_message,
+                    created_id,
+                    updated_id
+                ) VALUES (%s, 'failed', %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    context_status = 'failed',
+                    total_episode_count = VALUES(total_episode_count),
+                    ready_episode_count = VALUES(ready_episode_count),
+                    last_error_message = VALUES(last_error_message),
+                    updated_id = VALUES(updated_id)
+                """,
+                (
+                    product_id,
+                    total_episode_count,
+                    ready_episode_count,
+                    error_message[:500],
+                    settings.DB_DML_DEFAULT_ID,
+                    settings.DB_DML_DEFAULT_ID,
+                ),
+            )
+        conn.commit()
+        return ready_episode_count
+    finally:
+        conn.close()
+
+
+async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> dict[str, object]:
     results = {
         "inserted_docs": 0,
         "reused_docs": 0,
@@ -2352,6 +3275,12 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
         "reused_product_summaries": 0,
         "inserted_character_snapshots": 0,
         "reused_character_snapshots": 0,
+        "inserted_episode_character_signals": 0,
+        "reused_episode_character_signals": 0,
+        "inserted_character_inventories": 0,
+        "reused_character_inventories": 0,
+        "inserted_relation_inventories": 0,
+        "reused_relation_inventories": 0,
         "inserted_character_rp_profiles": 0,
         "reused_character_rp_profiles": 0,
         "inserted_character_rp_examples": 0,
@@ -2365,32 +3294,32 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
         rows_by_product.setdefault(int(row["product_id"]), []).append(row)
 
     summary_client: AsyncClient | None = None
-    if OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL:
+    if (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL) or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL):
         summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)
 
+    work_conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            for product_id, product_rows in rows_by_product.items():
-                product_failed = False
-                failed_ready_episode_count = 0
+        for product_id, product_rows in rows_by_product.items():
+            product_failed = False
+            failed_ready_episode_count = 0
+            with work_cursor(work_conn) as cur:
                 total_episode_count = fetch_total_episode_count(cur=cur, product_id=product_id)
-                episode_texts_by_no: dict[int, str] = {}
-                product_lock_acquired = False
-                if args.apply:
-                    product_lock_acquired = acquire_product_lock(cur, product_id)
-                    if not product_lock_acquired:
-                        results["products"].append(
-                            {
-                                "product_id": product_id,
-                                "context_status": "locked",
-                                "total_episode_count": total_episode_count,
-                                "ready_episode_count": 0,
-                            }
-                        )
-                        if args.verbose:
-                            print(f"[skip] product_id={product_id} lock busy")
-                        continue
-                    cur.execute("SAVEPOINT story_agent_product_batch")
+            episode_texts_by_no: dict[int, str] = {}
+
+            with product_lock_connection(product_id) if args.apply else nullcontext(None) as lock_conn:
+                if args.apply and lock_conn is None:
+                    results["products"].append(
+                        {
+                            "product_id": product_id,
+                            "context_status": "locked",
+                            "total_episode_count": total_episode_count,
+                            "ready_episode_count": 0,
+                        }
+                    )
+                    if args.verbose:
+                        print(f"[skip] product_id={product_id} lock busy")
+                    continue
+
                 try:
                     for row in product_rows:
                         source = await resolve_source_payload(row=row, use_epub_fallback=args.use_epub_fallback)
@@ -2422,28 +3351,32 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
                             continue
 
                         source_hash = sha256_text(normalized_text)
-                        existing = fetch_existing_doc(
-                            cur=cur,
-                            episode_id=int(row["episode_id"]),
-                            source_hash=source_hash,
-                            source_type=str(source["source_type"]),
-                        )
+                        with work_cursor(work_conn) as cur:
+                            existing = fetch_existing_doc(
+                                cur=cur,
+                                episode_id=int(row["episode_id"]),
+                                source_hash=source_hash,
+                                source_type=str(source["source_type"]),
+                            )
 
                         if args.apply:
                             try:
-                                context_doc_id = insert_doc_and_chunks(
-                                    cur=cur,
-                                    row=row,
-                                    source=source,
-                                    normalized_text=normalized_text,
-                                    chunks=chunks,
-                                )
+                                with work_cursor(work_conn) as cur:
+                                    context_doc_id = insert_doc_and_chunks(
+                                        cur=cur,
+                                        row=row,
+                                        source=source,
+                                        normalized_text=normalized_text,
+                                        chunks=chunks,
+                                    )
+                                work_conn.commit()
                                 if existing:
                                     results["reused_docs"] += 1
                                 else:
                                     results["inserted_docs"] += 1
+
                                 _, inserted_summary, summary_meta = await insert_episode_summary(
-                                    cur=cur,
+                                    conn=work_conn,
                                     row=row,
                                     source_hash=source_hash,
                                     normalized_text=normalized_text,
@@ -2469,45 +3402,10 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
                                     )
                             except Exception as exc:
                                 product_failed = True
-                                cur.execute("ROLLBACK TO SAVEPOINT story_agent_product_batch")
-                                cur.execute(
-                                    """
-                                    SELECT COUNT(*) AS ready_episode_count
-                                      FROM tb_story_agent_context_summary
-                                     WHERE product_id = %s
-                                       AND summary_type = 'episode_summary'
-                                       AND is_active = 'Y'
-                                    """,
-                                    (product_id,),
-                                )
-                                ready_row = cur.fetchone() or {}
-                                failed_ready_episode_count = int(ready_row.get("ready_episode_count") or 0)
-                                cur.execute(
-                                    """
-                                    INSERT INTO tb_story_agent_context_product (
-                                        product_id,
-                                        context_status,
-                                        total_episode_count,
-                                        ready_episode_count,
-                                        last_error_message,
-                                        created_id,
-                                        updated_id
-                                    ) VALUES (%s, 'failed', %s, %s, %s, %s, %s)
-                                    ON DUPLICATE KEY UPDATE
-                                        context_status = 'failed',
-                                        total_episode_count = VALUES(total_episode_count),
-                                        ready_episode_count = VALUES(ready_episode_count),
-                                        last_error_message = VALUES(last_error_message),
-                                        updated_id = VALUES(updated_id)
-                                    """,
-                                    (
-                                        product_id,
-                                        total_episode_count,
-                                        failed_ready_episode_count,
-                                        str(exc)[:500],
-                                        settings.DB_DML_DEFAULT_ID,
-                                        settings.DB_DML_DEFAULT_ID,
-                                    ),
+                                failed_ready_episode_count = mark_product_context_failed(
+                                    product_id=product_id,
+                                    total_episode_count=total_episode_count,
+                                    error_message=str(exc),
                                 )
                                 if args.verbose:
                                     print(
@@ -2519,13 +3417,14 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
                                 results["reused_docs"] += 1
                             else:
                                 results["inserted_docs"] += 1
-                            existing_summary = fetch_existing_summary(
-                                cur=cur,
-                                product_id=int(row["product_id"]),
-                                summary_type="episode_summary",
-                                scope_key=f"episode:{int(row['episode_id'])}",
-                                source_hash=build_summary_source_hash(source_hash, str(row.get("episode_title") or "")),
-                            )
+                            with work_cursor(work_conn) as cur:
+                                existing_summary = fetch_existing_summary(
+                                    cur=cur,
+                                    product_id=int(row["product_id"]),
+                                    summary_type="episode_summary",
+                                    scope_key=f"episode:{int(row['episode_id'])}",
+                                    source_hash=build_summary_source_hash(source_hash, str(row.get("episode_title") or "")),
+                                )
                             if existing_summary:
                                 results["reused_summaries"] += 1
                             else:
@@ -2537,23 +3436,67 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
                                 )
 
                     if args.apply and not product_failed:
-                        compound_counts = build_compound_summaries(
-                            cur=cur,
-                            product_id=product_id,
-                            product_title=str(product_rows[0].get("title") or ""),
-                        )
+                        with work_cursor(work_conn) as cur:
+                            compound_counts = build_compound_summaries(
+                                cur=cur,
+                                product_id=product_id,
+                                product_title=str(product_rows[0].get("title") or ""),
+                            )
+                        work_conn.commit()
                         results["inserted_range_summaries"] += compound_counts["range"][0]
                         results["reused_range_summaries"] += compound_counts["range"][1]
                         results["inserted_product_summaries"] += compound_counts["product"][0]
                         results["reused_product_summaries"] += compound_counts["product"][1]
                         results["inserted_character_snapshots"] += compound_counts["character"][0]
                         results["reused_character_snapshots"] += compound_counts["character"][1]
-                        rp_counts = await build_rp_summaries(
-                            cur=cur,
+
+                        with work_cursor(work_conn) as cur:
+                            episode_summary_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_summary")
+                        signal_counts = await build_episode_character_signals_summaries(
+                            conn=work_conn,
                             product_id=product_id,
-                            episode_rows=fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_summary"),
+                            episode_rows=episode_summary_rows,
+                            summary_client=summary_client,
+                            verbose=args.verbose,
+                        )
+                        results["inserted_episode_character_signals"] += signal_counts[0]
+                        results["reused_episode_character_signals"] += signal_counts[1]
+
+                        with work_cursor(work_conn) as cur:
+                            inventory_counts = build_character_inventory_summaries(
+                                cur=cur,
+                                product_id=product_id,
+                            )
+                            relation_counts = build_relation_inventory_summaries(
+                                cur=cur,
+                                product_id=product_id,
+                            )
+                            assert_story_agent_foundation_invariants(
+                                cur=cur,
+                                product_id=product_id,
+                            )
+                            inventory_map = fetch_active_character_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                            )
+                            relation_map = fetch_active_relation_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                            )
+                        work_conn.commit()
+                        results["inserted_character_inventories"] += inventory_counts[0]
+                        results["reused_character_inventories"] += inventory_counts[1]
+                        results["inserted_relation_inventories"] += relation_counts[0]
+                        results["reused_relation_inventories"] += relation_counts[1]
+
+                        rp_counts = await build_rp_summaries(
+                            conn=work_conn,
+                            product_id=product_id,
+                            episode_rows=episode_summary_rows,
                             episode_texts_by_no=episode_texts_by_no,
                             summary_client=summary_client,
+                            inventory_map=inventory_map,
+                            relation_map=relation_map,
                             verbose=args.verbose,
                         )
                         results["inserted_character_rp_profiles"] += rp_counts["profile"][0]
@@ -2561,14 +3504,14 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
                         results["inserted_character_rp_examples"] += rp_counts["examples"][0]
                         results["reused_character_rp_examples"] += rp_counts["examples"][1]
 
-                        status_row = refresh_product_context_status(
-                            cur=cur,
-                            product_id=product_id,
-                            total_episode_count=total_episode_count,
-                        )
+                        with work_cursor(work_conn) as cur:
+                            status_row = refresh_product_context_status(
+                                cur=cur,
+                                product_id=product_id,
+                                total_episode_count=total_episode_count,
+                            )
+                        work_conn.commit()
                         results["products"].append(status_row)
-                        cur.execute("RELEASE SAVEPOINT story_agent_product_batch")
-                        conn.commit()
                     elif args.apply and product_failed:
                         results["products"].append(
                             {
@@ -2578,8 +3521,6 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
                                 "ready_episode_count": failed_ready_episode_count,
                             }
                         )
-                        cur.execute("RELEASE SAVEPOINT story_agent_product_batch")
-                        conn.commit()
                     elif not args.apply:
                         results["products"].append(
                             {
@@ -2589,12 +3530,30 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace, con
                                 "ready_episode_count": 0,
                             }
                         )
-                finally:
-                    if args.apply and product_lock_acquired:
-                        release_product_lock(cur, product_id)
+                except Exception as exc:
+                    product_failed = True
+                    if args.apply:
+                        failed_ready_episode_count = mark_product_context_failed(
+                            product_id=product_id,
+                            total_episode_count=total_episode_count,
+                            error_message=str(exc),
+                        )
+                        results["products"].append(
+                            {
+                                "product_id": product_id,
+                                "context_status": "failed",
+                                "total_episode_count": total_episode_count,
+                                "ready_episode_count": failed_ready_episode_count,
+                            }
+                        )
+                    else:
+                        raise
+                    if args.verbose:
+                        print(f"[failed] product_id={product_id} error={str(exc)[:200]}")
     finally:
         if summary_client is not None:
             await summary_client.aclose()
+        work_conn.close()
     return results
 
 
@@ -2609,6 +3568,9 @@ def print_summary(results: dict[str, object], apply: bool) -> None:
         f"inserted_range_summaries={results['inserted_range_summaries']} reused_range_summaries={results['reused_range_summaries']} "
         f"inserted_product_summaries={results['inserted_product_summaries']} reused_product_summaries={results['reused_product_summaries']} "
         f"inserted_character_snapshots={results['inserted_character_snapshots']} reused_character_snapshots={results['reused_character_snapshots']} "
+        f"inserted_episode_character_signals={results['inserted_episode_character_signals']} reused_episode_character_signals={results['reused_episode_character_signals']} "
+        f"inserted_character_inventories={results['inserted_character_inventories']} reused_character_inventories={results['reused_character_inventories']} "
+        f"inserted_relation_inventories={results['inserted_relation_inventories']} reused_relation_inventories={results['reused_relation_inventories']} "
         f"inserted_character_rp_profiles={results['inserted_character_rp_profiles']} reused_character_rp_profiles={results['reused_character_rp_profiles']} "
         f"inserted_character_rp_examples={results['inserted_character_rp_examples']} reused_character_rp_examples={results['reused_character_rp_examples']} "
         f"skipped_rows={results['skipped_rows']}"
@@ -2631,19 +3593,12 @@ async def main() -> int:
         with conn.cursor() as cur:
             cur.execute(query, params)
             rows = list(cur.fetchall())
-
-        results = await build_context_rows(rows=rows, args=args, conn=conn)
-        print_summary(results=results, apply=args.apply)
-        if args.apply:
-            conn.commit()
-        else:
-            conn.rollback()
-        return 0
-    except Exception:
-        conn.rollback()
-        raise
     finally:
         conn.close()
+
+    results = await build_context_rows(rows=rows, args=args)
+    print_summary(results=results, apply=args.apply)
+    return 0
 
 
 if __name__ == "__main__":
