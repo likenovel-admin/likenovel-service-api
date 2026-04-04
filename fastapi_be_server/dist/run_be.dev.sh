@@ -45,7 +45,8 @@ cp "$BATCH_SRC"/*.sh "$BATCH_DST/"
 cp "$BATCH_SRC"/*.sql "$BATCH_DST/"
 cp "$BATCH_SRC"/*.py "$BATCH_DST/" 2>/dev/null || true
 chmod +x "$BATCH_DST"/*.sh
-sudo cp "$BATCH_SRC/cron_job.dev.sh" /etc/cron.d/likenovel-dev
-sudo chmod 644 /etc/cron.d/likenovel-dev
+# dev 배치 cron은 수동으로만 활성화 (필요 시: sudo cp "$BATCH_SRC/cron_job.dev.sh" /etc/cron.d/likenovel-dev)
+# sudo cp "$BATCH_SRC/cron_job.dev.sh" /etc/cron.d/likenovel-dev
+# sudo chmod 644 /etc/cron.d/likenovel-dev
 
 exit 0
