@@ -506,18 +506,25 @@ class PutPopupReqBody(AdminBase):
 
 class PostFAQReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
+    faq_type: str = Field(default="common", examples=["member"], description="FAQ 카테고리 코드")
     subject: str = Field(examples=["제목"], description="FAQ 제목")
     content: str = Field(examples=["내용"], description="FAQ 내용")
 
 
 class PutFAQReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
+    faq_type: Optional[str] = Field(default=None, examples=["member"], description="FAQ 카테고리 코드")
     subject: Optional[str] = Field(
         default=None, examples=["제목"], description="FAQ 제목"
     )
     content: Optional[str] = Field(
         default=None, examples=["내용"], description="FAQ 내용"
     )
+
+
+class FaqCategoryReqBody(AdminBase):
+    code: str = Field(examples=["member"], description="카테고리 코드")
+    name: str = Field(examples=["회원문의"], description="카테고리 표시명")
 
 
 class PostCommonRateReqBody(AdminBase):

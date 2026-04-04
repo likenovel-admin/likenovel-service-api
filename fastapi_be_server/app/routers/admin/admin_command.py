@@ -1066,6 +1066,49 @@ async def delete_faq(
     return await admin_faq_service.delete_faq(id, db=db)
 
 
+# ── FAQ 카테고리 ──
+
+
+@router.post("/faq-categories", tags=["CMS - FAQ"], dependencies=[Depends(analysis_logger)])
+async def post_faq_category(
+    req_body: admin_schema.FaqCategoryReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+    return await admin_faq_service.post_faq_category(req_body.code, req_body.name, db=db)
+
+
+@router.put("/faq-categories/{code}", tags=["CMS - FAQ"], dependencies=[Depends(analysis_logger)])
+async def put_faq_category(
+    req_body: admin_schema.FaqCategoryReqBody,
+    code: str = Path(..., description="카테고리 코드"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+    return await admin_faq_service.put_faq_category(code, req_body.name, db=db)
+
+
+@router.delete("/faq-categories/{code}", tags=["CMS - FAQ"], dependencies=[Depends(analysis_logger)])
+async def delete_faq_category(
+    code: str = Path(..., description="카테고리 코드"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+    return await admin_faq_service.delete_faq_category(code, db=db)
+
+
 @router.post(
     "/common-rate", tags=["CMS - 비율 조정"], dependencies=[Depends(analysis_logger)]
 )
