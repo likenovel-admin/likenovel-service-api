@@ -25,6 +25,15 @@ async def get_support_faqs(
 
 
 @router.get(
+    "/faq-categories", tags=["고객지원"], dependencies=[Depends(analysis_logger)]
+)
+async def get_support_faq_categories(
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await support_service.get_support_faq_categories(db=db)
+
+
+@router.get(
     "/faqs/{faq_id}", tags=["고객지원"], dependencies=[Depends(analysis_logger)]
 )
 async def get_support_faqs_faq_id(
