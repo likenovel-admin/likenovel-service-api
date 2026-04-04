@@ -27,9 +27,16 @@ class SupportSchema(BaseModel):
 class GetSupportFaqsToCamel(SupportSchema):
     id: int
     type: str
+    type_name: str | None = None
     question: str
     answer: str
     posting_date: datetime
+
+
+class GetSupportFaqCategoryToCamel(SupportSchema):
+    code: str
+    name: str
+    sort_order: int
 
 
 class GetSupportFaqsFaqIdToCamel(SupportSchema):

@@ -17,5 +17,4 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 50 * * * *  bash /app/dist/batch/summary_hourly_batch.sh >> /app/logs/summary_hourly_batch.log 2>&1
 0 0 * * *  bash /app/dist/batch/statistics_aggregation_daily_batch.sh >> /app/logs/statistics_aggregation_daily_batch.log 2>&1
 0 3 * * *  bash /app/dist/batch/ai_dna_extract_daily_batch.sh >> /app/logs/ai_dna_extract_daily_batch.log 2>&1
-* * * * *  bash /app/dist/batch/paid_episode_convert_batch.sh >> /app/logs/paid_episode_convert_batch.log 2>&1
-* * * * *  bash /app/dist/batch/scheduled_open_batch.sh >> /app/logs/scheduled_open_batch.log 2>&1
+* * * * *  EPISODE_STATE_TRANSITION_BATCH_ENABLE=1 bash /app/dist/batch/episode_state_transition_minute_batch.sh >> /app/logs/episode_state_transition_minute_batch.log 2>&1

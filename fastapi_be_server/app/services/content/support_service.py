@@ -65,15 +65,19 @@ async def get_support_faqs(
                     , a.primary_yn
                     , a.id
                     , a.faq_type
+                    , COALESCE(c.name, a.faq_type) AS faq_type_name
                     , a.subject AS question
                     , a.content AS answer
                     , a.updated_date AS posting_date
                 FROM tb_faq a
+                LEFT JOIN tb_faq_category c
+                  ON c.code = a.faq_type
                 WHERE a.use_yn = 'Y'
                 {category_filter}
             )
             SELECT t.id
                 , t.faq_type AS type
+                , t.faq_type_name AS type_name
                 , t.question
                 , t.answer
                 , t.posting_date
@@ -105,6 +109,33 @@ async def get_support_faqs(
     }
 
     return res_body
+
+
+async def get_support_faq_categories(db: AsyncSession):
+    categories = []
+
+    try:
+        query = text("""
+            SELECT code, name, sort_order
+            FROM tb_faq_category
+            ORDER BY sort_order
+        """)
+        result = await db.execute(query, {})
+        db_rst = result.mappings().all()
+
+        if db_rst:
+            categories = [
+                support_schema.GetSupportFaqCategoryToCamel(**row) for row in db_rst
+            ]
+
+    except SQLAlchemyError as e:
+        error_logger.error(f"faqCategoryList: {e}")
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.DB_OPERATION_ERROR,
+        )
+
+    return {"data": {"items": categories}}
 
 
 async def get_support_faqs_faq_id(faq_id: str, db: AsyncSession):
