@@ -129,6 +129,8 @@ STORY_AGENT_BROAD_SUMMARY_CONTEXT_LIMIT = 6
 STORY_AGENT_GEMINI_CONTEXT_EPISODE_LIMIT = 2
 STORY_AGENT_REFERENCE_RESOLUTION_MAX_TOKENS = 220
 STORY_AGENT_INTENT_MAX_TOKENS = 120
+STORY_AGENT_RP_RECALL_DECISION_MAX_TOKENS = 120
+STORY_AGENT_RP_RECALL_CONTEXT_CHAR_LIMIT = 1800
 STORY_AGENT_ALLOWED_INTENTS = {
     "factual",
     "comparative",
@@ -2089,6 +2091,157 @@ async def _get_story_agent_exact_summary_row(
     return dict(row) if row else None
 
 
+async def _build_story_agent_rp_trajectory_context(
+    *,
+    product_id: int,
+    latest_episode_no: int,
+    read_episode_to: int,
+    active_character_scope_key: str,
+    profile: dict[str, Any],
+    examples: list[dict[str, Any]],
+    db: AsyncSession,
+) -> dict[str, Any]:
+    upper_episode_no = min(
+        int(read_episode_to or 0) if int(read_episode_to or 0) > 0 else int(latest_episode_no or 0),
+        int(latest_episode_no or 0),
+    )
+    if upper_episode_no <= 0 or not active_character_scope_key:
+        return {}
+
+    candidate_names: list[str] = []
+    display_name = str(profile.get("display_name") or "").strip()
+    if display_name:
+        candidate_names.append(display_name)
+    for alias in profile.get("aliases") or []:
+        alias_text = str(alias or "").strip()
+        if alias_text:
+            candidate_names.append(alias_text)
+    scope_tail = active_character_scope_key.split(":")[-1].strip()
+    if scope_tail:
+        candidate_names.append(scope_tail)
+    normalized_names: list[str] = []
+    seen_names: set[str] = set()
+    for name in candidate_names:
+        if len(name) < 2:
+            continue
+        normalized_name = _normalize_story_agent_character_name(name)
+        if normalized_name in seen_names:
+            continue
+        seen_names.add(normalized_name)
+        normalized_names.append(name)
+
+    example_episode_nos = sorted(
+        {
+            int(item.get("episode_no") or 0)
+            for item in examples
+            if int(item.get("episode_no") or 0) > 0 and int(item.get("episode_no") or 0) <= upper_episode_no
+        },
+        reverse=True,
+    )
+
+    summary_candidate_rows: list[dict[str, Any]] = []
+    if normalized_names:
+        query_text = " ".join(normalized_names[:5])
+        keywords = _extract_story_agent_keywords(query_text)
+        latest_rows = await _get_story_agent_summary_candidates(
+            product_id=product_id,
+            keywords=keywords,
+            query_text=query_text,
+            latest_episode_no=upper_episode_no,
+            mode="latest",
+            episode_no=None,
+            db=db,
+        )
+        general_rows = await _get_story_agent_summary_candidates(
+            product_id=product_id,
+            keywords=keywords,
+            query_text=query_text,
+            latest_episode_no=upper_episode_no,
+            mode="general",
+            episode_no=None,
+            db=db,
+        )
+        summary_candidate_rows = _merge_story_agent_summary_rows(
+            latest_rows[:4],
+            general_rows[:4],
+            limit=6,
+        )
+
+    summary_rows_by_episode: dict[int, dict[str, Any]] = {}
+    for row in summary_candidate_rows:
+        episode_no = int(row.get("episodeTo") or row.get("episodeFrom") or 0)
+        if episode_no <= 0:
+            continue
+        summary_rows_by_episode.setdefault(episode_no, row)
+
+    named_summary_rows: list[dict[str, Any]] = []
+    if normalized_names:
+        for row in summary_candidate_rows:
+            summary_text = str(row.get("summaryText") or "").strip()
+            if not summary_text:
+                continue
+            if any(name in summary_text for name in normalized_names):
+                named_summary_rows.append(row)
+
+    anchor_row: dict[str, Any] | None = None
+    for episode_no in example_episode_nos:
+        anchor_row = summary_rows_by_episode.get(episode_no)
+        if anchor_row:
+            break
+        summary_rows = await _get_story_agent_summary_candidates(
+            product_id=product_id,
+            keywords=[],
+            query_text=f"{episode_no}화",
+            latest_episode_no=upper_episode_no,
+            mode="exact",
+            episode_no=episode_no,
+            db=db,
+        )
+        if summary_rows:
+            anchor_row = summary_rows[0]
+            break
+
+    if not anchor_row and named_summary_rows:
+        anchor_row = max(
+            named_summary_rows,
+            key=lambda row: int(row.get("episodeTo") or row.get("episodeFrom") or 0),
+        )
+    if not anchor_row and summary_candidate_rows:
+        anchor_row = summary_candidate_rows[0]
+    if not anchor_row:
+        return {}
+
+    anchor_episode_no = int(anchor_row.get("episodeTo") or anchor_row.get("episodeFrom") or 0)
+    anchor_summary_text = str(anchor_row.get("summaryText") or "").strip()[:600]
+    if anchor_episode_no <= 0 or not anchor_summary_text:
+        return {}
+
+    trajectory_history: list[dict[str, Any]] = []
+    seen_history_episodes: set[int] = {anchor_episode_no}
+    for row in named_summary_rows:
+        episode_no = int(row.get("episodeTo") or row.get("episodeFrom") or 0)
+        if episode_no <= 0 or episode_no in seen_history_episodes:
+            continue
+        summary_text = str(row.get("summaryText") or "").strip()
+        if not summary_text:
+            continue
+        seen_history_episodes.add(episode_no)
+        trajectory_history.append(
+            {
+                "episode_no": episode_no,
+                "summary_text": summary_text[:400],
+            }
+        )
+        if len(trajectory_history) >= 2:
+            break
+
+    return {
+        "anchor_episode_no": anchor_episode_no,
+        "anchor_summary_text": anchor_summary_text,
+        "trajectory_history": trajectory_history,
+    }
+
+
 async def _resolve_story_agent_active_character_scope_key(
     *,
     product_id: int,
@@ -2198,6 +2351,18 @@ async def _load_story_agent_rp_context(
         "inventory": inventory_payload or {},
         "session_memory": normalized_memory,
     }
+
+    trajectory_context = await _build_story_agent_rp_trajectory_context(
+        product_id=product_id,
+        latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+        read_episode_to=int(normalized_memory.get("read_episode_to") or 0),
+        active_character_scope_key=resolved_active_character,
+        profile=profile,
+        examples=list(examples_payload.get("examples") or []),
+        db=db,
+    )
+    if trajectory_context:
+        context.update(trajectory_context)
 
     if rp_mode == "scene":
         scene_episode_no = int(normalized_memory.get("scene_episode_no") or 0) or None
@@ -2444,6 +2609,196 @@ async def _resolve_story_agent_intent(
     return intent, needs_creative, mode
 
 
+async def _resolve_story_agent_rp_recall_need(
+    *,
+    user_prompt: str,
+    recent_messages: list[dict[str, str]],
+    rp_context: dict[str, Any],
+) -> tuple[bool, str]:
+    recent_context_message = build_story_agent_recent_context_message(recent_messages)
+    anchor_episode_no = int(rp_context.get("anchor_episode_no") or 0)
+    anchor_summary_text = str(rp_context.get("anchor_summary_text") or "").strip()
+    display_name = str(rp_context.get("display_name") or rp_context.get("active_character") or "캐릭터").strip()
+    system_prompt_parts = [
+        "너는 RP 원고 회상 보조 분류기다.",
+        "사용자에게 보여줄 답변을 쓰지 말고 JSON만 반환하라.",
+        "현재 질문이 정확한 대사, 특정 행동 디테일, 과거 장면의 실제 표현을 더 정확히 짚기 위해 원문 청크를 참조해야 하는지 판단하라.",
+        "단순한 감정 해석, 태도 해석, 현재 반응, 넓은 과거 회상만으로 충분하면 needs_exact_recall=false다.",
+        "정확히 뭐라고 했는지, 그때 어떤 행동을 했는지, 특정 장면의 말/행동 디테일을 복원해야 하면 needs_exact_recall=true다.",
+        "search_query는 원문 검색용 짧은 한국어 구문이다. 인물명, 행동, 사건, 관계 키워드를 포함하되 12단어 이내로 줄여라.",
+        "모르면 needs_exact_recall=false로 보수적으로 답하라.",
+        'JSON 스키마: {"needs_exact_recall":true|false,"search_query":"짧은 검색어"}',
+    ]
+    if anchor_episode_no > 0 and anchor_summary_text:
+        system_prompt_parts.append(
+            f"[현재 anchor]\n- {display_name}\n- 기준 회차: {anchor_episode_no}화\n- 요약: {anchor_summary_text[:300]}"
+        )
+    if recent_context_message:
+        system_prompt_parts.append(recent_context_message)
+
+    response = await _call_claude_messages(
+        system_prompt="\n\n".join(system_prompt_parts),
+        messages=[
+            {
+                "role": "user",
+                "content": f"질문: {user_prompt}\n\nJSON만 반환해.",
+            }
+        ],
+        max_tokens=STORY_AGENT_RP_RECALL_DECISION_MAX_TOKENS,
+    )
+    parsed = _extract_story_agent_json_object(_extract_text(response.get("content") or [])) or {}
+    raw_needs_exact_recall = parsed.get("needs_exact_recall")
+    if isinstance(raw_needs_exact_recall, bool):
+        needs_exact_recall = raw_needs_exact_recall
+    else:
+        needs_exact_recall = str(raw_needs_exact_recall or "").strip().lower() == "true"
+    search_query = re.sub(r"\s+", " ", str(parsed.get("search_query") or "").strip())[:120]
+    if not search_query:
+        search_query = _build_story_agent_prompt_preview(user_prompt)
+    return needs_exact_recall, search_query
+
+
+async def _build_story_agent_rp_exact_recall_context(
+    *,
+    product_row: dict[str, Any],
+    user_prompt: str,
+    recent_messages: list[dict[str, str]],
+    rp_context: dict[str, Any],
+    db: AsyncSession,
+) -> dict[str, Any]:
+    needs_exact_recall, search_query = await _resolve_story_agent_rp_recall_need(
+        user_prompt=user_prompt,
+        recent_messages=recent_messages,
+        rp_context=rp_context,
+    )
+    if not needs_exact_recall:
+        return {}
+
+    latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
+    read_episode_to = int(((rp_context.get("session_memory") or {}).get("read_episode_to")) or 0)
+    latest_public_episode_no = min(
+        read_episode_to if read_episode_to > 0 else latest_episode_no,
+        latest_episode_no,
+    )
+    if latest_public_episode_no <= 0:
+        return {}
+
+    anchor_episode_no = int(rp_context.get("anchor_episode_no") or 0)
+    candidate_episode_order: dict[int, int] = {}
+    candidate_episode_nos: list[int] = []
+    for episode_no in [anchor_episode_no, *[int(item.get("episode_no") or 0) for item in (rp_context.get("trajectory_history") or []) if isinstance(item, dict)]]:
+        if episode_no <= 0 or episode_no > latest_public_episode_no or episode_no in candidate_episode_order:
+            continue
+        candidate_episode_order[episode_no] = len(candidate_episode_order)
+        candidate_episode_nos.append(episode_no)
+
+    keywords = _extract_story_agent_keywords(search_query or user_prompt)
+    summary_rows = await _get_story_agent_summary_candidates(
+        product_id=int(product_row.get("productId") or 0),
+        keywords=keywords,
+        query_text=search_query or user_prompt,
+        latest_episode_no=latest_public_episode_no,
+        mode="general",
+        episode_no=None,
+        db=db,
+    )
+    for row in summary_rows[:3]:
+        for episode_no in [
+            int(row.get("episodeTo") or 0),
+            int(row.get("episodeFrom") or 0),
+        ]:
+            if (
+                episode_no <= 0
+                or episode_no > latest_public_episode_no
+                or episode_no in candidate_episode_order
+            ):
+                continue
+            candidate_episode_order[episode_no] = len(candidate_episode_order)
+            candidate_episode_nos.append(episode_no)
+
+    prioritized_rows: list[dict[str, Any]] = []
+    if candidate_episode_nos:
+        for episode_no in candidate_episode_nos[:5]:
+            episode_rows = await _get_story_agent_episode_contents(
+                product_id=int(product_row.get("productId") or 0),
+                episode_from=episode_no,
+                episode_to=episode_no,
+                latest_episode_no=latest_public_episode_no,
+                db=db,
+            )
+            for row in episode_rows:
+                chunk_text = str(row.get("chunkText") or "").strip()
+                if not chunk_text:
+                    continue
+                score = sum(1 for keyword in keywords if keyword and keyword in chunk_text)
+                if keywords and score <= 0:
+                    continue
+                prioritized_rows.append(
+                    {
+                        "episodeNo": episode_no,
+                        "chunkText": chunk_text,
+                        "matchScore": score,
+                    }
+                )
+
+    if prioritized_rows:
+        chunk_rows = sorted(
+            prioritized_rows,
+            key=lambda row: (
+                -int(row.get("matchScore") or 0),
+                candidate_episode_order.get(int(row.get("episodeNo") or 0), 999),
+            ),
+        )
+    else:
+        chunk_rows = await _search_story_agent_episode_contents(
+            product_id=int(product_row.get("productId") or 0),
+            query_text=search_query,
+            latest_episode_no=latest_public_episode_no,
+            db=db,
+        )
+        if not chunk_rows:
+            return {}
+
+    def _row_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
+        episode_no = int(row.get("episodeNo") or 0)
+        if episode_no in candidate_episode_order:
+            return (0, candidate_episode_order[episode_no], episode_no)
+        distance = abs(episode_no - anchor_episode_no) if anchor_episode_no > 0 else 9999
+        return (1, distance, episode_no)
+
+    selected_rows: list[dict[str, Any]] = []
+    seen_episode_nos: set[int] = set()
+    total_chars = 0
+    for row in sorted(chunk_rows, key=_row_sort_key):
+        episode_no = int(row.get("episodeNo") or 0)
+        chunk_text = str(row.get("chunkText") or "").strip()
+        if episode_no <= 0 or not chunk_text:
+            continue
+        if episode_no in seen_episode_nos and len(selected_rows) >= 2:
+            continue
+        if total_chars >= STORY_AGENT_RP_RECALL_CONTEXT_CHAR_LIMIT:
+            break
+        seen_episode_nos.add(episode_no)
+        clipped = chunk_text[:500]
+        selected_rows.append({"episode_no": episode_no, "chunk_text": clipped})
+        total_chars += len(clipped)
+        if len(selected_rows) >= 4:
+            break
+    if not selected_rows:
+        return {}
+
+    recall_lines = [
+        "- 아래는 지금 질문과 가장 가까운 공개 회차 원문 일부다.",
+        "- 정확한 대사나 행동은 여기에서 확인되는 범위 안에서만 반영하라.",
+        "- 원문에 보이지 않는 문장을 정확한 인용처럼 꾸며내지 마라.",
+    ]
+    for row in selected_rows:
+        recall_lines.append(f"[{int(row['episode_no'])}화 원문 일부]\n{row['chunk_text']}")
+    return {
+        "raw_recall_context": "\n".join(recall_lines),
+    }
+
+
 async def _generate_story_agent_reply(
     *,
     session_id: int,
@@ -2507,13 +2862,25 @@ async def _generate_story_agent_reply(
     )
     recent_messages = await _get_story_agent_recent_messages(session_id=session_id, db=db)
     if active_route == "rp" and rp_context:
+        exact_recall_context = await _build_story_agent_rp_exact_recall_context(
+            product_row=product_row,
+            user_prompt=user_prompt,
+            recent_messages=recent_messages,
+            rp_context=rp_context,
+            db=db,
+        )
+        if exact_recall_context:
+            rp_context = {
+                **rp_context,
+                **exact_recall_context,
+            }
         rp_plan = _build_story_agent_rp_plan(
             rp_context=rp_context,
             gemini_enabled=gemini_enabled,
         )
         if rp_plan["preferred_model"] == "gemini":
             try:
-                reply = await _generate_story_agent_rp_reply_with_gemini(
+                reply = await generate_story_agent_rp_reply_with_gemini(
                     product_row=product_row,
                     user_prompt=user_prompt,
                     rp_context=rp_context,
@@ -2528,7 +2895,7 @@ async def _generate_story_agent_reply(
                     rp_context.get("active_character"),
                     exc,
                 )
-        reply = await _generate_story_agent_rp_reply_with_claude(
+        reply = await generate_story_agent_rp_reply_with_claude(
             product_row=product_row,
             user_prompt=user_prompt,
             rp_context=rp_context,

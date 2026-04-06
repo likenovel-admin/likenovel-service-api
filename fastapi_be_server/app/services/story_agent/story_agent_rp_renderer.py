@@ -74,6 +74,32 @@ def build_story_agent_rp_system_prompt(
         if action_presence:
             inventory_lines.append(f"- 행동 존재감: {action_presence}")
     inventory_block = "\n".join(inventory_lines)
+    trajectory_block = ""
+    anchor_episode_no = int(rp_context.get("anchor_episode_no") or 0)
+    anchor_summary_text = str(rp_context.get("anchor_summary_text") or "").strip()
+    trajectory_history = [
+        item
+        for item in (rp_context.get("trajectory_history") or [])
+        if isinstance(item, dict)
+    ]
+    trajectory_parts: list[str] = []
+    if anchor_episode_no > 0 and anchor_summary_text:
+        trajectory_parts.append(
+            f"[현재 기준점]\n- {anchor_episode_no}화 기준\n{anchor_summary_text}"
+        )
+    history_lines: list[str] = []
+    for item in trajectory_history[:2]:
+        episode_no = int(item.get("episode_no") or 0)
+        summary_text = str(item.get("summary_text") or "").strip()
+        if episode_no <= 0 or not summary_text:
+            continue
+        history_lines.append(f"- {episode_no}화: {summary_text}")
+    if history_lines:
+        trajectory_parts.append("[캐릭터 궤적 참고]\n" + "\n".join(history_lines))
+    if trajectory_parts:
+        trajectory_block = "\n\n" + "\n\n".join(trajectory_parts)
+    raw_recall_context = str(rp_context.get("raw_recall_context") or "").strip()
+    raw_recall_block = f"\n\n[원문 참고]\n{raw_recall_context}" if raw_recall_context else ""
 
     scene_block = ""
     if str(rp_context.get("rp_mode") or "") == "scene":
@@ -118,6 +144,8 @@ def build_story_agent_rp_system_prompt(
         "- 예시와 세션 메모리, 현재 장면에서 공통으로 드러나는 결을 우선해 반응하라.\n\n"
         f"[참고 대사]\n{example_block or '- 정보 없음'}"
         f"{f'\n\n[세션 메모리]\n{memory_block}' if memory_block else ''}"
+        f"{trajectory_block}"
+        f"{raw_recall_block}"
         f"{scene_block}"
     )
 
