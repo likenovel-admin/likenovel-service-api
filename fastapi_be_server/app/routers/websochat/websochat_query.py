@@ -7,7 +7,14 @@ from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger, chk_cur_user
 import app.services.websochat.websochat_service as websochat_service
 
-router = APIRouter(prefix="/story-agent")
+router = APIRouter(prefix="/websochat")
+
+
+def get_websochat_guest_key(
+    guest_key: str | None = Header(default=None, alias="X-Websochat-Guest-Key"),
+    legacy_guest_key: str | None = Header(default=None, alias="X-Story-Agent-Guest-Key"),
+) -> str | None:
+    return guest_key or legacy_guest_key
 
 
 @router.get(
@@ -36,7 +43,7 @@ async def get_websochat_products(
 )
 async def get_websochat_sessions(
     product_id: int | None = Query(default=None),
-    guest_key: str | None = Header(default=None, alias="X-Story-Agent-Guest-Key"),
+    guest_key: str | None = Depends(get_websochat_guest_key),
     adult_yn: str = Query("N"),
     user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
@@ -57,7 +64,7 @@ async def get_websochat_sessions(
 )
 async def get_websochat_billing_status(
     qa_action_key: str | None = Query(default=None),
-    guest_key: str | None = Header(default=None, alias="X-Story-Agent-Guest-Key"),
+    guest_key: str | None = Depends(get_websochat_guest_key),
     user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
@@ -76,7 +83,7 @@ async def get_websochat_billing_status(
 )
 async def get_websochat_messages(
     session_id: int,
-    guest_key: str | None = Header(default=None, alias="X-Story-Agent-Guest-Key"),
+    guest_key: str | None = Depends(get_websochat_guest_key),
     user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
 ):

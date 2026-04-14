@@ -199,6 +199,23 @@ async def chk_cur_user(
     return decoded_token
 
 
+async def login_required(
+    user: Annotated[dict, Depends(chk_cur_user)],
+) -> str:
+    """
+    Legacy dependency wrapper.
+    기존 라우터 일부가 login_required -> kc_user_id(str) 계약을 기대하므로,
+    현재 표준 chk_cur_user() 결과에서 Keycloak subject를 꺼내 반환합니다.
+    """
+    kc_user_id = user.get("sub")
+    if not kc_user_id:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+    return kc_user_id
+
+
 def hash_password(plain_password: str) -> str:
     """
     bcrypt를 사용하여 비밀번호를 해시합니다.

@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import logging
+from typing import Optional
 from fastapi import status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
@@ -29,6 +30,23 @@ logger = logging.getLogger("admin_app")  # 커스텀 로거 생성
 """
 관리자 이벤트/배너 관리 서비스 함수 모음
 """
+
+BANNER_LIST_POSITION_MAP = {
+    "main-top": ("main", "top"),
+    "main-mid": ("main", "mid"),
+    "main-bot": ("main", "bot"),
+    "paid": ("paid", None),
+    "review": ("review", None),
+    "promotion": ("promotion", None),
+    "search": ("search", None),
+    "viewer": ("viewer", None),
+}
+
+BANNER_LIST_ORDER_BY_MAP = {
+    "show_order_asc": "COALESCE(show_order, 0) ASC, id ASC",
+    "show_order_desc": "COALESCE(show_order, 0) DESC, id DESC",
+    "latest_updated": "COALESCE(updated_date, created_date) DESC, id DESC",
+}
 
 
 async def events_list(type: str, page: int, count_per_page: int, db: AsyncSession):
@@ -483,13 +501,54 @@ async def delete_event(id: int, db: AsyncSession):
     return {"result": True}
 
 
-async def banners_list(page: int, count_per_page: int, db: AsyncSession):
+def _build_banner_list_where(position: Optional[str]) -> tuple[str, dict]:
+    if position in (None, "", "all"):
+        return "", {}
+
+    mapped_position = BANNER_LIST_POSITION_MAP.get(position)
+    if mapped_position is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.NOT_ALLOWED_POSITION.format(position),
+        )
+
+    base_position, division = mapped_position
+    where_clauses = ["position = :position"]
+    params = {"position": base_position}
+
+    if division is not None:
+        where_clauses.append("division = :division")
+        params["division"] = division
+
+    return f"WHERE {' AND '.join(where_clauses)}", params
+
+
+def _get_banner_list_order_by(sort_by: str) -> str:
+    order_by = BANNER_LIST_ORDER_BY_MAP.get(sort_by or "show_order_asc")
+    if order_by is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=f"허용되지 않은 정렬입니다. ({sort_by})",
+        )
+
+    return order_by
+
+
+async def banners_list(
+    page: int,
+    count_per_page: int,
+    position: Optional[str],
+    sort_by: str,
+    db: AsyncSession,
+):
     """
     배너 목록 조회
 
     Args:
         page: 페이지 번호
         count_per_page: 페이지당 항목 수
+        position: 배너 노출 위치 필터
+        sort_by: 정렬 기준
         db: 데이터베이스 세션
 
     Returns:
@@ -497,12 +556,16 @@ async def banners_list(page: int, count_per_page: int, db: AsyncSession):
     """
 
     limit_clause, limit_params = get_pagination_params(page, count_per_page)
+    where_clause, where_params = _build_banner_list_where(position)
+    order_by_clause = _get_banner_list_order_by(sort_by)
 
     # 전체 개수 구하기
-    count_query = text("""
-        SELECT COUNT(*) AS total_count FROM tb_carousel_banner
+    count_query = text(f"""
+        SELECT COUNT(*) AS total_count
+        FROM tb_carousel_banner
+        {where_clause}
     """)
-    count_result = await db.execute(count_query, {})
+    count_result = await db.execute(count_query, where_params)
     total_count = dict(count_result.mappings().first())["total_count"]
 
     # 실제 데이터 조회
@@ -514,10 +577,11 @@ async def banners_list(page: int, count_per_page: int, db: AsyncSession):
                 ELSE 'N'
             END AS `show`
         FROM tb_carousel_banner
-        ORDER BY created_date DESC
+        {where_clause}
+        ORDER BY {order_by_clause}
         {limit_clause}
     """)
-    result = await db.execute(query, limit_params)
+    result = await db.execute(query, {**where_params, **limit_params})
     rows = result.mappings().all()
 
     return build_paginated_response(rows, total_count, page, count_per_page)
