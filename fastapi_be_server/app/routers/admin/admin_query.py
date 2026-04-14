@@ -3659,6 +3659,11 @@ async def event_download_recipient_by_id(
 async def banners_list(
     page: int = Query(1, description="페이지"),
     count_per_page: int = Query(8, description="한 페이지 내 갯수"),
+    position: Optional[str] = Query(None, description="배너 노출 위치"),
+    sort_by: str = Query(
+        "show_order_asc",
+        description="정렬 기준(show_order_asc, show_order_desc, latest_updated)",
+    ),
     db: AsyncSession = Depends(get_likenovel_db),
     user: Dict[str, Any] = Depends(chk_cur_user),
 ):
@@ -3670,7 +3675,13 @@ async def banners_list(
     except Exception as e:
         raise e
 
-    return await admin_event_service.banners_list(page, count_per_page, db)
+    return await admin_event_service.banners_list(
+        page=page,
+        count_per_page=count_per_page,
+        position=position,
+        sort_by=sort_by,
+        db=db,
+    )
 
 
 @router.get(

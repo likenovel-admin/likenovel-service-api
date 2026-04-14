@@ -154,6 +154,7 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
     with conn.cursor() as cur:
         where = """
             p.open_yn = 'Y'
+            AND COALESCE(p.blind_yn, 'N') = 'N'
             AND COALESCE(u.role_type, 'normal') != 'admin'
             AND COALESCE(TRIM(p.author_name), '') != ''
             AND EXISTS (

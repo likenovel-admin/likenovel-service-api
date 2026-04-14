@@ -9,12 +9,15 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db, likenovel_db_session
-from app.services.websochat.websochat_stream import reset_websochat_stream_emitter, set_websochat_stream_emitter
+from app.services.websochat.websochat_stream import (
+    reset_websochat_stream_emitter,
+    set_websochat_stream_emitter,
+)
 from app.utils.auth import analysis_logger, chk_cur_user
 import app.schemas.websochat as websochat_schema
 import app.services.websochat.websochat_service as websochat_service
 
-router = APIRouter(prefix="/story-agent")
+router = APIRouter(prefix="/websochat")
 
 
 @router.post(
@@ -48,6 +51,44 @@ async def patch_websochat_session(
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.patch_session(
+        session_id=session_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.patch(
+    "/sessions/{session_id}/read-scope",
+    tags=["웹소챗"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def patch_websochat_session_read_scope(
+    session_id: int,
+    req_body: websochat_schema.PatchWebsochatSessionReadScopeReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await websochat_service.patch_session_read_scope(
+        session_id=session_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.patch(
+    "/sessions/{session_id}/mode",
+    tags=["웹소챗"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def patch_websochat_session_mode(
+    session_id: int,
+    req_body: websochat_schema.PatchWebsochatSessionModeReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await websochat_service.patch_session_mode(
         session_id=session_id,
         req_body=req_body,
         kc_user_id=user.get("sub"),

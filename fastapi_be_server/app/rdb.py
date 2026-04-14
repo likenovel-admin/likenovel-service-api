@@ -28,3 +28,7 @@ async def get_likenovel_db():
     async with likenovel_db_session() as likenovel_session:
         yield likenovel_session
         await likenovel_session.commit()
+
+
+# Legacy FastAPI dependencies still import `get_db`.
+get_db = get_likenovel_db

@@ -1171,6 +1171,30 @@ async def product_details_group_by_product_id(
         rows = result.mappings().all()
         product = convert_product_data(rows[0]) if rows else None
 
+        if product:
+            synced_latest_episode_query = text(
+                """
+                select
+                    least(
+                        coalesce(sacp.ready_episode_count, 0),
+                        coalesce(max(case when e.use_yn = 'Y' and e.open_yn = 'Y' then e.episode_no end), 0)
+                    ) as syncedLatestEpisodeNo
+                from tb_product p
+                left join tb_product_episode e
+                  on e.product_id = p.product_id
+                left join tb_story_agent_context_product sacp
+                  on sacp.product_id = p.product_id
+                where p.product_id = :product_id
+                group by sacp.ready_episode_count
+                """
+            )
+            synced_latest_episode_result = await db.execute(
+                synced_latest_episode_query, {"product_id": product_id}
+            )
+            product["syncedLatestEpisodeNo"] = max(
+                int(synced_latest_episode_result.scalar() or 0), 0
+            )
+
         # 작품이 존재하지만 비공개인 경우 조기 반환
         if product is None:
             private_check_query = text("""
