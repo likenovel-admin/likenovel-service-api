@@ -57,6 +57,7 @@ async def blind_list(
              , a.title
              , a.user_id
              , a.author_name
+             , COALESCE(u.email, '') AS author_email
              , COALESCE(g.keyword_name, '') AS primary_genre
              , a.blind_yn
              , a.created_date
@@ -65,6 +66,8 @@ async def blind_list(
                  WHERE e.product_id = a.product_id
                    AND e.use_yn = 'Y') AS episode_count
           FROM tb_product a
+          LEFT JOIN tb_user u
+            ON u.user_id = a.author_id
           LEFT JOIN tb_standard_keyword g
             ON g.keyword_id = a.primary_genre_id
          WHERE {where_sql}
