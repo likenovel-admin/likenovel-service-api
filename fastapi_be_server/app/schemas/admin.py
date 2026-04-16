@@ -807,3 +807,8 @@ class AdminCreateAccountReqBody(AdminBase):
 class PostBatchBlindReqBody(AdminBase):
     product_ids: List[int] = Field(description="블라인드 대상 작품 ID 목록")
     blind_yn: str = Field(examples=["Y"], description="블라인드 여부 (Y/N)")
+
+
+class PostBatchOpenReqBody(AdminBase):
+    product_ids: List[int] = Field(description="공개 상태 변경 대상 작품 ID 목록")
+    open_yn: str = Field(examples=["Y"], description="공개 여부 (Y/N)")
