@@ -1683,6 +1683,25 @@ async def post_batch_blind(
     )
 
 
+@router.post(
+    "/products/batch-open",
+    tags=["CMS - 작품 블라인드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_batch_open(
+    req_body: admin_schema.PostBatchOpenReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """작품 일괄 공개 상태 처리"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_blind_service.batch_open(
+        product_ids=req_body.product_ids,
+        open_yn=req_body.open_yn,
+        db=db,
+    )
+
+
 # ──────────────────── 일괄 업로드 ────────────────────
 
 
