@@ -59,6 +59,7 @@ async def blind_list(
              , a.author_name
              , COALESCE(u.email, '') AS author_email
              , COALESCE(g.keyword_name, '') AS primary_genre
+             , a.open_yn
              , a.blind_yn
              , a.created_date
              , (SELECT COUNT(*)
@@ -114,5 +115,32 @@ async def batch_blind(
         """).bindparams(bindparam("ids", expanding=True))
 
     result = await db.execute(query, {"ids": product_ids})
+
+    return {"result": True, "updated_count": result.rowcount}
+
+
+async def batch_open(
+    product_ids: list[int],
+    open_yn: str,
+    db: AsyncSession,
+):
+    if not product_ids:
+        return {"result": True, "updated_count": 0}
+
+    open_val = open_yn.upper()
+    if open_val not in ("Y", "N"):
+        open_val = "N"
+
+    query = text("""
+        UPDATE tb_product
+           SET open_yn = CASE
+                           WHEN blind_yn = 'Y' AND :open_yn = 'Y' THEN 'N'
+                           ELSE :open_yn
+                         END
+             , updated_date = NOW()
+         WHERE product_id IN :ids
+    """).bindparams(bindparam("ids", expanding=True))
+
+    result = await db.execute(query, {"ids": product_ids, "open_yn": open_val})
 
     return {"result": True, "updated_count": result.rowcount}
