@@ -4433,6 +4433,24 @@ async def ai_product_metadata_detail(
 
 
 @router.get(
+    "/products/{product_id}/episodes-txt",
+    tags=["CMS - 작품 블라인드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def download_blind_product_episodes_txt(
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """작품 회차 본문 TXT 다운로드"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_blind_service.download_product_episodes_txt(
+        product_id=product_id,
+        db=db,
+    )
+
+
+@router.get(
     "/products/blind-list",
     tags=["CMS - 작품 블라인드"],
     dependencies=[Depends(analysis_logger)],
