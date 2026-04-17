@@ -72,6 +72,7 @@ CHARACTER_INVENTORY_FORMAT_VERSION = "character_inventory_v2"
 RELATION_INVENTORY_FORMAT_VERSION = "relation_inventory_v1"
 CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v3"
 CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
+EPISODE_CHARACTER_SIGNALS_TOOL_NAME = "submit_episode_character_signals"
 DIALOGUE_QUOTE_RE = re.compile(r'["“](.*?)["”]', re.S)
 FIRST_PERSON_MONOLOGUE_RE = re.compile(r"\b(나는|내가|난|나를|내게|내겐|내 마음|내 생각|내 판단)\b")
 RP_SIMPLE_VOCATIVE_RE = re.compile(r"^[가-힣A-Za-z0-9]{2,12}(?:아|야)?[!?.…~]*$")
@@ -241,6 +242,98 @@ HOOK: <다음 전개 예측에 필요한 미해결 훅>
 6. REL은 실제로 드러난 관계만 넣는다. 애매하면 생략한다.
 7. HOOK은 0~3개만 넣는다.
 """
+
+EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA = {
+    "name": EPISODE_CHARACTER_SIGNALS_TOOL_NAME,
+    "description": "회차 요약에서 인물/관계/훅 구조화 신호를 JSON으로 반환한다.",
+    "input_schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "episode_no": {"type": "integer"},
+            "mentioned_characters": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "display_name": {"type": "string"},
+                        "aliases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 6,
+                        },
+                        "is_protagonist": {"type": "boolean"},
+                        "is_first_person": {"type": "boolean"},
+                        "entity_kind": {
+                            "type": "string",
+                            "enum": ["person", "stable_role", "collective", "other"],
+                        },
+                        "scene_weight": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                        },
+                        "role_in_episode": {
+                            "type": "string",
+                            "enum": ["lead", "counterpart", "support", "obstacle"],
+                        },
+                        "voice_mode": {
+                            "type": "string",
+                            "enum": ["dialogue", "monologue", "narration_only"],
+                        },
+                        "action_tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 4,
+                        },
+                        "affect_tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 4,
+                        },
+                        "relation_edges": {
+                            "type": "array",
+                            "maxItems": 5,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "target_label": {"type": "string"},
+                                    "relation_tag": {"type": "string"},
+                                    "direction": {
+                                        "type": "string",
+                                        "enum": ["to_target", "from_target", "mutual"],
+                                    },
+                                },
+                                "required": ["target_label", "relation_tag", "direction"],
+                            },
+                        },
+                    },
+                    "required": [
+                        "display_name",
+                        "aliases",
+                        "is_protagonist",
+                        "is_first_person",
+                        "entity_kind",
+                        "scene_weight",
+                        "role_in_episode",
+                        "voice_mode",
+                        "action_tags",
+                        "affect_tags",
+                        "relation_edges",
+                    ],
+                },
+            },
+            "cliffhanger_hooks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 3,
+            },
+        },
+        "required": ["episode_no", "mentioned_characters", "cliffhanger_hooks"],
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -619,6 +712,69 @@ def extract_anthropic_message_text(payload: dict) -> str:
         if text_value:
             parts.append(text_value)
     return "\n".join(parts).strip()
+
+
+def extract_anthropic_tool_input(payload: dict, *, tool_name: str) -> dict | None:
+    for item in list(payload.get("content") or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").strip() != "tool_use":
+            continue
+        if str(item.get("name") or "").strip() != tool_name:
+            continue
+        tool_input = item.get("input")
+        if isinstance(tool_input, dict):
+            return tool_input
+    return None
+
+
+class EpisodeCharacterSignalsParseError(ValueError):
+    def __init__(
+        self,
+        *,
+        episode_no: int,
+        model: str,
+        request_id: str,
+        json_parse_ok: bool,
+        line_parse_ok: bool,
+        char_count: int,
+        rel_count: int,
+        hook_count: int,
+        raw_sha256: str,
+        raw_preview: str,
+    ) -> None:
+        super().__init__(f"episode_character_signals returned no parseable structured output: episode_no={episode_no}")
+        self.episode_no = episode_no
+        self.model = model
+        self.request_id = request_id
+        self.json_parse_ok = json_parse_ok
+        self.line_parse_ok = line_parse_ok
+        self.char_count = char_count
+        self.rel_count = rel_count
+        self.hook_count = hook_count
+        self.raw_sha256 = raw_sha256
+        self.raw_preview = raw_preview
+
+
+def build_episode_character_signals_parse_diagnostics(raw_text: str) -> dict[str, object]:
+    raw = str(raw_text or "")
+    json_payload = extract_json_object(raw)
+    line_payload = parse_episode_character_signals_structured_text(raw)
+    mentioned_characters = list((line_payload or {}).get("mentioned_characters") or [])
+    relation_count = sum(len(list((item or {}).get("relation_edges") or [])) for item in mentioned_characters)
+    cliffhanger_hooks = list((line_payload or {}).get("cliffhanger_hooks") or [])
+    preview = raw.replace("\r", "\\r").replace("\n", "\\n")
+    if len(preview) > 500:
+        preview = f"{preview[:500]}..."
+    return {
+        "json_parse_ok": bool(json_payload),
+        "line_parse_ok": bool(line_payload),
+        "char_count": len(mentioned_characters),
+        "rel_count": relation_count,
+        "hook_count": len(cliffhanger_hooks),
+        "raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else "",
+        "raw_preview": preview,
+    }
 
 
 def build_anthropic_reasoning_options(model: str) -> dict[str, object]:
@@ -2330,33 +2486,89 @@ async def request_episode_character_signals_payload(
     summary_text: str,
 ) -> dict | None:
     user_prompt = build_episode_character_signals_user_prompt(row, summary_text)
+    episode_no = int(row.get("episode_no") or 0)
 
     if not settings.ANTHROPIC_API_KEY or not RP_REASONING_MODEL:
         raise RuntimeError("episode_character_signals requires anthropic reasoning configuration")
 
-    response = await client.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": settings.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": RP_REASONING_MODEL,
-            "max_tokens": 1400,
-            "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
-            "messages": [{"role": "user", "content": user_prompt}],
-            **build_anthropic_reasoning_options(RP_REASONING_MODEL),
-        },
-    )
-    response.raise_for_status()
-    raw_text = extract_anthropic_message_text(response.json())
-    parsed = extract_json_object(raw_text) or parse_episode_character_signals_structured_text(raw_text)
-    if not parsed:
-        raise ValueError(
-            f"episode_character_signals returned no parseable structured output: episode_no={int(row.get('episode_no') or 0)}"
+    request_headers = {
+        "x-api-key": settings.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    request_payload = {
+        "model": RP_REASONING_MODEL,
+        "max_tokens": 1400,
+        "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
+        "messages": [{"role": "user", "content": user_prompt}],
+        "tools": [EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA],
+        "tool_choice": {"type": "tool", "name": EPISODE_CHARACTER_SIGNALS_TOOL_NAME},
+        **build_anthropic_reasoning_options(RP_REASONING_MODEL),
+    }
+
+    response_payload: dict | None = None
+    request_id = ""
+    try:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=request_headers,
+            json=request_payload,
         )
-    return parsed
+        response.raise_for_status()
+        response_payload = response.json()
+        request_id = (
+            response.headers.get("request-id")
+            or response.headers.get("x-request-id")
+            or response.headers.get("anthropic-request-id")
+            or ""
+        ).strip()
+    except (HTTPStatusError, RequestError):
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=request_headers,
+            json={
+                "model": RP_REASONING_MODEL,
+                "max_tokens": 1400,
+                "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
+                "messages": [{"role": "user", "content": user_prompt}],
+                **build_anthropic_reasoning_options(RP_REASONING_MODEL),
+            },
+        )
+        response.raise_for_status()
+        response_payload = response.json()
+        request_id = (
+            response.headers.get("request-id")
+            or response.headers.get("x-request-id")
+            or response.headers.get("anthropic-request-id")
+            or ""
+        ).strip()
+
+    tool_payload = extract_anthropic_tool_input(response_payload or {}, tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME)
+    if tool_payload:
+        return tool_payload
+
+    raw_text = extract_anthropic_message_text(response_payload or {})
+    parsed_json = extract_json_object(raw_text)
+    if parsed_json:
+        return parsed_json
+
+    parsed_text = parse_episode_character_signals_structured_text(raw_text)
+    if parsed_text:
+        return parsed_text
+
+    diagnostics = build_episode_character_signals_parse_diagnostics(raw_text)
+    raise EpisodeCharacterSignalsParseError(
+        episode_no=episode_no,
+        model=RP_REASONING_MODEL,
+        request_id=request_id,
+        json_parse_ok=bool(diagnostics["json_parse_ok"]),
+        line_parse_ok=bool(diagnostics["line_parse_ok"]),
+        char_count=int(diagnostics["char_count"]),
+        rel_count=int(diagnostics["rel_count"]),
+        hook_count=int(diagnostics["hook_count"]),
+        raw_sha256=str(diagnostics["raw_sha256"]),
+        raw_preview=str(diagnostics["raw_preview"]),
+    )
 
 
 async def request_rp_profile_payload(
@@ -3120,7 +3332,20 @@ async def build_episode_character_signals_summaries(
             )
         except Exception as exc:
             if verbose:
-                print(f"[character-signals-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:160]}")
+                if isinstance(exc, EpisodeCharacterSignalsParseError):
+                    print(
+                        f"[character-signals-parse] product_id={product_id} episode_no={episode_no} "
+                        f"model={exc.model} request_id={exc.request_id or '-'} "
+                        f"json_parse_ok={'Y' if exc.json_parse_ok else 'N'} "
+                        f"line_parse_ok={'Y' if exc.line_parse_ok else 'N'} "
+                        f"char_count={exc.char_count} rel_count={exc.rel_count} hook_count={exc.hook_count} "
+                        f"raw_sha256={exc.raw_sha256}"
+                    )
+                    print(
+                        f"[character-signals-raw] product_id={product_id} episode_no={episode_no} "
+                        f"preview={json.dumps(exc.raw_preview, ensure_ascii=False)}"
+                    )
+                print(f"[character-signals-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
             continue
         normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
         with work_cursor(conn) as cur:
