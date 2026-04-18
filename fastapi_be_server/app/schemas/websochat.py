@@ -32,6 +32,7 @@ class WebsochatSessionItem(BaseModel):
     contextStatus: str | None = None
     canSendMessage: bool | None = None
     unavailableMessage: str | None = None
+    pendingQaActionKey: str | None = None
 
 
 class WebsochatMessageItem(BaseModel):
@@ -39,6 +40,7 @@ class WebsochatMessageItem(BaseModel):
     role: str
     content: str
     createdDate: str
+    clientMessageId: str | None = None
     referencedEpisodeNos: list[int] | None = None
     reasonCards: list["WebsochatReasonCardItem"] | None = None
     actionCards: list["WebsochatStarterActionItem"] | None = None

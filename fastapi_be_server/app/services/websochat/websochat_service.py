@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import json
 import logging
 import os
@@ -125,6 +126,11 @@ WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT = 2
 WEBSOCHAT_NONCANONICAL_NEXT_EPISODE_MARKER = "[[websochat:noncanonical:next_episode_write]]\n"
 WEBSOCHAT_MESSAGE_CASH_COST = 20
 WEBSOCHAT_NEXT_EPISODE_WRITE_CASH_COST = 30
+WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_CANDIDATE_LIMIT = 12
+WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_MIN_RATIO = 0.34
+WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS = 220
+WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME = "submit_character_resolution"
+WEBSOCHAT_ACTIVE_CHARACTER_SINGLE_CANDIDATE_FALLBACK_MIN_RATIO = 0.5
 
 
 def _resolve_websochat_message_cash_cost(
@@ -490,6 +496,25 @@ def _build_websochat_read_scope_required_reply() -> str:
     )
 
 
+def _infer_websochat_legacy_pending_qa_action_key(
+    *,
+    session_memory: dict[str, Any],
+    session_title: str | None,
+) -> str | None:
+    pending_qa_action_key = str(session_memory.get("pending_qa_action_key") or "").strip().lower() or None
+    if pending_qa_action_key in {"predict", "next_episode_write"}:
+        return pending_qa_action_key
+    scope_state = _resolve_websochat_read_scope_state(session_memory)
+    if scope_state == "known":
+        return None
+    normalized_title = re.sub(r"\s+", " ", str(session_title or "").strip())
+    if normalized_title == "다음 전개 예상해줘":
+        return "predict"
+    if normalized_title == "다음회차 써줘":
+        return "next_episode_write"
+    return None
+
+
 def _build_websochat_qa_mode_entry_reply(
     *,
     product_row: dict[str, Any],
@@ -521,6 +546,287 @@ def _build_websochat_rp_mode_entry_reply(
 
 def _build_websochat_rp_character_selection_guide_reply() -> str:
     return "누구랑 대화하고 싶어? 인물 이름만 말해주면 바로 그 인물과 대화를 시작할게."
+
+
+def _build_websochat_rp_character_resolution_clarify_reply(
+    *,
+    active_character_label: str | None,
+    resolution_source: str | None,
+    protagonist_intent: bool,
+    candidate_names: list[str] | None = None,
+) -> str:
+    normalized_label = re.sub(r"\s+", " ", str(active_character_label or "").strip())
+    if candidate_names and len(candidate_names) >= 2:
+        candidate_preview = ", ".join(candidate_names[:3])
+        return (
+            f"비슷한 인물이 여러 명 보여요. {candidate_preview}"
+            f"{' 중' if candidate_preview else ''} 누구랑 대화하고 싶어?"
+        )
+    if protagonist_intent or str(resolution_source or "").strip().lower() == "clarify_protagonist":
+        return "주인공을 말하는 거라면 이름이나 주인공이라고 적어줘. 다른 인물이면 그 인물 이름으로 다시 말해 주세요."
+    if normalized_label:
+        return (
+            f"이 작품 공개 범위에서는 {normalized_label}라는 인물을 찾지 못했어요. "
+            "주인공이나 다른 인물 이름으로 다시 말해 주세요."
+        )
+    return "이 작품 공개 범위에서 바로 찾을 수 있는 인물을 못 찾았어요. 주인공이나 다른 인물 이름으로 다시 말해 주세요."
+
+
+def _build_websochat_rp_scope_ready_reply(
+    *,
+    read_scope_label: str | None,
+    active_character_label: str | None,
+) -> str:
+    resolved_character_label = str(active_character_label or "").strip() or "그 인물"
+    if read_scope_label:
+        return f"좋아. {read_scope_label} 기준으로 맞췄어. 이제 {resolved_character_label}에게 말 걸어봐."
+    return f"좋아. 읽은 범위를 먼저 잡아뒀어. 이제 {resolved_character_label}에게 말 걸어봐."
+
+
+def _build_websochat_pending_qa_action_prompt(
+    *,
+    qa_action_key: str | None,
+    read_episode_to: int | None,
+) -> str | None:
+    normalized_action_key = str(qa_action_key or "").strip().lower() or None
+    if normalized_action_key not in {"predict", "next_episode_write"}:
+        return None
+    prompt_prefix = f"{max(int(read_episode_to or 0), 0)}화까지 기준으로 " if max(int(read_episode_to or 0), 0) > 0 else ""
+    if normalized_action_key == "predict":
+        return f"{prompt_prefix}다음 전개 예상해줘"
+    return f"{prompt_prefix}다음회차 써줘"
+
+
+def _resolve_websochat_next_session_title(
+    *,
+    default_prompt: str | None,
+    starter_mode_key: str | None,
+    session_memory: dict[str, Any],
+) -> str:
+    if str(starter_mode_key or "").strip().lower() == "rp":
+        active_character_label = _resolve_websochat_active_character_label(session_memory)
+        if active_character_label:
+            return f"{active_character_label}과 대화"
+    normalized_prompt = re.sub(r"\s+", " ", str(default_prompt or "")).strip()
+    return normalized_prompt[:40] or WEBSOCHAT_DEFAULT_TITLE
+
+
+def _build_websochat_character_candidate_names(
+    *,
+    scope_key: str,
+    payload: dict[str, Any],
+) -> list[str]:
+    names = [scope_key]
+    display_name = str(payload.get("display_name") or "").strip()
+    if display_name:
+        names.append(display_name)
+    aliases = [
+        str(alias or "").strip()
+        for alias in (payload.get("aliases") or [])
+        if str(alias or "").strip()
+    ]
+    return _merge_websochat_ordered_texts(names, aliases)
+
+
+def _score_websochat_character_name_similarity(
+    target_name: str,
+    candidate_names: list[str],
+) -> float:
+    normalized_target = _normalize_websochat_character_name(target_name)
+    if not normalized_target:
+        return 0.0
+    best_ratio = 0.0
+    for candidate_name in candidate_names:
+        normalized_candidate = _normalize_websochat_character_name(candidate_name)
+        if not normalized_candidate:
+            continue
+        if normalized_target == normalized_candidate:
+            return 1.0
+        ratio = SequenceMatcher(None, normalized_target, normalized_candidate).ratio()
+        if normalized_target in normalized_candidate or normalized_candidate in normalized_target:
+            ratio = max(ratio, 0.82)
+        best_ratio = max(best_ratio, ratio)
+    return best_ratio
+
+
+def _is_websochat_character_name_single_edit_close(
+    target_name: str,
+    candidate_name: str,
+) -> bool:
+    normalized_target = _normalize_websochat_character_name(target_name)
+    normalized_candidate = _normalize_websochat_character_name(candidate_name)
+    if not normalized_target or not normalized_candidate:
+        return False
+    if normalized_target == normalized_candidate:
+        return True
+    if normalized_target in normalized_candidate or normalized_candidate in normalized_target:
+        return min(len(normalized_target), len(normalized_candidate)) >= 2
+
+    target_len = len(normalized_target)
+    candidate_len = len(normalized_candidate)
+    if abs(target_len - candidate_len) > 1:
+        return False
+
+    if target_len == candidate_len:
+        diff_count = sum(1 for left, right in zip(normalized_target, normalized_candidate) if left != right)
+        return diff_count <= 1
+
+    shorter, longer = (
+        (normalized_target, normalized_candidate)
+        if target_len < candidate_len
+        else (normalized_candidate, normalized_target)
+    )
+    short_index = 0
+    long_index = 0
+    mismatch_count = 0
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+            continue
+        mismatch_count += 1
+        if mismatch_count > 1:
+            return False
+        long_index += 1
+    return True
+
+
+def _resolve_websochat_single_fuzzy_candidate_fallback(
+    *,
+    raw_value: str,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if len(candidates) != 1:
+        return None
+    candidate = dict(candidates[0] or {})
+    lexical_score = float(candidate.get("lexicalScore") or 0.0)
+    if lexical_score < WEBSOCHAT_ACTIVE_CHARACTER_SINGLE_CANDIDATE_FALLBACK_MIN_RATIO:
+        return None
+    candidate_names = [
+        str(alias or "").strip()
+        for alias in list(candidate.get("aliases") or [])
+        if str(alias or "").strip()
+    ]
+    if not _is_websochat_character_name_single_edit_close(raw_value, str(candidate.get("displayName") or "").strip()):
+        if not any(_is_websochat_character_name_single_edit_close(raw_value, candidate_name) for candidate_name in candidate_names):
+            return None
+    scope_key = str(candidate.get("scopeKey") or "").strip()
+    if not scope_key:
+        return None
+    return {
+        "scopeKey": scope_key,
+        "confidence": lexical_score,
+        "reason": "single_candidate_typo_fallback",
+    }
+
+
+async def _resolve_websochat_active_character_with_model(
+    *,
+    raw_value: str,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not settings.ANTHROPIC_API_KEY or not candidates:
+        return None
+
+    tool_schema = [
+        {
+            "name": WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME,
+            "description": "사용자 입력과 가장 가까운 캐릭터 scope_key 하나를 고르거나, 없으면 빈 문자열을 반환한다.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "scope_key": {
+                        "type": "string",
+                        "description": "선택한 scope_key. 적합한 후보가 없으면 빈 문자열.",
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "0.0~1.0 사이 확신도.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "판단 근거 한 줄.",
+                    },
+                },
+                "required": ["scope_key", "confidence", "reason"],
+            },
+        }
+    ]
+    candidate_payload = [
+        {
+            "scope_key": str(item.get("scopeKey") or "").strip(),
+            "display_name": str(item.get("displayName") or "").strip(),
+            "aliases": [str(alias).strip() for alias in list(item.get("aliases") or []) if str(alias).strip()],
+            "lexical_score": round(float(item.get("lexicalScore") or 0.0), 4),
+        }
+        for item in candidates
+        if str(item.get("scopeKey") or "").strip()
+    ]
+    if not candidate_payload:
+        return None
+
+    try:
+        response = await _call_claude_messages(
+            system_prompt="\n\n".join(
+                [
+                    "너는 웹소챗 인물명 해석기다.",
+                    "사용자 입력이 후보 캐릭터 중 누구를 뜻하는지 판단하고 tool input만 반환하라.",
+                    "하드코딩 추측이나 작품 밖 인물 상상은 금지한다.",
+                    "오타, 띄어쓰기 차이, 부분 이름, 별칭은 허용한다.",
+                    "후보 중 하나와 충분히 가깝지 않으면 scope_key는 빈 문자열로 반환하라.",
+                    "confidence가 0.65 미만이면 scope_key를 빈 문자열로 두어라.",
+                ]
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"사용자 입력: {raw_value}\n\n"
+                        f"후보 목록(JSON): {json.dumps(candidate_payload, ensure_ascii=False)}"
+                    ),
+                }
+            ],
+            tools=tool_schema,
+            tool_choice={"type": "tool", "name": WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME},
+            max_tokens=WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS,
+        )
+        content = response.get("content") or []
+        tool_uses = _extract_tool_use_blocks(content)
+        tool_input = None
+        for block in reversed(tool_uses):
+            if str(block.get("name") or "").strip() == WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME and isinstance(block.get("input"), dict):
+                tool_input = dict(block.get("input") or {})
+                break
+        if tool_input is None:
+            tool_input = _extract_websochat_json_object(_extract_text(content))
+        if not isinstance(tool_input, dict):
+            return None
+        raw_scope_key = str(tool_input.get("scope_key") or "").strip()
+        try:
+            confidence = float(tool_input.get("confidence") or 0.0)
+        except Exception:
+            confidence = 0.0
+        if not raw_scope_key or confidence < 0.65:
+            return None
+        candidate_scope_keys = {
+            str(item.get("scopeKey") or "").strip()
+            for item in candidates
+            if str(item.get("scopeKey") or "").strip()
+        }
+        if raw_scope_key not in candidate_scope_keys:
+            return None
+        return {
+            "scopeKey": raw_scope_key,
+            "confidence": max(0.0, min(confidence, 1.0)),
+            "reason": re.sub(r"\s+", " ", str(tool_input.get("reason") or "").strip())[:160],
+        }
+    except Exception as exc:
+        logger.warning(
+            "websochat rp_resolution_fuzzy_failed raw=%s error=%s",
+            raw_value,
+            exc,
+        )
+        return None
 
 
 async def _insert_websochat_assistant_message(
@@ -3225,6 +3531,8 @@ async def _resolve_websochat_protagonist_scope_key(
     if not protagonist_rows:
         return {
             "scopeKey": None,
+            "displayName": None,
+            "candidateNames": [],
             "protagonistIntent": False,
             "resolutionSource": "none",
             "candidateCount": 0,
@@ -3268,12 +3576,18 @@ async def _resolve_websochat_protagonist_scope_key(
             if dominant_inventory_row:
                 return {
                     "scopeKey": str(dominant_inventory_row.get("scopeKey") or "").strip() or None,
+                    "displayName": str((dominant_inventory_row.get("payload") or {}).get("display_name") or "").strip()
+                    or str(dominant_inventory_row.get("scopeKey") or "").strip()
+                    or None,
+                    "candidateNames": [],
                     "protagonistIntent": True,
                     "resolutionSource": "protagonist_inventory_dominant",
                     "candidateCount": len(protagonist_rows),
                 }
         return {
             "scopeKey": None,
+            "displayName": None,
+            "candidateNames": [],
             "protagonistIntent": False,
             "resolutionSource": "none",
             "candidateCount": 0,
@@ -3339,17 +3653,45 @@ async def _resolve_websochat_protagonist_scope_key(
 
     unique_scope_keys = sorted(set(matched_scope_keys))
     if len(unique_scope_keys) == 1:
+        matched_scope_key = unique_scope_keys[0]
+        matched_inventory_row = next(
+            (
+                row for row in matched_inventory_rows
+                if str(row.get("scopeKey") or "").strip() == matched_scope_key
+            ),
+            {},
+        )
         return {
-            "scopeKey": unique_scope_keys[0],
+            "scopeKey": matched_scope_key,
+            "displayName": str((matched_inventory_row.get("payload") or {}).get("display_name") or "").strip()
+            or matched_scope_key,
+            "candidateNames": [],
             "protagonistIntent": True,
             "resolutionSource": "protagonist_profile",
             "candidateCount": len(matched_inventory_rows),
         }
     if len(unique_scope_keys) > 1:
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message="주인공으로 잡히는 RP 캐릭터가 여러 명이라 누구와 대화할지 더 구체적으로 말해줘.",
-        )
+        candidate_names = []
+        for scope_key in unique_scope_keys:
+            matched_inventory_row = next(
+                (
+                    row for row in matched_inventory_rows
+                    if str(row.get("scopeKey") or "").strip() == scope_key
+                ),
+                {},
+            )
+            candidate_names.append(
+                str((matched_inventory_row.get("payload") or {}).get("display_name") or "").strip()
+                or scope_key
+            )
+        return {
+            "scopeKey": None,
+            "displayName": None,
+            "candidateNames": candidate_names,
+            "protagonistIntent": True,
+            "resolutionSource": "protagonist_ambiguous",
+            "candidateCount": len(unique_scope_keys),
+        }
     best_inventory_row = max(
         matched_inventory_rows,
         key=_rank_websochat_protagonist_inventory_row,
@@ -3357,6 +3699,10 @@ async def _resolve_websochat_protagonist_scope_key(
     best_scope_key = str(best_inventory_row.get("scopeKey") or "").strip()
     return {
         "scopeKey": best_scope_key or None,
+        "displayName": str((best_inventory_row.get("payload") or {}).get("display_name") or "").strip()
+        or best_scope_key
+        or None,
+        "candidateNames": [],
         "protagonistIntent": True,
         "resolutionSource": "protagonist_inventory",
         "candidateCount": len(matched_inventory_rows),
@@ -3594,6 +3940,8 @@ async def _resolve_websochat_active_character_resolution(
     if not raw_value:
         return {
             "scopeKey": None,
+            "displayName": None,
+            "candidateNames": [],
             "resolutionSource": "none",
             "protagonistIntent": False,
             "candidateCount": 0,
@@ -3601,6 +3949,8 @@ async def _resolve_websochat_active_character_resolution(
     if ":" in raw_value:
         return {
             "scopeKey": raw_value,
+            "displayName": raw_value.split("named:", 1)[1].strip() if "named:" in raw_value else raw_value,
+            "candidateNames": [],
             "resolutionSource": "explicit_scope",
             "protagonistIntent": False,
             "candidateCount": 1,
@@ -3618,6 +3968,7 @@ async def _resolve_websochat_active_character_resolution(
     if protagonist_intent:
         return {
             **protagonist_resolution,
+            "candidateNames": list(protagonist_resolution.get("candidateNames") or []),
             "resolutionSource": "clarify_protagonist",
         }
 
@@ -3636,6 +3987,7 @@ async def _resolve_websochat_active_character_resolution(
     )
     target_name = _normalize_websochat_character_name(raw_value)
     matched_inventory_scope_keys: list[str] = []
+    fuzzy_candidates_by_scope: dict[str, dict[str, Any]] = {}
     for row in inventory_result.mappings().all():
         scope_key = str(row.get("scopeKey") or "").strip()
         if not scope_key:
@@ -3643,30 +3995,41 @@ async def _resolve_websochat_active_character_resolution(
         payload = _extract_websochat_json_object(str(row.get("summaryText") or "")) or {}
         if not _is_websochat_inventory_rp_eligible(payload):
             continue
-        candidate_names = [scope_key]
-        display_name = str(payload.get("display_name") or "").strip()
-        if display_name:
-            candidate_names.append(display_name)
-        for alias in payload.get("aliases") or []:
-            alias_text = str(alias or "").strip()
-            if alias_text:
-                candidate_names.append(alias_text)
+        candidate_names = _build_websochat_character_candidate_names(scope_key=scope_key, payload=payload)
+        if scope_key not in fuzzy_candidates_by_scope:
+            fuzzy_candidates_by_scope[scope_key] = {
+                "scopeKey": scope_key,
+                "displayName": str(payload.get("display_name") or "").strip() or scope_key,
+                "aliases": candidate_names,
+                "lexicalScore": _score_websochat_character_name_similarity(raw_value, candidate_names),
+            }
         if any(_normalize_websochat_character_name(name) == target_name for name in candidate_names if str(name).strip()):
             matched_inventory_scope_keys.append(scope_key)
 
     unique_inventory_scope_keys = sorted(set(matched_inventory_scope_keys))
     if len(unique_inventory_scope_keys) == 1:
+        matched_scope_key = unique_inventory_scope_keys[0]
+        matched_candidate = fuzzy_candidates_by_scope.get(matched_scope_key) or {}
         return {
-            "scopeKey": unique_inventory_scope_keys[0],
+            "scopeKey": matched_scope_key,
+            "displayName": str(matched_candidate.get("displayName") or "").strip() or matched_scope_key,
             "resolutionSource": "inventory_alias",
             "protagonistIntent": False,
             "candidateCount": len(unique_inventory_scope_keys),
         }
     if len(unique_inventory_scope_keys) > 1:
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message="같은 이름으로 여러 인물이 잡혀서 누구와 대화할지 정하기 어렵습니다. 캐릭터를 더 구체적으로 지정해주세요.",
-        )
+        candidate_names = [
+            str((fuzzy_candidates_by_scope.get(scope_key) or {}).get("displayName") or "").strip() or scope_key
+            for scope_key in unique_inventory_scope_keys
+        ]
+        return {
+            "scopeKey": None,
+            "displayName": None,
+            "candidateNames": candidate_names,
+            "resolutionSource": "inventory_ambiguous",
+            "protagonistIntent": False,
+            "candidateCount": len(unique_inventory_scope_keys),
+        }
 
     result = await db.execute(
         text(
@@ -3688,32 +4051,126 @@ async def _resolve_websochat_active_character_resolution(
         if not scope_key:
             continue
         payload = _extract_websochat_json_object(str(row.get("summaryText") or "")) or {}
-        candidate_names = [scope_key]
-        display_name = str(payload.get("display_name") or "").strip()
-        if display_name:
-            candidate_names.append(display_name)
-        for alias in payload.get("aliases") or []:
-            alias_text = str(alias or "").strip()
-            if alias_text:
-                candidate_names.append(alias_text)
+        candidate_names = _build_websochat_character_candidate_names(scope_key=scope_key, payload=payload)
+        existing_candidate = fuzzy_candidates_by_scope.get(scope_key)
+        merged_candidate_names = (
+            _merge_websochat_ordered_texts(
+                list(existing_candidate.get("aliases") or []),
+                candidate_names,
+            )
+            if existing_candidate
+            else candidate_names
+        )
+        fuzzy_candidates_by_scope[scope_key] = {
+            "scopeKey": scope_key,
+            "displayName": str(payload.get("display_name") or "").strip()
+            or str((existing_candidate or {}).get("displayName") or "").strip()
+            or scope_key,
+            "aliases": merged_candidate_names,
+            "lexicalScore": max(
+                float((existing_candidate or {}).get("lexicalScore") or 0.0),
+                _score_websochat_character_name_similarity(raw_value, merged_candidate_names),
+            ),
+        }
         if any(_normalize_websochat_character_name(name) == target_name for name in candidate_names if str(name).strip()):
             matched_scope_keys.append(scope_key)
 
     unique_scope_keys = sorted(set(matched_scope_keys))
     if not unique_scope_keys:
+        ranked_fuzzy_candidates = sorted(
+            [
+                item
+                for item in fuzzy_candidates_by_scope.values()
+                if float(item.get("lexicalScore") or 0.0) >= WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_MIN_RATIO
+            ],
+            key=lambda item: (
+                float(item.get("lexicalScore") or 0.0),
+                len(str(item.get("displayName") or "").strip()),
+            ),
+            reverse=True,
+        )[:WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_CANDIDATE_LIMIT]
+        fuzzy_resolution = await _resolve_websochat_active_character_with_model(
+            raw_value=raw_value,
+            candidates=ranked_fuzzy_candidates,
+        )
+        if fuzzy_resolution:
+            matched_candidate = next(
+                (
+                    item
+                    for item in ranked_fuzzy_candidates
+                    if str(item.get("scopeKey") or "").strip() == fuzzy_resolution["scopeKey"]
+                ),
+                {},
+            )
+            logger.info(
+                "websochat rp_resolution_fuzzy product_id=%s raw=%s scope_key=%s confidence=%s reason=%s candidate_count=%s",
+                product_id,
+                raw_value,
+                fuzzy_resolution["scopeKey"],
+                fuzzy_resolution.get("confidence"),
+                fuzzy_resolution.get("reason"),
+                len(ranked_fuzzy_candidates),
+            )
+            return {
+                "scopeKey": fuzzy_resolution["scopeKey"],
+                "displayName": str(matched_candidate.get("displayName") or "").strip() or fuzzy_resolution["scopeKey"],
+                "resolutionSource": "fuzzy_llm",
+                "protagonistIntent": False,
+                "candidateCount": len(ranked_fuzzy_candidates),
+            }
+        fallback_resolution = _resolve_websochat_single_fuzzy_candidate_fallback(
+            raw_value=raw_value,
+            candidates=ranked_fuzzy_candidates,
+        )
+        if fallback_resolution:
+            matched_candidate = next(
+                (
+                    item
+                    for item in ranked_fuzzy_candidates
+                    if str(item.get("scopeKey") or "").strip() == fallback_resolution["scopeKey"]
+                ),
+                {},
+            )
+            logger.info(
+                "websochat rp_resolution_fuzzy_single_fallback product_id=%s raw=%s scope_key=%s confidence=%s candidate_count=%s",
+                product_id,
+                raw_value,
+                fallback_resolution["scopeKey"],
+                fallback_resolution.get("confidence"),
+                len(ranked_fuzzy_candidates),
+            )
+            return {
+                "scopeKey": fallback_resolution["scopeKey"],
+                "displayName": str(matched_candidate.get("displayName") or "").strip() or fallback_resolution["scopeKey"],
+                "resolutionSource": "fuzzy_single_fallback",
+                "protagonistIntent": False,
+                "candidateCount": len(ranked_fuzzy_candidates),
+            }
         return {
             "scopeKey": None,
+            "displayName": None,
             "resolutionSource": "none",
             "protagonistIntent": False,
-            "candidateCount": 0,
+            "candidateCount": len(ranked_fuzzy_candidates),
         }
     if len(unique_scope_keys) > 1:
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message="같은 이름으로 여러 RP 캐릭터가 잡혀서 누구와 대화할지 정하기 어렵습니다. 캐릭터를 더 구체적으로 지정해주세요.",
-        )
+        candidate_names = [
+            str((fuzzy_candidates_by_scope.get(scope_key) or {}).get("displayName") or "").strip() or scope_key
+            for scope_key in unique_scope_keys
+        ]
+        return {
+            "scopeKey": None,
+            "displayName": None,
+            "candidateNames": candidate_names,
+            "resolutionSource": "profile_ambiguous",
+            "protagonistIntent": False,
+            "candidateCount": len(unique_scope_keys),
+        }
+    matched_scope_key = unique_scope_keys[0]
+    matched_candidate = fuzzy_candidates_by_scope.get(matched_scope_key) or {}
     return {
-        "scopeKey": unique_scope_keys[0],
+        "scopeKey": matched_scope_key,
+        "displayName": str(matched_candidate.get("displayName") or "").strip() or matched_scope_key,
         "resolutionSource": "profile_alias",
         "protagonistIntent": False,
         "candidateCount": len(unique_scope_keys),
@@ -4873,6 +5330,7 @@ async def _get_existing_turn_messages(
             SELECT
                 message_id AS messageId,
                 role,
+                client_message_id AS clientMessageId,
                 content,
                 DATE_FORMAT(created_date, '%Y-%m-%d %H:%i:%s') AS createdDate
             FROM tb_story_agent_message
@@ -5153,6 +5611,10 @@ async def get_sessions(
                     db,
                 )
             read_episode_title = read_scope_title_cache[cache_key]
+        pending_qa_action_key = _infer_websochat_legacy_pending_qa_action_key(
+            session_memory=session_memory,
+            session_title=row.get("title"),
+        )
 
         items.append(
             {
@@ -5173,6 +5635,7 @@ async def get_sessions(
                 "contextStatus": product_state.get("contextStatus"),
                 "canSendMessage": product_state.get("canSendMessage"),
                 "unavailableMessage": product_state.get("unavailableMessage"),
+                "pendingQaActionKey": pending_qa_action_key,
                 "rpStage": rp_session_state["rpStage"],
                 "rpActiveCharacterLabel": rp_session_state["rpActiveCharacterLabel"],
             }
@@ -5205,6 +5668,7 @@ async def get_messages(
         SELECT
             message_id AS messageId,
             role,
+            client_message_id AS clientMessageId,
             content,
             DATE_FORMAT(created_date, '%Y-%m-%d %H:%i:%s') AS createdDate
         FROM tb_story_agent_message
@@ -5277,6 +5741,10 @@ async def get_messages(
     )
     guide_message = None
     pending_mode_entry_guide = str(session_memory.get("pending_mode_entry_guide") or "").strip().lower() or None
+    pending_qa_action_key = _infer_websochat_legacy_pending_qa_action_key(
+        session_memory=session_memory,
+        session_title=session_row.get("title"),
+    )
     if pending_mode_entry_guide == "rp_select":
         read_scope_label = await _build_websochat_read_scope_label(
             product_id=int(session_row["product_id"]),
@@ -5343,6 +5811,7 @@ async def get_messages(
                 "contextStatus": product_state.get("contextStatus"),
                 "canSendMessage": bool(product_state.get("canSendMessage")),
                 "unavailableMessage": product_state.get("unavailableMessage"),
+                "pendingQaActionKey": pending_qa_action_key,
                 "createdDate": (
                     session_row["created_date"].strftime("%Y-%m-%d %H:%M:%S")
                     if isinstance(session_row["created_date"], datetime)
@@ -5748,7 +6217,14 @@ async def post_message(
         db=db,
     )
     resolved_active_character = str(resolution.get("scopeKey") or "").strip() or None
-    if req_body.active_character and not resolved_active_character:
+    resolved_active_character_label = (
+        str(resolution.get("displayName") or "").strip()
+        or str(req_body.active_character or "").strip()
+        or None
+    )
+    needs_character_resolution_clarify = bool(req_body.active_character and not resolved_active_character)
+    character_resolution_clarify_reply = None
+    if needs_character_resolution_clarify:
         logger.info(
             "websochat rp_resolution_clarify product_id=%s raw=%s resolution_source=%s protagonist_intent=%s candidate_count=%s",
             int(session_row["product_id"]),
@@ -5757,22 +6233,33 @@ async def post_message(
             bool(resolution.get("protagonistIntent")),
             int(resolution.get("candidateCount") or 0),
         )
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message="누구와 이야기하고 싶은지 이름으로 한 번만 더 말해줘. 주인공이면 이름이나 주인공이라고 적어도 돼요.",
+        character_resolution_clarify_reply = _build_websochat_rp_character_resolution_clarify_reply(
+            active_character_label=req_body.active_character,
+            resolution_source=str(resolution.get("resolutionSource") or "none"),
+            protagonist_intent=bool(resolution.get("protagonistIntent")),
+            candidate_names=[
+                str(candidate_name).strip()
+                for candidate_name in list(resolution.get("candidateNames") or [])
+                if str(candidate_name).strip()
+            ],
         )
-    next_session_memory = _merge_websochat_session_memory(
-        base_memory=current_session_memory,
-        rp_mode=req_body.rp_mode,
-        active_character=resolved_active_character,
-        active_character_label=req_body.active_character,
-        scene_episode_no=req_body.scene_episode_no,
-        game_mode=explicit_game_mode,
-        game_gender_scope=req_body.game_gender_scope,
-        game_category=req_body.game_category,
-        game_match_mode=req_body.game_match_mode,
-        game_read_episode_to=req_body.game_read_episode_to,
-    )
+    if needs_character_resolution_clarify:
+        next_session_memory = _clear_websochat_rp_context(_clear_websochat_game_context(current_session_memory))
+        next_session_memory["pending_rp_character_selection"] = True
+        next_session_memory["pending_mode_entry_guide"] = None
+    else:
+        next_session_memory = _merge_websochat_session_memory(
+            base_memory=current_session_memory,
+            rp_mode=req_body.rp_mode,
+            active_character=resolved_active_character,
+            active_character_label=resolved_active_character_label,
+            scene_episode_no=req_body.scene_episode_no,
+            game_mode=explicit_game_mode,
+            game_gender_scope=req_body.game_gender_scope,
+            game_category=req_body.game_category,
+            game_match_mode=req_body.game_match_mode,
+            game_read_episode_to=req_body.game_read_episode_to,
+        )
     next_session_memory = _apply_websochat_account_read_scope(
         next_session_memory,
         req_body.account_read_episode_to,
@@ -5865,6 +6352,17 @@ async def post_message(
         synced_latest_episode_no,
         _build_websochat_prompt_preview(req_body.content),
     )
+    pending_qa_action_key = _infer_websochat_legacy_pending_qa_action_key(
+        session_memory=next_session_memory,
+        session_title=session_row.get("title"),
+    )
+    effective_qa_action_key = qa_action_key
+    if (
+        read_scope_decision["is_scope_only"]
+        and not effective_qa_action_key
+        and pending_qa_action_key in {"predict", "next_episode_write"}
+    ):
+        effective_qa_action_key = pending_qa_action_key
 
     created_id = user_id if user_id is not None else settings.DB_DML_DEFAULT_ID
 
@@ -5906,15 +6404,108 @@ async def post_message(
                 }
             }
 
+        if character_resolution_clarify_reply:
+            user_content = str(req_body.content or req_body.active_character or "").strip()
+            insert_query = text(
+                """
+                INSERT INTO tb_story_agent_message (
+                    session_id, role, client_message_id, content, created_id
+                )
+                VALUES (
+                    :session_id, :role, :client_message_id, :content, :created_id
+                )
+                """
+            )
+            user_result = await db.execute(
+                insert_query,
+                {
+                    "session_id": session_id,
+                    "role": "user",
+                    "client_message_id": req_body.client_message_id,
+                    "content": user_content,
+                    "created_id": created_id,
+                },
+            )
+            assistant_result = await db.execute(
+                insert_query,
+                {
+                    "session_id": session_id,
+                    "role": "assistant",
+                    "client_message_id": req_body.client_message_id,
+                    "content": character_resolution_clarify_reply,
+                    "created_id": settings.DB_DML_DEFAULT_ID,
+                },
+            )
+            await db.execute(
+                text(
+                    f"""
+                    UPDATE tb_story_agent_session
+                    SET title = CASE
+                            WHEN title = :default_title THEN :next_title
+                            ELSE title
+                        END,
+                        session_memory_json = :session_memory_json,
+                        expires_at = DATE_ADD(NOW(), INTERVAL {WEBSOCHAT_SESSION_TTL_DAYS} DAY),
+                        updated_id = :updated_id,
+                        updated_date = NOW()
+                    WHERE session_id = :session_id
+                    """
+                ),
+                {
+                    "default_title": WEBSOCHAT_DEFAULT_TITLE,
+                    "next_title": _resolve_websochat_next_session_title(
+                        default_prompt=user_content,
+                        starter_mode_key=starter_mode_key,
+                        session_memory=next_session_memory,
+                    ),
+                    "session_memory_json": _serialize_websochat_session_memory(next_session_memory),
+                    "updated_id": created_id,
+                    "session_id": session_id,
+                },
+            )
+            await db.commit()
+            logger.info(
+                "websochat rp_resolution_clarify_completed session_id=%s raw=%s resolution_source=%s",
+                session_id,
+                req_body.active_character,
+                str(resolution.get("resolutionSource") or "none"),
+            )
+            return {
+                "data": {
+                    "sessionId": session_id,
+                    "messages": [
+                        {
+                            "messageId": int(user_result.lastrowid),
+                            "role": "user",
+                            "clientMessageId": req_body.client_message_id,
+                            "content": user_content,
+                        },
+                        {
+                            "messageId": int(assistant_result.lastrowid),
+                            "role": "assistant",
+                            "clientMessageId": req_body.client_message_id,
+                            "content": character_resolution_clarify_reply,
+                        },
+                    ],
+                }
+            }
+
         should_charge_cash = await _resolve_websochat_message_charge_required(
             user_id=user_id,
             guest_key=resolved_guest_key,
             db=db,
-            qa_action_key=qa_action_key,
+            qa_action_key=effective_qa_action_key,
         )
 
         if read_scope_decision["is_scope_only"]:
             requested_read_episode_to = int(read_scope_decision["read_episode_to"] or 0) or None
+            current_rp_stage = _resolve_websochat_rp_stage(next_session_memory)
+            active_mode = str(next_session_memory.get("active_mode") or "").strip().lower()
+            read_scope_label = await _build_websochat_read_scope_label(
+                product_id=int(session_row["product_id"]),
+                read_episode_to=display_read_episode_to,
+                db=db,
+            )
             if (
                 requested_read_episode_to is not None
                 and synced_latest_episode_no > 0
@@ -5924,17 +6515,92 @@ async def post_message(
                     requested_read_episode_to=requested_read_episode_to,
                     synced_latest_episode_no=synced_latest_episode_no,
                 )
+                model_used = "system"
+                route_mode = "scope:set"
+                fallback_used = False
+                intent = "scope"
+                route_session_memory = next_session_memory
+            elif effective_qa_action_key in {"predict", "next_episode_write"}:
+                resumed_prompt = _build_websochat_pending_qa_action_prompt(
+                    qa_action_key=effective_qa_action_key,
+                    read_episode_to=display_read_episode_to,
+                )
+                resumed_session_memory = _normalize_websochat_session_memory(next_session_memory)
+                resumed_session_memory["pending_qa_action_key"] = None
+                (
+                    assistant_reply,
+                    model_used,
+                    route_mode,
+                    fallback_used,
+                    intent,
+                    route_session_memory,
+                ) = await _generate_websochat_reply(
+                    session_id=session_id,
+                    session_memory=resumed_session_memory,
+                    product_row=product_row,
+                    user_prompt=str(resumed_prompt or req_body.content),
+                    user_id=user_id,
+                    db=db,
+                    forced_route="qa",
+                )
+            elif active_mode in WEBSOCHAT_ALLOWED_GAME_MODES:
+                assistant_reply = (
+                    build_websochat_game_guide_reply(
+                        session_memory=next_session_memory,
+                        product_row=product_row,
+                        read_scope_label=read_scope_label,
+                    )
+                    or await _build_websochat_read_scope_confirm_reply(
+                        product_id=int(session_row["product_id"]),
+                        read_episode_to=display_read_episode_to,
+                        db=db,
+                    )
+                )
+                model_used = "system"
+                route_mode = "scope:set->game:guide"
+                fallback_used = False
+                intent = "scope"
+                route_session_memory = next_session_memory
+            elif current_rp_stage == "awaiting_character":
+                assistant_reply = _build_websochat_rp_mode_entry_reply(
+                    read_scope_label=read_scope_label,
+                )
+                model_used = "system"
+                route_mode = "scope:set->rp:starter"
+                fallback_used = False
+                intent = "scope"
+                route_session_memory = next_session_memory
+            elif current_rp_stage == "chatting":
+                assistant_reply = _build_websochat_rp_scope_ready_reply(
+                    read_scope_label=read_scope_label,
+                    active_character_label=_resolve_websochat_active_character_label(next_session_memory),
+                )
+                model_used = "system"
+                route_mode = "scope:set->rp:resume"
+                fallback_used = False
+                intent = "scope"
+                route_session_memory = next_session_memory
+            elif str(next_session_memory.get("pending_mode_entry_guide") or "").strip().lower() == "qa_ready":
+                assistant_reply = _build_websochat_qa_mode_entry_reply(
+                    product_row=product_row,
+                    read_scope_label=read_scope_label,
+                )
+                model_used = "system"
+                route_mode = "scope:set->qa:starter"
+                fallback_used = False
+                intent = "scope"
+                route_session_memory = next_session_memory
             else:
                 assistant_reply = await _build_websochat_read_scope_confirm_reply(
                     product_id=int(session_row["product_id"]),
                     read_episode_to=display_read_episode_to,
                     db=db,
                 )
-            model_used = "system"
-            route_mode = "scope:set"
-            fallback_used = False
-            intent = "scope"
-            route_session_memory = None
+                model_used = "system"
+                route_mode = "scope:set"
+                fallback_used = False
+                intent = "scope"
+                route_session_memory = next_session_memory
         elif starter_mode_key == "qa" and not qa_action_key:
             read_scope_label = await _build_websochat_read_scope_label(
                 product_id=int(session_row["product_id"]),
@@ -5988,7 +6654,11 @@ async def post_message(
                 if int(episode_no or 0) > 0
             ]
             next_session_memory = _normalize_websochat_session_memory(route_session_memory)
-        if route_mode not in {"qa:starter", "rp:starter"} and not _is_websochat_noncanonical_action(qa_action_key):
+        if route_mode == "guard:read_scope_required" and qa_action_key in {"predict", "next_episode_write"}:
+            next_session_memory["pending_qa_action_key"] = qa_action_key
+        elif route_mode != "guard:read_scope_required":
+            next_session_memory["pending_qa_action_key"] = None
+        if route_mode not in {"qa:starter", "rp:starter"} and not _is_websochat_noncanonical_action(effective_qa_action_key):
             next_session_memory = _update_websochat_session_memory_after_reply(
                 next_session_memory,
                 user_prompt=req_body.content,
@@ -6011,7 +6681,7 @@ async def post_message(
                 "session_id": session_id,
                 "role": "user",
                 "client_message_id": req_body.client_message_id,
-                "content": _mark_websochat_noncanonical_message(req_body.content, qa_action_key=qa_action_key),
+                "content": _mark_websochat_noncanonical_message(req_body.content, qa_action_key=effective_qa_action_key),
                 "created_id": created_id,
             },
         )
@@ -6021,7 +6691,7 @@ async def post_message(
                 "session_id": session_id,
                 "role": "assistant",
                 "client_message_id": req_body.client_message_id,
-                "content": _mark_websochat_noncanonical_message(assistant_reply, qa_action_key=qa_action_key),
+                "content": _mark_websochat_noncanonical_message(assistant_reply, qa_action_key=effective_qa_action_key),
                 "created_id": settings.DB_DML_DEFAULT_ID,
             },
         )
@@ -6032,7 +6702,7 @@ async def post_message(
                 session_id=session_id,
                 product_id=int(session_row["product_id"]),
                 db=db,
-                cash_cost=_resolve_websochat_message_cash_cost(qa_action_key),
+                cash_cost=_resolve_websochat_message_cash_cost(effective_qa_action_key),
             )
 
         update_title_query = text(
@@ -6053,7 +6723,11 @@ async def post_message(
             update_title_query,
             {
                 "default_title": WEBSOCHAT_DEFAULT_TITLE,
-                "next_title": req_body.content[:40],
+                "next_title": _resolve_websochat_next_session_title(
+                    default_prompt=req_body.content,
+                    starter_mode_key=starter_mode_key,
+                    session_memory=next_session_memory,
+                ),
                 "session_memory_json": _serialize_websochat_session_memory(next_session_memory),
                 "updated_id": created_id,
                 "session_id": session_id,
@@ -6077,6 +6751,7 @@ async def post_message(
             {
                 "messageId": int(assistant_result.lastrowid),
                 "role": "assistant",
+                "clientMessageId": req_body.client_message_id,
                 "content": assistant_reply,
                 "referencedEpisodeNos": [],
             }
@@ -6085,6 +6760,7 @@ async def post_message(
                 {
                     "messageId": int(assistant_result.lastrowid),
                     "role": "assistant",
+                    "clientMessageId": req_body.client_message_id,
                     "content": assistant_reply,
                 },
                 latest_episode_no=_resolve_websochat_episode_ref_ceiling(
@@ -6119,6 +6795,7 @@ async def post_message(
                     {
                         "messageId": int(user_result.lastrowid),
                         "role": "user",
+                        "clientMessageId": req_body.client_message_id,
                         "content": req_body.content,
                     },
                     _attach_websochat_concierge_cards(
