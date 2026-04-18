@@ -25,6 +25,7 @@ WEBSOCHAT_ALLOWED_READ_SCOPE_STATES = {"unknown", "none", "known"}
 WEBSOCHAT_ALLOWED_READ_SCOPE_SOURCES = {"unknown", "account", "prompt"}
 WEBSOCHAT_ALLOWED_RP_STAGES = {"idle", "awaiting_character", "chatting"}
 WEBSOCHAT_ALLOWED_PENDING_MODE_ENTRY_GUIDES = {"qa_ready", "rp_select"}
+WEBSOCHAT_ALLOWED_PENDING_QA_ACTION_KEYS = {"predict", "next_episode_write"}
 WEBSOCHAT_RP_RECENT_FACT_LIMIT = 6
 WEBSOCHAT_QA_RECENT_NOTE_LIMIT = 10
 WEBSOCHAT_QA_CORRECTION_LIMIT = 6
@@ -175,6 +176,7 @@ def _clear_websochat_game_context(session_memory: dict[str, Any]) -> dict[str, A
         game_category=None,
         game_match_mode=None,
     )
+    normalized["pending_qa_action_key"] = None
     normalized["pending_mode_entry_guide"] = None
     return normalized
 
@@ -188,6 +190,7 @@ def _clear_websochat_rp_context(session_memory: dict[str, Any]) -> dict[str, Any
     normalized["scene_episode_no"] = None
     normalized["relationship_stage"] = None
     normalized["recent_rp_facts"] = []
+    normalized["pending_qa_action_key"] = None
     normalized["pending_mode_entry_guide"] = None
     active_game_mode = str((normalized.get("game_context") or {}).get("mode") or "").strip().lower()
     normalized["active_mode"] = active_game_mode if active_game_mode in WEBSOCHAT_ALLOWED_GAME_MODES else None
@@ -235,6 +238,9 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
     pending_mode_entry_guide = str(parsed.get("pending_mode_entry_guide") or "").strip().lower() or None
     if pending_mode_entry_guide not in WEBSOCHAT_ALLOWED_PENDING_MODE_ENTRY_GUIDES:
         pending_mode_entry_guide = None
+    pending_qa_action_key = str(parsed.get("pending_qa_action_key") or "").strip().lower() or None
+    if pending_qa_action_key not in WEBSOCHAT_ALLOWED_PENDING_QA_ACTION_KEYS:
+        pending_qa_action_key = None
     try:
         scene_episode_no = int(parsed.get("scene_episode_no") or 0) or None
     except Exception:
@@ -279,6 +285,7 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         "active_character_label": active_character_label,
         "rp_mode": rp_mode,
         "pending_rp_character_selection": pending_rp_character_selection,
+        "pending_qa_action_key": pending_qa_action_key,
         "pending_mode_entry_guide": pending_mode_entry_guide,
         "scene_episode_no": scene_episode_no,
         "relationship_stage": relationship_stage,
@@ -476,8 +483,9 @@ def _serialize_websochat_session_memory(session_memory: dict[str, Any]) -> str |
     has_game_state = bool(normalized.get("game_context", {}).get("mode"))
     has_scope_state = bool(int(normalized.get("read_episode_to") or 0))
     has_non_read_scope_state = normalized.get("read_scope_state") == "none"
+    has_pending_qa_action = bool(normalized.get("pending_qa_action_key"))
     has_qa_memory = bool(normalized.get("qa_recent_notes"))
     has_qa_corrections = bool(normalized.get("qa_corrections"))
-    if not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_non_read_scope_state and not has_qa_memory and not has_qa_corrections:
+    if not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_non_read_scope_state and not has_pending_qa_action and not has_qa_memory and not has_qa_corrections:
         return None
     return json.dumps(normalized, ensure_ascii=False)

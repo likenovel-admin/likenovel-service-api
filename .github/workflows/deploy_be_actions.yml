@@ -67,8 +67,10 @@ jobs:
           S3_BUCKET: ln-s3
           TAGS: ${{ inputs.tags }}
         run: |
+          mkdir -p scripts
+          cp ../scripts/build_story_agent_context.py ./scripts/build_story_agent_context.py
           # *.whl, appspec.yml, run_be.sh, gconf.py, .env.production, init/, batch/ 압축
-          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py .env.production init/ batch/
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py .env.production init/ batch/ scripts/
           aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
           aws deploy create-deployment \
             --application-name $APPLICATION_NAME \
@@ -78,4 +80,3 @@ jobs:
             --s3-location bucket=$S3_BUCKET,bundleType=zip,key=$GITHUB_SHA.zip
           echo "(option) input additional comments: $TAGS"
         working-directory: ./fastapi_be_server/dist
-
