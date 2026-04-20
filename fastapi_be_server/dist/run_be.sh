@@ -48,4 +48,10 @@ cp "$BATCH_SRC"/*.sql "$BATCH_DST/" 2>/dev/null || true
 cp "$BATCH_SRC"/*.py "$BATCH_DST/" 2>/dev/null || true
 chmod +x "$BATCH_DST"/*.sh
 
+# prod 웹소챗 컨텍스트 배치 cron 보장 (중복 등록 방지)
+STORYCTX_CRON_LINE='10 * * * * STORYCTX_MAX_PARALLEL=2 bash /home/ln-admin/likenovel/batch/build_story_agent_context_batch.sh >> /home/ln-admin/likenovel/batch/build_story_agent_context_batch.log 2>&1'
+if ! crontab -l 2>/dev/null | grep -Fq "/home/ln-admin/likenovel/batch/build_story_agent_context_batch.sh"; then
+  (crontab -l 2>/dev/null; echo "$STORYCTX_CRON_LINE") | crontab -
+fi
+
 exit 0
