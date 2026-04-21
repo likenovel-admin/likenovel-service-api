@@ -188,6 +188,7 @@ def get_select_fields_and_joins_for_product(
                 "p.count_recommend",
                 "p.count_bookmark",
                 "COALESCE(ep_count.episode_count, 0) as hasEpisodeCount",
+                "CASE WHEN p.price_type = 'free' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(ep_count.episode_count, 0) >= 5 AND COALESCE(ep_count.episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
                 "COALESCE(ep_count.open_episode_count, 0) as totalOpenEpisodeCount",
                 "wff.status as waitingForFreeStatus",
                 "p69.status as sixNinePathStatus",
@@ -293,7 +294,7 @@ def get_select_fields_and_joins_for_product(
                 WHERE cf.use_yn = 'Y' AND cfi.use_yn = 'Y' AND cf.group_type = 'cover'
             ) cf ON cf.file_group_id = p.thumbnail_file_id
             LEFT JOIN (
-                SELECT product_id, COUNT(*) as episode_count, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) as open_episode_count
+                SELECT product_id, COUNT(*) as episode_count, SUM(episode_text_count) as episode_text_count, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) as open_episode_count
                 FROM tb_product_episode
                 WHERE use_yn = 'Y'
                 GROUP BY product_id
@@ -669,6 +670,7 @@ def convert_product_data(row: RowMapping):
     data["publishRegularYn"] = data.pop("publish_regular_yn", "Y")
     data["state"] = dict()
     data["state"]["ongoingState"] = data.pop("status_code")
+    data["state"]["canApplyForNormal"] = data.pop("canApplyForNormal") == "Y"
     data["state"]["convertToPaidState"] = (
         data.pop("convertToPaidState")
         if data.get("convertToPaidState") is not None
