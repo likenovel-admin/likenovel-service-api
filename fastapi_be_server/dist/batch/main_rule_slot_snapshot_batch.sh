@@ -4,10 +4,27 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+timestamp() {
+  date '+%F %T %Z'
+}
+
+log_info() {
+  echo "[$(timestamp)] [INFO] $*"
+}
+
+log_warn() {
+  echo "[$(timestamp)] [WARN] $*" 1>&2
+}
+
+log_error() {
+  echo "[$(timestamp)] [ERROR] $*" 1>&2
+}
+
 LOCK_DIR="/tmp/main-rule-slot-snapshot-batch.lock"
+RUN_STARTED_AT="$(date +%s)"
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "[WARN] main_rule_slot_snapshot_batch already running ($LOCK_DIR exists), skipping." 1>&2
+  log_warn "main_rule_slot_snapshot_batch already running (${LOCK_DIR} exists), skipping"
   exit 0
 fi
 trap 'rm -rf "$LOCK_DIR"' EXIT
@@ -30,17 +47,23 @@ fi
 MAX_RETRIES=3
 RETRY_DELAY=10
 
+log_info "main_rule_slot_snapshot_batch started"
+
 for attempt in $(seq 1 $MAX_RETRIES); do
+  log_info "main_rule_slot_snapshot_batch attempt ${attempt}/${MAX_RETRIES} started"
   mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < "${SCRIPT_DIR}/main_rule_slot_snapshot_batch.sql"
   rc=$?
   if [ $rc -eq 0 ]; then
+    log_info "main_rule_slot_snapshot_batch attempt ${attempt}/${MAX_RETRIES} succeeded"
+    log_info "main_rule_slot_snapshot_batch completed successfully in $(( $(date +%s) - RUN_STARTED_AT ))s"
     exit 0
   fi
-  echo "[WARN] main_rule_slot_snapshot_batch attempt $attempt/$MAX_RETRIES failed (exit=$rc)" 1>&2
+  log_warn "main_rule_slot_snapshot_batch attempt ${attempt}/${MAX_RETRIES} failed (exit=${rc})"
   if [ $attempt -lt $MAX_RETRIES ]; then
+    log_info "main_rule_slot_snapshot_batch retrying after ${RETRY_DELAY}s"
     sleep $RETRY_DELAY
   fi
 done
 
-echo "[ERROR] main_rule_slot_snapshot_batch failed after $MAX_RETRIES attempts" 1>&2
+log_error "main_rule_slot_snapshot_batch failed after ${MAX_RETRIES} attempts in $(( $(date +%s) - RUN_STARTED_AT ))s"
 exit 1
