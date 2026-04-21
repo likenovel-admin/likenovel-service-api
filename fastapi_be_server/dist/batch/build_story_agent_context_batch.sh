@@ -18,6 +18,12 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
 }
 
+append_timestamped_to_log() {
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '[%(%Y-%m-%d %H:%M:%S %Z)T] %s\n' -1 "$line"
+  done >> "${LOG_FILE}"
+}
+
 resolve_api_root() {
   if [ -f "${SCRIPT_DIR}/../../scripts/build_story_agent_context.py" ]; then
     cd "${SCRIPT_DIR}/../.." && pwd
@@ -195,7 +201,7 @@ run_product() {
       --build-mode full \
       --apply \
       --verbose
-  ) >> "${LOG_FILE}" 2>&1 &
+  ) > >(append_timestamped_to_log) 2>&1 &
 
   local pid=$!
   PIDS+=("${pid}")
