@@ -129,6 +129,7 @@ fi
 
 normalize_parallel
 acquire_lock
+log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL}"
 
 MYSQL_CMD=(
   mysql
@@ -182,6 +183,7 @@ SQL
 
 if [ "${#CANDIDATE_ROWS[@]}" -eq 0 ]; then
   log "[batch-empty] no eligible products"
+  log "[INFO] build_story_agent_context_batch completed ready=0 failed=0 max_parallel=${MAX_PARALLEL}"
   exit 0
 fi
 
@@ -221,6 +223,7 @@ done
 
 if [ "${#PIDS[@]}" -eq 0 ]; then
   log "[batch-empty] selected rows were unparsable"
+  log "[INFO] build_story_agent_context_batch completed ready=0 failed=0 max_parallel=${MAX_PARALLEL}"
   exit 0
 fi
 
@@ -244,6 +247,7 @@ for pid in "${PIDS[@]}"; do
 done
 
 log "[summary] launched=${#PIDS[@]} ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL}"
+log "[INFO] build_story_agent_context_batch completed ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL}"
 
 if [ "${fail_count}" -gt 0 ]; then
   exit 1
