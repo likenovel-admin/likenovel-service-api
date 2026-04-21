@@ -6,6 +6,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/batch_timestamp_logging.sh"
+enable_timestamped_logging
+
+BATCH_NAME="paid_episode_convert_batch"
+RUN_STARTED_AT="$(date +%s)"
+trap 'rc=$?; duration=$(( $(date +%s) - RUN_STARTED_AT )); echo "[INFO] ${BATCH_NAME} completed with exit=${rc} in ${duration}s"; exit "$rc"' EXIT
+
+echo "[INFO] ${BATCH_NAME} started"
+
 LOCK_FILE="${LOCK_FILE:-/tmp/likenovel_paid_episode_convert_batch.lock}"
 
 exec 9>"$LOCK_FILE"

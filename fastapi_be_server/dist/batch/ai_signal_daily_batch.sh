@@ -6,6 +6,14 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/batch_timestamp_logging.sh"
+enable_timestamped_logging
+
+BATCH_NAME="ai_signal_daily_batch"
+RUN_STARTED_AT="$(date +%s)"
+
+echo "[INFO] ${BATCH_NAME} started"
 
 LOCK_DIR="/tmp/ai-signal-daily-batch.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
@@ -152,11 +160,13 @@ stop_heartbeat_worker() {
 
 cleanup_on_exit() {
   local exit_code=$?
+  local duration=$(( $(date +%s) - RUN_STARTED_AT ))
   stop_heartbeat_worker
   if [ "$exit_code" -ne 0 ]; then
     mark_job_failed_if_needed
   fi
   rm -rf "$LOCK_DIR"
+  echo "[INFO] ${BATCH_NAME} completed with exit=${exit_code} in ${duration}s"
   exit "$exit_code"
 }
 trap cleanup_on_exit EXIT
