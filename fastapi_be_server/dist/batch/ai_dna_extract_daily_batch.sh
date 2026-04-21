@@ -8,6 +8,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JOB_FILE_ID="ai_dna_extract_daily_batch.sh"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/batch_timestamp_logging.sh"
+enable_timestamped_logging
+
+BATCH_NAME="ai_dna_extract_daily_batch"
+RUN_STARTED_AT="$(date +%s)"
 
 LOCK_DIR="/tmp/ai-dna-extract-daily-batch.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
@@ -148,15 +154,17 @@ SQL
 
 cleanup_on_exit() {
   local exit_code=$?
+  local duration=$(( $(date +%s) - RUN_STARTED_AT ))
   if [ "$JOB_MARKED_RUNNING" -eq 1 ] && [ "$exit_code" -ne 0 ]; then
     mark_job_failed_if_needed
   fi
   rm -rf "$LOCK_DIR"
+  echo "[INFO] ${BATCH_NAME} completed with exit=${exit_code} in ${duration}s"
   exit "$exit_code"
 }
 trap cleanup_on_exit EXIT
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting AI DNA extract batch..."
+echo "[INFO] ${BATCH_NAME} started"
 
 ensure_job_started
 JOB_MARKED_RUNNING=1
@@ -170,6 +178,6 @@ fi
 
 mark_job_success
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] AI DNA extract batch completed."
+echo "[INFO] ${BATCH_NAME} work completed."
 
 exit 0

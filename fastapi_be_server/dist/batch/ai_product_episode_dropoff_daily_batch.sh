@@ -3,6 +3,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/batch_timestamp_logging.sh"
+enable_timestamped_logging
+
+BATCH_NAME="ai_product_episode_dropoff_daily_batch"
+RUN_STARTED_AT="$(date +%s)"
+trap 'rc=$?; duration=$(( $(date +%s) - RUN_STARTED_AT )); echo "[INFO] ${BATCH_NAME} completed with exit=${rc} in ${duration}s"; exit "$rc"' EXIT
+
+echo "[INFO] ${BATCH_NAME} started"
 
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"

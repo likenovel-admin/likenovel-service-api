@@ -6,15 +6,31 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/batch_timestamp_logging.sh"
+enable_timestamped_logging
+
+BATCH_NAME="ai_taste_hourly_batch"
+RUN_STARTED_AT="$(date +%s)"
 
 LOCK_DIR="/tmp/ai-taste-hourly-batch.lock"
+
+cleanup_on_exit() {
+  local exit_code=$?
+  local duration=$(( $(date +%s) - RUN_STARTED_AT ))
+  rm -rf "$LOCK_DIR"
+  echo "[INFO] ${BATCH_NAME} completed with exit=${exit_code} in ${duration}s"
+  exit "$exit_code"
+}
+trap cleanup_on_exit EXIT
+
+echo "[INFO] ${BATCH_NAME} started"
 
 # 동시실행 방지 락
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "[WARN] ai_taste_hourly_batch already running ($LOCK_DIR exists), skipping." 1>&2
   exit 0
 fi
-trap 'rm -rf "$LOCK_DIR"' EXIT
 
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"
