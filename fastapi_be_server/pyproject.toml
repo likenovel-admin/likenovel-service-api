@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "app"
-version = "0.1.507"
+version = "0.1.508"
 description = "fastapi be server"
 authors = ["likenovel-dev <infra@likenovel.net>"]
 readme = "README.md"
