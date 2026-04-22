@@ -464,6 +464,31 @@ class PostBannerReqBody(AdminBase):
     mobile_image_id: int = Field(examples=[1], description="모바일 이미지 id")
 
 
+class ReorderBannerItem(AdminBase):
+    id: int = Field(examples=[12], description="배너 ID")
+    show_order: int = Field(examples=[1], description="새 노출 순서 (1-based, 연속값)")
+
+
+class ReorderBannersReqBody(AdminBase):
+    """
+    같은 position(+division) 내 배너 순서 일괄 재부여.
+    클라이언트는 1..N 연속값으로 계산해서 items를 전송한다.
+    """
+
+    position: str = Field(
+        examples=["main"],
+        description="노출 위치, main | paid | review | promotion | search | viewer",
+    )
+    division: Optional[str] = Field(
+        default=None,
+        examples=["top"],
+        description="position이 main인 경우 세부 위치, top | mid | bot",
+    )
+    items: list[ReorderBannerItem] = Field(
+        description="재부여할 배너 목록. 모든 id는 지정된 position(+division)에 속해야 함.",
+    )
+
+
 class PutBannerReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
     position: Optional[str] = Field(
