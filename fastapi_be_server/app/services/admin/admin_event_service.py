@@ -823,6 +823,115 @@ async def put_banner(
     return {"result": req_body}
 
 
+async def reorder_banners(
+    req_body: admin_schema.ReorderBannersReqBody, db: AsyncSession
+):
+    """
+    같은 position(+division) 내 배너 순서 일괄 재부여.
+    - position/division 검증
+    - items의 show_order 값이 1..N 연속·고유인지 검증
+    - 모든 id가 해당 position(+division)에 속하는지 검증
+    - 변경분만 CASE WHEN 단일 UPDATE로 반영 (원자적)
+    """
+
+    # position 검증
+    allowed_positions = ["main", "paid", "review", "promotion", "search", "viewer"]
+    if req_body.position not in allowed_positions:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.NOT_ALLOWED_POSITION.format(req_body.position),
+        )
+
+    # main일 때 division 필수
+    division = req_body.division
+    if req_body.position == "main":
+        if division is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.DETAIL_POSITION_REQUIRED,
+            )
+        if division not in ["top", "mid", "bot"]:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.NOT_ALLOWED_POSITION.format(division),
+            )
+
+    items = req_body.items or []
+    if not items:
+        return {"result": {"updated": 0}}
+
+    # show_order 1..N 연속·고유 검증
+    ids = [it.id for it in items]
+    orders = [it.show_order for it in items]
+    if len(set(ids)) != len(ids):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="중복된 배너 id가 포함되어 있습니다.",
+        )
+    if sorted(orders) != list(range(1, len(orders) + 1)):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="show_order는 1..N 연속·고유 값이어야 합니다.",
+        )
+
+    # 모든 id가 해당 position(+division)에 속하는지 검증
+    scope_where = "position = :position"
+    scope_params: dict = {"position": req_body.position}
+    if req_body.position == "main":
+        scope_where += " AND division = :division"
+        scope_params["division"] = division
+
+    placeholders = ",".join([f":id{i}" for i in range(len(ids))])
+    scope_params_with_ids = {
+        **scope_params,
+        **{f"id{i}": v for i, v in enumerate(ids)},
+    }
+    verify_query = text(
+        f"""
+        SELECT id, show_order FROM tb_carousel_banner
+        WHERE {scope_where} AND id IN ({placeholders})
+        """
+    )
+    result = await db.execute(verify_query, scope_params_with_ids)
+    found = {row["id"]: row["show_order"] for row in result.mappings().all()}
+
+    if len(found) != len(ids):
+        missing = [i for i in ids if i not in found]
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=f"요청한 배너 중 해당 영역에 속하지 않는 id가 있습니다: {missing}",
+        )
+
+    # 변경분만 골라내기 (기존 show_order와 동일한 건 제외)
+    changed = [it for it in items if found.get(it.id) != it.show_order]
+    if not changed:
+        return {"result": {"updated": 0}}
+
+    # CASE WHEN 단일 UPDATE
+    case_parts = []
+    update_params: dict = {**scope_params, "updated_id": -1, "updated_date": datetime.now()}
+    for i, it in enumerate(changed):
+        case_parts.append(f"WHEN :cid{i} THEN :cord{i}")
+        update_params[f"cid{i}"] = it.id
+        update_params[f"cord{i}"] = it.show_order
+    changed_ids_placeholders = ",".join([f":cid{i}" for i in range(len(changed))])
+
+    update_query = text(
+        f"""
+        UPDATE tb_carousel_banner
+        SET show_order = CASE id
+            {' '.join(case_parts)}
+        END,
+        updated_id = :updated_id,
+        updated_date = :updated_date
+        WHERE {scope_where} AND id IN ({changed_ids_placeholders})
+        """
+    )
+    await db.execute(update_query, update_params)
+
+    return {"result": {"updated": len(changed)}}
+
+
 async def delete_banner(id: int, db: AsyncSession):
     """
     배너 삭제

@@ -978,6 +978,27 @@ async def put_banner(
     return await admin_event_service.put_banner(req_body, id, db=db)
 
 
+@router.post(
+    "/banners/reorder",
+    tags=["CMS - 배너"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def reorder_banners(
+    req_body: admin_schema.ReorderBannersReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    배너 및 팝업 관리 - 같은 포지션 내 배너 순서 일괄 재부여
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_event_service.reorder_banners(req_body, db=db)
+
+
 @router.delete(
     "/banners/{id}", tags=["CMS - 배너"], dependencies=[Depends(analysis_logger)]
 )
