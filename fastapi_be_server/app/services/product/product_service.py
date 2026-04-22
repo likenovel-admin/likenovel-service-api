@@ -4535,6 +4535,7 @@ async def get_direct_recommend_products(
                 FROM tb_product p
                 {query_parts["joins"]}
                 WHERE {filter_option}
+                ORDER BY FIELD(p.product_id, {','.join(map(str, product_ids))})
             """)
 
             result = await db.execute(products_query, {})
