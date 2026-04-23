@@ -90,7 +90,7 @@ def _txt_to_html(txt: str) -> str:
     규칙
     - 빈 줄 1개 이상: 새 문단 구분
     - 문단 내부 단일 줄바꿈: <br/>
-    - 문단 사이 구분: 기존 뷰어 데이터에 맞춰 빈 <p></p> 3개
+    - 문단 사이 구분: 뷰어에서 보이는 빈 줄 <p><br/></p> 1개
     """
     normalized = txt.replace("\r\n", "\n").replace("\r", "\n")
     raw_paragraphs = [chunk for chunk in re.split(r"\n\s*\n+", normalized) if chunk.strip()]
@@ -102,7 +102,7 @@ def _txt_to_html(txt: str) -> str:
             continue
         parts.append(f"<p>{'<br/>'.join(lines)}</p>")
         if index < len(raw_paragraphs) - 1:
-            parts.extend(["<p></p>", "<p></p>", "<p></p>"])
+            parts.append("<p><br/></p>")
     return "".join(parts)
 
 
