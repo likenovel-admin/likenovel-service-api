@@ -7,7 +7,6 @@ import io
 import json
 import logging
 import random
-import re
 import secrets
 import string
 import tempfile
@@ -34,6 +33,8 @@ DAY_MAP = {
     "금": "FRI", "토": "SAT", "일": "SUN",
 }
 DAY_INDEX = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
+MAX_EPISODE_TEXT_LENGTH = 20000
+MAX_EPISODE_HTML_LENGTH = 30000
 
 
 # ─── 헬퍼 ─────────────────────────────────────────────────────
@@ -85,24 +86,34 @@ def _next_publish_date(base: datetime, active_weekdays: list[int], offset: int) 
 
 
 def _txt_to_html(txt: str) -> str:
-    """txt 본문을 문단 기준 HTML로 변환.
+    """txt 본문을 문단 모델 기준 HTML로 변환.
 
     규칙
-    - 빈 줄 1개 이상: 새 문단 구분
-    - 문단 내부 단일 줄바꿈: <br/>
-    - 문단 사이 구분: 뷰어에서 보이는 빈 줄 <p><br/></p> 1개
+    - 연속된 non-empty line 은 같은 문단에서 <br/> 로 연결
+    - 빈 줄 하나당 <p><br/></p> 1개 보존
+    - 마지막 EOF 개행 1개는 무시해 의도치 않은 끝 빈 줄을 막음
     """
     normalized = txt.replace("\r\n", "\n").replace("\r", "\n")
-    raw_paragraphs = [chunk for chunk in re.split(r"\n\s*\n+", normalized) if chunk.strip()]
+    lines = normalized.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
 
     parts: list[str] = []
-    for index, paragraph in enumerate(raw_paragraphs):
-        lines = [html_escape(line.strip()) for line in paragraph.split("\n") if line.strip()]
-        if not lines:
-            continue
-        parts.append(f"<p>{'<br/>'.join(lines)}</p>")
-        if index < len(raw_paragraphs) - 1:
+    paragraph_lines: list[str] = []
+
+    def flush_paragraph() -> None:
+        if not paragraph_lines:
+            return
+        parts.append(f"<p>{'<br/>'.join(html_escape(line) for line in paragraph_lines)}</p>")
+        paragraph_lines.clear()
+
+    for line in lines:
+        if line == "":
+            flush_paragraph()
             parts.append("<p><br/></p>")
+            continue
+        paragraph_lines.append(line)
+    flush_paragraph()
     return "".join(parts)
 
 
@@ -567,7 +578,18 @@ async def _create_episodes(
 
     for ep_no, txt_content in sorted_eps:
         html_content = _txt_to_html(txt_content)
-        text_count = len(BeautifulSoup(html_content, "html.parser").get_text(strip=True))
+        text_count = len(
+            BeautifulSoup(html_content, "html.parser").get_text(separator=" ", strip=True)
+        )
+
+        if text_count > MAX_EPISODE_TEXT_LENGTH:
+            raise ValueError(
+                f"episode {ep_no} text length exceeds {MAX_EPISODE_TEXT_LENGTH}"
+            )
+        if len(html_content) > MAX_EPISODE_HTML_LENGTH:
+            raise ValueError(
+                f"episode {ep_no} html length exceeds {MAX_EPISODE_HTML_LENGTH}"
+            )
 
         # open_yn + publish_reserve_date 결정
         if ep_no <= first_open_ep:
