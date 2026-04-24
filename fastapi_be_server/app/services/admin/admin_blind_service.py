@@ -172,9 +172,10 @@ def _serialize_html_node_to_text(node) -> str:
 
 def _normalize_viewer_block_text(text: str) -> str:
     normalized = text.replace("\xa0", " ")
-    normalized = re.sub(r"\r\n?", "\n", normalized)
-    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
-    return normalized.strip("\n")
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized.replace("\n", "").strip() == "":
+        return ""
+    return normalized
 
 
 def _iter_viewer_text_blocks(root) -> list[str]:
@@ -183,7 +184,7 @@ def _iter_viewer_text_blocks(root) -> list[str]:
     for child in root.children:
         if isinstance(child, NavigableString):
             block = _normalize_viewer_block_text(str(child))
-            if block:
+            if block.strip():
                 blocks.append(block)
             continue
 
@@ -203,7 +204,7 @@ def _iter_viewer_text_blocks(root) -> list[str]:
         block = _normalize_viewer_block_text(_serialize_html_node_to_text(child))
         if tag_name in {"p", "div", "section", "article", "blockquote", "pre", "li"}:
             blocks.append(block)
-        elif block:
+        elif block.strip():
             blocks.append(block)
 
     return blocks
@@ -216,22 +217,7 @@ def _html_to_plain_text(value: str | None) -> str:
     soup = BeautifulSoup(value, "html.parser")
     root = soup.body if soup.body else soup
     blocks = _iter_viewer_text_blocks(root)
-
-    collapsed: list[str] = []
-    blank_pending = False
-
-    for block in blocks:
-        if block == "":
-            if collapsed:
-                blank_pending = True
-            continue
-
-        if blank_pending:
-            collapsed.append("")
-            blank_pending = False
-        collapsed.append(block)
-
-    return "\n".join(collapsed).strip()
+    return "\n".join(blocks)
 
 
 def _sanitize_file_name(value: str) -> str:
