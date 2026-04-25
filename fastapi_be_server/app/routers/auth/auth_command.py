@@ -158,6 +158,9 @@ async def get_auth_signup_naver_callback(
         res_body = await auth_service.get_auth_signup_naver_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -166,7 +169,7 @@ async def get_auth_signup_naver_callback(
             req_body = auth_schema.SigninReqBody(**res_body)
             res_body = await post_auth_signin(req_body=req_body, db=db)
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:
@@ -237,6 +240,9 @@ async def get_auth_signup_google_callback(
         res_body = await auth_service.get_auth_signup_google_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -245,7 +251,7 @@ async def get_auth_signup_google_callback(
             req_body = auth_schema.SigninReqBody(**res_body)
             res_body = await post_auth_signin(req_body=req_body, db=db)
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:
@@ -316,6 +322,9 @@ async def get_auth_signup_kakao_callback(
         res_body = await auth_service.get_auth_signup_kakao_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -324,7 +333,7 @@ async def get_auth_signup_kakao_callback(
             req_body = auth_schema.SigninReqBody(**res_body)
             res_body = await post_auth_signin(req_body=req_body, db=db)
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:
@@ -395,6 +404,9 @@ async def get_auth_signup_apple_callback(
         res_body = await auth_service.get_auth_signup_apple_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -403,7 +415,7 @@ async def get_auth_signup_apple_callback(
             req_body = auth_schema.SigninReqBody(**res_body)
             res_body = await post_auth_signin(req_body=req_body, db=db)
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:
@@ -619,6 +631,9 @@ async def get_auth_signin_naver_callback(
         res_body = await auth_service.get_auth_signin_naver_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -627,7 +642,7 @@ async def get_auth_signin_naver_callback(
             req_body = auth_schema.SigninReqBody(**res_body)
             res_body = await post_auth_signin(req_body=req_body, db=db)
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:
@@ -698,6 +713,9 @@ async def get_auth_signin_google_callback(
         res_body = await auth_service.get_auth_signin_google_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -706,7 +724,7 @@ async def get_auth_signin_google_callback(
             req_body = auth_schema.SigninReqBody(**res_body)
             res_body = await post_auth_signin(req_body=req_body, db=db)
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:
@@ -777,6 +795,9 @@ async def get_auth_signin_kakao_callback(
         res_body = await auth_service.get_auth_signin_kakao_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -818,7 +839,7 @@ async def get_auth_signin_kakao_callback(
                 message=ErrorMessages.INTERNAL_SERVER_ERROR,
             )
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={sns_id}&temp_issued_key={temp_issued_key}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={sns_id}&temp_issued_key={temp_issued_key}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:
@@ -889,6 +910,9 @@ async def get_auth_signin_apple_callback(
         res_body = await auth_service.get_auth_signin_apple_callback(
             db=db, code=code, state=state, error=error
         )
+        keep_signin_yn = (
+            res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
+        )
 
         if res_body.get("ad_info_agree_yn"):  # 미등록(회원가입 후 로그인)
             req_body = auth_schema.SignupReqBody(**res_body)
@@ -897,7 +921,7 @@ async def get_auth_signin_apple_callback(
             req_body = auth_schema.SigninReqBody(**res_body)
             res_body = await post_auth_signin(req_body=req_body, db=db)
 
-        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}"
+        url_with_query = f"{settings.FE_REDIRECT_URL}?sns_id={res_body.get('data').get('auth').get('snsId')}&temp_issued_key={res_body.get('data').get('auth').get('tempIssuedKey')}&keep_signin_yn={keep_signin_yn}"
 
         return RedirectResponse(url=url_with_query, status_code=302)
     except Exception as e:

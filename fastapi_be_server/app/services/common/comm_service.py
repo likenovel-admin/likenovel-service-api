@@ -455,9 +455,13 @@ async def sns_token_endpoint(
                 res.raise_for_status()
                 return res.json()
     except HTTPStatusError as e:
+        masked_data = {
+            k: ("***" if k in ("client_secret", "code", "client_id") else v)
+            for k, v in data.items()
+        }
         logger.error(
             f"SNS Token Endpoint Error - Type: {type}, Status: {e.response.status_code}, "
-            f"URL: {url}, Response: {e.response.text}, Data: {data}"
+            f"URL: {url}, Response: {e.response.text}, Data: {masked_data}"
         )
         raise CustomResponseException(
             status_code=e.response.status_code,
