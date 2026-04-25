@@ -1180,22 +1180,25 @@ async def product_details_group_by_product_id(
                     least(
                         coalesce(sacp.ready_episode_count, 0),
                         coalesce(max(case when e.use_yn = 'Y' and e.open_yn = 'Y' then e.episode_no end), 0)
-                    ) as syncedLatestEpisodeNo
+                    ) as syncedLatestEpisodeNo,
+                    sacp.context_status as contextStatus
                 from tb_product p
                 left join tb_product_episode e
                   on e.product_id = p.product_id
                 left join tb_story_agent_context_product sacp
                   on sacp.product_id = p.product_id
                 where p.product_id = :product_id
-                group by sacp.ready_episode_count
+                group by sacp.ready_episode_count, sacp.context_status
                 """
             )
             synced_latest_episode_result = await db.execute(
                 synced_latest_episode_query, {"product_id": product_id}
             )
+            synced_row = synced_latest_episode_result.mappings().first() or {}
             product["syncedLatestEpisodeNo"] = max(
-                int(synced_latest_episode_result.scalar() or 0), 0
+                int(synced_row.get("syncedLatestEpisodeNo") or 0), 0
             )
+            product["contextStatus"] = synced_row.get("contextStatus")
 
         # 작품이 존재하지만 비공개인 경우 조기 반환
         if product is None:
