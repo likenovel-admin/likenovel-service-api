@@ -35,9 +35,9 @@ from app.services.admin.admin_bulk_upload_service import _txt_to_html
 
 
 class AdminBulkUploadServiceUnitTest(unittest.TestCase):
-    def test_txt_to_html_joins_adjacent_lines_with_br(self):
+    def test_txt_to_html_maps_single_newline_to_new_paragraph(self):
         html = _txt_to_html("첫 줄\n둘째 줄")
-        self.assertEqual(html, "<p>첫 줄<br/>둘째 줄</p>")
+        self.assertEqual(html, "<p>첫 줄</p><p>둘째 줄</p>")
 
     def test_txt_to_html_preserves_blank_line_count(self):
         html = _txt_to_html("A\n\nB\n\n\nC")
@@ -49,6 +49,10 @@ class AdminBulkUploadServiceUnitTest(unittest.TestCase):
     def test_txt_to_html_ignores_single_terminal_newline(self):
         html = _txt_to_html("A\n")
         self.assertEqual(html, "<p>A</p>")
+
+    def test_txt_to_html_preserves_intentional_trailing_blank_line(self):
+        html = _txt_to_html("A\n\n")
+        self.assertEqual(html, "<p>A</p><p><br/></p>")
 
 
 if __name__ == "__main__":
