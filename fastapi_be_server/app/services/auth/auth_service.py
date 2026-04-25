@@ -467,6 +467,12 @@ async def post_auth_signup(req_body: auth_schema.SignupReqBody, db: AsyncSession
             ]
 
             await db.execute(query, ins_datas)
+    except CustomResponseException:
+        if admin_acc_token is not None and id is not None:
+            await comm_service.kc_users_id_endpoint(
+                method="DELETE", admin_acc_token=admin_acc_token, id=id
+            )  # 키클록 데이터 롤백
+        raise
     except OperationalError as e:
         logger.error(f"OperationalError in post_auth_signup: {e}")
         if admin_acc_token is not None and id is not None:
@@ -768,6 +774,8 @@ async def get_auth_signup_naver_callback(
                     "sns_link_id": naver_link_id,
                     "sns_keep_signin_yn": keep_signin_yn,
                 }
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -960,6 +968,8 @@ async def get_auth_signup_google_callback(
                     "sns_link_id": google_link_id,
                     "sns_keep_signin_yn": keep_signin_yn,
                 }
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1162,6 +1172,8 @@ async def get_auth_signup_kakao_callback(
                     "sns_link_id": kakao_link_id,
                     "sns_keep_signin_yn": keep_signin_yn,
                 }
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1316,6 +1328,8 @@ async def get_auth_signup_apple_callback(
                     "sns_link_id": apple_link_id,
                     "sns_keep_signin_yn": keep_signin_yn,
                 }
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3369,38 +3383,45 @@ async def put_auth_token_relay_callback(
             )
             db_rst = result.mappings().all()
 
-            if db_rst:
-                accessToken = db_rst[0].get("access_token")
-                accessTokenExpiresIn = db_rst[0].get("access_expire_in")
-                refreshToken = db_rst[0].get("refresh_token")
-                refreshTokenExpiresIn = db_rst[0].get("refresh_expire_in")
-                recentSignInType = db_rst[0].get("sns_type")
-                userId = db_rst[0].get("user_id")
-                birthDate = db_rst[0].get("birthdate")
-                gender = db_rst[0].get("gender")
+            if not db_rst:
+                raise CustomResponseException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    message=ErrorMessages.INVALID_TOKEN,
+                )
 
-                auth_data = {
-                    "accessToken": accessToken,
-                    "accessTokenExpiresIn": accessTokenExpiresIn,
-                    "refreshToken": refreshToken,
-                    "refreshTokenExpiresIn": refreshTokenExpiresIn,
-                    "recentSignInType": recentSignInType,
-                    "userId": userId,
-                    "birthDate": birthDate,
-                    "gender": gender,
-                }
+            accessToken = db_rst[0].get("access_token")
+            accessTokenExpiresIn = db_rst[0].get("access_expire_in")
+            refreshToken = db_rst[0].get("refresh_token")
+            refreshTokenExpiresIn = db_rst[0].get("refresh_expire_in")
+            recentSignInType = db_rst[0].get("sns_type")
+            userId = db_rst[0].get("user_id")
+            birthDate = db_rst[0].get("birthdate")
+            gender = db_rst[0].get("gender")
 
-                query = text("""
-                                 update tb_user_social
-                                    set temp_issued_key = null
-                                      , access_token = null
-                                      , access_expire_in = null
-                                      , refresh_token = null
-                                      , refresh_expire_in = null
-                                  where sns_id = :sns_id
-                                 """)
+            auth_data = {
+                "accessToken": accessToken,
+                "accessTokenExpiresIn": accessTokenExpiresIn,
+                "refreshToken": refreshToken,
+                "refreshTokenExpiresIn": refreshTokenExpiresIn,
+                "recentSignInType": recentSignInType,
+                "userId": userId,
+                "birthDate": birthDate,
+                "gender": gender,
+            }
 
-                await db.execute(query, {"sns_id": req_body.sns_id})
+            query = text("""
+                             update tb_user_social
+                                set temp_issued_key = null
+                                  , access_token = null
+                                  , access_expire_in = null
+                                  , refresh_token = null
+                                  , refresh_expire_in = null
+                              where sns_id = :sns_id
+                             """)
+
+            await db.execute(query, {"sns_id": req_body.sns_id})
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
