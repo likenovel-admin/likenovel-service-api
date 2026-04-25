@@ -29,6 +29,28 @@ logger = logging.getLogger(__name__)
 auth 도메인 개별 서비스 함수 모음
 """
 
+SIGNUP_METHOD_LABELS = {
+    "likenovel": "이메일",
+    "naver": "네이버",
+    "kakao": "카카오",
+    "google": "구글",
+    "apple": "Apple",
+}
+
+
+def _existing_email_message(latest_signed_type: Optional[str]) -> str:
+    signup_method = SIGNUP_METHOD_LABELS.get(latest_signed_type or "")
+    if not signup_method:
+        return ErrorMessages.ALREADY_EXIST_EMAIL
+    return f"이미 {signup_method}로 가입된 계정입니다. {signup_method}로 로그인해주세요."
+
+
+def _active_signup_method(rows: list[dict]) -> Optional[str]:
+    for row in rows:
+        if row.get("use_yn") == "Y":
+            return row.get("latest_signed_type")
+    return None
+
 
 async def post_auth_signup(req_body: auth_schema.SignupReqBody, db: AsyncSession):
     admin_acc_token = None
@@ -43,6 +65,7 @@ async def post_auth_signup(req_body: auth_schema.SignupReqBody, db: AsyncSession
 
             email_status_query = text("""
                              select use_yn
+                                  , latest_signed_type
                                from tb_user
                               where (
                                     email = :email
@@ -55,13 +78,14 @@ async def post_auth_signup(req_body: auth_schema.SignupReqBody, db: AsyncSession
             email_status_result = await db.execute(
                 email_status_query, {"email": req_body.email}
             )
-            existing_email_statuses = [
-                row.get("use_yn") for row in email_status_result.mappings().all()
-            ]
+            existing_email_rows = email_status_result.mappings().all()
+            existing_email_statuses = [row.get("use_yn") for row in existing_email_rows]
             if "Y" in existing_email_statuses:
                 raise CustomResponseException(
                     status_code=status.HTTP_409_CONFLICT,
-                    message=ErrorMessages.ALREADY_EXIST_EMAIL,
+                    message=_existing_email_message(
+                        _active_signup_method(existing_email_rows)
+                    ),
                 )
             if "N" in existing_email_statuses:
                 raise CustomResponseException(
@@ -645,7 +669,9 @@ async def get_auth_signup_naver_callback(
                     else:
                         raise CustomResponseException(
                             status_code=status.HTTP_409_CONFLICT,
-                            message=ErrorMessages.ALREADY_EXIST_EMAIL_WITH_DIFFERENT_METHOD,
+                            message=_existing_email_message(
+                                account.get("latest_signed_type")
+                            ),
                         )
 
             if db_rst:
@@ -918,7 +944,9 @@ async def get_auth_signup_google_callback(
                     else:
                         raise CustomResponseException(
                             status_code=status.HTTP_409_CONFLICT,
-                            message=ErrorMessages.ALREADY_EXIST_EMAIL_WITH_DIFFERENT_METHOD,
+                            message=_existing_email_message(
+                                account.get("latest_signed_type")
+                            ),
                         )
 
             if db_rst:
@@ -1122,7 +1150,9 @@ async def get_auth_signup_kakao_callback(
                     else:
                         raise CustomResponseException(
                             status_code=status.HTTP_409_CONFLICT,
-                            message=ErrorMessages.ALREADY_EXIST_EMAIL_WITH_DIFFERENT_METHOD,
+                            message=_existing_email_message(
+                                account.get("latest_signed_type")
+                            ),
                         )
 
             if db_rst:
@@ -1353,21 +1383,35 @@ async def post_auth_email_duplicate_check(
     req_body: auth_schema.EmailDuplicateCheckReqBody,
     db: AsyncSession,
 ):
-    # DB에서 이메일 중복 체크 (use_yn='Y'인 활성 계정만)
+    # 최종 가입 가드와 같은 기준으로 active/tombstone 이메일을 함께 확인한다.
     query = text("""
-        SELECT user_id FROM tb_user
-        WHERE email = :email AND use_yn = 'Y'
+        SELECT use_yn
+             , latest_signed_type
+          FROM tb_user
+        WHERE (
+            email = :email
+            OR (
+                email LIKE 'outed;%;%'
+                AND substring_index(email, ';', -1) = :email
+            )
+        )
     """)
     result = await db.execute(query, {"email": req_body.email})
-    existing_user = result.mappings().first()
+    existing_email_rows = result.mappings().all()
+    existing_email_statuses = [row.get("use_yn") for row in existing_email_rows]
 
-    if existing_user:
+    if "Y" in existing_email_statuses:
         raise CustomResponseException(
             status_code=status.HTTP_409_CONFLICT,
-            message=ErrorMessages.ALREADY_EXIST_EMAIL,
+            message=_existing_email_message(_active_signup_method(existing_email_rows)),
         )
-    else:
-        return
+    if "N" in existing_email_statuses:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.ALREADY_WITHDRAWN_MEMBER,
+        )
+
+    return
 
 
 async def post_auth_signin(
