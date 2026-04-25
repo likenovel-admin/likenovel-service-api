@@ -41,6 +41,34 @@ async def post_auth_signup(req_body: auth_schema.SignupReqBody, db: AsyncSession
                 # 라이크노벨 자체가입
                 keep_signin_yn = "N"
 
+            email_status_query = text("""
+                             select use_yn
+                               from tb_user
+                              where (
+                                    email = :email
+                                    or (
+                                        email like 'outed;%;%'
+                                        and substring_index(email, ';', -1) = :email
+                                    )
+                                )
+                             """)
+            email_status_result = await db.execute(
+                email_status_query, {"email": req_body.email}
+            )
+            existing_email_statuses = [
+                row.get("use_yn") for row in email_status_result.mappings().all()
+            ]
+            if "Y" in existing_email_statuses:
+                raise CustomResponseException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    message=ErrorMessages.ALREADY_EXIST_EMAIL,
+                )
+            if "N" in existing_email_statuses:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message=ErrorMessages.ALREADY_WITHDRAWN_MEMBER,
+                )
+
             type = "client_normal" if keep_signin_yn == "N" else "client_keep"
 
             res_json = await comm_service.kc_token_endpoint(method="POST", type=type)
@@ -1832,6 +1860,8 @@ async def get_auth_signin_naver_callback(
                     status_code=status.HTTP_404_NOT_FOUND,
                     message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
                 )
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -2058,6 +2088,8 @@ async def get_auth_signin_google_callback(
                     status_code=status.HTTP_404_NOT_FOUND,
                     message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
                 )
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -2292,6 +2324,8 @@ async def get_auth_signin_kakao_callback(
                     status_code=status.HTTP_404_NOT_FOUND,
                     message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
                 )
+    except CustomResponseException:
+        raise
     except OperationalError as e:
         logger.error(e)
         raise CustomResponseException(
@@ -2429,6 +2463,8 @@ async def get_auth_signin_apple_callback(
                     status_code=status.HTTP_404_NOT_FOUND,
                     message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
                 )
+    except CustomResponseException:
+        raise
     except OperationalError:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

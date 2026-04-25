@@ -370,9 +370,9 @@ class ErrorMessages:
     UCI_OR_ISBN_REQUIRED = "UCI와 ISBN 중 최소 1개는 입력해야 합니다."
 
     # 리소스 중복 관련
-    ALREADY_EXIST_EMAIL = "이미 존재하는 이메일입니다."
+    ALREADY_EXIST_EMAIL = "이미 가입된 이메일이에요. 로그인 페이지로 이동해 주세요."
     ALREADY_EXIST_EMAIL_WITH_DIFFERENT_METHOD = (
-        "해당 계정은 다른 방식으로 이미 가입된 계정입니다."
+        "이 이메일은 다른 방법(이메일·카카오·구글 등)으로 이미 가입되어 있어요. 처음 가입할 때 사용한 방법으로 로그인해 주세요."
     )
     ALREADY_EXIST_NICKNAME = "이미 존재하는 닉네임입니다."
     ALREADY_EXIST_COMPANY = "이미 등록된 회사명입니다."
@@ -383,7 +383,7 @@ class ErrorMessages:
     ALREADY_STOPPED_STATE = "이미 사용 중지인 상태입니다."
     ALREADY_APPROVED = "이미 승인되었습니다."
     ALREADY_REJECTED = "이미 반려되었습니다."
-    ALREADY_WITHDRAWN_MEMBER = "이미 탈퇴한 회원입니다."
+    ALREADY_WITHDRAWN_MEMBER = "탈퇴 처리된 계정이에요. 같은 이메일로는 재가입이 어려우니 다른 이메일을 이용하시거나 고객센터로 문의해 주세요."
     ALREADY_ACCEPTED_CONTRACT_OFFER = "이미 수락된 계약 제안입니다."
     ALREADY_REJECTED_CONTRACT_OFFER = "이미 거절된 계약 제안입니다."
     ALREADY_ENDED_APPLIED_PROMOTION = "이미 종료된 신청 프로모션입니다."
