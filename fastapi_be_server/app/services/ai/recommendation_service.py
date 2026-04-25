@@ -24,7 +24,10 @@ from app.schemas.ai_recommendation import MAX_EVENT_PAYLOAD_LENGTH
 
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 logger = logging.getLogger(__name__)
-MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 5
+MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 3
+MIN_RECENT_READ_POOL_FOR_PROFILE = 3
+MIN_QUALIFIED_RECENT_READ_PRODUCTS = 2
+MIN_RECENT_READ_EPISODES_PER_PRODUCT = 2
 AXIS_CONFIDENCE_THRESHOLD = 0.55
 AXIS_WEIGHT = {
     "type": 18.0,
@@ -2062,8 +2065,8 @@ async def _build_weak_recent_read_section(
 async def _build_profile_from_recent_reads(user_id: int, adult_yn: str, db: AsyncSession) -> dict | None:
     """
     콜드스타트 대체 규칙:
-    - 최근 열람 작품 pool 5개 이상
-    - 각 3회차 이상 읽은 작품이 2개 이상
+    - 최근 열람 작품 pool 3개 이상
+    - 각 2회차 이상 읽은 작품이 2개 이상
     """
     query = text(
         """
@@ -2081,11 +2084,15 @@ async def _build_profile_from_recent_reads(user_id: int, adult_yn: str, db: Asyn
     )
     result = await db.execute(query, {"user_id": user_id})
     read_rows = result.mappings().all()
-    if len(read_rows) < 5:
+    if len(read_rows) < MIN_RECENT_READ_POOL_FOR_PROFILE:
         return None
 
-    qualified_rows = [r for r in read_rows if (r.get("read_episode_count") or 0) >= 3]
-    if len(qualified_rows) < 2:
+    qualified_rows = [
+        r
+        for r in read_rows
+        if (r.get("read_episode_count") or 0) >= MIN_RECENT_READ_EPISODES_PER_PRODUCT
+    ]
+    if len(qualified_rows) < MIN_QUALIFIED_RECENT_READ_PRODUCTS:
         return None
 
     seed_product_ids = [int(qualified_rows[0]["product_id"]), int(qualified_rows[1]["product_id"])]

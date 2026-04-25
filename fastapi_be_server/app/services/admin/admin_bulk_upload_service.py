@@ -89,7 +89,7 @@ def _txt_to_html(txt: str) -> str:
     """txt 본문을 문단 모델 기준 HTML로 변환.
 
     규칙
-    - 연속된 non-empty line 은 같은 문단에서 <br/> 로 연결
+    - non-empty line 하나당 <p> 1개 생성
     - 빈 줄 하나당 <p><br/></p> 1개 보존
     - 마지막 EOF 개행 1개는 무시해 의도치 않은 끝 빈 줄을 막음
     """
@@ -99,21 +99,12 @@ def _txt_to_html(txt: str) -> str:
         lines.pop()
 
     parts: list[str] = []
-    paragraph_lines: list[str] = []
-
-    def flush_paragraph() -> None:
-        if not paragraph_lines:
-            return
-        parts.append(f"<p>{'<br/>'.join(html_escape(line) for line in paragraph_lines)}</p>")
-        paragraph_lines.clear()
 
     for line in lines:
         if line == "":
-            flush_paragraph()
             parts.append("<p><br/></p>")
             continue
-        paragraph_lines.append(line)
-    flush_paragraph()
+        parts.append(f"<p>{html_escape(line)}</p>")
     return "".join(parts)
 
 
