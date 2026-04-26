@@ -722,11 +722,8 @@ async def products_of_managed(
     if limit is None:
         limit = 50
 
-    await statistics_service.insert_site_statistics_log(
-        db=db, type="visit", user_id=user_id
-    )
-    await statistics_service.insert_site_statistics_log(
-        db=db, type="page_view", user_id=user_id
+    await statistics_service.insert_site_statistics_logs(
+        db=db, types=["visit", "page_view"], user_id=user_id
     )
 
     filter_option = []
@@ -802,11 +799,8 @@ async def product_by_product_id(product_id: str, kc_user_id: str, db: AsyncSessi
     res_body = dict()
     res_body["data"] = convert_product_data(row)
 
-    await statistics_service.insert_site_statistics_log(
-        db=db, type="visit", user_id=user_id
-    )
-    await statistics_service.insert_site_statistics_log(
-        db=db, type="page_view", user_id=user_id
+    await statistics_service.insert_site_statistics_logs(
+        db=db, types=["visit", "page_view"], user_id=user_id
     )
 
     return res_body
@@ -904,11 +898,8 @@ async def products_all(
     res_body = dict()
     res_body["data"] = [convert_product_data(row) for row in rows]
 
-    await statistics_service.insert_site_statistics_log(
-        db=db, type="visit", user_id=user_id
-    )
-    await statistics_service.insert_site_statistics_log(
-        db=db, type="page_view", user_id=user_id
+    await statistics_service.insert_site_statistics_logs(
+        db=db, types=["visit", "page_view"], user_id=user_id
     )
 
     return res_body
@@ -1695,11 +1686,8 @@ async def product_details_group_by_product_id(
         res_body = dict()
         res_body["data"] = grouped_results
 
-        await statistics_service.insert_site_statistics_log(
-            db=db, type="visit", user_id=user_id
-        )
-        await statistics_service.insert_site_statistics_log(
-            db=db, type="page_view", user_id=user_id
+        await statistics_service.insert_site_statistics_logs(
+            db=db, types=["visit", "page_view"], user_id=user_id
         )
 
         return res_body
