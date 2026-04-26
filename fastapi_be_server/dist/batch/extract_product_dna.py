@@ -33,6 +33,16 @@ DB_NAME = os.getenv("BATCH_DB_NAME", "likenovel")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
+# DNA LLM provider switch.
+# Default stays Anthropic so an env rollback restores the previous behavior.
+AI_DNA_PROVIDER = os.getenv("AI_DNA_PROVIDER", "anthropic").strip().lower()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+AI_DNA_OPENROUTER_MODEL = os.getenv("AI_DNA_OPENROUTER_MODEL", "deepseek/deepseek-v3.2").strip()
+AI_DNA_OPENROUTER_PROVIDER_ONLY = os.getenv("AI_DNA_OPENROUTER_PROVIDER_ONLY", "friendli").strip()
+AI_DNA_RESPONSE_FORMAT = os.getenv("AI_DNA_RESPONSE_FORMAT", "json_schema").strip().lower()
+AI_DNA_TIMEOUT_SECONDS = float(os.getenv("AI_DNA_TIMEOUT_SECONDS", "120.0"))
+
 MAX_RETRY_COUNT = 2  # 초기 1회 + 재시도 2회
 MAX_ANALYZE_EPISODES = 10
 MAX_ANALYZE_CHARS = 60000
@@ -43,7 +53,6 @@ FAILED_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_FAILED_RETRY_COOLDOWN_DA
 INCOMPLETE_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_INCOMPLETE_RETRY_COOLDOWN_DAYS", "3"))
 ANALYSIS_PIPELINE_VERSION = os.getenv("AI_METADATA_PIPELINE_VERSION", "dna-v20260320-r1")
 UNSUPPORTED_LABEL_ERROR_PREFIX = "unsupported_label:"
-CURRENT_ANALYSIS_VERSION = ANALYSIS_PIPELINE_VERSION[:50]
 
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
@@ -57,6 +66,7 @@ AXIS_LIMITS: dict[str, tuple[int, int]] = {
 }
 ALLOWED_HEROINE_WEIGHT = {"high", "mid", "low", "none"}
 ALLOWED_PACING = {"fast", "medium", "slow"}
+OPENROUTER_ALLOWED_FINISH_REASONS = {"stop"}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -236,7 +246,6 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
             where += f"""
             AND (
                 m.id IS NULL
-                OR COALESCE(m.model_version, '') <> %s
                 OR (
                     COALESCE(m.analysis_status, 'pending') = 'failed'
                     AND COALESCE(m.analysis_error_message, '') NOT LIKE %s
@@ -261,7 +270,7 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
                 )
             )
             """  # 미분석 즉시, 실패는 cooldown 뒤, 10화 공개/수정 시 최종 1회 재분석
-            params.extend([CURRENT_ANALYSIS_VERSION, f"{UNSUPPORTED_LABEL_ERROR_PREFIX}%"])
+            params.append(f"{UNSUPPORTED_LABEL_ERROR_PREFIX}%")
 
         cur.execute(
             f"""
@@ -444,6 +453,153 @@ def load_label_definitions() -> str:
     return ""
 
 
+def _split_csv(value: str) -> list[str]:
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def _compact_model_slug(model: str) -> str:
+    slug = (model or "").split("/")[-1].strip().lower()
+    return (
+        slug.replace("deepseek-", "ds-")
+        .replace("claude-", "cl-")
+        .replace("haiku-", "hq-")
+        .replace("json_schema", "schema")
+    )
+
+
+def _compact_response_format(value: str) -> str:
+    if value == "json_schema":
+        return "schema"
+    if value == "json_object":
+        return "json"
+    return (value or "default")[:10]
+
+
+def _current_analysis_version() -> str:
+    if AI_DNA_PROVIDER != "openrouter":
+        return ANALYSIS_PIPELINE_VERSION[:50]
+    provider = (_split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY) or ["auto"])[0]
+    version = "|".join(
+        [
+            ANALYSIS_PIPELINE_VERSION,
+            "or",
+            _compact_model_slug(AI_DNA_OPENROUTER_MODEL),
+            provider,
+            _compact_response_format(AI_DNA_RESPONSE_FORMAT),
+        ]
+    )
+    return version[:50]
+
+
+CURRENT_ANALYSIS_VERSION = _current_analysis_version()
+
+
+def _build_openrouter_response_format(allowed_labels: dict[str, set[str]]) -> dict[str, Any]:
+    if AI_DNA_RESPONSE_FORMAT == "json_object":
+        return {"type": "json_object"}
+    if AI_DNA_RESPONSE_FORMAT != "json_schema":
+        raise ValueError(f"unsupported AI_DNA_RESPONSE_FORMAT: {AI_DNA_RESPONSE_FORMAT}")
+
+    axis_properties: dict[str, Any] = {}
+    for axis in AXIS_ORDER:
+        min_items, max_items = AXIS_LIMITS[axis]
+        axis_properties[axis] = {
+            "type": "array",
+            "items": {"type": "string", "enum": sorted(allowed_labels[axis])},
+            "minItems": min_items,
+            "maxItems": max_items,
+        }
+    confidence_properties = {
+        axis: {"type": "number", "minimum": 0, "maximum": 1}
+        for axis in AXIS_ORDER
+    }
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "protagonist_type": {"type": "string"},
+                    "protagonist_desc": {"type": "string"},
+                    "heroine_type": {"type": "string"},
+                    "heroine_weight": {
+                        "type": "string",
+                        "enum": sorted(ALLOWED_HEROINE_WEIGHT),
+                    },
+                    "mood": {"type": "string"},
+                    "pacing": {"type": "string", "enum": sorted(ALLOWED_PACING)},
+                    "premise": {"type": "string"},
+                    "hook": {"type": "string"},
+                    "themes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                    "taste_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                },
+                "required": [
+                    "protagonist_type",
+                    "protagonist_desc",
+                    "heroine_type",
+                    "heroine_weight",
+                    "mood",
+                    "pacing",
+                    "premise",
+                    "hook",
+                    "themes",
+                    "taste_tags",
+                ],
+            },
+            "axis_labels": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": axis_properties,
+                "required": list(AXIS_ORDER),
+            },
+            "axis_confidence": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": confidence_properties,
+                "required": list(AXIS_ORDER),
+            },
+            "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["summary", "axis_labels", "axis_confidence", "overall_confidence"],
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "likenovel_dna_axis_extraction",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+def _validate_runtime_config(allowed_labels: dict[str, set[str]]) -> None:
+    if MAX_LLM_OUTPUT_TOKENS <= 0:
+        raise RuntimeError("AI_METADATA_MAX_TOKENS must be > 0")
+    if AI_DNA_PROVIDER == "anthropic":
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError("ANTHROPIC_API_KEY 환경변수를 설정하세요.")
+        return
+    if AI_DNA_PROVIDER != "openrouter":
+        raise RuntimeError(f"unsupported AI_DNA_PROVIDER: {AI_DNA_PROVIDER}")
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY 환경변수를 설정하세요.")
+    if not AI_DNA_OPENROUTER_MODEL:
+        raise RuntimeError("AI_DNA_OPENROUTER_MODEL 환경변수를 설정하세요.")
+    if AI_DNA_TIMEOUT_SECONDS <= 0:
+        raise RuntimeError("AI_DNA_TIMEOUT_SECONDS must be > 0")
+    _build_openrouter_response_format(allowed_labels)
+
+
 def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str]]) -> dict[str, Any]:
     summary = payload.get("summary")
     if not isinstance(summary, dict):
@@ -554,6 +710,164 @@ def call_claude(system_prompt: str, user_prompt: str) -> str:
         return data["content"][0]["text"]
 
 
+def _extract_openrouter_message_text(payload: dict[str, Any]) -> str:
+    choice = (payload.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    parts.append(str(text))
+            elif item:
+                parts.append(str(item))
+        content = "\n".join(parts)
+    return str(content or "").strip()
+
+
+def _redact_openrouter_message(text: str) -> str:
+    cleaned = re.sub(r'(?i)(user_id["=: ]+)([A-Za-z0-9_-]+)', r"\1***", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:240]
+
+
+def _sanitize_openrouter_error(resp: httpx.Response) -> str:
+    message = ""
+    code = ""
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or error.get("type") or "").strip()
+            message = str(error.get("message") or "").strip()
+        if not code:
+            code = str(payload.get("code") or "").strip()
+        if not message:
+            message = str(payload.get("message") or "").strip()
+    detail_parts = [f"status={resp.status_code}"]
+    if code:
+        detail_parts.append(f"code={code}")
+    if message:
+        detail_parts.append(f"message={_redact_openrouter_message(message)}")
+    return f"OpenRouter API error ({', '.join(detail_parts)})"
+
+
+def _validate_openrouter_choice(payload: dict[str, Any]) -> dict[str, Any]:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("OpenRouter invalid response: missing choices")
+    choice = choices[0] or {}
+    finish_reason = choice.get("finish_reason")
+    if finish_reason and finish_reason not in OPENROUTER_ALLOWED_FINISH_REASONS:
+        raise RuntimeError(f"OpenRouter incomplete response: finish_reason={finish_reason}")
+    return choice
+
+
+def call_openrouter(
+    system_prompt: str,
+    user_prompt: str,
+    allowed_labels: dict[str, set[str]],
+) -> tuple[str, dict[str, Any]]:
+    """OpenRouter Chat Completions 호출 (동기)."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY 환경변수를 설정하세요.")
+    if not AI_DNA_OPENROUTER_MODEL:
+        raise RuntimeError("AI_DNA_OPENROUTER_MODEL 환경변수를 설정하세요.")
+
+    payload: dict[str, Any] = {
+        "model": AI_DNA_OPENROUTER_MODEL,
+        "temperature": 0.1,
+        "max_tokens": MAX_LLM_OUTPUT_TOKENS,
+        "response_format": _build_openrouter_response_format(allowed_labels),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    provider_only = _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY)
+    if provider_only:
+        payload["provider"] = {
+            "only": provider_only,
+            "require_parameters": True,
+        }
+
+    with httpx.Client(timeout=AI_DNA_TIMEOUT_SECONDS) as client:
+        resp = client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "LikeNovel AI DNA Metadata Batch",
+            },
+            json=payload,
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(_sanitize_openrouter_error(resp))
+
+    data = resp.json()
+    _validate_openrouter_choice(data)
+    raw = _extract_openrouter_message_text(data)
+    if not raw:
+        finish_reason = ((data.get("choices") or [{}])[0] or {}).get("finish_reason")
+        raise RuntimeError(f"OpenRouter empty content (finish_reason={finish_reason or 'unknown'})")
+    return raw, data.get("usage") or {}
+
+
+def _usage_summary(usage: dict[str, Any] | None) -> dict[str, Any]:
+    usage = usage or {}
+    return {
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "cost": usage.get("cost"),
+    }
+
+
+def _call_llm(
+    system_prompt: str,
+    user_prompt: str,
+    allowed_labels: dict[str, set[str]],
+) -> tuple[str, dict[str, Any]]:
+    if AI_DNA_PROVIDER == "anthropic":
+        return call_claude(system_prompt, user_prompt), {
+            "provider": "anthropic",
+            "model": ANTHROPIC_MODEL,
+            "response_format": "json_object",
+        }
+    if AI_DNA_PROVIDER == "openrouter":
+        raw, usage = call_openrouter(system_prompt, user_prompt, allowed_labels)
+        return raw, {
+            "provider": "openrouter",
+            "model": AI_DNA_OPENROUTER_MODEL,
+            "provider_only": _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY),
+            "response_format": AI_DNA_RESPONSE_FORMAT,
+            "usage": _usage_summary(usage),
+        }
+    raise RuntimeError(f"unsupported AI_DNA_PROVIDER: {AI_DNA_PROVIDER}")
+
+
+def _attach_llm_meta(parsed: dict[str, Any], calls: list[dict[str, Any]]) -> dict[str, Any]:
+    enriched = dict(parsed)
+    total_cost = 0.0
+    found_cost = False
+    for call in calls:
+        usage = call.get("usage") or {}
+        if usage.get("cost") is not None:
+            total_cost += float(usage["cost"])
+            found_cost = True
+    enriched["_llm_meta"] = {
+        "analysis_version": CURRENT_ANALYSIS_VERSION,
+        "calls": calls,
+        "total_cost": round(total_cost, 8) if found_cost else None,
+    }
+    return enriched
+
+
 def parse_json(raw: str) -> dict:
     text = raw.strip()
     if text.startswith("```"):
@@ -610,16 +924,26 @@ def analyze_product(
 ) -> tuple[dict, dict]:
     """작품 1개 분석."""
     user_prompt = _build_analysis_prompt(product, allowed_labels, episodes_text, used_count)
-    raw = call_claude(DNA_SYSTEM_PROMPT, user_prompt)
+    raw, call_meta = _call_llm(DNA_SYSTEM_PROMPT, user_prompt, allowed_labels)
+    llm_calls = [{"stage": "analysis", **call_meta}]
     parsed = parse_json(raw)
     try:
         normalized = normalize_payload(parsed, allowed_labels)
     except UnsupportedLabelError as repair_error:
         repair_prompt = _build_repair_prompt(product, allowed_labels, parsed, repair_error)
-        repaired_raw = call_claude(DNA_SYSTEM_PROMPT, repair_prompt)
+        repaired_raw, repair_call_meta = _call_llm(DNA_SYSTEM_PROMPT, repair_prompt, allowed_labels)
+        llm_calls.append(
+            {
+                "stage": "repair",
+                "repair_axis": repair_error.axis,
+                "repair_label": repair_error.label,
+                **repair_call_meta,
+            }
+        )
         repaired_parsed = parse_json(repaired_raw)
         normalized = normalize_payload(repaired_parsed, allowed_labels)
         parsed = repaired_parsed
+    parsed = _attach_llm_meta(parsed, llm_calls)
     return normalized, parsed
 
 
@@ -735,6 +1059,13 @@ def _format_failure_message(error: Exception) -> str:
     return (str(error) or "unknown error")[:1000]
 
 
+def _format_cost_from_parsed(parsed: dict[str, Any]) -> str:
+    meta = parsed.get("_llm_meta") if isinstance(parsed, dict) else None
+    if not isinstance(meta, dict) or meta.get("total_cost") is None:
+        return ""
+    return f", cost=${float(meta['total_cost']):.6f}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="작품 AI 메타 추출")
     parser.add_argument("--product-id", type=int, help="특정 작품 ID만 분석")
@@ -746,9 +1077,11 @@ def main():
         parser.error("--product-id 또는 --all 중 하나를 지정하세요.")
 
     allowed_labels = load_allowed_labels()
+    _validate_runtime_config(allowed_labels)
     conn = db_connect()
     print(f"[OK] DB 연결 성공 ({DB_HOST}:{DB_PORT})")
     print(f"[OK] 라벨 SSOT 로드 완료: {next(path for path in LABELS_JSON_CANDIDATES if path.exists())}")
+    print(f"[INFO] provider={AI_DNA_PROVIDER}, version={CURRENT_ANALYSIS_VERSION}")
 
     products = get_products(conn, args.product_id, args.force)
     print(f"[INFO] 분석 대상: {len(products)}개 작품")
@@ -777,7 +1110,7 @@ def main():
                 save_dna(conn, pid, dna, parsed, attempt)
                 success += 1
                 analyzed = True
-                print(f"OK (attempt={attempt})")
+                print(f"OK (attempt={attempt}{_format_cost_from_parsed(parsed)})")
                 break
             except UnsupportedLabelError as e:
                 last_error = _format_failure_message(e)
@@ -796,6 +1129,8 @@ def main():
 
     conn.close()
     print(f"\n[DONE] 성공: {success}, 실패: {fail}")
+    if fail > 0 and success == 0:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
