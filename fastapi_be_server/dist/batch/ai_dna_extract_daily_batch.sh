@@ -48,16 +48,20 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 echo "$$" > "$LOCK_PID_FILE"
 
-# PID 1에서 환경변수 로딩 (cron_env.sh가 DB만 로드하므로 ANTHROPIC 키도 가져옴)
+# PID 1에서 환경변수 로딩 (cron_env.sh 누락/cron 직접 실행 fallback)
 if [ -r /proc/1/environ ]; then
   while IFS='=' read -r key value; do
     case "$key" in
-      ANTHROPIC_API_KEY|ANTHROPIC_MODEL|AI_METADATA_MAX_TOKENS)
+      ANTHROPIC_API_KEY|ANTHROPIC_MODEL|OPENROUTER_API_KEY|OPENROUTER_BASE_URL|AI_DNA_PROVIDER|AI_DNA_OPENROUTER_MODEL|AI_DNA_OPENROUTER_PROVIDER_ONLY|AI_DNA_RESPONSE_FORMAT|AI_DNA_TIMEOUT_SECONDS|AI_METADATA_MAX_TOKENS|AI_METADATA_PIPELINE_VERSION|AI_METADATA_FAILED_RETRY_COOLDOWN_DAYS|AI_METADATA_INCOMPLETE_RETRY_COOLDOWN_DAYS)
         export "$key=$value"
         ;;
     esac
   done < <(tr '\0' '\n' < /proc/1/environ)
 fi
+
+AI_DNA_PROVIDER="${AI_DNA_PROVIDER:-anthropic}"
+AI_DNA_PROVIDER="${AI_DNA_PROVIDER//[$'\t\r\n ']/}"
+AI_DNA_PROVIDER="${AI_DNA_PROVIDER,,}"
 
 DB_HOST="${DB_HOST:-mysql}"
 DB_PORT="${DB_PORT:-3306}"
@@ -82,10 +86,28 @@ if [ -z "$BATCH_DB_USER" ] || [ -z "$BATCH_DB_PASSWORD" ]; then
   exit 1
 fi
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "[ERROR] Missing ANTHROPIC_API_KEY env for batch." 1>&2
-  exit 1
-fi
+case "$AI_DNA_PROVIDER" in
+  anthropic)
+    AI_DNA_SELECTED_MODEL="${ANTHROPIC_MODEL:-unknown}"
+    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+      echo "[ERROR] Missing ANTHROPIC_API_KEY env for AI_DNA_PROVIDER=anthropic." 1>&2
+      exit 1
+    fi
+    ;;
+  openrouter)
+    AI_DNA_SELECTED_MODEL="${AI_DNA_OPENROUTER_MODEL:-unknown}"
+    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+      echo "[ERROR] Missing OPENROUTER_API_KEY env for AI_DNA_PROVIDER=openrouter." 1>&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "[ERROR] Unsupported AI_DNA_PROVIDER: $AI_DNA_PROVIDER" 1>&2
+    exit 1
+    ;;
+esac
+
+echo "[INFO] AI DNA provider=$AI_DNA_PROVIDER model=$AI_DNA_SELECTED_MODEL"
 
 MYSQL_CMD=(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4)
 if [ -n "${MYSQL_SSL_OPT:-}" ]; then
