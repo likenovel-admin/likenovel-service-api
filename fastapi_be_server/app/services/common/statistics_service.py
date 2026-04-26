@@ -364,6 +364,41 @@ async def insert_site_statistics_log(
     await db.commit()
 
 
+async def insert_site_statistics_logs(
+    db: AsyncSession,
+    types: list[str],
+    user_id: int | str | None,
+    date: datetime | None = None,
+):
+    """
+    여러 사이트 통계 로그를 한 번의 executemany + commit으로 저장합니다.
+    read API에서 visit/page_view를 연속 기록할 때 commit 왕복을 줄이기 위한 helper입니다.
+    """
+    if user_id is None or not types:
+        return
+    if isinstance(user_id, str):
+        kc_user_id = user_id
+        query = text("""
+                         SELECT user_id FROM tb_user WHERE kc_user_id = :kc_user_id
+                         """)
+        result = await db.execute(query, {"kc_user_id": kc_user_id})
+        row = result.mappings().one_or_none()
+        if row is None:
+            return
+        user_id = row.get("user_id")
+    if date is None:
+        date = datetime.now()
+    query = text("""
+        INSERT INTO tb_site_statistics_log (date, type, user_id, created_date)
+        VALUES (:date, :type, :user_id, NOW())
+    """)
+    await db.execute(
+        query,
+        [{"date": date, "type": type, "user_id": user_id} for type in types],
+    )
+    await db.commit()
+
+
 async def payment_statistics(
     start_date: str | None,
     end_date: str | None,
