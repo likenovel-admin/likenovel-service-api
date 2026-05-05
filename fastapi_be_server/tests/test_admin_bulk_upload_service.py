@@ -31,7 +31,7 @@ sqlalchemy_asyncio_stub = ModuleType("sqlalchemy.ext.asyncio")
 sqlalchemy_asyncio_stub.AsyncSession = object
 sys.modules.setdefault("sqlalchemy.ext.asyncio", sqlalchemy_asyncio_stub)
 
-from app.services.admin.admin_bulk_upload_service import _txt_to_html
+from app.services.admin.admin_bulk_upload_service import _normalize_episode_no_map, _txt_to_html
 
 
 class AdminBulkUploadServiceUnitTest(unittest.TestCase):
@@ -53,6 +53,17 @@ class AdminBulkUploadServiceUnitTest(unittest.TestCase):
     def test_txt_to_html_preserves_intentional_trailing_blank_line(self):
         html = _txt_to_html("A\n\n")
         self.assertEqual(html, "<p>A</p><p><br/></p>")
+
+    def test_normalize_episode_no_map_keeps_one_based_numbers(self):
+        episodes = {1: "one", 2: "two", 10: "ten"}
+        self.assertEqual(_normalize_episode_no_map(episodes), episodes)
+
+    def test_normalize_episode_no_map_remaps_zero_based_numbers(self):
+        episodes = {0: "prologue", 1: "one", 2: "two"}
+        self.assertEqual(
+            _normalize_episode_no_map(episodes),
+            {1: "prologue", 2: "one", 3: "two"},
+        )
 
 
 if __name__ == "__main__":
