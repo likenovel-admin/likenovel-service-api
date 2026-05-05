@@ -320,6 +320,17 @@ def _extract_episode_no(filename: str) -> int | None:
     return None
 
 
+def _normalize_episode_no_map(episodes: dict[int, str]) -> dict[int, str]:
+    """DB episode_no는 1부터 시작하도록 보정한다.
+
+    파일명은 `0 프롤로그.txt`처럼 올 수 있지만, 플랫폼 회차번호는 1-based다.
+    0이 섞인 경우 정렬 순서를 유지한 채 1..N으로 재번호 매긴다.
+    """
+    if not episodes or 0 not in episodes:
+        return episodes
+    return {index: content for index, (_, content) in enumerate(sorted(episodes.items()), start=1)}
+
+
 async def _load_genre_map(db: AsyncSession) -> dict[str, int]:
     result = await db.execute(text(
         "SELECT keyword_id, keyword_name FROM tb_standard_keyword "
@@ -564,7 +575,7 @@ async def _create_episodes(
     except (ValueError, TypeError):
         start_date = datetime.now() + timedelta(days=1)
 
-    sorted_eps = sorted(episodes.items())
+    sorted_eps = sorted(_normalize_episode_no_map(episodes).items())
     schedule_offset = 0
 
     for ep_no, txt_content in sorted_eps:
