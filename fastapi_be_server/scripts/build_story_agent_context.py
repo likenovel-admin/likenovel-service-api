@@ -49,6 +49,11 @@ DB_NAME = os.getenv("BATCH_DB_NAME", "likenovel")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 EPISODE_SUMMARY_MODEL = os.getenv("STORY_AGENT_SUMMARY_MODEL", "deepseek/deepseek-v3.2").strip()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+RP_DEEPSEEK_FALLBACK_MODEL = (
+    os.getenv("STORY_AGENT_RP_DEEPSEEK_FALLBACK_MODEL", "").strip() or "deepseek-v4-pro"
+)
 RP_REASONING_MODEL = (os.getenv("STORY_AGENT_RP_REASONING_MODEL", "").strip() or "claude-sonnet-4-6")
 if RP_REASONING_MODEL.startswith("anthropic."):
     RP_REASONING_MODEL = RP_REASONING_MODEL.split(".", 1)[1].strip()
@@ -726,6 +731,92 @@ def extract_anthropic_tool_input(payload: dict, *, tool_name: str) -> dict | Non
         if isinstance(tool_input, dict):
             return tool_input
     return None
+
+
+def build_deepseek_chat_url() -> str:
+    return f"{DEEPSEEK_BASE_URL}/chat/completions"
+
+
+def deepseek_headers(*, title: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": title,
+    }
+
+
+async def request_deepseek_json_payload(
+    client: AsyncClient,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    title: str,
+) -> dict | None:
+    if not DEEPSEEK_API_KEY:
+        return None
+    response = await client.post(
+        build_deepseek_chat_url(),
+        headers=deepseek_headers(title=title),
+        json={
+            "model": RP_DEEPSEEK_FALLBACK_MODEL,
+            "thinking": {"type": "disabled"},
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": f"{system_prompt}\n\n반드시 유효한 JSON object만 반환하라."},
+                {"role": "user", "content": user_prompt},
+            ],
+        },
+    )
+    response.raise_for_status()
+    return extract_json_object(extract_openrouter_message_text(response.json()))
+
+
+async def request_deepseek_tool_payload(
+    client: AsyncClient,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    tool_schema: dict,
+    tool_name: str,
+    max_tokens: int,
+    title: str,
+) -> dict | None:
+    if not DEEPSEEK_API_KEY:
+        return None
+    response = await client.post(
+        build_deepseek_chat_url(),
+        headers=deepseek_headers(title=title),
+        json={
+            "model": RP_DEEPSEEK_FALLBACK_MODEL,
+            "thinking": {"type": "disabled"},
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        f"{system_prompt}\n\n"
+                        "반드시 유효한 JSON object만 반환하라. "
+                        "반환 JSON은 제공된 schema의 parameters 구조와 같은 최상위 필드를 사용해야 한다."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"schema_parameters:\n"
+                        f"{json.dumps(tool_schema.get('input_schema') or {}, ensure_ascii=False)}\n\n"
+                        f"{user_prompt}"
+                    ),
+                },
+            ],
+        },
+    )
+    response.raise_for_status()
+    return extract_json_object(extract_openrouter_message_text(response.json()))
 
 
 class EpisodeCharacterSignalsParseError(ValueError):
@@ -2353,6 +2444,55 @@ def mark_rp_example_candidates(items: list[dict[str, object]], aliases: list[str
     return marked
 
 
+def select_rp_example_texts(
+    payload: dict,
+    dialogue_items: list[dict[str, object]],
+    aliases: list[str],
+    limit: int = 5,
+) -> list[str]:
+    dialogue_texts = {
+        str(item.get("text") or "").strip()
+        for item in dialogue_items
+        if str(item.get("kind") or "dialogue").strip().lower() == "dialogue"
+        and str(item.get("text") or "").strip()
+    }
+    selected: list[str] = []
+    seen: set[str] = set()
+    for item in payload.get("example_dialogues") or []:
+        text_value = str(item).strip()
+        if (
+            text_value
+            and text_value in dialogue_texts
+            and text_value not in seen
+            and is_preferred_rp_example_text(text_value, aliases)
+        ):
+            selected.append(text_value)
+            seen.add(text_value)
+        if len(selected) >= limit:
+            return selected
+
+    fallback_candidates = sorted(
+        [
+            item for item in dialogue_items
+            if str(item.get("kind") or "dialogue").strip().lower() == "dialogue"
+            and bool(item.get("is_example_candidate"))
+            and str(item.get("text") or "").strip()
+        ],
+        key=lambda item: (
+            -int(item.get("example_score") or 0),
+            int(item.get("episode_no") or 0),
+        ),
+    )
+    for item in fallback_candidates:
+        text_value = str(item.get("text") or "").strip()
+        if text_value and text_value not in seen:
+            selected.append(text_value)
+            seen.add(text_value)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def collect_rp_summary_context_lines(
     target: dict[str, object],
     episode_rows: list[dict[str, object]],
@@ -2458,6 +2598,23 @@ async def request_rp_character_plan_payload(
         except (HTTPStatusError, RequestError, ValueError):
             pass
 
+    try:
+        parsed = await request_deepseek_json_payload(
+            client,
+            system_prompt=RP_CHARACTER_PLAN_PROMPT,
+            user_prompt=user_prompt,
+            max_tokens=1800,
+            title="LikeNovel Story Agent RP Character Plan DeepSeek Fallback",
+        )
+        if parsed:
+            logger.info(
+                "[storyctx] rp_character_plan fallback=deepseek model=%s",
+                RP_DEEPSEEK_FALLBACK_MODEL,
+            )
+            return parsed
+    except (HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("[storyctx] rp_character_plan deepseek fallback failed: %s", exc)
+
     response = await client.post(
         f"{OPENROUTER_BASE_URL}/chat/completions",
         headers={
@@ -2488,60 +2645,66 @@ async def request_episode_character_signals_payload(
     user_prompt = build_episode_character_signals_user_prompt(row, summary_text)
     episode_no = int(row.get("episode_no") or 0)
 
-    if not settings.ANTHROPIC_API_KEY or not RP_REASONING_MODEL:
-        raise RuntimeError("episode_character_signals requires anthropic reasoning configuration")
-
-    request_headers = {
-        "x-api-key": settings.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    request_payload = {
-        "model": RP_REASONING_MODEL,
-        "max_tokens": 1400,
-        "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
-        "messages": [{"role": "user", "content": user_prompt}],
-        "tools": [EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA],
-        "tool_choice": {"type": "tool", "name": EPISODE_CHARACTER_SIGNALS_TOOL_NAME},
-        **build_anthropic_reasoning_options(RP_REASONING_MODEL),
-    }
-
     response_payload: dict | None = None
     request_id = ""
-    try:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=request_headers,
-            json=request_payload,
-        )
-        response.raise_for_status()
-        response_payload = response.json()
-        request_id = (
-            response.headers.get("request-id")
-            or response.headers.get("x-request-id")
-            or response.headers.get("anthropic-request-id")
-            or ""
-        ).strip()
-    except (HTTPStatusError, RequestError):
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=request_headers,
-            json={
-                "model": RP_REASONING_MODEL,
-                "max_tokens": 1400,
-                "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
-                "messages": [{"role": "user", "content": user_prompt}],
-                **build_anthropic_reasoning_options(RP_REASONING_MODEL),
-            },
-        )
-        response.raise_for_status()
-        response_payload = response.json()
-        request_id = (
-            response.headers.get("request-id")
-            or response.headers.get("x-request-id")
-            or response.headers.get("anthropic-request-id")
-            or ""
-        ).strip()
+    if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
+        request_headers = {
+            "x-api-key": settings.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        request_payload = {
+            "model": RP_REASONING_MODEL,
+            "max_tokens": 1400,
+            "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "tools": [EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA],
+            "tool_choice": {"type": "tool", "name": EPISODE_CHARACTER_SIGNALS_TOOL_NAME},
+            **build_anthropic_reasoning_options(RP_REASONING_MODEL),
+        }
+
+        try:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=request_headers,
+                json=request_payload,
+            )
+            response.raise_for_status()
+            response_payload = response.json()
+            request_id = (
+                response.headers.get("request-id")
+                or response.headers.get("x-request-id")
+                or response.headers.get("anthropic-request-id")
+                or ""
+            ).strip()
+        except (HTTPStatusError, RequestError) as exc:
+            try:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=request_headers,
+                    json={
+                        "model": RP_REASONING_MODEL,
+                        "max_tokens": 1400,
+                        "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
+                        "messages": [{"role": "user", "content": user_prompt}],
+                        **build_anthropic_reasoning_options(RP_REASONING_MODEL),
+                    },
+                )
+                response.raise_for_status()
+                response_payload = response.json()
+                request_id = (
+                    response.headers.get("request-id")
+                    or response.headers.get("x-request-id")
+                    or response.headers.get("anthropic-request-id")
+                    or ""
+                ).strip()
+            except (HTTPStatusError, RequestError) as retry_exc:
+                logger.warning(
+                    "[storyctx] episode_character_signals anthropic failed episode_no=%s: %s / retry=%s",
+                    episode_no,
+                    exc,
+                    retry_exc,
+                )
 
     tool_payload = extract_anthropic_tool_input(response_payload or {}, tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME)
     if tool_payload:
@@ -2555,6 +2718,33 @@ async def request_episode_character_signals_payload(
     parsed_text = parse_episode_character_signals_structured_text(raw_text)
     if parsed_text:
         return parsed_text
+
+    try:
+        deepseek_payload = await request_deepseek_tool_payload(
+            client,
+            system_prompt=EPISODE_CHARACTER_SIGNALS_PROMPT,
+            user_prompt=(
+                build_episode_character_signals_user_prompt(row, summary_text)
+                + "\n\nJSON function arguments must satisfy the provided schema exactly."
+            ),
+            tool_schema=EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA,
+            tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME,
+            max_tokens=1400,
+            title="LikeNovel Story Agent Episode Character Signals DeepSeek Fallback",
+        )
+        if deepseek_payload:
+            logger.info(
+                "[storyctx] episode_character_signals fallback=deepseek model=%s episode_no=%s",
+                RP_DEEPSEEK_FALLBACK_MODEL,
+                episode_no,
+            )
+            return deepseek_payload
+    except (HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "[storyctx] episode_character_signals deepseek fallback failed episode_no=%s: %s",
+            episode_no,
+            exc,
+        )
 
     diagnostics = build_episode_character_signals_parse_diagnostics(raw_text)
     raise EpisodeCharacterSignalsParseError(
@@ -2611,6 +2801,23 @@ async def request_rp_profile_payload(
                 return parsed
         except (HTTPStatusError, RequestError, ValueError):
             pass
+
+    try:
+        parsed = await request_deepseek_json_payload(
+            client,
+            system_prompt=RP_PROFILE_SYNTHESIS_PROMPT,
+            user_prompt=user_prompt,
+            max_tokens=1200,
+            title="LikeNovel Story Agent RP Profile DeepSeek Fallback",
+        )
+        if parsed:
+            logger.info(
+                "[storyctx] rp_profile fallback=deepseek model=%s",
+                RP_DEEPSEEK_FALLBACK_MODEL,
+            )
+            return parsed
+    except (HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("[storyctx] rp_profile deepseek fallback failed: %s", exc)
 
     response = await client.post(
         f"{OPENROUTER_BASE_URL}/chat/completions",
@@ -2987,26 +3194,7 @@ async def build_rp_summaries(
             "personality_core": [str(item).strip() for item in (payload.get("personality_core") or []) if str(item).strip()][:2],
             "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
         }
-        example_texts = [
-            str(item).strip()
-            for item in (payload.get("example_dialogues") or [])
-            if str(item).strip() and is_preferred_rp_example_text(str(item).strip(), aliases)
-        ][:5]
-        if not example_texts:
-            fallback_candidates = sorted(
-                [
-                    item for item in dialogue_items
-                    if bool(item.get("is_example_candidate")) and str(item.get("text") or "").strip()
-                ],
-                key=lambda item: (
-                    -int(item.get("example_score") or 0),
-                    int(item.get("episode_no") or 0),
-                ),
-            )
-            example_texts = [
-                str(item.get("text") or "").strip()
-                for item in fallback_candidates
-            ][:5]
+        example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
         if not example_texts:
             continue
         example_payload = {
@@ -3203,26 +3391,7 @@ async def build_rp_summaries_delta(
             "personality_core": [str(item).strip() for item in (payload.get("personality_core") or []) if str(item).strip()][:2],
             "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
         }
-        example_texts = [
-            str(item).strip()
-            for item in (payload.get("example_dialogues") or [])
-            if str(item).strip() and is_preferred_rp_example_text(str(item).strip(), aliases)
-        ][:5]
-        if not example_texts:
-            fallback_candidates = sorted(
-                [
-                    item for item in dialogue_items
-                    if bool(item.get("is_example_candidate")) and str(item.get("text") or "").strip()
-                ],
-                key=lambda item: (
-                    -int(item.get("example_score") or 0),
-                    int(item.get("episode_no") or 0),
-                ),
-            )
-            example_texts = [
-                str(item.get("text") or "").strip()
-                for item in fallback_candidates
-            ][:5]
+        example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
         if not example_texts:
             logger.info(
                 "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s",
