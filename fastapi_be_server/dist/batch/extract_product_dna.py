@@ -42,6 +42,9 @@ AI_DNA_OPENROUTER_MODEL = os.getenv("AI_DNA_OPENROUTER_MODEL", "deepseek/deepsee
 AI_DNA_OPENROUTER_PROVIDER_ONLY = os.getenv("AI_DNA_OPENROUTER_PROVIDER_ONLY", "friendli").strip()
 AI_DNA_RESPONSE_FORMAT = os.getenv("AI_DNA_RESPONSE_FORMAT", "json_schema").strip().lower()
 AI_DNA_TIMEOUT_SECONDS = float(os.getenv("AI_DNA_TIMEOUT_SECONDS", "120.0"))
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+AI_DNA_DEEPSEEK_FALLBACK_MODEL = os.getenv("AI_DNA_DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-flash").strip()
 
 MAX_RETRY_COUNT = 2  # 초기 1회 + 재시도 2회
 MAX_ANALYZE_EPISODES = 10
@@ -818,6 +821,67 @@ def call_openrouter(
     return raw, data.get("usage") or {}
 
 
+def _sanitize_deepseek_error(resp: httpx.Response) -> str:
+    message = ""
+    code = ""
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or error.get("type") or "").strip()
+            message = str(error.get("message") or "").strip()
+        if not code:
+            code = str(payload.get("code") or "").strip()
+        if not message:
+            message = str(payload.get("message") or "").strip()
+    detail_parts = [f"status={resp.status_code}"]
+    if code:
+        detail_parts.append(f"code={code}")
+    if message:
+        detail_parts.append(f"message={_redact_openrouter_message(message)}")
+    return f"DeepSeek API error ({', '.join(detail_parts)})"
+
+
+def call_deepseek(system_prompt: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
+    """DeepSeek 공식 Chat Completions 호출 (Anthropic fallback용)."""
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY 환경변수를 설정하세요.")
+    if not AI_DNA_DEEPSEEK_FALLBACK_MODEL:
+        raise RuntimeError("AI_DNA_DEEPSEEK_FALLBACK_MODEL 환경변수를 설정하세요.")
+
+    with httpx.Client(timeout=AI_DNA_TIMEOUT_SECONDS) as client:
+        resp = client.post(
+            f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": AI_DNA_DEEPSEEK_FALLBACK_MODEL,
+                "temperature": 0.2,
+                "max_tokens": MAX_LLM_OUTPUT_TOKENS,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(_sanitize_deepseek_error(resp))
+
+    data = resp.json()
+    _validate_openrouter_choice(data)
+    raw = _extract_openrouter_message_text(data)
+    if not raw:
+        finish_reason = ((data.get("choices") or [{}])[0] or {}).get("finish_reason")
+        raise RuntimeError(f"DeepSeek empty content (finish_reason={finish_reason or 'unknown'})")
+    return raw, data.get("usage") or {}
+
+
 def _usage_summary(usage: dict[str, Any] | None) -> dict[str, Any]:
     usage = usage or {}
     return {
@@ -834,11 +898,24 @@ def _call_llm(
     allowed_labels: dict[str, set[str]],
 ) -> tuple[str, dict[str, Any]]:
     if AI_DNA_PROVIDER == "anthropic":
-        return call_claude(system_prompt, user_prompt), {
-            "provider": "anthropic",
-            "model": ANTHROPIC_MODEL,
-            "response_format": "json_object",
-        }
+        try:
+            return call_claude(system_prompt, user_prompt), {
+                "provider": "anthropic",
+                "model": ANTHROPIC_MODEL,
+                "response_format": "json_object",
+            }
+        except Exception as exc:
+            if not DEEPSEEK_API_KEY:
+                raise
+            raw, usage = call_deepseek(system_prompt, user_prompt)
+            return raw, {
+                "provider": "deepseek",
+                "fallback_from": "anthropic",
+                "fallback_reason": str(exc)[:240],
+                "model": AI_DNA_DEEPSEEK_FALLBACK_MODEL,
+                "response_format": "json_object",
+                "usage": _usage_summary(usage),
+            }
     if AI_DNA_PROVIDER == "openrouter":
         raw, usage = call_openrouter(system_prompt, user_prompt, allowed_labels)
         return raw, {
