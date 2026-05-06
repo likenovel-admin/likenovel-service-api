@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS tb_story_agent_usage_log (
+    usage_log_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id BIGINT NOT NULL COMMENT '웹소챗 세션 ID',
+    user_message_id BIGINT NULL COMMENT '사용자 메시지 ID',
+    assistant_message_id BIGINT NULL COMMENT '어시스턴트 메시지 ID',
+    product_id INT NOT NULL COMMENT '작품 ID',
+    user_id INT NULL COMMENT '로그인 사용자 ID',
+    guest_key VARCHAR(64) NULL COMMENT '비로그인 식별 키',
+    model_used VARCHAR(40) NOT NULL COMMENT 'gemini | haiku | system | game-host 등',
+    route_mode VARCHAR(80) NOT NULL COMMENT '웹소챗 라우팅 모드',
+    intent VARCHAR(80) NULL COMMENT '분류된 의도',
+    fallback_used CHAR(1) NOT NULL DEFAULT 'N' COMMENT 'fallback 사용 여부',
+    charged_cash INT NOT NULL DEFAULT 0 COMMENT '해당 턴 캐시 차감액',
+    created_id INT NULL COMMENT 'row를 생성한 id',
+    created_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '생성일',
+    KEY idx_story_agent_usage_session (session_id),
+    KEY idx_story_agent_usage_product_created (product_id, created_date),
+    KEY idx_story_agent_usage_user_created (user_id, created_date),
+    KEY idx_story_agent_usage_model_created (model_used, created_date),
+    KEY idx_story_agent_usage_created (created_date)
+);

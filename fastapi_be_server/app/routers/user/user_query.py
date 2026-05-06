@@ -572,6 +572,9 @@ async def post_userid_identity_token(
 
 @router.get("/cash", tags=["유저 - 캐시"], dependencies=[Depends(analysis_logger)])
 async def get_user_cash(
+    category: str = Query("all", description="조회 구분: all | charge | used"),
+    page: int = Query(1, ge=1, description="페이지 번호"),
+    page_size: int = Query(30, ge=1, le=100, alias="pageSize", description="페이지 크기"),
     user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
@@ -580,7 +583,13 @@ async def get_user_cash(
     캐시 사용내역 조회
     """
 
-    return await user_service.get_user_cash(kc_user_id=user.get("sub"), db=db)
+    return await user_service.get_user_cash(
+        kc_user_id=user.get("sub"),
+        db=db,
+        category=category,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get(
