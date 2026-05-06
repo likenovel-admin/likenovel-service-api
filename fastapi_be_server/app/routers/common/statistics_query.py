@@ -507,3 +507,40 @@ async def payment_statistics_by_user_for_excel_download(
     return await statistics_service.payment_statistics_by_user(
         start_date, end_date, search_target, search_word, -1, -1, db
     )
+
+
+@router.get(
+    "/websochat-usage",
+    tags=["웹소챗 사용 통계"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def websochat_usage_statistics(
+    start_date: str | None = Query(None, description="시작 날짜"),
+    end_date: str | None = Query(None, description="종료 날짜"),
+    search_target: str = Query("", description="검색 타겟(email | nickname | product_title | session_title)"),
+    search_word: str = Query("", description="검색어"),
+    product_id: int | None = Query(None, description="작품 ID"),
+    model_used: str = Query("", description="모델 필터"),
+    route_mode: str = Query("", description="라우트 필터"),
+    fallback_used: str = Query("", description="fallback 사용 여부(Y | N)"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(8, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """웹소챗 사용량/비용 통계."""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+
+    return await statistics_service.websochat_usage_statistics(
+        start_date,
+        end_date,
+        search_target,
+        search_word,
+        product_id,
+        model_used,
+        route_mode,
+        fallback_used,
+        page,
+        count_per_page,
+        db,
+    )

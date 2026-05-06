@@ -600,3 +600,194 @@ async def payment_statistics_by_user(
     rows = result.mappings().all()
 
     return build_paginated_response(rows, total_count, page, count_per_page)
+
+
+async def websochat_usage_statistics(
+    start_date: str | None,
+    end_date: str | None,
+    search_target: str,
+    search_word: str,
+    product_id: int | None,
+    model_used: str,
+    route_mode: str,
+    fallback_used: str,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+):
+    """웹소챗 사용량/비용 운영 대시보드."""
+    params: dict[str, object] = {}
+    where_conditions: list[str] = []
+
+    if start_date:
+        where_conditions.append("DATE(l.created_date) >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where_conditions.append("DATE(l.created_date) <= :end_date")
+        params["end_date"] = end_date
+    if product_id is not None:
+        where_conditions.append("l.product_id = :product_id")
+        params["product_id"] = product_id
+    if model_used:
+        where_conditions.append("l.model_used = :model_used")
+        params["model_used"] = model_used
+    if route_mode:
+        where_conditions.append("l.route_mode = :route_mode")
+        params["route_mode"] = route_mode
+    if fallback_used in {"Y", "N"}:
+        where_conditions.append("l.fallback_used = :fallback_used")
+        params["fallback_used"] = fallback_used
+
+    normalized_search_word = str(search_word or "").strip()
+    if normalized_search_word:
+        params["search_word"] = f"%{normalized_search_word}%"
+        if search_target == "email":
+            where_conditions.append("u.email LIKE :search_word")
+        elif search_target == "nickname":
+            where_conditions.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM tb_user_profile up
+                    WHERE up.user_id = l.user_id
+                      AND up.nickname LIKE :search_word
+                )
+                """
+            )
+        elif search_target == "product_title":
+            where_conditions.append("p.title LIKE :search_word")
+        elif search_target == "session_title":
+            where_conditions.append("s.title LIKE :search_word")
+        else:
+            where_conditions.append(
+                """
+                (
+                    u.email LIKE :search_word
+                    OR p.title LIKE :search_word
+                    OR s.title LIKE :search_word
+                    OR EXISTS (
+                        SELECT 1
+                        FROM tb_user_profile up
+                        WHERE up.user_id = l.user_id
+                          AND up.nickname LIKE :search_word
+                    )
+                )
+                """
+            )
+
+    where_sql = "WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+    base_from_sql = f"""
+        FROM tb_story_agent_usage_log l
+        INNER JOIN tb_story_agent_session s ON s.session_id = l.session_id
+        LEFT JOIN tb_product p ON p.product_id = l.product_id
+        LEFT JOIN tb_user u ON u.user_id = l.user_id
+        {where_sql}
+    """
+
+    summary_query = text(
+        f"""
+        SELECT
+            COUNT(*) AS total_turn_count,
+            COUNT(DISTINCT l.session_id) AS session_count,
+            COUNT(DISTINCT l.product_id) AS product_count,
+            COUNT(DISTINCT l.user_id) AS user_count,
+            COALESCE(SUM(CASE WHEN l.charged_cash > 0 THEN 1 ELSE 0 END), 0) AS charged_turn_count,
+            COALESCE(SUM(l.charged_cash), 0) AS charged_cash,
+            COALESCE(SUM(CASE WHEN l.fallback_used = 'Y' THEN 1 ELSE 0 END), 0) AS fallback_count
+        {base_from_sql}
+        """
+    )
+    summary_result = await db.execute(summary_query, params)
+    summary = dict(summary_result.mappings().first() or {})
+
+    model_query = text(
+        f"""
+        SELECT
+            l.model_used,
+            COUNT(*) AS turn_count,
+            COALESCE(SUM(l.charged_cash), 0) AS charged_cash,
+            COALESCE(SUM(CASE WHEN l.fallback_used = 'Y' THEN 1 ELSE 0 END), 0) AS fallback_count
+        {base_from_sql}
+        GROUP BY l.model_used
+        ORDER BY turn_count DESC, charged_cash DESC
+        """
+    )
+    model_result = await db.execute(model_query, params)
+    model_summary = [dict(row) for row in model_result.mappings().all()]
+
+    route_query = text(
+        f"""
+        SELECT
+            l.route_mode,
+            COUNT(*) AS turn_count,
+            COALESCE(SUM(l.charged_cash), 0) AS charged_cash
+        {base_from_sql}
+        GROUP BY l.route_mode
+        ORDER BY turn_count DESC, charged_cash DESC
+        LIMIT 20
+        """
+    )
+    route_result = await db.execute(route_query, params)
+    route_summary = [dict(row) for row in route_result.mappings().all()]
+
+    product_query = text(
+        f"""
+        SELECT
+            l.product_id,
+            COALESCE(p.title, CONCAT('작품 ', l.product_id)) AS product_title,
+            COUNT(*) AS turn_count,
+            COUNT(DISTINCT l.session_id) AS session_count,
+            COALESCE(SUM(l.charged_cash), 0) AS charged_cash
+        {base_from_sql}
+        GROUP BY l.product_id, p.title
+        ORDER BY turn_count DESC, charged_cash DESC
+        LIMIT 10
+        """
+    )
+    product_result = await db.execute(product_query, params)
+    product_summary = [dict(row) for row in product_result.mappings().all()]
+
+    count_query = text(f"SELECT COUNT(*) AS total_count {base_from_sql}")
+    count_result = await db.execute(count_query, params)
+    total_count = int(dict(count_result.mappings().first() or {}).get("total_count") or 0)
+
+    detail_query_sql = f"""
+        SELECT
+            l.usage_log_id,
+            l.session_id,
+            l.product_id,
+            COALESCE(p.title, CONCAT('작품 ', l.product_id)) AS product_title,
+            s.title AS session_title,
+            l.user_id,
+            u.email,
+            {get_nickname_sub_query('l.user_id')},
+            l.guest_key,
+            l.model_used,
+            l.route_mode,
+            l.intent,
+            l.fallback_used,
+            l.charged_cash,
+            l.created_date
+        {base_from_sql}
+        ORDER BY l.created_date DESC, l.usage_log_id DESC
+    """
+    if page != -1 and count_per_page != -1:
+        offset = max(page - 1, 0) * count_per_page
+        detail_query_sql += " LIMIT :limit OFFSET :offset"
+        detail_params = {**params, "limit": count_per_page, "offset": offset}
+    else:
+        detail_params = params
+
+    detail_result = await db.execute(text(detail_query_sql), detail_params)
+    results = [dict(row) for row in detail_result.mappings().all()]
+
+    return {
+        "total_count": total_count,
+        "page": page,
+        "count_per_page": count_per_page,
+        "summary": summary,
+        "model_summary": model_summary,
+        "route_summary": route_summary,
+        "product_summary": product_summary,
+        "results": results,
+    }
