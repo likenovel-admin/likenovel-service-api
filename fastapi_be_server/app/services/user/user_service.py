@@ -585,8 +585,19 @@ async def get_user_profiles_profile_id_info(
 
 
 @handle_exceptions
-async def get_user_cash(kc_user_id: str, db: AsyncSession):
+async def get_user_cash(
+    kc_user_id: str,
+    db: AsyncSession,
+    category: str = "all",
+    page: int = 1,
+    page_size: int = 30,
+):
     res_data = list()
+    normalized_category = category if category in {"all", "charge", "used"} else "all"
+    safe_page = max(page, 1)
+    safe_page_size = min(max(page_size, 1), 100)
+    offset = (safe_page - 1) * safe_page_size
+    total_count = 0
 
     if kc_user_id:
         user_id = await comm_service.get_user_from_kc(kc_user_id, db)
@@ -596,28 +607,36 @@ async def get_user_cash(kc_user_id: str, db: AsyncSession):
                 message=ErrorMessages.LOGIN_REQUIRED,
             )
 
-        query = text("""
-                            select t.*
-                            from (
-                                select case when a.sponsor_type = 'story_agent' then 'used'
-                                            when a.amount > 0 then 'charge'
-                                            else 'use'
-                                        end as category
-                                    , a.amount
-                                    , case when a.sponsor_type = 'story_agent'
-                                            then coalesce(p.title, '스토리 에이전트')
-                                            else '캐시 지급'
-                                        end as product_title
-                                    , case when a.sponsor_type = 'story_agent'
-                                            then concat('스토리 에이전트 · ', coalesce(s.title, '세션'))
-                                            else null
-                                        end as episode_title
-                                    , a.created_date
+        cash_history_query = """
+                                select 'used' as category
+                                    , sum(a.amount) as amount
+                                    , coalesce(p.title, '스토리 에이전트') as product_title
+                                    , concat('웹소챗 · ', coalesce(s.title, '세션')) as episode_title
+                                    , max(a.created_date) as created_date
                                 from tb_user_cashbook_transaction a
                                 left join tb_story_agent_session s on a.story_agent_session_id = s.session_id
                                 left join tb_product p on p.product_id = coalesce(a.product_id, s.product_id)
                                 where a.from_user_id = :user_id
                                 and a.use_yn = 'Y'
+                                and a.sponsor_type = 'story_agent'
+                                group by case when a.story_agent_session_id is not null
+                                                then concat('session:', a.story_agent_session_id)
+                                                else concat('transaction:', a.id)
+                                            end
+                                    , coalesce(p.title, '스토리 에이전트')
+                                    , concat('웹소챗 · ', coalesce(s.title, '세션'))
+                                union all
+                                select case when a.amount > 0 then 'charge'
+                                            else 'use'
+                                        end as category
+                                    , a.amount
+                                    , '캐시 지급' as product_title
+                                    , null as episode_title
+                                    , a.created_date
+                                from tb_user_cashbook_transaction a
+                                where a.from_user_id = :user_id
+                                and a.use_yn = 'Y'
+                                and (a.sponsor_type is null or a.sponsor_type <> 'story_agent')
                                 union all
                                 select 'used' as category
                                     , a.item_price * a.quantity as amount
@@ -631,12 +650,45 @@ async def get_user_cash(kc_user_id: str, db: AsyncSession):
                                 and b.user_id = :user_id
                                 inner join tb_product_order_item_info c on a.item_id = c.item_info_id
                                 where a.cancel_yn = 'N'
+                            """
+
+        query = text(f"""
+                            select t.*
+                            from (
+                                {cash_history_query}
                             ) t
+                            where (
+                                :category = 'all'
+                                or (:category = 'used' and t.category in ('used', 'use'))
+                                or t.category = :category
+                            )
                             order by t.created_date desc
+                            limit :limit offset :offset
                             """)
 
-        result = await db.execute(query, {"user_id": user_id})
+        count_query = text(f"""
+                            select count(*) as total_count
+                            from (
+                                {cash_history_query}
+                            ) t
+                            where (
+                                :category = 'all'
+                                or (:category = 'used' and t.category in ('used', 'use'))
+                                or t.category = :category
+                            )
+                            """)
+
+        query_params = {
+            "user_id": user_id,
+            "category": normalized_category,
+            "limit": safe_page_size,
+            "offset": offset,
+        }
+
+        result = await db.execute(query, query_params)
         db_rst = result.mappings().all()
+        count_result = await db.execute(count_query, query_params)
+        total_count = count_result.scalar_one() or 0
 
         if db_rst:
             res_data = [user_schema.GetUserCashToCamel(**row) for row in db_rst]
@@ -646,7 +698,13 @@ async def get_user_cash(kc_user_id: str, db: AsyncSession):
             message=ErrorMessages.EXPIRED_ACCESS_TOKEN,
         )
 
-    res_body = {"data": res_data}
+    res_body = {
+        "data": res_data,
+        "page": safe_page,
+        "pageSize": safe_page_size,
+        "totalCount": total_count,
+        "hasNext": offset + len(res_data) < total_count,
+    }
 
     return res_body
 

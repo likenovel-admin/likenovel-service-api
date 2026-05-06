@@ -43,6 +43,25 @@ class WebsochatMessage(Base):
     created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
 
+class WebsochatUsageLog(Base):
+    __tablename__ = "tb_story_agent_usage_log"
+
+    usage_log_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    session_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False, comment="웹소챗 세션 ID")
+    user_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="사용자 메시지 ID")
+    assistant_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="어시스턴트 메시지 ID")
+    product_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False, comment="작품 ID")
+    user_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True, comment="로그인 사용자 ID")
+    guest_key: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="비로그인 식별 키")
+    model_used: Mapped[str] = mapped_column(String(40), index=True, nullable=False, comment="gemini | haiku | system | game-host 등")
+    route_mode: Mapped[str] = mapped_column(String(80), nullable=False, comment="웹소챗 라우팅 모드")
+    intent: Mapped[str | None] = mapped_column(String(80), nullable=True, comment="분류된 의도")
+    fallback_used: Mapped[str] = mapped_column(String(1), nullable=False, server_default="N", comment="fallback 사용 여부")
+    charged_cash: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", comment="해당 턴 캐시 차감액")
+    created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
 class WebsochatContextProduct(Base):
     __tablename__ = "tb_story_agent_context_product"
 

@@ -5254,6 +5254,73 @@ async def _charge_websochat_cash(
     )
 
 
+async def _insert_websochat_usage_log(
+    session_id: int,
+    user_message_id: int,
+    assistant_message_id: int,
+    product_id: int,
+    user_id: int | None,
+    guest_key: str | None,
+    model_used: str,
+    route_mode: str,
+    intent: str | None,
+    fallback_used: bool,
+    charged_cash: int,
+    created_id: int,
+    db: AsyncSession,
+) -> None:
+    await db.execute(
+        text(
+            """
+            INSERT INTO tb_story_agent_usage_log (
+                session_id,
+                user_message_id,
+                assistant_message_id,
+                product_id,
+                user_id,
+                guest_key,
+                model_used,
+                route_mode,
+                intent,
+                fallback_used,
+                charged_cash,
+                created_id,
+                created_date
+            )
+            VALUES (
+                :session_id,
+                :user_message_id,
+                :assistant_message_id,
+                :product_id,
+                :user_id,
+                :guest_key,
+                :model_used,
+                :route_mode,
+                :intent,
+                :fallback_used,
+                :charged_cash,
+                :created_id,
+                NOW()
+            )
+            """
+        ),
+        {
+            "session_id": session_id,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "product_id": product_id,
+            "user_id": user_id,
+            "guest_key": guest_key,
+            "model_used": model_used,
+            "route_mode": route_mode,
+            "intent": intent,
+            "fallback_used": "Y" if fallback_used else "N",
+            "charged_cash": charged_cash,
+            "created_id": created_id,
+        },
+    )
+
+
 async def _enforce_websochat_message_usage(
     user_id: int | None,
     guest_key: str | None,
@@ -6436,6 +6503,21 @@ async def post_message(
                     "created_id": settings.DB_DML_DEFAULT_ID,
                 },
             )
+            await _insert_websochat_usage_log(
+                session_id=session_id,
+                user_message_id=int(user_result.lastrowid),
+                assistant_message_id=int(assistant_result.lastrowid),
+                product_id=int(session_row["product_id"]),
+                user_id=int(user_id) if user_id is not None else None,
+                guest_key=resolved_guest_key,
+                model_used="system",
+                route_mode="rp:clarify",
+                intent="rp_resolution",
+                fallback_used=False,
+                charged_cash=0,
+                created_id=created_id,
+                db=db,
+            )
             await db.execute(
                 text(
                     f"""
@@ -6696,14 +6778,36 @@ async def post_message(
             },
         )
 
+        charged_cash = (
+            _resolve_websochat_message_cash_cost(effective_qa_action_key)
+            if should_charge_cash
+            else 0
+        )
+
         if should_charge_cash:
             await _charge_websochat_cash(
                 user_id=int(user_id),
                 session_id=session_id,
                 product_id=int(session_row["product_id"]),
                 db=db,
-                cash_cost=_resolve_websochat_message_cash_cost(effective_qa_action_key),
+                cash_cost=charged_cash,
             )
+
+        await _insert_websochat_usage_log(
+            session_id=session_id,
+            user_message_id=int(user_result.lastrowid),
+            assistant_message_id=int(assistant_result.lastrowid),
+            product_id=int(session_row["product_id"]),
+            user_id=int(user_id) if user_id is not None else None,
+            guest_key=resolved_guest_key,
+            model_used=model_used,
+            route_mode=route_mode,
+            intent=intent,
+            fallback_used=fallback_used,
+            charged_cash=charged_cash,
+            created_id=created_id,
+            db=db,
+        )
 
         update_title_query = text(
             f"""
