@@ -17,6 +17,8 @@ from app.services.websochat.websochat_contracts import (
 from app.services.websochat.websochat_context_loader import build_websochat_scope_context_message_for_subtype
 from app.services.websochat.websochat_llm import (
     WEBSOCHAT_CREATIVE_TEMPERATURE,
+    WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
+    WEBSOCHAT_LONG_GENERATION_TIMEOUT_SECONDS,
     WEBSOCHAT_QA_TEMPERATURE,
     WEBSOCHAT_REPLY_MAX_TOKENS,
     call_websochat_gemini,
@@ -29,6 +31,7 @@ from app.services.websochat.websochat_qa_renderer import (
 
 WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS = 4096
 WEBSOCHAT_NEXT_EPISODE_WRITE_MIN_CHARS = 4800
+WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS = WEBSOCHAT_LONG_GENERATION_TIMEOUT_SECONDS
 logger = logging.getLogger(__name__)
 
 
@@ -1232,6 +1235,7 @@ async def _retry_websochat_next_episode_write_with_gemini(
         messages=to_websochat_gemini_contents(retry_messages),
         max_tokens=WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS,
         temperature=WEBSOCHAT_CREATIVE_TEMPERATURE,
+        timeout_seconds=WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS,
     )
 
 
@@ -1538,6 +1542,7 @@ async def _generate_websochat_reply_with_gemini(
         messages=to_websochat_gemini_contents(messages),
         max_tokens=WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS if is_next_episode_write_query else WEBSOCHAT_REPLY_MAX_TOKENS,
         temperature=WEBSOCHAT_CREATIVE_TEMPERATURE if (is_predict_query or is_next_episode_write_query) else WEBSOCHAT_QA_TEMPERATURE,
+        timeout_seconds=WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS if is_next_episode_write_query else WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
     )
     clarify_retry_count = 0
     entity_grounding_retry_count = 0
@@ -1879,6 +1884,7 @@ async def _generate_websochat_reply_with_claude(
             messages=messages,
             tools=tools,
             max_tokens=WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS if is_next_episode_write_query else WEBSOCHAT_REPLY_MAX_TOKENS,
+            timeout_seconds=WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS if is_next_episode_write_query else 35.0,
         )
         content = response.get("content") or []
         text_reply = _extract_text(content)
@@ -2026,7 +2032,6 @@ async def execute_websochat_qa(
     prefetch_context_chars: int,
     tools: list[dict[str, Any]],
 ) -> WebsochatQaExecutionResult:
-    fallback_used = False
     skip_tools = _should_websochat_skip_tools(
         user_prompt=user_prompt,
         qa_plan=qa_plan,
@@ -2038,35 +2043,7 @@ async def execute_websochat_qa(
             qa_plan["route_mode"],
             " ".join(str(user_prompt or "").split())[:80],
         )
-    if qa_plan["preferred_model"] == "gemini":
-        try:
-            reply, referenced_episode_nos = await _generate_websochat_reply_with_gemini(
-                product_row=product_row,
-                user_prompt=user_prompt,
-                resolved_mode=qa_plan["route_mode"],
-                evidence_bundle=evidence_bundle,
-                recent_messages=recent_messages,
-                qa_plan=qa_plan,
-                qa_recent_notes=qa_recent_notes,
-                qa_corrections=qa_corrections,
-                current_qa_corrections=current_qa_corrections,
-                db=db,
-                hooks=hooks,
-                gemini_context_episode_limit=gemini_context_episode_limit,
-                prefetch_context_chars=prefetch_context_chars,
-            )
-            return {
-                "reply": reply,
-                "model_used": "gemini",
-                "fallback_used": False,
-                "route_mode": qa_plan["route_mode"],
-                "intent": qa_plan["intent"],
-                "referenced_episode_nos": referenced_episode_nos,
-            }
-        except Exception:
-            fallback_used = True
-
-    reply, referenced_episode_nos = await _generate_websochat_reply_with_claude(
+    reply, referenced_episode_nos = await _generate_websochat_reply_with_gemini(
         product_row=product_row,
         user_prompt=user_prompt,
         resolved_mode=qa_plan["route_mode"],
@@ -2078,14 +2055,13 @@ async def execute_websochat_qa(
         current_qa_corrections=current_qa_corrections,
         db=db,
         hooks=hooks,
-        max_tool_rounds=1 if skip_tools else max_tool_rounds,
-        tools=[] if skip_tools else tools,
+        gemini_context_episode_limit=gemini_context_episode_limit,
         prefetch_context_chars=prefetch_context_chars,
     )
     return {
         "reply": reply,
-        "model_used": "haiku",
-        "fallback_used": fallback_used,
+        "model_used": "gemini",
+        "fallback_used": False,
         "route_mode": qa_plan["route_mode"],
         "intent": qa_plan["intent"],
         "referenced_episode_nos": referenced_episode_nos,

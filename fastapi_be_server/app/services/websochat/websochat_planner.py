@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.websochat.websochat_contracts import (
-    WebsochatModel,
     WebsochatResponsePlan,
     WebsochatRoute,
     WebsochatScopeState,
@@ -36,7 +35,7 @@ def _build_websochat_rp_plan(
         "answer_mode": "direct",
         "tone": "playful",
         "route_mode": f"rp:{rp_mode}",
-        "preferred_model": "gemini" if gemini_enabled else "haiku",
+        "preferred_model": "gemini",
         "intent": "playful",
     }
 
@@ -50,12 +49,11 @@ def _build_websochat_qa_plan(
     scope_state: WebsochatScopeState = "known",
 ) -> WebsochatResponsePlan:
     tone: WebsochatTone = "playful" if intent in {"playful", "self_insert", "simulation"} else "analytical"
-    preferred_model: WebsochatModel = "gemini" if gemini_enabled and needs_creative else "haiku"
     return {
         "route": "qa",
         "answer_mode": "concierge" if scope_state == "none" else "direct",
         "tone": tone,
         "route_mode": "qa:concierge" if scope_state == "none" else resolved_mode,
-        "preferred_model": preferred_model,
+        "preferred_model": "gemini",
         "intent": "concierge" if scope_state == "none" else intent,
     }
