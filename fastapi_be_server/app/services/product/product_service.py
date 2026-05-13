@@ -150,6 +150,31 @@ async def _resolve_cp_link_info(
     return cp_info
 
 
+def _resolve_product_cp_link_update_values(
+    *,
+    current_monopoly_yn: str,
+    requested_monopoly_yn: str,
+    current_contract_yn: str,
+    current_cp_user_id: int | None,
+    requested_contract_yn: str,
+    requested_cp_user_id: int | None,
+) -> tuple[str, int | None]:
+    current_monopoly = (current_monopoly_yn or "N").upper()
+    requested_monopoly = (requested_monopoly_yn or current_monopoly).upper()
+    current_contract = (current_contract_yn or "N").upper()
+    next_contract_yn = "Y" if (requested_contract_yn or "N").upper() == "Y" else "N"
+    if (
+        current_contract == "Y"
+        and current_cp_user_id is not None
+        and current_monopoly != requested_monopoly
+        and next_contract_yn != "Y"
+        and requested_cp_user_id is None
+    ):
+        return "Y", current_cp_user_id
+
+    return next_contract_yn, requested_cp_user_id if next_contract_yn == "Y" else None
+
+
 def get_select_fields_and_joins_for_product(
     user_id: int | None = None,
     join_rank: bool = False,
@@ -3075,6 +3100,7 @@ async def put_products_product_id(
                 query = text("""
                                  select blind_yn
                                       , open_yn
+                                      , monopoly_yn
                                       , contract_yn
                                       , cp_user_id
                                       , price_type
@@ -3101,6 +3127,7 @@ async def put_products_product_id(
                     )
                 current_blind_yn = (current_product.get("blind_yn") or "N").upper()
                 current_open_yn = (current_product.get("open_yn") or "N").upper()
+                current_monopoly_yn = (current_product.get("monopoly_yn") or "N").upper()
                 current_contract_yn = (current_product.get("contract_yn") or "N").upper()
                 current_cp_user_id = current_product.get("cp_user_id")
                 current_paid_apply_status = current_product.get("paid_apply_status")
@@ -3151,14 +3178,39 @@ async def put_products_product_id(
                     if requested_cp_link_info
                     else None
                 )
+                next_contract_yn, next_cp_user_id = _resolve_product_cp_link_update_values(
+                    current_monopoly_yn=current_monopoly_yn,
+                    requested_monopoly_yn=req_body.monopoly_yn,
+                    current_contract_yn=current_contract_yn,
+                    current_cp_user_id=current_cp_user_id,
+                    requested_contract_yn=req_body.cp_contract_yn,
+                    requested_cp_user_id=requested_cp_user_id,
+                )
                 if is_contract_locked and (
-                    req_body.cp_contract_yn != current_contract_yn
+                    next_contract_yn != current_contract_yn
                     or normalize_cp_nickname(requested_cp_nickname)
                     != normalize_cp_nickname(current_cp_nickname)
                 ):
                     raise CustomResponseException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         message="심사중 또는 승인된 작품은 계약 정보를 변경할 수 없습니다.",
+                    )
+                if (
+                    current_paid_apply_status in ("review", "accepted")
+                    and req_body.monopoly_yn != current_monopoly_yn
+                ):
+                    raise CustomResponseException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        message="심사중 또는 승인된 작품은 독점 여부를 변경할 수 없습니다.",
+                    )
+                if (
+                    current_price_type == "paid"
+                    and req_body.monopoly_yn != current_monopoly_yn
+                    and current_user_role != "admin"
+                ):
+                    raise CustomResponseException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        message="유료 작품의 독점 여부는 관리자만 변경할 수 있습니다.",
                     )
 
                 story_agent_setting_text = (
@@ -3388,8 +3440,8 @@ async def put_products_product_id(
                             "open_yn": "N" if requested_blind_yn == "Y" else req_body.open_yn,
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
-                            "contract_yn": req_body.cp_contract_yn,
-                            "cp_user_id": requested_cp_user_id,
+                            "contract_yn": next_contract_yn,
+                            "cp_user_id": next_cp_user_id,
                             "paid_open_date": convert_to_kor_time(
                                 req_body.paid_setting_date
                             )
@@ -3462,8 +3514,8 @@ async def put_products_product_id(
                             "open_yn": "N" if requested_blind_yn == "Y" else req_body.open_yn,
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
-                            "contract_yn": req_body.cp_contract_yn,
-                            "cp_user_id": requested_cp_user_id,
+                            "contract_yn": next_contract_yn,
+                            "cp_user_id": next_cp_user_id,
                             "paid_open_date": convert_to_kor_time(
                                 req_body.paid_setting_date
                             )

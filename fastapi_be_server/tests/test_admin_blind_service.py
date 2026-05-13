@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import unittest
 from html.parser import HTMLParser
@@ -14,8 +15,17 @@ fastapi_responses_stub = ModuleType("fastapi.responses")
 fastapi_responses_stub.StreamingResponse = _StreamingResponse
 sys.modules.setdefault("fastapi.responses", fastapi_responses_stub)
 
+class _SqlText:
+    def __init__(self, sql: str):
+        self.sql = sql
+
+    def bindparams(self, *args, **kwargs):
+        return self
+
+
 sqlalchemy_stub = ModuleType("sqlalchemy")
-sqlalchemy_stub.text = lambda *args, **kwargs: None
+sqlalchemy_stub.RowMapping = object
+sqlalchemy_stub.text = lambda value, *args, **kwargs: _SqlText(value)
 sqlalchemy_stub.bindparam = lambda *args, **kwargs: None
 sys.modules.setdefault("sqlalchemy", sqlalchemy_stub)
 
@@ -27,11 +37,19 @@ sqlalchemy_asyncio_stub.AsyncSession = object
 sys.modules.setdefault("sqlalchemy.ext.asyncio", sqlalchemy_asyncio_stub)
 
 const_stub = ModuleType("app.const")
+const_stub.CommonConstants = SimpleNamespace(COMPANY_LIKENOVEL="라이크노벨")
 const_stub.ErrorMessages = SimpleNamespace(NOT_FOUND_PRODUCT="NOT_FOUND_PRODUCT")
+const_stub.LOGGER_TYPE = SimpleNamespace(LOGGER_FILE_NAME_FOR_SERVICE_ERROR="test.log")
+const_stub.settings = SimpleNamespace(DB_DML_DEFAULT_ID=0)
 sys.modules.setdefault("app.const", const_stub)
 
 response_stub = ModuleType("app.utils.response")
+response_stub.CustomResponseException = type(
+    "CustomResponseException", (Exception,), {}
+)
 response_stub.check_exists_or_404 = lambda *args, **kwargs: None
+response_stub.build_list_response = lambda *args, **kwargs: {}
+response_stub.build_paginated_response = lambda *args, **kwargs: {}
 sys.modules.setdefault("app.utils.response", response_stub)
 
 
@@ -106,7 +124,20 @@ bs4_stub.NavigableString = _NavigableString
 bs4_stub.Tag = _Tag
 sys.modules.setdefault("bs4", bs4_stub)
 
-from app.services.admin.admin_blind_service import _html_to_plain_text
+from app.services.admin.admin_blind_service import _html_to_plain_text, batch_monopoly
+
+
+class _FakeExecuteResult:
+    rowcount = 2
+
+
+class _FakeDb:
+    def __init__(self):
+        self.calls = []
+
+    async def execute(self, query, params):
+        self.calls.append((query, params))
+        return _FakeExecuteResult()
 
 
 class AdminBlindServiceUnitTest(unittest.TestCase):
@@ -121,6 +152,19 @@ class AdminBlindServiceUnitTest(unittest.TestCase):
     def test_html_to_plain_text_keeps_block_separator_without_collapsing(self):
         text = _html_to_plain_text("<p>첫 줄</p><p><br/></p><p>둘째 줄</p>")
         self.assertEqual(text, "첫 줄\n\n둘째 줄")
+
+    def test_batch_monopoly_updates_only_monopoly_column(self):
+        db = _FakeDb()
+
+        result = asyncio.run(batch_monopoly([1, 2], "n", db))
+
+        self.assertEqual(result, {"result": True, "updated_count": 2})
+        self.assertEqual(len(db.calls), 1)
+        query, params = db.calls[0]
+        self.assertIn("monopoly_yn = :monopoly_yn", query.sql)
+        self.assertNotIn("contract_yn", query.sql)
+        self.assertNotIn("cp_user_id", query.sql)
+        self.assertEqual(params, {"ids": [1, 2], "monopoly_yn": "N"})
 
 
 if __name__ == "__main__":
