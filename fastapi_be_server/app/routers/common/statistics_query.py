@@ -544,3 +544,57 @@ async def websochat_usage_statistics(
         count_per_page,
         db,
     )
+
+
+@router.get(
+    "/ai-reader-engagement",
+    tags=["AI 유저 인게이지먼트 통계"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_reader_engagement_statistics(
+    start_date: str | None = Query(None, description="시작 날짜"),
+    end_date: str | None = Query(None, description="종료 날짜"),
+    product_id: int | None = Query(None, description="작품 ID"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(20, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """AI reader 운영/작품 반응 관제판."""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+
+    return await statistics_service.ai_reader_engagement_statistics(
+        start_date,
+        end_date,
+        product_id,
+        page,
+        count_per_page,
+        db,
+    )
+
+
+@router.get(
+    "/ai-reader-engagement/agents/{agent_id}/actions",
+    tags=["AI 유저 인게이지먼트 통계"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_reader_agent_actions(
+    agent_id: int,
+    start_date: str | None = Query(None, description="시작 날짜"),
+    end_date: str | None = Query(None, description="종료 날짜"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(50, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """AI 독자 개별 활동 내역(action queue)."""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+
+    return await statistics_service.ai_reader_agent_actions_history(
+        agent_id,
+        start_date,
+        end_date,
+        page,
+        count_per_page,
+        db,
+    )

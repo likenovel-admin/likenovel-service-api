@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import re
 
@@ -826,6 +826,168 @@ class AdminCreateAccountReqBody(AdminBase):
             raise ValueError("숫자 포함")
         if not re.search(r"[\W_]", value):
             raise ValueError("특문 포함")
+        return value
+
+
+DEFAULT_AI_READER_ACTIVE_HOURS = [6, 7, 12, 20, 21, 22]
+DEFAULT_AI_READER_AGE_GROUP_RATIOS = {
+    "10s": 8,
+    "20s": 23,
+    "30s": 36,
+    "40s": 29,
+    "50s": 4,
+}
+DEFAULT_AI_READER_GENDER_RATIOS = {
+    "M": 52,
+    "F": 48,
+}
+ALLOWED_AI_READER_AGE_GROUPS = set(DEFAULT_AI_READER_AGE_GROUP_RATIOS)
+ALLOWED_AI_READER_GENDERS = {"M", "F", "X"}
+
+
+def _validate_ai_reader_ratio_map(
+    value: Dict[str, int],
+    *,
+    allowed_keys: set[str],
+    field_name: str,
+) -> Dict[str, int]:
+    normalized = {str(key): int(raw_value) for key, raw_value in value.items()}
+    unknown_keys = sorted(set(normalized) - allowed_keys)
+    if unknown_keys:
+        raise ValueError(f"{field_name} contains unsupported keys: {', '.join(unknown_keys)}")
+    if any(ratio < 0 for ratio in normalized.values()):
+        raise ValueError(f"{field_name} must not contain negative values")
+    if sum(normalized.values()) != 100:
+        raise ValueError(f"{field_name} must sum to 100")
+    if not any(ratio > 0 for ratio in normalized.values()):
+        raise ValueError(f"{field_name} must include at least one positive value")
+    return normalized
+
+
+class PostAiReaderBootstrapReqBody(AdminBase):
+    email_prefix: str = Field(
+        min_length=1,
+        max_length=80,
+        examples=["prod-ai-reader-"],
+        description="AI 독자로 연결할 기존 유저 이메일 prefix",
+    )
+    agent_count: int = Field(default=100, ge=1, le=100, description="투입할 AI 독자 수")
+    schedule_date: Optional[str] = Field(
+        default=None,
+        examples=["2026-05-13"],
+        description="생성할 스케줄 날짜 YYYY-MM-DD, 미지정 시 오늘",
+    )
+    apply: bool = Field(default=False, description="false면 드라이런, true면 DB 반영")
+    allow_partial: bool = Field(
+        default=False,
+        description="기존 유저 수가 agent_count보다 적어도 가능한 수만 반영",
+    )
+    agent_index_offset: int = Field(default=0, ge=0, le=100000, description="deterministic seed 시작 index")
+    daily_llm_budget: int = Field(default=8, ge=1, le=20, description="에이전트 1명 하루 LLM 세션 예산")
+    active_hours: List[int] = Field(
+        default_factory=lambda: list(DEFAULT_AI_READER_ACTIVE_HOURS),
+        min_length=1,
+        max_length=24,
+        examples=[[6, 7, 12, 20, 21, 22]],
+        description="AI 독자 활동 시간대 0~23",
+    )
+    daily_session_target: int = Field(default=2, ge=1, le=8, description="하루 wake 세션 목표")
+    age_group_ratios: Dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_AI_READER_AGE_GROUP_RATIOS),
+        description="연령대 비율. 허용값: 10s,20s,30s,40s,50s. 합계 100",
+    )
+    gender_ratios: Dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_AI_READER_GENDER_RATIOS),
+        description="성별 비율. 허용값: M,F,X. 합계 100",
+    )
+    dry_run_token: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="apply=true 전에 같은 입력으로 받은 dry-run token",
+    )
+
+    @field_validator("email_prefix")
+    def validate_email_prefix(cls, value):
+        prefix = value.strip()
+        if not prefix:
+            raise ValueError("email_prefix is required")
+        if "%" in prefix or "_" in prefix:
+            raise ValueError("email_prefix must not contain SQL LIKE wildcards")
+        return prefix
+
+    @field_validator("active_hours")
+    def validate_active_hours(cls, value):
+        normalized = sorted(set(int(hour) for hour in value))
+        if len(normalized) != len(value):
+            raise ValueError("active_hours must not contain duplicates")
+        if any(hour < 0 or hour > 23 for hour in normalized):
+            raise ValueError("active_hours must be between 0 and 23")
+        return normalized
+
+    @field_validator("age_group_ratios")
+    def validate_age_group_ratios(cls, value):
+        return _validate_ai_reader_ratio_map(
+            value,
+            allowed_keys=ALLOWED_AI_READER_AGE_GROUPS,
+            field_name="age_group_ratios",
+        )
+
+    @field_validator("gender_ratios")
+    def validate_gender_ratios(cls, value):
+        return _validate_ai_reader_ratio_map(
+            value,
+            allowed_keys=ALLOWED_AI_READER_GENDERS,
+            field_name="gender_ratios",
+        )
+
+
+class PostAiReaderResumePausedReqBody(AdminBase):
+    agent_count: int = Field(default=100, ge=1, le=100, description="재가동할 paused AI 독자 수")
+    schedule_date: Optional[str] = Field(
+        default=None,
+        examples=["2026-05-14"],
+        description="생성할 스케줄 날짜 YYYY-MM-DD, 미지정 시 오늘",
+    )
+    apply: bool = Field(default=False, description="false면 드라이런, true면 DB 반영")
+    dry_run_token: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="apply=true 전에 같은 입력으로 받은 dry-run token",
+    )
+
+
+class PutAiReaderScheduleReqBody(AdminBase):
+    schedule_date: Optional[str] = Field(
+        default=None,
+        examples=["2026-05-13"],
+        description="조정할 스케줄 날짜 YYYY-MM-DD, 미지정 시 오늘",
+    )
+    active_hours: List[int] = Field(
+        min_length=1,
+        max_length=24,
+        examples=[[6, 7, 20, 21]],
+        description="활동 시간대 0~23",
+    )
+    daily_session_target: int = Field(default=2, ge=1, le=8, description="하루 wake 세션 목표")
+    daily_llm_budget: Optional[int] = Field(default=None, ge=1, le=20, description="하루 LLM 세션 예산")
+    status: Optional[str] = Field(default=None, examples=["active"], description="active | paused")
+    replace_running: bool = Field(default=False, description="실행 중 스케줄도 강제 종료 후 교체")
+
+    @field_validator("active_hours")
+    def validate_active_hours(cls, value):
+        normalized = sorted(set(int(hour) for hour in value))
+        if len(normalized) != len(value):
+            raise ValueError("active_hours must not contain duplicates")
+        if any(hour < 0 or hour > 23 for hour in normalized):
+            raise ValueError("active_hours must be between 0 and 23")
+        return normalized
+
+    @field_validator("status")
+    def validate_status(cls, value):
+        if value is None:
+            return value
+        if value not in {"active", "paused"}:
+            raise ValueError("status must be active or paused")
         return value
 
 
