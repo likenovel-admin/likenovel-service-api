@@ -70,6 +70,8 @@ async def blind_list(
              , COALESCE(g.keyword_name, '') AS primary_genre
              , a.open_yn
              , a.blind_yn
+             , a.monopoly_yn
+             , a.price_type
              , a.created_date
              , (SELECT COUNT(*)
                   FROM tb_product_episode e
@@ -124,6 +126,33 @@ async def batch_blind(
         """).bindparams(bindparam("ids", expanding=True))
 
     result = await db.execute(query, {"ids": product_ids})
+
+    return {"result": True, "updated_count": result.rowcount}
+
+
+async def batch_monopoly(
+    product_ids: list[int],
+    monopoly_yn: str,
+    db: AsyncSession,
+):
+    if not product_ids:
+        return {"result": True, "updated_count": 0}
+
+    monopoly_val = monopoly_yn.upper()
+    if monopoly_val not in ("Y", "N"):
+        monopoly_val = "N"
+
+    query = text("""
+        UPDATE tb_product
+           SET monopoly_yn = :monopoly_yn
+             , updated_date = NOW()
+         WHERE product_id IN :ids
+    """).bindparams(bindparam("ids", expanding=True))
+
+    result = await db.execute(
+        query,
+        {"ids": product_ids, "monopoly_yn": monopoly_val},
+    )
 
     return {"result": True, "updated_count": result.rowcount}
 
