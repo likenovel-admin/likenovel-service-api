@@ -2800,7 +2800,15 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
 
         executed_sql = "\n".join(str(call.args[0]).lower() for call in db.execute.call_args_list)
         self.assertIn("status = 'paused'", executed_sql)
+        self.assertIn("join tb_user", executed_sql)
+        self.assertIn("substring_index(u.email, '@', -1)", executed_sql)
+        self.assertIn("tb_user_social", executed_sql)
         self.assertNotIn("email like", executed_sql)
+        params = db.execute.call_args_list[0].args[1]
+        self.assertEqual(
+            params["allowed_domains"],
+            ["ai-reader.likenovel.dev", "ai-reader.likenovel.net"],
+        )
         self.assertFalse(result["applied"])
         self.assertEqual(result["available_agent_count"], 3)
         self.assertEqual(result["missing_agent_count"], 0)

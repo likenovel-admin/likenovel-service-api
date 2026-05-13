@@ -474,34 +474,57 @@ async def resume_paused_ai_reader_agents(
     db: AsyncSession,
 ) -> dict[str, Any]:
     target_date = _parse_schedule_date(req_body.schedule_date)
+    allowed_domains = _allowed_ai_reader_account_domains()
+    if not allowed_domains:
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="AI reader account allowed domains are not configured.",
+        )
     count_result = await db.execute(
         text("""
             select count(*) as available_agent_count
-              from tb_ai_reader_agent
-             where status = 'paused'
-        """)
+              from tb_ai_reader_agent a
+              join tb_user u on u.user_id = a.user_id
+             where a.status = 'paused'
+               and u.use_yn = 'Y'
+               and lower(substring_index(u.email, '@', -1)) in :allowed_domains
+               and not exists (
+                       select 1
+                         from tb_user_social us
+                        where us.user_id = u.user_id
+                   )
+        """).bindparams(bindparam("allowed_domains", expanding=True)),
+        {"allowed_domains": allowed_domains},
     )
     available_agent_count = int(count_result.scalar() or 0)
 
     select_sql = """
         select
-            ai_reader_agent_id,
-            agent_key,
-            user_id,
-            age_group,
-            gender,
-            activity_pattern_json,
-            daily_llm_budget
-          from tb_ai_reader_agent
-         where status = 'paused'
-         order by updated_date desc, ai_reader_agent_id asc
+            a.ai_reader_agent_id,
+            a.agent_key,
+            a.user_id,
+            a.age_group,
+            a.gender,
+            a.activity_pattern_json,
+            a.daily_llm_budget
+          from tb_ai_reader_agent a
+          join tb_user u on u.user_id = a.user_id
+         where a.status = 'paused'
+           and u.use_yn = 'Y'
+           and lower(substring_index(u.email, '@', -1)) in :allowed_domains
+           and not exists (
+                   select 1
+                     from tb_user_social us
+                    where us.user_id = u.user_id
+               )
+         order by a.updated_date desc, a.ai_reader_agent_id asc
          limit :limit
     """
     if req_body.apply:
         select_sql += " for update"
     paused_result = await db.execute(
-        text(select_sql),
-        {"limit": req_body.agent_count},
+        text(select_sql).bindparams(bindparam("allowed_domains", expanding=True)),
+        {"allowed_domains": allowed_domains, "limit": req_body.agent_count},
     )
     agents = [dict(row) for row in paused_result.mappings().all()]
     agent_fingerprints = _resume_paused_agent_fingerprints(agents)
