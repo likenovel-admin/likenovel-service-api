@@ -424,6 +424,7 @@ async def _call_claude_messages(
     tools: list[dict] | None = None,
     tool_choice: dict[str, Any] | None = None,
     max_tokens: int = 1024,
+    timeout_seconds: float = 35.0,
 ) -> dict:
     if not settings.ANTHROPIC_API_KEY:
         raise CustomResponseException(
@@ -442,7 +443,7 @@ async def _call_claude_messages(
     if tool_choice:
         payload["tool_choice"] = tool_choice
 
-    async with httpx.AsyncClient(timeout=35.0) as client:
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={

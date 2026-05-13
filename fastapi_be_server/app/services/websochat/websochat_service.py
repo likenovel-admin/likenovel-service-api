@@ -2552,10 +2552,26 @@ async def _generate_websochat_worldcup_reply(
     gender_scope = str(game_context.get("gender_scope") or "").strip().lower()
     category = str(game_context.get("category") or "").strip().lower()
     product_id = int(product_row.get("productId") or 0)
+    latest_episode_no = max(int(product_row.get("latestEpisodeNo") or 0), 0)
+    synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_row)
+    read_scope_ceiling_episode_no = _resolve_websochat_episode_ref_ceiling(
+        latest_episode_no,
+        synced_latest_episode_no,
+        None,
+    )
+
+    def clamp_worldcup_read_scope(read_episode_to: int | None) -> int | None:
+        resolved_read_episode_to = max(int(read_episode_to or 0), 0)
+        if resolved_read_episode_to <= 0:
+            return None
+        if read_scope_ceiling_episode_no <= 0:
+            return resolved_read_episode_to
+        return min(resolved_read_episode_to, read_scope_ceiling_episode_no)
+
     if not gender_scope or not category:
         read_scope_label = await _build_websochat_read_scope_label(
             product_id=product_id,
-            read_episode_to=normalized.get("read_episode_to"),
+            read_episode_to=clamp_worldcup_read_scope(normalized.get("read_episode_to")),
             db=db,
         )
         return (
@@ -2578,10 +2594,21 @@ async def _generate_websochat_worldcup_reply(
     if followup["exit_requested"]:
         reply = "좋아요. 월드컵은 여기서 잠깐 쉬고, 다시 작품 얘기로 돌아가볼게요."
         return reply, _clear_websochat_game_context(normalized)
-    latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
+
+    def clamp_worldcup_state_read_scope(current_state: dict[str, Any]) -> bool:
+        previous_value = max(int(current_state.get("read_episode_to") or 0), 0)
+        if previous_value <= 0:
+            return False
+        next_value = clamp_worldcup_read_scope(previous_value)
+        if not next_value or next_value == previous_value:
+            return False
+        current_state["read_episode_to"] = next_value
+        return True
+
+    read_scope_was_clamped = clamp_worldcup_state_read_scope(state)
     inferred_read_episode_to = await _resolve_websochat_prompt_read_episode_to(
         product_id=int(product_row.get("productId") or 0),
-        latest_episode_no=latest_episode_no,
+        latest_episode_no=read_scope_ceiling_episode_no or latest_episode_no,
         user_prompt=user_prompt,
         db=db,
     )
@@ -2614,6 +2641,7 @@ async def _generate_websochat_worldcup_reply(
             gender_scope=gender_scope,
             category=category,
         )
+        read_scope_was_clamped = clamp_worldcup_state_read_scope(state) or read_scope_was_clamped
 
     if inferred_read_episode_to is not None:
         state["read_episode_to"] = inferred_read_episode_to
@@ -2623,6 +2651,7 @@ async def _generate_websochat_worldcup_reply(
     has_constraint_update = any(
         [
             inferred_read_episode_to is not None and inferred_read_episode_to != previous_read_episode_to,
+            read_scope_was_clamped,
             bool(inferred_requested_size and inferred_requested_size != previous_requested_size),
             bool(requested_gender_scope and requested_gender_scope != previous_gender_scope),
             bool(requested_category and requested_category != previous_category),
@@ -4910,29 +4939,18 @@ async def _generate_websochat_reply(
             gemini_enabled=gemini_enabled,
         )
         if rp_plan["preferred_model"] == "gemini":
-            try:
-                reply = await generate_websochat_rp_reply_with_gemini(
-                    product_row=product_row,
-                    user_prompt=user_prompt,
-                    rp_context=rp_context,
-                    recent_messages=recent_messages,
-                )
-                return reply, "gemini", rp_plan["route_mode"], False, rp_plan["intent"], None
-            except Exception as exc:
-                logger.warning(
-                    "websochat rp_route_selected model_used=gemini fallback_used=true product_id=%s session_id=%s active_character=%s error=%s",
-                    product_row.get("productId"),
-                    session_id,
-                    rp_context.get("active_character"),
-                    exc,
-                )
-        reply = await generate_websochat_rp_reply_with_claude(
-            product_row=product_row,
-            user_prompt=user_prompt,
-            rp_context=rp_context,
-            recent_messages=recent_messages,
+            reply = await generate_websochat_rp_reply_with_gemini(
+                product_row=product_row,
+                user_prompt=user_prompt,
+                rp_context=rp_context,
+                recent_messages=recent_messages,
+            )
+            return reply, "gemini", rp_plan["route_mode"], False, rp_plan["intent"], None
+        raise CustomResponseException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="AI_PROVIDER_NOT_CONFIGURED",
+            message="AI 생성 설정을 확인하는 중이에요. 잠시 후 다시 시도해 주세요.",
         )
-        return reply, "haiku", rp_plan["route_mode"], gemini_enabled, rp_plan["intent"], None
 
     intent_result, detected_qa_corrections = await asyncio.gather(
         _resolve_websochat_intent(
@@ -5097,26 +5115,36 @@ async def _get_websochat_chunk_previews(
 
 async def _acquire_named_lock(lock_name: str) -> AsyncConnection | None:
     conn = await likenovel_db_engine.connect()
+    if await _acquire_named_lock_on_connection(lock_name, conn):
+        return conn
+    await conn.close()
+    return None
+
+
+async def _acquire_named_lock_on_connection(lock_name: str, conn: AsyncConnection) -> bool:
     result = await conn.execute(
         text("SELECT GET_LOCK(:lock_name, :timeout) AS locked"),
         {"lock_name": lock_name, "timeout": WEBSOCHAT_SESSION_LOCK_TIMEOUT_SECONDS},
     )
     row = result.mappings().one()
-    if bool(row.get("locked")):
-        return conn
-    await conn.close()
-    return None
+    return bool(row.get("locked"))
 
 
 async def _release_named_lock(lock_name: str, conn: AsyncConnection | None) -> None:
     if conn is None:
         return
     try:
-        await conn.execute(text("SELECT RELEASE_LOCK(:lock_name)"), {"lock_name": lock_name})
+        await _release_named_lock_on_connection(lock_name, conn)
     except Exception as exc:
         logger.warning("failed to release named lock [%s]: %s", lock_name, exc)
     finally:
         await conn.close()
+
+
+async def _release_named_lock_on_connection(lock_name: str, conn: AsyncConnection | None) -> None:
+    if conn is None:
+        return
+    await conn.execute(text("SELECT RELEASE_LOCK(:lock_name)"), {"lock_name": lock_name})
 
 
 async def _acquire_websochat_session_lock(session_id: int) -> AsyncConnection | None:
@@ -5142,12 +5170,34 @@ async def _acquire_websochat_actor_lock(
     return await _acquire_named_lock(_get_websochat_actor_lock_name(user_id, guest_key))
 
 
+async def _acquire_websochat_actor_lock_on_connection(
+    user_id: int | None,
+    guest_key: str | None,
+    conn: AsyncConnection,
+) -> bool:
+    return await _acquire_named_lock_on_connection(
+        _get_websochat_actor_lock_name(user_id, guest_key),
+        conn,
+    )
+
+
 async def _release_websochat_actor_lock(
     user_id: int | None,
     guest_key: str | None,
     conn: AsyncConnection | None,
 ) -> None:
     await _release_named_lock(_get_websochat_actor_lock_name(user_id, guest_key), conn)
+
+
+async def _release_websochat_actor_lock_on_connection(
+    user_id: int | None,
+    guest_key: str | None,
+    conn: AsyncConnection | None,
+) -> None:
+    await _release_named_lock_on_connection(
+        _get_websochat_actor_lock_name(user_id, guest_key),
+        conn,
+    )
 
 
 async def _get_websochat_daily_user_message_count(
@@ -5201,6 +5251,13 @@ async def _charge_websochat_cash(
     db: AsyncSession,
     cash_cost: int,
 ) -> None:
+    balance = await _get_user_cash_balance_for_websochat(user_id=user_id, db=db)
+    if balance < cash_cost:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.INSUFFICIENT_CASH_BALANCE,
+        )
+
     await db.execute(
         text(
             """
@@ -6434,6 +6491,7 @@ async def post_message(
     created_id = user_id if user_id is not None else settings.DB_DML_DEFAULT_ID
 
     session_lock_conn: AsyncConnection | None = None
+    actor_lock_acquired = False
     try:
         session_lock_conn = await _acquire_websochat_session_lock(session_id=session_id)
         if session_lock_conn is None:
@@ -6470,6 +6528,17 @@ async def post_message(
                     "messages": existing_messages,
                 }
             }
+
+        actor_lock_acquired = await _acquire_websochat_actor_lock_on_connection(
+            user_id=user_id,
+            guest_key=resolved_guest_key,
+            conn=session_lock_conn,
+        )
+        if not actor_lock_acquired:
+            raise CustomResponseException(
+                status_code=status.HTTP_409_CONFLICT,
+                message="같은 계정 또는 기기에서 다른 메시지를 처리 중입니다. 잠시 후 다시 시도해주세요.",
+            )
 
         if character_resolution_clarify_reply:
             user_content = str(req_body.content or req_body.active_character or "").strip()
@@ -6913,5 +6982,11 @@ async def post_message(
         await db.rollback()
         raise
     finally:
+        if actor_lock_acquired:
+            await _release_websochat_actor_lock_on_connection(
+                user_id=user_id,
+                guest_key=resolved_guest_key,
+                conn=session_lock_conn,
+            )
         if session_lock_conn is not None:
             await _release_websochat_session_lock(session_id=session_id, conn=session_lock_conn)
