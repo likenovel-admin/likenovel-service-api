@@ -1687,7 +1687,7 @@ async def post_admin_create_account(
 
 @router.post(
     "/products/batch-blind",
-    tags=["CMS - 작품 블라인드"],
+    tags=["CMS - 작품 독점/블라인드"],
     dependencies=[Depends(analysis_logger)],
 )
 async def post_batch_blind(
@@ -1705,8 +1705,27 @@ async def post_batch_blind(
 
 
 @router.post(
+    "/products/batch-monopoly",
+    tags=["CMS - 작품 독점/블라인드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_batch_monopoly(
+    req_body: admin_schema.PostBatchMonopolyReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """작품 독점/비독점 상태 처리"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_blind_service.batch_monopoly(
+        product_ids=req_body.product_ids,
+        monopoly_yn=req_body.monopoly_yn,
+        db=db,
+    )
+
+
+@router.post(
     "/products/batch-open",
-    tags=["CMS - 작품 블라인드"],
+    tags=["CMS - 작품 독점/블라인드"],
     dependencies=[Depends(analysis_logger)],
 )
 async def post_batch_open(

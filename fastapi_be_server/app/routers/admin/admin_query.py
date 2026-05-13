@@ -4434,7 +4434,7 @@ async def ai_product_metadata_detail(
 
 @router.get(
     "/products/{product_id}/episodes-txt",
-    tags=["CMS - 작품 블라인드"],
+    tags=["CMS - 작품 독점/블라인드"],
     dependencies=[Depends(analysis_logger)],
 )
 async def download_blind_product_episodes_txt(
@@ -4452,7 +4452,7 @@ async def download_blind_product_episodes_txt(
 
 @router.get(
     "/products/blind-list",
-    tags=["CMS - 작품 블라인드"],
+    tags=["CMS - 작품 독점/블라인드"],
     dependencies=[Depends(analysis_logger)],
 )
 async def get_blind_list(

@@ -23,6 +23,40 @@ partner 작품 관리 서비스 함수 모음
 """
 
 
+def _normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _can_update_paid_monopoly(user_data: dict | None) -> bool:
+    return bool(user_data and user_data.get("role") == "admin")
+
+
+def _is_paid_apply_monopoly_locked(
+    current_price_type: Optional[str], paid_apply_status: Optional[str]
+) -> bool:
+    return (
+        (current_price_type or "").lower() != "paid"
+        and (paid_apply_status or "").lower() in ("review", "accepted")
+    )
+
+
+def _resolve_cp_link_update_values(
+    *,
+    fields_set: set[str],
+    cp_company_name: Optional[str],
+    resolved_cp_user_id: Optional[int],
+    current_contract_yn: Optional[str],
+    current_cp_user_id: Optional[int],
+) -> tuple[str, Optional[int]]:
+    if "cp_company_name" not in fields_set or _normalize_optional_text(cp_company_name) is None:
+        return (current_contract_yn or "N").upper(), current_cp_user_id
+
+    return "Y", resolved_cp_user_id
+
+
 async def get_approved_cp_company_name_by_user_id(
     user_id: int, db: AsyncSession
 ) -> Optional[str]:
@@ -379,6 +413,14 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
             , a.open_yn as openYn
             , a.ratings_code
             , a.price_type
+            , (
+                select ppa.status_code
+                  from tb_product_paid_apply ppa
+                 where ppa.product_id = a.product_id
+                   and ppa.use_yn = 'Y'
+                 order by ppa.id desc
+                 limit 1
+            ) as paid_apply_status
             , (select z.keyword_name from tb_standard_keyword z
                 where z.use_yn = 'Y'
                 and z.major_genre_yn = 'Y'
@@ -533,7 +575,15 @@ async def put_product(
 
     query = text("""
                 SELECT uci, isbn, series_regular_price, single_regular_price, single_rental_price,
-                       blind_yn, open_yn, price_type
+                       blind_yn, open_yn, price_type, monopoly_yn, contract_yn, cp_user_id,
+                       (
+                            select ppa.status_code
+                              from tb_product_paid_apply ppa
+                             where ppa.product_id = tb_product.product_id
+                               and ppa.use_yn = 'Y'
+                             order by ppa.id desc
+                             limit 1
+                       ) as paid_apply_status
                   FROM tb_product
                  WHERE product_id = :product_id
                  LIMIT 1
@@ -559,6 +609,12 @@ async def put_product(
     current_single_rental_price = int(product_row.get("single_rental_price") or 0)
     current_blind_yn = (product_row.get("blind_yn") or "N").upper()
     current_open_yn = (product_row.get("open_yn") or "N").upper()
+    current_monopoly_yn = (product_row.get("monopoly_yn") or "N").upper()
+    current_contract_yn = (product_row.get("contract_yn") or "N").upper()
+    current_cp_user_id = product_row.get("cp_user_id")
+    current_price_type = product_row.get("price_type")
+    current_paid_apply_status = product_row.get("paid_apply_status")
+    fields_set = getattr(req_body, "model_fields_set", set()) or set()
 
     next_series_regular_price = (
         int(req_body.series_regular_price)
@@ -581,6 +637,30 @@ async def put_product(
         if next_series_regular_price > 0 or next_single_regular_price > 0
         else "free"
     )
+    requested_monopoly_yn = (
+        (req_body.monopoly_yn or current_monopoly_yn).upper()
+        if "monopoly_yn" in fields_set
+        else current_monopoly_yn
+    )
+
+    if (
+        _is_paid_apply_monopoly_locked(current_price_type, current_paid_apply_status)
+        and requested_monopoly_yn != current_monopoly_yn
+    ):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="심사중 또는 승인된 작품은 독점 여부를 변경할 수 없습니다.",
+        )
+
+    if (
+        (current_price_type == "paid" or next_price_type == "paid")
+        and requested_monopoly_yn != current_monopoly_yn
+        and not _can_update_paid_monopoly(user_data)
+    ):
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message="유료 작품의 독점 여부는 관리자만 변경할 수 있습니다.",
+        )
 
     if next_price_type == "paid" and not next_uci and not next_isbn:
         raise CustomResponseException(
@@ -629,7 +709,6 @@ async def put_product(
 
     free_episode_start_no = req_body.free_episode_start_no
     free_episode_end_no = req_body.free_episode_end_no
-    fields_set = getattr(req_body, "model_fields_set", set()) or set()
     blind_yn_in_request = "blind_yn" in fields_set
     open_yn_in_request = "open_yn" in fields_set
 
@@ -703,7 +782,8 @@ async def put_product(
             )
 
     cp_user_id = None
-    if req_body.cp_company_name is not None:
+    requested_cp_company_name = _normalize_optional_text(req_body.cp_company_name)
+    if requested_cp_company_name is not None:
         if (
             (req_body.cp_offered_price is None) !=
             (req_body.cp_settlement_rate is None)
@@ -738,12 +818,12 @@ async def put_product(
                           and approval_code = 'accepted'
                           and approval_date is not null
                     """)
-        result = await db.execute(query, {"cp_company_name": req_body.cp_company_name})
+        result = await db.execute(query, {"cp_company_name": requested_cp_company_name})
         rows = result.mappings().all()
         if len(rows) == 0:
             raise CustomResponseException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                message=f"유효하지 않은 cp사명입니다. ({req_body.cp_company_name})",
+                message=f"유효하지 않은 cp사명입니다. ({requested_cp_company_name})",
             )
         cp_user_id = rows[0]["user_id"]
     elif req_body.cp_offered_price is not None or req_body.cp_settlement_rate is not None:
@@ -757,7 +837,7 @@ async def put_product(
     )
 
     should_defer_cp_contract_offer = False
-    if req_body.cp_company_name is not None and not has_cp_contract_input:
+    if requested_cp_company_name is not None and not has_cp_contract_input:
         if user_data and user_data["role"] == "CP":
             current_cp_company_name = await get_approved_cp_company_name_by_user_id(
                 user_data["user_id"], db
@@ -767,7 +847,7 @@ async def put_product(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     message="승인된 CP 계정 정보가 없어 CP 작품으로 저장할 수 없습니다.",
                 )
-            if req_body.cp_company_name != current_cp_company_name:
+            if requested_cp_company_name != current_cp_company_name:
                 raise CustomResponseException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     message="본인 승인된 CP사만 선택할 수 있습니다.",
@@ -830,10 +910,17 @@ async def put_product(
         else:
             set_clause = f"{set_clause}, open_yn = 'N'"
 
+    next_contract_yn, next_cp_user_id = _resolve_cp_link_update_values(
+        fields_set=fields_set,
+        cp_company_name=req_body.cp_company_name,
+        resolved_cp_user_id=cp_user_id,
+        current_contract_yn=current_contract_yn,
+        current_cp_user_id=current_cp_user_id,
+    )
     set_clause = f"{set_clause}, contract_yn = :contract_yn"
-    params["contract_yn"] = "Y" if req_body.cp_company_name is not None else "N"
+    params["contract_yn"] = next_contract_yn
     set_clause = f"{set_clause}, cp_user_id = :cp_user_id"
-    params["cp_user_id"] = cp_user_id
+    params["cp_user_id"] = next_cp_user_id
     set_clause = f"{set_clause}, price_type = :price_type"
     params["price_type"] = next_price_type
     if has_free_episode_range or clear_free_episode_range:
@@ -850,13 +937,13 @@ async def put_product(
 
     await db.execute(query, params)
 
-    if req_body.cp_company_name is not None:
+    if requested_cp_company_name is not None:
         if should_defer_cp_contract_offer:
             logger.info(
                 "defer contract_offer write for own CP product: product_id=%s, user_id=%s, cp_company_name=%s",
                 product_id,
                 user_data["user_id"] if user_data else None,
-                req_body.cp_company_name,
+                requested_cp_company_name,
             )
         else:
             # cp사 선택한 상태
@@ -905,15 +992,9 @@ async def put_product(
                     "cp_settlement_rate": req_body.cp_settlement_rate,
                     "cp_offered_price": req_body.cp_offered_price,
                     "product_id": product_id,
-                    "cp_company_name": req_body.cp_company_name,
+                    "cp_company_name": requested_cp_company_name,
                 },
             )
-    else:
-        # 설정 안함 선택한 상태
-        query = text("""
-                         update tb_product_contract_offer set use_yn = 'N' where product_id = :product_id
-                         """)
-        await db.execute(query, {"product_id": product_id})
 
     if has_free_episode_range or clear_free_episode_range:
         if has_free_episode_range:
