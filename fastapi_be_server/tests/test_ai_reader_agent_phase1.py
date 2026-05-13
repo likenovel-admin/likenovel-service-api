@@ -832,6 +832,7 @@ class AiReaderActionApplierTest(unittest.IsolatedAsyncioTestCase):
             self._FakeMappingsResult([{"hour": 21, "read_count": 12}]),
             self._FakeMappingsResult([{"age_group": "30s", "gender": "M", "read_count": 7}]),
             self._FakeMappingsResult([{"event_time": "2026-05-12 21:00:00", "error_message": "bad json"}]),
+            self._FakeMappingsResult([{"ai_reader_action_id": 1001, "action_type": "read"}]),
         ]
 
         response = await statistics_service.ai_reader_engagement_statistics(
@@ -923,6 +924,7 @@ class AiReaderActionApplierTest(unittest.IsolatedAsyncioTestCase):
             self._FakeMappingsResult([{"product_id": 473, "product_title": "테스트", "ai_view_count": 4}]),
             self._FakeMappingsResult([{"hour": 20, "read_count": 4}]),
             self._FakeMappingsResult([{"age_group": "30s", "gender": "M", "read_count": 4}]),
+            self._FakeMappingsResult([]),
             self._FakeMappingsResult([]),
         ]
 
@@ -2930,6 +2932,42 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["available_user_count"], 0)
         self.assertEqual(result["missing_user_count"], 100)
         self.assertIsNotNone(result["dry_run_token"])
+
+    async def test_bootstrap_ai_reader_agents_only_uses_dedicated_ai_reader_accounts(self):
+        from app.schemas.admin import PostAiReaderBootstrapReqBody
+        from app.services.admin import admin_ai_reader_service
+
+        db = AsyncMock()
+        db.execute.return_value = self._FakeMappingsResult(
+            [
+                {
+                    "user_id": 201,
+                    "email": "codex-age100c-20260512-clean-001@ai-reader.likenovel.dev",
+                }
+            ]
+        )
+
+        result = await admin_ai_reader_service.bootstrap_ai_reader_agents(
+            req_body=PostAiReaderBootstrapReqBody(
+                email_prefix="codex-age100c-20260512-clean-",
+                agent_count=1,
+                schedule_date="2026-05-14",
+                apply=False,
+            ),
+            db=db,
+        )
+
+        executed_sql = "\n".join(str(call.args[0]).lower() for call in db.execute.call_args_list)
+        self.assertIn("substring_index(email, '@', -1)", executed_sql)
+        self.assertIn("not exists", executed_sql)
+        self.assertIn("tb_user_social", executed_sql)
+        self.assertIn("tb_ai_reader_agent", executed_sql)
+        params = db.execute.call_args_list[0].args[1]
+        self.assertEqual(
+            params["allowed_domains"],
+            ["ai-reader.likenovel.dev", "ai-reader.likenovel.net"],
+        )
+        self.assertEqual(result["available_user_count"], 1)
 
     def test_bootstrap_ai_reader_agents_caps_agent_count_at_100(self):
         from app.schemas.admin import PostAiReaderBootstrapReqBody

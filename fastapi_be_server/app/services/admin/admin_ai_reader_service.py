@@ -59,6 +59,14 @@ def _sleep_hours(active_hours: list[int]) -> list[int]:
     return [hour for hour in range(24) if hour not in active_set]
 
 
+def _allowed_ai_reader_account_domains() -> list[str]:
+    return [
+        domain.strip().lower()
+        for domain in settings.AI_READER_ACCOUNT_ALLOWED_DOMAINS.split(",")
+        if domain.strip()
+    ]
+
+
 def build_ai_reader_bootstrap_dry_run_token(
     *,
     email_prefix: str,
@@ -796,6 +804,12 @@ async def bootstrap_ai_reader_agents(
     db: AsyncSession,
 ) -> dict[str, Any]:
     target_date = _parse_schedule_date(req_body.schedule_date)
+    allowed_domains = _allowed_ai_reader_account_domains()
+    if not allowed_domains:
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="AI reader account allowed domains are not configured.",
+        )
     user_result = await db.execute(
         text("""
             select
@@ -805,11 +819,23 @@ async def bootstrap_ai_reader_agents(
              where use_yn = 'Y'
                and role_type = 'normal'
                and email like :email_like
+               and lower(substring_index(email, '@', -1)) in :allowed_domains
+               and not exists (
+                       select 1
+                         from tb_user_social us
+                        where us.user_id = tb_user.user_id
+                   )
+               and not exists (
+                       select 1
+                         from tb_ai_reader_agent ar
+                        where ar.user_id = tb_user.user_id
+                   )
              order by email asc, user_id asc
              limit :limit
-        """),
+        """).bindparams(bindparam("allowed_domains", expanding=True)),
         {
             "email_like": f"{req_body.email_prefix}%",
+            "allowed_domains": allowed_domains,
             "limit": req_body.agent_count,
         },
     )

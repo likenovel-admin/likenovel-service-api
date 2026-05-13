@@ -868,8 +868,8 @@ class PostAiReaderBootstrapReqBody(AdminBase):
     email_prefix: str = Field(
         min_length=1,
         max_length=80,
-        examples=["prod-ai-reader-"],
-        description="AI 독자로 연결할 기존 유저 이메일 prefix",
+        examples=["ai-reader-"],
+        description="AI 전용 계정 이메일 prefix",
     )
     agent_count: int = Field(default=100, ge=1, le=100, description="투입할 AI 독자 수")
     schedule_date: Optional[str] = Field(

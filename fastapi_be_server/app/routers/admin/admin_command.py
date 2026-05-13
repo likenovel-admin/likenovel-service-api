@@ -42,7 +42,7 @@ async def post_ai_reader_bootstrap(
     user: Dict[str, Any] = Depends(chk_cur_user),
 ):
     """
-    기존 유저 계정을 AI 독자로 연결하고 지정일 스케줄을 생성한다.
+    AI 전용 계정을 AI 독자로 등록하고 지정일 스케줄을 생성한다.
     apply=false면 DB 반영 없이 드라이런만 반환한다.
     """
     try:

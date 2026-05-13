@@ -230,6 +230,10 @@ class Settings(BaseSettings):
     AI_READER_OPENROUTER_TIMEOUT_SECONDS: float = float(
         os.getenv("AI_READER_OPENROUTER_TIMEOUT_SECONDS", "30")
     )
+    AI_READER_ACCOUNT_ALLOWED_DOMAINS: str = os.getenv(
+        "AI_READER_ACCOUNT_ALLOWED_DOMAINS",
+        "ai-reader.likenovel.dev,ai-reader.likenovel.net",
+    )
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     WEBSOCHAT_GEMINI_MODEL: str = os.getenv(
         "WEBSOCHAT_GEMINI_MODEL",
