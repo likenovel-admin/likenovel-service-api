@@ -8,6 +8,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.exceptions import CustomResponseException
 from app.rdb import get_likenovel_db, likenovel_db_session
 from app.services.websochat.websochat_stream import (
     reset_websochat_stream_emitter,
@@ -18,6 +19,20 @@ import app.schemas.websochat as websochat_schema
 import app.services.websochat.websochat_service as websochat_service
 
 router = APIRouter(prefix="/websochat")
+
+
+def _build_websochat_stream_error_payload(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, CustomResponseException):
+        return {
+            "detail": exc.message or "AI 답변을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.",
+            "code": exc.code or "WEBSOCHAT_STREAM_FAILED",
+            "status": exc.status_code,
+        }
+    return {
+        "detail": "AI 답변을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.",
+        "code": "WEBSOCHAT_STREAM_FAILED",
+        "status": 502,
+    }
 
 
 @router.post(
@@ -134,6 +149,31 @@ async def post_websochat_message(
     )
 
 
+@router.post(
+    "/sessions/{session_id}/next-episode",
+    tags=["웹소챗"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_websochat_next_episode_message(
+    session_id: int,
+    req_body: websochat_schema.PostWebsochatMessageReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    next_episode_req_body = req_body.model_copy(
+        update={
+            "starter_mode_key": "qa",
+            "qa_action_key": "next_episode_write",
+        }
+    )
+    return await websochat_service.post_message(
+        session_id=session_id,
+        req_body=next_episode_req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
 @router.options(
     "/sessions/{session_id}/messages/stream",
     tags=["웹소챗"],
@@ -221,7 +261,7 @@ async def post_websochat_message_stream(
         except Exception as exc:
             await _queue_event(
                 "assistant_error",
-                {"detail": str(exc) or "websochat stream failed"},
+                _build_websochat_stream_error_payload(exc),
             )
         finally:
             reset_websochat_stream_emitter(tokens)
