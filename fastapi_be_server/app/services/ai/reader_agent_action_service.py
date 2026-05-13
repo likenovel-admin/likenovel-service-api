@@ -31,6 +31,14 @@ READ_POOL_GUARD_RETRY_REASONS = frozenset(
 logger = logging.getLogger(__name__)
 
 
+def _allowed_ai_reader_account_domains() -> list[str]:
+    return [
+        domain.strip().lower()
+        for domain in settings.AI_READER_ACCOUNT_ALLOWED_DOMAINS.split(",")
+        if domain.strip()
+    ]
+
+
 class InvalidReaderActionError(ValueError):
     pass
 
@@ -279,6 +287,7 @@ async def _claim_due_actions(
         max_attempt_count=max_attempt_count,
     )
 
+    allowed_domains = _allowed_ai_reader_account_domains()
     result = await db.execute(
         text("""
             select q.ai_reader_action_id
@@ -293,6 +302,15 @@ async def _claim_due_actions(
               join tb_ai_reader_agent a
                 on a.ai_reader_agent_id = q.ai_reader_agent_id
                and a.status = 'active'
+              join tb_user u
+                on u.user_id = a.user_id
+               and u.use_yn = 'Y'
+               and lower(substring_index(u.email, '@', -1)) in :allowed_domains
+               and not exists (
+                       select 1
+                         from tb_user_social us
+                        where us.user_id = u.user_id
+                   )
              where (
                     (
                         q.status = 'queued'
@@ -308,11 +326,12 @@ async def _claim_due_actions(
              order by q.available_at, q.ai_reader_action_id
              limit :limit
              for update skip locked
-        """),
+        """).bindparams(bindparam("allowed_domains", expanding=True)),
         {
             "limit": limit,
             "lease_timeout_seconds": lease_timeout_seconds,
             "max_attempt_count": max_attempt_count,
+            "allowed_domains": allowed_domains,
         },
     )
     rows = result.mappings().all()
@@ -326,14 +345,30 @@ async def _claim_due_actions(
               join tb_ai_reader_agent a
                 on a.ai_reader_agent_id = q.ai_reader_agent_id
                and a.status = 'active'
+              join tb_user u
+                on u.user_id = a.user_id
+               and u.use_yn = 'Y'
+               and lower(substring_index(u.email, '@', -1)) in :allowed_domains
+               and not exists (
+                       select 1
+                         from tb_user_social us
+                        where us.user_id = u.user_id
+                   )
                set q.status = 'running'
                  , q.locked_by = :worker_id
                  , q.locked_at = current_timestamp
                  , q.attempt_count = q.attempt_count + 1
              where q.ai_reader_action_id in :action_ids
                and q.status in ('queued', 'running')
-        """).bindparams(bindparam("action_ids", expanding=True)),
-        {"worker_id": worker_id[:100], "action_ids": action_ids},
+        """).bindparams(
+            bindparam("action_ids", expanding=True),
+            bindparam("allowed_domains", expanding=True),
+        ),
+        {
+            "worker_id": worker_id[:100],
+            "action_ids": action_ids,
+            "allowed_domains": allowed_domains,
+        },
     )
     _ensure_rows_changed(result, "claim_due_actions", expected_count=len(action_ids))
     return [

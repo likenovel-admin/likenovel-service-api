@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.const import settings
 from app.services.ai import reader_agent_action_service as action_service
 from app.services.ai import reader_agent_decision_service as decision_service
 
@@ -77,6 +78,14 @@ PostSuccessFunc = Callable[[AsyncSession], Awaitable[None]]
 BAYESIAN_BOOKMARK_SUGGEST_THRESHOLD = 0.62
 BAYESIAN_RECOMMEND_SUGGEST_THRESHOLD = 0.55
 BAYESIAN_EVALUATE_SUGGEST_THRESHOLD = 0.55
+
+
+def _allowed_ai_reader_account_domains() -> list[str]:
+    return [
+        domain.strip().lower()
+        for domain in settings.AI_READER_ACCOUNT_ALLOWED_DOMAINS.split(",")
+        if domain.strip()
+    ]
 
 
 def build_reader_daily_schedule_windows(
@@ -218,7 +227,16 @@ async def ensure_reader_daily_schedules(
                     a.ai_reader_agent_id,
                     a.activity_pattern_json
                   from tb_ai_reader_agent a
+                  join tb_user u
+                    on u.user_id = a.user_id
                  where a.status = 'active'
+                   and u.use_yn = 'Y'
+                   and lower(substring_index(u.email, '@', -1)) in :allowed_domains
+                   and not exists (
+                        select 1
+                          from tb_user_social us
+                         where us.user_id = u.user_id
+                   )
                    and not exists (
                         select 1
                           from tb_ai_reader_daily_schedule s
@@ -227,10 +245,11 @@ async def ensure_reader_daily_schedules(
                    )
                  order by a.ai_reader_agent_id asc
                  limit :limit
-            """),
+            """).bindparams(bindparam("allowed_domains", expanding=True)),
             {
                 "schedule_date": schedule_date,
                 "limit": limit,
+                "allowed_domains": _allowed_ai_reader_account_domains(),
             },
         )
         rows = [dict(row) for row in result.mappings().all()]
@@ -318,6 +337,8 @@ async def cleanup_budget_exhausted_ready_reader_sessions(db: AsyncSession) -> in
             update tb_ai_reader_daily_schedule s
               join tb_ai_reader_agent a
                 on a.ai_reader_agent_id = s.ai_reader_agent_id
+              join tb_user u
+                on u.user_id = a.user_id
                set s.status = 'done'
                  , s.locked_by = null
                  , s.locked_at = null
@@ -328,6 +349,13 @@ async def cleanup_budget_exhausted_ready_reader_sessions(db: AsyncSession) -> in
                and s.active_start_at <= current_timestamp
                and s.active_end_at > current_timestamp
                and a.status = 'active'
+               and u.use_yn = 'Y'
+               and lower(substring_index(u.email, '@', -1)) in :allowed_domains
+               and not exists (
+                    select 1
+                      from tb_user_social us
+                     where us.user_id = u.user_id
+               )
                and (
                     select count(*)
                       from tb_ai_reader_llm_decision d
@@ -336,7 +364,8 @@ async def cleanup_budget_exhausted_ready_reader_sessions(db: AsyncSession) -> in
                        and d.created_date < current_date() + interval 1 day
                        and d.decision_status in ('pending', 'success', 'failed')
                ) >= a.daily_llm_budget
-        """)
+        """).bindparams(bindparam("allowed_domains", expanding=True)),
+        {"allowed_domains": _allowed_ai_reader_account_domains()},
     )
     return int(getattr(result, "rowcount", 0) or 0)
 
@@ -449,10 +478,19 @@ async def _select_claimable_reader_session_rows(
               from tb_ai_reader_daily_schedule s force index ({index_name})
               straight_join tb_ai_reader_agent a
                 on a.ai_reader_agent_id = s.ai_reader_agent_id
+              join tb_user u
+                on u.user_id = a.user_id
              where {condition_sql}
                and s.active_start_at <= current_timestamp
                and s.active_end_at > current_timestamp
                and a.status = 'active'
+               and u.use_yn = 'Y'
+               and lower(substring_index(u.email, '@', -1)) in :allowed_domains
+               and not exists (
+                    select 1
+                      from tb_user_social us
+                     where us.user_id = u.user_id
+               )
                and (
                     (
                         select count(*)
@@ -482,11 +520,12 @@ async def _select_claimable_reader_session_rows(
              order by s.active_start_at, s.ai_reader_schedule_id
              limit :limit
              for update skip locked
-        """),
+        """).bindparams(bindparam("allowed_domains", expanding=True)),
         {
             "limit": limit,
             "lease_timeout_seconds": lease_timeout_seconds,
             "prompt_version": decision_service.READER_DECISION_PROMPT_VERSION,
+            "allowed_domains": _allowed_ai_reader_account_domains(),
         },
     )
     return result.mappings().all()
