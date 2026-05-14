@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.const import settings
+
 
 KOREAN_AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
 AGE_GROUP_WEIGHTS = (
@@ -130,14 +132,34 @@ def build_initial_axis_bias(rng: random.Random) -> dict[str, dict[str, float]]:
     return bias
 
 
+def _allowed_labels_candidates() -> list[Path]:
+    resolved = Path(__file__).resolve()
+    parents = resolved.parents
+    app_root = parents[3] if len(parents) > 3 else Path(settings.ROOT_PATH)
+    candidates = [
+        Path(settings.ROOT_PATH) / "dist" / "ai" / "allowed-labels-by-axis.json",
+        Path(settings.ROOT_PATH) / "batch" / "allowed-labels-by-axis.json",
+        app_root / "dist" / "ai" / "allowed-labels-by-axis.json",
+    ]
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        deduped.append(path)
+        seen.add(path)
+    return deduped
+
+
 def _load_allowed_labels_by_axis() -> dict[str, set[str]]:
-    path = (
-        Path(__file__).resolve().parents[3]
-        / "dist"
-        / "ai"
-        / "allowed-labels-by-axis.json"
-    )
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = None
+    for path in _allowed_labels_candidates():
+        if not path.exists():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        break
+    if payload is None:
+        raise FileNotFoundError("allowed-labels-by-axis.json 파일을 찾을 수 없습니다.")
     allowed: dict[str, set[str]] = {}
     for english_axis, korean_axis in AXIS_CODEBOOK_KEY.items():
         labels = payload.get(korean_axis, [])

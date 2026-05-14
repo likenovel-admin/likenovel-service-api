@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -8121,6 +8122,46 @@ class AiReaderWorkerCycleTest(unittest.IsolatedAsyncioTestCase):
 
 
 class AiReaderPersonaFactoryTest(unittest.TestCase):
+    def test_reader_agent_persona_loads_axis_labels_from_deployed_batch_path(self):
+        from app.const import settings
+        from app.services.ai import reader_agent_persona_service as service
+
+        payload = {
+            "세": ["현대판타지"],
+            "직": ["회사원"],
+            "능": ["회귀"],
+            "연": ["동료애"],
+            "작": ["빠른전개"],
+            "타": ["성장형"],
+            "목": ["복수"],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root_path = Path(tmp_dir)
+            batch_path = root_path / "batch"
+            batch_path.mkdir(parents=True)
+            (batch_path / "allowed-labels-by-axis.json").write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            fake_service_file = (
+                root_path
+                / ".venv"
+                / "lib"
+                / "python3.12"
+                / "site-packages"
+                / "app"
+                / "services"
+                / "ai"
+                / "reader_agent_persona_service.py"
+            )
+
+            with patch.object(settings, "ROOT_PATH", str(root_path)):
+                with patch.object(service, "__file__", str(fake_service_file)):
+                    loaded = service._load_allowed_labels_by_axis()
+
+        self.assertEqual(loaded["worldview"], {"현대판타지"})
+        self.assertEqual(loaded["job"], {"회사원"})
+
     def test_generate_reader_agent_seed_uses_likenovel_axis_labels(self):
         from app.services.ai import reader_agent_persona_service as service
 
