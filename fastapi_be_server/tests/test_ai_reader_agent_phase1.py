@@ -4621,6 +4621,7 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         db.commit.assert_awaited_once()
 
     async def test_bootstrap_ai_reader_agents_requires_existing_prod_users_before_apply(self):
+        from app.schemas import admin as admin_schema
         from app.schemas.admin import PostAiReaderBootstrapReqBody
         from app.services.admin import admin_ai_reader_service
 
@@ -4630,6 +4631,30 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
                 {"user_id": 101, "email": "prod-ai-reader-0001@likenovel.internal"},
             ]
         )
+        dry_run_token = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            email_prefix="prod-ai-reader-",
+            agent_count=2,
+            schedule_date="2026-05-13",
+            schedule_duration_days=30,
+            allow_partial=False,
+            agent_index_offset=0,
+            daily_llm_budget=8,
+            active_hours=list(admin_schema.DEFAULT_AI_READER_ACTIVE_HOURS),
+            daily_session_target=2,
+            start_immediately=False,
+            immediate_batch_size=20,
+            immediate_batch_interval_minutes=10,
+            immediate_schedule_start_at=None,
+            age_group_ratios=dict(admin_schema.DEFAULT_AI_READER_AGE_GROUP_RATIOS),
+            gender_ratios=dict(admin_schema.DEFAULT_AI_READER_GENDER_RATIOS),
+            user_fingerprints=[
+                {
+                    "user_id": 101,
+                    "email": "prod-ai-reader-0001@likenovel.internal",
+                    "agent_key": "ai-reader-0000",
+                }
+            ],
+        )
 
         with self.assertRaises(Exception) as raised:
             await admin_ai_reader_service.bootstrap_ai_reader_agents(
@@ -4638,11 +4663,152 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
                     agent_count=2,
                     schedule_date="2026-05-13",
                     apply=True,
+                    dry_run_token=dry_run_token,
                 ),
                 db=db,
             )
 
         self.assertIn("AI reader bootstrap requires", str(raised.exception))
+
+    async def test_bootstrap_ai_reader_agents_apply_auto_provisions_missing_users(self):
+        from app.schemas import admin as admin_schema
+        from app.schemas.admin import PostAiReaderBootstrapReqBody
+        from app.services.admin import admin_ai_reader_service
+
+        db = AsyncMock()
+        db.execute.side_effect = [
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult(
+                [
+                    {"user_id": 101, "email": "prod-ai-reader-0001@ai-reader.likenovel.net"},
+                    {"user_id": 102, "email": "prod-ai-reader-0002@ai-reader.likenovel.net"},
+                ]
+            ),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult([], rowcount=2),
+            self._FakeMappingsResult(
+                [
+                    {
+                        "ai_reader_agent_id": 1001,
+                        "agent_key": "ai-reader-0000",
+                        "user_id": 101,
+                        "activity_pattern_json": '{"active_hours":[6],"daily_session_target":1}',
+                    },
+                    {
+                        "ai_reader_agent_id": 1002,
+                        "agent_key": "ai-reader-0001",
+                        "user_id": 102,
+                        "activity_pattern_json": '{"active_hours":[6],"daily_session_target":1}',
+                    },
+                ]
+            ),
+        ]
+        dry_run_token = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            email_prefix="prod-ai-reader-",
+            agent_count=2,
+            schedule_date="2026-05-13",
+            schedule_duration_days=1,
+            allow_partial=False,
+            agent_index_offset=0,
+            daily_llm_budget=8,
+            active_hours=[6],
+            daily_session_target=1,
+            start_immediately=False,
+            immediate_batch_size=20,
+            immediate_batch_interval_minutes=10,
+            immediate_schedule_start_at=None,
+            age_group_ratios=dict(admin_schema.DEFAULT_AI_READER_AGE_GROUP_RATIOS),
+            gender_ratios=dict(admin_schema.DEFAULT_AI_READER_GENDER_RATIOS),
+            user_fingerprints=[],
+        )
+
+        with patch.object(
+            admin_ai_reader_service,
+            "_provision_missing_ai_reader_users",
+            AsyncMock(return_value=2),
+            create=True,
+        ) as provision_missing, patch.object(
+            admin_ai_reader_service,
+            "replace_reader_daily_schedule_windows_bulk",
+            AsyncMock(return_value={"retired_count": 0, "deleted_count": 0, "upserted_count": 2}),
+        ):
+            result = await admin_ai_reader_service.bootstrap_ai_reader_agents(
+                req_body=PostAiReaderBootstrapReqBody(
+                    email_prefix="prod-ai-reader-",
+                    agent_count=2,
+                    schedule_date="2026-05-13",
+                    schedule_duration_days=1,
+                    apply=True,
+                    auto_provision_missing_users=True,
+                    active_hours=[6],
+                    daily_session_target=1,
+                    dry_run_token=dry_run_token,
+                ),
+                db=db,
+            )
+
+        provision_missing.assert_awaited_once()
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["available_user_count"], 2)
+        self.assertEqual(result["provisioned_user_count"], 2)
+        self.assertEqual(result["applied_count"], 2)
+        self.assertEqual(result["schedule_count"], 2)
+
+    async def test_create_ai_reader_dedicated_user_removes_likenovel_social_row(self):
+        from app.services.admin import admin_ai_reader_service
+
+        db = AsyncMock()
+        db.execute.side_effect = [
+            self._FakeMappingsResult([{"user_id": 123}]),
+            self._FakeMappingsResult([], rowcount=1),
+        ]
+
+        with patch.object(
+            admin_ai_reader_service.auth_service,
+            "post_auth_signup",
+            AsyncMock(),
+        ) as signup:
+            user_id = await admin_ai_reader_service._create_ai_reader_dedicated_user(
+                db,
+                email="prod-ai-reader-0001@ai-reader.likenovel.net",
+            )
+
+        signup.assert_awaited_once()
+        signup_body = signup.await_args.kwargs["req_body"]
+        self.assertEqual(signup_body.email, "prod-ai-reader-0001@ai-reader.likenovel.net")
+        self.assertEqual(signup_body.ad_info_agree_yn, "N")
+        delete_sql = str(db.execute.call_args_list[1].args[0]).lower()
+        self.assertIn("delete from tb_user_social", delete_sql)
+        self.assertIn("sns_type = 'likenovel'", delete_sql)
+        self.assertEqual(user_id, 123)
+        db.commit.assert_awaited_once()
+
+    async def test_provision_missing_ai_reader_users_generates_dedicated_domain_emails(self):
+        from app.services.admin import admin_ai_reader_service
+
+        db = AsyncMock()
+        db.execute.return_value = self._FakeMappingsResult([])
+
+        with patch.object(
+            admin_ai_reader_service,
+            "_create_ai_reader_dedicated_user",
+            AsyncMock(side_effect=[101, 102]),
+        ) as create_user:
+            created_count = await admin_ai_reader_service._provision_missing_ai_reader_users(
+                db,
+                email_prefix="prod-ai-reader-",
+                missing_count=2,
+                allowed_domains=["ai-reader.likenovel.dev", "ai-reader.likenovel.net"],
+            )
+
+        self.assertEqual(created_count, 2)
+        self.assertEqual(
+            [call.kwargs["email"] for call in create_user.await_args_list],
+            [
+                "prod-ai-reader-0001@ai-reader.likenovel.net",
+                "prod-ai-reader-0002@ai-reader.likenovel.net",
+            ],
+        )
 
     async def test_bootstrap_ai_reader_agents_rejects_like_wildcard_prefix(self):
         from app.schemas.admin import PostAiReaderBootstrapReqBody

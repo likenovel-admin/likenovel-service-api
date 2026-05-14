@@ -888,6 +888,10 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         default=False,
         description="기존 유저 수가 agent_count보다 적어도 가능한 수만 반영",
     )
+    auto_provision_missing_users: bool = Field(
+        default=False,
+        description="apply=true에서 AI 전용 계정이 부족하면 부족분을 자동 발급한 뒤 투입",
+    )
     agent_index_offset: int = Field(default=0, ge=0, le=100000, description="deterministic seed 시작 index")
     daily_llm_budget: int = Field(default=8, ge=1, le=20, description="에이전트 1명 하루 LLM 세션 예산")
     active_hours: List[int] = Field(
