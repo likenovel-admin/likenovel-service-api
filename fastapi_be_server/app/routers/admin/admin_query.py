@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger, chk_cur_user
 from app.services.admin import (
+    admin_ai_reader_service,
     admin_ai_onboarding_service,
     admin_ai_metadata_service,
     admin_basic_service,
@@ -23,6 +24,36 @@ from app.services.admin import (
 from app.utils.common import check_user
 
 router = APIRouter(prefix="/admins")
+
+
+@router.get(
+    "/ai-readers",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_ai_reader_agents(
+    schedule_date: Optional[str] = Query(default=None, description="조회할 스케줄 날짜 YYYY-MM-DD"),
+    status: str = Query(default="active", description="active | paused | all"),
+    page: int = Query(default=1, ge=1),
+    count_per_page: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 독자 투입/스케줄 조정용 목록.
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_reader_service.list_ai_reader_agents(
+        schedule_date=schedule_date,
+        status_filter=status,
+        page=page,
+        count_per_page=count_per_page,
+        db=db,
+    )
 
 
 @router.get(

@@ -7,6 +7,7 @@ from app.utils.auth import analysis_logger, chk_cur_user
 import app.schemas.admin as admin_schema
 import app.schemas.auth as auth_schema
 from app.services.admin import (
+    admin_ai_reader_service,
     admin_ai_onboarding_service,
     admin_ai_metadata_service,
     admin_basic_service,
@@ -28,6 +29,152 @@ import app.services.auth.auth_service as auth_service
 from app.utils.common import check_user
 
 router = APIRouter(prefix="/admins")
+
+
+@router.post(
+    "/ai-readers/bootstrap",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_ai_reader_bootstrap(
+    req_body: admin_schema.PostAiReaderBootstrapReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 전용 계정을 AI 독자로 등록하고 지정일 스케줄을 생성한다.
+    apply=false면 DB 반영 없이 드라이런만 반환한다.
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_reader_service.bootstrap_ai_reader_agents(
+        req_body=req_body,
+        db=db,
+    )
+
+
+@router.post(
+    "/ai-readers/pause-all",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_ai_reader_pause_all(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    active AI 독자를 전체 일시정지하고 남은 스케줄/action 대기열을 정리한다.
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_reader_service.pause_all_ai_reader_agents(db=db)
+
+
+@router.post(
+    "/ai-readers/resume-paused",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_ai_reader_resume_paused(
+    req_body: admin_schema.PostAiReaderResumePausedReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    paused AI 독자를 지정 수만큼 재가동하고 지정일 스케줄을 생성한다.
+    apply=false면 DB 반영 없이 드라이런만 반환한다.
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_reader_service.resume_paused_ai_reader_agents(
+        req_body=req_body,
+        db=db,
+    )
+
+
+@router.post(
+    "/ai-readers/refresh-schedules",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_ai_reader_refresh_schedules(
+    req_body: admin_schema.PostAiReaderRefreshSchedulesReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    active지만 현재 실행 가능한 스케줄이 없는 AI 독자에게 새 스케줄을 생성한다.
+    apply=false면 DB 반영 없이 드라이런만 반환한다.
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_reader_service.refresh_active_ai_reader_schedules(
+        req_body=req_body,
+        db=db,
+    )
+
+
+@router.post(
+    "/ai-readers/restart",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_ai_reader_restart(
+    req_body: admin_schema.PostAiReaderRestartReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    전체 AI 독자의 남은 활동을 정리하고 지정 수만큼 새 스케줄로 재투입한다.
+    apply=false면 DB 반영 없이 드라이런만 반환한다.
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_reader_service.restart_ai_reader_agents(
+        req_body=req_body,
+        db=db,
+    )
+
+
+@router.put(
+    "/ai-readers/{ai_reader_agent_id}/schedule",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_ai_reader_schedule(
+    req_body: admin_schema.PutAiReaderScheduleReqBody,
+    ai_reader_agent_id: int = Path(..., description="AI 독자 에이전트 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 독자 활동 시간/세션 목표를 수정하고 해당 날짜 daily schedule row를 즉시 교체한다.
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_ai_reader_service.update_ai_reader_agent_schedule(
+        ai_reader_agent_id=ai_reader_agent_id,
+        req_body=req_body,
+        db=db,
+    )
 
 
 @router.post("/login", tags=["CMS - 관리자"], dependencies=[Depends(analysis_logger)])
