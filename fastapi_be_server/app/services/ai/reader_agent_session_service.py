@@ -221,6 +221,7 @@ async def ensure_reader_daily_schedules(
     missing_agent_count = 0
     created_schedule_count = 0
     for schedule_date in normalized_dates:
+        schedule_start_at = datetime.combine(schedule_date, datetime.min.time())
         result = await db.execute(
             text("""
                 select
@@ -237,6 +238,20 @@ async def ensure_reader_daily_schedules(
                           from tb_user_social us
                          where us.user_id = u.user_id
                    )
+                   and (
+                        json_extract(a.activity_pattern_json, '$.auto_pause_after') is null
+                        or timestamp(cast(nullif(
+                            json_unquote(json_extract(a.activity_pattern_json, '$.auto_pause_after')),
+                            'null'
+                        ) as char)) > :schedule_start_at
+                   )
+                   and (
+                        json_extract(a.activity_pattern_json, '$.auto_pause_schedule_end_date') is null
+                        or date(cast(nullif(
+                            json_unquote(json_extract(a.activity_pattern_json, '$.auto_pause_schedule_end_date')),
+                            'null'
+                        ) as char)) >= :schedule_date
+                   )
                    and not exists (
                         select 1
                           from tb_ai_reader_daily_schedule s
@@ -248,6 +263,7 @@ async def ensure_reader_daily_schedules(
             """).bindparams(bindparam("allowed_domains", expanding=True)),
             {
                 "schedule_date": schedule_date,
+                "schedule_start_at": schedule_start_at,
                 "limit": limit,
                 "allowed_domains": _allowed_ai_reader_account_domains(),
             },
@@ -270,6 +286,76 @@ async def ensure_reader_daily_schedules(
         "missing_agent_count": missing_agent_count,
         "created_schedule_count": created_schedule_count,
     }
+
+
+async def pause_expired_active_reader_agents(db: AsyncSession) -> int:
+    expired_result = await db.execute(
+        text("""
+            select a.ai_reader_agent_id
+              from tb_ai_reader_agent a
+             where a.status = 'active'
+               and timestamp(cast(nullif(
+                    json_unquote(json_extract(a.activity_pattern_json, '$.auto_pause_after')),
+                    'null'
+               ) as char)) <= current_timestamp
+               and not exists (
+                    select 1
+                      from tb_ai_reader_daily_schedule s
+                     where s.ai_reader_agent_id = a.ai_reader_agent_id
+                       and s.status in ('ready', 'running')
+                       and s.active_end_at > current_timestamp
+               )
+             for update
+        """)
+    )
+    ai_reader_agent_ids = [
+        int(row["ai_reader_agent_id"])
+        for row in expired_result.mappings().all()
+    ]
+    if not ai_reader_agent_ids:
+        return 0
+
+    result = await db.execute(
+        text("""
+            update tb_ai_reader_agent a
+               set a.status = 'paused',
+                   a.updated_date = current_timestamp
+             where a.ai_reader_agent_id in :ai_reader_agent_ids
+               and a.status = 'active'
+        """).bindparams(bindparam("ai_reader_agent_ids", expanding=True)),
+        {"ai_reader_agent_ids": ai_reader_agent_ids},
+    )
+    await db.execute(
+        text("""
+            update tb_ai_reader_action_queue
+               set status = 'failed',
+                   active_scope_key = null,
+                   locked_by = null,
+                   locked_at = null,
+                   error_message = 'cancelled by expired ai reader schedule',
+                   updated_date = current_timestamp
+             where ai_reader_agent_id in :ai_reader_agent_ids
+               and (
+                    status = 'queued'
+                    or (
+                        status = 'running'
+                        and locked_at is not null
+                        and locked_at <= timestampadd(
+                            second,
+                            -:action_lease_timeout_seconds,
+                            current_timestamp
+                        )
+                    )
+               )
+        """).bindparams(bindparam("ai_reader_agent_ids", expanding=True)),
+        {
+            "ai_reader_agent_ids": ai_reader_agent_ids,
+            "action_lease_timeout_seconds": (
+                action_service.DEFAULT_ACTION_LEASE_TIMEOUT_SECONDS
+            ),
+        },
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 async def claim_due_reader_sessions(
@@ -583,6 +669,7 @@ async def process_claimed_reader_session(
                 session,
                 db,
                 llm_call=llm_call,
+                worker_id=worker_id,
                 post_success=lambda tx_db: mark_succeeded(
                     tx_db,
                     schedule_id=session.ai_reader_schedule_id,
@@ -669,6 +756,7 @@ async def _process_reader_session_decision(
     db: AsyncSession,
     *,
     llm_call: decision_service.ReaderLlmCall | None = None,
+    worker_id: str | None = None,
     post_success: PostSuccessFunc | None = None,
 ) -> ReaderSessionDecisionResult:
     snapshot = await build_reader_decision_snapshot(session, db)
@@ -708,21 +796,104 @@ async def _process_reader_session_decision(
         decision=llm_decision,
         actions=actions,
     )
+    block_reason: str | None = None
     async with _transaction_scope(db):
-        await mark_reader_llm_decision_succeeded(
-            db,
-            llm_decision_id=llm_decision_id,
-            decision=llm_decision,
-        )
-        result = await persist_reader_session_decision(
-            session=session,
-            prepared=prepared,
-            llm_decision_id=llm_decision_id,
-            db=db,
-        )
         if post_success is not None:
-            await post_success(db)
-        return result
+            block_reason = await _reader_session_finalization_block_reason(
+                session,
+                db,
+                worker_id=worker_id,
+            )
+            if block_reason is not None:
+                await mark_reader_llm_decision_failed(
+                    db,
+                    llm_decision_id=llm_decision_id,
+                    error_message=block_reason,
+                )
+            else:
+                await mark_reader_llm_decision_succeeded(
+                    db,
+                    llm_decision_id=llm_decision_id,
+                    decision=llm_decision,
+                )
+                result = await persist_reader_session_decision(
+                    session=session,
+                    prepared=prepared,
+                    llm_decision_id=llm_decision_id,
+                    db=db,
+                )
+                await post_success(db)
+                return result
+        else:
+            await mark_reader_llm_decision_succeeded(
+                db,
+                llm_decision_id=llm_decision_id,
+                decision=llm_decision,
+            )
+            result = await persist_reader_session_decision(
+                session=session,
+                prepared=prepared,
+                llm_decision_id=llm_decision_id,
+                db=db,
+            )
+            return result
+
+    if block_reason is not None:
+        raise InvalidReaderSessionError(block_reason)
+    raise InvalidReaderSessionError("reader session finalization failed")
+
+
+async def _reader_session_finalization_block_reason(
+    session: ReaderClaimedSession,
+    db: AsyncSession,
+    *,
+    worker_id: str | None = None,
+) -> str | None:
+    result = await db.execute(
+        text("""
+            select a.status as agent_status
+                 , s.status as schedule_status
+                 , s.locked_by as locked_by
+                 , case
+                    when s.active_start_at <= current_timestamp
+                     and s.active_end_at > current_timestamp
+                    then 1
+                    else 0
+                   end as within_active_window
+              from tb_ai_reader_agent a
+              join tb_ai_reader_daily_schedule s
+                on s.ai_reader_agent_id = a.ai_reader_agent_id
+             where a.ai_reader_agent_id = :ai_reader_agent_id
+               and a.user_id = :user_id
+               and s.ai_reader_schedule_id = :ai_reader_schedule_id
+             limit 1
+             for update
+        """),
+        {
+            "ai_reader_agent_id": session.ai_reader_agent_id,
+            "user_id": session.user_id,
+            "ai_reader_schedule_id": session.ai_reader_schedule_id,
+        },
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        return "session_missing"
+
+    agent_status = str(row.get("agent_status") or "missing")
+    if agent_status != "active":
+        return f"agent_{agent_status}"
+
+    schedule_status = str(row.get("schedule_status") or "missing")
+    if schedule_status != "running":
+        return f"schedule_{schedule_status}"
+
+    if int(row.get("within_active_window") or 0) != 1:
+        return "schedule_window_closed"
+
+    if worker_id is not None and row.get("locked_by") != worker_id[:100]:
+        return "session_lock_lost"
+
+    return None
 
 
 async def prepare_reader_session_decision(

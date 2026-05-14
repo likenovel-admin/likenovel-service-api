@@ -227,6 +227,7 @@ SessionProcessor = Callable[
 ActionClaimer = Callable[..., Awaitable[list[action_service.ReaderQueuedAction]]]
 ActionProcessor = Callable[..., Awaitable[action_service.ReaderActionApplyResult]]
 SchemaGuard = Callable[[AsyncSession], Awaitable[None]]
+ExpiredAgentPauser = Callable[[AsyncSession], Awaitable[int]]
 _reader_worker_schema_ready_checked = False
 
 
@@ -422,6 +423,7 @@ async def run_reader_worker_cycle(
     action_claimer: ActionClaimer = action_service.claim_due_actions,
     action_processor: ActionProcessor = action_service.process_claimed_action,
     schema_guard: SchemaGuard = ensure_reader_worker_schema_ready_once,
+    expired_agent_pauser: ExpiredAgentPauser = session_service.pause_expired_active_reader_agents,
 ) -> ReaderWorkerCycleResult:
     if not worker_id.strip():
         raise ValueError("worker_id is required")
@@ -440,6 +442,7 @@ async def run_reader_worker_cycle(
         )
 
     await schema_guard(db)
+    await expired_agent_pauser(db)
 
     sessions = await session_claimer(db, worker_id=worker_id, limit=session_limit)
     processed_session_count = 0

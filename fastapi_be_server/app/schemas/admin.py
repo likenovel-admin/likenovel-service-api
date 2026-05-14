@@ -877,6 +877,12 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         examples=["2026-05-13"],
         description="생성할 스케줄 날짜 YYYY-MM-DD, 미지정 시 오늘",
     )
+    schedule_duration_days: int = Field(
+        default=30,
+        ge=1,
+        le=90,
+        description="시작일부터 반복 스케줄을 생성할 기간(일)",
+    )
     apply: bool = Field(default=False, description="false면 드라이런, true면 DB 반영")
     allow_partial: bool = Field(
         default=False,
@@ -892,6 +898,27 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         description="AI 독자 활동 시간대 0~23",
     )
     daily_session_target: int = Field(default=2, ge=1, le=8, description="하루 wake 세션 목표")
+    start_immediately: bool = Field(
+        default=False,
+        description="오늘 날짜 스케줄에 즉시 시작 배치 스케줄을 추가",
+    )
+    immediate_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="즉시 시작 시 한 번에 열릴 AI 독자 수",
+    )
+    immediate_batch_interval_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="즉시 시작 배치 간격(분)",
+    )
+    immediate_schedule_start_at: Optional[str] = Field(
+        default=None,
+        max_length=32,
+        description="dry-run에서 고정한 즉시 시작 첫 배치 시각",
+    )
     age_group_ratios: Dict[str, int] = Field(
         default_factory=lambda: dict(DEFAULT_AI_READER_AGE_GROUP_RATIOS),
         description="연령대 비율. 허용값: 10s,20s,30s,40s,50s. 합계 100",
@@ -948,11 +975,86 @@ class PostAiReaderResumePausedReqBody(AdminBase):
         examples=["2026-05-14"],
         description="생성할 스케줄 날짜 YYYY-MM-DD, 미지정 시 오늘",
     )
+    schedule_duration_days: int = Field(
+        default=30,
+        ge=1,
+        le=90,
+        description="시작일부터 반복 스케줄을 생성할 기간(일)",
+    )
     apply: bool = Field(default=False, description="false면 드라이런, true면 DB 반영")
+    start_immediately: bool = Field(
+        default=False,
+        description="오늘 날짜 스케줄에 즉시 시작 배치 스케줄을 추가",
+    )
+    immediate_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="즉시 시작 시 한 번에 열릴 AI 독자 수",
+    )
+    immediate_batch_interval_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="즉시 시작 배치 간격(분)",
+    )
+    immediate_schedule_start_at: Optional[str] = Field(
+        default=None,
+        max_length=32,
+        description="dry-run에서 고정한 즉시 시작 첫 배치 시각",
+    )
+    active_hours: Optional[List[int]] = Field(
+        default=None,
+        min_length=1,
+        max_length=24,
+        examples=[[6, 7, 20, 21]],
+        description="재가동 시 덮어쓸 활동 시간대 0~23",
+    )
+    daily_session_target: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=8,
+        description="재가동 시 덮어쓸 하루 wake 세션 목표",
+    )
+    daily_llm_budget: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=20,
+        description="재가동 시 덮어쓸 하루 LLM 세션 예산",
+    )
     dry_run_token: Optional[str] = Field(
         default=None,
         max_length=128,
         description="apply=true 전에 같은 입력으로 받은 dry-run token",
+    )
+
+    @field_validator("active_hours")
+    def validate_active_hours(cls, value):
+        if value is None:
+            return value
+        normalized = sorted(set(int(hour) for hour in value))
+        if len(normalized) != len(value):
+            raise ValueError("active_hours must not contain duplicates")
+        if any(hour < 0 or hour > 23 for hour in normalized):
+            raise ValueError("active_hours must be between 0 and 23")
+        return normalized
+
+
+class PostAiReaderRefreshSchedulesReqBody(PostAiReaderResumePausedReqBody):
+    agent_count: int = Field(
+        default=100,
+        ge=1,
+        le=100,
+        description="새 스케줄을 생성할 active AI 독자 수",
+    )
+
+
+class PostAiReaderRestartReqBody(PostAiReaderResumePausedReqBody):
+    agent_count: int = Field(
+        default=100,
+        ge=1,
+        le=100,
+        description="전체 AI 독자를 정리한 뒤 새로 active 전환할 AI 독자 수",
     )
 
 

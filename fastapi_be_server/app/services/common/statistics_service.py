@@ -4,7 +4,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 
-from app.const import CommonConstants
+from app.const import CommonConstants, settings
 from app.exceptions import CustomResponseException
 from app.utils.query import get_nickname_sub_query
 from app.utils.response import build_paginated_response
@@ -26,6 +26,11 @@ AI_READER_MONITOR_TABLES = (
 AI_READER_ENGAGEMENT_SUMMARY_KEYS = (
     "total_agent_count",
     "active_agent_count",
+    "paused_agent_count",
+    "available_paused_agent_count",
+    "scheduled_active_agent_count",
+    "idle_active_agent_count",
+    "available_idle_active_agent_count",
     "created_agent_count",
     "today_schedule_count",
     "open_schedule_count",
@@ -37,6 +42,7 @@ AI_READER_ENGAGEMENT_SUMMARY_KEYS = (
     "queued_action_count",
     "running_action_count",
     "failed_action_count",
+    "skipped_action_count",
     "applied_action_count",
     "ai_view_count",
     "ai_bookmark_count",
@@ -46,6 +52,14 @@ AI_READER_ENGAGEMENT_SUMMARY_KEYS = (
     "ai_evaluation_count",
     "drop_count",
 )
+
+
+def _allowed_ai_reader_account_domains() -> list[str]:
+    return [
+        domain.strip().lower()
+        for domain in settings.AI_READER_ACCOUNT_ALLOWED_DOMAINS.split(",")
+        if domain.strip()
+    ]
 
 
 async def site_statistics(
@@ -866,6 +880,7 @@ def _empty_ai_reader_engagement_response(page: int, count_per_page: int) -> dict
         "hourly_summary": [],
         "cohort_summary": [],
         "recent_errors": [],
+        "recent_actions": [],
         "results": [],
     }
 
@@ -940,18 +955,76 @@ async def ai_reader_engagement_statistics(
         evaluation_product_filter = "WHERE product_id = :product_id"
         schedule_error_filter = "AND 1 = 0"
 
+    allowed_domains = _allowed_ai_reader_account_domains() or ["__ai_reader_domain_not_configured__"]
     agent_result = await db.execute(
         text("""
             SELECT
                 COUNT(*) AS total_agent_count,
-                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active_agent_count,
-                COALESCE(SUM(CASE WHEN created_date >= :start_at AND created_date < :end_exclusive THEN 1 ELSE 0 END), 0) AS created_agent_count,
+                COALESCE(SUM(CASE WHEN a.status = 'active' THEN 1 ELSE 0 END), 0) AS active_agent_count,
+                COALESCE(SUM(CASE WHEN a.status = 'paused' THEN 1 ELSE 0 END), 0) AS paused_agent_count,
+                COALESCE(SUM(CASE
+                    WHEN a.status = 'active'
+                     AND EXISTS (
+                         SELECT 1
+                           FROM tb_ai_reader_daily_schedule s_active
+                          WHERE s_active.ai_reader_agent_id = a.ai_reader_agent_id
+                            AND s_active.status IN ('ready', 'running')
+                            AND s_active.active_end_at > current_timestamp
+                     )
+                    THEN 1
+                    ELSE 0
+                END), 0) AS scheduled_active_agent_count,
+                COALESCE(SUM(CASE
+                    WHEN a.status = 'active'
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM tb_ai_reader_daily_schedule s_idle
+                          WHERE s_idle.ai_reader_agent_id = a.ai_reader_agent_id
+                            AND s_idle.status IN ('ready', 'running')
+                            AND s_idle.active_end_at > current_timestamp
+                     )
+                    THEN 1
+                    ELSE 0
+                END), 0) AS idle_active_agent_count,
+                COALESCE(SUM(CASE
+                    WHEN a.status = 'active'
+                     AND u.use_yn = 'Y'
+                     AND lower(substring_index(u.email, '@', -1)) in :allowed_domains
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM tb_user_social us
+                          WHERE us.user_id = u.user_id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM tb_ai_reader_daily_schedule s_available_idle
+                          WHERE s_available_idle.ai_reader_agent_id = a.ai_reader_agent_id
+                            AND s_available_idle.status IN ('ready', 'running')
+                            AND s_available_idle.active_end_at > current_timestamp
+                     )
+                    THEN 1
+                    ELSE 0
+                END), 0) AS available_idle_active_agent_count,
+                COALESCE(SUM(CASE
+                    WHEN a.status = 'paused'
+                     AND u.use_yn = 'Y'
+                     AND lower(substring_index(u.email, '@', -1)) in :allowed_domains
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM tb_user_social us
+                          WHERE us.user_id = u.user_id
+                     )
+                    THEN 1
+                    ELSE 0
+                END), 0) AS available_paused_agent_count,
+                COALESCE(SUM(CASE WHEN a.created_date >= :start_at AND a.created_date < :end_exclusive THEN 1 ELSE 0 END), 0) AS created_agent_count,
                 0 AS today_schedule_count,
                 0 AS open_schedule_count,
                 0 AS failed_schedule_count
-            FROM tb_ai_reader_agent
-        """),
-        params,
+            FROM tb_ai_reader_agent a
+            LEFT JOIN tb_user u ON u.user_id = a.user_id
+        """).bindparams(bindparam("allowed_domains", expanding=True)),
+        {**params, "allowed_domains": allowed_domains},
     )
     agent_summary = dict(agent_result.mappings().first() or {})
 
@@ -1008,7 +1081,18 @@ async def ai_reader_engagement_statistics(
             SELECT
                 COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_action_count,
                 COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running_action_count,
-                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_action_count,
+                COALESCE(SUM(CASE
+                    WHEN status = 'failed'
+                     AND updated_date >= :start_at
+                     AND updated_date < :end_exclusive THEN 1
+                    ELSE 0
+                END), 0) AS failed_action_count,
+                COALESCE(SUM(CASE
+                    WHEN status = 'skipped'
+                     AND updated_date >= :start_at
+                     AND updated_date < :end_exclusive THEN 1
+                    ELSE 0
+                END), 0) AS skipped_action_count,
                 COALESCE(SUM(CASE
                     WHEN status = 'applied'
                      AND applied_at >= :start_at
@@ -1017,7 +1101,9 @@ async def ai_reader_engagement_statistics(
                 END), 0) AS applied_action_count
             FROM tb_ai_reader_action_queue
             WHERE (
-                status IN ('queued', 'running', 'failed')
+                status IN ('queued', 'running')
+                OR (status = 'failed' AND updated_date >= :start_at AND updated_date < :end_exclusive)
+                OR (status = 'skipped' AND updated_date >= :start_at AND updated_date < :end_exclusive)
                 OR (status = 'applied' AND applied_at >= :start_at AND applied_at < :end_exclusive)
             )
               {action_product_filter}
@@ -1057,18 +1143,25 @@ async def ai_reader_engagement_statistics(
     )
     drop_summary = dict(drop_result.mappings().first() or {})
 
-    product_where = "WHERE m.stat_date BETWEEN :start_date AND :end_date"
-    if product_id is not None:
-        product_where += f" {product_where_filter}"
+    product_base_subquery = f"""
+                SELECT m.product_id
+                FROM tb_ai_reader_public_metric_daily m
+                WHERE m.stat_date BETWEEN :start_date AND :end_date
+                  {product_where_filter}
+                UNION
+                SELECT q.product_id
+                FROM tb_ai_reader_action_queue q
+                WHERE q.status = 'applied'
+                  AND q.applied_at >= :start_at
+                  AND q.applied_at < :end_exclusive
+                  {queued_action_product_filter}
+    """
 
     count_result = await db.execute(
         text(f"""
             SELECT COUNT(*) AS total_count
             FROM (
-                SELECT m.product_id
-                FROM tb_ai_reader_public_metric_daily m
-                {product_where}
-                GROUP BY m.product_id
+{product_base_subquery}
             ) z
         """),
         params,
@@ -1079,28 +1172,80 @@ async def ai_reader_engagement_statistics(
     product_result = await db.execute(
         text(f"""
             SELECT
-                m.product_id,
-                COALESCE(p.title, CONCAT('작품 ', m.product_id)) AS product_title,
-                COALESCE(SUM(m.ai_view_count), 0) AS ai_view_count,
-                COALESCE(SUM(m.ai_bookmark_count), 0) AS ai_bookmark_count,
-                COALESCE(SUM(m.ai_unbookmark_count), 0) AS ai_unbookmark_count,
-                COALESCE(SUM(m.ai_recommend_count), 0) AS ai_recommend_count,
-                COALESCE(SUM(m.ai_unrecommend_count), 0) AS ai_unrecommend_count,
-                COALESCE(SUM(m.ai_evaluation_count), 0) AS ai_evaluation_count,
+                b.product_id,
+                COALESCE(p.title, CONCAT('작품 ', b.product_id)) AS product_title,
+                COALESCE(m.ai_view_count, 0) AS ai_view_count,
+                COALESCE(m.ai_bookmark_count, 0) AS ai_bookmark_count,
+                COALESCE(m.ai_unbookmark_count, 0) AS ai_unbookmark_count,
+                COALESCE(m.ai_recommend_count, 0) AS ai_recommend_count,
+                COALESCE(m.ai_unrecommend_count, 0) AS ai_unrecommend_count,
+                COALESCE(m.ai_evaluation_count, 0) AS ai_evaluation_count,
+                COALESCE(a.ai_view_action_count, 0) AS ai_view_action_count,
+                COALESCE(a.ai_bookmark_add_action_count, 0) AS ai_bookmark_add_action_count,
+                COALESCE(a.ai_bookmark_remove_action_count, 0) AS ai_bookmark_remove_action_count,
+                COALESCE(a.ai_bookmark_net_action_count, 0) AS ai_bookmark_net_action_count,
+                COALESCE(a.ai_recommend_add_action_count, 0) AS ai_recommend_add_action_count,
+                COALESCE(a.ai_recommend_remove_action_count, 0) AS ai_recommend_remove_action_count,
+                COALESCE(a.ai_recommend_net_action_count, 0) AS ai_recommend_net_action_count,
+                COALESCE(a.ai_evaluation_action_count, 0) AS ai_evaluation_action_count,
+                a.last_ai_action_at,
                 COALESCE(d.drop_count, 0) AS drop_count,
                 COALESCE(p.count_hit, 0) AS public_view_count,
                 COALESCE(p.count_bookmark, 0) AS public_bookmark_count,
                 COALESCE(p.count_recommend, 0) AS public_recommend_count,
                 COALESCE(e.public_evaluation_count, 0) AS public_evaluation_count,
                 (
-                    COALESCE(SUM(m.ai_view_count), 0)
-                    + COALESCE(SUM(m.ai_recommend_count), 0) * 5
-                    + COALESCE(SUM(m.ai_bookmark_count), 0) * 4
-                    + COALESCE(SUM(m.ai_evaluation_count), 0) * 3
+                    COALESCE(m.ai_view_count, 0)
+                    + COALESCE(m.ai_recommend_count, 0) * 5
+                    + COALESCE(m.ai_bookmark_count, 0) * 4
+                    + COALESCE(m.ai_evaluation_count, 0) * 3
                     - COALESCE(d.drop_count, 0) * 2
                 ) AS ai_popularity_score
-            FROM tb_ai_reader_public_metric_daily m
-            LEFT JOIN tb_product p ON p.product_id = m.product_id
+            FROM (
+{product_base_subquery}
+            ) b
+            LEFT JOIN (
+                SELECT
+                    m.product_id,
+                    COALESCE(SUM(m.ai_view_count), 0) AS ai_view_count,
+                    COALESCE(SUM(m.ai_bookmark_count), 0) AS ai_bookmark_count,
+                    COALESCE(SUM(m.ai_unbookmark_count), 0) AS ai_unbookmark_count,
+                    COALESCE(SUM(m.ai_recommend_count), 0) AS ai_recommend_count,
+                    COALESCE(SUM(m.ai_unrecommend_count), 0) AS ai_unrecommend_count,
+                    COALESCE(SUM(m.ai_evaluation_count), 0) AS ai_evaluation_count
+                FROM tb_ai_reader_public_metric_daily m
+                WHERE m.stat_date BETWEEN :start_date AND :end_date
+                  {product_where_filter}
+                GROUP BY m.product_id
+            ) m ON m.product_id = b.product_id
+            LEFT JOIN (
+                SELECT
+                    q.product_id,
+                    COALESCE(SUM(CASE WHEN q.action_type = 'read' THEN 1 ELSE 0 END), 0) AS ai_view_action_count,
+                    COALESCE(SUM(CASE WHEN q.action_type = 'bookmark' AND q.target_value = 'Y' THEN 1 ELSE 0 END), 0) AS ai_bookmark_add_action_count,
+                    COALESCE(SUM(CASE WHEN q.action_type = 'bookmark' AND q.target_value = 'N' THEN 1 ELSE 0 END), 0) AS ai_bookmark_remove_action_count,
+                    COALESCE(SUM(CASE
+                        WHEN q.action_type = 'bookmark' AND q.target_value = 'Y' THEN 1
+                        WHEN q.action_type = 'bookmark' AND q.target_value = 'N' THEN -1
+                        ELSE 0
+                    END), 0) AS ai_bookmark_net_action_count,
+                    COALESCE(SUM(CASE WHEN q.action_type = 'recommend' AND q.target_value = 'Y' THEN 1 ELSE 0 END), 0) AS ai_recommend_add_action_count,
+                    COALESCE(SUM(CASE WHEN q.action_type = 'recommend' AND q.target_value = 'N' THEN 1 ELSE 0 END), 0) AS ai_recommend_remove_action_count,
+                    COALESCE(SUM(CASE
+                        WHEN q.action_type = 'recommend' AND q.target_value = 'Y' THEN 1
+                        WHEN q.action_type = 'recommend' AND q.target_value = 'N' THEN -1
+                        ELSE 0
+                    END), 0) AS ai_recommend_net_action_count,
+                    COALESCE(SUM(CASE WHEN q.action_type = 'evaluate' THEN 1 ELSE 0 END), 0) AS ai_evaluation_action_count,
+                    MAX(q.applied_at) AS last_ai_action_at
+                FROM tb_ai_reader_action_queue q
+                WHERE q.status = 'applied'
+                  AND q.applied_at >= :start_at
+                  AND q.applied_at < :end_exclusive
+                  {queued_action_product_filter}
+                GROUP BY q.product_id
+            ) a ON a.product_id = b.product_id
+            LEFT JOIN tb_product p ON p.product_id = b.product_id
             LEFT JOIN (
                 SELECT product_id, COUNT(*) AS drop_count
                 FROM tb_ai_reader_action_queue
@@ -1110,23 +1255,14 @@ async def ai_reader_engagement_statistics(
                   AND applied_at < :end_exclusive
                   {action_product_filter}
                 GROUP BY product_id
-            ) d ON d.product_id = m.product_id
+            ) d ON d.product_id = b.product_id
             LEFT JOIN (
                 SELECT product_id, COUNT(*) AS public_evaluation_count
                 FROM tb_product_evaluation
                 {evaluation_product_filter}
                 GROUP BY product_id
-            ) e ON e.product_id = m.product_id
-            {product_where}
-            GROUP BY
-                m.product_id,
-                p.title,
-                p.count_hit,
-                p.count_bookmark,
-                p.count_recommend,
-                d.drop_count,
-                e.public_evaluation_count
-            ORDER BY ai_popularity_score DESC, ai_view_count DESC, m.product_id DESC
+            ) e ON e.product_id = b.product_id
+            ORDER BY a.last_ai_action_at DESC, ai_popularity_score DESC, ai_view_action_count DESC, b.product_id DESC
             LIMIT :limit OFFSET :offset
         """),
         {**params, "limit": count_per_page, "offset": offset},
@@ -1234,6 +1370,36 @@ async def ai_reader_engagement_statistics(
     )
     recent_errors = [dict(row) for row in error_result.mappings().all()]
 
+    recent_actions_result = await db.execute(
+        text(f"""
+            SELECT
+                q.ai_reader_action_id,
+                q.ai_reader_agent_id,
+                a.agent_key,
+                a.age_group,
+                a.gender,
+                q.product_id,
+                p.title AS product_title,
+                q.episode_id,
+                q.action_type,
+                q.target_value,
+                q.status,
+                q.applied_at,
+                q.created_date
+            FROM tb_ai_reader_action_queue q
+            INNER JOIN tb_ai_reader_agent a ON a.ai_reader_agent_id = q.ai_reader_agent_id
+            LEFT JOIN tb_product p ON p.product_id = q.product_id
+            WHERE q.status = 'applied'
+              AND q.applied_at >= :start_at
+              AND q.applied_at < :end_exclusive
+              {queued_action_product_filter}
+            ORDER BY q.applied_at DESC, q.ai_reader_action_id DESC
+            LIMIT 30
+        """),
+        params,
+    )
+    recent_actions = [dict(row) for row in recent_actions_result.mappings().all()]
+
     return {
         "total_count": total_count,
         "page": page,
@@ -1248,6 +1414,7 @@ async def ai_reader_engagement_statistics(
         "hourly_summary": hourly_summary,
         "cohort_summary": cohort_summary,
         "recent_errors": recent_errors,
+        "recent_actions": recent_actions,
         "results": products,
     }
 
@@ -1325,6 +1492,119 @@ async def ai_reader_agent_actions_history(
               AND created_date >= :start_at
               AND created_date < :end_exclusive
             ORDER BY created_date DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": safe_count_per_page, "offset": offset},
+    )
+    items = [dict(row) for row in items_result.mappings().all()]
+
+    return {
+        "total_count": total_count,
+        "page": safe_page,
+        "count_per_page": safe_count_per_page,
+        "items": items,
+    }
+
+
+async def ai_reader_actions_timeline(
+    start_date: str | None,
+    end_date: str | None,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+    status_filter: str | None = None,
+) -> dict:
+    normalized_start, normalized_end = _normalize_ai_reader_date_range(start_date, end_date)
+    safe_page = max(1, int(page or 1))
+    safe_count_per_page = max(1, min(int(count_per_page or 50), 200))
+    offset = (safe_page - 1) * safe_count_per_page
+    normalized_status_filter = (status_filter or "applied").strip().lower()
+    status_conditions = {
+        "applied": "q.status = 'applied'",
+        "pending": "q.status IN ('queued', 'running')",
+        "skipped": "q.status = 'skipped'",
+        "failed": "q.status = 'failed'",
+        "all": "1 = 1",
+    }
+    if normalized_status_filter not in status_conditions:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="status_filter must be one of applied, pending, skipped, failed, all.",
+        )
+    status_condition = status_conditions[normalized_status_filter]
+    event_time_expr = (
+        "q.applied_at"
+        if normalized_status_filter == "applied"
+        else "COALESCE(q.applied_at, q.updated_date, q.created_date)"
+    )
+
+    if not await _has_ai_reader_action_queue_table(db):
+        return {
+            "total_count": 0,
+            "page": safe_page,
+            "count_per_page": safe_count_per_page,
+            "items": [],
+        }
+
+    end_exclusive = (
+        datetime.strptime(normalized_end, "%Y-%m-%d").date()
+        + timedelta(days=1)
+    )
+    params = {
+        "start_at": f"{normalized_start} 00:00:00",
+        "end_exclusive": f"{end_exclusive.isoformat()} 00:00:00",
+    }
+
+    count_result = await db.execute(
+        text(
+            f"""
+            SELECT COUNT(*) AS total_count
+            FROM tb_ai_reader_action_queue q
+            WHERE {status_condition}
+              AND {event_time_expr} >= :start_at
+              AND {event_time_expr} < :end_exclusive
+            """,
+        ),
+        params,
+    )
+    total_count = int(count_result.scalar() or 0)
+
+    if total_count == 0:
+        return {
+            "total_count": 0,
+            "page": safe_page,
+            "count_per_page": safe_count_per_page,
+            "items": [],
+        }
+
+    items_result = await db.execute(
+        text(
+            f"""
+            SELECT
+                q.ai_reader_action_id,
+                q.ai_reader_agent_id,
+                a.agent_key,
+                a.age_group,
+                a.gender,
+                q.product_id,
+                p.title AS product_title,
+                q.episode_id,
+                q.action_type,
+                q.target_value,
+                q.status,
+                {event_time_expr} AS event_time,
+                q.applied_at,
+                q.created_date,
+                q.updated_date,
+                q.error_message
+            FROM tb_ai_reader_action_queue q
+            INNER JOIN tb_ai_reader_agent a ON a.ai_reader_agent_id = q.ai_reader_agent_id
+            LEFT JOIN tb_product p ON p.product_id = q.product_id
+            WHERE {status_condition}
+              AND {event_time_expr} >= :start_at
+              AND {event_time_expr} < :end_exclusive
+            ORDER BY event_time DESC, q.ai_reader_action_id DESC
             LIMIT :limit OFFSET :offset
             """
         ),

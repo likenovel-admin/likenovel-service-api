@@ -28,6 +28,24 @@ READ_POOL_GUARD_RETRY_REASONS = frozenset(
         "insufficient_read_pool",
     }
 )
+AI_READER_BOOKMARK_ADD_DAILY_LIMIT = 9
+AI_READER_BOOKMARK_ADD_DAILY_LIMIT_LOCK_KEY = "ai-reader:bookmark-add-daily-limit"
+AI_READER_BOOKMARK_ADD_DAILY_LIMIT_LOCK_TIMEOUT_SECONDS = 5
+AI_READER_RECOMMEND_ADD_DAILY_LIMIT = 15
+AI_READER_RECOMMEND_ADD_PRODUCT_DAILY_LIMIT = 5
+AI_READER_RECOMMEND_ADD_EPISODE_DAILY_LIMIT = 3
+AI_READER_RECOMMEND_ADD_DAILY_LIMIT_LOCK_KEY = "ai-reader:recommend-add-daily-limit"
+AI_READER_EVALUATION_DAILY_LIMIT = 3
+AI_READER_EVALUATION_PRODUCT_DAILY_LIMIT = 1
+AI_READER_EVALUATION_EPISODE_DAILY_LIMIT = 1
+AI_READER_EVALUATION_DAILY_LIMIT_LOCK_KEY = "ai-reader:evaluation-daily-limit"
+AI_READER_LIMITED_PUBLIC_METRIC_COLUMNS = frozenset(
+    {
+        "ai_bookmark_count",
+        "ai_recommend_count",
+        "ai_evaluation_count",
+    }
+)
 logger = logging.getLogger(__name__)
 
 
@@ -113,8 +131,6 @@ async def _process_claimed_action_in_session(
     success_func: SuccessFunc | None = None,
     failed_func: FailedFunc | None = None,
 ) -> ReaderActionApplyResult:
-    apply_action = apply_func or apply_reader_action
-
     async def mark_success(
         tx_db: AsyncSession,
         *,
@@ -147,8 +163,18 @@ async def _process_claimed_action_in_session(
     try:
         async with db.begin():
             lock_key = await _acquire_action_target_lock(action, db)
-            if not await _is_action_agent_active(action, db):
-                result = _result(action, applied=False, reason="agent_paused")
+            block_reason = await _get_action_agent_block_reason(action, db)
+            if block_reason:
+                logger.warning(
+                    "blocked ai reader action before user state mutation",
+                    extra={
+                        "ai_reader_action_id": action.ai_reader_action_id,
+                        "ai_reader_agent_id": action.ai_reader_agent_id,
+                        "user_id": action.user_id,
+                        "reason": block_reason,
+                    },
+                )
+                result = _result(action, applied=False, reason=block_reason)
                 await mark_failed_action(
                     db,
                     action_id=action.ai_reader_action_id,
@@ -156,7 +182,10 @@ async def _process_claimed_action_in_session(
                     error_message=result.reason,
                 )
                 return result
-            result = await apply_action(action, db)
+            if apply_func is None:
+                result = await _dispatch_reader_action(action, db)
+            else:
+                result = await apply_func(action, db)
             if await _should_retry_after_pending_read_pool_action(action, result, db):
                 await mark_action_retry_later(
                     db,
@@ -165,11 +194,18 @@ async def _process_claimed_action_in_session(
                     retry_delay_seconds=READ_POOL_GUARD_RETRY_DELAY_SECONDS,
                     error_message=result.reason,
                 )
-            else:
+            elif result.applied:
                 await mark_succeeded(
                     db,
                     action_id=action.ai_reader_action_id,
                     worker_id=worker_id,
+                )
+            else:
+                await mark_action_skipped(
+                    db,
+                    action_id=action.ai_reader_action_id,
+                    worker_id=worker_id,
+                    skip_reason=result.reason,
                 )
             return result
     except ReaderActionLockBusyError:
@@ -492,16 +528,140 @@ async def _release_action_target_lock(lock_key: str, db: AsyncSession) -> None:
         )
 
 
-async def _is_action_agent_active(
+async def _acquire_bookmark_add_daily_limit_lock(db: AsyncSession) -> str:
+    return await _acquire_ai_public_metric_limit_lock(
+        db,
+        lock_key=AI_READER_BOOKMARK_ADD_DAILY_LIMIT_LOCK_KEY,
+        error_label="bookmark add daily limit",
+    )
+
+
+async def _acquire_recommend_add_daily_limit_lock(db: AsyncSession) -> str:
+    return await _acquire_ai_public_metric_limit_lock(
+        db,
+        lock_key=AI_READER_RECOMMEND_ADD_DAILY_LIMIT_LOCK_KEY,
+        error_label="recommend add daily limit",
+    )
+
+
+async def _acquire_evaluation_daily_limit_lock(db: AsyncSession) -> str:
+    return await _acquire_ai_public_metric_limit_lock(
+        db,
+        lock_key=AI_READER_EVALUATION_DAILY_LIMIT_LOCK_KEY,
+        error_label="evaluation daily limit",
+    )
+
+
+async def _acquire_ai_public_metric_limit_lock(
+    db: AsyncSession,
+    *,
+    lock_key: str,
+    error_label: str,
+) -> str:
+    result = await db.execute(
+        text("select get_lock(:lock_key, :timeout_seconds)"),
+        {
+            "lock_key": lock_key,
+            "timeout_seconds": AI_READER_BOOKMARK_ADD_DAILY_LIMIT_LOCK_TIMEOUT_SECONDS,
+        },
+    )
+    lock_result = result.scalar_one()
+    if lock_result == 0:
+        raise ReaderActionLockBusyError(f"{error_label} lock busy")
+    if lock_result != 1:
+        raise InvalidReaderActionError(f"failed to acquire {error_label} lock")
+    return lock_key
+
+
+async def _daily_ai_bookmark_add_count(db: AsyncSession) -> int:
+    return await _ai_public_metric_daily_count(
+        db,
+        metric_column="ai_bookmark_count",
+    )
+
+
+async def _ai_public_metric_daily_count(
+    db: AsyncSession,
+    *,
+    metric_column: str,
+    product_id: int | None = None,
+    episode_id: int | None = None,
+) -> int:
+    if metric_column not in AI_READER_LIMITED_PUBLIC_METRIC_COLUMNS:
+        raise InvalidReaderActionError("metric_column is invalid")
+    filters = []
+    params: dict[str, int] = {}
+    if product_id is not None:
+        filters.append("and product_id = :product_id")
+        params["product_id"] = product_id
+    if episode_id is not None:
+        filters.append("and episode_id = :episode_id")
+        params["episode_id"] = episode_id
+    filter_sql = "\n               ".join(filters)
+    result = await db.execute(
+        text(f"""
+            select coalesce(sum({metric_column}), 0) as metric_count
+              from tb_ai_reader_public_metric_daily
+             where stat_date = current_date()
+               {filter_sql}
+        """),
+        params,
+    )
+    return int(result.scalar() or 0)
+
+
+async def _ai_public_metric_limit_reason(
+    db: AsyncSession,
+    *,
+    metric_column: str,
+    daily_limit: int,
+    product_daily_limit: int,
+    episode_daily_limit: int,
+    product_id: int,
+    episode_id: int,
+    reason_prefix: str,
+) -> str | None:
+    if (
+        await _ai_public_metric_daily_count(db, metric_column=metric_column)
+        >= daily_limit
+    ):
+        return f"{reason_prefix}_daily_limit_reached"
+    if (
+        await _ai_public_metric_daily_count(
+            db,
+            metric_column=metric_column,
+            product_id=product_id,
+        )
+        >= product_daily_limit
+    ):
+        return f"{reason_prefix}_product_daily_limit_reached"
+    if (
+        await _ai_public_metric_daily_count(
+            db,
+            metric_column=metric_column,
+            product_id=product_id,
+            episode_id=episode_id,
+        )
+        >= episode_daily_limit
+    ):
+        return f"{reason_prefix}_episode_daily_limit_reached"
+    return None
+
+
+async def _get_action_agent_block_reason(
     action: ReaderQueuedAction,
     db: AsyncSession,
-) -> bool:
+) -> str | None:
     result = await db.execute(
         text("""
-            select status
-              from tb_ai_reader_agent
-             where ai_reader_agent_id = :ai_reader_agent_id
-               and user_id = :user_id
+            select a.status
+                 , lower(substring_index(u.email, '@', -1)) as email_domain
+                 , u.use_yn as user_use_yn
+              from tb_ai_reader_agent a
+              join tb_user u
+                on u.user_id = a.user_id
+             where a.ai_reader_agent_id = :ai_reader_agent_id
+               and a.user_id = :user_id
              limit 1
              for update
         """),
@@ -511,7 +671,43 @@ async def _is_action_agent_active(
         },
     )
     row = result.mappings().one_or_none()
-    return bool(row and row.get("status") == "active")
+    if not row:
+        return "agent_missing"
+    if row.get("status") != "active":
+        return "agent_paused"
+    if row.get("user_use_yn") != "Y":
+        return "user_inactive"
+    if row.get("email_domain") not in _allowed_ai_reader_account_domains():
+        return "non_dedicated_ai_reader_account"
+    if await _is_action_transaction_isolation_unsafe(db):
+        return "unsafe_transaction_isolation"
+    if await _is_action_social_account(action, db):
+        return "social_ai_reader_account_not_allowed"
+    return None
+
+
+async def _is_action_transaction_isolation_unsafe(db: AsyncSession) -> bool:
+    result = await db.execute(text("select @@transaction_isolation"))
+    isolation = str(result.scalar() or "").upper().replace(" ", "-")
+    return isolation != "REPEATABLE-READ"
+
+
+async def _is_action_social_account(
+    action: ReaderQueuedAction,
+    db: AsyncSession,
+) -> bool:
+    result = await db.execute(
+        text("""
+            select sns_id
+              from tb_user_social
+             where user_id = :user_id
+             order by sns_id asc
+             limit 1
+             for update
+        """),
+        {"user_id": action.user_id},
+    )
+    return result.mappings().one_or_none() is not None
 
 
 async def _should_retry_after_pending_read_pool_action(
@@ -680,6 +876,36 @@ async def mark_action_failed(
     _ensure_rows_changed(result, "mark_action_failed")
 
 
+async def mark_action_skipped(
+    db: AsyncSession,
+    *,
+    action_id: int,
+    worker_id: str,
+    skip_reason: str,
+) -> None:
+    if not worker_id.strip():
+        raise InvalidReaderActionError("worker_id is required")
+    result = await db.execute(
+        text("""
+            update tb_ai_reader_action_queue
+               set status = 'skipped'
+                 , error_message = :skip_reason
+                 , active_scope_key = null
+                 , locked_by = null
+                 , locked_at = null
+             where ai_reader_action_id = :action_id
+               and status = 'running'
+               and locked_by = :worker_id
+        """),
+        {
+            "action_id": action_id,
+            "worker_id": worker_id[:100],
+            "skip_reason": skip_reason[:1000],
+        },
+    )
+    _ensure_rows_changed(result, "mark_action_skipped")
+
+
 async def mark_action_retry_later(
     db: AsyncSession,
     *,
@@ -719,6 +945,26 @@ async def apply_reader_action(
     action: ReaderQueuedAction,
     db: AsyncSession,
 ) -> ReaderActionApplyResult:
+    async with _transaction_scope(db):
+        block_reason = await _get_action_agent_block_reason(action, db)
+        if block_reason:
+            logger.warning(
+                "blocked direct ai reader action before user state mutation",
+                extra={
+                    "ai_reader_action_id": action.ai_reader_action_id,
+                    "ai_reader_agent_id": action.ai_reader_agent_id,
+                    "user_id": action.user_id,
+                    "reason": block_reason,
+                },
+            )
+            return _result(action, applied=False, reason=block_reason)
+        return await _dispatch_reader_action(action, db)
+
+
+async def _dispatch_reader_action(
+    action: ReaderQueuedAction,
+    db: AsyncSession,
+) -> ReaderActionApplyResult:
     if action.action_type == "bookmark":
         return await _apply_bookmark_action(action, db)
     if action.action_type == "evaluate":
@@ -742,80 +988,99 @@ async def _apply_bookmark_action(
     if target_use_yn == "Y" and not await _has_ai_reader_read_product(action, db):
         return _result(action, applied=False, reason="product_not_read")
 
-    result = await db.execute(
-        text("""
-            select id
-                 , use_yn
-              from tb_user_bookmark
-             where user_id = :user_id
-               and product_id = :product_id
-             order by id
-        """),
-        {"user_id": action.user_id, "product_id": action.product_id},
-    )
-    rows = result.mappings().all()
+    quota_lock_key: str | None = None
+    if target_use_yn == "Y":
+        quota_lock_key = await _acquire_bookmark_add_daily_limit_lock(db)
 
-    changed = False
-    cleaned_duplicates = False
-    if rows:
-        row = rows[0]
-        duplicate_ids = _duplicate_row_ids(rows)
-        if duplicate_ids:
-            await _delete_user_bookmark_ids(duplicate_ids, db)
-            cleaned_duplicates = True
-        if row.get("use_yn") != target_use_yn:
+    try:
+        if (
+            target_use_yn == "Y"
+            and await _daily_ai_bookmark_add_count(db)
+            >= AI_READER_BOOKMARK_ADD_DAILY_LIMIT
+        ):
+            return _result(
+                action,
+                applied=False,
+                reason="bookmark_add_daily_limit_reached",
+            )
+
+        result = await db.execute(
+            text("""
+                select id
+                     , use_yn
+                  from tb_user_bookmark
+                 where user_id = :user_id
+                   and product_id = :product_id
+                 order by id
+            """),
+            {"user_id": action.user_id, "product_id": action.product_id},
+        )
+        rows = result.mappings().all()
+
+        changed = False
+        cleaned_duplicates = False
+        if rows:
+            row = rows[0]
+            duplicate_ids = _duplicate_row_ids(rows)
+            if duplicate_ids:
+                await _delete_user_bookmark_ids(duplicate_ids, db)
+                cleaned_duplicates = True
+            if row.get("use_yn") != target_use_yn:
+                await db.execute(
+                    text("""
+                        update tb_user_bookmark
+                           set use_yn = :target_use_yn
+                             , updated_id = :user_id
+                         where id = :id
+                    """),
+                    {
+                        "id": row.get("id"),
+                        "target_use_yn": target_use_yn,
+                        "user_id": action.user_id,
+                    },
+                )
+                changed = True
+        elif target_use_yn == "Y":
             await db.execute(
                 text("""
-                    update tb_user_bookmark
-                       set use_yn = :target_use_yn
-                         , updated_id = :user_id
-                     where id = :id
+                    insert into tb_user_bookmark
+                        (user_id, product_id, use_yn, created_id, updated_id)
+                    values
+                        (:user_id, :product_id, 'Y', :created_id, :updated_id)
                 """),
                 {
-                    "id": row.get("id"),
-                    "target_use_yn": target_use_yn,
                     "user_id": action.user_id,
+                    "product_id": action.product_id,
+                    "created_id": settings.DB_DML_DEFAULT_ID,
+                    "updated_id": settings.DB_DML_DEFAULT_ID,
                 },
             )
             changed = True
-    elif target_use_yn == "Y":
-        await db.execute(
-            text("""
-                insert into tb_user_bookmark
-                    (user_id, product_id, use_yn, created_id, updated_id)
-                values
-                    (:user_id, :product_id, 'Y', :created_id, :updated_id)
-            """),
-            {
-                "user_id": action.user_id,
-                "product_id": action.product_id,
-                "created_id": settings.DB_DML_DEFAULT_ID,
-                "updated_id": settings.DB_DML_DEFAULT_ID,
-            },
+
+        if not changed:
+            if cleaned_duplicates:
+                await _refresh_product_bookmark_count(action.product_id, db)
+            return _result(action, applied=False, reason="already_in_target_state")
+
+        await _refresh_product_bookmark_count(action.product_id, db)
+        await _mark_ai_product_state_flag(
+            action,
+            db,
+            flag_column="bookmarked_yn",
+            flag_value=target_use_yn,
         )
-        changed = True
-
-    if not changed:
-        if cleaned_duplicates:
-            await _refresh_product_bookmark_count(action.product_id, db)
-        return _result(action, applied=False, reason="already_in_target_state")
-
-    await _refresh_product_bookmark_count(action.product_id, db)
-    await _mark_ai_product_state_flag(
-        action,
-        db,
-        flag_column="bookmarked_yn",
-        flag_value=target_use_yn,
-    )
-    await _increment_ai_public_metric(
-        product_id=action.product_id,
-        episode_id=0,
-        metric_column=(
-            "ai_bookmark_count" if target_use_yn == "Y" else "ai_unbookmark_count"
-        ),
-        db=db,
-    )
-    return _result(action, applied=True, reason="applied")
+        await _increment_ai_public_metric(
+            product_id=action.product_id,
+            episode_id=0,
+            metric_column=(
+                "ai_bookmark_count" if target_use_yn == "Y" else "ai_unbookmark_count"
+            ),
+            db=db,
+        )
+        return _result(action, applied=True, reason="applied")
+    finally:
+        if quota_lock_key is not None:
+            await _release_action_target_lock(quota_lock_key, db)
 
 
 async def _apply_read_action(
@@ -977,47 +1242,64 @@ async def _apply_evaluate_action(
     if read_episode_count < MIN_EVALUATION_READ_EPISODE_COUNT:
         return _result(action, applied=False, reason="insufficient_read_pool")
 
-    await db.execute(
-        text("""
-            insert into tb_product_evaluation
-                (product_id, episode_id, user_id, eval_code, created_id, updated_id)
-            values
-                (:product_id, :episode_id, :user_id, :eval_code, :created_id, :updated_id)
-        """),
-        {
-            "product_id": product_id,
-            "episode_id": action.episode_id,
-            "user_id": action.user_id,
-            "eval_code": action.target_value,
-            "created_id": settings.DB_DML_DEFAULT_ID,
-            "updated_id": settings.DB_DML_DEFAULT_ID,
-        },
-    )
-    await db.execute(
-        text("""
-            update tb_product_episode
-               set count_evaluation = (
-                    select count(*)
-                      from tb_product_evaluation
-                     where episode_id = :episode_id
-               )
-             where episode_id = :episode_id
-        """),
-        {"episode_id": action.episode_id},
-    )
-    await _mark_ai_product_state_flag(
-        action,
-        db,
-        flag_column="evaluated_yn",
-        flag_value="Y",
-    )
-    await _increment_ai_public_metric(
-        product_id=product_id,
-        episode_id=action.episode_id,
-        metric_column="ai_evaluation_count",
-        db=db,
-    )
-    return _result(action, applied=True, reason="applied")
+    quota_lock_key = await _acquire_evaluation_daily_limit_lock(db)
+    try:
+        limit_reason = await _ai_public_metric_limit_reason(
+            db,
+            metric_column="ai_evaluation_count",
+            daily_limit=AI_READER_EVALUATION_DAILY_LIMIT,
+            product_daily_limit=AI_READER_EVALUATION_PRODUCT_DAILY_LIMIT,
+            episode_daily_limit=AI_READER_EVALUATION_EPISODE_DAILY_LIMIT,
+            product_id=product_id,
+            episode_id=action.episode_id,
+            reason_prefix="evaluation",
+        )
+        if limit_reason:
+            return _result(action, applied=False, reason=limit_reason)
+
+        await db.execute(
+            text("""
+                insert into tb_product_evaluation
+                    (product_id, episode_id, user_id, eval_code, created_id, updated_id)
+                values
+                    (:product_id, :episode_id, :user_id, :eval_code, :created_id, :updated_id)
+            """),
+            {
+                "product_id": product_id,
+                "episode_id": action.episode_id,
+                "user_id": action.user_id,
+                "eval_code": action.target_value,
+                "created_id": settings.DB_DML_DEFAULT_ID,
+                "updated_id": settings.DB_DML_DEFAULT_ID,
+            },
+        )
+        await db.execute(
+            text("""
+                update tb_product_episode
+                   set count_evaluation = (
+                        select count(*)
+                          from tb_product_evaluation
+                         where episode_id = :episode_id
+                   )
+                 where episode_id = :episode_id
+            """),
+            {"episode_id": action.episode_id},
+        )
+        await _mark_ai_product_state_flag(
+            action,
+            db,
+            flag_column="evaluated_yn",
+            flag_value="Y",
+        )
+        await _increment_ai_public_metric(
+            product_id=product_id,
+            episode_id=action.episode_id,
+            metric_column="ai_evaluation_count",
+            db=db,
+        )
+        return _result(action, applied=True, reason="applied")
+    finally:
+        await _release_action_target_lock(quota_lock_key, db)
 
 
 async def _apply_drop_action(
@@ -1271,27 +1553,48 @@ async def _apply_recommend_action(
 
     changed = False
     like_ids = _row_ids(rows)
+    quota_lock_key: str | None = None
     if rows and target_like_yn == "N":
         await _delete_episode_like_ids(like_ids, db)
         changed = True
     elif not rows and target_like_yn == "Y":
         if not await _has_ai_reader_read_episode(action, db):
             return _result(action, applied=False, reason="episode_not_read")
-        await db.execute(
-            text("""
-                insert into tb_product_episode_like
-                    (product_id, episode_id, user_id, created_id)
-                values
-                    (:product_id, :episode_id, :user_id, :created_id)
-            """),
-            {
-                "product_id": action.product_id,
-                "episode_id": action.episode_id,
-                "user_id": action.user_id,
-                "created_id": settings.DB_DML_DEFAULT_ID,
-            },
-        )
-        changed = True
+        quota_lock_key = await _acquire_recommend_add_daily_limit_lock(db)
+        try:
+            limit_reason = await _ai_public_metric_limit_reason(
+                db,
+                metric_column="ai_recommend_count",
+                daily_limit=AI_READER_RECOMMEND_ADD_DAILY_LIMIT,
+                product_daily_limit=AI_READER_RECOMMEND_ADD_PRODUCT_DAILY_LIMIT,
+                episode_daily_limit=AI_READER_RECOMMEND_ADD_EPISODE_DAILY_LIMIT,
+                product_id=action.product_id,
+                episode_id=action.episode_id,
+                reason_prefix="recommend_add",
+            )
+            if limit_reason:
+                await _release_action_target_lock(quota_lock_key, db)
+                quota_lock_key = None
+                return _result(action, applied=False, reason=limit_reason)
+            await db.execute(
+                text("""
+                    insert into tb_product_episode_like
+                        (product_id, episode_id, user_id, created_id)
+                    values
+                        (:product_id, :episode_id, :user_id, :created_id)
+                """),
+                {
+                    "product_id": action.product_id,
+                    "episode_id": action.episode_id,
+                    "user_id": action.user_id,
+                    "created_id": settings.DB_DML_DEFAULT_ID,
+                },
+            )
+            changed = True
+        except Exception:
+            await _release_action_target_lock(quota_lock_key, db)
+            quota_lock_key = None
+            raise
     elif len(like_ids) > 1:
         await _delete_episode_like_ids(like_ids[1:], db)
         await _refresh_episode_like_recommend_count(
@@ -1303,22 +1606,26 @@ async def _apply_recommend_action(
     if not changed:
         return _result(action, applied=False, reason="already_in_target_state")
 
-    await _refresh_episode_like_recommend_count(action.product_id, action.episode_id, db)
-    await _mark_ai_product_state_flag(
-        action,
-        db,
-        flag_column="recommended_yn",
-        flag_value=target_like_yn,
-    )
-    await _increment_ai_public_metric(
-        product_id=action.product_id,
-        episode_id=action.episode_id,
-        metric_column=(
-            "ai_recommend_count" if target_like_yn == "Y" else "ai_unrecommend_count"
-        ),
-        db=db,
-    )
-    return _result(action, applied=True, reason="applied")
+    try:
+        await _refresh_episode_like_recommend_count(action.product_id, action.episode_id, db)
+        await _mark_ai_product_state_flag(
+            action,
+            db,
+            flag_column="recommended_yn",
+            flag_value=target_like_yn,
+        )
+        await _increment_ai_public_metric(
+            product_id=action.product_id,
+            episode_id=action.episode_id,
+            metric_column=(
+                "ai_recommend_count" if target_like_yn == "Y" else "ai_unrecommend_count"
+            ),
+            db=db,
+        )
+        return _result(action, applied=True, reason="applied")
+    finally:
+        if quota_lock_key is not None:
+            await _release_action_target_lock(quota_lock_key, db)
 
 
 async def _refresh_product_bookmark_count(product_id: int, db: AsyncSession) -> None:

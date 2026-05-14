@@ -574,6 +574,33 @@ async def ai_reader_engagement_statistics(
 
 
 @router.get(
+    "/ai-reader-engagement/actions",
+    tags=["AI 유저 인게이지먼트 통계"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_reader_actions_timeline(
+    start_date: str | None = Query(None, description="시작 날짜"),
+    end_date: str | None = Query(None, description="종료 날짜"),
+    status_filter: str | None = Query("applied", description="applied|pending|skipped|failed|all"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(50, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """전체 AI 독자 활동 타임라인(action queue)."""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+
+    return await statistics_service.ai_reader_actions_timeline(
+        start_date,
+        end_date,
+        page,
+        count_per_page,
+        db,
+        status_filter=status_filter,
+    )
+
+
+@router.get(
     "/ai-reader-engagement/agents/{agent_id}/actions",
     tags=["AI 유저 인게이지먼트 통계"],
     dependencies=[Depends(analysis_logger)],
