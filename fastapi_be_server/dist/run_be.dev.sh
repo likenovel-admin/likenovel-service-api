@@ -7,10 +7,13 @@ sudo chmod -R 700 /home/ln-admin/likenovel/api-dev
 
 cd /home/ln-admin/likenovel/api-dev
 
-# 최초 배포 시 pidfile이 없을 수 있음
-if [ -f gunicorn.pid ]; then
-  kill -TERM $(cat gunicorn.pid)
+# 최초 배포나 과거 배포본에는 pidfile이 없거나 stale일 수 있음
+if [ -f gunicorn.pid ] && kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
+  kill -TERM "$(cat gunicorn.pid)"
   sleep 10
+else
+  pkill -TERM -f "/home/ln-admin/likenovel/api-dev/.venv/bin/gunicorn -c" || true
+  sleep 5
 fi
 
 rm -rf ./__pycache__
