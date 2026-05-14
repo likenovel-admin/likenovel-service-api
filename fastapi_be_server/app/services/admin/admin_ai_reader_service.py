@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import secrets
 from datetime import datetime, date, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -10,8 +11,10 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.schemas.admin as admin_schema
+import app.schemas.auth as auth_schema
 from app.const import settings
 from app.exceptions import CustomResponseException
+from app.services.auth import auth_service
 from app.services.ai import reader_agent_persona_service
 from app.services.ai import reader_agent_session_service
 
@@ -233,6 +236,156 @@ def _allowed_ai_reader_account_domains() -> list[str]:
         for domain in settings.AI_READER_ACCOUNT_ALLOWED_DOMAINS.split(",")
         if domain.strip()
     ]
+
+
+def _provision_ai_reader_account_domain(allowed_domains: list[str]) -> str:
+    frontend_url = (settings.SERVICE_FRONTEND_URL or "").lower()
+    preferred_suffix = ".dev" if ".dev" in frontend_url else ".net"
+    for domain in allowed_domains:
+        if domain.endswith(preferred_suffix):
+            return domain
+    return allowed_domains[0]
+
+
+def _generate_ai_reader_account_password() -> str:
+    return f"Ai{secrets.randbelow(10_000_000_000):010d}!"
+
+
+async def _fetch_bootstrap_candidate_users(
+    db: AsyncSession,
+    *,
+    email_prefix: str,
+    allowed_domains: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    user_result = await db.execute(
+        text("""
+            select
+                user_id,
+                email
+              from tb_user
+             where use_yn = 'Y'
+               and role_type = 'normal'
+               and email like :email_like
+               and lower(substring_index(email, '@', -1)) in :allowed_domains
+               and not exists (
+                       select 1
+                         from tb_user_social us
+                        where us.user_id = tb_user.user_id
+                   )
+               and not exists (
+                       select 1
+                         from tb_ai_reader_agent ar
+                        where ar.user_id = tb_user.user_id
+                   )
+             order by email asc, user_id asc
+             limit :limit
+        """).bindparams(bindparam("allowed_domains", expanding=True)),
+        {
+            "email_like": f"{email_prefix}%",
+            "allowed_domains": allowed_domains,
+            "limit": limit,
+        },
+    )
+    return [dict(row) for row in user_result.mappings().all()]
+
+
+async def _create_ai_reader_dedicated_user(
+    db: AsyncSession,
+    *,
+    email: str,
+) -> int:
+    await auth_service.post_auth_signup(
+        req_body=auth_schema.SignupReqBody(
+            email=email,
+            password=_generate_ai_reader_account_password(),
+            birthdate="2000-01-01",
+            gender="M",
+            ad_info_agree_yn="N",
+        ),
+        db=db,
+    )
+    user_result = await db.execute(
+        text("""
+            select user_id
+              from tb_user
+             where email = :email
+               and use_yn = 'Y'
+             order by user_id desc
+             limit 1
+        """),
+        {"email": email},
+    )
+    user_row = user_result.mappings().one_or_none()
+    if not user_row:
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=f"AI reader account was created but user row was not found: {email}",
+        )
+    user_id = int(user_row["user_id"])
+    await db.execute(
+        text("""
+            delete from tb_user_social
+             where user_id = :user_id
+               and sns_type = 'likenovel'
+        """),
+        {"user_id": user_id},
+    )
+    await db.commit()
+    return user_id
+
+
+async def _provision_missing_ai_reader_users(
+    db: AsyncSession,
+    *,
+    email_prefix: str,
+    missing_count: int,
+    allowed_domains: list[str],
+) -> int:
+    if missing_count <= 0:
+        return 0
+    domain = _provision_ai_reader_account_domain(allowed_domains)
+    await db.commit()
+    existing_result = await db.execute(
+        text("""
+            select lower(email) as email
+              from tb_user
+             where email like :email_like
+               and lower(substring_index(email, '@', -1)) = :domain
+        """),
+        {
+            "email_like": f"{email_prefix}%@{domain}",
+            "domain": domain,
+        },
+    )
+    used_emails = {
+        str(row["email"]).lower()
+        for row in existing_result.mappings().all()
+        if row.get("email")
+    }
+    await db.commit()
+    created_count = 0
+    next_index = 1
+    while created_count < missing_count:
+        if next_index > 999_999:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="AI reader account email suffix range is exhausted.",
+            )
+        email = f"{email_prefix}{next_index:04d}@{domain}"
+        next_index += 1
+        if len(email) > 100 or email.lower() in used_emails:
+            continue
+        try:
+            await _create_ai_reader_dedicated_user(db, email=email)
+        except CustomResponseException as exc:
+            if exc.status_code == status.HTTP_409_CONFLICT:
+                used_emails.add(email.lower())
+                continue
+            raise
+        used_emails.add(email.lower())
+        created_count += 1
+    return created_count
 
 
 def build_ai_reader_bootstrap_dry_run_token(
@@ -1895,45 +2048,129 @@ async def bootstrap_ai_reader_agents(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             message="AI reader account allowed domains are not configured.",
         )
-    user_result = await db.execute(
-        text("""
-            select
-                user_id,
-                email
-              from tb_user
-             where use_yn = 'Y'
-               and role_type = 'normal'
-               and email like :email_like
-               and lower(substring_index(email, '@', -1)) in :allowed_domains
-               and not exists (
-                       select 1
-                         from tb_user_social us
-                        where us.user_id = tb_user.user_id
-                   )
-               and not exists (
-                       select 1
-                         from tb_ai_reader_agent ar
-                        where ar.user_id = tb_user.user_id
-                   )
-             order by email asc, user_id asc
-             limit :limit
-        """).bindparams(bindparam("allowed_domains", expanding=True)),
-        {
-            "email_like": f"{req_body.email_prefix}%",
-            "allowed_domains": allowed_domains,
-            "limit": req_body.agent_count,
-        },
+    users = await _fetch_bootstrap_candidate_users(
+        db,
+        email_prefix=req_body.email_prefix,
+        allowed_domains=allowed_domains,
+        limit=req_body.agent_count,
     )
-    users = [dict(row) for row in user_result.mappings().all()]
-    if req_body.apply and len(users) < req_body.agent_count and not req_body.allow_partial:
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message=(
-                "AI reader bootstrap requires "
-                f"{req_body.agent_count} existing users for prefix {req_body.email_prefix}, "
-                f"found {len(users)}."
+    initial_users = users[: req_body.agent_count]
+    initial_seeds = reader_agent_persona_service.generate_reader_agent_seeds(
+        count=len(initial_users),
+        index_offset=req_body.agent_index_offset,
+        age_group_ratios=req_body.age_group_ratios,
+        gender_ratios=req_body.gender_ratios,
+        active_hours=req_body.active_hours,
+        daily_session_target=req_body.daily_session_target,
+    )
+    initial_user_fingerprints = [
+        {
+            "user_id": int(user["user_id"]),
+            "email": str(user.get("email") or ""),
+            "agent_key": seed.agent_key,
+        }
+        for user, seed in zip(initial_users, initial_seeds, strict=True)
+    ]
+    schedule_now = _now_in_kst()
+    requested_immediate_schedule_start_at = _parse_immediate_schedule_start_at(
+        req_body.immediate_schedule_start_at
+    )
+    initial_immediate_batches = _build_immediate_schedule_batches(
+        agent_count=len(initial_users),
+        schedule_date=target_date,
+        start_immediately=req_body.start_immediately,
+        batch_size=req_body.immediate_batch_size,
+        batch_interval_minutes=req_body.immediate_batch_interval_minutes,
+        now=schedule_now,
+        immediate_schedule_start_at=requested_immediate_schedule_start_at,
+    )
+    initial_immediate_schedule_preview = _immediate_schedule_preview_payload(
+        initial_immediate_batches
+    )
+    initial_immediate_schedule_start_at = (
+        initial_immediate_schedule_preview[0]["active_start_at"]
+        if initial_immediate_schedule_preview
+        else None
+    )
+    initial_auto_pause_after = _operation_auto_pause_after(
+        schedule_end_date=schedule_end_date,
+        immediate_batches=initial_immediate_batches,
+    )
+    dry_run_token = _expected_bootstrap_dry_run_token(
+        req_body,
+        schedule_date=target_date,
+        immediate_schedule_start_at=initial_immediate_schedule_start_at,
+        user_fingerprints=initial_user_fingerprints,
+    )
+    preview = [
+        {
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "agent_key": seed.agent_key,
+            "age_group": seed.age_group,
+            "gender": seed.gender,
+            "activity_pattern": _activity_pattern_with_auto_pause_after(
+                seed.activity_pattern_json,
+                initial_auto_pause_after,
+                schedule_end_date,
             ),
+        }
+        for user, seed in zip(initial_users, initial_seeds, strict=True)
+    ]
+    if not req_body.apply:
+        return {
+            "applied": False,
+            "schedule_date": target_date.isoformat(),
+            "schedule_duration_days": req_body.schedule_duration_days,
+            "schedule_end_date": schedule_end_date.isoformat(),
+            "requested_count": req_body.agent_count,
+            "available_user_count": len(users),
+            "missing_user_count": max(0, req_body.agent_count - len(users)),
+            "dry_run_token": dry_run_token,
+            "preview": preview,
+            "immediate_schedule_preview": initial_immediate_schedule_preview,
+            "immediate_schedule_start_at": initial_immediate_schedule_start_at,
+            "provisioned_user_count": 0,
+        }
+
+    _assert_matching_bootstrap_dry_run_token(
+        req_body,
+        schedule_date=target_date,
+        immediate_schedule_start_at=initial_immediate_schedule_start_at,
+        user_fingerprints=initial_user_fingerprints,
+    )
+    provisioned_user_count = 0
+    if len(users) < req_body.agent_count and not req_body.allow_partial:
+        if not req_body.auto_provision_missing_users:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=(
+                    "AI reader bootstrap requires "
+                    f"{req_body.agent_count} existing users for prefix {req_body.email_prefix}, "
+                    f"found {len(users)}."
+                ),
+            )
+        provisioned_user_count = await _provision_missing_ai_reader_users(
+            db,
+            email_prefix=req_body.email_prefix,
+            missing_count=req_body.agent_count - len(users),
+            allowed_domains=allowed_domains,
         )
+        users = await _fetch_bootstrap_candidate_users(
+            db,
+            email_prefix=req_body.email_prefix,
+            allowed_domains=allowed_domains,
+            limit=req_body.agent_count,
+        )
+        if len(users) < req_body.agent_count:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=(
+                    "AI reader bootstrap auto-provision did not create enough users: "
+                    f"required {req_body.agent_count}, found {len(users)}."
+                ),
+            )
+
     target_users = users[: req_body.agent_count]
     seeds = reader_agent_persona_service.generate_reader_agent_seeds(
         count=len(target_users),
@@ -1947,18 +2184,6 @@ async def bootstrap_ai_reader_agents(
         {"user_id": user["user_id"], "agent_key": seed.agent_key}
         for user, seed in zip(target_users, seeds, strict=True)
     ]
-    user_fingerprints = [
-        {
-            "user_id": int(user["user_id"]),
-            "email": str(user.get("email") or ""),
-            "agent_key": seed.agent_key,
-        }
-        for user, seed in zip(target_users, seeds, strict=True)
-    ]
-    schedule_now = _now_in_kst()
-    requested_immediate_schedule_start_at = _parse_immediate_schedule_start_at(
-        req_body.immediate_schedule_start_at
-    )
     immediate_batches = _build_immediate_schedule_batches(
         agent_count=len(target_users),
         schedule_date=target_date,
@@ -1980,23 +2205,10 @@ async def bootstrap_ai_reader_agents(
         schedule_end_date=schedule_end_date,
         immediate_batches=immediate_batches,
     )
-    dry_run_token = _expected_bootstrap_dry_run_token(
-        req_body,
-        schedule_date=target_date,
-        immediate_schedule_start_at=immediate_schedule_start_at,
-        user_fingerprints=user_fingerprints,
+    await _assert_ai_reader_identity_available(
+        db,
+        expected_pairs=expected_pairs,
     )
-    if req_body.apply:
-        _assert_matching_bootstrap_dry_run_token(
-            req_body,
-            schedule_date=target_date,
-            immediate_schedule_start_at=immediate_schedule_start_at,
-            user_fingerprints=user_fingerprints,
-        )
-        await _assert_ai_reader_identity_available(
-            db,
-            expected_pairs=expected_pairs,
-        )
     preview = [
         {
             "user_id": user["user_id"],
@@ -2012,20 +2224,6 @@ async def bootstrap_ai_reader_agents(
         }
         for user, seed in zip(target_users, seeds, strict=True)
     ]
-    if not req_body.apply:
-        return {
-            "applied": False,
-            "schedule_date": target_date.isoformat(),
-            "schedule_duration_days": req_body.schedule_duration_days,
-            "schedule_end_date": schedule_end_date.isoformat(),
-            "requested_count": req_body.agent_count,
-            "available_user_count": len(users),
-            "missing_user_count": max(0, req_body.agent_count - len(users)),
-            "dry_run_token": dry_run_token,
-            "preview": preview,
-            "immediate_schedule_preview": immediate_schedule_preview,
-            "immediate_schedule_start_at": immediate_schedule_start_at,
-        }
 
     if not target_users:
         return {
@@ -2039,6 +2237,7 @@ async def bootstrap_ai_reader_agents(
             "preview": [],
             "immediate_schedule_preview": [],
             "immediate_schedule_start_at": None,
+            "provisioned_user_count": provisioned_user_count,
         }
 
     await db.execute(
@@ -2165,6 +2364,7 @@ async def bootstrap_ai_reader_agents(
         "schedule_end_date": schedule_end_date.isoformat(),
         "requested_count": req_body.agent_count,
         "available_user_count": len(users),
+        "provisioned_user_count": provisioned_user_count,
         "applied_count": len(agents),
         "schedule_count": replace_result["upserted_count"],
         "preview": preview,
