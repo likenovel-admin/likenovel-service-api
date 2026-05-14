@@ -1,4 +1,5 @@
-from sqlalchemy import BigInteger, Date, Double, Index, Integer, String, Text, TIMESTAMP, UniqueConstraint, text
+from decimal import Decimal
+from sqlalchemy import BigInteger, Date, Double, Index, Integer, JSON, Numeric, String, Text, TIMESTAMP, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from datetime import date, datetime
@@ -1659,6 +1660,337 @@ class AiSignalRetentionPolicy(Base):
     )
     last_purge_before_date: Mapped[date] = mapped_column(
         Date, nullable=True, comment="마지막 삭제 기준일"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiReaderAgent(Base):
+    __tablename__ = "tb_ai_reader_agent"  # AI reader persona mapped to tb_user
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uk_ai_reader_agent_user"),
+        UniqueConstraint("agent_key", name="uk_ai_reader_agent_key"),
+        Index("idx_ai_reader_agent_status", "status"),
+    )
+
+    ai_reader_agent_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, comment="유저 아이디")
+    agent_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="AI 독자 key"
+    )
+    age_group: Mapped[str] = mapped_column(
+        String(20), nullable=False, comment="연령대"
+    )
+    gender: Mapped[str] = mapped_column(String(20), nullable=False, comment="성별")
+    persona_json: Mapped[dict] = mapped_column(
+        JSON, nullable=False, comment="고정 페르소나 JSON"
+    )
+    taste_memory_json: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True, comment="취향 메모리 JSON"
+    )
+    activity_pattern_json: Mapped[dict] = mapped_column(
+        JSON, nullable=False, comment="활동 패턴 JSON"
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="active", comment="상태"
+    )
+    daily_llm_budget: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="8", comment="일일 LLM 판단 예산"
+    )
+    created_id: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiReaderDailySchedule(Base):
+    __tablename__ = "tb_ai_reader_daily_schedule"  # AI reader wake/sleep window
+    __table_args__ = (
+        UniqueConstraint(
+            "ai_reader_agent_id",
+            "schedule_date",
+            "active_start_at",
+            name="uk_ai_reader_daily_schedule_agent_window",
+        ),
+        Index(
+            "idx_ai_reader_daily_schedule_due",
+            "status",
+            "active_start_at",
+            "active_end_at",
+        ),
+        Index(
+            "idx_ai_reader_daily_schedule_stale",
+            "status",
+            "locked_at",
+            "active_start_at",
+            "active_end_at",
+            "ai_reader_schedule_id",
+        ),
+    )
+
+    ai_reader_schedule_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+    ai_reader_agent_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    schedule_date: Mapped[date] = mapped_column(Date, nullable=False)
+    active_start_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False)
+    active_end_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False)
+    session_budget: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1"
+    )
+    used_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="ready"
+    )
+    locked_by: Mapped[str] = mapped_column(String(100), nullable=True)
+    locked_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=True)
+    error_message: Mapped[str] = mapped_column(String(1000), nullable=True)
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiReaderProductState(Base):
+    __tablename__ = "tb_ai_reader_product_state"  # AI reader state per product
+    __table_args__ = (
+        UniqueConstraint(
+            "ai_reader_agent_id",
+            "product_id",
+            name="uk_ai_reader_product_state_agent_product",
+        ),
+        Index("idx_ai_reader_product_state_product", "product_id", "state"),
+    )
+
+    ai_reader_product_state_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+    ai_reader_agent_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_episode_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    state: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="reading"
+    )
+    read_episode_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    bookmarked_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N"
+    )
+    recommended_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N"
+    )
+    evaluated_yn: Mapped[str] = mapped_column(
+        String(1), nullable=False, server_default="N"
+    )
+    last_decision_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiReaderLlmDecision(Base):
+    __tablename__ = "tb_ai_reader_llm_decision"  # LLM decision audit log
+    __table_args__ = (
+        UniqueConstraint(
+            "ai_reader_agent_id",
+            "session_id",
+            "prompt_version",
+            name="uk_ai_reader_llm_decision_session",
+        ),
+        Index("idx_ai_reader_llm_decision_request", "request_hash"),
+        Index(
+            "idx_ai_reader_llm_decision_agent_created",
+            "ai_reader_agent_id",
+            "created_date",
+        ),
+        Index("idx_ai_reader_llm_decision_status", "decision_status", "created_date"),
+        Index(
+            "idx_ai_reader_llm_decision_status_created_product",
+            "decision_status",
+            "created_date",
+            "product_id",
+        ),
+    )
+
+    ai_reader_llm_decision_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+    ai_reader_agent_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    episode_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_snapshot_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    decision_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    decision_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="pending"
+    )
+    error_message: Mapped[str] = mapped_column(String(1000), nullable=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=True)
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 6),
+        nullable=True,
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiReaderActionQueue(Base):
+    __tablename__ = "tb_ai_reader_action_queue"  # AI reader action apply queue
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uk_ai_reader_action_idempotency"),
+        UniqueConstraint(
+            "active_scope_key",
+            name="uk_ai_reader_action_active_scope",
+        ),
+        Index(
+            "idx_ai_reader_action_queue_due",
+            "status",
+            "available_at",
+            "ai_reader_action_id",
+        ),
+        Index(
+            "idx_ai_reader_action_queue_stale",
+            "status",
+            "locked_at",
+            "attempt_count",
+            "ai_reader_action_id",
+        ),
+        Index(
+            "idx_ai_reader_action_queue_agent_created",
+            "ai_reader_agent_id",
+            "created_date",
+        ),
+        Index(
+            "idx_ai_reader_action_queue_target",
+            "action_type",
+            "product_id",
+            "episode_id",
+        ),
+        Index(
+            "idx_ai_reader_action_queue_status_applied_product",
+            "status",
+            "applied_at",
+            "product_id",
+            "action_type",
+        ),
+        Index(
+            "idx_ai_reader_action_queue_failed_updated_product",
+            "status",
+            "updated_date",
+            "product_id",
+        ),
+    )
+
+    ai_reader_action_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    active_scope_key: Mapped[str] = mapped_column(String(64), nullable=True)
+    ai_reader_agent_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    episode_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    action_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    target_value: Mapped[str] = mapped_column(String(40), nullable=True)
+    llm_decision_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
+    decision_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="queued"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    locked_by: Mapped[str] = mapped_column(String(100), nullable=True)
+    locked_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=True)
+    available_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    applied_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=True)
+    error_message: Mapped[str] = mapped_column(String(1000), nullable=True)
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AiReaderPublicMetricDaily(Base):
+    __tablename__ = "tb_ai_reader_public_metric_daily"  # AI contribution to public metrics
+    __table_args__ = (
+        UniqueConstraint(
+            "stat_date",
+            "product_id",
+            "episode_id",
+            name="uk_ai_reader_public_metric_daily_target",
+        ),
+        Index("idx_ai_reader_public_metric_daily_product", "product_id", "stat_date"),
+    )
+
+    ai_reader_public_metric_daily_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+    stat_date: Mapped[date] = mapped_column(Date, nullable=False)
+    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    episode_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    ai_view_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    ai_bookmark_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    ai_unbookmark_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    ai_recommend_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    ai_unrecommend_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    ai_evaluation_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
     )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")

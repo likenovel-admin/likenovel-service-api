@@ -211,6 +211,29 @@ class Settings(BaseSettings):
     # anthropic (AI 추천)
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_BASE_URL: str = os.getenv(
+        "OPENROUTER_BASE_URL",
+        "https://openrouter.ai/api/v1",
+    ).rstrip("/")
+    AI_READER_OPENROUTER_MODEL: str = os.getenv(
+        "AI_READER_OPENROUTER_MODEL",
+        os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v3.2"),
+    )
+    AI_READER_OPENROUTER_PROVIDER_ONLY: str = os.getenv(
+        "AI_READER_OPENROUTER_PROVIDER_ONLY",
+        "",
+    )
+    AI_READER_OPENROUTER_TEMPERATURE: float = float(
+        os.getenv("AI_READER_OPENROUTER_TEMPERATURE", "0.4")
+    )
+    AI_READER_OPENROUTER_TIMEOUT_SECONDS: float = float(
+        os.getenv("AI_READER_OPENROUTER_TIMEOUT_SECONDS", "30")
+    )
+    AI_READER_ACCOUNT_ALLOWED_DOMAINS: str = os.getenv(
+        "AI_READER_ACCOUNT_ALLOWED_DOMAINS",
+        "ai-reader.likenovel.dev,ai-reader.likenovel.net",
+    )
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     WEBSOCHAT_GEMINI_MODEL: str = os.getenv(
         "WEBSOCHAT_GEMINI_MODEL",
