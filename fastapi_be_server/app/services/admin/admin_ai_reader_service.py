@@ -152,6 +152,24 @@ def _immediate_schedule_preview_payload(
     ]
 
 
+def _time_blocks_payload(time_blocks: Any) -> list[dict[str, Any]] | None:
+    if not time_blocks:
+        return None
+    payload: list[dict[str, Any]] = []
+    for block in time_blocks:
+        raw = block.model_dump() if hasattr(block, "model_dump") else dict(block)
+        item = {
+            "start_hour": int(raw["start_hour"]),
+            "end_hour": int(raw["end_hour"]),
+            "sessions_per_agent": int(raw.get("sessions_per_agent") or 1),
+        }
+        label = raw.get("label")
+        if label:
+            item["label"] = str(label)
+        payload.append(item)
+    return payload
+
+
 def _operation_auto_pause_after(
     *,
     schedule_end_date: date,
@@ -172,10 +190,16 @@ def _activity_pattern_with_auto_pause_after(
     pattern_value: Any,
     auto_pause_after: datetime | None,
     auto_pause_schedule_end_date: date | None = None,
+    time_blocks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     pattern = _parse_json_field(pattern_value, {})
     if not isinstance(pattern, dict):
         pattern = {}
+    if time_blocks is not None:
+        pattern = {
+            **pattern,
+            "time_blocks": time_blocks,
+        }
     if auto_pause_after is not None:
         pattern = {
             **pattern,
@@ -399,6 +423,7 @@ def build_ai_reader_bootstrap_dry_run_token(
     daily_llm_budget: int,
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
+    time_blocks: list[dict[str, Any]] | None = None,
     start_immediately: bool = False,
     immediate_batch_size: int = 20,
     immediate_batch_interval_minutes: int = 10,
@@ -425,6 +450,7 @@ def build_ai_reader_bootstrap_dry_run_token(
         "daily_llm_budget": daily_llm_budget,
         "active_hours": sorted(normalized_active_hours),
         "daily_session_target": daily_session_target or 2,
+        "time_blocks": time_blocks,
         "start_immediately": bool(start_immediately),
         "immediate_batch_size": immediate_batch_size,
         "immediate_batch_interval_minutes": immediate_batch_interval_minutes,
@@ -466,6 +492,7 @@ def _expected_bootstrap_dry_run_token(
         daily_llm_budget=req_body.daily_llm_budget,
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
+        time_blocks=_time_blocks_payload(req_body.time_blocks),
         start_immediately=req_body.start_immediately,
         immediate_batch_size=req_body.immediate_batch_size,
         immediate_batch_interval_minutes=req_body.immediate_batch_interval_minutes,
@@ -510,6 +537,7 @@ def build_ai_reader_resume_paused_dry_run_token(
     immediate_schedule_start_at: str | None = None,
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
+    time_blocks: list[dict[str, Any]] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
 ) -> str:
@@ -524,6 +552,7 @@ def build_ai_reader_resume_paused_dry_run_token(
         "immediate_schedule_start_at": immediate_schedule_start_at,
         "active_hours": sorted(active_hours) if active_hours else None,
         "daily_session_target": daily_session_target,
+        "time_blocks": time_blocks,
         "daily_llm_budget": daily_llm_budget,
         "agent_fingerprints": sorted(
             agent_fingerprints or [],
@@ -560,6 +589,7 @@ def _expected_resume_paused_dry_run_token(
         immediate_schedule_start_at=immediate_schedule_start_at,
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
+        time_blocks=_time_blocks_payload(req_body.time_blocks),
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
     )
@@ -599,6 +629,7 @@ def build_ai_reader_refresh_schedules_dry_run_token(
     immediate_schedule_start_at: str | None = None,
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
+    time_blocks: list[dict[str, Any]] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
 ) -> str:
@@ -614,6 +645,7 @@ def build_ai_reader_refresh_schedules_dry_run_token(
         "immediate_schedule_start_at": immediate_schedule_start_at,
         "active_hours": sorted(active_hours) if active_hours else None,
         "daily_session_target": daily_session_target,
+        "time_blocks": time_blocks,
         "daily_llm_budget": daily_llm_budget,
         "agent_fingerprints": sorted(
             agent_fingerprints or [],
@@ -650,6 +682,7 @@ def _expected_refresh_schedules_dry_run_token(
         immediate_schedule_start_at=immediate_schedule_start_at,
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
+        time_blocks=_time_blocks_payload(req_body.time_blocks),
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
     )
@@ -689,6 +722,7 @@ def build_ai_reader_restart_dry_run_token(
     immediate_schedule_start_at: str | None = None,
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
+    time_blocks: list[dict[str, Any]] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
 ) -> str:
@@ -704,6 +738,7 @@ def build_ai_reader_restart_dry_run_token(
         "immediate_schedule_start_at": immediate_schedule_start_at,
         "active_hours": sorted(active_hours) if active_hours else None,
         "daily_session_target": daily_session_target,
+        "time_blocks": time_blocks,
         "daily_llm_budget": daily_llm_budget,
         "agent_fingerprints": sorted(
             agent_fingerprints or [],
@@ -740,6 +775,7 @@ def _expected_restart_dry_run_token(
         immediate_schedule_start_at=immediate_schedule_start_at,
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
+        time_blocks=_time_blocks_payload(req_body.time_blocks),
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
     )
@@ -807,6 +843,11 @@ def _resume_activity_pattern_for_agent(
         "sleep_hours": _sleep_hours(active_hours),
         "daily_session_target": int(daily_session_target),
     }
+    requested_time_blocks = _time_blocks_payload(req_body.time_blocks)
+    if requested_time_blocks is not None:
+        next_pattern["time_blocks"] = requested_time_blocks
+    elif req_body.active_hours is not None:
+        next_pattern.pop("time_blocks", None)
     if auto_pause_after is not None:
         next_pattern["auto_pause_after"] = _format_schedule_datetime(auto_pause_after)
         if auto_pause_schedule_end_date is not None:
@@ -2096,6 +2137,7 @@ async def bootstrap_ai_reader_agents(
         schedule_end_date=schedule_end_date,
         immediate_batches=initial_immediate_batches,
     )
+    requested_time_blocks = _time_blocks_payload(req_body.time_blocks)
     dry_run_token = _expected_bootstrap_dry_run_token(
         req_body,
         schedule_date=target_date,
@@ -2113,6 +2155,7 @@ async def bootstrap_ai_reader_agents(
                 seed.activity_pattern_json,
                 initial_auto_pause_after,
                 schedule_end_date,
+                requested_time_blocks,
             ),
         }
         for user, seed in zip(initial_users, initial_seeds, strict=True)
@@ -2220,6 +2263,7 @@ async def bootstrap_ai_reader_agents(
                 seed.activity_pattern_json,
                 auto_pause_after,
                 schedule_end_date,
+                requested_time_blocks,
             ),
         }
         for user, seed in zip(target_users, seeds, strict=True)
@@ -2289,6 +2333,7 @@ async def bootstrap_ai_reader_agents(
                         seed.activity_pattern_json,
                         auto_pause_after,
                         schedule_end_date,
+                        requested_time_blocks,
                     ),
                     ensure_ascii=False,
                 ),
@@ -2425,6 +2470,11 @@ async def update_ai_reader_agent_schedule(
         "auto_pause_after": _format_schedule_datetime(auto_pause_after),
         "auto_pause_schedule_end_date": target_date.isoformat(),
     }
+    requested_time_blocks = _time_blocks_payload(req_body.time_blocks)
+    if requested_time_blocks is not None:
+        next_pattern["time_blocks"] = requested_time_blocks
+    else:
+        next_pattern.pop("time_blocks", None)
     next_status = req_body.status or agent.get("status") or "active"
     next_daily_llm_budget = req_body.daily_llm_budget or int(agent.get("daily_llm_budget") or 8)
 

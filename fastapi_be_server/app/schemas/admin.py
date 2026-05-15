@@ -845,6 +845,35 @@ ALLOWED_AI_READER_AGE_GROUPS = set(DEFAULT_AI_READER_AGE_GROUP_RATIOS)
 ALLOWED_AI_READER_GENDERS = {"M", "F", "X"}
 
 
+class AiReaderTimeBlock(AdminBase):
+    label: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="운영자에게 보여줄 시간표 블록 이름",
+    )
+    start_hour: int = Field(ge=0, le=23, description="블록 시작 시각(시)")
+    end_hour: int = Field(ge=1, le=24, description="블록 종료 시각(시, exclusive)")
+    sessions_per_agent: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description="블록 안에서 AI 독자 1명당 생성할 세션 수",
+    )
+
+    @field_validator("label")
+    def validate_label(cls, value):
+        if value is None:
+            return value
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_time_range(self):
+        if self.end_hour <= self.start_hour:
+            raise ValueError("time block end_hour must be greater than start_hour")
+        return self
+
+
 def _validate_ai_reader_ratio_map(
     value: Dict[str, int],
     *,
@@ -902,6 +931,12 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         description="AI 독자 활동 시간대 0~23",
     )
     daily_session_target: int = Field(default=2, ge=1, le=8, description="하루 wake 세션 목표")
+    time_blocks: Optional[List[AiReaderTimeBlock]] = Field(
+        default=None,
+        min_length=1,
+        max_length=24,
+        description="시간표 블록. 있으면 active_hours/daily_session_target보다 우선 사용",
+    )
     start_immediately: bool = Field(
         default=False,
         description="오늘 날짜 스케줄에 즉시 시작 배치 스케줄을 추가",
@@ -1020,6 +1055,12 @@ class PostAiReaderResumePausedReqBody(AdminBase):
         le=8,
         description="재가동 시 덮어쓸 하루 wake 세션 목표",
     )
+    time_blocks: Optional[List[AiReaderTimeBlock]] = Field(
+        default=None,
+        min_length=1,
+        max_length=24,
+        description="재가동 시 덮어쓸 시간표 블록",
+    )
     daily_llm_budget: Optional[int] = Field(
         default=None,
         ge=1,
@@ -1075,6 +1116,12 @@ class PutAiReaderScheduleReqBody(AdminBase):
         description="활동 시간대 0~23",
     )
     daily_session_target: int = Field(default=2, ge=1, le=8, description="하루 wake 세션 목표")
+    time_blocks: Optional[List[AiReaderTimeBlock]] = Field(
+        default=None,
+        min_length=1,
+        max_length=24,
+        description="조정할 시간표 블록",
+    )
     daily_llm_budget: Optional[int] = Field(default=None, ge=1, le=20, description="하루 LLM 세션 예산")
     status: Optional[str] = Field(default=None, examples=["active"], description="active | paused")
     replace_running: bool = Field(default=False, description="실행 중 스케줄도 강제 종료 후 교체")

@@ -5562,6 +5562,77 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual({window.schedule_date for window in windows}, {date(2026, 5, 7)})
 
+    def test_build_reader_daily_schedule_windows_uses_time_blocks(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        windows = service.build_reader_daily_schedule_windows(
+            ai_reader_agent_id=7,
+            schedule_date=date(2026, 5, 7),
+            activity_pattern={
+                "active_hours": [7, 8, 12, 18, 19, 20, 21, 22],
+                "daily_session_target": 3,
+                "time_blocks": [
+                    {"label": "출근", "start_hour": 7, "end_hour": 9},
+                    {"label": "점심", "start_hour": 12, "end_hour": 13},
+                    {"label": "저녁", "start_hour": 18, "end_hour": 23},
+                ],
+            },
+        )
+
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(sum(window.session_budget for window in windows), 3)
+        self.assertIn(windows[0].active_start_at.hour, range(7, 9))
+        self.assertEqual(windows[0].active_end_at.hour, 9)
+        self.assertEqual(windows[1].active_start_at.hour, 12)
+        self.assertEqual(windows[1].active_end_at.hour, 13)
+        self.assertIn(windows[2].active_start_at.hour, range(18, 23))
+        self.assertEqual(windows[2].active_end_at.hour, 23)
+
+    def test_build_reader_daily_schedule_windows_spreads_agents_inside_time_block(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        start_hours = set()
+        for ai_reader_agent_id in range(1, 101):
+            windows = service.build_reader_daily_schedule_windows(
+                ai_reader_agent_id=ai_reader_agent_id,
+                schedule_date=date(2026, 5, 7),
+                activity_pattern={
+                    "time_blocks": [
+                        {"label": "저녁", "start_hour": 18, "end_hour": 23},
+                    ],
+                },
+            )
+            self.assertEqual(len(windows), 1)
+            start_hours.add(windows[0].active_start_at.hour)
+
+        self.assertTrue(start_hours.issubset({18, 19, 20, 21, 22}))
+        self.assertGreater(len(start_hours), 1)
+
+    def test_ai_reader_request_accepts_time_blocks(self):
+        from pydantic import ValidationError
+
+        from app.schemas.admin import PostAiReaderBootstrapReqBody
+
+        req_body = PostAiReaderBootstrapReqBody(
+            email_prefix="ai-reader-",
+            time_blocks=[
+                {"label": "출근", "start_hour": 7, "end_hour": 9},
+                {"label": "점심", "start_hour": 12, "end_hour": 13},
+                {"label": "저녁", "start_hour": 18, "end_hour": 23},
+            ],
+        )
+
+        self.assertEqual(len(req_body.time_blocks), 3)
+        self.assertEqual(req_body.time_blocks[2].end_hour, 23)
+
+        with self.assertRaises(ValidationError):
+            PostAiReaderBootstrapReqBody(
+                email_prefix="ai-reader-",
+                time_blocks=[
+                    {"label": "broken", "start_hour": 18, "end_hour": 18},
+                ],
+            )
+
     def test_build_reader_daily_schedule_windows_keeps_midnight_window_contiguous(self):
         from app.services.ai import reader_agent_session_service as service
 
