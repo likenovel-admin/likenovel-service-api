@@ -100,6 +100,20 @@ def build_reader_daily_schedule_windows(
     if not isinstance(pattern, dict):
         raise InvalidReaderSessionError("activity_pattern must be an object")
 
+    time_blocks = _normalize_time_blocks(pattern.get("time_blocks"))
+    if time_blocks:
+        windows: list[ReaderDailyScheduleWindow] = []
+        for block_index, block in enumerate(time_blocks):
+            windows.extend(
+                _build_time_block_schedule_windows(
+                    ai_reader_agent_id=ai_reader_agent_id,
+                    schedule_date=schedule_date,
+                    block=block,
+                    block_index=block_index,
+                )
+            )
+        return sorted(windows, key=lambda window: window.active_start_at)
+
     active_hours = _normalize_active_hours(pattern.get("active_hours"))
     segments = _active_hour_segments(active_hours)
     if not segments:
@@ -142,6 +156,46 @@ def build_reader_daily_schedule_windows(
             )
         )
     return sorted(windows, key=lambda window: window.active_start_at)
+
+
+def _build_time_block_schedule_windows(
+    *,
+    ai_reader_agent_id: int,
+    schedule_date: date,
+    block: dict[str, Any],
+    block_index: int,
+) -> list[ReaderDailyScheduleWindow]:
+    start_hour = int(block["start_hour"])
+    end_hour = int(block["end_hour"])
+    sessions_per_agent = int(block.get("sessions_per_agent") or 1)
+    duration_minutes = (end_hour - start_hour) * 60
+    block_start_at = datetime.combine(schedule_date, time(start_hour, 0))
+    block_end_at = datetime.combine(schedule_date, time.min) + timedelta(hours=end_hour)
+
+    windows: list[ReaderDailyScheduleWindow] = []
+    for session_index in range(sessions_per_agent):
+        offset_minutes = _time_block_offset_minutes(
+            ai_reader_agent_id=ai_reader_agent_id,
+            schedule_date=schedule_date,
+            start_hour=start_hour,
+            end_hour=end_hour,
+            block_index=block_index,
+            session_index=session_index,
+            sessions_per_agent=sessions_per_agent,
+            duration_minutes=duration_minutes,
+        )
+        active_start_at = block_start_at + timedelta(minutes=offset_minutes)
+        active_end_at = max(block_end_at, active_start_at + timedelta(minutes=30))
+        windows.append(
+            ReaderDailyScheduleWindow(
+                ai_reader_agent_id=ai_reader_agent_id,
+                schedule_date=schedule_date,
+                active_start_at=active_start_at,
+                active_end_at=active_end_at,
+                session_budget=1,
+            )
+        )
+    return windows
 
 
 async def upsert_reader_daily_schedule_windows(
@@ -1619,6 +1673,43 @@ def _normalize_active_hours(value: Any) -> set[int]:
     return hours
 
 
+def _normalize_time_blocks(value: Any) -> list[dict[str, Any]]:
+    if value in (None, []):
+        return []
+    if not isinstance(value, list):
+        raise InvalidReaderSessionError("activity_pattern.time_blocks must be a list")
+
+    blocks: list[dict[str, Any]] = []
+    for raw_block in value:
+        if not isinstance(raw_block, dict):
+            raise InvalidReaderSessionError("time_blocks contains invalid block")
+        try:
+            start_hour = int(raw_block.get("start_hour"))
+            end_hour = int(raw_block.get("end_hour"))
+            sessions_per_agent = int(raw_block.get("sessions_per_agent") or 1)
+        except (TypeError, ValueError) as exc:
+            raise InvalidReaderSessionError("time_blocks contains invalid hour") from exc
+
+        if start_hour < 0 or start_hour > 23:
+            raise InvalidReaderSessionError("time_blocks.start_hour must be between 0 and 23")
+        if end_hour < 1 or end_hour > 24:
+            raise InvalidReaderSessionError("time_blocks.end_hour must be between 1 and 24")
+        if end_hour <= start_hour:
+            raise InvalidReaderSessionError("time_blocks.end_hour must be greater than start_hour")
+        if sessions_per_agent < 1 or sessions_per_agent > 8:
+            raise InvalidReaderSessionError("time_blocks.sessions_per_agent must be between 1 and 8")
+
+        blocks.append(
+            {
+                "label": raw_block.get("label"),
+                "start_hour": start_hour,
+                "end_hour": end_hour,
+                "sessions_per_agent": sessions_per_agent,
+            }
+        )
+    return blocks
+
+
 def _active_hour_segments(active_hours: set[int]) -> list[tuple[int, int, int]]:
     if not active_hours:
         return []
@@ -1681,6 +1772,36 @@ def _schedule_jitter_minutes(
     raw = f"{ai_reader_agent_id}|{schedule_date.isoformat()}|{start_hour}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return int(digest[:8], 16) % 60
+
+
+def _time_block_offset_minutes(
+    *,
+    ai_reader_agent_id: int,
+    schedule_date: date,
+    start_hour: int,
+    end_hour: int,
+    block_index: int,
+    session_index: int,
+    sessions_per_agent: int,
+    duration_minutes: int,
+) -> int:
+    if duration_minutes <= 0:
+        raise InvalidReaderSessionError("time block duration must be positive")
+
+    raw = (
+        f"{ai_reader_agent_id}|{schedule_date.isoformat()}|"
+        f"{start_hour}|{end_hour}|{block_index}|{session_index}"
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    jitter_seed = int(digest[:8], 16)
+
+    if sessions_per_agent <= 1:
+        return jitter_seed % duration_minutes
+
+    slot_minutes = max(1, duration_minutes // sessions_per_agent)
+    slot_start = min(duration_minutes - 1, session_index * slot_minutes)
+    slot_capacity = max(1, min(slot_minutes, duration_minutes - slot_start))
+    return slot_start + (jitter_seed % slot_capacity)
 
 
 async def reserve_reader_llm_decision(
