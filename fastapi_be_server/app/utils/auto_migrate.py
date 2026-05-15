@@ -63,7 +63,7 @@ def _parse_statements(sql_content: str) -> list[str]:
     )
 
     statements = []
-    for part in sql_content.split(";"):
+    for part in _split_sql_statements(sql_content):
         lines = [line for line in part.strip().splitlines() if line.strip()]
         stmt = "\n".join(lines).strip()
         if not stmt:
@@ -72,6 +72,47 @@ def _parse_statements(sql_content: str) -> list[str]:
         if re.match(r"^USE\s+", stmt, re.IGNORECASE):
             continue
         statements.append(stmt)
+    return statements
+
+
+def _split_sql_statements(sql_content: str) -> list[str]:
+    statements: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+
+    while index < len(sql_content):
+        char = sql_content[index]
+
+        if quote is not None:
+            current.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                next_char = sql_content[index + 1] if index + 1 < len(sql_content) else ""
+                if next_char == quote:
+                    current.append(next_char)
+                    index += 1
+                else:
+                    quote = None
+            index += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            current.append(char)
+        elif char == ";":
+            statements.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+
+    if current:
+        statements.append("".join(current))
     return statements
 
 
