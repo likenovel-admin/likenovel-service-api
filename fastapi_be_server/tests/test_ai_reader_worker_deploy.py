@@ -37,6 +37,8 @@ def test_prod_run_script_replaces_and_starts_ai_reader_worker():
     run_script = PROJECT_ROOT / "dist" / "run_be.sh"
     content = run_script.read_text(encoding="utf-8")
 
+    assert "source .env" not in content
+    assert "load_env_file .env" in content
     assert "stop_pidfile_process()" in content
     assert "ai_reader_worker.pid" in content
     assert "ai_reader_worker_manual_*.pid" in content
@@ -44,3 +46,12 @@ def test_prod_run_script_replaces_and_starts_ai_reader_worker():
     assert "AI_READER_WORKER_ENABLED=Y nohup ./.venv/bin/python -u scripts/run_ai_reader_worker.py" in content
     assert "--worker-id \"ai-reader-prod-$(hostname)\"" in content
     assert "[ERROR] AI reader worker failed to start" in content
+
+
+def test_deploy_run_scripts_do_not_source_env_files():
+    for script_name in ("run_be.sh", "run_be.dev.sh"):
+        content = (PROJECT_ROOT / "dist" / script_name).read_text(encoding="utf-8")
+
+        assert "source .env" not in content
+        assert "load_env_file .env" in content
+        assert "while IFS= read -r line" in content

@@ -7,6 +7,39 @@ sudo chmod -R 700 /home/ln-admin/likenovel/api-dev
 
 cd /home/ln-admin/likenovel/api-dev
 
+load_env_file() {
+  local env_file="$1"
+  local line key value quote
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+
+    case "$line" in
+      ''|'#'*) continue ;;
+      export\ *=*) line="${line#export }" ;;
+      *=*)
+        key="${line%%=*}"
+        value="${line#*=}"
+
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          echo "[run_be.dev] ignore invalid env key: $key" >&2
+          continue
+        fi
+
+        quote="${value:0:1}"
+        if [[ "$quote" == '"' || "$quote" == "'" ]] && [[ "${value: -1}" == "$quote" ]]; then
+          value="${value:1:${#value}-2}"
+        fi
+
+        export "$key=$value"
+        ;;
+      *)
+        echo "[run_be.dev] ignore malformed env line: $line" >&2
+        ;;
+    esac
+  done < "$env_file"
+}
+
 # 최초 배포나 과거 배포본에는 pidfile이 없거나 stale일 수 있음
 if [ -f gunicorn.pid ] && kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
   kill -TERM "$(cat gunicorn.pid)"
@@ -33,9 +66,8 @@ pip3 install --upgrade pip
 pip3 install "$(ls -v app-*.whl | tail -n 1)"
 
 # .env를 시스템 환경변수로 export (const.py의 os.getenv가 읽을 수 있도록)
-set -a
-source .env
-set +a
+# SMTP_PASSWORD처럼 공백이 포함된 값이 있어 shell source를 쓰지 않는다.
+load_env_file .env
 
 gunicorn -c ./gconf.py
 deactivate
