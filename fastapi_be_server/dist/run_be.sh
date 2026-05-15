@@ -9,6 +9,32 @@ sudo chmod -R 700 /home/ln-admin/likenovel/api
 
 cd /home/ln-admin/likenovel/api
 
+stop_pidfile_process() {
+  local pidfile="$1"
+  if [ ! -f "$pidfile" ]; then
+    return
+  fi
+  local pid
+  pid="$(cat "$pidfile")"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return
+  fi
+  kill -TERM "$pid"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+    sleep 1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+for worker_pidfile in ai_reader_worker.pid ai_reader_worker_manual_*.pid; do
+  stop_pidfile_process "$worker_pidfile"
+done
+pkill -TERM -f "/home/ln-admin/likenovel/api/.venv/bin/python .*scripts/run_ai_reader_worker.py" || true
+sleep 3
+
 # 최초 배포나 과거 배포본에는 pidfile이 없거나 stale일 수 있음
 if [ -f gunicorn.pid ] && kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
   kill -TERM "$(cat gunicorn.pid)"
@@ -40,6 +66,23 @@ source .env
 set +a
 
 gunicorn -c ./gconf.py
+
+AI_READER_WORKER_LOG=./logs/data/ai_reader_worker.log
+AI_READER_WORKER_PID=./ai_reader_worker.pid
+AI_READER_WORKER_ENABLED=Y nohup ./.venv/bin/python -u scripts/run_ai_reader_worker.py \
+  --worker-id "ai-reader-prod-$(hostname)" \
+  --session-limit 10 \
+  --action-limit 50 \
+  --interval-seconds 5 \
+  >> "$AI_READER_WORKER_LOG" 2>&1 &
+echo $! > "$AI_READER_WORKER_PID"
+sleep 1
+if ! kill -0 "$(cat "$AI_READER_WORKER_PID")" 2>/dev/null; then
+  echo "[ERROR] AI reader worker failed to start"
+  tail -50 "$AI_READER_WORKER_LOG" || true
+  exit 1
+fi
+
 deactivate
 
 # 배치 파일 동기화: 배포된 batch/ → 크론이 참조하는 /home/ln-admin/likenovel/batch/

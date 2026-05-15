@@ -87,6 +87,7 @@ jobs:
           cp gconf.dev.py gconf.py
           mkdir -p scripts
           cp ../scripts/build_story_agent_context.py ./scripts/build_story_agent_context.py
+          cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py
 
           # *.whl, appspec.yml, run_be.sh, gconf.py, .env.production 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
           zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py .env.production init/ batch/ scripts/
