@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 async def set_ai_reader_worker_db_timezone(db) -> None:
-    await db.execute(text("set time_zone = '+09:00'"))
+    await db.execute(text("set time_zone = :tz"), {"tz": "+09:00"})
 
 
 async def ensure_reader_daily_schedules_for_worker(db) -> dict[str, int]:
