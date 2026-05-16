@@ -718,6 +718,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                     and role_type = 'cp'
                                 )
                                 select a.product_id
+                                    , a.episode_no
                                     , e.title
                                     , IF(e.thumbnail_file_id IS NULL, NULL, (SELECT w.file_path FROM tb_common_file q, tb_common_file_item w
                                         WHERE q.file_group_id = w.file_group_id AND q.use_yn = 'Y' AND w.use_yn = 'Y'
@@ -746,6 +747,20 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                     , f.prev_episode_id
                                     , f.next_episode_id
                                     , a.price_type
+                                    , (select p.price_type from tb_product p where p.product_id = a.product_id) as product_price_type
+                                    , coalesce((
+                                        select sacp.context_status
+                                        from tb_story_agent_context_product sacp
+                                        where sacp.product_id = a.product_id
+                                        limit 1
+                                    ), 'pending') as websochat_context_status
+                                    , e.max_episode as websochat_published_latest_episode_no
+                                    , coalesce((
+                                        select least(coalesce(sacp.ready_episode_count, 0), e.max_episode)
+                                        from tb_story_agent_context_product sacp
+                                        where sacp.product_id = a.product_id
+                                        limit 1
+                                    ), 0) as websochat_synced_latest_episode_no
                                     , a.open_yn
                                     , (select p.open_yn from tb_product p where p.product_id = a.product_id) as product_open_yn
                                     , (select p.author_id from tb_product p where p.product_id = a.product_id) as product_author_id
@@ -846,11 +861,27 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                         usage_id = None
 
                     is_private = episode_open_yn == "N"
+                    episode_no = int(db_rst[0].get("episode_no") or 0)
+                    product_price_type = db_rst[0].get("product_price_type")
+                    websochat_context_status = db_rst[0].get("websochat_context_status")
+                    websochat_published_latest_episode_no = int(
+                        db_rst[0].get("websochat_published_latest_episode_no") or 0
+                    )
+                    websochat_synced_latest_episode_no = int(
+                        db_rst[0].get("websochat_synced_latest_episode_no") or 0
+                    )
+                    websochat_eligible = (
+                        product_price_type == "free"
+                        and websochat_context_status == "ready"
+                        and episode_no > 0
+                        and websochat_synced_latest_episode_no >= episode_no
+                    )
 
                     res_data = {
                         "product_id": product_id,
                         "title": db_rst[0].get("title"),
                         "coverImagePath": db_rst[0].get("cover_image_path"),
+                        "episodeNo": episode_no,
                         "episodeTitle": db_rst[0].get("episode_title"),
                         "epubFilePath": epub_file_path,
                         "privateYn": "Y" if is_private else "N",
@@ -886,6 +917,11 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                         "nextEpisodeRentalRemaining": db_rst[0].get(
                             "next_rental_remaining"
                         ),
+                        "productPriceType": product_price_type,
+                        "websochatContextStatus": websochat_context_status,
+                        "websochatPublishedLatestEpisodeNo": websochat_published_latest_episode_no,
+                        "websochatSyncedLatestEpisodeNo": websochat_synced_latest_episode_no,
+                        "websochatEligible": websochat_eligible,
                     }
 
                     if usage_id is not None:
@@ -1061,6 +1097,20 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                     , c.prev_episode_id
                                     , c.next_episode_id
                                     , a.price_type
+                                    , (select p.price_type from tb_product p where p.product_id = a.product_id) as product_price_type
+                                    , coalesce((
+                                        select sacp.context_status
+                                        from tb_story_agent_context_product sacp
+                                        where sacp.product_id = a.product_id
+                                        limit 1
+                                    ), 'pending') as websochat_context_status
+                                    , b.max_episode as websochat_published_latest_episode_no
+                                    , coalesce((
+                                        select least(coalesce(sacp.ready_episode_count, 0), b.max_episode)
+                                        from tb_story_agent_context_product sacp
+                                        where sacp.product_id = a.product_id
+                                        limit 1
+                                    ), 0) as websochat_synced_latest_episode_no
                                     , (select price_type from tb_product_episode where episode_id = c.prev_episode_id) as prev_price_type
                                     , (select price_type from tb_product_episode where episode_id = c.next_episode_id) as next_price_type
                                 from tb_product_episode a
@@ -1080,6 +1130,23 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                         message=ErrorMessages.LOGIN_REQUIRED,
                     )
 
+                episode_no = int(db_rst[0].get("episode_no") or 0)
+                product_price_type = db_rst[0].get("product_price_type")
+                websochat_context_status = db_rst[0].get("websochat_context_status")
+                websochat_published_latest_episode_no = int(
+                    db_rst[0].get("websochat_published_latest_episode_no") or 0
+                )
+                websochat_synced_latest_episode_no = int(
+                    db_rst[0].get("websochat_synced_latest_episode_no") or 0
+                )
+                websochat_eligible = (
+                    product_price_type == "free"
+                    and websochat_context_status == "ready"
+                    and episode_no > 0
+                    and episode_no <= 5
+                    and websochat_synced_latest_episode_no >= episode_no
+                )
+
                 epub_file_path = comm_service.make_r2_presigned_url(
                     type="download",
                     bucket_name=settings.R2_SC_EPUB_BUCKET,
@@ -1090,6 +1157,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                     "product_id": db_rst[0].get("product_id"),
                     "title": db_rst[0].get("title"),
                     "coverImagePath": db_rst[0].get("cover_image_path"),
+                    "episodeNo": episode_no,
                     "episodeTitle": db_rst[0].get("episode_title"),
                     "epubFilePath": epub_file_path,
                     "bingeWatchYn": "N",  # TODO: cleaned garbled comment (encoding issue).
@@ -1117,6 +1185,11 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                     "nextEpisodePriceType": db_rst[0].get("next_price_type"),
                     "previousEpisodeRentalRemaining": None,
                     "nextEpisodeRentalRemaining": None,
+                    "productPriceType": product_price_type,
+                    "websochatContextStatus": websochat_context_status,
+                    "websochatPublishedLatestEpisodeNo": websochat_published_latest_episode_no,
+                    "websochatSyncedLatestEpisodeNo": websochat_synced_latest_episode_no,
+                    "websochatEligible": websochat_eligible,
                 }
 
                 # TODO: cleaned garbled comment (encoding issue).
