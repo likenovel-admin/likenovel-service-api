@@ -5386,11 +5386,11 @@ def refresh_product_context_status(cur, product_id: int, total_episode_count: in
             updated_id
         ) VALUES (%s, %s, %s, %s, NOW(), NULL, %s, %s)
         ON DUPLICATE KEY UPDATE
-            context_status = VALUES(context_status),
+            context_status = IF(context_status = 'disabled', context_status, VALUES(context_status)),
             total_episode_count = VALUES(total_episode_count),
             ready_episode_count = VALUES(ready_episode_count),
             last_built_at = VALUES(last_built_at),
-            last_error_message = NULL,
+            last_error_message = IF(context_status = 'disabled', last_error_message, NULL),
             updated_id = VALUES(updated_id)
         """,
         (
@@ -5485,10 +5485,10 @@ def mark_product_context_failed(*, product_id: int, total_episode_count: int, er
                     updated_id
                 ) VALUES (%s, 'failed', %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    context_status = 'failed',
+                    context_status = IF(context_status = 'disabled', context_status, 'failed'),
                     total_episode_count = VALUES(total_episode_count),
                     ready_episode_count = VALUES(ready_episode_count),
-                    last_error_message = VALUES(last_error_message),
+                    last_error_message = IF(context_status = 'disabled', last_error_message, VALUES(last_error_message)),
                     updated_id = VALUES(updated_id)
                 """,
                 (

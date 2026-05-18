@@ -53,6 +53,9 @@ class PostProductsReqBody(ProductsBase):
     product_type: Optional[str] = Field(
         default=None, examples=["normal"], description="연재 유형(normal: 일반연재, null: 자유연재)"
     )
+    websochat_enabled_yn: Optional[str] = Field(
+        default="Y", examples=["Y"], description="웹소챗 활성화 여부"
+    )
     series_regular_price: Optional[int] = Field(
         default=None, examples=[0], description="연재 가격"
     )
@@ -104,6 +107,9 @@ class PutProductsProductIdReqBody(ProductsBase):
     cp_contract_yn: str = Field(examples=["N"], description="계약여부")
     cp_nickname: Optional[str] = Field(
         default=None, examples=["likenovelcp"], description="담당 CP 기본 닉네임"
+    )
+    websochat_enabled_yn: Optional[str] = Field(
+        default=None, examples=["Y"], description="웹소챗 활성화 여부"
     )
     paid_setting_date: Optional[datetime] = Field(
         default=None,

@@ -94,7 +94,6 @@ from app.services.websochat.websochat_qa_executor import (
 )
 from app.services.websochat.websochat_qa_renderer import build_websochat_recent_context_message
 from app.services.websochat.websochat_rp_renderer import (
-    generate_websochat_rp_reply_with_claude,
     generate_websochat_rp_reply_with_gemini,
 )
 from app.services.websochat.websochat_renderers import generate_websochat_vs_comparison
@@ -112,8 +111,11 @@ from app.services.websochat.websochat_scope_resolver import (
     _resolve_websochat_scope_read_episode_to,
 )
 from app.services.websochat.websochat_stream import emit_websochat_stream_text_if_needed
+from app.services.websochat.websochat_llm import (
+    call_websochat_gemini,
+    to_websochat_gemini_contents,
+)
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
-from app.services.ai.ai_chat_service import _call_claude_messages, _extract_text, _extract_tool_use_blocks, _to_json_safe
 from app.services.common.comm_service import get_user_from_kc
 from app.utils.common import handle_exceptions
 from app.utils.query import get_file_path_sub_query
@@ -122,15 +124,32 @@ from app.utils.time import get_full_age
 WEBSOCHAT_DEFAULT_TITLE = "새 대화"
 WEBSOCHAT_SESSION_LOCK_TIMEOUT_SECONDS = 0
 WEBSOCHAT_SESSION_TTL_DAYS = 30
-WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT = 2
+WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT = 3
 WEBSOCHAT_NONCANONICAL_NEXT_EPISODE_MARKER = "[[websochat:noncanonical:next_episode_write]]\n"
 WEBSOCHAT_MESSAGE_CASH_COST = 20
 WEBSOCHAT_NEXT_EPISODE_WRITE_CASH_COST = 30
 WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_CANDIDATE_LIMIT = 12
 WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_MIN_RATIO = 0.34
 WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS = 220
-WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME = "submit_character_resolution"
 WEBSOCHAT_ACTIVE_CHARACTER_SINGLE_CANDIDATE_FALLBACK_MIN_RATIO = 0.5
+
+
+async def _call_websochat_gemini_json(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> dict[str, Any]:
+    raw_reply = await call_websochat_gemini(
+        system_prompt=system_prompt,
+        messages=to_websochat_gemini_contents(
+            [{"role": "user", "content": user_prompt}]
+        ),
+        max_tokens=max_tokens,
+        temperature=0.1,
+    )
+    parsed = _extract_websochat_json_object(raw_reply)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _resolve_websochat_message_cash_cost(
@@ -163,6 +182,7 @@ def _build_websochat_billing_status_payload(
 
 WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE = "비공개된 작품과는 더이상 이야기하실 수 없습니다."
 WEBSOCHAT_CONTEXT_PENDING_MESSAGE = "이 작품은 아직 대화 준비 중입니다."
+WEBSOCHAT_CONTEXT_DISABLED_MESSAGE = "현재 웹소챗이 비활성화된 작품입니다."
 WEBSOCHAT_PLACEHOLDER_TEMPLATE = (
     "[{title}] 기준으로 관련 회차와 원문 일부를 먼저 찾았습니다.\n"
     "{context_block}\n\n"
@@ -200,6 +220,24 @@ def _resolve_websochat_synced_latest_episode_no(product_row: dict[str, Any] | No
     if latest_episode_no <= 0:
         return 0
     return min(synced_latest_episode_no, latest_episode_no)
+
+
+def _assert_websochat_product_context_available(product_row: dict[str, Any]) -> None:
+    context_status = product_row.get("contextStatus")
+    if context_status != "ready":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=(
+                WEBSOCHAT_CONTEXT_DISABLED_MESSAGE
+                if context_status == "disabled"
+                else WEBSOCHAT_CONTEXT_PENDING_MESSAGE
+            ),
+        )
+    if _resolve_websochat_synced_latest_episode_no(product_row) <= 0:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=WEBSOCHAT_CONTEXT_PENDING_MESSAGE,
+        )
 
 
 def _build_websochat_next_episode_write_pending_message(
@@ -460,13 +498,6 @@ def _build_websochat_starter(
             "qaActionKey": None,
             "cashCost": None,
         },
-        {
-            "label": "이상형월드컵",
-            "prompt": f"{prompt_prefix}이 작품으로 이상형월드컵을 시작해줘",
-            "modeKey": "ideal_worldcup",
-            "qaActionKey": None,
-            "cashCost": None,
-        },
     ]
     starter_actions = (
         list(concierge_payload.get("actions") or [])
@@ -496,6 +527,10 @@ def _build_websochat_read_scope_required_reply() -> str:
     )
 
 
+def _build_websochat_read_scope_fallback_prefix() -> str:
+    return "읽은 범위를 정확히 못 잡아서 1화 기준으로 시작할게요. 스포일러 없이 순차적으로 이어갈게요.\n\n"
+
+
 def _infer_websochat_legacy_pending_qa_action_key(
     *,
     session_memory: dict[str, Any],
@@ -513,6 +548,29 @@ def _infer_websochat_legacy_pending_qa_action_key(
     if normalized_title == "다음회차 써줘":
         return "next_episode_write"
     return None
+
+
+def _resolve_websochat_next_pending_qa_action_key(
+    *,
+    route_mode: str | None,
+    requested_qa_action_key: str | None,
+    effective_qa_action_key: str | None,
+    current_pending_qa_action_key: str | None,
+) -> str | None:
+    normalized_route_mode = str(route_mode or "").strip().lower()
+    requested_action_key = str(requested_qa_action_key or "").strip().lower() or None
+    effective_action_key = str(effective_qa_action_key or "").strip().lower() or None
+    pending_action_key = str(current_pending_qa_action_key or "").strip().lower() or None
+    if pending_action_key not in {"predict", "next_episode_write"}:
+        pending_action_key = None
+
+    if normalized_route_mode == "guard:read_scope_required":
+        if requested_action_key in {"predict", "next_episode_write"}:
+            return requested_action_key
+        return pending_action_key
+    if effective_action_key in {"predict", "next_episode_write"}:
+        return None
+    return pending_action_key
 
 
 def _build_websochat_qa_mode_entry_reply(
@@ -725,33 +783,9 @@ async def _resolve_websochat_active_character_with_model(
     raw_value: str,
     candidates: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    if not settings.ANTHROPIC_API_KEY or not candidates:
+    if not settings.GEMINI_API_KEY or not candidates:
         return None
 
-    tool_schema = [
-        {
-            "name": WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME,
-            "description": "사용자 입력과 가장 가까운 캐릭터 scope_key 하나를 고르거나, 없으면 빈 문자열을 반환한다.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "scope_key": {
-                        "type": "string",
-                        "description": "선택한 scope_key. 적합한 후보가 없으면 빈 문자열.",
-                    },
-                    "confidence": {
-                        "type": "number",
-                        "description": "0.0~1.0 사이 확신도.",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "판단 근거 한 줄.",
-                    },
-                },
-                "required": ["scope_key", "confidence", "reason"],
-            },
-        }
-    ]
     candidate_payload = [
         {
             "scope_key": str(item.get("scopeKey") or "").strip(),
@@ -766,41 +800,25 @@ async def _resolve_websochat_active_character_with_model(
         return None
 
     try:
-        response = await _call_claude_messages(
+        tool_input = await _call_websochat_gemini_json(
             system_prompt="\n\n".join(
                 [
                     "너는 웹소챗 인물명 해석기다.",
-                    "사용자 입력이 후보 캐릭터 중 누구를 뜻하는지 판단하고 tool input만 반환하라.",
+                    "사용자 입력이 후보 캐릭터 중 누구를 뜻하는지 판단하고 JSON만 반환하라.",
                     "하드코딩 추측이나 작품 밖 인물 상상은 금지한다.",
                     "오타, 띄어쓰기 차이, 부분 이름, 별칭은 허용한다.",
                     "후보 중 하나와 충분히 가깝지 않으면 scope_key는 빈 문자열로 반환하라.",
                     "confidence가 0.65 미만이면 scope_key를 빈 문자열로 두어라.",
+                    'JSON 스키마: {"scope_key":"", "confidence":0.0, "reason":"판단 근거 한 줄"}',
                 ]
             ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"사용자 입력: {raw_value}\n\n"
-                        f"후보 목록(JSON): {json.dumps(candidate_payload, ensure_ascii=False)}"
-                    ),
-                }
-            ],
-            tools=tool_schema,
-            tool_choice={"type": "tool", "name": WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME},
+            user_prompt=(
+                f"사용자 입력: {raw_value}\n\n"
+                f"후보 목록(JSON): {json.dumps(candidate_payload, ensure_ascii=False)}\n\n"
+                "JSON만 반환해."
+            ),
             max_tokens=WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS,
         )
-        content = response.get("content") or []
-        tool_uses = _extract_tool_use_blocks(content)
-        tool_input = None
-        for block in reversed(tool_uses):
-            if str(block.get("name") or "").strip() == WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_TOOL_NAME and isinstance(block.get("input"), dict):
-                tool_input = dict(block.get("input") or {})
-                break
-        if tool_input is None:
-            tool_input = _extract_websochat_json_object(_extract_text(content))
-        if not isinstance(tool_input, dict):
-            return None
         raw_scope_key = str(tool_input.get("scope_key") or "").strip()
         try:
             confidence = float(tool_input.get("confidence") or 0.0)
@@ -1035,6 +1053,8 @@ async def _get_websochat_product_session_state(
             or int(product.get("latestEpisodeNo") or 0) <= 0
         ):
             unavailable_message = WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE
+        elif product.get("contextStatus") == "disabled":
+            unavailable_message = WEBSOCHAT_CONTEXT_DISABLED_MESSAGE
         elif product.get("contextStatus") != "ready":
             unavailable_message = WEBSOCHAT_CONTEXT_PENDING_MESSAGE
         elif adult_yn != "Y" and product.get("ratingsCode") != "all":
@@ -4414,13 +4434,11 @@ async def _resolve_websochat_reference(
         context_parts.append(summary_context_message)
     context_parts.append(f"현재 질문: {user_prompt}")
 
-    response = await _call_claude_messages(
+    parsed = await _call_websochat_gemini_json(
         system_prompt="\n\n".join(context_parts),
-        messages=[{"role": "user", "content": "JSON만 반환해."}],
+        user_prompt="JSON만 반환해.",
         max_tokens=WEBSOCHAT_REFERENCE_RESOLUTION_MAX_TOKENS,
     )
-    content = response.get("content") or []
-    parsed = _extract_websochat_json_object(_extract_text(content))
     if not parsed:
         return None
 
@@ -4568,17 +4586,11 @@ async def _resolve_websochat_qa_corrections(
     if recent_context_message:
         system_prompt_parts.append(recent_context_message)
 
-    response = await _call_claude_messages(
+    parsed = await _call_websochat_gemini_json(
         system_prompt="\n\n".join(system_prompt_parts),
-        messages=[
-            {
-                "role": "user",
-                "content": f"현재 사용자 발화: {user_prompt}\n\nJSON만 반환해.",
-            }
-        ],
+        user_prompt=f"현재 사용자 발화: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_QA_CORRECTION_MAX_TOKENS,
     )
-    parsed = _extract_websochat_json_object(_extract_text(response.get("content") or [])) or {}
     raw_has_corrections = parsed.get("has_corrections")
     if isinstance(raw_has_corrections, bool):
         has_corrections = raw_has_corrections
@@ -4639,17 +4651,11 @@ async def _resolve_websochat_intent(
     if recent_context_message:
         system_prompt_parts.append(recent_context_message)
 
-    response = await _call_claude_messages(
+    parsed = await _call_websochat_gemini_json(
         system_prompt="\n\n".join(system_prompt_parts),
-        messages=[
-            {
-                "role": "user",
-                "content": f"질문: {user_prompt}\n\nJSON만 반환해.",
-            }
-        ],
+        user_prompt=f"질문: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_INTENT_MAX_TOKENS,
     )
-    parsed = _extract_websochat_json_object(_extract_text(response.get("content") or [])) or {}
     intent = str(parsed.get("intent") or "").strip().lower()
     if intent not in WEBSOCHAT_ALLOWED_INTENTS:
         intent = "factual"
@@ -4691,17 +4697,11 @@ async def _resolve_websochat_rp_recall_need(
     if recent_context_message:
         system_prompt_parts.append(recent_context_message)
 
-    response = await _call_claude_messages(
+    parsed = await _call_websochat_gemini_json(
         system_prompt="\n\n".join(system_prompt_parts),
-        messages=[
-            {
-                "role": "user",
-                "content": f"질문: {user_prompt}\n\nJSON만 반환해.",
-            }
-        ],
+        user_prompt=f"질문: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_RP_RECALL_DECISION_MAX_TOKENS,
     )
-    parsed = _extract_websochat_json_object(_extract_text(response.get("content") or [])) or {}
     raw_needs_exact_recall = parsed.get("needs_exact_recall")
     if isinstance(raw_needs_exact_recall, bool):
         needs_exact_recall = raw_needs_exact_recall
@@ -4898,6 +4898,29 @@ async def _generate_websochat_reply(
             normalized_memory,
         )
 
+    scope_fallback_notice = False
+    if not int(normalized_memory.get("read_episode_to") or 0):
+        if normalized_memory.get("read_scope_prompted"):
+            normalized_memory["read_episode_to"] = 1
+            normalized_memory["read_scope_state"] = "known"
+            normalized_memory["read_scope_source"] = "unknown"
+            normalized_memory["read_scope_prompted"] = True
+            scope_state = "known"
+            scope_fallback_notice = True
+        else:
+            prompted_memory = dict(normalized_memory)
+            prompted_memory["read_scope_prompted"] = True
+            prompted_memory["read_scope_state"] = "unknown"
+            prompted_memory["read_scope_source"] = "unknown"
+            return (
+                _build_websochat_read_scope_required_reply(),
+                "guard",
+                "guard:read_scope_required",
+                False,
+                "read_scope_required",
+                prompted_memory,
+            )
+
     if not int(normalized_memory.get("read_episode_to") or 0):
         return (
             _build_websochat_read_scope_required_reply(),
@@ -4963,10 +4986,35 @@ async def _generate_websochat_reply(
             qa_recent_notes=list(normalized_memory.get("qa_recent_notes") or []),
             qa_corrections=list(normalized_memory.get("qa_corrections") or []),
         ),
+        return_exceptions=True,
     )
+    if isinstance(intent_result, Exception):
+        logger.warning(
+            "websochat intent_resolution_failed fallback=factual prompt_preview=%r",
+            _build_websochat_prompt_preview(user_prompt),
+            exc_info=(
+                type(intent_result),
+                intent_result,
+                intent_result.__traceback__,
+            ),
+        )
+        intent_result = ("factual", False, "general")
+    if isinstance(detected_qa_corrections, Exception):
+        logger.warning(
+            "websochat qa_corrections_resolution_failed fallback=empty prompt_preview=%r",
+            _build_websochat_prompt_preview(user_prompt),
+            exc_info=(
+                type(detected_qa_corrections),
+                detected_qa_corrections,
+                detected_qa_corrections.__traceback__,
+            ),
+        )
+        detected_qa_corrections = []
     intent, needs_creative, routed_mode = intent_result
     qa_subtype = resolve_websochat_qa_subtype(user_prompt)
     route_session_memory: dict[str, Any] | None = None
+    if scope_fallback_notice:
+        route_session_memory = normalized_memory
     if detected_qa_corrections:
         normalized_memory = _merge_websochat_qa_corrections(
             normalized_memory,
@@ -5043,7 +5091,10 @@ async def _generate_websochat_reply(
     if result.get("referenced_episode_nos"):
         route_session_memory = dict(route_session_memory or normalized_memory)
         route_session_memory[WEBSOCHAT_QA_EPISODE_REF_MEMORY_KEY] = list(result.get("referenced_episode_nos") or [])
-    return result["reply"], result["model_used"], result["route_mode"], result["fallback_used"], result["intent"], route_session_memory
+    reply = result["reply"]
+    if scope_fallback_notice:
+        reply = f"{_build_websochat_read_scope_fallback_prefix()}{reply}"
+    return reply, result["model_used"], result["route_mode"], result["fallback_used"], result["intent"], route_session_memory
 
 
 
@@ -6009,11 +6060,7 @@ async def create_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=product_state.get("unavailableMessage") or ErrorMessages.NOT_FOUND_PRODUCT,
         )
-    if product_row.get("contextStatus") != "ready":
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message=WEBSOCHAT_CONTEXT_PENDING_MESSAGE,
-        )
+    _assert_websochat_product_context_available(product_row)
 
     title = (req_body.title or WEBSOCHAT_DEFAULT_TITLE).strip()[:120]
     resolution = await _resolve_websochat_active_character_resolution(
@@ -6423,11 +6470,7 @@ async def post_message(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=product_state.get("unavailableMessage") or WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE,
         )
-    if product_row.get("contextStatus") != "ready":
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message=WEBSOCHAT_CONTEXT_PENDING_MESSAGE,
-        )
+    _assert_websochat_product_context_available(product_row)
     synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_row)
     latest_episode_no = max(int(product_row.get("latestEpisodeNo") or 0), 0)
     requested_next_episode_write = _is_websochat_noncanonical_action(
@@ -6805,10 +6848,12 @@ async def post_message(
                 if int(episode_no or 0) > 0
             ]
             next_session_memory = _normalize_websochat_session_memory(route_session_memory)
-        if route_mode == "guard:read_scope_required" and qa_action_key in {"predict", "next_episode_write"}:
-            next_session_memory["pending_qa_action_key"] = qa_action_key
-        elif route_mode != "guard:read_scope_required":
-            next_session_memory["pending_qa_action_key"] = None
+        next_session_memory["pending_qa_action_key"] = _resolve_websochat_next_pending_qa_action_key(
+            route_mode=route_mode,
+            requested_qa_action_key=qa_action_key,
+            effective_qa_action_key=effective_qa_action_key,
+            current_pending_qa_action_key=pending_qa_action_key,
+        )
         if route_mode not in {"qa:starter", "rp:starter"} and not _is_websochat_noncanonical_action(effective_qa_action_key):
             next_session_memory = _update_websochat_session_memory_after_reply(
                 next_session_memory,

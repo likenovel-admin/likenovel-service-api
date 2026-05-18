@@ -20,6 +20,7 @@ from app.utils.query import (
     get_file_path_sub_query,
     get_badge_image_sub_query,
 )
+from app.utils.rich_text_sanitizer import sanitize_rich_text_html
 
 logger = logging.getLogger("product_review_app")  # 커스텀 로거 생성
 
@@ -342,6 +343,10 @@ async def post_product_review(
             message=ErrorMessages.LOGIN_REQUIRED,
         )
 
+    req_body = req_body.model_copy(
+        update={"review_text": sanitize_rich_text_html(req_body.review_text)}
+    )
+
     columns, values, params = build_insert_query(
         req_body,
         required_fields=["product_id", "user_id", "review_title", "review_text"],
@@ -381,6 +386,11 @@ async def put_product_review(
         raise CustomResponseException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
+    if req_body.review_text is not None:
+        req_body = req_body.model_copy(
+            update={"review_text": sanitize_rich_text_html(req_body.review_text)}
         )
 
     set_clause, params = build_update_query(
