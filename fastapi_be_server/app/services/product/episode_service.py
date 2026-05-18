@@ -21,6 +21,7 @@ from app.exceptions import CustomResponseException
 from app.rdb import likenovel_db_session
 from app.utils.time import convert_to_kor_time
 from app.utils.query import get_file_path_sub_query
+from app.utils.rich_text_sanitizer import sanitize_rich_text_html
 import app.services.common.comm_service as comm_service
 import app.schemas.episode as episode_schema
 import app.services.common.statistics_service as statistics_service
@@ -1783,13 +1784,15 @@ async def post_episodes_products_product_id(
                         message=ErrorMessages.FREE_PRODUCT_CANNOT_CREATE_PAID_EPISODE,
                     )
 
+                safe_content = sanitize_rich_text_html(req_body.content)
+
                 # TODO: cleaned garbled comment (encoding issue).
                 try:
-                    soup = BeautifulSoup(req_body.content, "html.parser")
+                    soup = BeautifulSoup(safe_content, "html.parser")
                     text_content = soup.get_text(separator=" ", strip=True)  # TODO: cleaned garbled comment (encoding issue).
                 except Exception:
                     # TODO: cleaned garbled comment (encoding issue).
-                    text_content = req_body.content
+                    text_content = safe_content
 
                 if len(text_content) > 20000:
                     raise CustomResponseException(
@@ -1874,7 +1877,7 @@ async def post_episodes_products_product_id(
                             "price_type": price_type,
                             "episode_title": req_body.title,
                             "episode_text_count": len(text_content),
-                            "episode_content": req_body.content,
+                            "episode_content": safe_content,
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,
@@ -1930,7 +1933,7 @@ async def post_episodes_products_product_id(
                             "episode_no": next_episode_no,
                             "episode_title": req_body.title,
                             "episode_text_count": len(text_content),
-                            "episode_content": req_body.content,
+                            "episode_content": safe_content,
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,
@@ -4123,13 +4126,15 @@ async def put_episodes_episode_id(
                             message=ErrorMessages.INVALID_EPISODE_INFO,
                         )
 
+                safe_content = sanitize_rich_text_html(req_body.content)
+
                 # TODO: cleaned garbled comment (encoding issue).
                 try:
-                    soup = BeautifulSoup(req_body.content, "html.parser")
+                    soup = BeautifulSoup(safe_content, "html.parser")
                     text_content = soup.get_text(separator=" ", strip=True)  # TODO: cleaned garbled comment (encoding issue).
                 except Exception:
                     # TODO: cleaned garbled comment (encoding issue).
-                    text_content = req_body.content
+                    text_content = safe_content
 
                 if len(text_content) > 20000:
                     raise CustomResponseException(
@@ -4176,7 +4181,7 @@ async def put_episodes_episode_id(
                             "episode_id": episode_id_to_int,
                             "episode_title": req_body.title,
                             "episode_text_count": len(text_content),
-                            "episode_content": req_body.content,
+                            "episode_content": safe_content,
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,
@@ -4212,7 +4217,7 @@ async def put_episodes_episode_id(
                             "price_type": price_type,
                             "episode_title": req_body.title,
                             "episode_text_count": len(text_content),
-                            "episode_content": req_body.content,
+                            "episode_content": safe_content,
                             "author_comment": req_body.author_comment,
                             "comment_open_yn": req_body.comment_open_yn,
                             "evaluation_open_yn": req_body.evaluation_open_yn,

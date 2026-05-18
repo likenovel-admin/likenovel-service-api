@@ -52,6 +52,89 @@ MAIN_RULE_SLOT_DEFINITIONS = [
     },
 ]
 
+WEBSOCHAT_CONTEXT_DISABLED_STATUS = "disabled"
+
+
+def _normalize_websochat_enabled_yn(value: str | None) -> str:
+    normalized = (value or "Y").upper()
+    if normalized not in ("Y", "N"):
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_INFO,
+        )
+    return normalized
+
+
+def _resolve_reenabled_websochat_context_status(
+    *,
+    ready_episode_count: int | None,
+    total_episode_count: int | None,
+) -> str:
+    ready_count = max(int(ready_episode_count or 0), 0)
+    total_count = max(int(total_episode_count or 0), 0)
+    if ready_count > 0 and total_count > 0 and ready_count >= total_count:
+        return "ready"
+    return "pending"
+
+
+async def _sync_websochat_context_enabled_state(
+    *,
+    product_id: int,
+    requested_enabled_yn: str | None,
+    db: AsyncSession,
+    current_context_status: str | None = None,
+    current_total_episode_count: int | None = None,
+    current_ready_episode_count: int | None = None,
+) -> None:
+    enabled_yn = _normalize_websochat_enabled_yn(requested_enabled_yn)
+    current_status = current_context_status or "pending"
+
+    if enabled_yn == "Y" and current_status != WEBSOCHAT_CONTEXT_DISABLED_STATUS:
+        return
+
+    if enabled_yn == "N":
+        next_status = WEBSOCHAT_CONTEXT_DISABLED_STATUS
+    else:
+        next_status = _resolve_reenabled_websochat_context_status(
+            ready_episode_count=current_ready_episode_count,
+            total_episode_count=current_total_episode_count,
+        )
+
+    query = text("""
+        INSERT INTO tb_story_agent_context_product (
+            product_id,
+            context_status,
+            total_episode_count,
+            ready_episode_count,
+            last_error_message,
+            created_id,
+            updated_id
+        ) VALUES (
+            :product_id,
+            :context_status,
+            COALESCE(:total_episode_count, 0),
+            COALESCE(:ready_episode_count, 0),
+            NULL,
+            :created_id,
+            :updated_id
+        )
+        ON DUPLICATE KEY UPDATE
+            context_status = VALUES(context_status),
+            last_error_message = NULL,
+            updated_id = VALUES(updated_id)
+    """)
+    await db.execute(
+        query,
+        {
+            "product_id": product_id,
+            "context_status": next_status,
+            "total_episode_count": current_total_episode_count,
+            "ready_episode_count": current_ready_episode_count,
+            "created_id": settings.DB_DML_DEFAULT_ID,
+            "updated_id": settings.DB_DML_DEFAULT_ID,
+        },
+    )
+
 
 async def _resolve_current_user_role(kc_user_id: str, db: AsyncSession) -> str:
     """
@@ -2547,6 +2630,13 @@ async def get_products_product_id_info(
                                     , a.paid_episode_no
                                     , a.price_type
                                     , a.product_type
+                                    , case when coalesce((
+                                        select sacp.context_status
+                                          from tb_story_agent_context_product sacp
+                                         where sacp.product_id = a.product_id
+                                         limit 1
+                                      ), 'pending') = 'disabled'
+                                      then 'N' else 'Y' end as websochat_enabled_yn
                                     , (
                                         select ppa.status_code
                                           from tb_product_paid_apply ppa
@@ -2609,6 +2699,7 @@ async def get_products_product_id_info(
                     "paidApplyStatus": db_rst[0].get("paid_apply_status"),
                     "paidApprovedYn": db_rst[0].get("paid_approved_yn"),
                     "productType": db_rst[0].get("product_type"),
+                    "websochatEnabledYn": db_rst[0].get("websochat_enabled_yn"),
                 }
         except CustomResponseException as e:
             logger.error(e)
@@ -2656,7 +2747,7 @@ async def get_products_validate_cp_nickname(
         )
 
     current_user_role = await _resolve_current_user_role(kc_user_id, db)
-    if current_user_role != "author":
+    if current_user_role not in ("author", "admin", "CP"):
         raise CustomResponseException(
             status_code=status.HTTP_403_FORBIDDEN,
             message=ErrorMessages.FORBIDDEN,
@@ -2938,6 +3029,12 @@ async def post_products(
                 new_product_id = result.scalar()
                 res_data = {"product_id": new_product_id}
 
+                await _sync_websochat_context_enabled_state(
+                    product_id=int(new_product_id),
+                    requested_enabled_yn=req_body.websochat_enabled_yn,
+                    db=db,
+                )
+
                 # tb_product_trend_index ins
                 query = text("""
                                  insert into tb_product_trend_index (product_id, created_id, updated_id)
@@ -3133,6 +3230,19 @@ async def put_products_product_id(
                 current_paid_apply_status = current_product.get("paid_apply_status")
                 current_price_type = current_product.get("price_type")
                 current_story_agent_setting_text = current_product.get("story_agent_setting_text")
+                context_query = text("""
+                    select context_status
+                         , total_episode_count
+                         , ready_episode_count
+                      from tb_story_agent_context_product
+                     where product_id = :product_id
+                     limit 1
+                     for update
+                """)
+                context_result = await db.execute(
+                    context_query, {"product_id": product_id_to_int}
+                )
+                current_websochat_context = context_result.mappings().one_or_none()
                 fields_set = getattr(req_body, "model_fields_set", set()) or set()
                 blind_yn_in_request = "blind_yn" in fields_set
                 requested_blind_yn = (
@@ -3532,6 +3642,28 @@ async def put_products_product_id(
                             status_code=status.HTTP_403_FORBIDDEN,
                             message=ErrorMessages.FORBIDDEN,
                         )
+
+                if "websochat_enabled_yn" in fields_set:
+                    await _sync_websochat_context_enabled_state(
+                        product_id=product_id_to_int,
+                        requested_enabled_yn=req_body.websochat_enabled_yn,
+                        db=db,
+                        current_context_status=(
+                            current_websochat_context.get("context_status")
+                            if current_websochat_context
+                            else None
+                        ),
+                        current_total_episode_count=(
+                            current_websochat_context.get("total_episode_count")
+                            if current_websochat_context
+                            else None
+                        ),
+                        current_ready_episode_count=(
+                            current_websochat_context.get("ready_episode_count")
+                            if current_websochat_context
+                            else None
+                        ),
+                    )
 
                 # tb_mapped_product_keyword upd
                 query = text("""

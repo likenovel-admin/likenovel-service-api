@@ -239,7 +239,7 @@ class Settings(BaseSettings):
         "WEBSOCHAT_GEMINI_MODEL",
         os.getenv(
             "STORY_AGENT_GEMINI_MODEL",
-            os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"),
+            os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"),
         ),
     )
     STORY_AGENT_GEMINI_MODEL: str = WEBSOCHAT_GEMINI_MODEL
