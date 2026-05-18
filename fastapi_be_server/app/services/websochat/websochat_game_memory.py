@@ -45,6 +45,14 @@ def _normalize_websochat_string_list(raw_value: Any, *, limit: int = 20) -> list
     return items
 
 
+def _normalize_websochat_bool(raw_value: Any) -> bool:
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, str):
+        return raw_value.strip().lower() in {"1", "true", "y", "yes", "on"}
+    return bool(raw_value)
+
+
 def _normalize_websochat_qa_corrections(raw_value: Any) -> list[dict[str, str]]:
     normalized_items: list[dict[str, str]] = []
     seen_keys: set[tuple[str, str, str]] = set()
@@ -222,6 +230,7 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         read_episode_to = max(int(parsed.get("read_episode_to") or 0), 0) or None
     except Exception:
         read_episode_to = None
+    read_scope_prompted = _normalize_websochat_bool(parsed.get("read_scope_prompted"))
     read_scope_state = str(parsed.get("read_scope_state") or "").strip().lower() or None
     if read_scope_state not in WEBSOCHAT_ALLOWED_READ_SCOPE_STATES:
         read_scope_state = "known" if read_episode_to else "unknown"
@@ -279,6 +288,7 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
     return {
         "active_mode": active_mode,
         "read_episode_to": read_episode_to,
+        "read_scope_prompted": read_scope_prompted,
         "read_scope_state": read_scope_state,
         "read_scope_source": read_scope_source,
         "active_character": active_character,
@@ -482,10 +492,11 @@ def _serialize_websochat_session_memory(session_memory: dict[str, Any]) -> str |
     has_pending_rp_state = bool(normalized.get("pending_rp_character_selection"))
     has_game_state = bool(normalized.get("game_context", {}).get("mode"))
     has_scope_state = bool(int(normalized.get("read_episode_to") or 0))
+    has_scope_prompted = bool(normalized.get("read_scope_prompted"))
     has_non_read_scope_state = normalized.get("read_scope_state") == "none"
     has_pending_qa_action = bool(normalized.get("pending_qa_action_key"))
     has_qa_memory = bool(normalized.get("qa_recent_notes"))
     has_qa_corrections = bool(normalized.get("qa_corrections"))
-    if not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_non_read_scope_state and not has_pending_qa_action and not has_qa_memory and not has_qa_corrections:
+    if not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_scope_prompted and not has_non_read_scope_state and not has_pending_qa_action and not has_qa_memory and not has_qa_corrections:
         return None
     return json.dumps(normalized, ensure_ascii=False)

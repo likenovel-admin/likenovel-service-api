@@ -160,6 +160,7 @@ LEFT JOIN tb_story_agent_context_product sacp
   ON sacp.product_id = p.product_id
 WHERE p.price_type = 'free'
   AND p.open_yn = 'Y'
+  AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
 GROUP BY
   p.product_id,
   p.title,

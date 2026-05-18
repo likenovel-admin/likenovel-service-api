@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.const import settings
-from app.services.ai.ai_chat_service import _call_claude_messages, _extract_text
 from app.services.websochat.websochat_game_memory import (
     WEBSOCHAT_ALLOWED_GAME_MODES,
     _normalize_websochat_session_memory,
@@ -16,18 +14,11 @@ async def call_websochat_game_host_model(
     system_prompt: str,
     user_prompt: str,
 ) -> str:
-    if settings.GEMINI_API_KEY:
-        return await call_websochat_gemini(
-            system_prompt=system_prompt,
-            messages=to_websochat_gemini_contents([{"role": "user", "content": user_prompt}]),
-            max_tokens=640,
-        )
-    response = await _call_claude_messages(
+    return await call_websochat_gemini(
         system_prompt=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+        messages=to_websochat_gemini_contents([{"role": "user", "content": user_prompt}]),
         max_tokens=640,
     )
-    return _extract_text(response.get("content") or "").strip()
 
 
 async def generate_websochat_vs_comparison(

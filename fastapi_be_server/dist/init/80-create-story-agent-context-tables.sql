@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS tb_story_agent_context_product (
     product_id BIGINT PRIMARY KEY COMMENT '작품 ID',
-    context_status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT 'pending | processing | ready | failed',
+    context_status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT 'pending | processing | ready | failed | disabled',
     total_episode_count INT NOT NULL DEFAULT 0 COMMENT '대상 회차 수',
     ready_episode_count INT NOT NULL DEFAULT 0 COMMENT '적재 완료 회차 수',
     active_product_summary_id BIGINT NULL COMMENT '현재 활성 작품 요약 summary_id',

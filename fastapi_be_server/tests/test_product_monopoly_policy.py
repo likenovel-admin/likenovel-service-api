@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import sys
 from types import ModuleType, SimpleNamespace
@@ -6,8 +7,10 @@ from types import ModuleType, SimpleNamespace
 fastapi_stub = ModuleType("fastapi")
 fastapi_stub.status = SimpleNamespace(
     HTTP_400_BAD_REQUEST=400,
+    HTTP_401_UNAUTHORIZED=401,
     HTTP_403_FORBIDDEN=403,
     HTTP_404_NOT_FOUND=404,
+    HTTP_422_UNPROCESSABLE_ENTITY=422,
 )
 sys.modules.setdefault("fastapi", fastapi_stub)
 
@@ -30,15 +33,26 @@ sys.modules.setdefault("sqlalchemy.ext.asyncio", sqlalchemy_asyncio_stub)
 
 const_stub = ModuleType("app.const")
 const_stub.CommonConstants = SimpleNamespace(COMPANY_LIKENOVEL="라이크노벨")
-const_stub.ErrorMessages = SimpleNamespace()
+const_stub.ErrorMessages = SimpleNamespace(
+    EXPIRED_ACCESS_TOKEN="expired",
+    FORBIDDEN="forbidden",
+    LOGIN_REQUIRED="login required",
+)
 const_stub.LOGGER_TYPE = SimpleNamespace(LOGGER_FILE_NAME_FOR_SERVICE_ERROR="test.log")
 const_stub.settings = SimpleNamespace(DB_DML_DEFAULT_ID=0)
 sys.modules.setdefault("app.const", const_stub)
 
 exceptions_stub = ModuleType("app.exceptions")
-exceptions_stub.CustomResponseException = type(
-    "CustomResponseException", (Exception,), {}
-)
+
+
+class CustomResponseException(Exception):
+    def __init__(self, status_code=None, message=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+exceptions_stub.CustomResponseException = CustomResponseException
 sys.modules.setdefault("app.exceptions", exceptions_stub)
 
 schemas_partner_stub = ModuleType("app.schemas.partner")
@@ -114,8 +128,40 @@ from app.services.partner.partner_product_service import (
     _resolve_cp_link_update_values,
 )
 from app.services.product.product_service import (
+    get_products_validate_cp_nickname,
+    _resolve_reenabled_websochat_context_status,
     _resolve_product_cp_link_update_values,
 )
+import app.services.product.product_service as product_service_module
+
+
+for _stubbed_module_name in [
+    "fastapi",
+    "sqlalchemy",
+    "sqlalchemy.exc",
+    "sqlalchemy.ext",
+    "sqlalchemy.ext.asyncio",
+    "app.const",
+    "app.exceptions",
+    "app.schemas",
+    "app.schemas.partner",
+    "app.schemas.product",
+    "app.schemas.user_giftbook",
+    "app.utils.time",
+    "app.utils.response",
+    "app.utils.query",
+    "app.services.common",
+    "app.services.common.cp_link_service",
+    "app.services.common.comm_service",
+    "app.config",
+    "app.config.log_config",
+    "app.services.common.statistics_service",
+    "app.services.user",
+    "app.services.user.user_giftbook_service",
+    "app.services.event",
+    "app.services.event.event_reward_service",
+]:
+    sys.modules.pop(_stubbed_module_name, None)
 
 
 class ProductMonopolyPolicyUnitTest(unittest.TestCase):
@@ -167,6 +213,66 @@ class ProductMonopolyPolicyUnitTest(unittest.TestCase):
 
         self.assertEqual(contract_yn, "Y")
         self.assertEqual(cp_user_id, 123)
+
+    def test_reenabled_websochat_ready_when_all_existing_context_is_ready(self):
+        self.assertEqual(
+            _resolve_reenabled_websochat_context_status(
+                ready_episode_count=10,
+                total_episode_count=10,
+            ),
+            "ready",
+        )
+
+    def test_reenabled_websochat_returns_pending_when_context_needs_rebuild(self):
+        self.assertEqual(
+            _resolve_reenabled_websochat_context_status(
+                ready_episode_count=3,
+                total_episode_count=10,
+            ),
+            "pending",
+        )
+
+    def test_admin_can_validate_cp_nickname_like_update_flow(self):
+        async def fake_get_user_from_kc(kc_user_id, db):
+            return 1063
+
+        async def fake_resolve_current_user_role(kc_user_id, db):
+            return "admin"
+
+        async def fake_get_accepted_cp_info_by_nickname(nickname, db):
+            return {"user_id": 9, "nickname": nickname}
+
+        original_get_user_from_kc = product_service_module.comm_service.get_user_from_kc
+        original_resolve_current_user_role = (
+            product_service_module._resolve_current_user_role
+        )
+        original_get_accepted_cp_info_by_nickname = (
+            product_service_module.get_accepted_cp_info_by_nickname
+        )
+        try:
+            product_service_module.comm_service.get_user_from_kc = fake_get_user_from_kc
+            product_service_module._resolve_current_user_role = (
+                fake_resolve_current_user_role
+            )
+            product_service_module.get_accepted_cp_info_by_nickname = (
+                fake_get_accepted_cp_info_by_nickname
+            )
+
+            result = asyncio.run(
+                get_products_validate_cp_nickname("bart", "kc-admin", object())
+            )
+
+            self.assertEqual(result, {"data": {"valid": True}})
+        finally:
+            product_service_module.comm_service.get_user_from_kc = (
+                original_get_user_from_kc
+            )
+            product_service_module._resolve_current_user_role = (
+                original_resolve_current_user_role
+            )
+            product_service_module.get_accepted_cp_info_by_nickname = (
+                original_get_accepted_cp_info_by_nickname
+            )
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ class WebsochatContextProduct(Base):
         String(20),
         nullable=False,
         server_default="pending",
-        comment="pending | processing | ready | failed",
+        comment="pending | processing | ready | failed | disabled",
     )
     total_episode_count: Mapped[int] = mapped_column(
         Integer,

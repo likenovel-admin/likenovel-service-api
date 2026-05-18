@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from app.const import LOGGER_TYPE, settings, ErrorMessages
 from app.exceptions import CustomResponseException
 from app.utils.time import convert_to_kor_time
+from app.utils.rich_text_sanitizer import sanitize_rich_text_html
 import app.schemas.product as product_schema
 
 from app.config.log_config import service_error_logger
@@ -166,13 +167,15 @@ async def post_products_product_id_notices(
                         message=ErrorMessages.INVALID_PRODUCT_NOTICE_INFO,
                     )
 
+                safe_content = sanitize_rich_text_html(req_body.content)
+
                 # 내용 글자수 검증
                 try:
-                    soup = BeautifulSoup(req_body.content, "html.parser")
+                    soup = BeautifulSoup(safe_content, "html.parser")
                     text_content = soup.get_text(separator=" ", strip=True)  # 태그 제외
                 except Exception:
                     # HTML이 아닌 일반 텍스트인 경우
-                    text_content = req_body.content
+                    text_content = safe_content
 
                 if len(text_content) > 20000:
                     raise CustomResponseException(
@@ -221,7 +224,7 @@ async def post_products_product_id_notices(
                             "user_id": user_id,
                             "id": product_notice_id_to_int,
                             "subject": req_body.title,
-                            "content": req_body.content,
+                            "content": safe_content,
                             "publish_reserve_date": convert_to_kor_time(
                                 req_body.publish_reserve_date
                             )
@@ -245,7 +248,7 @@ async def post_products_product_id_notices(
                             "user_id": user_id,
                             "product_id": product_id_to_int,
                             "subject": req_body.title,
-                            "content": req_body.content,
+                            "content": safe_content,
                             "publish_reserve_date": convert_to_kor_time(
                                 req_body.publish_reserve_date
                             )
@@ -337,13 +340,15 @@ async def put_products_notices_product_notice_id(
                         message=ErrorMessages.INVALID_PRODUCT_NOTICE_INFO,
                     )
 
+                safe_content = sanitize_rich_text_html(req_body.content)
+
                 # 내용 글자수 검증
                 try:
-                    soup = BeautifulSoup(req_body.content, "html.parser")
+                    soup = BeautifulSoup(safe_content, "html.parser")
                     text_content = soup.get_text(separator=" ", strip=True)  # 태그 제외
                 except Exception:
                     # HTML이 아닌 일반 텍스트인 경우
-                    text_content = req_body.content
+                    text_content = safe_content
 
                 if len(text_content) > 20000:
                     raise CustomResponseException(
@@ -367,7 +372,7 @@ async def put_products_notices_product_notice_id(
                         "user_id": user_id,
                         "id": product_notice_id_to_int,
                         "subject": req_body.title,
-                        "content": req_body.content,
+                        "content": safe_content,
                         "publish_reserve_date": convert_to_kor_time(
                             req_body.publish_reserve_date
                         )
