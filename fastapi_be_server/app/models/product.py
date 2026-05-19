@@ -163,6 +163,12 @@ class ProductEpisode(Base):
             "price_type",
             "episode_no",
         ),
+        Index(
+            "idx_product_episode_product_no_use",
+            "product_id",
+            "episode_no",
+            "use_yn",
+        ),
     )
 
     # column
