@@ -11,6 +11,7 @@ from app.services.admin import (
     admin_basic_service,
     admin_blind_service,
     admin_content_service,
+    admin_episode_management_service,
     admin_event_service,
     admin_faq_service,
     admin_notification_service,
@@ -24,6 +25,24 @@ from app.services.admin import (
 from app.utils.common import check_user
 
 router = APIRouter(prefix="/admins")
+
+
+@router.get(
+    "/products/{product_id}/episodes/delegated/summary",
+    tags=["CMS - 관리자 대리 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_admin_delegated_episode_summary(
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """기존 작품 회차 대리 추가/수정 대상 요약"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_episode_management_service.get_admin_delegated_episode_summary(
+        product_id=product_id,
+        db=db,
+    )
 
 
 @router.get(

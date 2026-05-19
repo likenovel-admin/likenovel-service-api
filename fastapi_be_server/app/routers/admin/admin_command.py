@@ -13,6 +13,7 @@ from app.services.admin import (
     admin_basic_service,
     admin_blind_service,
     admin_bulk_upload_service,
+    admin_episode_management_service,
     admin_free_serial_schedule_service,
     admin_content_service,
     admin_event_service,
@@ -1890,6 +1891,47 @@ async def post_batch_open(
 
 
 # ──────────────────── 일괄 업로드 ────────────────────
+
+
+@router.post(
+    "/products/{product_id}/episodes/delegated/preview",
+    tags=["CMS - 관리자 대리 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_admin_delegated_episode_operation_preview(
+    req_body: admin_schema.AdminDelegatedEpisodeOperationReqBody,
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """기존 작품 회차 대리 추가/수정 미리보기"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_episode_management_service.preview_admin_delegated_episode_operation(
+        product_id=product_id,
+        req_body=req_body,
+        db=db,
+    )
+
+
+@router.post(
+    "/products/{product_id}/episodes/delegated/apply",
+    tags=["CMS - 관리자 대리 회차 관리"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_admin_delegated_episode_operation_apply(
+    req_body: admin_schema.AdminDelegatedEpisodeOperationReqBody,
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """기존 작품 회차 대리 추가/수정 적용"""
+    current_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_episode_management_service.apply_admin_delegated_episode_operation(
+        product_id=product_id,
+        req_body=req_body,
+        admin_user_id=int(current_user["user_id"]),
+        db=db,
+    )
 
 
 @router.post(
