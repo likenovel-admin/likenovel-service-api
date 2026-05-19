@@ -2640,7 +2640,7 @@ class AiReaderActionApplierTest(unittest.IsolatedAsyncioTestCase):
         db.execute.side_effect = [
             self._FakeMappingsResult([{"read_count": 1}]),
             self._FakeMappingsResult([], scalar_value=1),
-            self._FakeMappingsResult([{"bookmark_add_count": 9}]),
+            self._FakeMappingsResult([{"bookmark_add_count": 12}]),
             self._FakeMappingsResult([], scalar_value=1),
         ]
 
@@ -5775,6 +5775,49 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             recommend["posterior_threshold"],
         )
         self.assertTrue(recommend["suggested"])
+
+    def test_reader_engagement_context_suggests_borderline_bookmark_match(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        target = {
+            "worldview_tags": '["현대", "게이트"]',
+            "protagonist_job_tags": '["헌터"]',
+            "protagonist_material_tags": '["시스템"]',
+            "axis_style_tags": '["모험"]',
+            "axis_romance_tags": "[]",
+            "protagonist_type_tags": "[]",
+            "protagonist_goal_primary": "",
+            "episode_no": 3,
+        }
+        persona = {
+            "initial_axis_bias": {
+                "세": {"현대": 0.74, "게이트": 0.74},
+                "직": {"헌터": 0.74},
+                "능": {"시스템": 0.74},
+                "작": {"모험": 0.74},
+            },
+            "bookmark_threshold": 0.6,
+            "recommend_threshold": 0.8,
+            "rating_severity": 0.5,
+        }
+        state = {
+            "read_episode_count": 3,
+            "bookmarked_yn": "N",
+            "recommended_yn": "N",
+            "evaluated_yn": "N",
+        }
+
+        context = service._build_reader_engagement_context(
+            target,
+            persona=persona,
+            state=state,
+            taste_factors=[],
+        )
+
+        bookmark = context["action_affordances"]["bookmark"]
+        self.assertGreaterEqual(bookmark["posterior_hint"], 0.6)
+        self.assertLess(bookmark["posterior_hint"], 0.62)
+        self.assertTrue(bookmark["suggested"])
 
     async def test_process_reader_session_persists_decision_and_enqueues_actions(self):
         from app.services.ai import reader_agent_session_service as service

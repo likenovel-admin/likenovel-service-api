@@ -75,7 +75,7 @@ SessionSuccessFunc = Callable[..., Awaitable[None]]
 SessionFailedFunc = Callable[..., Awaitable[None]]
 PostSuccessFunc = Callable[[AsyncSession], Awaitable[None]]
 
-BAYESIAN_BOOKMARK_SUGGEST_THRESHOLD = 0.62
+BAYESIAN_BOOKMARK_SUGGEST_THRESHOLD = 0.60
 BAYESIAN_RECOMMEND_SUGGEST_THRESHOLD = 0.55
 BAYESIAN_EVALUATE_SUGGEST_THRESHOLD = 0.55
 
