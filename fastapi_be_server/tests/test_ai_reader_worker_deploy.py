@@ -1,4 +1,5 @@
 import asyncio
+import tomllib
 from pathlib import Path
 
 
@@ -31,6 +32,16 @@ def test_prod_deploy_bundle_includes_ai_reader_worker_script():
     assert "cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py" in content
     assert "zip -r $GITHUB_SHA.zip" in content
     assert "scripts/" in content
+
+
+def test_prod_wheel_pins_sqlalchemy_for_aiomysql_pre_ping():
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    sqlalchemy_dependency = pyproject["tool"]["poetry"]["dependencies"]["sqlalchemy"]
+
+    assert sqlalchemy_dependency == {
+        "extras": ["asyncio"],
+        "version": "2.0.41",
+    }
 
 
 def test_prod_run_script_replaces_and_starts_ai_reader_worker():
