@@ -34,14 +34,16 @@ def test_prod_deploy_bundle_includes_ai_reader_worker_script():
     assert "scripts/" in content
 
 
-def test_prod_wheel_pins_sqlalchemy_for_aiomysql_pre_ping():
+def test_prod_wheel_pins_mysql_driver_stack_for_aiomysql_pre_ping():
     pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    sqlalchemy_dependency = pyproject["tool"]["poetry"]["dependencies"]["sqlalchemy"]
+    dependencies = pyproject["tool"]["poetry"]["dependencies"]
 
-    assert sqlalchemy_dependency == {
+    assert dependencies["sqlalchemy"] == {
         "extras": ["asyncio"],
         "version": "2.0.41",
     }
+    assert dependencies["pymysql"] == "1.1.1"
+    assert dependencies["aiomysql"] == "0.2.0"
 
 
 def test_prod_run_script_replaces_and_starts_ai_reader_worker():
