@@ -1,4 +1,4 @@
-from sqlalchemy import Date, Double, Integer, String, TIMESTAMP, UniqueConstraint, text
+from sqlalchemy import BigInteger, Date, Double, Integer, JSON, String, TIMESTAMP, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from datetime import datetime
@@ -625,6 +625,51 @@ class EventV2RewardRecipient(Base):
     )
     updated_id: Mapped[int] = mapped_column(
         Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AdminEpisodeOperationAudit(Base):
+    __tablename__ = "tb_admin_episode_operation_audit"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="operation fingerprint"
+    )
+    item_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="item key inside the operation"
+    )
+    admin_user_id: Mapped[int] = mapped_column(Integer, nullable=False, comment="admin user id")
+    product_id: Mapped[int] = mapped_column(Integer, nullable=False, comment="target product id")
+    episode_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="target episode id")
+    episode_no: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="target episode no")
+    action: Mapped[str] = mapped_column(
+        String(30), nullable=False, comment="append_epub or replace_epub"
+    )
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, comment="succeeded or failed"
+    )
+    before_json: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True, comment="snapshot before operation"
+    )
+    after_json: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True, comment="snapshot after operation"
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        String(1000), nullable=True, comment="failure detail"
+    )
+    created_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="row creator"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="row updater"
     )
     updated_date: Mapped[datetime] = mapped_column(
         TIMESTAMP,

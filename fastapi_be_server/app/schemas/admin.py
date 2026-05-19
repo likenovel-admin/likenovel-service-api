@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from typing import Dict, List, Optional
 
+from datetime import datetime
 import re
 
 
@@ -96,6 +97,91 @@ class PutProductNoticeReqBody(AdminBase):
         default=None, examples=["N"], description="작품 공지 공개 여부"
     )
     use_yn: Optional[str] = Field(default=None, examples=["Y"], description="사용 여부")
+
+
+class AdminDelegatedEpisodeOperationItem(AdminBase):
+    episode_no: int = Field(examples=[51], description="대상 회차 번호", gt=0)
+    title: str = Field(examples=["51화."], description="회차명", min_length=1)
+    epub_file_id: int = Field(examples=[1], description="EPUB 파일 스토리지 그룹 ID", gt=0)
+    source_sha256: Optional[str] = Field(
+        default=None, examples=["a" * 64], description="원본 파일 SHA-256"
+    )
+    author_comment: Optional[str] = Field(
+        default=None, examples=["안녕하세요"], description="작가 코멘트"
+    )
+    evaluation_open_yn: str = Field(default="Y", examples=["Y"], description="평가 오픈 여부")
+    comment_open_yn: str = Field(default="Y", examples=["Y"], description="댓글 오픈 여부")
+    publish_reserve_yn: str = Field(default="N", examples=["N"], description="예약 설정 여부")
+    publish_reserve_date: Optional[datetime] = Field(
+        default=None, examples=["2026-05-19T16:00:00+09:00"], description="예약 공개 일시"
+    )
+    price_type: Optional[str] = Field(
+        default=None, examples=["free"], description="회차 가격 타입(free, paid)"
+    )
+
+    @field_validator("publish_reserve_date", mode="before")
+    def validate_publish_reserve_date(cls, value):
+        if value == "Invalid Date" or not value:
+            return None
+        return value
+
+    @field_validator("evaluation_open_yn", "comment_open_yn", "publish_reserve_yn")
+    def validate_yn(cls, value):
+        if value not in ("Y", "N"):
+            raise ValueError("Y 또는 N만 허용됩니다.")
+        return value
+
+    @field_validator("price_type")
+    def validate_price_type(cls, value):
+        if value in (None, ""):
+            return None
+        if value not in ("free", "paid"):
+            raise ValueError("free 또는 paid만 허용됩니다.")
+        return value
+
+    @field_validator("source_sha256")
+    def validate_source_sha256(cls, value):
+        if value in (None, ""):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("SHA-256 hex 값만 허용됩니다.")
+        return value
+
+
+class AdminDelegatedEpisodeOperationReqBody(AdminBase):
+    action: str = Field(
+        examples=["append_epub"],
+        description="작업 종류: append_epub 또는 replace_epub",
+    )
+    episodes: List[AdminDelegatedEpisodeOperationItem] = Field(
+        default_factory=list, description="대상 회차 목록"
+    )
+
+    @field_validator("action")
+    def validate_action(cls, value):
+        if value not in ("append_epub", "replace_epub"):
+            raise ValueError("append_epub 또는 replace_epub만 허용됩니다.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_episode_set(self):
+        if not self.episodes:
+            raise ValueError("회차 목록이 비어 있습니다.")
+        episode_nos = [episode.episode_no for episode in self.episodes]
+        if len(episode_nos) != len(set(episode_nos)):
+            raise ValueError("중복 회차 번호가 있습니다.")
+        if self.action == "replace_epub":
+            reserved_episode = next(
+                (
+                    episode
+                    for episode in self.episodes
+                    if episode.publish_reserve_yn == "Y"
+                ),
+                None,
+            )
+            if reserved_episode is not None:
+                raise ValueError("기존 회차 내용 교체에서는 예약 공개일을 변경할 수 없습니다.")
+        return self
 
 
 class PostKeywordReqBody(AdminBase):

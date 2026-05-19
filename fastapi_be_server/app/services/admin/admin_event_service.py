@@ -24,6 +24,7 @@ from app.const import CommonConstants
 
 from urllib.parse import quote
 from app.const import ErrorMessages
+from app.services.admin.banner_order_service import _build_banner_reorder_plan
 
 logger = logging.getLogger("admin_app")  # 커스텀 로거 생성
 
@@ -47,6 +48,118 @@ BANNER_LIST_ORDER_BY_MAP = {
     "show_order_desc": "COALESCE(show_order, 0) DESC, id DESC",
     "latest_updated": "COALESCE(updated_date, created_date) DESC, id DESC",
 }
+
+ALLOWED_BANNER_POSITIONS = ["main", "paid", "review", "promotion", "search", "viewer"]
+ALLOWED_MAIN_BANNER_DIVISIONS = ["top", "mid", "bot"]
+
+
+def _validate_banner_scope(position: str, division: Optional[str]) -> tuple[str, Optional[str]]:
+    if position not in ALLOWED_BANNER_POSITIONS:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.NOT_ALLOWED_POSITION.format(position),
+        )
+
+    if position == "main":
+        if division is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.DETAIL_POSITION_REQUIRED,
+            )
+        if division not in ALLOWED_MAIN_BANNER_DIVISIONS:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.NOT_ALLOWED_POSITION.format(division),
+            )
+        return position, division
+
+    return position, None
+
+
+def _build_banner_scope_where(position: str, division: Optional[str]) -> tuple[str, dict]:
+    where = "position = :position"
+    params = {"position": position}
+    if position == "main":
+        where += " AND division = :division"
+        params["division"] = division
+    return where, params
+
+
+def _validate_banner_target_position(target_position: int, max_position: int) -> int:
+    if target_position < 1 or target_position > max_position:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=f"노출 위치는 1부터 {max_position} 사이로 입력해주세요.",
+        )
+    return target_position
+
+
+async def _fetch_banner_scope_rows(
+    db: AsyncSession, position: str, division: Optional[str]
+) -> list[dict]:
+    scope_where, scope_params = _build_banner_scope_where(position, division)
+    query = text(f"""
+        SELECT id, show_order
+        FROM tb_carousel_banner
+        WHERE {scope_where}
+        ORDER BY COALESCE(show_order, 0) ASC, id ASC
+    """)
+    result = await db.execute(query, scope_params)
+    return [dict(row) for row in result.mappings().all()]
+
+
+async def _normalize_banner_scope_order(
+    db: AsyncSession,
+    position: str,
+    division: Optional[str],
+    target_id: int | None = None,
+    target_position: int | None = None,
+) -> int:
+    rows = await _fetch_banner_scope_rows(db, position, division)
+    if not rows:
+        return 0
+
+    try:
+        plan = _build_banner_reorder_plan(rows, target_id, target_position)
+    except ValueError as exc:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=f"노출 위치는 1부터 {len(rows)} 사이로 입력해주세요.",
+        ) from exc
+
+    current_orders = {row["id"]: int(row.get("show_order") or 0) for row in rows}
+    changed = [
+        (banner_id, order)
+        for banner_id, order in plan
+        if current_orders.get(banner_id) != order
+    ]
+    if not changed:
+        return 0
+
+    scope_where, scope_params = _build_banner_scope_where(position, division)
+    case_parts = []
+    update_params = {
+        **scope_params,
+        "updated_id": -1,
+        "updated_date": datetime.now(),
+    }
+    for index, (banner_id, order) in enumerate(changed):
+        case_parts.append(f"WHEN :bid{index} THEN :border{index}")
+        update_params[f"bid{index}"] = banner_id
+        update_params[f"border{index}"] = order
+
+    id_placeholders = ",".join([f":bid{index}" for index in range(len(changed))])
+    update_query = text(f"""
+        UPDATE tb_carousel_banner
+        SET show_order = CASE id
+            {' '.join(case_parts)}
+        END,
+        updated_id = :updated_id,
+        updated_date = :updated_date
+        WHERE {scope_where} AND id IN ({id_placeholders})
+    """)
+    await db.execute(update_query, update_params)
+    return len(changed)
 
 
 async def events_list(type: str, page: int, count_per_page: int, db: AsyncSession):
@@ -572,11 +685,15 @@ async def banners_list(
     query = text(f"""
         SELECT
             *,
+            {get_file_path_sub_query("b.image_id", "image_path")},
+            {get_file_name_sub_query("b.image_id", "file_name")},
+            {get_file_path_sub_query("b.mobile_image_id", "mobile_image_path")},
+            {get_file_name_sub_query("b.mobile_image_id", "mobile_file_name")},
             CASE
                 WHEN show_start_date < CURRENT_TIMESTAMP AND CURRENT_TIMESTAMP < show_end_date THEN 'Y'
                 ELSE 'N'
             END AS `show`
-        FROM tb_carousel_banner
+        FROM tb_carousel_banner b
         {where_clause}
         ORDER BY {order_by_clause}
         {limit_clause}
@@ -641,31 +758,13 @@ async def post_banner(req_body: admin_schema.PostBannerReqBody, db: AsyncSession
             message=ErrorMessages.INVALID_RECOMMEND_EXPOSE_START_DATE,
         )
 
-    if req_body.position not in [
-        "main",
-        "paid",
-        "review",
-        "promotion",
-        "search",
-        "viewer",
-    ]:
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message=ErrorMessages.NOT_ALLOWED_POSITION.format(req_body.position),
-        )
-
-    if req_body.position == "main":
-        if req_body.division is None:
-            raise CustomResponseException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                message=ErrorMessages.DETAIL_POSITION_REQUIRED,
-            )
-
-        if req_body.division not in ["top", "mid", "bot"]:
-            raise CustomResponseException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                message=ErrorMessages.NOT_ALLOWED_POSITION.format(req_body.division),
-            )
+    position, division = _validate_banner_scope(req_body.position, req_body.division)
+    scope_rows = await _fetch_banner_scope_rows(db, position, division)
+    target_position = (
+        _validate_banner_target_position(req_body.show_order, len(scope_rows) + 1)
+        if req_body.show_order is not None
+        else len(scope_rows) + 1
+    )
 
     columns, values, params = build_insert_query(
         req_body,
@@ -679,14 +778,28 @@ async def post_banner(req_body: admin_schema.PostBannerReqBody, db: AsyncSession
             "mobile_image_id",
         ],
         optional_fields=["division", "show_order"],
-        field_defaults={"show_order": 1},
+        field_defaults={"show_order": target_position},
     )
+    if "division" in params:
+        params["division"] = division
 
     query = text(
         f"INSERT INTO tb_carousel_banner (id, {columns}, created_id, created_date) VALUES (default, {values}, :created_id, :created_date)"
     )
 
-    await db.execute(query, params)
+    result = await db.execute(query, params)
+    inserted_id = getattr(result, "lastrowid", None)
+    if not inserted_id:
+        inserted_id_result = await db.execute(text("SELECT LAST_INSERT_ID() AS id"), {})
+        inserted_id = dict(inserted_id_result.mappings().first())["id"]
+
+    await _normalize_banner_scope_order(
+        db,
+        position=position,
+        division=division,
+        target_id=int(inserted_id),
+        target_position=target_position,
+    )
 
     return {"result": req_body}
 
@@ -733,33 +846,31 @@ async def put_banner(
                 message=ErrorMessages.INVALID_RECOMMEND_EXPOSE_START_DATE,
             )
 
-    if req_body.position is not None and req_body.position not in [
-        "main",
-        "paid",
-        "review",
-        "promotion",
-        "search",
-        "viewer",
-    ]:
-        raise CustomResponseException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            message=ErrorMessages.NOT_ALLOWED_POSITION.format(req_body.position),
+    old_position, old_division = _validate_banner_scope(
+        org_banner["position"], org_banner.get("division")
+    )
+    requested_position = (
+        req_body.position if req_body.position is not None else org_banner["position"]
+    )
+    requested_division = (
+        req_body.division
+        if req_body.division is not None
+        else org_banner.get("division")
+    )
+    new_position, new_division = _validate_banner_scope(
+        requested_position, requested_division
+    )
+    scope_changed = (old_position, old_division) != (new_position, new_division)
+
+    new_scope_rows = await _fetch_banner_scope_rows(db, new_position, new_division)
+    max_target_position = len(new_scope_rows) + (1 if scope_changed else 0)
+    target_position = None
+    if req_body.show_order is not None:
+        target_position = _validate_banner_target_position(
+            req_body.show_order, max_target_position
         )
-
-    if (
-        org_banner["position"] == "main" and req_body.position is None
-    ) or req_body.position == "main":
-        if req_body.division is None:
-            raise CustomResponseException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                message=ErrorMessages.DETAIL_POSITION_REQUIRED,
-            )
-
-        if req_body.division not in ["top", "mid", "bot"]:
-            raise CustomResponseException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                message=ErrorMessages.NOT_ALLOWED_POSITION.format(req_body.division),
-            )
+    elif scope_changed:
+        target_position = max_target_position
 
     update_filed_query_list = [
         "updated_id = :updated_id",
@@ -772,12 +883,13 @@ async def put_banner(
         update_filed_query_list.append("position = :position")
         db_execute_params["position"] = req_body.position
 
-    if (
-        org_banner["position"] == "main" and req_body.position is None
-    ) or req_body.position == "main":
+    if new_position == "main":
         if req_body.division is not None:
             update_filed_query_list.append("division = :division")
             db_execute_params["division"] = req_body.division
+        elif scope_changed:
+            update_filed_query_list.append("division = :division")
+            db_execute_params["division"] = new_division
     else:
         update_filed_query_list.append("division = :division")
         db_execute_params["division"] = None
@@ -794,9 +906,9 @@ async def put_banner(
         update_filed_query_list.append("show_end_date = :show_end_date")
         db_execute_params["show_end_date"] = req_body.show_end_date
 
-    if req_body.show_order is not None:
+    if target_position is not None:
         update_filed_query_list.append("show_order = :show_order")
-        db_execute_params["show_order"] = req_body.show_order
+        db_execute_params["show_order"] = target_position
 
     if req_body.url is not None:
         update_filed_query_list.append("url = :url")
@@ -819,6 +931,18 @@ async def put_banner(
                     """)
 
     await db.execute(query, db_execute_params)
+
+    if scope_changed:
+        await _normalize_banner_scope_order(
+            db, position=old_position, division=old_division
+        )
+    await _normalize_banner_scope_order(
+        db,
+        position=new_position,
+        division=new_division,
+        target_id=id,
+        target_position=target_position,
+    )
 
     return {"result": req_body}
 
