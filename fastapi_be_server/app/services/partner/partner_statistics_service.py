@@ -30,6 +30,126 @@ def _normalize_episode_title(title):
     return re.sub(r"\.epub$", "", str(title).strip(), flags=re.IGNORECASE)
 
 
+def _recent_24h_hit_delta(current_count_hit, previous_count_hit) -> int:
+    return max(int(current_count_hit or 0) - int(previous_count_hit or 0), 0)
+
+
+def _recent_24h_episode_snapshots_ready(
+    current_rows, previous_rows, total_episode_count
+) -> bool:
+    _ = (previous_rows, total_episode_count)
+    return len(current_rows) > 0
+
+
+def _to_isoformat(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _build_recent_24h_episode_rows(
+    current_rows, previous_rows, product_recent_24h_count_hit
+):
+    previous_by_episode_id = {row["episode_id"]: row for row in previous_rows}
+    rows = []
+
+    for row in sorted(current_rows, key=lambda item: item["episode_no"]):
+        previous_row = previous_by_episode_id.get(row["episode_id"], {})
+        recent_count_hit = _recent_24h_hit_delta(
+            row.get("count_hit"),
+            previous_row.get("count_hit"),
+        )
+        share_rate = None
+        if product_recent_24h_count_hit > 0:
+            share_rate = round(recent_count_hit / product_recent_24h_count_hit, 4)
+
+        rows.append(
+            {
+                "episodeId": row["episode_id"],
+                "episodeNo": row["episode_no"],
+                "episodeTitle": _normalize_episode_title(row.get("episode_title")),
+                "recent24hCountHit": recent_count_hit,
+                "cumulativeCountHit": int(row.get("count_hit") or 0),
+                "shareRate": share_rate,
+            }
+        )
+
+    return rows
+
+
+def _build_recent_24h_hourly_rows(snapshots):
+    sorted_snapshots = sorted(snapshots, key=lambda item: item["basis_at"])
+    rows = []
+
+    for previous_row, current_row in zip(sorted_snapshots, sorted_snapshots[1:]):
+        basis_at = current_row["basis_at"]
+        rows.append(
+            {
+                "hourLabel": basis_at.strftime("%H:%M"),
+                "countHit": _recent_24h_hit_delta(
+                    current_row.get("count_hit"),
+                    previous_row.get("count_hit"),
+                ),
+            }
+        )
+
+    return rows
+
+
+def _build_recent_24h_not_ready_response(
+    product_id, basis_at, cumulative_count_hit, total_episode_count
+):
+    basis_at_isoformat = _to_isoformat(basis_at)
+    return {
+        "productId": product_id,
+        "basisAt": basis_at_isoformat,
+        "fromAt": None,
+        "toAt": None,
+        "totalEpisodeCount": total_episode_count,
+        "summary": {
+            "recent24hCountHit": None,
+            "previous24hCountHit": None,
+            "cumulativeCountHit": int(cumulative_count_hit or 0),
+            "rankStatus": "not_ready",
+            "rankBasisAt": basis_at_isoformat,
+        },
+        "hourly": [],
+        "episodes": [],
+    }
+
+
+def _build_recent_24h_response(
+    product_id,
+    current_basis,
+    previous_basis,
+    total_episode_count,
+    recent_24h_count_hit,
+    previous_24h_count_hit,
+    cumulative_count_hit,
+    hourly_rows,
+    episode_rows,
+):
+    current_basis_isoformat = _to_isoformat(current_basis)
+    return {
+        "productId": product_id,
+        "basisAt": current_basis_isoformat,
+        "fromAt": _to_isoformat(previous_basis),
+        "toAt": current_basis_isoformat,
+        "totalEpisodeCount": total_episode_count,
+        "summary": {
+            "recent24hCountHit": recent_24h_count_hit,
+            "previous24hCountHit": previous_24h_count_hit,
+            "cumulativeCountHit": int(cumulative_count_hit or 0),
+            "rankStatus": "pending",
+            "rankBasisAt": current_basis_isoformat,
+        },
+        "hourly": hourly_rows,
+        "episodes": episode_rows,
+    }
+
+
 def _cp_owned_product_ids_subquery(user_id: int) -> str:
     return f"""
         SELECT product_id
@@ -393,6 +513,170 @@ async def product_episode_dropoff_statistics_list(
             "product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)"
         ],
         extra_params={"author_id": user_data["user_id"]},
+    )
+
+
+@handle_exceptions
+async def product_recent_24h_statistics(
+    product_id: int, db: AsyncSession, user_data: dict
+):
+    user_id = user_data["user_id"]
+
+    product_result = await db.execute(
+        text("""
+            SELECT p.product_id, p.count_hit
+              FROM tb_product p
+             WHERE p.product_id = :product_id
+               AND p.author_id = :user_id
+        """),
+        {"product_id": product_id, "user_id": user_id},
+    )
+    product_row = product_result.mappings().first()
+    if product_row is None:
+        raise CustomResponseException(
+            status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_PRODUCT,
+        )
+
+    episode_count_result = await db.execute(
+        text("""
+            SELECT COUNT(*) AS total_episode_count
+              FROM tb_product_episode
+             WHERE product_id = :product_id
+               AND use_yn = 'Y'
+        """),
+        {"product_id": product_id},
+    )
+    total_episode_count = int(
+        episode_count_result.mappings().first()["total_episode_count"] or 0
+    )
+
+    latest_basis_result = await db.execute(
+        text("""
+            SELECT MAX(basis_at) AS basis_at
+              FROM tb_product_hit_snapshot_hourly
+        """)
+    )
+    current_basis = latest_basis_result.mappings().first()["basis_at"]
+    if current_basis is None:
+        return _build_recent_24h_not_ready_response(
+            product_id=product_id,
+            basis_at=None,
+            cumulative_count_hit=product_row["count_hit"],
+            total_episode_count=total_episode_count,
+        )
+
+    previous_basis = current_basis - timedelta(hours=24)
+
+    product_snapshot_result = await db.execute(
+        text("""
+            SELECT basis_at, count_hit
+              FROM tb_product_hit_snapshot_hourly
+             WHERE product_id = :product_id
+               AND basis_at IN (
+                   :basis_at,
+                   DATE_SUB(:basis_at, INTERVAL 24 HOUR),
+                   DATE_SUB(:basis_at, INTERVAL 48 HOUR)
+               )
+        """),
+        {"product_id": product_id, "basis_at": current_basis},
+    )
+    product_snapshots = {
+        row["basis_at"]: row for row in product_snapshot_result.mappings().all()
+    }
+    current_snapshot = product_snapshots.get(current_basis)
+    previous_snapshot = product_snapshots.get(previous_basis)
+    previous_48h_snapshot = product_snapshots.get(current_basis - timedelta(hours=48))
+    if current_snapshot is None or previous_snapshot is None:
+        return _build_recent_24h_not_ready_response(
+            product_id=product_id,
+            basis_at=current_basis,
+            cumulative_count_hit=product_row["count_hit"],
+            total_episode_count=total_episode_count,
+        )
+
+    recent_24h_count_hit = _recent_24h_hit_delta(
+        current_snapshot["count_hit"], previous_snapshot["count_hit"]
+    )
+    previous_24h_count_hit = None
+    if previous_48h_snapshot is not None:
+        previous_24h_count_hit = _recent_24h_hit_delta(
+            previous_snapshot["count_hit"], previous_48h_snapshot["count_hit"]
+        )
+
+    current_episode_result = await db.execute(
+        text("""
+            SELECT s.episode_id,
+                   s.episode_no,
+                   e.episode_title,
+                   s.count_hit
+              FROM tb_product_episode_hit_snapshot_hourly s
+              INNER JOIN tb_product_episode e
+                      ON e.episode_id = s.episode_id
+                     AND e.product_id = s.product_id
+                     AND e.use_yn = 'Y'
+             WHERE s.product_id = :product_id
+               AND s.basis_at = :basis_at
+             ORDER BY s.episode_no ASC
+        """),
+        {"product_id": product_id, "basis_at": current_basis},
+    )
+    current_episode_rows = current_episode_result.mappings().all()
+
+    previous_episode_result = await db.execute(
+        text("""
+            SELECT episode_id, count_hit
+              FROM tb_product_episode_hit_snapshot_hourly
+             WHERE product_id = :product_id
+               AND basis_at = :basis_at
+        """),
+        {"product_id": product_id, "basis_at": previous_basis},
+    )
+    previous_episode_rows = previous_episode_result.mappings().all()
+    if not _recent_24h_episode_snapshots_ready(
+        current_episode_rows, previous_episode_rows, total_episode_count
+    ):
+        return _build_recent_24h_not_ready_response(
+            product_id=product_id,
+            basis_at=current_basis,
+            cumulative_count_hit=current_snapshot["count_hit"],
+            total_episode_count=total_episode_count,
+        )
+
+    episode_rows = _build_recent_24h_episode_rows(
+        current_episode_rows,
+        previous_episode_rows,
+        recent_24h_count_hit,
+    )
+
+    hourly_snapshot_result = await db.execute(
+        text("""
+            SELECT basis_at, count_hit
+              FROM tb_product_hit_snapshot_hourly
+             WHERE product_id = :product_id
+               AND basis_at BETWEEN :previous_basis AND :current_basis
+             ORDER BY basis_at ASC
+        """),
+        {
+            "product_id": product_id,
+            "previous_basis": previous_basis,
+            "current_basis": current_basis,
+        },
+    )
+    hourly_rows = _build_recent_24h_hourly_rows(
+        hourly_snapshot_result.mappings().all()
+    )
+
+    return _build_recent_24h_response(
+        product_id=product_id,
+        current_basis=current_basis,
+        previous_basis=previous_basis,
+        total_episode_count=total_episode_count,
+        recent_24h_count_hit=recent_24h_count_hit,
+        previous_24h_count_hit=previous_24h_count_hit,
+        cumulative_count_hit=current_snapshot["count_hit"],
+        hourly_rows=hourly_rows,
+        episode_rows=episode_rows,
     )
 
 

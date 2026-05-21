@@ -1,4 +1,5 @@
 from pathlib import Path
+import unittest
 
 
 def test_parse_statements_keeps_semicolon_inside_sql_string_literal():
@@ -33,3 +34,76 @@ def test_ai_reader_phase1_migration_parses_all_create_table_statements():
 
     assert len(statements) == 6
     assert all(statement.startswith("CREATE TABLE IF NOT EXISTS") for statement in statements)
+
+
+class ProductHitSnapshotMigrationTest(unittest.TestCase):
+    def test_product_hit_snapshot_migration_parses_all_create_table_statements(self):
+        from app.utils.auto_migrate import _parse_statements
+
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "init"
+            / "96-create-product-hit-snapshot-hourly.sql"
+        )
+
+        statements = _parse_statements(migration_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(statements), 2)
+        self.assertTrue(
+            all(
+                statement.startswith("CREATE TABLE IF NOT EXISTS")
+                for statement in statements
+            )
+        )
+
+
+class SitePageViewMigrationTest(unittest.TestCase):
+    def test_site_page_view_migration_parses_create_table_statement(self):
+        from app.utils.auto_migrate import _parse_statements
+
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "init"
+            / "97-create-site-page-view-event.sql"
+        )
+
+        statements = _parse_statements(migration_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(statements), 1)
+        self.assertTrue(statements[0].startswith("CREATE TABLE IF NOT EXISTS"))
+        self.assertIn("tb_site_page_view_event", statements[0])
+
+    def test_site_page_view_migration_keeps_write_indexes_minimal(self):
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "init"
+            / "97-create-site-page-view-event.sql"
+        )
+
+        sql = migration_path.read_text(encoding="utf-8")
+
+        self.assertIn("uq_site_page_view_event_event_id", sql)
+        self.assertIn("idx_site_page_view_event_source_occurred", sql)
+        self.assertNotIn("idx_site_page_view_event_route_occurred", sql)
+        self.assertNotIn("idx_site_page_view_event_user_occurred", sql)
+        self.assertNotIn("idx_site_page_view_event_session_occurred", sql)
+
+    def test_site_statistics_batch_uses_kst_target_range_for_page_view(self):
+        batch_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "batch"
+            / "statistics_aggregation_daily_batch.sql"
+        )
+
+        sql = batch_path.read_text(encoding="utf-8")
+
+        self.assertIn("SET time_zone = '+09:00'", sql)
+        self.assertIn("@site_stats_target_start", sql)
+        self.assertIn("@site_stats_target_end", sql)
+        self.assertIn("pv.occurred_at >= @site_stats_target_start", sql)
+        self.assertIn("pv.occurred_at < @site_stats_target_end", sql)
+        self.assertNotIn("DATE(occurred_at)", sql)
