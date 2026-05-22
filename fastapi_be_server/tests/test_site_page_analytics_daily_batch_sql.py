@@ -17,6 +17,12 @@ def _batch_sh() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _advisory_lock_sh() -> str:
+    return (
+        ROOT / "dist" / "batch" / "batch_advisory_lock.sh"
+    ).read_text(encoding="utf-8")
+
+
 class SitePageAnalyticsDailyBatchSqlTest(unittest.TestCase):
     def test_site_page_analytics_batch_is_independent_from_hot_product_tables(self):
         sql = _batch_sql().lower()
@@ -46,3 +52,12 @@ class SitePageAnalyticsDailyBatchSqlTest(unittest.TestCase):
         self.assertIn("BATCH_DATE", script)
         self.assertIn('source "${SCRIPT_DIR}/cron_env.sh"', script)
         self.assertIn("site_page_analytics_daily_batch.sql", script)
+
+    def test_site_page_analytics_advisory_lock_does_not_use_coproc_session(self):
+        script = _advisory_lock_sh()
+
+        self.assertNotIn("coproc", script)
+        self.assertIn("IS_USED_LOCK", script)
+        self.assertIn("GET_LOCK", script)
+        self.assertIn("RELEASE_LOCK", script)
+        self.assertIn("mktemp /tmp/likenovel_batch_advisory_lock", script)
