@@ -83,6 +83,8 @@ SITE_PAGE_VIEW_ROUTE_GROUPS = {
     "unknown",
 }
 
+SITE_PAGE_DWELL_MAX_ACTIVE_MS = 30 * 60 * 1000
+
 
 def _allowed_ai_reader_account_domains() -> list[str]:
     return [
@@ -134,6 +136,12 @@ def _normalize_page_view_occurred_at(occurred_at: datetime) -> datetime:
     return occurred_at.astimezone(ZoneInfo(settings.KOREA_TIMEZONE)).replace(
         tzinfo=None
     )
+
+
+def _normalize_site_page_dwell_active_ms(active_ms: int | None) -> int:
+    if active_ms is None:
+        return 0
+    return min(max(int(active_ms), 0), SITE_PAGE_DWELL_MAX_ACTIVE_MS)
 
 
 async def insert_site_page_view_event(
@@ -224,6 +232,214 @@ async def insert_site_page_view_event(
         },
     )
     await db.commit()
+
+
+async def insert_site_page_dwell_event(
+    db: AsyncSession,
+    kc_user_id: str | None,
+    event_id: str,
+    occurred_at: datetime,
+    visitor_id: str,
+    session_id: str,
+    route_group: str,
+    route_name: str,
+    path_template: str,
+    active_ms: int,
+    source: str,
+    taxonomy_version: int,
+):
+    user_id = None
+    if kc_user_id:
+        user_query = text("""
+            SELECT user_id
+            FROM tb_user
+            WHERE kc_user_id = :kc_user_id
+        """)
+        result = await db.execute(user_query, {"kc_user_id": kc_user_id})
+        row = result.mappings().one_or_none()
+        if row is not None:
+            user_id = row.get("user_id")
+
+    normalized_route_group = _normalize_site_page_view_route_group(route_group)
+
+    query = text("""
+        INSERT INTO tb_site_page_dwell_event (
+            event_id,
+            occurred_at,
+            user_id,
+            visitor_id,
+            session_id,
+            route_group,
+            route_name,
+            path_template,
+            active_ms,
+            source,
+            taxonomy_version,
+            created_date
+        )
+        VALUES (
+            :event_id,
+            :occurred_at,
+            :user_id,
+            :visitor_id,
+            :session_id,
+            :route_group,
+            :route_name,
+            :path_template,
+            :active_ms,
+            :source,
+            :taxonomy_version,
+            NOW()
+        )
+        ON DUPLICATE KEY UPDATE event_id = event_id
+    """)
+    await db.execute(
+        query,
+        {
+            "event_id": event_id,
+            "occurred_at": _normalize_page_view_occurred_at(occurred_at),
+            "user_id": user_id,
+            "visitor_id": _limit_text(visitor_id, 80),
+            "session_id": _limit_text(session_id, 80),
+            "route_group": normalized_route_group,
+            "route_name": _limit_text(route_name or "unknown", 120),
+            "path_template": _limit_text(_sanitize_page_view_path(path_template), 255),
+            "active_ms": _normalize_site_page_dwell_active_ms(active_ms),
+            "source": _normalize_site_page_view_source(source),
+            "taxonomy_version": taxonomy_version or 1,
+        },
+    )
+    await db.commit()
+
+
+def _normalize_site_page_route_daily_date_range(
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[str, str]:
+    today = datetime.now(ZoneInfo(settings.KOREA_TIMEZONE)).date()
+    normalized_start = start_date or (today - timedelta(days=6)).isoformat()
+    normalized_end = end_date or today.isoformat()
+
+    try:
+        parsed_start = datetime.strptime(normalized_start, "%Y-%m-%d").date()
+        parsed_end = datetime.strptime(normalized_end, "%Y-%m-%d").date()
+    except ValueError:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="날짜 형식이 올바르지 않습니다.",
+        )
+
+    if parsed_start > parsed_end:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="start_date는 end_date보다 늦을 수 없습니다.",
+        )
+
+    if (parsed_end - parsed_start).days > 89:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="조회 기간은 최대 90일까지 선택할 수 있습니다.",
+        )
+
+    return parsed_start.isoformat(), parsed_end.isoformat()
+
+
+async def site_page_route_statistics(
+    start_date: str | None,
+    end_date: str | None,
+    route_group: str | None,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+):
+    start_date, end_date = _normalize_site_page_route_daily_date_range(
+        start_date, end_date
+    )
+    params: dict = {
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    where_conditions = ["stat_date BETWEEN :start_date AND :end_date"]
+
+    normalized_route_group = (route_group or "").strip()
+    if normalized_route_group and normalized_route_group != "all":
+        where_conditions.append("route_group = :route_group")
+        params["route_group"] = normalized_route_group
+
+    where_sql = "WHERE " + " AND ".join(where_conditions)
+
+    summary_query = text(
+        f"""
+        SELECT
+            COALESCE(SUM(page_view_count), 0) AS page_view_count,
+            COALESCE(SUM(visitor_count), 0) AS visitor_count,
+            COALESCE(SUM(session_count), 0) AS session_count,
+            COALESCE(SUM(dwell_event_count), 0) AS dwell_event_count,
+            COALESCE(SUM(active_dwell_total_ms), 0) AS active_dwell_total_ms,
+            CASE
+                WHEN COALESCE(SUM(dwell_event_count), 0) = 0 THEN 0
+                ELSE CAST(ROUND(SUM(active_dwell_total_ms) / SUM(dwell_event_count)) AS UNSIGNED)
+            END AS active_dwell_avg_ms,
+            COALESCE(SUM(short_dwell_count), 0) AS short_dwell_count
+        FROM tb_site_page_route_daily
+        {where_sql}
+        """
+    )
+    summary_result = await db.execute(summary_query, params)
+    summary = dict(summary_result.mappings().first() or {})
+
+    count_query = text(
+        f"""
+        SELECT COUNT(*) AS total_count
+        FROM (
+            SELECT route_group, path_template
+            FROM tb_site_page_route_daily
+            {where_sql}
+            GROUP BY route_group, route_name, path_template
+        ) t
+        """
+    )
+    count_result = await db.execute(count_query, params)
+    total_count = int(dict(count_result.mappings().first() or {}).get("total_count") or 0)
+
+    detail_query_sql = f"""
+        SELECT
+            route_group,
+            route_name,
+            path_template,
+            COALESCE(SUM(page_view_count), 0) AS page_view_count,
+            COALESCE(SUM(visitor_count), 0) AS visitor_count,
+            COALESCE(SUM(session_count), 0) AS session_count,
+            COALESCE(SUM(dwell_event_count), 0) AS dwell_event_count,
+            COALESCE(SUM(active_dwell_total_ms), 0) AS active_dwell_total_ms,
+            CASE
+                WHEN COALESCE(SUM(dwell_event_count), 0) = 0 THEN 0
+                ELSE CAST(ROUND(SUM(active_dwell_total_ms) / SUM(dwell_event_count)) AS UNSIGNED)
+            END AS active_dwell_avg_ms,
+            COALESCE(SUM(short_dwell_count), 0) AS short_dwell_count
+        FROM tb_site_page_route_daily
+        {where_sql}
+        GROUP BY route_group, route_name, path_template
+        ORDER BY page_view_count DESC, active_dwell_total_ms DESC, route_group ASC, path_template ASC
+    """
+
+    if page != -1 and count_per_page != -1:
+        offset = max(page - 1, 0) * count_per_page
+        detail_query_sql += " LIMIT :limit OFFSET :offset"
+        detail_params = {**params, "limit": count_per_page, "offset": offset}
+    else:
+        detail_params = params
+
+    detail_result = await db.execute(text(detail_query_sql), detail_params)
+    results = [dict(row) for row in detail_result.mappings().all()]
+
+    return {
+        "total_count": total_count,
+        "page": page,
+        "count_per_page": count_per_page,
+        "summary": summary,
+        "results": results,
+    }
 
 
 async def site_statistics(
