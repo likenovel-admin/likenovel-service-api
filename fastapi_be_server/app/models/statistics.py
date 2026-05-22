@@ -1,8 +1,8 @@
-from sqlalchemy import DateTime, Index, Integer, String, TIMESTAMP, text
+from sqlalchemy import Date, DateTime, Index, Integer, String, TIMESTAMP, text
 from sqlalchemy.dialects.mysql import BIGINT
 from sqlalchemy.orm import Mapped, mapped_column
 
-from datetime import datetime
+from datetime import date, datetime
 
 from app.rdb import Base
 
@@ -79,6 +79,119 @@ class SitePageViewEvent(Base):
     )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class SitePageDwellEvent(Base):
+    __tablename__ = "tb_site_page_dwell_event"
+    __table_args__ = (
+        Index("uq_site_page_dwell_event_event_id", "event_id", unique=True),
+        Index("idx_site_page_dwell_event_source_occurred", "source", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True), primary_key=True, autoincrement=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, comment="클라이언트 생성 이벤트 UUID"
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, comment="브라우저 route 활성 체류 시작 시각"
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="로그인 유저 ID, 게스트는 NULL"
+    )
+    visitor_id: Mapped[str] = mapped_column(
+        String(80), nullable=False, comment="브라우저 단위 익명 방문자 ID"
+    )
+    session_id: Mapped[str] = mapped_column(
+        String(80), nullable=False, comment="브라우저 세션 ID"
+    )
+    route_group: Mapped[str] = mapped_column(
+        String(80), nullable=False, comment="route 대분류"
+    )
+    route_name: Mapped[str] = mapped_column(
+        String(120), nullable=False, comment="route 세부명"
+    )
+    path_template: Mapped[str] = mapped_column(
+        String(255), nullable=False, comment="정규화된 route template"
+    )
+    active_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="visible 상태에서 누적된 활성 체류 시간(ms)"
+    )
+    source: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        server_default="service-web",
+        comment="이벤트 소스",
+    )
+    taxonomy_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="route taxonomy version"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class SitePageRouteDaily(Base):
+    __tablename__ = "tb_site_page_route_daily"
+    __table_args__ = (
+        Index("idx_site_page_route_daily_route", "route_group", "route_name"),
+        Index("idx_site_page_route_daily_stat_date", "stat_date"),
+    )
+
+    stat_date: Mapped[date] = mapped_column(
+        Date, primary_key=True, nullable=False, comment="집계 일자(KST)"
+    )
+    route_group: Mapped[str] = mapped_column(
+        String(80), primary_key=True, nullable=False, comment="route 대분류"
+    )
+    route_name: Mapped[str] = mapped_column(
+        String(120), primary_key=True, nullable=False, comment="route 세부명"
+    )
+    path_template: Mapped[str] = mapped_column(
+        String(255), primary_key=True, nullable=False, comment="정규화된 route template"
+    )
+    page_view_count: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True), nullable=False, server_default="0", comment="페이지뷰 수"
+    )
+    visitor_count: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True),
+        nullable=False,
+        server_default="0",
+        comment="브라우저 기준 방문자 수",
+    )
+    session_count: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True), nullable=False, server_default="0", comment="브라우저 세션 수"
+    )
+    dwell_event_count: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True), nullable=False, server_default="0", comment="활성 체류 이벤트 수"
+    )
+    active_dwell_total_ms: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True),
+        nullable=False,
+        server_default="0",
+        comment="활성 체류 총합(ms)",
+    )
+    active_dwell_avg_ms: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True),
+        nullable=False,
+        server_default="0",
+        comment="활성 체류 평균(ms)",
+    )
+    short_dwell_count: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True),
+        nullable=False,
+        server_default="0",
+        comment="5초 미만 활성 체류 이벤트 수",
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
     )
 
 
