@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from app.routers.common import statistics_command
-from app.schemas.statistics import PostSitePageViewReqBody
+from app.schemas.statistics import PostSitePageDwellReqBody, PostSitePageViewReqBody
 from app.services.common import statistics_service
 from app.utils.auth import analysis_logger
 
@@ -16,6 +16,16 @@ class FakeResult:
 
     def one_or_none(self):
         return self._row
+
+    def first(self):
+        return self._row
+
+    def all(self):
+        if self._row is None:
+            return []
+        if isinstance(self._row, list):
+            return self._row
+        return [self._row]
 
 
 class FakeDb:
@@ -234,3 +244,111 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertNotIn(analysis_logger, dependency_calls)
+
+    async def test_guest_page_dwell_inserts_null_user_id_and_capped_active_ms(self):
+        db = FakeDb()
+
+        await statistics_service.insert_site_page_dwell_event(
+            db=db,
+            kc_user_id=None,
+            event_id="c4b7b9c2-8cc4-4b2e-9bf5-4f2e2f037001",
+            occurred_at=datetime(2026, 5, 23, 12, 34, 56, tzinfo=timezone.utc),
+            visitor_id="pv_guest",
+            session_id="pvs_guest",
+            route_group="viewer",
+            route_name="viewer_episode",
+            path_template="/viewer/[id]",
+            active_ms=31 * 60 * 1000,
+            source="service-web",
+            taxonomy_version=1,
+        )
+
+        insert_call = db.calls[-1]
+        self.assertIn("INSERT INTO tb_site_page_dwell_event", insert_call[0])
+        self.assertIsNone(insert_call[1]["user_id"])
+        self.assertEqual(insert_call[1]["active_ms"], 30 * 60 * 1000)
+        self.assertEqual(db.commits, 1)
+
+    def test_page_dwell_schema_rejects_subsecond_active_ms(self):
+        with self.assertRaises(ValueError):
+            PostSitePageDwellReqBody(
+                eventId="c4b7b9c2-8cc4-4b2e-9bf5-4f2e2f037001",
+                occurredAt="2026-05-23T12:34:56.789+09:00",
+                visitorId="pv_visitor",
+                sessionId="pvs_session",
+                routeGroup="viewer",
+                routeName="viewer_episode",
+                pathTemplate="/viewer/[id]",
+                activeMs=999,
+                source="service-web",
+                taxonomyVersion=1,
+            )
+
+    def test_page_dwell_router_does_not_attach_raw_analysis_logger(self):
+        page_dwell_route = next(
+            route
+            for route in statistics_command.router.routes
+            if getattr(route, "path", "").endswith("/page-dwell")
+        )
+
+        dependency_calls = [
+            dependency.call for dependency in page_dwell_route.dependant.dependencies
+        ]
+
+        self.assertNotIn(analysis_logger, dependency_calls)
+
+    async def test_site_page_route_statistics_reads_daily_mart_only(self):
+        db = FakeDb()
+
+        async def execute(query, params=None):
+            sql = str(query)
+            db.calls.append((sql, params))
+            if "COUNT(*) AS total_count" in sql:
+                return FakeResult({"total_count": 1})
+            if "route_group," in sql and "GROUP BY route_group" in sql:
+                return FakeResult(
+                    [
+                        {
+                            "route_group": "viewer",
+                            "route_name": "viewer_episode",
+                            "path_template": "/viewer/[id]",
+                            "page_view_count": 10,
+                            "visitor_count": 7,
+                            "session_count": 8,
+                            "dwell_event_count": 6,
+                            "active_dwell_total_ms": 120000,
+                            "active_dwell_avg_ms": 20000,
+                            "short_dwell_count": 1,
+                        }
+                    ]
+                )
+            return FakeResult(
+                {
+                    "page_view_count": 10,
+                    "visitor_count": 7,
+                    "session_count": 8,
+                    "dwell_event_count": 6,
+                    "active_dwell_total_ms": 120000,
+                    "active_dwell_avg_ms": 20000,
+                    "short_dwell_count": 1,
+                }
+            )
+
+        db.execute = execute
+
+        result = await statistics_service.site_page_route_statistics(
+            start_date="2026-05-20",
+            end_date="2026-05-23",
+            route_group="viewer",
+            page=1,
+            count_per_page=20,
+            db=db,
+        )
+
+        combined_sql = "\n".join(call[0] for call in db.calls)
+        self.assertIn("FROM tb_site_page_route_daily", combined_sql)
+        self.assertNotIn("tb_site_page_view_event", combined_sql)
+        self.assertNotIn("tb_site_page_dwell_event", combined_sql)
+        self.assertEqual(result["total_count"], 1)
+        self.assertEqual(result["results"][0]["route_group"], "viewer")
+        self.assertEqual(db.calls[0][1]["route_group"], "viewer")
