@@ -27,7 +27,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
 
         db.execute.assert_not_awaited()
 
-    async def test_update_ai_slot_feedback_flags_updates_click_and_continued(self):
+    async def test_next_episode_click_without_ai_taste_entry_does_not_mark_click(self):
         db = AsyncMock()
 
         await recommendation_service._update_ai_slot_feedback_flags(
@@ -37,7 +37,45 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
             db=db,
         )
 
+        self.assertEqual(db.execute.await_count, 1)
+        executed_sql = str(db.execute.await_args_list[0].args[0])
+        self.assertNotIn("SET target.clicked_yn = 'Y'", executed_sql)
+        self.assertIn("SET target.continued_3ep_yn = 'Y'", executed_sql)
+
+    async def test_next_episode_click_with_ai_taste_entry_marks_click_and_continued(self):
+        db = AsyncMock()
+
+        await recommendation_service._update_ai_slot_feedback_flags(
+            user_id=100,
+            product_id=200,
+            event_type="next_episode_click",
+            event_payload={"entry_source": "ai_taste_section"},
+            db=db,
+        )
+
         self.assertEqual(db.execute.await_count, 2)
+        clicked_sql = str(db.execute.await_args_list[0].args[0])
+        continued_sql = str(db.execute.await_args_list[1].args[0])
+        self.assertIn("SET target.clicked_yn = 'Y'", clicked_sql)
+        self.assertIn("tb_user_ai_signal_event seed", clicked_sql)
+        self.assertIn("seed.event_type = 'taste_slot_click'", clicked_sql)
+        self.assertIn("seed.created_date >= s.served_at", clicked_sql)
+        self.assertIn("SET target.continued_3ep_yn = 'Y'", continued_sql)
+
+    async def test_taste_slot_click_marks_click_only(self):
+        db = AsyncMock()
+
+        await recommendation_service._update_ai_slot_feedback_flags(
+            user_id=100,
+            product_id=200,
+            event_type="taste_slot_click",
+            event_payload={"source": "ai_taste_section"},
+            db=db,
+        )
+
+        self.assertEqual(db.execute.await_count, 1)
+        executed_sql = str(db.execute.await_args_list[0].args[0])
+        self.assertIn("SET target.clicked_yn = 'Y'", executed_sql)
 
     async def test_score_engagement_for_recommendation_prefers_strong_read_signals(self):
         strong = {
