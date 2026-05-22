@@ -4,6 +4,28 @@ import unittest
 from html.parser import HTMLParser
 from types import ModuleType, SimpleNamespace
 
+_STUBBED_MODULE_NAMES = (
+    "fastapi.responses",
+    "sqlalchemy",
+    "sqlalchemy.ext",
+    "sqlalchemy.ext.asyncio",
+    "app.const",
+    "app.utils.response",
+    "bs4",
+)
+_MISSING = object()
+_ORIGINAL_MODULES = {
+    name: sys.modules.get(name, _MISSING) for name in _STUBBED_MODULE_NAMES
+}
+
+
+def _restore_stubbed_modules():
+    for name, module in _ORIGINAL_MODULES.items():
+        if module is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
 
 class _StreamingResponse:
     def __init__(self, *args, **kwargs):
@@ -13,7 +35,7 @@ class _StreamingResponse:
 
 fastapi_responses_stub = ModuleType("fastapi.responses")
 fastapi_responses_stub.StreamingResponse = _StreamingResponse
-sys.modules.setdefault("fastapi.responses", fastapi_responses_stub)
+sys.modules["fastapi.responses"] = fastapi_responses_stub
 
 class _SqlText:
     def __init__(self, sql: str):
@@ -27,21 +49,21 @@ sqlalchemy_stub = ModuleType("sqlalchemy")
 sqlalchemy_stub.RowMapping = object
 sqlalchemy_stub.text = lambda value, *args, **kwargs: _SqlText(value)
 sqlalchemy_stub.bindparam = lambda *args, **kwargs: None
-sys.modules.setdefault("sqlalchemy", sqlalchemy_stub)
+sys.modules["sqlalchemy"] = sqlalchemy_stub
 
 sqlalchemy_ext_stub = ModuleType("sqlalchemy.ext")
-sys.modules.setdefault("sqlalchemy.ext", sqlalchemy_ext_stub)
+sys.modules["sqlalchemy.ext"] = sqlalchemy_ext_stub
 
 sqlalchemy_asyncio_stub = ModuleType("sqlalchemy.ext.asyncio")
 sqlalchemy_asyncio_stub.AsyncSession = object
-sys.modules.setdefault("sqlalchemy.ext.asyncio", sqlalchemy_asyncio_stub)
+sys.modules["sqlalchemy.ext.asyncio"] = sqlalchemy_asyncio_stub
 
 const_stub = ModuleType("app.const")
 const_stub.CommonConstants = SimpleNamespace(COMPANY_LIKENOVEL="라이크노벨")
 const_stub.ErrorMessages = SimpleNamespace(NOT_FOUND_PRODUCT="NOT_FOUND_PRODUCT")
 const_stub.LOGGER_TYPE = SimpleNamespace(LOGGER_FILE_NAME_FOR_SERVICE_ERROR="test.log")
 const_stub.settings = SimpleNamespace(DB_DML_DEFAULT_ID=0)
-sys.modules.setdefault("app.const", const_stub)
+sys.modules["app.const"] = const_stub
 
 response_stub = ModuleType("app.utils.response")
 response_stub.CustomResponseException = type(
@@ -50,7 +72,7 @@ response_stub.CustomResponseException = type(
 response_stub.check_exists_or_404 = lambda *args, **kwargs: None
 response_stub.build_list_response = lambda *args, **kwargs: {}
 response_stub.build_paginated_response = lambda *args, **kwargs: {}
-sys.modules.setdefault("app.utils.response", response_stub)
+sys.modules["app.utils.response"] = response_stub
 
 
 class _NavigableString(str):
@@ -122,9 +144,12 @@ bs4_stub = ModuleType("bs4")
 bs4_stub.BeautifulSoup = _beautiful_soup
 bs4_stub.NavigableString = _NavigableString
 bs4_stub.Tag = _Tag
-sys.modules.setdefault("bs4", bs4_stub)
+sys.modules["bs4"] = bs4_stub
 
-from app.services.admin.admin_blind_service import _html_to_plain_text, batch_monopoly
+try:
+    from app.services.admin.admin_blind_service import _html_to_plain_text, batch_monopoly
+finally:
+    _restore_stubbed_modules()
 
 
 class _FakeExecuteResult:
