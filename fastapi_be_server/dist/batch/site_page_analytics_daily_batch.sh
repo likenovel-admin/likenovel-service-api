@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/batch_timestamp_logging.sh"
 enable_timestamped_logging
 # shellcheck source=/dev/null
+source "${SCRIPT_DIR}/cron_env.sh"
+# shellcheck source=/dev/null
 source "${SCRIPT_DIR}/batch_advisory_lock.sh"
 
 BATCH_NAME="site_page_analytics_daily_batch"
