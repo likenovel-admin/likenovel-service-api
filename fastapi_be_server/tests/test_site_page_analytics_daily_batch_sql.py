@@ -42,7 +42,15 @@ class SitePageAnalyticsDailyBatchSqlTest(unittest.TestCase):
         self.assertIn("@site_page_analytics_target_date", sql)
         self.assertIn("delete from tb_site_page_route_daily", sql)
         self.assertIn("stat_date = @site_page_analytics_target_date", sql)
-        self.assertIn("insert into tb_site_page_route_daily", sql)
+        self.assertEqual(sql.count("insert into tb_site_page_route_daily"), 2)
+
+    def test_site_page_analytics_batch_avoids_temp_table_reopen_pattern(self):
+        sql = _batch_sql().lower()
+
+        self.assertNotIn("union all", sql)
+        self.assertIn("left join tmp_site_page_route_dwell", sql)
+        self.assertIn("left join tmp_site_page_route_pv", sql)
+        self.assertIn("where pv.path_template is null", sql)
 
     def test_site_page_analytics_shell_uses_advisory_lock_and_manual_date(self):
         script = _batch_sh()

@@ -102,8 +102,23 @@ FROM tmp_site_page_route_pv pv
 LEFT JOIN tmp_site_page_route_dwell dw
   ON dw.route_group = pv.route_group
  AND dw.route_name = pv.route_name
- AND dw.path_template = pv.path_template
-UNION ALL
+ AND dw.path_template = pv.path_template;
+
+INSERT INTO tb_site_page_route_daily (
+    stat_date,
+    route_group,
+    route_name,
+    path_template,
+    page_view_count,
+    visitor_count,
+    session_count,
+    dwell_event_count,
+    active_dwell_total_ms,
+    active_dwell_avg_ms,
+    short_dwell_count,
+    created_date,
+    updated_date
+)
 SELECT
     @site_page_analytics_target_date AS stat_date,
     dw.route_group,
