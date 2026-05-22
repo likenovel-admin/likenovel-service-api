@@ -44,4 +44,5 @@ class SitePageAnalyticsDailyBatchSqlTest(unittest.TestCase):
         self.assertIn("run_sql_with_advisory_lock", script)
         self.assertIn("lk_site_page_analytics_daily_batch", script)
         self.assertIn("BATCH_DATE", script)
+        self.assertIn('source "${SCRIPT_DIR}/cron_env.sh"', script)
         self.assertIn("site_page_analytics_daily_batch.sql", script)
