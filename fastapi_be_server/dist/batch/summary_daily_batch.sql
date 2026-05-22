@@ -93,6 +93,8 @@ update tb_product_trend_index a
         select product_id, coalesce(count_hit, 0) as count_hit
           from tb_product_episode
          where episode_no = 4
+           and use_yn = 'Y'
+           and open_yn = 'Y'
       ) ep4
       inner join (
         select pe.product_id, coalesce(pe.count_hit, 0) as count_hit
@@ -100,9 +102,13 @@ update tb_product_trend_index a
          inner join (
             select product_id, max(episode_no) - 3 as target_no
               from tb_product_episode
+             where use_yn = 'Y'
+               and open_yn = 'Y'
              group by product_id
             having count(*) >= 15
          ) mx on pe.product_id = mx.product_id and pe.episode_no = mx.target_no
+          where pe.use_yn = 'Y'
+           and pe.open_yn = 'Y'
       ) ep_recent on ep4.product_id = ep_recent.product_id
   ) as t on a.product_id = t.product_id
    set a.reading_rate = t.reading_rate
