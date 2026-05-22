@@ -3,139 +3,7 @@ import unittest
 import sys
 from types import ModuleType, SimpleNamespace
 
-
-fastapi_stub = ModuleType("fastapi")
-fastapi_stub.status = SimpleNamespace(
-    HTTP_400_BAD_REQUEST=400,
-    HTTP_401_UNAUTHORIZED=401,
-    HTTP_403_FORBIDDEN=403,
-    HTTP_404_NOT_FOUND=404,
-    HTTP_422_UNPROCESSABLE_ENTITY=422,
-)
-sys.modules.setdefault("fastapi", fastapi_stub)
-
-sqlalchemy_stub = ModuleType("sqlalchemy")
-sqlalchemy_stub.RowMapping = object
-sqlalchemy_stub.text = lambda value: value
-sys.modules.setdefault("sqlalchemy", sqlalchemy_stub)
-
-sqlalchemy_exc_stub = ModuleType("sqlalchemy.exc")
-sqlalchemy_exc_stub.OperationalError = Exception
-sqlalchemy_exc_stub.SQLAlchemyError = Exception
-sys.modules.setdefault("sqlalchemy.exc", sqlalchemy_exc_stub)
-
-sqlalchemy_ext_stub = ModuleType("sqlalchemy.ext")
-sys.modules.setdefault("sqlalchemy.ext", sqlalchemy_ext_stub)
-
-sqlalchemy_asyncio_stub = ModuleType("sqlalchemy.ext.asyncio")
-sqlalchemy_asyncio_stub.AsyncSession = object
-sys.modules.setdefault("sqlalchemy.ext.asyncio", sqlalchemy_asyncio_stub)
-
-const_stub = ModuleType("app.const")
-const_stub.CommonConstants = SimpleNamespace(COMPANY_LIKENOVEL="라이크노벨")
-const_stub.ErrorMessages = SimpleNamespace(
-    EXPIRED_ACCESS_TOKEN="expired",
-    FORBIDDEN="forbidden",
-    LOGIN_REQUIRED="login required",
-)
-const_stub.LOGGER_TYPE = SimpleNamespace(LOGGER_FILE_NAME_FOR_SERVICE_ERROR="test.log")
-const_stub.settings = SimpleNamespace(DB_DML_DEFAULT_ID=0)
-sys.modules.setdefault("app.const", const_stub)
-
-exceptions_stub = ModuleType("app.exceptions")
-
-
-class CustomResponseException(Exception):
-    def __init__(self, status_code=None, message=None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
-
-
-exceptions_stub.CustomResponseException = CustomResponseException
-sys.modules.setdefault("app.exceptions", exceptions_stub)
-
-schemas_partner_stub = ModuleType("app.schemas.partner")
-schemas_partner_stub.PutProductReqBody = object
-sys.modules.setdefault("app.schemas", ModuleType("app.schemas"))
-sys.modules.setdefault("app.schemas.partner", schemas_partner_stub)
-
-schemas_product_stub = ModuleType("app.schemas.product")
-schemas_product_stub.PostProductsReqBody = object
-schemas_product_stub.PutProductsProductIdReqBody = object
-schemas_product_stub.PostProductReportReqBody = object
-schemas_product_stub.GetProductsGenresToCamel = object
-sys.modules.setdefault("app.schemas.product", schemas_product_stub)
-
-schemas_user_giftbook_stub = ModuleType("app.schemas.user_giftbook")
-sys.modules.setdefault("app.schemas.user_giftbook", schemas_user_giftbook_stub)
-
-utils_time_stub = ModuleType("app.utils.time")
-utils_time_stub.convert_to_kor_time = lambda value: value
-sys.modules.setdefault("app.utils.time", utils_time_stub)
-
-utils_response_stub = ModuleType("app.utils.response")
-utils_response_stub.CustomResponseException = type(
-    "CustomResponseException", (Exception,), {}
-)
-utils_response_stub.build_list_response = lambda *args, **kwargs: {}
-utils_response_stub.build_paginated_response = lambda *args, **kwargs: {}
-utils_response_stub.check_exists_or_404 = lambda *args, **kwargs: None
-sys.modules.setdefault("app.utils.response", utils_response_stub)
-
-utils_query_stub = ModuleType("app.utils.query")
-utils_query_stub.build_update_query = lambda *args, **kwargs: ("", {})
-utils_query_stub.get_file_path_sub_query = lambda *args, **kwargs: "NULL"
-utils_query_stub.get_pagination_params = lambda *args, **kwargs: (1, 20, 0)
-sys.modules.setdefault("app.utils.query", utils_query_stub)
-
-cp_link_stub = ModuleType("app.services.common.cp_link_service")
-cp_link_stub.get_accepted_cp_info_map_by_user_ids = None
-cp_link_stub.get_accepted_cp_info_by_nickname = None
-cp_link_stub.get_accepted_cp_info_by_user_id = None
-cp_link_stub.normalize_cp_nickname = lambda value: value.strip() if isinstance(value, str) and value.strip() else None
-sys.modules.setdefault("app.services.common", ModuleType("app.services.common"))
-sys.modules.setdefault("app.services.common.cp_link_service", cp_link_stub)
-
-comm_service_stub = ModuleType("app.services.common.comm_service")
-comm_service_stub.get_user_from_kc = None
-sys.modules.setdefault("app.services.common.comm_service", comm_service_stub)
-
-log_config_stub = ModuleType("app.config.log_config")
-log_config_stub.service_error_logger = lambda *args, **kwargs: None
-sys.modules.setdefault("app.config", ModuleType("app.config"))
-sys.modules.setdefault("app.config.log_config", log_config_stub)
-
-statistics_service_stub = ModuleType("app.services.common.statistics_service")
-sys.modules.setdefault("app.services.common.statistics_service", statistics_service_stub)
-
-user_giftbook_service_stub = ModuleType("app.services.user.user_giftbook_service")
-sys.modules.setdefault("app.services.user", ModuleType("app.services.user"))
-sys.modules.setdefault(
-    "app.services.user.user_giftbook_service", user_giftbook_service_stub
-)
-
-event_reward_service_stub = ModuleType("app.services.event.event_reward_service")
-sys.modules.setdefault("app.services.event", ModuleType("app.services.event"))
-sys.modules.setdefault(
-    "app.services.event.event_reward_service", event_reward_service_stub
-)
-
-
-from app.services.partner.partner_product_service import (
-    _can_update_paid_monopoly,
-    _is_paid_apply_monopoly_locked,
-    _resolve_cp_link_update_values,
-)
-from app.services.product.product_service import (
-    get_products_validate_cp_nickname,
-    _resolve_reenabled_websochat_context_status,
-    _resolve_product_cp_link_update_values,
-)
-import app.services.product.product_service as product_service_module
-
-
-for _stubbed_module_name in [
+_STUBBED_MODULE_NAMES = (
     "fastapi",
     "sqlalchemy",
     "sqlalchemy.exc",
@@ -160,8 +28,149 @@ for _stubbed_module_name in [
     "app.services.user.user_giftbook_service",
     "app.services.event",
     "app.services.event.event_reward_service",
-]:
-    sys.modules.pop(_stubbed_module_name, None)
+)
+_MISSING = object()
+_ORIGINAL_MODULES = {
+    name: sys.modules.get(name, _MISSING) for name in _STUBBED_MODULE_NAMES
+}
+
+
+def _restore_stubbed_modules():
+    for name, module in _ORIGINAL_MODULES.items():
+        if module is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
+fastapi_stub = ModuleType("fastapi")
+fastapi_stub.status = SimpleNamespace(
+    HTTP_400_BAD_REQUEST=400,
+    HTTP_401_UNAUTHORIZED=401,
+    HTTP_403_FORBIDDEN=403,
+    HTTP_404_NOT_FOUND=404,
+    HTTP_422_UNPROCESSABLE_ENTITY=422,
+)
+sys.modules["fastapi"] = fastapi_stub
+
+sqlalchemy_stub = ModuleType("sqlalchemy")
+sqlalchemy_stub.RowMapping = object
+sqlalchemy_stub.text = lambda value: value
+sys.modules["sqlalchemy"] = sqlalchemy_stub
+
+sqlalchemy_exc_stub = ModuleType("sqlalchemy.exc")
+sqlalchemy_exc_stub.OperationalError = Exception
+sqlalchemy_exc_stub.SQLAlchemyError = Exception
+sys.modules["sqlalchemy.exc"] = sqlalchemy_exc_stub
+
+sqlalchemy_ext_stub = ModuleType("sqlalchemy.ext")
+sys.modules["sqlalchemy.ext"] = sqlalchemy_ext_stub
+
+sqlalchemy_asyncio_stub = ModuleType("sqlalchemy.ext.asyncio")
+sqlalchemy_asyncio_stub.AsyncSession = object
+sys.modules["sqlalchemy.ext.asyncio"] = sqlalchemy_asyncio_stub
+
+const_stub = ModuleType("app.const")
+const_stub.CommonConstants = SimpleNamespace(COMPANY_LIKENOVEL="라이크노벨")
+const_stub.ErrorMessages = SimpleNamespace(
+    EXPIRED_ACCESS_TOKEN="expired",
+    FORBIDDEN="forbidden",
+    LOGIN_REQUIRED="login required",
+)
+const_stub.LOGGER_TYPE = SimpleNamespace(LOGGER_FILE_NAME_FOR_SERVICE_ERROR="test.log")
+const_stub.settings = SimpleNamespace(DB_DML_DEFAULT_ID=0)
+sys.modules["app.const"] = const_stub
+
+exceptions_stub = ModuleType("app.exceptions")
+
+
+class CustomResponseException(Exception):
+    def __init__(self, status_code=None, message=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+exceptions_stub.CustomResponseException = CustomResponseException
+sys.modules["app.exceptions"] = exceptions_stub
+
+schemas_partner_stub = ModuleType("app.schemas.partner")
+schemas_partner_stub.PutProductReqBody = object
+sys.modules["app.schemas"] = ModuleType("app.schemas")
+sys.modules["app.schemas.partner"] = schemas_partner_stub
+
+schemas_product_stub = ModuleType("app.schemas.product")
+schemas_product_stub.PostProductsReqBody = object
+schemas_product_stub.PutProductsProductIdReqBody = object
+schemas_product_stub.PostProductReportReqBody = object
+schemas_product_stub.GetProductsGenresToCamel = object
+sys.modules["app.schemas.product"] = schemas_product_stub
+
+schemas_user_giftbook_stub = ModuleType("app.schemas.user_giftbook")
+sys.modules["app.schemas.user_giftbook"] = schemas_user_giftbook_stub
+
+utils_time_stub = ModuleType("app.utils.time")
+utils_time_stub.convert_to_kor_time = lambda value: value
+sys.modules["app.utils.time"] = utils_time_stub
+
+utils_response_stub = ModuleType("app.utils.response")
+utils_response_stub.CustomResponseException = type(
+    "CustomResponseException", (Exception,), {}
+)
+utils_response_stub.build_list_response = lambda *args, **kwargs: {}
+utils_response_stub.build_paginated_response = lambda *args, **kwargs: {}
+utils_response_stub.check_exists_or_404 = lambda *args, **kwargs: None
+sys.modules["app.utils.response"] = utils_response_stub
+
+utils_query_stub = ModuleType("app.utils.query")
+utils_query_stub.build_update_query = lambda *args, **kwargs: ("", {})
+utils_query_stub.get_file_path_sub_query = lambda *args, **kwargs: "NULL"
+utils_query_stub.get_pagination_params = lambda *args, **kwargs: (1, 20, 0)
+sys.modules["app.utils.query"] = utils_query_stub
+
+cp_link_stub = ModuleType("app.services.common.cp_link_service")
+cp_link_stub.get_accepted_cp_info_map_by_user_ids = None
+cp_link_stub.get_accepted_cp_info_by_nickname = None
+cp_link_stub.get_accepted_cp_info_by_user_id = None
+cp_link_stub.normalize_cp_nickname = lambda value: value.strip() if isinstance(value, str) and value.strip() else None
+sys.modules["app.services.common"] = ModuleType("app.services.common")
+sys.modules["app.services.common.cp_link_service"] = cp_link_stub
+
+comm_service_stub = ModuleType("app.services.common.comm_service")
+comm_service_stub.get_user_from_kc = None
+sys.modules["app.services.common.comm_service"] = comm_service_stub
+
+log_config_stub = ModuleType("app.config.log_config")
+log_config_stub.service_error_logger = lambda *args, **kwargs: None
+sys.modules["app.config"] = ModuleType("app.config")
+sys.modules["app.config.log_config"] = log_config_stub
+
+statistics_service_stub = ModuleType("app.services.common.statistics_service")
+sys.modules["app.services.common.statistics_service"] = statistics_service_stub
+
+user_giftbook_service_stub = ModuleType("app.services.user.user_giftbook_service")
+sys.modules["app.services.user"] = ModuleType("app.services.user")
+sys.modules["app.services.user.user_giftbook_service"] = user_giftbook_service_stub
+
+event_reward_service_stub = ModuleType("app.services.event.event_reward_service")
+sys.modules["app.services.event"] = ModuleType("app.services.event")
+sys.modules["app.services.event.event_reward_service"] = event_reward_service_stub
+
+
+try:
+    from app.services.partner.partner_product_service import (
+        _can_update_paid_monopoly,
+        _is_paid_apply_monopoly_locked,
+        _resolve_cp_link_update_values,
+    )
+    from app.services.product.product_service import (
+        get_products_validate_cp_nickname,
+        _resolve_reenabled_websochat_context_status,
+        _resolve_product_cp_link_update_values,
+    )
+    import app.services.product.product_service as product_service_module
+finally:
+    _restore_stubbed_modules()
 
 
 class ProductMonopolyPolicyUnitTest(unittest.TestCase):

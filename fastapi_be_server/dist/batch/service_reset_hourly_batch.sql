@@ -8,6 +8,17 @@ update tb_cms_batch_job_process a
 
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
 
+SET @recent_24h_basis_at = STR_TO_DATE(
+    DATE_FORMAT(
+        CASE
+            WHEN MINUTE(NOW()) < 30 THEN DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            ELSE NOW()
+        END,
+        '%Y-%m-%d %H:30:00'
+    ),
+    '%Y-%m-%d %H:%i:%s'
+);
+
 start transaction;
 
 -- 기존 랭킹을 임시 테이블에 저장 (privious_rank 계산용)
@@ -284,11 +295,53 @@ select 'paidMainTop'
 DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank;
 DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank_area;
 
+commit;
+
+INSERT INTO tb_product_hit_snapshot_hourly (
+    basis_at, product_id, count_hit, created_id, updated_id
+)
+SELECT @recent_24h_basis_at
+     , p.product_id
+     , GREATEST(COALESCE(p.count_hit, 0), 0)
+     , 0
+     , 0
+  FROM tb_product p
+ WHERE p.use_yn = 'Y'
+ON DUPLICATE KEY UPDATE
+    count_hit = VALUES(count_hit),
+    updated_id = 0,
+    updated_date = CURRENT_TIMESTAMP;
+
+INSERT INTO tb_product_episode_hit_snapshot_hourly (
+    basis_at, product_id, episode_id, episode_no, count_hit, created_id, updated_id
+)
+SELECT @recent_24h_basis_at
+     , e.product_id
+     , e.episode_id
+     , e.episode_no
+     , GREATEST(COALESCE(e.count_hit, 0), 0)
+     , 0
+     , 0
+  FROM tb_product_episode e
+ INNER JOIN tb_product p
+    ON p.product_id = e.product_id
+   AND p.use_yn = 'Y'
+ WHERE e.use_yn = 'Y'
+ON DUPLICATE KEY UPDATE
+    episode_no = VALUES(episode_no),
+    count_hit = VALUES(count_hit),
+    updated_id = 0,
+    updated_date = CURRENT_TIMESTAMP;
+
+DELETE FROM tb_product_episode_hit_snapshot_hourly
+ WHERE basis_at < DATE_SUB(@recent_24h_basis_at, INTERVAL 7 DAY);
+
+DELETE FROM tb_product_hit_snapshot_hourly
+ WHERE basis_at < DATE_SUB(@recent_24h_basis_at, INTERVAL 7 DAY);
+
 update tb_cms_batch_job_process a
    set a.completed_yn = 'Y'
      , a.created_id = 0
      , a.updated_id = 0
  where a.job_file_id = 'service_reset_hourly_batch.sh'
 ;
-
-commit;

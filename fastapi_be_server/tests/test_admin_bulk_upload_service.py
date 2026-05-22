@@ -2,36 +2,66 @@ import unittest
 import sys
 from types import ModuleType, SimpleNamespace
 
-sys.modules.setdefault("pandas", ModuleType("pandas"))
+_STUBBED_MODULE_NAMES = (
+    "pandas",
+    "bs4",
+    "app.const",
+    "app.services.common",
+    "app.utils.query",
+    "sqlalchemy",
+    "sqlalchemy.ext",
+    "sqlalchemy.ext.asyncio",
+)
+_MISSING = object()
+_ORIGINAL_MODULES = {
+    name: sys.modules.get(name, _MISSING) for name in _STUBBED_MODULE_NAMES
+}
+
+
+def _restore_stubbed_modules():
+    for name, module in _ORIGINAL_MODULES.items():
+        if module is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
+sys.modules["pandas"] = ModuleType("pandas")
 
 bs4_stub = ModuleType("bs4")
 bs4_stub.BeautifulSoup = object
-sys.modules.setdefault("bs4", bs4_stub)
+sys.modules["bs4"] = bs4_stub
 
 const_stub = ModuleType("app.const")
 const_stub.settings = SimpleNamespace()
-sys.modules.setdefault("app.const", const_stub)
+sys.modules["app.const"] = const_stub
 
 common_stub = ModuleType("app.services.common")
 common_stub.comm_service = SimpleNamespace()
-sys.modules.setdefault("app.services.common", common_stub)
+sys.modules["app.services.common"] = common_stub
 
 query_stub = ModuleType("app.utils.query")
 query_stub.get_file_path_sub_query = lambda *args, **kwargs: None
-sys.modules.setdefault("app.utils.query", query_stub)
+sys.modules["app.utils.query"] = query_stub
 
 sqlalchemy_stub = ModuleType("sqlalchemy")
 sqlalchemy_stub.text = lambda *args, **kwargs: None
-sys.modules.setdefault("sqlalchemy", sqlalchemy_stub)
+sys.modules["sqlalchemy"] = sqlalchemy_stub
 
 sqlalchemy_ext_stub = ModuleType("sqlalchemy.ext")
-sys.modules.setdefault("sqlalchemy.ext", sqlalchemy_ext_stub)
+sys.modules["sqlalchemy.ext"] = sqlalchemy_ext_stub
 
 sqlalchemy_asyncio_stub = ModuleType("sqlalchemy.ext.asyncio")
 sqlalchemy_asyncio_stub.AsyncSession = object
-sys.modules.setdefault("sqlalchemy.ext.asyncio", sqlalchemy_asyncio_stub)
+sys.modules["sqlalchemy.ext.asyncio"] = sqlalchemy_asyncio_stub
 
-from app.services.admin.admin_bulk_upload_service import _normalize_episode_no_map, _txt_to_html
+try:
+    from app.services.admin.admin_bulk_upload_service import (
+        _normalize_episode_no_map,
+        _txt_to_html,
+    )
+finally:
+    _restore_stubbed_modules()
 
 
 class AdminBulkUploadServiceUnitTest(unittest.TestCase):

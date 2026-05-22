@@ -111,6 +111,7 @@ AI_SLOT_FEEDBACK_SIGNAL_EVENTS = {
     "latest_episode_reached",
     "next_episode_click",
 }
+AI_TASTE_ENTRY_SOURCE = "ai_taste_section"
 AI_SLOT_FEEDBACK_WINDOW_DAYS = 30
 AI_SLOT_FEEDBACK_MIN_EPISODES = 3
 ENGAGEMENT_SAMPLE_TARGET = 20
@@ -808,6 +809,16 @@ def _is_exit_episode_view(event_type: str, payload: dict | None) -> bool:
     return trigger == "exit"
 
 
+def _has_ai_taste_entry_source(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    for key in ("entry_source", "entrySource", "source"):
+        if str(payload.get(key) or "").strip().lower() == AI_TASTE_ENTRY_SOURCE:
+            return True
+    return False
+
+
 def _compute_signal_factor_score_multiplier(
     event_type: str,
     payload: dict | None,
@@ -1270,6 +1281,7 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
             user_id=user_id,
             product_id=product_id,
             event_type=event_type,
+            event_payload=payload,
             db=db,
         )
     except Exception as e:
@@ -1291,6 +1303,7 @@ async def _update_ai_slot_feedback_flags(
     product_id: int,
     event_type: str,
     db: AsyncSession,
+    event_payload: dict | None = None,
 ) -> None:
     if user_id <= 0 or product_id <= 0:
         return
@@ -1304,7 +1317,26 @@ async def _update_ai_slot_feedback_flags(
         "product_id": product_id,
     }
 
-    if normalized_event_type == "taste_slot_click":
+    should_mark_click = normalized_event_type == "taste_slot_click" or (
+        normalized_event_type == "next_episode_click"
+        and _has_ai_taste_entry_source(event_payload)
+    )
+    taste_slot_seed_guard = ""
+    if normalized_event_type == "next_episode_click":
+        taste_slot_seed_guard = """
+                  AND EXISTS (
+                        SELECT 1
+                        FROM tb_user_ai_signal_event seed
+                        WHERE seed.user_id = s.user_id
+                          AND seed.product_id = s.product_id
+                          AND seed.event_type = 'taste_slot_click'
+                          AND seed.created_date >= s.served_at
+                          AND seed.created_date <= NOW()
+                        LIMIT 1
+                    )
+        """
+
+    if should_mark_click:
         click_query = text(
             f"""
             UPDATE tb_ai_slot_serving_log target
@@ -1314,6 +1346,7 @@ async def _update_ai_slot_feedback_flags(
                 WHERE s.user_id = :user_id
                   AND s.product_id = :product_id
                   AND s.clicked_yn = 'N'
+{taste_slot_seed_guard}
                   AND s.served_at >= DATE_SUB(NOW(), INTERVAL {AI_SLOT_FEEDBACK_WINDOW_DAYS} DAY)
                   AND s.served_at > COALESCE(
                         (
@@ -1333,7 +1366,8 @@ async def _update_ai_slot_feedback_flags(
             """
         )
         await db.execute(click_query, params)
-        return
+        if normalized_event_type == "taste_slot_click":
+            return
 
     continued_query = text(
         f"""
