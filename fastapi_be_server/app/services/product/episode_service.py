@@ -929,6 +929,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                         query = text("""
                                             update tb_user_product_usage
                                             set updated_id = :user_id
+                                                , updated_date = NOW()
                                             where id = :id
                                             """)
 

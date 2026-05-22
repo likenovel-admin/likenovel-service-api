@@ -1,8 +1,10 @@
 import logging
+import re
 from fastapi import status
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from app.const import CommonConstants, settings
 from app.exceptions import CustomResponseException
@@ -53,6 +55,34 @@ AI_READER_ENGAGEMENT_SUMMARY_KEYS = (
     "drop_count",
 )
 
+SITE_PAGE_VIEW_ROUTE_GROUPS = {
+    "home",
+    "viewer",
+    "product_detail",
+    "search",
+    "ranking",
+    "websochat",
+    "event",
+    "promotion",
+    "review",
+    "quest",
+    "notice",
+    "faq",
+    "mypage",
+    "auth",
+    "payment",
+    "author",
+    "legal",
+    "system",
+    "catalog",
+    "support",
+    "message",
+    "preference",
+    "present",
+    "vote",
+    "unknown",
+}
+
 
 def _allowed_ai_reader_account_domains() -> list[str]:
     return [
@@ -60,6 +90,140 @@ def _allowed_ai_reader_account_domains() -> list[str]:
         for domain in settings.AI_READER_ACCOUNT_ALLOWED_DOMAINS.split(",")
         if domain.strip()
     ]
+
+
+def _limit_text(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    return value[:limit]
+
+
+def _sanitize_page_view_path(path: str | None) -> str:
+    if not path:
+        return "/"
+    sanitized = path.split("?", 1)[0].split("#", 1)[0]
+    if not sanitized.startswith("/"):
+        sanitized = "/" + sanitized
+    return sanitized[:255]
+
+
+def _normalize_site_page_view_route_group(route_group: str | None) -> str:
+    if route_group in SITE_PAGE_VIEW_ROUTE_GROUPS:
+        return route_group
+    return "unknown"
+
+
+def _normalize_site_page_view_source(source: str | None) -> str:
+    if source == "service-web":
+        return "service-web"
+    return "service-web"
+
+
+def _normalize_site_page_view_query_hash(query_hash: str | None) -> str | None:
+    if query_hash is None:
+        return None
+    normalized = query_hash.lower()
+    if re.fullmatch(r"[0-9a-f]{64}", normalized):
+        return normalized
+    return None
+
+
+def _normalize_page_view_occurred_at(occurred_at: datetime) -> datetime:
+    if occurred_at.tzinfo is None:
+        return occurred_at
+    return occurred_at.astimezone(ZoneInfo(settings.KOREA_TIMEZONE)).replace(
+        tzinfo=None
+    )
+
+
+async def insert_site_page_view_event(
+    db: AsyncSession,
+    kc_user_id: str | None,
+    event_id: str,
+    occurred_at: datetime,
+    visitor_id: str,
+    session_id: str,
+    route_group: str,
+    route_name: str,
+    path_template: str,
+    path: str,
+    query_hash: str | None,
+    referrer_path: str | None,
+    source: str,
+    taxonomy_version: int,
+):
+    user_id = None
+    if kc_user_id:
+        user_query = text("""
+            SELECT user_id
+            FROM tb_user
+            WHERE kc_user_id = :kc_user_id
+        """)
+        result = await db.execute(user_query, {"kc_user_id": kc_user_id})
+        row = result.mappings().one_or_none()
+        if row is not None:
+            user_id = row.get("user_id")
+
+    normalized_route_group = _normalize_site_page_view_route_group(route_group)
+    sanitized_path = _sanitize_page_view_path(path)
+    sanitized_referrer_path = (
+        _sanitize_page_view_path(referrer_path) if referrer_path else None
+    )
+
+    query = text("""
+        INSERT INTO tb_site_page_view_event (
+            event_id,
+            occurred_at,
+            user_id,
+            visitor_id,
+            session_id,
+            route_group,
+            route_name,
+            path_template,
+            path,
+            query_hash,
+            referrer_path,
+            source,
+            taxonomy_version,
+            created_date
+        )
+        VALUES (
+            :event_id,
+            :occurred_at,
+            :user_id,
+            :visitor_id,
+            :session_id,
+            :route_group,
+            :route_name,
+            :path_template,
+            :path,
+            :query_hash,
+            :referrer_path,
+            :source,
+            :taxonomy_version,
+            NOW()
+        )
+        ON DUPLICATE KEY UPDATE event_id = event_id
+    """)
+    await db.execute(
+        query,
+        {
+            "event_id": event_id,
+            "occurred_at": _normalize_page_view_occurred_at(occurred_at),
+            "user_id": user_id,
+            "visitor_id": _limit_text(visitor_id, 80),
+            "session_id": _limit_text(session_id, 80),
+            "route_group": normalized_route_group,
+            "route_name": _limit_text(route_name or "unknown", 120),
+            "path_template": _limit_text(_sanitize_page_view_path(path_template), 255),
+            "path": sanitized_path,
+            "query_hash": _normalize_site_page_view_query_hash(query_hash),
+            "referrer_path": sanitized_referrer_path,
+            "source": _normalize_site_page_view_source(source),
+            "taxonomy_version": taxonomy_version or 1,
+        },
+    )
+    await db.commit()
 
 
 async def site_statistics(

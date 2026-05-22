@@ -742,6 +742,25 @@ async def product_statistics_list(
 
 
 @router.get(
+    "/product-recent-24h-statistics/{product_id}",
+    tags=["파트너 - 작품별 통계"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_recent_24h_statistics(
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    user_data = await check_user(kc_user_id=user.get("sub"), db=db)
+
+    return await partner_statistics_service.product_recent_24h_statistics(
+        product_id=product_id,
+        db=db,
+        user_data=user_data,
+    )
+
+
+@router.get(
     "/product-statistics/all",
     tags=["파트너 - 작품별 통계"],
     responses={
