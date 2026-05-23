@@ -2,10 +2,13 @@
 
 # dev 백엔드 서버 새로운 배포 버전으로 재기동
 
-sudo chown -R ln-admin:ln-admin /home/ln-admin/likenovel/api-dev
-sudo chmod -R 700 /home/ln-admin/likenovel/api-dev
+APP_DIR=/home/ln-admin/likenovel/api-dev
+SERVICE_NAME=likenovel-api-dev.service
 
-cd /home/ln-admin/likenovel/api-dev
+sudo chown -R ln-admin:ln-admin "$APP_DIR"
+sudo chmod -R 700 "$APP_DIR"
+
+cd "$APP_DIR"
 
 load_env_file() {
   local env_file="$1"
@@ -40,14 +43,43 @@ load_env_file() {
   done < "$env_file"
 }
 
-# 최초 배포나 과거 배포본에는 pidfile이 없거나 stale일 수 있음
-if [ -f gunicorn.pid ] && kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
-  kill -TERM "$(cat gunicorn.pid)"
-  sleep 10
-else
-  pkill -TERM -f "/home/ln-admin/likenovel/api-dev/.venv/bin/gunicorn -c" || true
+require_systemd_access() {
+  if ! sudo -n systemctl show "$SERVICE_NAME" >/dev/null 2>&1; then
+    echo "[run_be.dev] cannot access $SERVICE_NAME via sudo -n systemctl" >&2
+    exit 1
+  fi
+}
+
+stop_service_and_orphans() {
+  sudo -n systemctl stop "$SERVICE_NAME" || true
+
+  # 이전 CodeDeploy 경로가 systemd 밖에서 띄운 gunicorn을 정리한다.
+  pkill -TERM -f "$APP_DIR/.venv/bin/gunicorn -c" || true
   sleep 5
-fi
+  pkill -KILL -f "$APP_DIR/.venv/bin/gunicorn -c" || true
+  rm -f gunicorn.pid
+}
+
+start_service_and_verify() {
+  sudo -n systemctl reset-failed "$SERVICE_NAME" || true
+  sudo -n systemctl start "$SERVICE_NAME"
+  sleep 5
+
+  if ! sudo -n systemctl is-active --quiet "$SERVICE_NAME"; then
+    echo "[run_be.dev] $SERVICE_NAME failed to become active" >&2
+    sudo -n systemctl status "$SERVICE_NAME" --no-pager || true
+    exit 1
+  fi
+
+  if [ ! -f gunicorn.pid ] || ! kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
+    echo "[run_be.dev] $SERVICE_NAME active but gunicorn.pid is missing or stale" >&2
+    sudo -n systemctl status "$SERVICE_NAME" --no-pager || true
+    exit 1
+  fi
+}
+
+require_systemd_access
+stop_service_and_orphans
 
 rm -rf ./__pycache__
 rm -rf ./.venv
@@ -69,7 +101,6 @@ pip3 install "$(ls -v app-*.whl | tail -n 1)"
 # SMTP_PASSWORD처럼 공백이 포함된 값이 있어 shell source를 쓰지 않는다.
 load_env_file .env
 
-gunicorn -c ./gconf.py
 deactivate
 
 # 배치 파일 동기화 + cron.d 등록
@@ -83,5 +114,7 @@ chmod +x "$BATCH_DST"/*.sh
 # dev 배치 cron은 수동으로만 활성화 (필요 시: sudo cp "$BATCH_SRC/cron_job.dev.sh" /etc/cron.d/likenovel-dev)
 # sudo cp "$BATCH_SRC/cron_job.dev.sh" /etc/cron.d/likenovel-dev
 # sudo chmod 644 /etc/cron.d/likenovel-dev
+
+start_service_and_verify
 
 exit 0
