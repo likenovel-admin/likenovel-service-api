@@ -77,3 +77,40 @@ def test_dev_run_script_uses_systemd_as_gunicorn_owner():
     assert 'sudo -n systemctl stop "$SERVICE_NAME"' in content
     assert 'sudo -n systemctl start "$SERVICE_NAME"' in content
     assert "gunicorn -c ./gconf.py" not in content
+
+
+def test_dev_codedeploy_uses_staging_destination_for_symlink_release():
+    appspec = PROJECT_ROOT / "dist" / "appspec.dev.yml"
+    content = appspec.read_text(encoding="utf-8")
+
+    assert "destination: /home/ln-admin/likenovel/api-dev-deploy" in content
+    assert "destination: /home/ln-admin/likenovel/api-dev\n" not in content
+
+
+def test_dev_workflow_bundles_versioned_boot_start_script():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions_dev.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    assert "zip -r $GITHUB_SHA.zip" in content
+    assert "boot-start-api-dev.sh" in content
+    assert (PROJECT_ROOT / "dist" / "boot-start-api-dev.sh").is_file()
+
+
+def test_dev_run_script_prepares_release_before_service_stop_and_retains_five():
+    content = (PROJECT_ROOT / "dist" / "run_be.dev.sh").read_text(encoding="utf-8")
+    main_flow = content[content.index("require_systemd_access"):]
+
+    assert "DEPLOY_DIR=/home/ln-admin/likenovel/api-dev-deploy" in content
+    assert "CURRENT_LINK=/home/ln-admin/likenovel/api-dev" in content
+    assert "RELEASE_BASE=/home/ln-admin/likenovel/releases/api-dev" in content
+    assert "RELEASE_KEEP=5" in content
+    assert '${DEPLOYMENT_ID:-${CODEDEPLOY_DEPLOYMENT_ID:-manual-$$}}' in content
+    assert "ls -t app-*.whl | head -n 1" in content
+    assert "prepare_release" in content
+    assert "switch_current_link" in content
+    assert "rollback_to_previous_release" in content
+    assert 'cleanup_old_releases "$RELEASE_KEEP"' in content
+
+    assert main_flow.index("prepare_release") < main_flow.index("stop_service_and_orphans")
+    assert main_flow.index("stop_service_and_orphans") < main_flow.index("switch_current_link")
+    assert main_flow.index("start_service_and_verify") < main_flow.index('cleanup_old_releases "$RELEASE_KEEP"')
