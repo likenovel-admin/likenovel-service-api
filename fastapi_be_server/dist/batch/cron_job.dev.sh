@@ -1,5 +1,5 @@
 # /etc/cron.d/likenovel-dev — dev 환경 배치 스케줄
-# run_be.dev.sh에서 자동 설치됨 (sudo cp → /etc/cron.d/likenovel-dev)
+# dev에서는 자동 설치하지 않음. 필요할 때 수동으로 sudo cp → /etc/cron.d/likenovel-dev
 
 SHELL=/bin/bash
 BASH_ENV=/home/ln-admin/likenovel/batch-dev/cron_env.sh
