@@ -46,8 +46,9 @@ jobs:
           poetry install
           poetry run python tests/test_ai_reader_worker_deploy.py
           bash -n dist/run_be.sh
+          bash -n dist/boot-start-api.sh
           bash -n dist/verify_backend_prod_deploy.sh
-          shellcheck --severity=warning dist/run_be.sh dist/verify_backend_prod_deploy.sh
+          shellcheck --severity=warning dist/run_be.sh dist/boot-start-api.sh dist/verify_backend_prod_deploy.sh
           poetry build
           git config --global user.name 'likenovel-dev'
           git config --global user.email 'infra@likenovel.net'
@@ -79,9 +80,9 @@ jobs:
           mkdir -p scripts
           cp ../scripts/build_story_agent_context.py ./scripts/build_story_agent_context.py
           cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py
-          chmod +x verify_backend_prod_deploy.sh
-          # *.whl, appspec.yml, run_be.sh, gconf.py, .env.production, init/, batch/ 압축
-          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py verify_backend_prod_deploy.sh .env.production init/ batch/ scripts/
+          chmod +x run_be.sh boot-start-api.sh verify_backend_prod_deploy.sh
+          # *.whl, appspec.yml, run_be.sh, boot-start-api.sh, gconf.py, .env.production, init/, batch/ 압축
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh boot-start-api.sh gconf.py verify_backend_prod_deploy.sh .env.production init/ batch/ scripts/
           aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
           DEPLOY_ID=$(aws deploy create-deployment \
             --application-name $APPLICATION_NAME \
