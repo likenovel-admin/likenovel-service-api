@@ -221,6 +221,19 @@ def test_prod_run_script_uses_systemd_as_gunicorn_owner():
     assert "gunicorn -c ./gconf.py" not in content
 
 
+def test_prod_run_script_cleans_current_python_module_gunicorn_orphans():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+
+    assert '"/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c"' in content
+    assert (
+        '"/home/ln-admin/likenovel/api/.venv/bin/python -m gunicorn.app.wsgiapp -c"'
+        in content
+    )
+    assert 'for orphan_pattern in "${orphan_patterns[@]}"; do' in content
+    assert 'pkill -TERM -f "$orphan_pattern"' in content
+    assert 'pkill -KILL -f "$orphan_pattern"' in content
+
+
 def test_prod_workflow_bundles_boot_start_script():
     workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
     content = workflow.read_text(encoding="utf-8")
