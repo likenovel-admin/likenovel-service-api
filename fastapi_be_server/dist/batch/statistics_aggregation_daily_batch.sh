@@ -9,6 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/batch_timestamp_logging.sh"
 enable_timestamped_logging
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/batch_advisory_lock.sh"
 
 BATCH_NAME="statistics_aggregation_daily_batch"
 RUN_STARTED_AT="$(date +%s)"
@@ -34,12 +36,17 @@ fi
 
 MAX_RETRIES=3
 RETRY_DELAY=10
+SQL_FILE="${SCRIPT_DIR}/statistics_aggregation_daily_batch.sql"
 
 for attempt in $(seq 1 $MAX_RETRIES); do
-  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PW" "$DB_NAME" --default-character-set=utf8mb4 $MYSQL_SSL_OPT < "${SCRIPT_DIR}/statistics_aggregation_daily_batch.sql"
+  run_sql_with_advisory_lock "lk_statistics_aggregation_daily_batch" "$SQL_FILE" "$BATCH_NAME"
   rc=$?
   if [ $rc -eq 0 ]; then
     exit 0
+  fi
+  if [ $rc -eq 2 ]; then
+    echo "[WARN] ${BATCH_NAME} skipped because advisory lock is busy" 1>&2
+    exit 2
   fi
   echo "[WARN] statistics_aggregation_daily_batch attempt $attempt/$MAX_RETRIES failed (exit=$rc)" 1>&2
   if [ $attempt -lt $MAX_RETRIES ]; then

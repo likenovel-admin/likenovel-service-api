@@ -108,6 +108,63 @@ class SitePageViewMigrationTest(unittest.TestCase):
         self.assertIn("pv.occurred_at < @site_stats_target_end", sql)
         self.assertNotIn("DATE(occurred_at)", sql)
 
+    def test_site_statistics_batch_counts_dau_from_logged_in_page_views(self):
+        batch_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "batch"
+            / "statistics_aggregation_daily_batch.sql"
+        )
+
+        sql = batch_path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "COUNT(DISTINCT CASE WHEN pv.user_id IS NOT NULL THEN pv.user_id END)",
+            sql,
+        )
+        self.assertIn("pv.user_id IS NOT NULL", sql)
+        self.assertIn("pv.source = 'service-web'", sql)
+        self.assertIn("pv.occurred_at >= @site_stats_target_start", sql)
+        self.assertIn("pv.occurred_at < @site_stats_target_end", sql)
+        self.assertIn("page_stats.dau_count as dau", sql)
+        self.assertNotIn(
+            "COUNT(DISTINCT CASE WHEN type = 'active' THEN user_id END) as dau",
+            sql,
+        )
+
+    def test_site_statistics_batch_aggregates_page_view_and_dau_in_one_raw_scan(
+        self,
+    ):
+        batch_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "batch"
+            / "statistics_aggregation_daily_batch.sql"
+        )
+
+        sql = batch_path.read_text(encoding="utf-8")
+
+        self.assertEqual(sql.count("FROM tb_site_page_view_event pv"), 1)
+        self.assertIn("page_stats.page_view_count as page_view", sql)
+        self.assertIn("page_stats.dau_count as dau", sql)
+
+    def test_statistics_aggregation_shell_uses_advisory_lock(self):
+        script_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "batch"
+            / "statistics_aggregation_daily_batch.sh"
+        )
+
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('source "${SCRIPT_DIR}/batch_advisory_lock.sh"', script)
+        self.assertIn(
+            'run_sql_with_advisory_lock "lk_statistics_aggregation_daily_batch"',
+            script,
+        )
+        self.assertIn("statistics_aggregation_daily_batch.sql", script)
+
 
 class SitePageRouteDailyMigrationTest(unittest.TestCase):
     def test_site_page_analytics_migration_creates_raw_and_daily_tables(self):
