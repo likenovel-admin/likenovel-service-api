@@ -230,6 +230,16 @@ def test_prod_workflow_bundles_boot_start_script():
     assert (PROJECT_ROOT / "dist" / "boot-start-api.sh").is_file()
 
 
+def test_prod_boot_start_uses_python_module_not_moved_console_script():
+    content = (PROJECT_ROOT / "dist" / "boot-start-api.sh").read_text(encoding="utf-8")
+
+    assert (
+        'exec "$APP_DIR/.venv/bin/python" -m gunicorn.app.wsgiapp -c "$APP_DIR/gconf.py"'
+        in content
+    )
+    assert 'exec "$APP_DIR/.venv/bin/gunicorn" -c "$APP_DIR/gconf.py"' not in content
+
+
 def test_deploy_run_scripts_do_not_source_env_files():
     for script_name in ("run_be.sh", "run_be.dev.sh"):
         content = (PROJECT_ROOT / "dist" / script_name).read_text(encoding="utf-8")

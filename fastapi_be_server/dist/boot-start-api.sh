@@ -65,4 +65,4 @@ fi
 load_env_file "$APP_DIR/.env"
 mkdir -p "$APP_DIR/logs/data" "$APP_DIR/logs/error"
 
-exec "$APP_DIR/.venv/bin/gunicorn" -c "$APP_DIR/gconf.py"
+exec "$APP_DIR/.venv/bin/python" -m gunicorn.app.wsgiapp -c "$APP_DIR/gconf.py"
