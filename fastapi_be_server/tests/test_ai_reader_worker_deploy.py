@@ -68,3 +68,12 @@ def test_deploy_run_scripts_do_not_source_env_files():
         assert "source .env" not in content
         assert "load_env_file .env" in content
         assert "while IFS= read -r line" in content
+
+
+def test_dev_run_script_uses_systemd_as_gunicorn_owner():
+    content = (PROJECT_ROOT / "dist" / "run_be.dev.sh").read_text(encoding="utf-8")
+
+    assert "SERVICE_NAME=likenovel-api-dev.service" in content
+    assert 'sudo -n systemctl stop "$SERVICE_NAME"' in content
+    assert 'sudo -n systemctl start "$SERVICE_NAME"' in content
+    assert "gunicorn -c ./gconf.py" not in content
