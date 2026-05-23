@@ -11,6 +11,8 @@ sudo chmod -R 700 /home/ln-admin/likenovel/api
 cd /home/ln-admin/likenovel/api || exit 1
 
 SERVICE_NAME=likenovel-api.service
+NEXT_VENV=.venv-next
+PREV_VENV=.venv-prev
 
 load_env_file() {
   local env_file="$1"
@@ -87,39 +89,65 @@ stop_service_and_orphans() {
   pkill -KILL -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" || true
 }
 
+prepare_next_venv() {
+  rm -rf "$NEXT_VENV" "$NEXT_VENV.failed"
+  python3 -m venv "$NEXT_VENV"
+  "$NEXT_VENV/bin/python" -m pip install --upgrade pip
+  "$NEXT_VENV/bin/pip" install "$(ls -v app-*.whl | tail -n 1)"
+  "$NEXT_VENV/bin/python" - <<'PY'
+from importlib.metadata import version
+
+for package in ("sqlalchemy", "pymysql", "aiomysql"):
+    print(f"[run_be] installed {package}=={version(package)}")
+PY
+}
+
+activate_next_venv() {
+  rm -rf "$PREV_VENV"
+  if [ -d .venv ]; then
+    mv .venv "$PREV_VENV"
+  fi
+  mv "$NEXT_VENV" .venv
+}
+
 start_service_and_verify() {
   sudo -n systemctl reset-failed "$SERVICE_NAME" || true
   if ! sudo -n systemctl start "$SERVICE_NAME"; then
     sudo -n systemctl status "$SERVICE_NAME" --no-pager || true
-    exit 1
+    return 1
   fi
 
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if sudo -n systemctl is-active --quiet "$SERVICE_NAME" \
       && [ -f gunicorn.pid ] \
       && kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
-      return
+      return 0
     fi
     sleep 2
   done
 
   sudo -n systemctl status "$SERVICE_NAME" --no-pager || true
   echo "[run_be] $SERVICE_NAME did not become active with live gunicorn.pid" >&2
-  exit 1
+  return 1
+}
+
+restore_previous_venv_and_restart() {
+  sudo -n systemctl stop "$SERVICE_NAME" || true
+  if [ -d .venv ]; then
+    rm -rf "$NEXT_VENV.failed"
+    mv .venv "$NEXT_VENV.failed"
+  fi
+  if [ ! -d "$PREV_VENV" ]; then
+    echo "[run_be] previous venv missing; rollback unavailable" >&2
+    return 1
+  fi
+  mv "$PREV_VENV" .venv
+  start_service_and_verify
 }
 
 require_systemd_access
 
-for worker_pidfile in ai_reader_worker.pid ai_reader_worker_manual_*.pid; do
-  stop_pidfile_process "$worker_pidfile"
-done
-pkill -TERM -f "/home/ln-admin/likenovel/api/.venv/bin/python .*scripts/run_ai_reader_worker.py" || true
-sleep 3
-
-stop_service_and_orphans
-
 rm -rf ./__pycache__
-rm -rf ./.venv
 
 # 로그 디렉토리 생성 (없으면 라우터 import 실패)
 mkdir -p ./logs/data ./logs/error
@@ -129,21 +157,25 @@ cp .env.production .env
 # trailing newline 보장 (없으면 cron_env.sh의 while read가 마지막 줄 스킵)
 tail -c1 .env | read -r _ || echo >> .env
 
-python3 -m venv .venv
-./.venv/bin/python -m pip install --upgrade pip
-./.venv/bin/pip install "$(ls -v app-*.whl | tail -n 1)"
-./.venv/bin/python - <<'PY'
-from importlib.metadata import version
+prepare_next_venv
 
-for package in ("sqlalchemy", "pymysql", "aiomysql"):
-    print(f"[run_be] installed {package}=={version(package)}")
-PY
+for worker_pidfile in ai_reader_worker.pid ai_reader_worker_manual_*.pid; do
+  stop_pidfile_process "$worker_pidfile"
+done
+pkill -TERM -f "/home/ln-admin/likenovel/api/.venv/bin/python .*scripts/run_ai_reader_worker.py" || true
+sleep 3
+
+stop_service_and_orphans
+activate_next_venv
 
 # .env를 시스템 환경변수로 export (const.py의 os.getenv가 읽을 수 있도록)
 # SMTP_PASSWORD처럼 공백이 포함된 값이 있어 shell source를 쓰지 않는다.
 load_env_file .env
 
-start_service_and_verify
+if ! start_service_and_verify; then
+  echo "[run_be] start failed; restoring previous venv" >&2
+  restore_previous_venv_and_restart
+fi
 
 AI_READER_WORKER_LOG=./logs/data/ai_reader_worker.log
 AI_READER_WORKER_PID=./ai_reader_worker.pid
@@ -160,6 +192,7 @@ if ! kill -0 "$(cat "$AI_READER_WORKER_PID")" 2>/dev/null; then
   tail -50 "$AI_READER_WORKER_LOG" || true
   exit 1
 fi
+rm -rf "$PREV_VENV" "$NEXT_VENV.failed"
 
 # 배치 파일 동기화: 배포된 batch/ → 크론이 참조하는 /home/ln-admin/likenovel/batch/
 BATCH_SRC=/home/ln-admin/likenovel/api/batch

@@ -116,12 +116,41 @@ def test_prod_run_script_uses_strict_mode_and_explicit_venv_pip():
     assert first_lines == ["#!/bin/bash", "set -euo pipefail", ""]
     assert "source .venv/bin/activate" not in content
     assert "deactivate" not in content
-    assert "./.venv/bin/python -m pip install --upgrade pip" in content
-    assert './.venv/bin/pip install "$(ls -v app-*.whl | tail -n 1)"' in content
+    assert '"$NEXT_VENV/bin/python" -m pip install --upgrade pip' in content
+    assert '"$NEXT_VENV/bin/pip" install "$(ls -v app-*.whl | tail -n 1)"' in content
     assert "from importlib.metadata import version" in content
     assert "[run_be] installed {package}==" in content
     assert 'chmod +x "$BATCH_DST"/*.sh' not in content
     assert 'for batch_script in "$BATCH_DST"/*.sh; do' in content
+
+
+def test_prod_run_script_prebuilds_next_venv_before_stopping_service():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+    main_flow = content[content.index("\nrequire_systemd_access\n") :]
+
+    assert "NEXT_VENV=.venv-next" in content
+    assert "PREV_VENV=.venv-prev" in content
+    assert "prepare_next_venv" in content
+    assert "activate_next_venv" in content
+    assert "restore_previous_venv_and_restart" in content
+    assert "rm -rf ./.venv" not in content
+    assert 'mv .venv "$PREV_VENV"' in content
+    assert 'mv "$NEXT_VENV" .venv' in content
+    assert 'rm -rf "$PREV_VENV"' in content
+
+    assert main_flow.index("prepare_next_venv") < main_flow.index("stop_service_and_orphans")
+    assert main_flow.index("stop_service_and_orphans") < main_flow.index("activate_next_venv")
+    assert main_flow.index("activate_next_venv") < main_flow.index("start_service_and_verify")
+
+
+def test_prod_run_script_rolls_back_venv_if_systemd_start_fails():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+
+    assert 'if ! start_service_and_verify; then' in content
+    assert "restore_previous_venv_and_restart" in content
+    assert 'mv .venv "$NEXT_VENV.failed"' in content
+    assert 'mv "$PREV_VENV" .venv' in content
+    assert 'sudo -n systemctl start "$SERVICE_NAME"' in content
 
 
 def test_prod_run_script_uses_systemd_as_gunicorn_owner():
