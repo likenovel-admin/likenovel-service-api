@@ -306,7 +306,6 @@ SELECT @recent_24h_basis_at
      , 0
      , 0
   FROM tb_product p
- WHERE p.use_yn = 'Y'
 ON DUPLICATE KEY UPDATE
     count_hit = VALUES(count_hit),
     updated_id = 0,
@@ -325,7 +324,6 @@ SELECT @recent_24h_basis_at
   FROM tb_product_episode e
  INNER JOIN tb_product p
     ON p.product_id = e.product_id
-   AND p.use_yn = 'Y'
  WHERE e.use_yn = 'Y'
 ON DUPLICATE KEY UPDATE
     episode_no = VALUES(episode_no),
