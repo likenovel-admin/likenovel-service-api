@@ -19,24 +19,32 @@ DELETE FROM tb_site_statistics WHERE DATE(date) = @site_stats_target_date;
 INSERT INTO tb_site_statistics (date, visitors, page_view, login_count, dau, mau, created_date)
 SELECT 
     @site_stats_target_date as date,
-    COUNT(DISTINCT CASE WHEN type = 'visit' THEN user_id END) as visitors,
-    (
-        SELECT COUNT(*)
-        FROM tb_site_page_view_event pv
-        WHERE pv.source = 'service-web'
-          AND pv.occurred_at >= @site_stats_target_start
-          AND pv.occurred_at < @site_stats_target_end
-    ) as page_view,
-    COUNT(CASE WHEN type = 'login' THEN 1 END) as login_count,
-    COUNT(DISTINCT CASE WHEN type = 'active' THEN user_id END) as dau,
+    log_stats.visitors as visitors,
+    page_stats.page_view_count as page_view,
+    log_stats.login_count as login_count,
+    page_stats.dau_count as dau,
     (SELECT COUNT(DISTINCT user_id) 
         FROM tb_site_statistics_log 
         WHERE date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) 
         AND date < CURDATE()
         AND type = 'active') as mau,
     NOW() as created_date
-FROM tb_site_statistics_log
-WHERE DATE(date) = @site_stats_target_date;
+FROM (
+    SELECT
+        COUNT(DISTINCT CASE WHEN type = 'visit' THEN user_id END) as visitors,
+        COUNT(CASE WHEN type = 'login' THEN 1 END) as login_count
+    FROM tb_site_statistics_log
+    WHERE DATE(date) = @site_stats_target_date
+) log_stats
+CROSS JOIN (
+    SELECT
+        COUNT(*) as page_view_count,
+        COUNT(DISTINCT CASE WHEN pv.user_id IS NOT NULL THEN pv.user_id END) as dau_count
+    FROM tb_site_page_view_event pv
+    WHERE pv.source = 'service-web'
+      AND pv.occurred_at >= @site_stats_target_start
+      AND pv.occurred_at < @site_stats_target_end
+) page_stats;
 
 -- 결제 통계 테이블에서 전날 데이터 삭제 (중복 방지)
 DELETE FROM tb_payment_statistics 
