@@ -154,18 +154,36 @@ require_systemd_access() {
 }
 
 stop_service_and_orphans() {
+  local orphan_pattern
+  local all_stopped
+  local orphan_patterns=(
+    "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c"
+    "/home/ln-admin/likenovel/api/.venv/bin/python -m gunicorn.app.wsgiapp -c"
+  )
+
   sudo -n systemctl stop "$SERVICE_NAME" || true
   rm -f gunicorn.pid
 
   # 이전 CodeDeploy 경로가 systemd 밖에서 띄운 gunicorn을 정리한다.
-  pkill -TERM -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" || true
+  for orphan_pattern in "${orphan_patterns[@]}"; do
+    pkill -TERM -f "$orphan_pattern" || true
+  done
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if ! pgrep -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" >/dev/null 2>&1; then
+    all_stopped=1
+    for orphan_pattern in "${orphan_patterns[@]}"; do
+      if pgrep -f "$orphan_pattern" >/dev/null 2>&1; then
+        all_stopped=0
+        break
+      fi
+    done
+    if [ "$all_stopped" -eq 1 ]; then
       return
     fi
     sleep 1
   done
-  pkill -KILL -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" || true
+  for orphan_pattern in "${orphan_patterns[@]}"; do
+    pkill -KILL -f "$orphan_pattern" || true
+  done
 }
 
 prepare_next_venv() {
