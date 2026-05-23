@@ -9,6 +9,8 @@ sudo chmod -R 700 /home/ln-admin/likenovel/api
 
 cd /home/ln-admin/likenovel/api || exit 1
 
+SERVICE_NAME=likenovel-api.service
+
 load_env_file() {
   local env_file="$1"
   local line key value quote
@@ -62,20 +64,58 @@ stop_pidfile_process() {
   kill -KILL "$pid" 2>/dev/null || true
 }
 
+require_systemd_access() {
+  if ! sudo -n systemctl show "$SERVICE_NAME" >/dev/null 2>&1; then
+    echo "[run_be] cannot access $SERVICE_NAME via sudo -n systemctl" >&2
+    exit 1
+  fi
+}
+
+stop_service_and_orphans() {
+  sudo -n systemctl stop "$SERVICE_NAME" || true
+  rm -f gunicorn.pid
+
+  # 이전 CodeDeploy 경로가 systemd 밖에서 띄운 gunicorn을 정리한다.
+  pkill -TERM -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! pgrep -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 1
+  done
+  pkill -KILL -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" || true
+}
+
+start_service_and_verify() {
+  sudo -n systemctl reset-failed "$SERVICE_NAME" || true
+  if ! sudo -n systemctl start "$SERVICE_NAME"; then
+    sudo -n systemctl status "$SERVICE_NAME" --no-pager || true
+    exit 1
+  fi
+
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if sudo -n systemctl is-active --quiet "$SERVICE_NAME" \
+      && [ -f gunicorn.pid ] \
+      && kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
+      return
+    fi
+    sleep 2
+  done
+
+  sudo -n systemctl status "$SERVICE_NAME" --no-pager || true
+  echo "[run_be] $SERVICE_NAME did not become active with live gunicorn.pid" >&2
+  exit 1
+}
+
+require_systemd_access
+
 for worker_pidfile in ai_reader_worker.pid ai_reader_worker_manual_*.pid; do
   stop_pidfile_process "$worker_pidfile"
 done
 pkill -TERM -f "/home/ln-admin/likenovel/api/.venv/bin/python .*scripts/run_ai_reader_worker.py" || true
 sleep 3
 
-# 최초 배포나 과거 배포본에는 pidfile이 없거나 stale일 수 있음
-if [ -f gunicorn.pid ] && kill -0 "$(cat gunicorn.pid)" 2>/dev/null; then
-  kill -TERM "$(cat gunicorn.pid)"
-  sleep 10
-else
-  pkill -TERM -f "/home/ln-admin/likenovel/api/.venv/bin/gunicorn -c" || true
-  sleep 5
-fi
+stop_service_and_orphans
 
 rm -rf ./__pycache__
 rm -rf ./.venv
@@ -97,7 +137,7 @@ pip3 install "$(ls -v app-*.whl | tail -n 1)"
 # SMTP_PASSWORD처럼 공백이 포함된 값이 있어 shell source를 쓰지 않는다.
 load_env_file .env
 
-gunicorn -c ./gconf.py
+start_service_and_verify
 
 AI_READER_WORKER_LOG=./logs/data/ai_reader_worker.log
 AI_READER_WORKER_PID=./ai_reader_worker.pid

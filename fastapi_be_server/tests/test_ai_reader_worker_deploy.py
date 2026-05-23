@@ -32,7 +32,6 @@ def test_prod_deploy_bundle_includes_ai_reader_worker_script():
     assert "cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py" in content
     assert "zip -r $GITHUB_SHA.zip" in content
     assert "verify_backend_prod_deploy.sh" in content
-    assert "chmod +x verify_backend_prod_deploy.sh" in content
     assert "scripts/" in content
 
 
@@ -41,8 +40,9 @@ def test_prod_workflow_runs_pre_deploy_quality_gates_and_waits_for_codedeploy():
     content = workflow.read_text(encoding="utf-8")
 
     assert "poetry run python tests/test_ai_reader_worker_deploy.py" in content
-    assert "shellcheck --severity=warning dist/run_be.sh dist/verify_backend_prod_deploy.sh" in content
+    assert "shellcheck --severity=warning dist/run_be.sh dist/boot-start-api.sh dist/verify_backend_prod_deploy.sh" in content
     assert "bash -n dist/run_be.sh" in content
+    assert "bash -n dist/boot-start-api.sh" in content
     assert "bash -n dist/verify_backend_prod_deploy.sh" in content
     assert "DEPLOY_ID=$(aws deploy create-deployment" in content
     assert 'aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"' in content
@@ -106,6 +106,27 @@ def test_prod_run_script_replaces_and_starts_ai_reader_worker():
     assert "AI_READER_WORKER_ENABLED=Y nohup ./.venv/bin/python -u scripts/run_ai_reader_worker.py" in content
     assert "--worker-id \"ai-reader-prod-$(hostname)\"" in content
     assert "[ERROR] AI reader worker failed to start" in content
+
+
+def test_prod_run_script_uses_systemd_as_gunicorn_owner():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+
+    assert "SERVICE_NAME=likenovel-api.service" in content
+    assert "require_systemd_access" in content
+    assert "stop_service_and_orphans" in content
+    assert "start_service_and_verify" in content
+    assert 'sudo -n systemctl stop "$SERVICE_NAME"' in content
+    assert 'sudo -n systemctl start "$SERVICE_NAME"' in content
+    assert "gunicorn -c ./gconf.py" not in content
+
+
+def test_prod_workflow_bundles_boot_start_script():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    assert "chmod +x run_be.sh boot-start-api.sh verify_backend_prod_deploy.sh" in content
+    assert "boot-start-api.sh" in content
+    assert (PROJECT_ROOT / "dist" / "boot-start-api.sh").is_file()
 
 
 def test_deploy_run_scripts_do_not_source_env_files():
