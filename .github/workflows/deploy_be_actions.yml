@@ -44,7 +44,7 @@ jobs:
           # 필요시 major 적용(patch는 세 번째 숫자 증가)
           poetry version patch
           poetry install
-          poetry run pytest tests/test_ai_reader_worker_deploy.py -q
+          poetry run python tests/test_ai_reader_worker_deploy.py
           bash -n dist/run_be.sh
           bash -n dist/verify_backend_prod_deploy.sh
           shellcheck --severity=warning dist/run_be.sh dist/verify_backend_prod_deploy.sh
