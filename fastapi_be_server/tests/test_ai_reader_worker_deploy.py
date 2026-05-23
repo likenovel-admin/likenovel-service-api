@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import tomllib
 from pathlib import Path
 
@@ -108,6 +109,21 @@ def test_prod_run_script_replaces_and_starts_ai_reader_worker():
     assert "[ERROR] AI reader worker failed to start" in content
 
 
+def test_prod_run_script_uses_strict_mode_and_explicit_venv_pip():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+    first_lines = content.splitlines()[:3]
+
+    assert first_lines == ["#!/bin/bash", "set -euo pipefail", ""]
+    assert "source .venv/bin/activate" not in content
+    assert "deactivate" not in content
+    assert "./.venv/bin/python -m pip install --upgrade pip" in content
+    assert './.venv/bin/pip install "$(ls -v app-*.whl | tail -n 1)"' in content
+    assert "from importlib.metadata import version" in content
+    assert "[run_be] installed {package}==" in content
+    assert 'chmod +x "$BATCH_DST"/*.sh' not in content
+    assert 'for batch_script in "$BATCH_DST"/*.sh; do' in content
+
+
 def test_prod_run_script_uses_systemd_as_gunicorn_owner():
     content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
 
@@ -204,7 +220,41 @@ def test_dev_before_install_prunes_only_guarded_staging_dir():
     assert "api-dev-deploy" in content
 
 
+def _run_direct_tests(namespace):
+    for name, test_func in sorted(namespace.items()):
+        if not name.startswith("test_") or not callable(test_func):
+            continue
+        required_params = [
+            param
+            for param in inspect.signature(test_func).parameters.values()
+            if param.default is inspect.Parameter.empty
+            and param.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if required_params:
+            continue
+        test_func()
+
+
+def test_direct_runner_skips_pytest_fixture_style_tests():
+    called = []
+
+    def test_plain_contract():
+        called.append("plain")
+
+    def test_needs_tmp_path(tmp_path):
+        called.append(f"fixture:{tmp_path}")
+
+    _run_direct_tests(
+        {
+            "test_plain_contract": test_plain_contract,
+            "test_needs_tmp_path": test_needs_tmp_path,
+            "helper": lambda: called.append("helper"),
+        }
+    )
+
+    assert called == ["plain"]
+
+
 if __name__ == "__main__":
-    for name, test_func in sorted(globals().items()):
-        if name.startswith("test_") and callable(test_func):
-            test_func()
+    _run_direct_tests(globals())
