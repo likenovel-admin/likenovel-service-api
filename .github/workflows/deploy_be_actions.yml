@@ -34,11 +34,20 @@ jobs:
         run: |
           curl -sSL https://install.python-poetry.org | python3 -
 
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
       - name: Poetry Build
         run: |
           # 필요시 major 적용(patch는 세 번째 숫자 증가)
           poetry version patch
           poetry install
+          poetry run pytest tests/test_ai_reader_worker_deploy.py -q
+          bash -n dist/run_be.sh
+          bash -n dist/verify_backend_prod_deploy.sh
+          shellcheck --severity=warning dist/run_be.sh dist/verify_backend_prod_deploy.sh
           poetry build
           git config --global user.name 'likenovel-dev'
           git config --global user.email 'infra@likenovel.net'
@@ -70,14 +79,34 @@ jobs:
           mkdir -p scripts
           cp ../scripts/build_story_agent_context.py ./scripts/build_story_agent_context.py
           cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py
+          chmod +x verify_backend_prod_deploy.sh
           # *.whl, appspec.yml, run_be.sh, gconf.py, .env.production, init/, batch/ 압축
-          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py .env.production init/ batch/ scripts/
+          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh gconf.py verify_backend_prod_deploy.sh .env.production init/ batch/ scripts/
           aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
-          aws deploy create-deployment \
+          DEPLOY_ID=$(aws deploy create-deployment \
             --application-name $APPLICATION_NAME \
             --deployment-config-name $DEPLOY_CONFIG_NAME \
             --deployment-group-name $DEPLOY_GROUP_NAME \
             --description "backend server deploy" \
-            --s3-location bucket=$S3_BUCKET,bundleType=zip,key=$GITHUB_SHA.zip
+            --s3-location bucket=$S3_BUCKET,bundleType=zip,key=$GITHUB_SHA.zip \
+            --query deploymentId \
+            --output text)
+          echo "CodeDeploy deployment id: $DEPLOY_ID"
+          if ! aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"; then
+            aws deploy get-deployment --deployment-id "$DEPLOY_ID" || true
+            exit 1
+          fi
+          aws deploy get-deployment --deployment-id "$DEPLOY_ID"
           echo "(option) input additional comments: $TAGS"
+        working-directory: ./fastapi_be_server/dist
+
+      - name: Verify prod backend runtime
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/likenovel_prod_deploy_key
+          chmod 600 ~/.ssh/likenovel_prod_deploy_key
+          ssh -i ~/.ssh/likenovel_prod_deploy_key -o StrictHostKeyChecking=no -T ln-admin@ec2-3-34-11-39.ap-northeast-2.compute.amazonaws.com \
+            'ssh -i /home/ln-admin/.ssh/ln_kp.pem -o StrictHostKeyChecking=no -T ln-admin@10.0.100.110 bash -s' < ./verify_backend_prod_deploy.sh
         working-directory: ./fastapi_be_server/dist

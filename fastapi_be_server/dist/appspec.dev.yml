@@ -2,9 +2,13 @@ version: 0.0
 os: linux
 files:
   - source: /
-    destination: /home/ln-admin/likenovel/api-dev
+    destination: /home/ln-admin/likenovel/api-dev-deploy
 file_exists_behavior: OVERWRITE
 hooks:
+  BeforeInstall:
+    - location: before_install.sh
+      timeout: 60
+      runas: ln-admin
   ApplicationStart:
     - location: run_be.sh
       timeout: 300

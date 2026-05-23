@@ -7,7 +7,7 @@
 sudo chown -R ln-admin:ln-admin /home/ln-admin/likenovel/api
 sudo chmod -R 700 /home/ln-admin/likenovel/api
 
-cd /home/ln-admin/likenovel/api
+cd /home/ln-admin/likenovel/api || exit 1
 
 load_env_file() {
   local env_file="$1"
