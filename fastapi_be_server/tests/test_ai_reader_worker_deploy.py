@@ -85,14 +85,20 @@ def test_dev_codedeploy_uses_staging_destination_for_symlink_release():
 
     assert "destination: /home/ln-admin/likenovel/api-dev-deploy" in content
     assert "destination: /home/ln-admin/likenovel/api-dev\n" not in content
+    assert "BeforeInstall:" in content
+    assert "location: before_install.sh" in content
 
 
 def test_dev_workflow_bundles_versioned_boot_start_script():
     workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions_dev.yml"
     content = workflow.read_text(encoding="utf-8")
 
+    assert "cp before_install.dev.sh before_install.sh" in content
+    assert "chmod +x before_install.sh run_be.sh boot-start-api-dev.sh" in content
     assert "zip -r $GITHUB_SHA.zip" in content
+    assert "before_install.sh" in content
     assert "boot-start-api-dev.sh" in content
+    assert (PROJECT_ROOT / "dist" / "before_install.dev.sh").is_file()
     assert (PROJECT_ROOT / "dist" / "boot-start-api-dev.sh").is_file()
 
 
@@ -110,7 +116,21 @@ def test_dev_run_script_prepares_release_before_service_stop_and_retains_five():
     assert "switch_current_link" in content
     assert "rollback_to_previous_release" in content
     assert 'cleanup_old_releases "$RELEASE_KEEP"' in content
+    assert "replace_current_symlink" in content
+    assert 'mv -Tf "$tmp_link" "$CURRENT_LINK"' in content
+    assert 'rm -f "$CURRENT_LINK"' not in content
 
     assert main_flow.index("prepare_release") < main_flow.index("stop_service_and_orphans")
     assert main_flow.index("stop_service_and_orphans") < main_flow.index("switch_current_link")
     assert main_flow.index("start_service_and_verify") < main_flow.index('cleanup_old_releases "$RELEASE_KEEP"')
+
+
+def test_dev_before_install_prunes_only_guarded_staging_dir():
+    content = (PROJECT_ROOT / "dist" / "before_install.dev.sh").read_text(encoding="utf-8")
+
+    assert "DEPLOY_DIR=/home/ln-admin/likenovel/api-dev-deploy" in content
+    assert 'case "$DEPLOY_DIR" in' in content
+    assert '"/home/ln-admin/likenovel/api-dev-deploy")' in content
+    assert 'find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +' in content
+    assert "api-dev" in content
+    assert "api-dev-deploy" in content
