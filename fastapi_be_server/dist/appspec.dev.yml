@@ -2,7 +2,7 @@ version: 0.0
 os: linux
 files:
   - source: /
-    destination: /home/ln-admin/likenovel/api-dev
+    destination: /home/ln-admin/likenovel/api-dev-deploy
 file_exists_behavior: OVERWRITE
 hooks:
   ApplicationStart:
