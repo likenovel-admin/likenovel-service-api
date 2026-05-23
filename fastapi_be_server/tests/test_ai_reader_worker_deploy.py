@@ -31,7 +31,54 @@ def test_prod_deploy_bundle_includes_ai_reader_worker_script():
 
     assert "cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py" in content
     assert "zip -r $GITHUB_SHA.zip" in content
+    assert "verify_backend_prod_deploy.sh" in content
+    assert "chmod +x verify_backend_prod_deploy.sh" in content
     assert "scripts/" in content
+
+
+def test_prod_workflow_runs_pre_deploy_quality_gates_and_waits_for_codedeploy():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    assert "poetry run pytest tests/test_ai_reader_worker_deploy.py -q" in content
+    assert "shellcheck --severity=warning dist/run_be.sh dist/verify_backend_prod_deploy.sh" in content
+    assert "bash -n dist/run_be.sh" in content
+    assert "bash -n dist/verify_backend_prod_deploy.sh" in content
+    assert "DEPLOY_ID=$(aws deploy create-deployment" in content
+    assert 'aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"' in content
+    assert 'aws deploy get-deployment --deployment-id "$DEPLOY_ID"' in content
+
+
+def test_prod_workflow_runs_hard_readback_over_bastion():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    assert "SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}" in content
+    assert "ssh -i ~/.ssh/likenovel_prod_deploy_key" in content
+    assert "ln-admin@ec2-3-34-11-39.ap-northeast-2.compute.amazonaws.com" in content
+    assert "ln-admin@10.0.100.110" in content
+    assert "bash -s' < ./verify_backend_prod_deploy.sh" in content
+
+
+def test_prod_verify_script_checks_runtime_process_worker_and_versions():
+    content = (PROJECT_ROOT / "dist" / "verify_backend_prod_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "SERVICE_NAME=likenovel-api.service" in content
+    assert "PID_FILE=/home/ln-admin/likenovel/api/gunicorn.pid" in content
+    assert "AI_READER_WORKER_LOG=/home/ln-admin/likenovel/api/logs/data/ai_reader_worker.log" in content
+    assert "systemctl show" in content
+    assert "MainPID" in content
+    assert "ss -ltnp" in content
+    assert "10.0.100.110:3010/health" in content
+    assert "ai_reader_worker.pid" in content
+    assert "ai reader worker cycle completed" in content
+    assert "from importlib.metadata import version" in content
+    assert "sqlalchemy==2.0.41" in content
+    assert "pymysql==1.1.1" in content
+    assert "aiomysql==0.2.0" in content
+    assert "exit 1" in content
 
 
 def test_prod_wheel_pins_mysql_driver_stack_for_aiomysql_pre_ping():
