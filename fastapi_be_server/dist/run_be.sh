@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # 백엔드 서버 새로운 배포 버전으로 재기동
 # 운영 시에는 서버점검 공지 후 해당 작업 권장(가장 안전한 방법)
@@ -129,9 +130,14 @@ cp .env.production .env
 tail -c1 .env | read -r _ || echo >> .env
 
 python3 -m venv .venv
-source .venv/bin/activate
-pip3 install --upgrade pip
-pip3 install "$(ls -v app-*.whl | tail -n 1)"
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/pip install "$(ls -v app-*.whl | tail -n 1)"
+./.venv/bin/python - <<'PY'
+from importlib.metadata import version
+
+for package in ("sqlalchemy", "pymysql", "aiomysql"):
+    print(f"[run_be] installed {package}=={version(package)}")
+PY
 
 # .env를 시스템 환경변수로 export (const.py의 os.getenv가 읽을 수 있도록)
 # SMTP_PASSWORD처럼 공백이 포함된 값이 있어 shell source를 쓰지 않는다.
@@ -155,8 +161,6 @@ if ! kill -0 "$(cat "$AI_READER_WORKER_PID")" 2>/dev/null; then
   exit 1
 fi
 
-deactivate
-
 # 배치 파일 동기화: 배포된 batch/ → 크론이 참조하는 /home/ln-admin/likenovel/batch/
 BATCH_SRC=/home/ln-admin/likenovel/api/batch
 BATCH_DST=/home/ln-admin/likenovel/batch
@@ -164,7 +168,10 @@ mkdir -p "$BATCH_DST"
 cp "$BATCH_SRC"/*.sh "$BATCH_DST/" 2>/dev/null || true
 cp "$BATCH_SRC"/*.sql "$BATCH_DST/" 2>/dev/null || true
 cp "$BATCH_SRC"/*.py "$BATCH_DST/" 2>/dev/null || true
-chmod +x "$BATCH_DST"/*.sh
+for batch_script in "$BATCH_DST"/*.sh; do
+  [ -f "$batch_script" ] || continue
+  chmod +x "$batch_script"
+done
 
 # prod 웹소챗 컨텍스트 배치 cron 보장 (중복 등록 방지)
 STORYCTX_CRON_LINE='10 * * * * STORYCTX_MAX_PARALLEL=2 bash /home/ln-admin/likenovel/batch/build_story_agent_context_batch.sh >> /home/ln-admin/likenovel/batch/build_story_agent_context_batch.log 2>&1'
