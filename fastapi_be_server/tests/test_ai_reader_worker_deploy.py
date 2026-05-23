@@ -40,7 +40,7 @@ def test_prod_workflow_runs_pre_deploy_quality_gates_and_waits_for_codedeploy():
     workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
     content = workflow.read_text(encoding="utf-8")
 
-    assert "poetry run pytest tests/test_ai_reader_worker_deploy.py -q" in content
+    assert "poetry run python tests/test_ai_reader_worker_deploy.py" in content
     assert "shellcheck --severity=warning dist/run_be.sh dist/verify_backend_prod_deploy.sh" in content
     assert "bash -n dist/run_be.sh" in content
     assert "bash -n dist/verify_backend_prod_deploy.sh" in content
@@ -181,3 +181,9 @@ def test_dev_before_install_prunes_only_guarded_staging_dir():
     assert 'find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +' in content
     assert "api-dev" in content
     assert "api-dev-deploy" in content
+
+
+if __name__ == "__main__":
+    for name, test_func in sorted(globals().items()):
+        if name.startswith("test_") and callable(test_func):
+            test_func()
