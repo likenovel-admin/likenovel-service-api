@@ -13,6 +13,11 @@ cd /home/ln-admin/likenovel/api || exit 1
 SERVICE_NAME=likenovel-api.service
 NEXT_VENV=.venv-next
 PREV_VENV=.venv-prev
+ENV_BACKUP=.env.prev
+AI_READER_WORKER_LOG=./logs/data/ai_reader_worker.log
+AI_READER_WORKER_PID=./ai_reader_worker.pid
+REQUIRED_ENV_KEYS=(DB_USER_ID DB_USER_PW DB_IP DB_PORT)
+PATH_ENV_KEYS=(ROOT_PATH FCM_SERVICE_ACCOUNT_JSON_PATH)
 
 load_env_file() {
   local env_file="$1"
@@ -45,6 +50,80 @@ load_env_file() {
         ;;
     esac
   done < "$env_file"
+}
+
+validate_env_file() {
+  local env_file="$1"
+  local line key value quote line_no required_key path_key
+  declare -A env_values=()
+
+  if [ ! -s "$env_file" ]; then
+    echo "[run_be] env file missing or empty: $env_file" >&2
+    return 1
+  fi
+
+  line_no=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+    line="${line%$'\r'}"
+
+    case "$line" in
+      ''|'#'*) continue ;;
+      export\ *=*) line="${line#export }" ;;
+      *=*) ;;
+      *)
+        echo "[run_be] malformed env line ${line_no}: $line" >&2
+        return 1
+        ;;
+    esac
+
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "[run_be] invalid env key at line ${line_no}: $key" >&2
+      return 1
+    fi
+    if [[ -v "env_values[$key]" ]]; then
+      echo "[run_be] duplicate env key: $key" >&2
+      return 1
+    fi
+
+    quote="${value:0:1}"
+    if [[ "$quote" == '"' || "$quote" == "'" ]]; then
+      if [[ "${value: -1}" != "$quote" ]]; then
+        echo "[run_be] unclosed env quote at line ${line_no}: $key" >&2
+        return 1
+      fi
+      value="${value:1:${#value}-2}"
+    fi
+
+    env_values["$key"]="$value"
+  done < "$env_file"
+
+  for required_key in "${REQUIRED_ENV_KEYS[@]}"; do
+    if [[ ! -v "env_values[$required_key]" ]] || [ -z "${env_values[$required_key]}" ]; then
+      echo "[run_be] missing required env key: $required_key" >&2
+      return 1
+    fi
+  done
+
+  if [[ ! "${env_values[DB_PORT]}" =~ ^[0-9]+$ ]]; then
+    echo "[run_be] DB_PORT must be numeric" >&2
+    return 1
+  fi
+
+  for path_key in "${PATH_ENV_KEYS[@]}"; do
+    if [[ -v "env_values[$path_key]" ]] && [ -n "${env_values[$path_key]}" ]; then
+      case "${env_values[$path_key]}" in
+        /*) ;;
+        *)
+          echo "[run_be] path env must be absolute: $path_key" >&2
+          return 1
+          ;;
+      esac
+    fi
+  done
 }
 
 stop_pidfile_process() {
@@ -102,12 +181,49 @@ for package in ("sqlalchemy", "pymysql", "aiomysql"):
 PY
 }
 
+verify_env_database_connection() {
+  local env_file="$1"
+
+  load_env_file "$env_file"
+  "$NEXT_VENV/bin/python" - <<'PY'
+import asyncio
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from app.const import settings
+
+
+async def main():
+    engine = create_async_engine(settings.LIKENOVEL_DB_URL, pool_pre_ping=True)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    finally:
+        await engine.dispose()
+
+
+asyncio.run(main())
+print("[run_be] DB smoke check passed")
+PY
+}
+
 activate_next_venv() {
   rm -rf "$PREV_VENV"
   if [ -d .venv ]; then
     mv .venv "$PREV_VENV"
   fi
   mv "$NEXT_VENV" .venv
+}
+
+activate_next_env() {
+  rm -f "$ENV_BACKUP"
+  if [ -f .env ]; then
+    cp .env "$ENV_BACKUP"
+  fi
+  cp .env.production .env
+  # trailing newline 보장 (없으면 cron_env.sh의 while read가 마지막 줄 스킵)
+  tail -c1 .env | read -r _ || echo >> .env
 }
 
 start_service_and_verify() {
@@ -145,19 +261,40 @@ restore_previous_venv_and_restart() {
   start_service_and_verify
 }
 
+restore_previous_env() {
+  if [ ! -f "$ENV_BACKUP" ]; then
+    echo "[run_be] previous env missing; rollback unavailable" >&2
+    return 1
+  fi
+  mv "$ENV_BACKUP" .env
+}
+
+start_ai_reader_worker() {
+  AI_READER_WORKER_ENABLED=Y nohup ./.venv/bin/python -u scripts/run_ai_reader_worker.py \
+    --worker-id "ai-reader-prod-$(hostname)" \
+    --session-limit 10 \
+    --action-limit 50 \
+    --interval-seconds 5 \
+    >> "$AI_READER_WORKER_LOG" 2>&1 &
+  echo $! > "$AI_READER_WORKER_PID"
+  sleep 1
+  if ! kill -0 "$(cat "$AI_READER_WORKER_PID")" 2>/dev/null; then
+    echo "[ERROR] AI reader worker failed to start"
+    tail -50 "$AI_READER_WORKER_LOG" || true
+    return 1
+  fi
+}
+
 require_systemd_access
+validate_env_file .env.production
 
 rm -rf ./__pycache__
 
 # 로그 디렉토리 생성 (없으면 라우터 import 실패)
 mkdir -p ./logs/data ./logs/error
 
-# .env.production → .env (pydantic_settings가 .env를 읽음)
-cp .env.production .env
-# trailing newline 보장 (없으면 cron_env.sh의 while read가 마지막 줄 스킵)
-tail -c1 .env | read -r _ || echo >> .env
-
 prepare_next_venv
+verify_env_database_connection .env.production
 
 for worker_pidfile in ai_reader_worker.pid ai_reader_worker_manual_*.pid; do
   stop_pidfile_process "$worker_pidfile"
@@ -167,32 +304,28 @@ sleep 3
 
 stop_service_and_orphans
 activate_next_venv
+activate_next_env
 
 # .env를 시스템 환경변수로 export (const.py의 os.getenv가 읽을 수 있도록)
 # SMTP_PASSWORD처럼 공백이 포함된 값이 있어 shell source를 쓰지 않는다.
 load_env_file .env
 
 if ! start_service_and_verify; then
-  echo "[run_be] start failed; restoring previous venv" >&2
-  restore_previous_venv_and_restart
-fi
-
-AI_READER_WORKER_LOG=./logs/data/ai_reader_worker.log
-AI_READER_WORKER_PID=./ai_reader_worker.pid
-AI_READER_WORKER_ENABLED=Y nohup ./.venv/bin/python -u scripts/run_ai_reader_worker.py \
-  --worker-id "ai-reader-prod-$(hostname)" \
-  --session-limit 10 \
-  --action-limit 50 \
-  --interval-seconds 5 \
-  >> "$AI_READER_WORKER_LOG" 2>&1 &
-echo $! > "$AI_READER_WORKER_PID"
-sleep 1
-if ! kill -0 "$(cat "$AI_READER_WORKER_PID")" 2>/dev/null; then
-  echo "[ERROR] AI reader worker failed to start"
-  tail -50 "$AI_READER_WORKER_LOG" || true
+  echo "[run_be] start failed; restoring previous env and venv" >&2
+  restore_status=0
+  restore_previous_env || restore_status=$?
+  restore_previous_venv_and_restart || restore_status=$?
+  if [ "$restore_status" -eq 0 ]; then
+    start_ai_reader_worker || restore_status=$?
+  fi
+  if [ "$restore_status" -ne 0 ]; then
+    echo "[run_be] rollback had failures: $restore_status" >&2
+  fi
   exit 1
 fi
-rm -rf "$PREV_VENV" "$NEXT_VENV.failed"
+
+start_ai_reader_worker
+rm -rf "$PREV_VENV" "$NEXT_VENV.failed" "$ENV_BACKUP"
 
 # 배치 파일 동기화: 배포된 batch/ → 크론이 참조하는 /home/ln-admin/likenovel/batch/
 BATCH_SRC=/home/ln-admin/likenovel/api/batch

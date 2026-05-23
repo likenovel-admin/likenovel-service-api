@@ -143,14 +143,70 @@ def test_prod_run_script_prebuilds_next_venv_before_stopping_service():
     assert main_flow.index("activate_next_venv") < main_flow.index("start_service_and_verify")
 
 
+def test_prod_run_script_validates_env_before_stopping_service_or_copying_env():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+    main_flow = content[content.index("\nrequire_systemd_access\n") :]
+
+    assert "validate_env_file()" in content
+    assert "verify_env_database_connection()" in content
+    assert "activate_next_env()" in content
+    assert "ENV_BACKUP=.env.prev" in content
+    assert "validate_env_file .env.production" in main_flow
+    assert "verify_env_database_connection .env.production" in main_flow
+    assert "activate_next_env" in main_flow
+    assert "cp .env.production .env" in content
+    assert 'load_env_file "$env_file"' in content
+
+    assert main_flow.index("validate_env_file .env.production") < main_flow.index("prepare_next_venv")
+    assert main_flow.index("prepare_next_venv") < main_flow.index("verify_env_database_connection .env.production")
+    assert main_flow.index("verify_env_database_connection .env.production") < main_flow.index("stop_service_and_orphans")
+    assert main_flow.index("stop_service_and_orphans") < main_flow.index("activate_next_env")
+    assert main_flow.index("activate_next_env") < main_flow.index("load_env_file .env")
+    assert main_flow.index("load_env_file .env") < main_flow.index("start_service_and_verify")
+
+
+def test_prod_run_script_env_validator_has_minimal_hard_guards():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+
+    assert "REQUIRED_ENV_KEYS=(DB_USER_ID DB_USER_PW DB_IP DB_PORT)" in content
+    assert 'PATH_ENV_KEYS=(ROOT_PATH FCM_SERVICE_ACCOUNT_JSON_PATH)' in content
+    assert 'invalid env key at line ${line_no}: $key' in content
+    assert 'malformed env line ${line_no}' in content
+    assert 'duplicate env key: $key' in content
+    assert 'missing required env key: $required_key' in content
+    assert 'DB_PORT must be numeric' in content
+    assert 'path env must be absolute: $path_key' in content
+
+
+def test_prod_run_script_db_smoke_uses_new_venv_and_env_production_before_stop():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+
+    assert '"$NEXT_VENV/bin/python" - <<\'PY\'' in content
+    assert "from sqlalchemy import text" in content
+    assert "from sqlalchemy.ext.asyncio import create_async_engine" in content
+    assert "from app.const import settings" in content
+    assert 'await conn.execute(text("SELECT 1"))' in content
+    assert "[run_be] DB smoke check passed" in content
+
+
 def test_prod_run_script_rolls_back_venv_if_systemd_start_fails():
     content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+    failure_block = content[
+        content.index('if ! start_service_and_verify; then') :
+        content.index("# 배치 파일 동기화")
+    ]
 
     assert 'if ! start_service_and_verify; then' in content
     assert "restore_previous_venv_and_restart" in content
+    assert "restore_previous_env" in content
     assert 'mv .venv "$NEXT_VENV.failed"' in content
     assert 'mv "$PREV_VENV" .venv' in content
+    assert 'mv "$ENV_BACKUP" .env' in content
     assert 'sudo -n systemctl start "$SERVICE_NAME"' in content
+    assert "start_ai_reader_worker" in failure_block
+    assert failure_block.index("restore_previous_venv_and_restart") < failure_block.index("start_ai_reader_worker")
+    assert failure_block.index("start_ai_reader_worker") < failure_block.index("exit 1")
+    assert "exit 1" in failure_block
 
 
 def test_prod_run_script_uses_systemd_as_gunicorn_owner():
