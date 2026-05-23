@@ -148,40 +148,46 @@ current_release_target() {
   fi
 }
 
-switch_current_link() {
+replace_current_symlink() {
+  local target="$1"
   local tmp_link="${CURRENT_LINK}.next"
 
-  PREVIOUS_RELEASE="$(current_release_target)"
   rm -f "$tmp_link"
+  ln -s "$target" "$tmp_link"
+  mv -Tf "$tmp_link" "$CURRENT_LINK"
+}
+
+switch_current_link() {
+  PREVIOUS_RELEASE="$(current_release_target)"
 
   if [ -L "$CURRENT_LINK" ]; then
-    rm -f "$CURRENT_LINK"
+    replace_current_symlink "$NEW_RELEASE_DIR"
   elif [ -d "$CURRENT_LINK" ]; then
     LEGACY_BACKUP="$RELEASE_BASE/$(date +%Y%m%d%H%M%S)-pre-symlink"
     mv "$CURRENT_LINK" "$LEGACY_BACKUP"
+    replace_current_symlink "$NEW_RELEASE_DIR"
   elif [ -e "$CURRENT_LINK" ]; then
     echo "[run_be.dev] current path is not a directory or symlink: $CURRENT_LINK" >&2
     exit 1
+  else
+    replace_current_symlink "$NEW_RELEASE_DIR"
   fi
-
-  ln -s "$NEW_RELEASE_DIR" "$tmp_link"
-  mv -T "$tmp_link" "$CURRENT_LINK"
 }
 
 rollback_to_previous_release() {
-  local tmp_link="${CURRENT_LINK}.rollback"
-
-  rm -f "$tmp_link"
   if [ -n "$PREVIOUS_RELEASE" ] && [ -d "$PREVIOUS_RELEASE" ]; then
-    ln -s "$PREVIOUS_RELEASE" "$tmp_link"
-    rm -f "$CURRENT_LINK"
-    mv -T "$tmp_link" "$CURRENT_LINK"
+    replace_current_symlink "$PREVIOUS_RELEASE"
     log "rolled back current link to $PREVIOUS_RELEASE"
     return 0
   fi
 
   if [ -n "$LEGACY_BACKUP" ] && [ -d "$LEGACY_BACKUP" ]; then
-    rm -f "$CURRENT_LINK"
+    if [ -L "$CURRENT_LINK" ]; then
+      unlink "$CURRENT_LINK"
+    elif [ -e "$CURRENT_LINK" ]; then
+      echo "[run_be.dev] cannot restore legacy backup over non-symlink path: $CURRENT_LINK" >&2
+      return 1
+    fi
     mv "$LEGACY_BACKUP" "$CURRENT_LINK"
     log "rolled back current directory from $LEGACY_BACKUP"
     return 0
