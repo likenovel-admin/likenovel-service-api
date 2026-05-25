@@ -368,6 +368,95 @@ def _parse_json_from_llm(raw: str) -> dict:
 #  작품 AI DNA
 # ──────────────────────────────────────────────────────────
 
+MAX_PRODUCT_BRIEF_IDS = 60
+
+
+def _normalize_product_brief_ids(product_ids: list[int]) -> list[int]:
+    normalized_ids: list[int] = []
+    seen: set[int] = set()
+
+    for value in product_ids or []:
+        product_id = _safe_int(value, 0)
+        if product_id <= 0 or product_id in seen:
+            continue
+        seen.add(product_id)
+        normalized_ids.append(product_id)
+        if len(normalized_ids) >= MAX_PRODUCT_BRIEF_IDS:
+            break
+
+    return normalized_ids
+
+
+def _compact_brief_text(value, limit: int = 500) -> str | None:
+    text_value = " ".join(str(value or "").split())
+    if not text_value:
+        return None
+    if len(text_value) <= limit:
+        return text_value
+    return text_value[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _product_ai_brief_row_to_dict(row) -> dict:
+    data = dict(row)
+    return {
+        "productId": data.get("product_id"),
+        "title": data.get("title"),
+        "premise": _compact_brief_text(data.get("premise")),
+        "hook": _compact_brief_text(data.get("hook")),
+        "mood": _compact_brief_text(data.get("mood"), 160),
+        "pacing": data.get("pacing"),
+        "protagonistType": _compact_brief_text(data.get("protagonist_type"), 120),
+        "protagonistGoal": _compact_brief_text(
+            data.get("protagonist_goal_primary"), 120
+        ),
+        "tasteTags": _as_list(data.get("taste_tags")),
+        "worldviewTags": _as_list(data.get("worldview_tags")),
+        "protagonistTypeTags": _as_list(data.get("protagonist_type_tags")),
+        "protagonistJobTags": _as_list(data.get("protagonist_job_tags")),
+        "protagonistMaterialTags": _as_list(data.get("protagonist_material_tags")),
+        "styleTags": _as_list(data.get("axis_style_tags")),
+        "romanceTags": _as_list(data.get("axis_romance_tags")),
+    }
+
+
+async def get_product_ai_briefs(
+    product_ids: list[int], db: AsyncSession, adult_yn: str = "N"
+) -> list[dict]:
+    normalized_ids = _normalize_product_brief_ids(product_ids)
+    if not normalized_ids:
+        return []
+
+    # Public route cannot trust client-supplied adult_yn; only all-age briefs are exposed.
+    query = text(f"""
+        SELECT
+            p.product_id,
+            p.title,
+            m.premise,
+            m.hook,
+            m.mood,
+            m.pacing,
+            m.protagonist_type,
+            m.protagonist_goal_primary,
+            m.taste_tags,
+            m.worldview_tags,
+            m.protagonist_type_tags,
+            m.protagonist_job_tags,
+            m.protagonist_material_tags,
+            m.axis_style_tags,
+            m.axis_romance_tags
+        FROM tb_product_ai_metadata m
+        INNER JOIN tb_product p ON p.product_id = m.product_id
+        WHERE m.product_id IN :product_ids
+          AND p.open_yn = 'Y'
+          AND m.analysis_status = 'success'
+          AND COALESCE(m.exclude_from_recommend_yn, 'N') = 'N'
+          AND p.ratings_code = 'all'
+    """).bindparams(bindparam("product_ids", expanding=True))
+
+    result = await db.execute(query, {"product_ids": normalized_ids})
+    return [_product_ai_brief_row_to_dict(row) for row in result.mappings().all()]
+
+
 async def get_product_ai_metadata(product_id: int, db: AsyncSession) -> dict | None:
     query = text("""
         SELECT
