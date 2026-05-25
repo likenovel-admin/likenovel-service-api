@@ -15,6 +15,16 @@ router = APIRouter(prefix="/ai")
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 
 
+def _parse_product_ids_param(product_ids: str) -> list[int]:
+    parsed_ids: list[int] = []
+    for raw_value in (product_ids or "").split(","):
+        try:
+            parsed_ids.append(int(raw_value.strip()))
+        except (TypeError, ValueError):
+            continue
+    return parsed_ids
+
+
 @router.get(
     "/taste-profile",
     tags=["AI 추천"],
@@ -67,6 +77,23 @@ async def get_onboarding_products(
         default_top_n=10,
     )
     return {"data": products, "tag_tabs": tag_tabs}
+
+
+@router.get(
+    "/product-briefs",
+    tags=["AI 추천"],
+    responses={200: {"description": "작품 AI 사서 공개 소개 데이터 조회"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_product_ai_briefs(
+    product_ids: str = Query("", description="쉼표로 구분한 작품 ID 목록"),
+    adult_yn: str = Query("N", description="현재 공개 brief는 전체이용가 작품만 반환"),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    briefs = await recommendation_service.get_product_ai_briefs(
+        _parse_product_ids_param(product_ids), db, adult_yn=adult_yn
+    )
+    return {"data": briefs}
 
 
 @router.get(
