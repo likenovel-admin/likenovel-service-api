@@ -38,6 +38,7 @@ resolve_api_root() {
   cd "${SCRIPT_DIR}/../api" && pwd
 }
 
+# shellcheck disable=SC2329
 cleanup_on_exit() {
   local exit_code=$?
   rm -rf "${LOCK_DIR}"
@@ -149,35 +150,47 @@ fi
 
 readarray -t CANDIDATE_ROWS < <("${MYSQL_CMD[@]}" <<SQL
 SELECT
-  p.product_id,
-  REPLACE(REPLACE(p.title, '\t', ' '), '\n', ' ') AS title
-FROM tb_product p
-JOIN tb_product_episode pe
-  ON pe.product_id = p.product_id
- AND pe.use_yn = 'Y'
- AND pe.open_yn = 'Y'
-LEFT JOIN tb_story_agent_context_product sacp
-  ON sacp.product_id = p.product_id
-WHERE p.price_type = 'free'
-  AND p.open_yn = 'Y'
-  AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
-GROUP BY
-  p.product_id,
-  p.title,
-  sacp.context_status,
-  sacp.ready_episode_count
-HAVING
-  COALESCE(sacp.context_status, 'pending') IN ('pending', 'processing', 'failed')
-  OR COALESCE(sacp.ready_episode_count, 0) < MAX(pe.episode_no)
+  candidates.product_id,
+  candidates.title
+FROM (
+  SELECT
+    p.product_id,
+    REPLACE(REPLACE(p.title, '\t', ' '), '\n', ' ') AS title,
+    COALESCE(sacp.context_status, 'pending') AS context_status,
+    SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count
+  FROM tb_product p
+  JOIN tb_product_episode pe
+    ON pe.product_id = p.product_id
+   AND pe.use_yn = 'Y'
+   AND pe.open_yn = 'Y'
+  LEFT JOIN tb_story_agent_context_product sacp
+    ON sacp.product_id = p.product_id
+  LEFT JOIN tb_story_agent_context_summary sacs
+    ON sacs.product_id = p.product_id
+   AND sacs.summary_type = 'episode_summary'
+   AND sacs.is_active = 'Y'
+   AND sacs.scope_key = CONCAT('episode:', pe.episode_id)
+  WHERE p.price_type = 'free'
+    AND p.open_yn = 'Y'
+    AND p.blind_yn = 'N'
+    AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
+  GROUP BY
+    p.product_id,
+    p.title,
+    sacp.context_status
+  HAVING
+    context_status IN ('pending', 'processing', 'failed')
+    OR missing_open_episode_count > 0
+) candidates
 ORDER BY
-  CASE COALESCE(sacp.context_status, 'pending')
+  CASE candidates.context_status
     WHEN 'failed' THEN 0
     WHEN 'processing' THEN 1
     WHEN 'pending' THEN 2
     ELSE 3
   END ASC,
-  (MAX(pe.episode_no) - COALESCE(sacp.ready_episode_count, 0)) DESC,
-  p.product_id ASC
+  candidates.missing_open_episode_count DESC,
+  candidates.product_id ASC
 LIMIT ${MAX_PARALLEL};
 SQL
 )
