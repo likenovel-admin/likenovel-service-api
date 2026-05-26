@@ -577,6 +577,27 @@ async def websochat_usage_statistics(
 
 
 @router.get(
+    "/ai-api-usage",
+    tags=["AI API 사용량 통계"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_api_usage_statistics(
+    start_date: str | None = Query(None, description="시작 날짜"),
+    end_date: str | None = Query(None, description="종료 날짜"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """AI API 사용량/비용 통계."""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+
+    return await statistics_service.ai_api_usage_statistics(
+        start_date,
+        end_date,
+        db,
+    )
+
+
+@router.get(
     "/ai-reader-engagement",
     tags=["AI 유저 인게이지먼트 통계"],
     dependencies=[Depends(analysis_logger)],
