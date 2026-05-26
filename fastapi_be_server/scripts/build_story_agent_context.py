@@ -1260,8 +1260,6 @@ def validate_delta_args(args: argparse.Namespace) -> None:
         raise ValueError("--build-mode delta 에서는 --limit를 지원하지 않습니다.")
     if not args.product_ids:
         raise ValueError("--build-mode delta 에서는 --product-id가 필수입니다.")
-    if not args.episode_ids and not args.episode_nos:
-        raise ValueError("--build-mode delta 에서는 --episode-id 또는 --episode-no 중 하나 이상이 필요합니다.")
 
 
 def build_open_add_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
@@ -3058,12 +3056,22 @@ def compute_rp_affected_scope_keys(
 ) -> set[str]:
     touched_character_keys = extract_character_keys_from_signal_rows(old_touched_signal_rows) | extract_character_keys_from_signal_rows(new_touched_signal_rows)
     touched_relation_keys = extract_relation_keys_from_signal_rows(old_touched_signal_rows) | extract_relation_keys_from_signal_rows(new_touched_signal_rows)
-    relation_character_keys = extract_relation_character_keys(touched_relation_keys, old_relation_map, new_relation_map)
-    candidate_scope_keys = touched_character_keys | relation_character_keys | set(cleanup_scope_keys or set())
-    for scope_key in set(old_inventory_map.keys()) | set(new_inventory_map.keys()):
-        if scope_key not in candidate_scope_keys:
-            continue
-        if scope_key not in old_profile_map or scope_key not in old_examples_map:
+    changed_relation_keys = {
+        relation_key
+        for relation_key in touched_relation_keys
+        if dict((old_relation_map or {}).get(relation_key) or {}) != dict((new_relation_map or {}).get(relation_key) or {})
+    }
+    relation_character_keys = extract_relation_character_keys(changed_relation_keys, old_relation_map, new_relation_map)
+    candidate_scope_keys = set(cleanup_scope_keys or set())
+    for scope_key in touched_character_keys | relation_character_keys:
+        old_inventory_item = dict((old_inventory_map or {}).get(scope_key) or {})
+        new_inventory_item = dict((new_inventory_map or {}).get(scope_key) or {})
+        if (
+            old_inventory_item != new_inventory_item
+            or scope_key in relation_character_keys
+            or scope_key not in old_profile_map
+            or scope_key not in old_examples_map
+        ):
             candidate_scope_keys.add(scope_key)
     return {scope_key for scope_key in candidate_scope_keys if str(scope_key or "").strip()}
 
@@ -3489,6 +3497,29 @@ async def build_episode_character_signals_summaries(
                 build_rp_reasoning_signature(),
             ],
         )
+        existing_summary_id = 0
+        with work_cursor(conn) as cur:
+            existing = fetch_existing_summary(
+                cur=cur,
+                product_id=product_id,
+                summary_type="episode_character_signals",
+                scope_key=scope_key,
+                source_hash=source_hash,
+            )
+            if existing:
+                existing_summary_id = int(existing["summary_id"])
+                activate_existing_summary(
+                    cur,
+                    existing_summary_id,
+                    product_id,
+                    "episode_character_signals",
+                    scope_key,
+                )
+        if existing_summary_id:
+            conn.commit()
+            reused_count += 1
+            continue
+
         try:
             payload = await request_episode_character_signals_payload(
                 summary_client,
