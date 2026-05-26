@@ -13,6 +13,8 @@ LOCK_DIR="${STORYCTX_LOCK_DIR:-/tmp/build-story-agent-context-batch.lock}"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 MAX_LOCK_AGE_SECONDS="${STORYCTX_MAX_LOCK_AGE_SECONDS:-21600}"
 MAX_PARALLEL="${STORYCTX_MAX_PARALLEL:-2}"
+BUILD_MODE="${STORYCTX_BUILD_MODE:-delta}"
+MAX_MISSING_EPISODES="${STORYCTX_MAX_MISSING_EPISODES:-5}"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
@@ -94,6 +96,29 @@ normalize_parallel() {
   fi
 }
 
+normalize_build_mode() {
+  case "${BUILD_MODE}" in
+    delta|full)
+      ;;
+    *)
+      log "[error] invalid STORYCTX_BUILD_MODE=${BUILD_MODE}"
+      exit 1
+      ;;
+  esac
+
+  if [ "${BUILD_MODE}" = "full" ] && [ "${STORYCTX_ALLOW_FULL:-0}" != "1" ]; then
+    log "[error] full build blocked. set STORYCTX_ALLOW_FULL=1 for manual backfill only"
+    exit 1
+  fi
+
+  if ! [[ "${MAX_MISSING_EPISODES}" =~ ^[0-9]+$ ]]; then
+    MAX_MISSING_EPISODES=5
+  fi
+  if [ "${MAX_MISSING_EPISODES}" -lt 1 ]; then
+    MAX_MISSING_EPISODES=1
+  fi
+}
+
 API_ROOT="$(resolve_api_root)"
 BUILD_SCRIPT="${API_ROOT}/scripts/build_story_agent_context.py"
 
@@ -129,8 +154,9 @@ if [ -z "${OPENROUTER_API_KEY:-}" ]; then
 fi
 
 normalize_parallel
+normalize_build_mode
 acquire_lock
-log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL}"
+log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE} max_missing_episodes=${MAX_MISSING_EPISODES}"
 
 MYSQL_CMD=(
   mysql
@@ -179,8 +205,7 @@ FROM (
     p.title,
     sacp.context_status
   HAVING
-    context_status IN ('pending', 'processing', 'failed')
-    OR missing_open_episode_count > 0
+    missing_open_episode_count BETWEEN 1 AND ${MAX_MISSING_EPISODES}
 ) candidates
 ORDER BY
   CASE candidates.context_status
@@ -214,7 +239,7 @@ run_product() {
     export PYTHONUNBUFFERED=1
     exec "${PYTHON_BIN}" "${BUILD_SCRIPT}" \
       --product-id "${product_id}" \
-      --build-mode full \
+      --build-mode "${BUILD_MODE}" \
       --apply \
       --verbose
   ) > >(append_timestamped_to_log) 2>&1 &
@@ -260,8 +285,8 @@ for pid in "${PIDS[@]}"; do
   fi
 done
 
-log "[summary] launched=${#PIDS[@]} ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL}"
-log "[INFO] build_story_agent_context_batch completed ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL}"
+log "[summary] launched=${#PIDS[@]} ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
+log "[INFO] build_story_agent_context_batch completed ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
 
 if [ "${fail_count}" -gt 0 ]; then
   exit 1
