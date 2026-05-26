@@ -19,6 +19,7 @@ MAX_ANALYZE_EPISODES = 10
 MAX_ANALYZE_CHARS = 60000
 MAX_LLM_OUTPUT_TOKENS = 4096
 MIN_REQUIRED_EPISODES = 3
+MIN_FIRST_EPISODE_TEXT_COUNT = 1000
 
 ALLOWED_ANALYSIS_STATUS = {"pending", "success", "failed"}
 ALLOWED_EXCLUDE_YN = {"Y", "N"}
@@ -726,10 +727,10 @@ async def _get_product_for_analysis(product_id: int, db: AsyncSession) -> dict[s
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             message="작가명이 비어있는 작품은 AI 메타 수집 대상이 아닙니다.",
         )
-    if (product.get("first_episode_text_count") or 0) < 5000:
+    if (product.get("first_episode_text_count") or 0) < MIN_FIRST_EPISODE_TEXT_COUNT:
         raise CustomResponseException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            message="첫 회차 5000자 미만 작품은 AI 메타 수집 대상이 아닙니다.",
+            message=f"첫 회차 {MIN_FIRST_EPISODE_TEXT_COUNT}자 미만 작품은 AI 메타 수집 대상이 아닙니다.",
         )
     return product
 
@@ -808,7 +809,7 @@ async def ai_product_metadata_list(
         "p.open_yn = 'Y'",
         "COALESCE(u.role_type, 'normal') != 'admin'",
         "COALESCE(TRIM(p.author_name), '') != ''",
-        """
+        f"""
         EXISTS (
             SELECT 1
             FROM tb_product_episode fe
@@ -816,7 +817,7 @@ async def ai_product_metadata_list(
               AND fe.episode_no = 1
               AND fe.use_yn = 'Y'
               AND fe.open_yn = 'Y'
-              AND fe.episode_text_count >= 5000
+              AND fe.episode_text_count >= {MIN_FIRST_EPISODE_TEXT_COUNT}
         )
         """,
     ]

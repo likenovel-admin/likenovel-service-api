@@ -51,6 +51,7 @@ MAX_ANALYZE_EPISODES = 10
 MAX_ANALYZE_CHARS = 60000
 MAX_LLM_OUTPUT_TOKENS = int(os.getenv("AI_METADATA_MAX_TOKENS", "4096"))
 MIN_REQUIRED_EPISODES = 3
+MIN_FIRST_EPISODE_TEXT_COUNT = 1000
 DEFAULT_GOAL_LABEL = "성장"
 FAILED_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_FAILED_RETRY_COOLDOWN_DAYS", "3"))
 INCOMPLETE_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_INCOMPLETE_RETRY_COOLDOWN_DAYS", "3"))
@@ -220,7 +221,7 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
     """분석 대상 작품 목록 조회."""
     with conn.cursor() as cur:
         params: list[Any] = []
-        where = """
+        where = f"""
             p.open_yn = 'Y'
             AND COALESCE(p.blind_yn, 'N') = 'N'
             AND COALESCE(u.role_type, 'normal') != 'admin'
@@ -232,7 +233,7 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
                   AND fe.episode_no = 1
                   AND fe.use_yn = 'Y'
                   AND fe.open_yn = 'Y'
-                  AND fe.episode_text_count >= 5000
+                  AND fe.episode_text_count >= {MIN_FIRST_EPISODE_TEXT_COUNT}
             )
             AND (
                 SELECT COUNT(*)

@@ -44,3 +44,41 @@ class AiDnaDeepseekFallbackTest(TestCase):
         with patch.object(module, "call_claude", side_effect=RuntimeError("Claude API error: 429 credit")):
             with self.assertRaisesRegex(RuntimeError, "Claude API error"):
                 module._call_llm("system", "user", {axis: set() for axis in module.AXIS_ORDER})
+
+
+class FakeCursor:
+    def __init__(self):
+        self.sql = ""
+        self.params = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql = sql
+        self.params = params
+
+    def fetchall(self):
+        return []
+
+
+class FakeConnection:
+    def __init__(self):
+        self.last_cursor = FakeCursor()
+
+    def cursor(self):
+        return self.last_cursor
+
+
+class AiDnaProductTargetQueryTest(TestCase):
+    def test_first_episode_minimum_text_count_is_1000(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        module.get_products(conn, force=True)
+
+        self.assertIn("fe.episode_text_count >= 1000", conn.last_cursor.sql)
+        self.assertNotIn("fe.episode_text_count >= 5000", conn.last_cursor.sql)
