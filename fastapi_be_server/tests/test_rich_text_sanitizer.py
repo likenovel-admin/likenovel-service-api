@@ -1,4 +1,7 @@
-from app.utils.rich_text_sanitizer import sanitize_rich_text_html
+from app.utils.rich_text_sanitizer import (
+    normalize_episode_body_html,
+    sanitize_rich_text_html,
+)
 
 
 def test_sanitize_rich_text_preserves_editor_shape_and_image():
@@ -64,3 +67,51 @@ def test_sanitize_rich_text_preserves_div_and_span_structure_without_attrs():
     assert "<div><span>둘째줄</span></div>" in sanitized
     assert "onclick" not in sanitized
     assert "color:red" not in sanitized
+
+
+def test_sanitize_rich_text_removes_storage_only_trailing_breaks():
+    html = (
+        '<p>문장 하나<br class="ProseMirror-trailingBreak"/></p>'
+        "<p><br/></p>"
+        "<p>첫 줄<br/>둘째 줄</p>"
+        "<p>문장 둘<br/></p>"
+    )
+
+    sanitized = sanitize_rich_text_html(html)
+
+    assert '<p>문장 하나</p>' in sanitized
+    assert "<p><br/></p>" in sanitized
+    assert "<p>첫 줄<br/>둘째 줄</p>" in sanitized
+    assert "<p>문장 둘</p>" in sanitized
+    assert "ProseMirror-trailingBreak" not in sanitized
+
+
+def test_normalize_episode_body_html_cleans_epub_terminal_breaks():
+    normalized = normalize_episode_body_html(
+        "<p>문장 하나<br/></p><p><br/></p><p>첫 줄<br/>둘째 줄</p><p>&nbsp;</p>"
+    )
+
+    assert "<p>문장 하나</p>" in normalized
+    assert "<p><br/></p>" in normalized
+    assert "<p>첫 줄<br/>둘째 줄</p>" in normalized
+    assert normalized.count("<p><br/></p>") == 2
+
+
+def test_sanitize_rich_text_splits_leading_breaks_into_blank_paragraphs():
+    sanitized = sanitize_rich_text_html("<p><br/>문장 하나</p><p><br/><br/>문장 둘</p>")
+
+    assert sanitized == (
+        "<p><br/></p><p>문장 하나</p>"
+        "<p><br/></p><p><br/></p><p>문장 둘</p>"
+    )
+
+
+def test_normalize_episode_body_html_splits_leading_breaks_into_blank_paragraphs():
+    normalized = normalize_episode_body_html(
+        "<p><br/>문장 하나</p><p><br/><br/>문장 둘</p>"
+    )
+
+    assert normalized == (
+        "<p><br/></p><p>문장 하나</p>"
+        "<p><br/></p><p><br/></p><p>문장 둘</p>"
+    )

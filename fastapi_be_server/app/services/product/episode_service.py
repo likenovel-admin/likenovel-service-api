@@ -21,7 +21,10 @@ from app.exceptions import CustomResponseException
 from app.rdb import likenovel_db_session
 from app.utils.time import convert_to_kor_time
 from app.utils.query import get_file_path_sub_query
-from app.utils.rich_text_sanitizer import sanitize_rich_text_html
+from app.utils.rich_text_sanitizer import (
+    normalize_episode_body_html,
+    sanitize_rich_text_html,
+)
 import app.services.common.comm_service as comm_service
 import app.schemas.episode as episode_schema
 import app.services.common.statistics_service as statistics_service
@@ -190,7 +193,8 @@ def _extract_epub_document_parts(html_bytes: bytes) -> tuple[str, str]:
         tag.decompose()
 
     body = soup.find("body")
-    html_content = body.decode_contents() if body else str(soup)
+    raw_html_content = body.decode_contents() if body else str(soup)
+    html_content = normalize_episode_body_html(raw_html_content)
     text_content = soup.get_text(separator=" ", strip=True)
     return html_content, text_content
 

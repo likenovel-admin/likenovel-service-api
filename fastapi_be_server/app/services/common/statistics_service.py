@@ -3,7 +3,7 @@ import re
 from fastapi import status
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.const import CommonConstants, settings
@@ -1216,6 +1216,224 @@ async def websochat_usage_statistics(
         "route_summary": route_summary,
         "product_summary": product_summary,
         "results": results,
+    }
+
+
+async def ai_api_usage_statistics(
+    start_date: str | None,
+    end_date: str | None,
+    db: AsyncSession,
+) -> dict:
+    """AI API 사용량/비용 통계. 비용이 없는 로그는 미집계로 분리한다."""
+    params: dict[str, str] = {}
+    date_filters = {
+        "dna": "",
+        "reader": "",
+        "websochat": "",
+        "librarian": "",
+    }
+
+    if not start_date and not end_date:
+        default_end = date.today()
+        default_start = default_end - timedelta(days=6)
+        start_date = default_start.isoformat()
+        end_date = default_end.isoformat()
+
+    if bool(start_date) != bool(end_date):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="start_date와 end_date는 함께 전달해야 합니다.",
+        )
+
+    if start_date and end_date:
+        try:
+            normalized_start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            normalized_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="날짜 형식이 올바르지 않습니다.",
+            )
+        if normalized_start_date > normalized_end_date:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="start_date는 end_date보다 늦을 수 없습니다.",
+            )
+        if (normalized_end_date - normalized_start_date).days > 89:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="조회 기간은 최대 90일까지 선택할 수 있습니다.",
+            )
+        params["start_date"] = normalized_start_date.isoformat()
+        params["end_date_exclusive"] = (normalized_end_date + timedelta(days=1)).isoformat()
+        date_filters = {
+            "dna": "AND m.analyzed_at >= :start_date AND m.analyzed_at < :end_date_exclusive",
+            "reader": "AND d.created_date >= :start_date AND d.created_date < :end_date_exclusive",
+            "websochat": "AND l.created_date >= :start_date AND l.created_date < :end_date_exclusive",
+            "librarian": "AND c.created_date >= :start_date AND c.created_date < :end_date_exclusive",
+        }
+
+    source_sql = text(f"""
+        SELECT *
+        FROM (
+            SELECT
+                'dna_batch' AS source_key,
+                'DNA 배치' AS source_label,
+                COUNT(*) AS request_count,
+                COALESCE(SUM(CASE WHEN m.analysis_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+                COALESCE(SUM(CASE WHEN m.analysis_status = 'failed' THEN 1 ELSE 0 END), 0) AS failure_count,
+                COALESCE(SUM(CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(m.raw_analysis, '$._llm_meta.total_cost')), 'null') AS DECIMAL(18,8))), 0) AS exact_cost_usd,
+                0 AS estimated_cost_usd,
+                COALESCE(SUM(CASE WHEN NULLIF(JSON_UNQUOTE(JSON_EXTRACT(m.raw_analysis, '$._llm_meta.total_cost')), 'null') IS NULL THEN 1 ELSE 0 END), 0) AS untracked_count,
+                0 AS charged_cash
+            FROM tb_product_ai_metadata m
+            WHERE m.analyzed_at IS NOT NULL
+            {date_filters["dna"]}
+
+            UNION ALL
+
+            SELECT
+                'ai_reader_batch' AS source_key,
+                'AI독자 배치' AS source_label,
+                COUNT(*) AS request_count,
+                COALESCE(SUM(CASE WHEN d.decision_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+                COALESCE(SUM(CASE WHEN d.decision_status = 'failed' THEN 1 ELSE 0 END), 0) AS failure_count,
+                0 AS exact_cost_usd,
+                COALESCE(SUM(d.estimated_cost_usd), 0) AS estimated_cost_usd,
+                COALESCE(SUM(CASE WHEN d.estimated_cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS untracked_count,
+                0 AS charged_cash
+            FROM tb_ai_reader_llm_decision d
+            WHERE 1 = 1
+            {date_filters["reader"]}
+
+            UNION ALL
+
+            SELECT
+                'websochat_chat' AS source_key,
+                '웹소챗 채팅' AS source_label,
+                COUNT(*) AS request_count,
+                COUNT(*) AS success_count,
+                0 AS failure_count,
+                0 AS exact_cost_usd,
+                0 AS estimated_cost_usd,
+                COUNT(*) AS untracked_count,
+                COALESCE(SUM(l.charged_cash), 0) AS charged_cash
+            FROM tb_story_agent_usage_log l
+            WHERE 1 = 1
+            {date_filters["websochat"]}
+
+            UNION ALL
+
+            SELECT
+                'ai_librarian_chat' AS source_key,
+                'AI사서 채팅' AS source_label,
+                COUNT(*) AS request_count,
+                COUNT(*) AS success_count,
+                0 AS failure_count,
+                0 AS exact_cost_usd,
+                0 AS estimated_cost_usd,
+                COUNT(*) AS untracked_count,
+                0 AS charged_cash
+            FROM tb_user_ai_chat_message c
+            WHERE c.role = 'assistant'
+            {date_filters["librarian"]}
+        ) usage_sources
+    """)
+    source_result = await db.execute(source_sql, params)
+    rows = [dict(row) for row in source_result.mappings().all()]
+
+    model_sql = text(f"""
+        SELECT provider, model_name, source_key,
+               SUM(request_count) AS request_count,
+               SUM(exact_cost_usd) AS exact_cost_usd,
+               SUM(estimated_cost_usd) AS estimated_cost_usd,
+               SUM(untracked_count) AS untracked_count
+        FROM (
+            SELECT
+                CONVERT(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(m.raw_analysis, '$._llm_meta.calls[0].provider')), 'unknown') USING utf8mb4) COLLATE utf8mb4_general_ci AS provider,
+                CONVERT(COALESCE(m.model_version, 'unknown') USING utf8mb4) COLLATE utf8mb4_general_ci AS model_name,
+                CONVERT('dna_batch' USING utf8mb4) COLLATE utf8mb4_general_ci AS source_key,
+                COUNT(*) AS request_count,
+                COALESCE(SUM(CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(m.raw_analysis, '$._llm_meta.total_cost')), 'null') AS DECIMAL(18,8))), 0) AS exact_cost_usd,
+                0 AS estimated_cost_usd,
+                SUM(CASE WHEN NULLIF(JSON_UNQUOTE(JSON_EXTRACT(m.raw_analysis, '$._llm_meta.total_cost')), 'null') IS NULL THEN 1 ELSE 0 END) AS untracked_count
+            FROM tb_product_ai_metadata m
+            WHERE m.analyzed_at IS NOT NULL
+            {date_filters["dna"]}
+            GROUP BY provider, model_name
+
+            UNION ALL
+
+            SELECT
+                CONVERT('openrouter' USING utf8mb4) COLLATE utf8mb4_general_ci AS provider,
+                CONVERT(COALESCE(d.model_name, 'unknown') USING utf8mb4) COLLATE utf8mb4_general_ci AS model_name,
+                CONVERT('ai_reader_batch' USING utf8mb4) COLLATE utf8mb4_general_ci AS source_key,
+                COUNT(*) AS request_count,
+                0 AS exact_cost_usd,
+                COALESCE(SUM(d.estimated_cost_usd), 0) AS estimated_cost_usd,
+                SUM(CASE WHEN d.estimated_cost_usd IS NULL THEN 1 ELSE 0 END) AS untracked_count
+            FROM tb_ai_reader_llm_decision d
+            WHERE 1 = 1
+            {date_filters["reader"]}
+            GROUP BY model_name
+
+            UNION ALL
+
+            SELECT
+                CONVERT('unknown' USING utf8mb4) COLLATE utf8mb4_general_ci AS provider,
+                CONVERT(COALESCE(l.model_used, 'unknown') USING utf8mb4) COLLATE utf8mb4_general_ci AS model_name,
+                CONVERT('websochat_chat' USING utf8mb4) COLLATE utf8mb4_general_ci AS source_key,
+                COUNT(*) AS request_count,
+                0 AS exact_cost_usd,
+                0 AS estimated_cost_usd,
+                COUNT(*) AS untracked_count
+            FROM tb_story_agent_usage_log l
+            WHERE 1 = 1
+            {date_filters["websochat"]}
+            GROUP BY model_name
+
+            UNION ALL
+
+            SELECT
+                CONVERT('unknown' USING utf8mb4) COLLATE utf8mb4_general_ci AS provider,
+                CONVERT('ai-librarian-chat' USING utf8mb4) COLLATE utf8mb4_general_ci AS model_name,
+                CONVERT('ai_librarian_chat' USING utf8mb4) COLLATE utf8mb4_general_ci AS source_key,
+                COUNT(*) AS request_count,
+                0 AS exact_cost_usd,
+                0 AS estimated_cost_usd,
+                COUNT(*) AS untracked_count
+            FROM tb_user_ai_chat_message c
+            WHERE c.role = 'assistant'
+            {date_filters["librarian"]}
+        ) model_usage
+        WHERE request_count > 0
+        GROUP BY provider, model_name, source_key
+        ORDER BY request_count DESC, source_key ASC
+    """)
+    model_result = await db.execute(model_sql, params)
+    model_rows = [dict(row) for row in model_result.mappings().all()]
+
+    summary = {
+        "request_count": sum(int(row.get("request_count") or 0) for row in rows),
+        "success_count": sum(int(row.get("success_count") or 0) for row in rows),
+        "failure_count": sum(int(row.get("failure_count") or 0) for row in rows),
+        "exact_cost_usd": float(sum(float(row.get("exact_cost_usd") or 0) for row in rows)),
+        "estimated_cost_usd": float(sum(float(row.get("estimated_cost_usd") or 0) for row in rows)),
+        "tracked_cost_usd": float(
+            sum(
+                float(row.get("exact_cost_usd") or 0)
+                + float(row.get("estimated_cost_usd") or 0)
+                for row in rows
+            )
+        ),
+        "untracked_count": sum(int(row.get("untracked_count") or 0) for row in rows),
+        "charged_cash": sum(int(row.get("charged_cash") or 0) for row in rows),
+    }
+
+    return {
+        "summary": summary,
+        "results": rows,
+        "model_summary": model_rows,
     }
 
 
