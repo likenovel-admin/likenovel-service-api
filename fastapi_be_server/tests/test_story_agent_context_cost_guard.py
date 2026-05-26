@@ -78,6 +78,23 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
 
 class StoryAgentContextDeltaValidationTest(TestCase):
+    def test_delta_rp_refresh_is_opt_in_cli_flag(self):
+        module = load_module()
+
+        with patch.object(sys, "argv", ["build_story_agent_context.py", "--build-mode", "delta", "--product-id", "687"]):
+            args = module.parse_args()
+        self.assertFalse(args.refresh_rp)
+        self.assertFalse(module.should_refresh_delta_rp(args))
+
+        with patch.object(
+            sys,
+            "argv",
+            ["build_story_agent_context.py", "--build-mode", "delta", "--product-id", "687", "--refresh-rp"],
+        ):
+            args = module.parse_args()
+        self.assertTrue(args.refresh_rp)
+        self.assertTrue(module.should_refresh_delta_rp(args))
+
     def test_delta_mode_allows_product_only_apply_for_internal_changed_row_filtering(self):
         module = load_module()
         args = SimpleNamespace(

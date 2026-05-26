@@ -370,6 +370,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="상세 로그 출력")
     parser.add_argument("--use-epub-fallback", action="store_true", help="episode_content가 비어 있으면 EPUB에서 임시 원문 추출")
     parser.add_argument(
+        "--refresh-rp",
+        action="store_true",
+        help="delta 모드에서 캐릭터 RP 프로필/예시를 갱신. 기본 delta/cron에서는 비용 방지를 위해 생략.",
+    )
+    parser.add_argument(
         "--verification-json-path",
         type=str,
         default="",
@@ -1260,6 +1265,10 @@ def validate_delta_args(args: argparse.Namespace) -> None:
         raise ValueError("--build-mode delta 에서는 --limit를 지원하지 않습니다.")
     if not args.product_ids:
         raise ValueError("--build-mode delta 에서는 --product-id가 필수입니다.")
+
+
+def should_refresh_delta_rp(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "refresh_rp", False))
 
 
 def build_open_add_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
@@ -3265,6 +3274,17 @@ async def build_rp_summaries(
     return {key: (value[0], value[1]) for key, value in counts.items()}
 
 
+def build_empty_delta_rp_counts() -> dict[str, object]:
+    return {
+        "profile": [0, 0],
+        "examples": [0, 0],
+        "deactivated_profile_count": 0,
+        "deactivated_examples_count": 0,
+        "keep_old_dialogue_missing_count": 0,
+        "keep_old_examples_missing_count": 0,
+    }
+
+
 async def build_rp_summaries_delta(
     conn,
     *,
@@ -3277,14 +3297,7 @@ async def build_rp_summaries_delta(
     relation_map: dict[str, list[dict[str, object]]],
     verbose: bool = False,
 ) -> dict[str, object]:
-    counts: dict[str, object] = {
-        "profile": [0, 0],
-        "examples": [0, 0],
-        "deactivated_profile_count": 0,
-        "deactivated_examples_count": 0,
-        "keep_old_dialogue_missing_count": 0,
-        "keep_old_examples_missing_count": 0,
-    }
+    counts = build_empty_delta_rp_counts()
     if (
         not affected_scope_keys
         or summary_client is None
@@ -6039,17 +6052,24 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             old_examples_map=old_examples_map,
                             cleanup_scope_keys=set(character_cleanup.get("touched_scope_keys") or []),
                         )
-                        rp_counts = await build_rp_summaries_delta(
-                            conn=work_conn,
-                            product_id=product_id,
-                            affected_scope_keys=rp_affected_scope_keys,
-                            episode_rows=all_episode_summary_rows,
-                            episode_texts_by_no=episode_texts_by_no,
-                            summary_client=summary_client,
-                            inventory_map=new_inventory_map,
-                            relation_map=new_relation_scope_map,
-                            verbose=args.verbose,
-                        )
+                        rp_counts = build_empty_delta_rp_counts()
+                        if should_refresh_delta_rp(args):
+                            rp_counts = await build_rp_summaries_delta(
+                                conn=work_conn,
+                                product_id=product_id,
+                                affected_scope_keys=rp_affected_scope_keys,
+                                episode_rows=all_episode_summary_rows,
+                                episode_texts_by_no=episode_texts_by_no,
+                                summary_client=summary_client,
+                                inventory_map=new_inventory_map,
+                                relation_map=new_relation_scope_map,
+                                verbose=args.verbose,
+                            )
+                        elif args.verbose and rp_affected_scope_keys:
+                            print(
+                                f"[delta-rp-skip] product_id={product_id} "
+                                f"affected_scope_keys={len(rp_affected_scope_keys)}"
+                            )
                         with work_cursor(work_conn) as cur:
                             new_profile_map = fetch_active_summary_state_map(
                                 cur=cur,
