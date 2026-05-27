@@ -45,6 +45,16 @@ class FakeDb:
         self.commits += 1
 
 
+class FakeDbSequence:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.calls = []
+
+    async def execute(self, query, params=None):
+        self.calls.append((str(query), params))
+        return FakeResult(self.rows.pop(0))
+
+
 class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_guest_page_view_inserts_null_user_id(self):
         db = FakeDb()
@@ -165,6 +175,41 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
         insert_call = db.calls[-1]
         self.assertIsNone(insert_call[1]["query_hash"])
 
+    async def test_page_view_preserves_marketing_attribution(self):
+        db = FakeDb()
+
+        await statistics_service.insert_site_page_view_event(
+            db=db,
+            kc_user_id=None,
+            event_id="1ab1ef4f-a433-4777-a4a9-0d1ab2983b1a",
+            occurred_at=datetime(2026, 5, 27, 18, 0, 0, tzinfo=timezone.utc),
+            visitor_id="pv_marketing",
+            session_id="pvs_marketing",
+            route_group="product_detail",
+            route_name="product_detail",
+            path_template="/product/[id]",
+            path="/product/1109",
+            query_hash=None,
+            referrer_path=None,
+            source="service-web",
+            taxonomy_version=1,
+            utm_source="Instagram",
+            utm_medium="social",
+            utm_campaign="p1109_card",
+            utm_content="card01",
+            external_referrer_host="l.instagram.com",
+            external_referrer_group="instagram",
+        )
+
+        insert_call = db.calls[-1]
+        self.assertIn("utm_source", insert_call[0])
+        self.assertEqual(insert_call[1]["utm_source"], "instagram")
+        self.assertEqual(insert_call[1]["utm_medium"], "social")
+        self.assertEqual(insert_call[1]["utm_campaign"], "p1109_card")
+        self.assertEqual(insert_call[1]["utm_content"], "card01")
+        self.assertEqual(insert_call[1]["external_referrer_host"], "instagram.com")
+        self.assertEqual(insert_call[1]["external_referrer_group"], "instagram")
+
     def test_sanitize_path_drops_query_and_hash(self):
         self.assertEqual(
             statistics_service._sanitize_page_view_path(
@@ -232,6 +277,35 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(req.query_hash, query_hash)
 
+    def test_marketing_attribution_schema_truncates_instead_of_rejecting(self):
+        req = PostSitePageViewReqBody(
+            eventId="9e6c64d6-9222-4546-a7ef-8699f89e2d26",
+            occurredAt="2026-05-21T12:34:56.789+09:00",
+            visitorId="pv_visitor",
+            sessionId="pvs_session",
+            routeGroup="product_detail",
+            routeName="product_detail",
+            pathTemplate="/product/[id]",
+            path="/product/1109",
+            queryHash=None,
+            referrerPath="/",
+            utmSource="X" * 300,
+            utmMedium="social",
+            utmCampaign="P1109 Card",
+            utmContent="Card 01",
+            externalReferrerHost="L.Instagram.Com",
+            externalReferrerGroup="Instagram",
+            source="service-web",
+            taxonomyVersion=1,
+        )
+
+        self.assertEqual(len(req.utm_source), 120)
+        self.assertEqual(req.utm_medium, "social")
+        self.assertEqual(req.utm_campaign, "p1109_card")
+        self.assertEqual(req.utm_content, "card_01")
+        self.assertEqual(req.external_referrer_host, "l.instagram.com")
+        self.assertEqual(req.external_referrer_group, "instagram")
+
     def test_page_view_router_does_not_attach_raw_analysis_logger(self):
         page_view_route = next(
             route
@@ -244,6 +318,81 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertNotIn(analysis_logger, dependency_calls)
+
+    async def test_site_page_referrer_statistics_groups_marketing_fields(self):
+        db = FakeDbSequence(
+            [
+                {
+                    "page_view_count": 3,
+                    "visitor_count": 2,
+                    "session_count": 2,
+                },
+                {"total_count": 1},
+                [
+                    {
+                        "referrer_group": "instagram",
+                        "external_referrer_host": "instagram.com",
+                        "utm_source": "instagram",
+                        "utm_medium": "social",
+                        "utm_campaign": "p1109_card",
+                        "utm_content": "card01",
+                        "route_group": "product_detail",
+                        "route_name": "product_detail",
+                        "path_template": "/product/[id]",
+                        "landing_path": "/product/1109",
+                        "page_view_count": 3,
+                        "visitor_count": 2,
+                        "session_count": 2,
+                    }
+                ],
+            ]
+        )
+
+        result = await statistics_service.site_page_referrer_statistics(
+            start_date="2026-05-27",
+            end_date="2026-05-27",
+            referrer_group="instagram",
+            route_group="product_detail",
+            page=1,
+            count_per_page=20,
+            db=db,
+        )
+
+        self.assertEqual(result["summary"]["page_view_count"], 3)
+        self.assertEqual(result["total_count"], 1)
+        self.assertEqual(result["results"][0]["utm_campaign"], "p1109_card")
+        self.assertEqual(result["results"][0]["utm_content"], "card01")
+        detail_sql, detail_params = db.calls[-1]
+        self.assertIn("COALESCE(NULLIF(utm_source, ''), NULLIF(external_referrer_group, ''), 'unknown')", detail_sql)
+        self.assertEqual(detail_params["referrer_group"], "instagram")
+        self.assertEqual(detail_params["route_group"], "product_detail")
+
+    async def test_site_page_referrer_statistics_all_filter_does_not_become_other(self):
+        db = FakeDbSequence(
+            [
+                {
+                    "page_view_count": 5,
+                    "visitor_count": 3,
+                    "session_count": 4,
+                },
+                {"total_count": 2},
+                [],
+            ]
+        )
+
+        await statistics_service.site_page_referrer_statistics(
+            start_date="2026-05-27",
+            end_date="2026-05-27",
+            referrer_group="all",
+            route_group="all",
+            page=1,
+            count_per_page=20,
+            db=db,
+        )
+
+        for _sql, params in db.calls:
+            self.assertNotIn("referrer_group", params)
+            self.assertNotIn("route_group", params)
 
     async def test_guest_page_dwell_inserts_null_user_id_and_capped_active_ms(self):
         db = FakeDb()

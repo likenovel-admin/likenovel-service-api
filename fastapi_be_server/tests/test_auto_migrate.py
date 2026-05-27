@@ -91,6 +91,52 @@ class SitePageViewMigrationTest(unittest.TestCase):
         self.assertNotIn("idx_site_page_view_event_user_occurred", sql)
         self.assertNotIn("idx_site_page_view_event_session_occurred", sql)
 
+    def test_site_page_view_marketing_attribution_migration_runs_after_base_table(
+        self,
+    ):
+        init_dir = Path(__file__).resolve().parents[1] / "dist" / "init"
+        files = sorted(path.name for path in init_dir.glob("*.sql"))
+
+        self.assertLess(
+            files.index("99-alter-site-page-route-daily-primary-key.sql"),
+            files.index("99a-add-site-page-view-marketing-attribution.sql"),
+        )
+
+    def test_site_page_view_marketing_attribution_migration_adds_raw_fields(self):
+        from app.utils.auto_migrate import _parse_statements
+
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "init"
+            / "99a-add-site-page-view-marketing-attribution.sql"
+        )
+
+        sql = migration_path.read_text(encoding="utf-8").lower()
+        statements = _parse_statements(sql)
+
+        self.assertGreaterEqual(len(statements), 20)
+        self.assertIn("add column utm_source", sql)
+        self.assertIn("add column utm_medium", sql)
+        self.assertIn("add column utm_campaign", sql)
+        self.assertIn("add column utm_content", sql)
+        self.assertIn("add column external_referrer_host", sql)
+        self.assertIn("add column external_referrer_group", sql)
+        self.assertIn("idx_site_page_view_event_utm_occurred", sql)
+        self.assertIn("idx_site_page_view_event_referrer_occurred", sql)
+
+    def test_site_page_view_model_has_marketing_attribution_columns(self):
+        from app.models.statistics import SitePageViewEvent
+
+        columns = set(SitePageViewEvent.__table__.columns.keys())
+
+        self.assertIn("utm_source", columns)
+        self.assertIn("utm_medium", columns)
+        self.assertIn("utm_campaign", columns)
+        self.assertIn("utm_content", columns)
+        self.assertIn("external_referrer_host", columns)
+        self.assertIn("external_referrer_group", columns)
+
     def test_site_statistics_batch_uses_kst_target_range_for_page_view(self):
         batch_path = (
             Path(__file__).resolve().parents[1]
