@@ -68,6 +68,24 @@ class SitePageViewEvent(Base):
     referrer_path: Mapped[str | None] = mapped_column(
         String(255), nullable=True, comment="이전 pathname"
     )
+    utm_source: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, comment="마케팅 UTM source"
+    )
+    utm_medium: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, comment="마케팅 UTM medium"
+    )
+    utm_campaign: Mapped[str | None] = mapped_column(
+        String(120), nullable=True, comment="마케팅 UTM campaign"
+    )
+    utm_content: Mapped[str | None] = mapped_column(
+        String(120), nullable=True, comment="마케팅 UTM content"
+    )
+    external_referrer_host: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="외부 유입 referrer host"
+    )
+    external_referrer_group: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, comment="외부 유입 referrer 그룹"
+    )
     source: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
