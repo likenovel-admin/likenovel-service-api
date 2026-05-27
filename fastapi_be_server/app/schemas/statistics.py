@@ -4,6 +4,18 @@ import re
 from pydantic import BaseModel, Field, field_validator
 
 
+def _normalize_marketing_token(value: str | None, max_length: int) -> str | None:
+    if value is None:
+        return None
+    compacted = re.sub(r"[\x00-\x1f\x7f]", "", value).strip().lower()
+    if not compacted:
+        return None
+    normalized = re.sub(r"[^a-z0-9_-]+", "_", compacted).strip("_")
+    if not normalized:
+        return None
+    return normalized[:max_length]
+
+
 class PostSitePageViewReqBody(BaseModel):
     event_id: str = Field(..., alias="eventId", min_length=8, max_length=36)
     occurred_at: datetime = Field(..., alias="occurredAt")
@@ -15,6 +27,16 @@ class PostSitePageViewReqBody(BaseModel):
     path: str = Field(..., min_length=1, max_length=255)
     query_hash: str | None = Field(None, alias="queryHash", max_length=64)
     referrer_path: str | None = Field(None, alias="referrerPath", max_length=255)
+    utm_source: str | None = Field(None, alias="utmSource")
+    utm_medium: str | None = Field(None, alias="utmMedium")
+    utm_campaign: str | None = Field(None, alias="utmCampaign")
+    utm_content: str | None = Field(None, alias="utmContent")
+    external_referrer_host: str | None = Field(
+        None, alias="externalReferrerHost"
+    )
+    external_referrer_group: str | None = Field(
+        None, alias="externalReferrerGroup"
+    )
     source: str = Field("service-web", max_length=50)
     taxonomy_version: int = Field(1, alias="taxonomyVersion", ge=1, le=20)
 
@@ -29,6 +51,27 @@ class PostSitePageViewReqBody(BaseModel):
         if re.fullmatch(r"[0-9a-f]{64}", normalized):
             return normalized
         return None
+
+    @field_validator(
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_content",
+        "external_referrer_group",
+    )
+    @classmethod
+    def validate_marketing_token(cls, value: str | None) -> str | None:
+        return _normalize_marketing_token(value, 120)
+
+    @field_validator("external_referrer_host")
+    @classmethod
+    def validate_external_referrer_host(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        host = value.strip().lower()
+        if not host:
+            return None
+        return host[:255]
 
 
 class PostSitePageDwellReqBody(BaseModel):

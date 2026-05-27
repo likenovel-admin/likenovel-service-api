@@ -36,6 +36,12 @@ async def post_site_page_view(
         referrer_path=req_body.referrer_path,
         source=req_body.source,
         taxonomy_version=req_body.taxonomy_version,
+        utm_source=req_body.utm_source,
+        utm_medium=req_body.utm_medium,
+        utm_campaign=req_body.utm_campaign,
+        utm_content=req_body.utm_content,
+        external_referrer_host=req_body.external_referrer_host,
+        external_referrer_group=req_body.external_referrer_group,
     )
     return {"data": {"ok": True}}
 

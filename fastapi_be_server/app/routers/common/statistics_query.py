@@ -224,6 +224,37 @@ async def site_page_route_statistics(
 
 
 @router.get(
+    "/site-page-referrers",
+    tags=["site 통계"],
+    responses={
+        200: {"description": "사이트 유입경로별 페이지뷰 통계"},
+        422: {"description": "Validation Error"},
+        500: {"description": "Internal Server Error"},
+    },
+    dependencies=[Depends(analysis_logger)],
+)
+async def site_page_referrer_statistics(
+    start_date: str | None = Query(None, description="시작 날짜"),
+    end_date: str | None = Query(None, description="종료 날짜"),
+    referrer_group: str | None = Query(None, description="유입 그룹"),
+    route_group: str | None = Query(None, description="route 대분류"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(20, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    site 유입경로별 페이지뷰 통계
+    """
+
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+
+    return await statistics_service.site_page_referrer_statistics(
+        start_date, end_date, referrer_group, route_group, page, count_per_page, db
+    )
+
+
+@router.get(
     "/payment",
     tags=["결제 통계"],
     responses={

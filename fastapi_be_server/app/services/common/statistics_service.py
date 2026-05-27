@@ -84,6 +84,17 @@ SITE_PAGE_VIEW_ROUTE_GROUPS = {
 }
 
 SITE_PAGE_DWELL_MAX_ACTIVE_MS = 30 * 60 * 1000
+SITE_PAGE_VIEW_REFERRER_GROUPS = {
+    "direct",
+    "internal",
+    "twitter",
+    "instagram",
+    "threads",
+    "naver",
+    "google",
+    "other",
+    "unknown",
+}
 
 
 def _allowed_ai_reader_account_domains() -> list[str]:
@@ -130,6 +141,52 @@ def _normalize_site_page_view_query_hash(query_hash: str | None) -> str | None:
     return None
 
 
+def _normalize_marketing_token(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    compacted = re.sub(r"[\x00-\x1f\x7f]", "", str(value)).strip().lower()
+    if not compacted:
+        return None
+    normalized = re.sub(r"[^a-z0-9_-]+", "_", compacted).strip("_")
+    if not normalized:
+        return None
+    return normalized[:limit]
+
+
+def _normalize_external_referrer_host(value: str | None) -> str | None:
+    if value is None:
+        return None
+    host = str(value).strip().lower()
+    if not host:
+        return None
+    host = host.split("/", 1)[0].split(":", 1)[0]
+    host = re.sub(r"^(www|m|mobile|l)\.", "", host)
+    if host == "t.co":
+        return "t.co"
+    if host == "x.com" or host.endswith(".x.com"):
+        return "x.com"
+    if host == "twitter.com" or host.endswith(".twitter.com"):
+        return "twitter.com"
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        return "instagram.com"
+    if host == "threads.net" or host.endswith(".threads.net"):
+        return "threads.net"
+    if host == "naver.com" or host.endswith(".naver.com"):
+        return "naver.com"
+    if host == "google.com" or host.endswith(".google.com"):
+        return "google.com"
+    return _limit_text(host, 255)
+
+
+def _normalize_external_referrer_group(value: str | None) -> str | None:
+    normalized = _normalize_marketing_token(value, 80)
+    if normalized is None:
+        return None
+    if normalized in SITE_PAGE_VIEW_REFERRER_GROUPS:
+        return normalized
+    return "other"
+
+
 def _normalize_page_view_occurred_at(occurred_at: datetime) -> datetime:
     if occurred_at.tzinfo is None:
         return occurred_at
@@ -159,6 +216,12 @@ async def insert_site_page_view_event(
     referrer_path: str | None,
     source: str,
     taxonomy_version: int,
+    utm_source: str | None = None,
+    utm_medium: str | None = None,
+    utm_campaign: str | None = None,
+    utm_content: str | None = None,
+    external_referrer_host: str | None = None,
+    external_referrer_group: str | None = None,
 ):
     user_id = None
     if kc_user_id:
@@ -191,6 +254,12 @@ async def insert_site_page_view_event(
             path,
             query_hash,
             referrer_path,
+            utm_source,
+            utm_medium,
+            utm_campaign,
+            utm_content,
+            external_referrer_host,
+            external_referrer_group,
             source,
             taxonomy_version,
             created_date
@@ -207,6 +276,12 @@ async def insert_site_page_view_event(
             :path,
             :query_hash,
             :referrer_path,
+            :utm_source,
+            :utm_medium,
+            :utm_campaign,
+            :utm_content,
+            :external_referrer_host,
+            :external_referrer_group,
             :source,
             :taxonomy_version,
             NOW()
@@ -227,6 +302,16 @@ async def insert_site_page_view_event(
             "path": sanitized_path,
             "query_hash": _normalize_site_page_view_query_hash(query_hash),
             "referrer_path": sanitized_referrer_path,
+            "utm_source": _normalize_marketing_token(utm_source, 80),
+            "utm_medium": _normalize_marketing_token(utm_medium, 80),
+            "utm_campaign": _normalize_marketing_token(utm_campaign, 120),
+            "utm_content": _normalize_marketing_token(utm_content, 120),
+            "external_referrer_host": _normalize_external_referrer_host(
+                external_referrer_host
+            ),
+            "external_referrer_group": _normalize_external_referrer_group(
+                external_referrer_group
+            ),
             "source": _normalize_site_page_view_source(source),
             "taxonomy_version": taxonomy_version or 1,
         },
@@ -421,6 +506,127 @@ async def site_page_route_statistics(
         {where_sql}
         GROUP BY route_group, route_name, path_template
         ORDER BY page_view_count DESC, active_dwell_total_ms DESC, route_group ASC, path_template ASC
+    """
+
+    if page != -1 and count_per_page != -1:
+        offset = max(page - 1, 0) * count_per_page
+        detail_query_sql += " LIMIT :limit OFFSET :offset"
+        detail_params = {**params, "limit": count_per_page, "offset": offset}
+    else:
+        detail_params = params
+
+    detail_result = await db.execute(text(detail_query_sql), detail_params)
+    results = [dict(row) for row in detail_result.mappings().all()]
+
+    return {
+        "total_count": total_count,
+        "page": page,
+        "count_per_page": count_per_page,
+        "summary": summary,
+        "results": results,
+    }
+
+
+async def site_page_referrer_statistics(
+    start_date: str | None,
+    end_date: str | None,
+    referrer_group: str | None,
+    route_group: str | None,
+    page: int,
+    count_per_page: int,
+    db: AsyncSession,
+):
+    start_date, end_date = _normalize_site_page_route_daily_date_range(
+        start_date, end_date
+    )
+    params: dict = {
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    referrer_group_expr = (
+        "COALESCE(NULLIF(utm_source, ''), NULLIF(external_referrer_group, ''), 'unknown')"
+    )
+    where_conditions = [
+        "source = 'service-web'",
+        "occurred_at >= :start_date",
+        "occurred_at < DATE_ADD(:end_date, INTERVAL 1 DAY)",
+    ]
+
+    requested_referrer_group = (referrer_group or "").strip().lower()
+    normalized_referrer_group = (
+        _normalize_external_referrer_group(requested_referrer_group)
+        if requested_referrer_group and requested_referrer_group != "all"
+        else None
+    )
+    if normalized_referrer_group:
+        where_conditions.append(f"{referrer_group_expr} = :referrer_group")
+        params["referrer_group"] = normalized_referrer_group
+
+    normalized_route_group = (route_group or "").strip()
+    if normalized_route_group and normalized_route_group != "all":
+        where_conditions.append("route_group = :route_group")
+        params["route_group"] = normalized_route_group
+
+    where_sql = "WHERE " + " AND ".join(where_conditions)
+    group_columns = f"""
+        {referrer_group_expr},
+        external_referrer_host,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        route_group,
+        route_name,
+        path_template,
+        path
+    """
+
+    summary_query = text(
+        f"""
+        SELECT
+            COALESCE(COUNT(*), 0) AS page_view_count,
+            COALESCE(COUNT(DISTINCT visitor_id), 0) AS visitor_count,
+            COALESCE(COUNT(DISTINCT session_id), 0) AS session_count
+        FROM tb_site_page_view_event
+        {where_sql}
+        """
+    )
+    summary_result = await db.execute(summary_query, params)
+    summary = dict(summary_result.mappings().first() or {})
+
+    count_query = text(
+        f"""
+        SELECT COUNT(*) AS total_count
+        FROM (
+            SELECT {group_columns}
+            FROM tb_site_page_view_event
+            {where_sql}
+            GROUP BY {group_columns}
+        ) t
+        """
+    )
+    count_result = await db.execute(count_query, params)
+    total_count = int(dict(count_result.mappings().first() or {}).get("total_count") or 0)
+
+    detail_query_sql = f"""
+        SELECT
+            {referrer_group_expr} AS referrer_group,
+            external_referrer_host,
+            utm_source,
+            utm_medium,
+            utm_campaign,
+            utm_content,
+            route_group,
+            route_name,
+            path_template,
+            path AS landing_path,
+            COUNT(*) AS page_view_count,
+            COUNT(DISTINCT visitor_id) AS visitor_count,
+            COUNT(DISTINCT session_id) AS session_count
+        FROM tb_site_page_view_event
+        {where_sql}
+        GROUP BY {group_columns}
+        ORDER BY page_view_count DESC, visitor_count DESC, referrer_group ASC, landing_path ASC
     """
 
     if page != -1 and count_per_page != -1:
