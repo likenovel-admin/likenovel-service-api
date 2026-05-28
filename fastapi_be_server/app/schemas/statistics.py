@@ -37,6 +37,9 @@ class PostSitePageViewReqBody(BaseModel):
     external_referrer_group: str | None = Field(
         None, alias="externalReferrerGroup"
     )
+    product_id: int | None = Field(None, alias="productId", ge=1)
+    entry_source: str | None = Field(None, alias="entrySource")
+    entry_source_group: str | None = Field(None, alias="entrySourceGroup")
     source: str = Field("service-web", max_length=50)
     taxonomy_version: int = Field(1, alias="taxonomyVersion", ge=1, le=20)
 
@@ -58,6 +61,8 @@ class PostSitePageViewReqBody(BaseModel):
         "utm_campaign",
         "utm_content",
         "external_referrer_group",
+        "entry_source",
+        "entry_source_group",
     )
     @classmethod
     def validate_marketing_token(cls, value: str | None) -> str | None:

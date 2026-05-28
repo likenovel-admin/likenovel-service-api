@@ -42,6 +42,9 @@ async def post_site_page_view(
         utm_content=req_body.utm_content,
         external_referrer_host=req_body.external_referrer_host,
         external_referrer_group=req_body.external_referrer_group,
+        product_id=req_body.product_id,
+        entry_source=req_body.entry_source,
+        entry_source_group=req_body.entry_source_group,
     )
     return {"data": {"ok": True}}
 
