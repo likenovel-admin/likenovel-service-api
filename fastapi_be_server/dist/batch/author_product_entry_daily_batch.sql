@@ -76,24 +76,92 @@ INSERT INTO tb_author_product_entry_daily (
 )
 SELECT
     @author_product_entry_target_date AS stat_date,
-    pv.product_id,
-    COALESCE(pv.entry_source_group, 'other') AS entry_source_group,
-    COALESCE(pv.entry_source, '__null__') AS entry_source_norm,
+    resolved_pv.product_id,
+    resolved_pv.entry_source_group,
+    resolved_pv.entry_source_norm,
     COUNT(*) AS detail_view_count,
-    COUNT(DISTINCT pv.session_id) AS detail_session_count,
-    COUNT(DISTINCT pv.visitor_id) AS detail_visitor_count,
-    COUNT(DISTINCT pv.user_id) AS login_user_count,
+    COUNT(DISTINCT resolved_pv.session_id) AS detail_session_count,
+    COUNT(DISTINCT resolved_pv.visitor_id) AS detail_visitor_count,
+    COUNT(DISTINCT resolved_pv.user_id) AS login_user_count,
     NOW() AS created_date,
     NOW() AS updated_date
-FROM tb_site_page_view_event pv
-WHERE pv.route_group = 'product_detail'
-  AND pv.product_id IS NOT NULL
-  AND pv.occurred_at >= @author_product_entry_target_start
-  AND pv.occurred_at < @author_product_entry_target_end
+FROM (
+    SELECT
+        COALESCE(
+            pv.product_id,
+            CASE
+                WHEN pv.path REGEXP '^/product/[0-9]+$'
+                THEN CAST(SUBSTRING(pv.path, LENGTH('/product/') + 1) AS UNSIGNED)
+                ELSE NULL
+            END
+        ) AS product_id,
+        COALESCE(
+            pv.entry_source_group,
+            CASE
+                WHEN pv.entry_source IN ('social', 'instagram', 'x', 'twitter', 'threads')
+                  OR pv.utm_medium = 'social'
+                  OR pv.utm_source IN ('social', 'instagram', 'x', 'twitter', 'threads')
+                  OR pv.external_referrer_group IN ('social', 'instagram', 'x', 'twitter', 'threads')
+                  OR pv.external_referrer_host IN ('t.co', 'x.com', 'twitter.com', 'instagram.com', 'threads.net', 'threads.com')
+                THEN 'social'
+                WHEN pv.entry_source LIKE 'search_%'
+                  OR pv.referrer_path LIKE '/product/search%'
+                THEN 'search'
+                WHEN pv.entry_source LIKE 'top50_%'
+                  OR pv.referrer_path LIKE '/product/top50%'
+                THEN 'ranking'
+                WHEN pv.entry_source = 'direct'
+                THEN 'direct'
+                WHEN pv.entry_source = 'other'
+                THEN 'other'
+                WHEN pv.entry_source IS NOT NULL
+                THEN 'recommend_slot'
+                WHEN (pv.referrer_path IS NULL OR pv.referrer_path = '')
+                  AND (
+                    pv.external_referrer_group IS NULL
+                    OR pv.external_referrer_group IN ('direct', 'internal', 'unknown')
+                  )
+                THEN 'direct'
+                ELSE 'other'
+            END
+        ) AS entry_source_group,
+        COALESCE(
+            pv.entry_source,
+            CASE
+                WHEN pv.utm_medium = 'social'
+                  OR pv.utm_source IN ('social', 'instagram', 'x', 'twitter', 'threads')
+                  OR pv.external_referrer_group IN ('social', 'instagram', 'x', 'twitter', 'threads')
+                  OR pv.external_referrer_host IN ('t.co', 'x.com', 'twitter.com', 'instagram.com', 'threads.net', 'threads.com')
+                THEN 'social'
+                WHEN pv.entry_source LIKE 'search_%'
+                  OR pv.referrer_path LIKE '/product/search%'
+                THEN 'search'
+                WHEN pv.entry_source LIKE 'top50_%'
+                  OR pv.referrer_path LIKE '/product/top50%'
+                THEN 'ranking'
+                WHEN (pv.referrer_path IS NULL OR pv.referrer_path = '')
+                  AND (
+                    pv.external_referrer_group IS NULL
+                    OR pv.external_referrer_group IN ('direct', 'internal', 'unknown')
+                  )
+                THEN 'direct'
+                ELSE 'other'
+            END,
+            '__null__'
+        ) AS entry_source_norm,
+        pv.session_id,
+        pv.visitor_id,
+        pv.user_id
+    FROM tb_site_page_view_event pv
+    WHERE pv.route_group = 'product_detail'
+      AND pv.occurred_at >= @author_product_entry_target_start
+      AND pv.occurred_at < @author_product_entry_target_end
+) resolved_pv
+WHERE resolved_pv.product_id IS NOT NULL
 GROUP BY
-    pv.product_id,
-    COALESCE(pv.entry_source_group, 'other'),
-    COALESCE(pv.entry_source, '__null__');
+    resolved_pv.product_id,
+    resolved_pv.entry_source_group,
+    resolved_pv.entry_source_norm;
 
 UPDATE tb_cms_batch_job_process a
    SET a.completed_yn = 'Y',
