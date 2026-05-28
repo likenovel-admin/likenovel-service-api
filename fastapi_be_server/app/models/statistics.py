@@ -30,6 +30,12 @@ class SitePageViewEvent(Base):
     __table_args__ = (
         Index("uq_site_page_view_event_event_id", "event_id", unique=True),
         Index("idx_site_page_view_event_source_occurred", "source", "occurred_at"),
+        Index(
+            "idx_site_page_view_event_product_entry_occurred",
+            "product_id",
+            "entry_source_group",
+            "occurred_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -85,6 +91,15 @@ class SitePageViewEvent(Base):
     )
     external_referrer_group: Mapped[str | None] = mapped_column(
         String(80), nullable=True, comment="외부 유입 referrer 그룹"
+    )
+    product_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="작품 상세 진입 작품 ID"
+    )
+    entry_source: Mapped[str | None] = mapped_column(
+        String(120), nullable=True, comment="작품 상세 진입 source"
+    )
+    entry_source_group: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, comment="작가 노출용 작품 상세 진입 source 그룹"
     )
     source: Mapped[str] = mapped_column(
         String(50),
@@ -202,6 +217,69 @@ class SitePageRouteDaily(Base):
         nullable=False,
         server_default="0",
         comment="5초 미만 활성 체류 이벤트 수",
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class AuthorProductEntryDaily(Base):
+    __tablename__ = "tb_author_product_entry_daily"
+    __table_args__ = (
+        Index(
+            "uk_author_product_entry_daily",
+            "stat_date",
+            "product_id",
+            "entry_source_group",
+            "entry_source_norm",
+            unique=True,
+        ),
+        Index(
+            "idx_author_product_entry_daily_product_date",
+            "product_id",
+            "stat_date",
+        ),
+        Index(
+            "idx_author_product_entry_daily_date_group",
+            "stat_date",
+            "entry_source_group",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True), primary_key=True, autoincrement=True, comment="PK"
+    )
+    stat_date: Mapped[date] = mapped_column(
+        Date, nullable=False, comment="집계일"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="작품 ID"
+    )
+    entry_source_group: Mapped[str] = mapped_column(
+        String(80), nullable=False, comment="작가 노출용 유입 그룹"
+    )
+    entry_source_norm: Mapped[str] = mapped_column(
+        String(120),
+        nullable=False,
+        server_default="__null__",
+        comment="NULL dedupe용 source key",
+    )
+    detail_view_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="작품 상세 PV 수"
+    )
+    detail_session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="작품 상세 진입 세션 수"
+    )
+    detail_visitor_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="작품 상세 진입 방문자 수"
+    )
+    login_user_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="로그인 유저 수"
     )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")

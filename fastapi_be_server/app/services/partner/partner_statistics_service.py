@@ -516,6 +516,212 @@ async def product_episode_dropoff_statistics_list(
     )
 
 
+def _source_group_label(entry_source_group: str) -> str:
+    return {
+        "social": "소셜유입",
+        "recommend_slot": "구좌유입",
+        "search": "검색유입",
+        "ranking": "랭킹유입",
+        "direct": "직접유입",
+        "other": "기타",
+    }.get(entry_source_group, "기타")
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _parse_author_statistics_date_range(start_date: str, end_date: str):
+    if bool(start_date) != bool(end_date):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="start_date와 end_date는 함께 전달해야 합니다.",
+        )
+
+    if not start_date and not end_date:
+        today = datetime.now().date()
+        return today - timedelta(days=30), today
+
+    try:
+        normalized_start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+        normalized_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="날짜 형식이 올바르지 않습니다.",
+        )
+
+    if normalized_start_date > normalized_end_date:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="start_date는 end_date보다 늦을 수 없습니다.",
+        )
+
+    if (normalized_end_date - normalized_start_date).days > 89:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="조회 기간은 최대 90일까지 선택할 수 있습니다.",
+        )
+
+    return normalized_start_date, normalized_end_date
+
+
+@handle_exceptions
+async def product_inflow_dropoff_statistics(
+    product_id: int | None,
+    search_start_date: str,
+    search_end_date: str,
+    db: AsyncSession,
+    user_data: dict,
+):
+    """
+    작가 범위 작품별 유입/이탈 통합 통계
+    """
+
+    start_date, end_date = _parse_author_statistics_date_range(
+        search_start_date, search_end_date
+    )
+    params = {
+        "author_id": user_data["user_id"],
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+    }
+    product_condition = ""
+    if product_id is not None:
+        product_condition = "AND product_id = :product_id"
+        params["product_id"] = product_id
+
+    entry_query = text(f"""
+        SELECT
+            product_id,
+            entry_source_group,
+            SUM(detail_view_count) AS detail_view_count,
+            SUM(detail_session_count) AS detail_session_count,
+            SUM(detail_visitor_count) AS detail_visitor_count,
+            SUM(login_user_count) AS login_user_count
+        FROM tb_author_product_entry_daily
+        WHERE stat_date BETWEEN :start_date AND :end_date
+          AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)
+          {product_condition}
+        GROUP BY product_id, entry_source_group
+        ORDER BY detail_session_count DESC, product_id ASC, entry_source_group ASC
+    """)
+    entry_result = await db.execute(entry_query, params)
+    entry_rows = [dict(row) for row in entry_result.mappings().all()]
+
+    funnel_query = text(f"""
+        SELECT
+            product_id,
+            CASE
+                WHEN entry_source IN ('instagram', 'twitter', 'threads') THEN 'social'
+                WHEN entry_source LIKE 'search_%' THEN 'search'
+                WHEN entry_source LIKE 'top50_%' THEN 'ranking'
+                WHEN entry_source IS NULL THEN 'direct'
+                ELSE 'recommend_slot'
+            END AS entry_source_group,
+            SUM(detail_to_view_session_count) AS reader_session_count,
+            SUM(detail_exit_session_count) AS detail_exit_session_count
+        FROM tb_product_detail_funnel_daily
+        WHERE computed_date BETWEEN :start_date AND :end_date
+          AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)
+          {product_condition}
+        GROUP BY product_id, entry_source_group
+    """)
+    funnel_result = await db.execute(funnel_query, params)
+    funnel_rows = [dict(row) for row in funnel_result.mappings().all()]
+
+    dropoff_query = text(f"""
+        SELECT
+            product_id,
+            episode_id,
+            episode_no,
+            episode_title,
+            SUM(read_start_count) AS read_start_count,
+            SUM(episode_dropoff_count) AS episode_dropoff_count,
+            CASE
+                WHEN SUM(read_start_count) = 0 THEN 0
+                ELSE SUM(episode_dropoff_count) / SUM(read_start_count)
+            END AS episode_dropoff_rate
+        FROM tb_product_episode_dropoff_daily
+        WHERE computed_date BETWEEN :start_date AND :end_date
+          AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)
+          {product_condition}
+        GROUP BY product_id, episode_id, episode_no, episode_title
+        ORDER BY episode_no ASC, episode_id ASC
+    """)
+    dropoff_result = await db.execute(dropoff_query, params)
+    episode_dropoffs = [dict(row) for row in dropoff_result.mappings().all()]
+
+    grouped: dict[tuple[int, str], dict] = {}
+    for row in entry_rows:
+        key = (row["product_id"], row["entry_source_group"] or "other")
+        grouped[key] = {
+            "product_id": row["product_id"],
+            "entry_source_group": key[1],
+            "source_label": _source_group_label(key[1]),
+            "detail_view_count": int(row.get("detail_view_count") or 0),
+            "detail_session_count": int(row.get("detail_session_count") or 0),
+            "detail_visitor_count": int(row.get("detail_visitor_count") or 0),
+            "login_user_count": int(row.get("login_user_count") or 0),
+            "reader_session_count": 0,
+            "detail_exit_session_count": 0,
+        }
+
+    for row in funnel_rows:
+        key = (row["product_id"], row["entry_source_group"] or "other")
+        grouped.setdefault(
+            key,
+            {
+                "product_id": row["product_id"],
+                "entry_source_group": key[1],
+                "source_label": _source_group_label(key[1]),
+                "detail_view_count": 0,
+                "detail_session_count": 0,
+                "detail_visitor_count": 0,
+                "login_user_count": 0,
+                "reader_session_count": 0,
+                "detail_exit_session_count": 0,
+            },
+        )
+        grouped[key]["reader_session_count"] = int(
+            row.get("reader_session_count") or 0
+        )
+        grouped[key]["detail_exit_session_count"] = int(
+            row.get("detail_exit_session_count") or 0
+        )
+
+    source_groups = []
+    for row in grouped.values():
+        detail_sessions = int(row["detail_session_count"] or 0)
+        reader_sessions = int(row["reader_session_count"] or 0)
+        exit_sessions = int(row["detail_exit_session_count"] or 0)
+        source_groups.append(
+            {
+                **row,
+                "read_conversion_rate": _rate(reader_sessions, detail_sessions),
+                "detail_exit_rate": _rate(exit_sessions, detail_sessions),
+            }
+        )
+
+    source_groups.sort(
+        key=lambda item: (
+            -int(item["detail_session_count"] or 0),
+            int(item["product_id"] or 0),
+            str(item["entry_source_group"] or ""),
+        )
+    )
+
+    return {
+        "product_id": product_id,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "source_groups": source_groups,
+        "episode_dropoffs": episode_dropoffs,
+    }
+
+
 @handle_exceptions
 async def product_recent_24h_statistics(
     product_id: int, db: AsyncSession, user_data: dict

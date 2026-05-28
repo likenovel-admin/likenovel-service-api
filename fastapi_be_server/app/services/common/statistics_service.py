@@ -87,6 +87,7 @@ SITE_PAGE_DWELL_MAX_ACTIVE_MS = 30 * 60 * 1000
 SITE_PAGE_VIEW_REFERRER_GROUPS = {
     "direct",
     "internal",
+    "x",
     "twitter",
     "instagram",
     "threads",
@@ -94,6 +95,14 @@ SITE_PAGE_VIEW_REFERRER_GROUPS = {
     "google",
     "other",
     "unknown",
+}
+PRODUCT_ENTRY_SOURCE_GROUPS = {
+    "social",
+    "recommend_slot",
+    "search",
+    "ranking",
+    "direct",
+    "other",
 }
 
 
@@ -153,6 +162,13 @@ def _normalize_marketing_token(value: str | None, limit: int) -> str | None:
     return normalized[:limit]
 
 
+def _normalize_marketing_source(value: str | None, limit: int = 80) -> str | None:
+    normalized = _normalize_marketing_token(value, limit)
+    if normalized == "twitter":
+        return "x"
+    return normalized
+
+
 def _normalize_external_referrer_host(value: str | None) -> str | None:
     if value is None:
         return None
@@ -182,7 +198,18 @@ def _normalize_external_referrer_group(value: str | None) -> str | None:
     normalized = _normalize_marketing_token(value, 80)
     if normalized is None:
         return None
+    if normalized == "twitter":
+        normalized = "x"
     if normalized in SITE_PAGE_VIEW_REFERRER_GROUPS:
+        return normalized
+    return "other"
+
+
+def _normalize_product_entry_source_group(value: str | None) -> str | None:
+    normalized = _normalize_marketing_token(value, 80)
+    if normalized is None:
+        return None
+    if normalized in PRODUCT_ENTRY_SOURCE_GROUPS:
         return normalized
     return "other"
 
@@ -222,6 +249,9 @@ async def insert_site_page_view_event(
     utm_content: str | None = None,
     external_referrer_host: str | None = None,
     external_referrer_group: str | None = None,
+    product_id: int | None = None,
+    entry_source: str | None = None,
+    entry_source_group: str | None = None,
 ):
     user_id = None
     if kc_user_id:
@@ -260,6 +290,9 @@ async def insert_site_page_view_event(
             utm_content,
             external_referrer_host,
             external_referrer_group,
+            product_id,
+            entry_source,
+            entry_source_group,
             source,
             taxonomy_version,
             created_date
@@ -282,6 +315,9 @@ async def insert_site_page_view_event(
             :utm_content,
             :external_referrer_host,
             :external_referrer_group,
+            :product_id,
+            :entry_source,
+            :entry_source_group,
             :source,
             :taxonomy_version,
             NOW()
@@ -302,7 +338,7 @@ async def insert_site_page_view_event(
             "path": sanitized_path,
             "query_hash": _normalize_site_page_view_query_hash(query_hash),
             "referrer_path": sanitized_referrer_path,
-            "utm_source": _normalize_marketing_token(utm_source, 80),
+            "utm_source": _normalize_marketing_source(utm_source, 80),
             "utm_medium": _normalize_marketing_token(utm_medium, 80),
             "utm_campaign": _normalize_marketing_token(utm_campaign, 120),
             "utm_content": _normalize_marketing_token(utm_content, 120),
@@ -311,6 +347,11 @@ async def insert_site_page_view_event(
             ),
             "external_referrer_group": _normalize_external_referrer_group(
                 external_referrer_group
+            ),
+            "product_id": product_id if product_id and product_id > 0 else None,
+            "entry_source": _normalize_marketing_token(entry_source, 120),
+            "entry_source_group": _normalize_product_entry_source_group(
+                entry_source_group
             ),
             "source": _normalize_site_page_view_source(source),
             "taxonomy_version": taxonomy_version or 1,
