@@ -238,6 +238,9 @@ async def site_page_referrer_statistics(
     end_date: str | None = Query(None, description="종료 날짜"),
     referrer_group: str | None = Query(None, description="유입 그룹"),
     route_group: str | None = Query(None, description="route 대분류"),
+    traffic_signal: str | None = Query("tracked", description="유입 신호 필터"),
+    sort_by: str | None = Query("last_seen_at", description="정렬 기준"),
+    sort_order: str | None = Query("desc", description="정렬 방향"),
     page: int = Query(1, description="페이지"),
     count_per_page: int = Query(20, description="한 페이지 내 갯수"),
     db: AsyncSession = Depends(get_likenovel_db),
@@ -250,7 +253,16 @@ async def site_page_referrer_statistics(
     await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
 
     return await statistics_service.site_page_referrer_statistics(
-        start_date, end_date, referrer_group, route_group, page, count_per_page, db
+        start_date,
+        end_date,
+        referrer_group,
+        route_group,
+        page,
+        count_per_page,
+        db,
+        traffic_signal=traffic_signal,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 
