@@ -273,6 +273,7 @@ def get_select_fields_and_joins_for_product(
                 "p.synopsis_text as synopsis",
                 "p.author_name as authorNickname",
                 "p.price_type as priceType",
+                "p.paid_episode_no as paidEpisodeNo",
                 "COALESCE(p.single_regular_price, 0) as singleRegularPrice",
                 "COALESCE(p.single_rental_price, 0) as singleRentalPrice",
                 "COALESCE(p.series_regular_price, 0) as seriesRegularPrice",
