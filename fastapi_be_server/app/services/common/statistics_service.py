@@ -289,6 +289,13 @@ def _site_page_referrer_order_by(sort_by: str, sort_order: str) -> str:
     )
 
 
+def _site_page_referrer_group_expr() -> str:
+    raw_group = (
+        "COALESCE(NULLIF(utm_source, ''), NULLIF(external_referrer_group, ''), 'unknown')"
+    )
+    return f"CASE WHEN {raw_group} = 'twitter' THEN 'x' ELSE {raw_group} END"
+
+
 def _normalize_page_view_occurred_at(occurred_at: datetime) -> datetime:
     if occurred_at.tzinfo is None:
         return occurred_at
@@ -662,9 +669,7 @@ async def site_page_referrer_statistics(
         "start_date": start_date,
         "end_date": end_date,
     }
-    referrer_group_expr = (
-        "COALESCE(NULLIF(utm_source, ''), NULLIF(external_referrer_group, ''), 'unknown')"
-    )
+    referrer_group_expr = _site_page_referrer_group_expr()
     where_conditions = [
         "source = 'service-web'",
         "occurred_at >= :start_date",
