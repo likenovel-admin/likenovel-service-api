@@ -96,6 +96,13 @@ SITE_PAGE_VIEW_REFERRER_GROUPS = {
     "other",
     "unknown",
 }
+SITE_PAGE_REFERRER_TRAFFIC_SIGNALS = {"all", "tracked", "utm", "external", "unknown"}
+SITE_PAGE_REFERRER_SORT_KEYS = {
+    "last_seen_at",
+    "visitor_count",
+    "session_count",
+    "page_view_count",
+}
 PRODUCT_ENTRY_SOURCE_GROUPS = {
     "social",
     "recommend_slot",
@@ -212,6 +219,74 @@ def _normalize_product_entry_source_group(value: str | None) -> str | None:
     if normalized in PRODUCT_ENTRY_SOURCE_GROUPS:
         return normalized
     return "other"
+
+
+def _normalize_site_page_referrer_traffic_signal(value: str | None) -> str:
+    normalized = (value or "tracked").strip().lower()
+    if normalized in SITE_PAGE_REFERRER_TRAFFIC_SIGNALS:
+        return normalized
+    return "tracked"
+
+
+def _site_page_referrer_signal_condition(traffic_signal: str) -> str | None:
+    utm_present = """
+        (
+            (utm_source IS NOT NULL AND utm_source <> '')
+            OR (utm_medium IS NOT NULL AND utm_medium <> '')
+            OR (utm_campaign IS NOT NULL AND utm_campaign <> '')
+            OR (utm_content IS NOT NULL AND utm_content <> '')
+        )
+    """
+    external_present = """
+        (
+            (external_referrer_host IS NOT NULL AND external_referrer_host <> '')
+            OR (
+                external_referrer_group IS NOT NULL
+                AND external_referrer_group <> ''
+                AND external_referrer_group NOT IN ('direct', 'internal', 'unknown')
+            )
+        )
+    """
+
+    if traffic_signal == "all":
+        return None
+    if traffic_signal == "utm":
+        return utm_present
+    if traffic_signal == "external":
+        return external_present
+    if traffic_signal == "unknown":
+        return f"NOT {utm_present} AND NOT {external_present}"
+    return f"({utm_present} OR {external_present})"
+
+
+def _normalize_site_page_referrer_sort_by(value: str | None) -> str:
+    normalized = (value or "last_seen_at").strip().lower()
+    if normalized in SITE_PAGE_REFERRER_SORT_KEYS:
+        return normalized
+    return "last_seen_at"
+
+
+def _normalize_site_page_referrer_sort_order(value: str | None) -> str:
+    normalized = (value or "desc").strip().lower()
+    if normalized == "asc":
+        return "ASC"
+    return "DESC"
+
+
+def _site_page_referrer_order_by(sort_by: str, sort_order: str) -> str:
+    direction = _normalize_site_page_referrer_sort_order(sort_order)
+    normalized_sort_by = _normalize_site_page_referrer_sort_by(sort_by)
+    tie_breakers = {
+        "last_seen_at": "visitor_count DESC, session_count DESC, page_view_count DESC",
+        "visitor_count": "session_count DESC, page_view_count DESC, last_seen_at DESC",
+        "session_count": "visitor_count DESC, page_view_count DESC, last_seen_at DESC",
+        "page_view_count": "visitor_count DESC, session_count DESC, last_seen_at DESC",
+    }
+    return (
+        f"{normalized_sort_by} {direction}, "
+        f"{tie_breakers[normalized_sort_by]}, "
+        "referrer_group ASC, landing_path ASC"
+    )
 
 
 def _normalize_page_view_occurred_at(occurred_at: datetime) -> datetime:
@@ -576,6 +651,9 @@ async def site_page_referrer_statistics(
     page: int,
     count_per_page: int,
     db: AsyncSession,
+    traffic_signal: str | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
 ):
     start_date, end_date = _normalize_site_page_route_daily_date_range(
         start_date, end_date
@@ -607,6 +685,12 @@ async def site_page_referrer_statistics(
     if normalized_route_group and normalized_route_group != "all":
         where_conditions.append("route_group = :route_group")
         params["route_group"] = normalized_route_group
+
+    signal_condition = _site_page_referrer_signal_condition(
+        _normalize_site_page_referrer_traffic_signal(traffic_signal)
+    )
+    if signal_condition:
+        where_conditions.append(signal_condition)
 
     where_sql = "WHERE " + " AND ".join(where_conditions)
     group_columns = f"""
@@ -661,13 +745,15 @@ async def site_page_referrer_statistics(
             route_name,
             path_template,
             path AS landing_path,
+            MIN(occurred_at) AS first_seen_at,
+            MAX(occurred_at) AS last_seen_at,
             COUNT(*) AS page_view_count,
             COUNT(DISTINCT visitor_id) AS visitor_count,
             COUNT(DISTINCT session_id) AS session_count
         FROM tb_site_page_view_event
         {where_sql}
         GROUP BY {group_columns}
-        ORDER BY page_view_count DESC, visitor_count DESC, referrer_group ASC, landing_path ASC
+        ORDER BY {_site_page_referrer_order_by(sort_by, sort_order)}
     """
 
     if page != -1 and count_per_page != -1:
