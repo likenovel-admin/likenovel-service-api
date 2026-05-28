@@ -60,9 +60,25 @@ class AuthorProductEntryDailyBatchSqlTest(unittest.TestCase):
         sql = _batch_sql().lower()
 
         self.assertIn("route_group = 'product_detail'", sql)
-        self.assertIn("coalesce(pv.entry_source_group, 'other')", sql)
-        self.assertIn("count(distinct pv.session_id)", sql)
-        self.assertIn("count(distinct pv.visitor_id)", sql)
+        self.assertIn("coalesce(\n            pv.entry_source_group,", sql)
+        self.assertIn("count(distinct resolved_pv.session_id)", sql)
+        self.assertIn("count(distinct resolved_pv.visitor_id)", sql)
+
+    def test_author_product_entry_batch_recovers_product_id_from_path(self):
+        sql = _batch_sql().lower()
+
+        self.assertIn("pv.path regexp '^/product/[0-9]+$'", sql)
+        self.assertIn("substring(pv.path, length('/product/') + 1)", sql)
+
+    def test_author_product_entry_batch_reconstructs_missing_source_group(self):
+        sql = _batch_sql().lower()
+
+        self.assertIn("pv.entry_source in ('social', 'instagram', 'x', 'twitter', 'threads')", sql)
+        self.assertIn("pv.utm_medium = 'social'", sql)
+        self.assertIn("'threads.com'", sql)
+        self.assertIn("then 'social'", sql)
+        self.assertIn("pv.referrer_path like '/product/search%'", sql)
+        self.assertIn("pv.referrer_path like '/product/top50%'", sql)
 
     def test_author_product_entry_shell_uses_advisory_lock_and_manual_date(self):
         script = _batch_sh()
