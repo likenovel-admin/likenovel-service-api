@@ -137,6 +137,55 @@ class SitePageViewMigrationTest(unittest.TestCase):
         self.assertIn("external_referrer_host", columns)
         self.assertIn("external_referrer_group", columns)
 
+    def test_site_page_view_product_entry_attribution_migration_adds_raw_fields(
+        self,
+    ):
+        from app.utils.auto_migrate import _parse_statements
+
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "dist"
+            / "init"
+            / "100-add-site-page-view-product-entry-attribution.sql"
+        )
+
+        sql = migration_path.read_text(encoding="utf-8").lower()
+        statements = _parse_statements(sql)
+
+        self.assertGreaterEqual(len(statements), 14)
+        self.assertIn("add column product_id", sql)
+        self.assertIn("add column entry_source", sql)
+        self.assertIn("add column entry_source_group", sql)
+        self.assertIn("idx_site_page_view_event_product_entry_occurred", sql)
+
+    def test_site_page_view_model_has_product_entry_attribution_columns(self):
+        from app.models.statistics import SitePageViewEvent
+
+        columns = set(SitePageViewEvent.__table__.columns.keys())
+        index_names = {index.name for index in SitePageViewEvent.__table__.indexes}
+
+        self.assertIn("product_id", columns)
+        self.assertIn("entry_source", columns)
+        self.assertIn("entry_source_group", columns)
+        self.assertIn("idx_site_page_view_event_product_entry_occurred", index_names)
+
+    def test_author_product_entry_daily_model_matches_migration(self):
+        from app.models.statistics import AuthorProductEntryDaily
+
+        columns = set(AuthorProductEntryDaily.__table__.columns.keys())
+        index_names = {index.name for index in AuthorProductEntryDaily.__table__.indexes}
+
+        self.assertEqual(AuthorProductEntryDaily.__tablename__, "tb_author_product_entry_daily")
+        self.assertIn("stat_date", columns)
+        self.assertIn("product_id", columns)
+        self.assertIn("entry_source_group", columns)
+        self.assertIn("entry_source_norm", columns)
+        self.assertIn("detail_session_count", columns)
+        self.assertIn("detail_visitor_count", columns)
+        self.assertIn("uk_author_product_entry_daily", index_names)
+        self.assertIn("idx_author_product_entry_daily_product_date", index_names)
+        self.assertIn("idx_author_product_entry_daily_date_group", index_names)
+
     def test_site_statistics_batch_uses_kst_target_range_for_page_view(self):
         batch_path = (
             Path(__file__).resolve().parents[1]

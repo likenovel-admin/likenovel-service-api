@@ -210,6 +210,87 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(insert_call[1]["external_referrer_host"], "instagram.com")
         self.assertEqual(insert_call[1]["external_referrer_group"], "instagram")
 
+    async def test_page_view_normalizes_x_marketing_attribution(self):
+        db = FakeDb()
+
+        await statistics_service.insert_site_page_view_event(
+            db=db,
+            kc_user_id=None,
+            event_id="eb26e25b-b08d-4a56-bcd8-c7447b1b2b3f",
+            occurred_at=datetime(2026, 5, 27, 22, 10, 0, tzinfo=timezone.utc),
+            visitor_id="pv_x",
+            session_id="pvs_x",
+            route_group="product_detail",
+            route_name="product_detail",
+            path_template="/product/[id]",
+            path="/product/1126",
+            query_hash=None,
+            referrer_path=None,
+            source="service-web",
+            taxonomy_version=1,
+            utm_source="Twitter",
+            utm_medium="social",
+            utm_campaign="p1126_card",
+            utm_content="card01",
+            external_referrer_host="t.co",
+            external_referrer_group="twitter",
+        )
+
+        insert_call = db.calls[-1]
+        self.assertEqual(insert_call[1]["utm_source"], "x")
+        self.assertEqual(insert_call[1]["external_referrer_host"], "t.co")
+        self.assertEqual(insert_call[1]["external_referrer_group"], "x")
+
+    async def test_page_view_preserves_product_entry_attribution(self):
+        db = FakeDb()
+
+        await statistics_service.insert_site_page_view_event(
+            db=db,
+            kc_user_id=None,
+            event_id="0554070f-0866-46e6-86b9-44c6d2cf443a",
+            occurred_at=datetime(2026, 5, 27, 18, 0, 0, tzinfo=timezone.utc),
+            visitor_id="pv_product",
+            session_id="pvs_product",
+            route_group="product_detail",
+            route_name="product_detail",
+            path_template="/product/[id]",
+            path="/product/1117",
+            query_hash=None,
+            referrer_path=None,
+            source="service-web",
+            taxonomy_version=1,
+            product_id=1117,
+            entry_source="Instagram",
+            entry_source_group="social",
+        )
+
+        insert_call = db.calls[-1]
+        self.assertIn("product_id", insert_call[0])
+        self.assertIn("entry_source", insert_call[0])
+        self.assertIn("entry_source_group", insert_call[0])
+        self.assertEqual(insert_call[1]["product_id"], 1117)
+        self.assertEqual(insert_call[1]["entry_source"], "instagram")
+        self.assertEqual(insert_call[1]["entry_source_group"], "social")
+
+    def test_page_view_schema_accepts_product_entry_attribution(self):
+        payload = PostSitePageViewReqBody(
+            eventId="0554070f-0866-46e6-86b9-44c6d2cf443a",
+            occurredAt=datetime(2026, 5, 27, 18, 0, 0, tzinfo=timezone.utc),
+            visitorId="pv_product",
+            sessionId="pvs_product",
+            routeGroup="product_detail",
+            routeName="product_detail",
+            pathTemplate="/product/[id]",
+            path="/product/1117",
+            productId=1117,
+            entrySource="Instagram",
+            entrySourceGroup="social",
+        )
+
+        self.assertEqual(payload.product_id, 1117)
+        self.assertEqual(payload.entry_source, "instagram")
+        self.assertEqual(payload.entry_source_group, "social")
+
     def test_sanitize_path_drops_query_and_hash(self):
         self.assertEqual(
             statistics_service._sanitize_page_view_path(

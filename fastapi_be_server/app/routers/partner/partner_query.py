@@ -936,6 +936,38 @@ async def product_episode_dropoff_statistics_list(
 
 
 @router.get(
+    "/product-inflow-dropoff-statistics",
+    tags=["파트너 - 작품별 유입/이탈 통합 통계"],
+    responses={
+        200: {"description": "작가 범위 작품별 유입/이탈 통합 통계"},
+        422: {"description": "Validation Error"},
+        500: {"description": "Internal Server Error"},
+    },
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_inflow_dropoff_statistics(
+    product_id: int | None = Query(None, description="작품 ID"),
+    search_start_date: str = Query("", description="기간 검색 시작일"),
+    search_end_date: str = Query("", description="기간 검색 종료일"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    파트너 - 통계 분석 > 작품별 유입/이탈 통합 통계
+    상세 유입은 게스트 포함 PV mart, 읽기 전환/이탈은 기존 funnel/dropoff mart를 합산한다.
+    """
+    user_data = await check_user(kc_user_id=user.get("sub"), db=db)
+
+    return await partner_statistics_service.product_inflow_dropoff_statistics(
+        product_id,
+        search_start_date,
+        search_end_date,
+        db,
+        user_data,
+    )
+
+
+@router.get(
     "/product-episode-statistics",
     tags=["파트너 - 회차별 통계"],
     responses={
