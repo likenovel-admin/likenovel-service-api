@@ -28,14 +28,51 @@ SELECT product_id, current_rank
 FROM tb_product_rank
 WHERE created_date = (SELECT MAX(created_date) FROM tb_product_rank);
 
+-- Top 랭킹 기준 데이터
+-- 산식: 최근 24시간 조회수 70%, 누적 조회수 30%, CMS 평가는 산식 반영 없음
+-- 연재 Top 후보: 공개 회차 3화 이상이며 최근 30일 내 공개 또는 미래 예약 공개가 있는 연재중 작품
+SET @rank_freshness_basis_at = NOW();
+
+SET @prev_24h_snapshot_exists = (
+    SELECT COUNT(*)
+      FROM tb_product_hit_snapshot_hourly
+     WHERE basis_at = DATE_SUB(@recent_24h_basis_at, INTERVAL 24 HOUR)
+);
+
+DROP TEMPORARY TABLE IF EXISTS tmp_product_rank_basis;
+CREATE TEMPORARY TABLE tmp_product_rank_basis AS
+SELECT p.product_id
+     , GREATEST(COALESCE(p.count_hit, 0), 0) AS count_hit
+     , CASE
+         WHEN @prev_24h_snapshot_exists > 0 THEN
+           GREATEST(COALESCE(p.count_hit, 0) - COALESCE(prev_24h.count_hit, 0), 0)
+         ELSE 0
+       END AS recent_24h_count_hit
+     , ep.open_episode_count
+     , ep.latest_open_at
+     , ep.next_reserved_at
+  FROM tb_product p
+  LEFT JOIN tb_product_hit_snapshot_hourly prev_24h
+    ON prev_24h.product_id = p.product_id
+   AND prev_24h.basis_at = DATE_SUB(@recent_24h_basis_at, INTERVAL 24 HOUR)
+ INNER JOIN (
+    SELECT b.product_id
+         , SUM(CASE WHEN b.open_yn = 'Y' AND b.use_yn = 'Y' THEN 1 ELSE 0 END) AS open_episode_count
+         , MAX(CASE WHEN b.open_yn = 'Y' AND b.use_yn = 'Y' THEN COALESCE(b.publish_reserve_date, b.open_changed_date, b.created_date) ELSE NULL END) AS latest_open_at
+         , MIN(CASE WHEN b.open_yn = 'N' AND b.use_yn = 'Y' AND b.publish_reserve_date > @rank_freshness_basis_at THEN b.publish_reserve_date ELSE NULL END) AS next_reserved_at
+      FROM tb_product_episode b
+     WHERE b.use_yn = 'Y'
+     GROUP BY b.product_id
+ ) ep ON ep.product_id = p.product_id
+ WHERE ep.open_episode_count >= 3
+;
+
 -- 기존 랭킹 데이터 전체 삭제 (중복 방지)
 DELETE FROM tb_product_rank;
 
 -- 무료 Top 랭킹 재계산
--- 5회차 이상 작품만
--- 평가 없어도 조회수 기반으로 랭킹 진입, 평가가 있으면 가산
--- 총점 = W₁ * (해당 작품 조회수 / 조건에 맞는 작품 목록 중 가장 큰 조회수) + W₂ * 평가점수
--- 소수점 둘째자리까지 반올림, 총점이 같을 경우 조회수 기준 내림차순
+-- 공개 3회차 이상 작품만
+-- 총점 = 70 * log(1 + 최근 24시간 조회수 정규화) + 30 * log(1 + 누적 조회수 정규화)
 insert into tb_product_rank (product_id, current_rank, privious_rank, created_id, updated_id)
 select t.product_id
      , t.current_rank
@@ -44,33 +81,30 @@ select t.product_id
      , 0 as updated_id
   from (
     select z.product_id
-         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , ROW_NUMBER() OVER (order by round((
+             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+           ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as privious_rank
       from (
-        select a.product_id
-             , a.count_hit
-             , max(a.count_hit) over() as max_count_hit
-          from tb_product a
-         where exists (select 1 from tb_product_episode b
-                        where a.product_id = b.product_id
-                          and b.episode_no >= 5
-                          -- and b.open_yn = 'Y'
-                          and b.use_yn = 'Y')
+        select filtered.product_id
+             , filtered.count_hit
+             , filtered.recent_24h_count_hit
+             , MAX(filtered.count_hit) OVER() AS max_count_hit
+             , MAX(filtered.recent_24h_count_hit) OVER() AS max_recent_24h_count_hit
+          from tmp_product_rank_basis filtered
+         inner join tb_product y on filtered.product_id = y.product_id
+           and y.price_type = 'free'
       ) z
-     inner join tb_product y on z.product_id = y.product_id
-       and y.price_type = 'free'
-      left join tb_cms_product_evaluation x on z.product_id = x.product_id
-       and x.evaluation_yn = 'Y'
       left join tmp_previous_rank w on z.product_id = w.product_id
+     ORDER BY current_rank ASC
      limit 50 offset 0
   ) t
 ;
 
 -- 유료 Top 랭킹 재계산
--- 5회차 이상 작품만
--- 평가 없어도 조회수 기반으로 랭킹 진입, 평가가 있으면 가산
--- 총점 = W₁ * (해당 작품 조회수 / 조건에 맞는 작품 목록 중 가장 큰 조회수) + W₂ * 평가점수
--- 소수점 둘째자리까지 반올림, 총점이 같을 경우 조회수 기준 내림차순
+-- 공개 3회차 이상 작품만
+-- 총점 = 70 * log(1 + 최근 24시간 조회수 정규화) + 30 * log(1 + 누적 조회수 정규화)
 insert into tb_product_rank (product_id, current_rank, privious_rank, created_id, updated_id)
 select t.product_id
      , t.current_rank
@@ -79,24 +113,23 @@ select t.product_id
      , 0 as updated_id
   from (
     select z.product_id
-         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , ROW_NUMBER() OVER (order by round((
+             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+           ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as privious_rank
       from (
-        select a.product_id
-             , a.count_hit
-             , max(a.count_hit) over() as max_count_hit
-          from tb_product a
-         where exists (select 1 from tb_product_episode b
-                        where a.product_id = b.product_id
-                          and b.episode_no >= 5
-                          -- and b.open_yn = 'Y'
-                          and b.use_yn = 'Y')
+        select filtered.product_id
+             , filtered.count_hit
+             , filtered.recent_24h_count_hit
+             , MAX(filtered.count_hit) OVER() AS max_count_hit
+             , MAX(filtered.recent_24h_count_hit) OVER() AS max_recent_24h_count_hit
+          from tmp_product_rank_basis filtered
+         inner join tb_product y on filtered.product_id = y.product_id
+           and y.price_type = 'paid'
       ) z
-     inner join tb_product y on z.product_id = y.product_id
-       and y.price_type = 'paid'
-      left join tb_cms_product_evaluation x on z.product_id = x.product_id
-       and x.evaluation_yn = 'Y'
       left join tmp_previous_rank w on z.product_id = w.product_id
+     ORDER BY current_rank ASC
      limit 50 offset 0
   ) t
 ;
@@ -128,26 +161,34 @@ select 'freeSerialTop'
      , 0 as updated_id
   from (
     select z.product_id
-         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , ROW_NUMBER() OVER (order by round((
+             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+           ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
-        select a.product_id
-             , a.count_hit
-             , max(a.count_hit) over() as max_count_hit
-          from tb_product a
-         where exists (select 1 from tb_product_episode b
-                        where a.product_id = b.product_id
-                          and b.episode_no >= 5
-                          and b.use_yn = 'Y')
+        select filtered.product_id
+             , filtered.count_hit
+             , filtered.recent_24h_count_hit
+             , filtered.open_episode_count
+             , filtered.latest_open_at
+             , filtered.next_reserved_at
+             , MAX(filtered.count_hit) OVER() AS max_count_hit
+             , MAX(filtered.recent_24h_count_hit) OVER() AS max_recent_24h_count_hit
+          from tmp_product_rank_basis filtered
+         inner join tb_product y on filtered.product_id = y.product_id
+           and y.price_type = 'free'
+           and y.status_code = 'ongoing'
+           and y.open_yn = 'Y'
+         where filtered.open_episode_count >= 3
+           and (
+                filtered.latest_open_at >= DATE_SUB(@rank_freshness_basis_at, INTERVAL 30 DAY)
+                or filtered.next_reserved_at IS NOT NULL
+           )
       ) z
-     inner join tb_product y on z.product_id = y.product_id
-       and y.price_type = 'free'
-       and y.status_code in ('ongoing', 'rest')
-       and y.open_yn = 'Y'
-      left join tb_cms_product_evaluation x on z.product_id = x.product_id
-       and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
        and w.area_code = 'freeSerialTop'
+     ORDER BY current_rank ASC, z.recent_24h_count_hit DESC, z.count_hit DESC
      limit 50 offset 0
   ) t
 ;
@@ -162,27 +203,35 @@ select 'paidSerialTop'
      , 0 as updated_id
   from (
     select z.product_id
-         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , ROW_NUMBER() OVER (order by round((
+             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+           ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
-        select a.product_id
-             , a.count_hit
-             , max(a.count_hit) over() as max_count_hit
-          from tb_product a
-         where exists (select 1 from tb_product_episode b
-                        where a.product_id = b.product_id
-                          and b.episode_no >= 5
-                          and b.use_yn = 'Y')
+        select filtered.product_id
+             , filtered.count_hit
+             , filtered.recent_24h_count_hit
+             , filtered.open_episode_count
+             , filtered.latest_open_at
+             , filtered.next_reserved_at
+             , MAX(filtered.count_hit) OVER() AS max_count_hit
+             , MAX(filtered.recent_24h_count_hit) OVER() AS max_recent_24h_count_hit
+          from tmp_product_rank_basis filtered
+         inner join tb_product y on filtered.product_id = y.product_id
+           and y.price_type = 'paid'
+           and y.publish_regular_yn = 'Y'
+           and y.status_code = 'ongoing'
+           and y.open_yn = 'Y'
+         where filtered.open_episode_count >= 3
+           and (
+                filtered.latest_open_at >= DATE_SUB(@rank_freshness_basis_at, INTERVAL 30 DAY)
+                or filtered.next_reserved_at IS NOT NULL
+           )
       ) z
-     inner join tb_product y on z.product_id = y.product_id
-       and y.price_type = 'paid'
-       and y.publish_regular_yn = 'Y'
-       and y.status_code in ('ongoing', 'rest')
-       and y.open_yn = 'Y'
-      left join tb_cms_product_evaluation x on z.product_id = x.product_id
-       and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
        and w.area_code = 'paidSerialTop'
+     ORDER BY current_rank ASC, z.recent_24h_count_hit DESC, z.count_hit DESC
      limit 50 offset 0
   ) t
 ;
@@ -197,27 +246,27 @@ select 'paidEndTop'
      , 0 as updated_id
   from (
     select z.product_id
-         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , ROW_NUMBER() OVER (order by round((
+             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+           ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
-        select a.product_id
-             , a.count_hit
-             , max(a.count_hit) over() as max_count_hit
-          from tb_product a
-         where exists (select 1 from tb_product_episode b
-                        where a.product_id = b.product_id
-                          and b.episode_no >= 5
-                          and b.use_yn = 'Y')
+        select filtered.product_id
+             , filtered.count_hit
+             , filtered.recent_24h_count_hit
+             , MAX(filtered.count_hit) OVER() AS max_count_hit
+             , MAX(filtered.recent_24h_count_hit) OVER() AS max_recent_24h_count_hit
+          from tmp_product_rank_basis filtered
+         inner join tb_product y on filtered.product_id = y.product_id
+           and y.price_type = 'paid'
+           and y.publish_regular_yn = 'Y'
+           and y.status_code = 'end'
+           and y.open_yn = 'Y'
       ) z
-     inner join tb_product y on z.product_id = y.product_id
-       and y.price_type = 'paid'
-       and y.publish_regular_yn = 'Y'
-       and y.status_code = 'end'
-       and y.open_yn = 'Y'
-      left join tb_cms_product_evaluation x on z.product_id = x.product_id
-       and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
        and w.area_code = 'paidEndTop'
+     ORDER BY current_rank ASC, z.recent_24h_count_hit DESC, z.count_hit DESC
      limit 50 offset 0
   ) t
 ;
@@ -232,26 +281,26 @@ select 'paidStandaloneTop'
      , 0 as updated_id
   from (
     select z.product_id
-         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , ROW_NUMBER() OVER (order by round((
+             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+           ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
-        select a.product_id
-             , a.count_hit
-             , max(a.count_hit) over() as max_count_hit
-          from tb_product a
-         where exists (select 1 from tb_product_episode b
-                        where a.product_id = b.product_id
-                          and b.episode_no >= 5
-                          and b.use_yn = 'Y')
+        select filtered.product_id
+             , filtered.count_hit
+             , filtered.recent_24h_count_hit
+             , MAX(filtered.count_hit) OVER() AS max_count_hit
+             , MAX(filtered.recent_24h_count_hit) OVER() AS max_recent_24h_count_hit
+          from tmp_product_rank_basis filtered
+         inner join tb_product y on filtered.product_id = y.product_id
+           and y.price_type = 'paid'
+           and y.publish_regular_yn = 'N'
+           and y.open_yn = 'Y'
       ) z
-     inner join tb_product y on z.product_id = y.product_id
-       and y.price_type = 'paid'
-       and y.publish_regular_yn = 'N'
-       and y.open_yn = 'Y'
-      left join tb_cms_product_evaluation x on z.product_id = x.product_id
-       and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
        and w.area_code = 'paidStandaloneTop'
+     ORDER BY current_rank ASC, z.recent_24h_count_hit DESC, z.count_hit DESC
      limit 50 offset 0
   ) t
 ;
@@ -266,27 +315,38 @@ select 'paidMainTop'
      , 0 as updated_id
   from (
     select z.product_id
-         , rank() over (order by round((COALESCE(x.weight_count_hit, 50) * (z.count_hit / z.max_count_hit) + COALESCE(x.weight_evaluation_score, 0) * COALESCE(x.evaluation_score, 0)) / 100, 2) desc, z.count_hit desc) as current_rank
+         , ROW_NUMBER() OVER (order by round((
+             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+           ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
-        select a.product_id
-             , a.count_hit
-             , max(a.count_hit) over() as max_count_hit
-          from tb_product a
-         where exists (select 1 from tb_product_episode b
-                        where a.product_id = b.product_id
-                          and b.episode_no >= 5
-                          and b.use_yn = 'Y')
+        select filtered.product_id
+             , filtered.count_hit
+             , filtered.recent_24h_count_hit
+             , filtered.open_episode_count
+             , filtered.latest_open_at
+             , filtered.next_reserved_at
+             , MAX(filtered.count_hit) OVER() AS max_count_hit
+             , MAX(filtered.recent_24h_count_hit) OVER() AS max_recent_24h_count_hit
+          from tmp_product_rank_basis filtered
+         inner join tb_product y on filtered.product_id = y.product_id
+           and y.price_type = 'paid'
+           and y.publish_regular_yn = 'Y'
+           and y.open_yn = 'Y'
+         where y.status_code = 'end'
+            or (
+                 y.status_code = 'ongoing'
+                 and filtered.open_episode_count >= 3
+                 and (
+                      filtered.latest_open_at >= DATE_SUB(@rank_freshness_basis_at, INTERVAL 30 DAY)
+                      or filtered.next_reserved_at IS NOT NULL
+                 )
+            )
       ) z
-     inner join tb_product y on z.product_id = y.product_id
-       and y.price_type = 'paid'
-       and y.publish_regular_yn = 'Y'
-       and y.status_code in ('ongoing', 'rest', 'end')
-       and y.open_yn = 'Y'
-      left join tb_cms_product_evaluation x on z.product_id = x.product_id
-       and x.evaluation_yn = 'Y'
       left join tmp_previous_rank_area w on z.product_id = w.product_id
        and w.area_code = 'paidMainTop'
+     ORDER BY current_rank ASC, z.recent_24h_count_hit DESC, z.count_hit DESC
      limit 50 offset 0
   ) t
 ;
@@ -294,6 +354,7 @@ select 'paidMainTop'
 -- 임시 테이블 삭제
 DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank;
 DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank_area;
+DROP TEMPORARY TABLE IF EXISTS tmp_product_rank_basis;
 
 commit;
 
