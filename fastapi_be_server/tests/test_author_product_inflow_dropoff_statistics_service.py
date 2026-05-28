@@ -96,6 +96,10 @@ class AuthorProductInflowDropoffStatisticsServiceTest(
         self.assertIn("tb_author_product_entry_daily", combined_sql)
         self.assertIn("tb_product_detail_funnel_daily", combined_sql)
         self.assertIn("tb_product_episode_dropoff_daily", combined_sql)
+        self.assertIn(
+            "WHEN entry_source IN ('social', 'instagram', 'x', 'twitter', 'threads') THEN 'social'",
+            combined_sql,
+        )
         self.assertIn("author_id = :author_id", combined_sql)
         self.assertIn("product_id = :product_id", combined_sql)
         self.assertEqual(db.calls[0][1]["author_id"], 999)

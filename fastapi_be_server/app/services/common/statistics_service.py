@@ -194,6 +194,8 @@ def _normalize_external_referrer_host(value: str | None) -> str | None:
         return "instagram.com"
     if host == "threads.net" or host.endswith(".threads.net"):
         return "threads.net"
+    if host == "threads.com" or host.endswith(".threads.com"):
+        return "threads.com"
     if host == "naver.com" or host.endswith(".naver.com"):
         return "naver.com"
     if host == "google.com" or host.endswith(".google.com"):
@@ -201,10 +203,31 @@ def _normalize_external_referrer_host(value: str | None) -> str | None:
     return _limit_text(host, 255)
 
 
-def _normalize_external_referrer_group(value: str | None) -> str | None:
-    normalized = _normalize_marketing_token(value, 80)
-    if normalized is None:
+def _external_referrer_group_from_host(host: str | None) -> str | None:
+    if host is None:
         return None
+    if host in {"t.co", "x.com", "twitter.com"}:
+        return "x"
+    if host == "instagram.com":
+        return "instagram"
+    if host in {"threads.net", "threads.com"}:
+        return "threads"
+    if host == "naver.com":
+        return "naver"
+    if host == "google.com":
+        return "google"
+    return None
+
+
+def _normalize_external_referrer_group(
+    value: str | None, host: str | None = None
+) -> str | None:
+    normalized = _normalize_marketing_token(value, 80)
+    host_group = _external_referrer_group_from_host(host)
+    if normalized is None or normalized == "other":
+        if host_group:
+            return host_group
+        return normalized
     if normalized == "twitter":
         normalized = "x"
     if normalized in SITE_PAGE_VIEW_REFERRER_GROUPS:
@@ -406,6 +429,9 @@ async def insert_site_page_view_event(
         )
         ON DUPLICATE KEY UPDATE event_id = event_id
     """)
+    normalized_external_referrer_host = _normalize_external_referrer_host(
+        external_referrer_host
+    )
     await db.execute(
         query,
         {
@@ -424,11 +450,9 @@ async def insert_site_page_view_event(
             "utm_medium": _normalize_marketing_token(utm_medium, 80),
             "utm_campaign": _normalize_marketing_token(utm_campaign, 120),
             "utm_content": _normalize_marketing_token(utm_content, 120),
-            "external_referrer_host": _normalize_external_referrer_host(
-                external_referrer_host
-            ),
+            "external_referrer_host": normalized_external_referrer_host,
             "external_referrer_group": _normalize_external_referrer_group(
-                external_referrer_group
+                external_referrer_group, normalized_external_referrer_host
             ),
             "product_id": product_id if product_id and product_id > 0 else None,
             "entry_source": _normalize_marketing_token(entry_source, 120),

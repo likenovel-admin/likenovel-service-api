@@ -241,6 +241,32 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(insert_call[1]["external_referrer_host"], "t.co")
         self.assertEqual(insert_call[1]["external_referrer_group"], "x")
 
+    async def test_page_view_normalizes_threads_com_referrer(self):
+        db = FakeDb()
+
+        await statistics_service.insert_site_page_view_event(
+            db=db,
+            kc_user_id=None,
+            event_id="6a17fdb8-e386-4d15-9f89-ff36943ddfcc",
+            occurred_at=datetime(2026, 5, 27, 22, 20, 0, tzinfo=timezone.utc),
+            visitor_id="pv_threads",
+            session_id="pvs_threads",
+            route_group="product_detail",
+            route_name="product_detail",
+            path_template="/product/[id]",
+            path="/product/1126",
+            query_hash=None,
+            referrer_path=None,
+            source="service-web",
+            taxonomy_version=1,
+            external_referrer_host="threads.com",
+            external_referrer_group="other",
+        )
+
+        insert_call = db.calls[-1]
+        self.assertEqual(insert_call[1]["external_referrer_host"], "threads.com")
+        self.assertEqual(insert_call[1]["external_referrer_group"], "threads")
+
     async def test_page_view_preserves_product_entry_attribution(self):
         db = FakeDb()
 
