@@ -803,7 +803,7 @@ class ProductCountVariance(Base):
 
 
 class MainRuleSlotSnapshot(Base):
-    __tablename__ = "tb_main_rule_slot_snapshot"  # 메인 규칙형 구좌 3일 스냅샷
+    __tablename__ = "tb_main_rule_slot_snapshot"  # 메인 규칙형 구좌 일별 스냅샷
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     slot_key: Mapped[str] = mapped_column(

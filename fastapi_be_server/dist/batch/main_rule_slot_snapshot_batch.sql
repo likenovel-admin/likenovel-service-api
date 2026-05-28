@@ -50,13 +50,9 @@ UPDATE tb_cms_batch_job_process a
      , a.updated_id = 0
  WHERE a.id = @job_id;
 
-SET @anchor_date = DATE('2026-01-01');
 SET @snapshot_ref_at = CURDATE();
-SET @snapshot_start_date = DATE_SUB(
-    @snapshot_ref_at,
-    INTERVAL MOD(DATEDIFF(@snapshot_ref_at, @anchor_date), 3) DAY
-);
-SET @snapshot_end_date = DATE_ADD(@snapshot_start_date, INTERVAL 2 DAY);
+SET @snapshot_start_date = @snapshot_ref_at;
+SET @snapshot_end_date = @snapshot_ref_at;
 
 SELECT COUNT(DISTINCT CONCAT(slot_key, ':', adult_yn))
   INTO @current_snapshot_slot_count
