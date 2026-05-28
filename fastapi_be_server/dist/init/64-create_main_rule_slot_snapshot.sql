@@ -15,4 +15,4 @@ CREATE TABLE IF NOT EXISTS tb_main_rule_slot_snapshot (
     UNIQUE KEY uk_slot_window_order (slot_key, adult_yn, snapshot_start_date, display_order),
     KEY idx_active_slot_lookup (adult_yn, snapshot_start_date, snapshot_end_date, slot_key, display_order),
     KEY idx_product_id (product_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='메인 규칙형 구좌 3일 스냅샷';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='메인 규칙형 구좌 일별 스냅샷';
