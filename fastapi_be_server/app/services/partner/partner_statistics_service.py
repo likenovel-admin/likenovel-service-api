@@ -615,7 +615,7 @@ async def product_inflow_dropoff_statistics(
         SELECT
             product_id,
             CASE
-                WHEN entry_source IN ('instagram', 'twitter', 'threads') THEN 'social'
+                WHEN entry_source IN ('social', 'instagram', 'x', 'twitter', 'threads') THEN 'social'
                 WHEN entry_source LIKE 'search_%' THEN 'search'
                 WHEN entry_source LIKE 'top50_%' THEN 'ranking'
                 WHEN entry_source IS NULL THEN 'direct'
