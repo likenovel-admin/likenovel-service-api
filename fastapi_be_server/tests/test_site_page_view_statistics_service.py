@@ -528,6 +528,56 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ORDER BY last_seen_at DESC", detail_sql)
         self.assertEqual(result["results"][0]["last_seen_at"], datetime(2026, 5, 27, 20, 0, 0))
 
+    async def test_site_page_referrer_statistics_canonicalizes_legacy_twitter_to_x(self):
+        db = FakeDbSequence(
+            [
+                {
+                    "page_view_count": 1,
+                    "visitor_count": 1,
+                    "session_count": 1,
+                },
+                {"total_count": 1},
+                [
+                    {
+                        "referrer_group": "x",
+                        "external_referrer_host": "t.co",
+                        "utm_source": None,
+                        "utm_medium": None,
+                        "utm_campaign": None,
+                        "utm_content": None,
+                        "route_group": "product_detail",
+                        "route_name": "product_detail",
+                        "path_template": "/product/[id]",
+                        "landing_path": "/product/1126",
+                        "first_seen_at": datetime(2026, 5, 27, 22, 0, 0),
+                        "last_seen_at": datetime(2026, 5, 27, 22, 0, 0),
+                        "page_view_count": 1,
+                        "visitor_count": 1,
+                        "session_count": 1,
+                    }
+                ],
+            ]
+        )
+
+        result = await statistics_service.site_page_referrer_statistics(
+            start_date="2026-05-27",
+            end_date="2026-05-27",
+            referrer_group="x",
+            route_group="all",
+            page=1,
+            count_per_page=20,
+            db=db,
+            traffic_signal="tracked",
+            sort_by="last_seen_at",
+            sort_order="desc",
+        )
+
+        combined_sql = "\n".join(call[0] for call in db.calls)
+        self.assertIn("THEN 'x'", combined_sql)
+        self.assertIn("external_referrer_group", combined_sql)
+        self.assertEqual(db.calls[-1][1]["referrer_group"], "x")
+        self.assertEqual(result["results"][0]["referrer_group"], "x")
+
     async def test_site_page_referrer_statistics_rejects_raw_sort_sql(self):
         db = FakeDbSequence(
             [
