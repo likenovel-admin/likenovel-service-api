@@ -475,6 +475,90 @@ class SitePageViewStatisticsServiceTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("referrer_group", params)
             self.assertNotIn("route_group", params)
 
+    async def test_site_page_referrer_statistics_filters_tracked_and_sorts_recent_first(self):
+        db = FakeDbSequence(
+            [
+                {
+                    "page_view_count": 4,
+                    "visitor_count": 3,
+                    "session_count": 3,
+                },
+                {"total_count": 1},
+                [
+                    {
+                        "referrer_group": "x",
+                        "external_referrer_host": "t.co",
+                        "utm_source": "x",
+                        "utm_medium": "social",
+                        "utm_campaign": "p1126_card",
+                        "utm_content": "card01",
+                        "route_group": "product_detail",
+                        "route_name": "product_detail",
+                        "path_template": "/product/[id]",
+                        "landing_path": "/product/1126",
+                        "first_seen_at": datetime(2026, 5, 27, 18, 0, 0),
+                        "last_seen_at": datetime(2026, 5, 27, 20, 0, 0),
+                        "page_view_count": 4,
+                        "visitor_count": 3,
+                        "session_count": 3,
+                    }
+                ],
+            ]
+        )
+
+        result = await statistics_service.site_page_referrer_statistics(
+            start_date="2026-05-27",
+            end_date="2026-05-27",
+            referrer_group="all",
+            route_group="all",
+            page=1,
+            count_per_page=20,
+            db=db,
+            traffic_signal="tracked",
+            sort_by="last_seen_at",
+            sort_order="desc",
+        )
+
+        combined_sql = "\n".join(call[0] for call in db.calls)
+        detail_sql, _detail_params = db.calls[-1]
+        self.assertIn("utm_source IS NOT NULL", combined_sql)
+        self.assertIn("external_referrer_host IS NOT NULL", combined_sql)
+        self.assertIn("MIN(occurred_at) AS first_seen_at", detail_sql)
+        self.assertIn("MAX(occurred_at) AS last_seen_at", detail_sql)
+        self.assertIn("ORDER BY last_seen_at DESC", detail_sql)
+        self.assertEqual(result["results"][0]["last_seen_at"], datetime(2026, 5, 27, 20, 0, 0))
+
+    async def test_site_page_referrer_statistics_rejects_raw_sort_sql(self):
+        db = FakeDbSequence(
+            [
+                {
+                    "page_view_count": 0,
+                    "visitor_count": 0,
+                    "session_count": 0,
+                },
+                {"total_count": 0},
+                [],
+            ]
+        )
+
+        await statistics_service.site_page_referrer_statistics(
+            start_date="2026-05-27",
+            end_date="2026-05-27",
+            referrer_group="all",
+            route_group="all",
+            page=1,
+            count_per_page=20,
+            db=db,
+            traffic_signal="bad raw",
+            sort_by="page_view_count; DROP TABLE tb_site_page_view_event",
+            sort_order="desc; --",
+        )
+
+        combined_sql = "\n".join(call[0] for call in db.calls)
+        self.assertNotIn("DROP TABLE", combined_sql)
+        self.assertNotIn("desc; --", combined_sql)
+        self.assertIn("ORDER BY last_seen_at DESC", db.calls[-1][0])
+
     async def test_guest_page_dwell_inserts_null_user_id_and_capped_active_ms(self):
         db = FakeDb()
 
