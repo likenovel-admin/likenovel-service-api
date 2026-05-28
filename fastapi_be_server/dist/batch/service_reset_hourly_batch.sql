@@ -29,7 +29,7 @@ FROM tb_product_rank
 WHERE created_date = (SELECT MAX(created_date) FROM tb_product_rank);
 
 -- Top 랭킹 기준 데이터
--- 산식: 최근 24시간 조회수 70%, 누적 조회수 30%, CMS 평가는 산식 반영 없음
+-- 산식: 최근 24시간 조회수 90%, 누적 조회수 10%, CMS 평가는 산식 반영 없음
 -- 연재 Top 후보: 공개 회차 3화 이상이며 최근 30일 내 공개 또는 미래 예약 공개가 있는 연재중 작품
 SET @rank_freshness_basis_at = NOW();
 
@@ -72,7 +72,7 @@ DELETE FROM tb_product_rank;
 
 -- 무료 Top 랭킹 재계산
 -- 공개 3회차 이상 작품만
--- 총점 = 70 * log(1 + 최근 24시간 조회수 정규화) + 30 * log(1 + 누적 조회수 정규화)
+-- 총점 = 90 * log(1 + 최근 24시간 조회수 정규화) + 10 * log(1 + 누적 조회수 정규화)
 insert into tb_product_rank (product_id, current_rank, privious_rank, created_id, updated_id)
 select t.product_id
      , t.current_rank
@@ -82,8 +82,8 @@ select t.product_id
   from (
     select z.product_id
          , ROW_NUMBER() OVER (order by round((
-             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
-             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+             90 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 10 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
            ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as privious_rank
       from (
@@ -104,7 +104,7 @@ select t.product_id
 
 -- 유료 Top 랭킹 재계산
 -- 공개 3회차 이상 작품만
--- 총점 = 70 * log(1 + 최근 24시간 조회수 정규화) + 30 * log(1 + 누적 조회수 정규화)
+-- 총점 = 90 * log(1 + 최근 24시간 조회수 정규화) + 10 * log(1 + 누적 조회수 정규화)
 insert into tb_product_rank (product_id, current_rank, privious_rank, created_id, updated_id)
 select t.product_id
      , t.current_rank
@@ -114,8 +114,8 @@ select t.product_id
   from (
     select z.product_id
          , ROW_NUMBER() OVER (order by round((
-             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
-             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+             90 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 10 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
            ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as privious_rank
       from (
@@ -162,8 +162,8 @@ select 'freeSerialTop'
   from (
     select z.product_id
          , ROW_NUMBER() OVER (order by round((
-             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
-             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+             90 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 10 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
            ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
@@ -204,8 +204,8 @@ select 'paidSerialTop'
   from (
     select z.product_id
          , ROW_NUMBER() OVER (order by round((
-             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
-             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+             90 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 10 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
            ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
@@ -247,8 +247,8 @@ select 'paidEndTop'
   from (
     select z.product_id
          , ROW_NUMBER() OVER (order by round((
-             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
-             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+             90 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 10 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
            ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
@@ -282,8 +282,8 @@ select 'paidStandaloneTop'
   from (
     select z.product_id
          , ROW_NUMBER() OVER (order by round((
-             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
-             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+             90 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 10 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
            ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
@@ -316,8 +316,8 @@ select 'paidMainTop'
   from (
     select z.product_id
          , ROW_NUMBER() OVER (order by round((
-             70 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
-             + 30 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
+             90 * CASE WHEN z.max_recent_24h_count_hit > 0 THEN LN(1 + z.recent_24h_count_hit) / LN(1 + z.max_recent_24h_count_hit) ELSE 0 END
+             + 10 * CASE WHEN z.max_count_hit > 0 THEN LN(1 + z.count_hit) / LN(1 + z.max_count_hit) ELSE 0 END
            ) / 100, 4) desc, z.recent_24h_count_hit desc, z.count_hit desc, z.product_id desc) as current_rank
          , w.current_rank as previous_rank
       from (
