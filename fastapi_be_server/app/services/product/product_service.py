@@ -576,7 +576,7 @@ TOP_MANAGED_AREA_RULES = {
         "area_label": "freeSerialTop",
         "filters": [
             'p.price_type = "free"',
-            'p.status_code IN ("ongoing", "rest")',
+            'p.status_code = "ongoing"',
         ],
     },
     "paidSerialTop": {
@@ -585,7 +585,7 @@ TOP_MANAGED_AREA_RULES = {
         "filters": [
             'p.price_type = "paid"',
             'p.publish_regular_yn = "Y"',
-            'p.status_code IN ("ongoing", "rest")',
+            'p.status_code = "ongoing"',
         ],
     },
     "paidEndTop": {
@@ -611,7 +611,7 @@ TOP_MANAGED_AREA_RULES = {
         "filters": [
             'p.price_type = "paid"',
             'p.publish_regular_yn = "Y"',
-            'p.status_code IN ("ongoing", "rest", "end")',
+            'p.status_code IN ("ongoing", "end")',
         ],
     },
 }
