@@ -57,3 +57,13 @@ class ServiceResetHourlyBatchSqlTest(unittest.TestCase):
         self.assertNotIn("set status_code = 'stop'", sql)
         self.assertNotIn('set status_code = "stop"', sql)
         self.assertNotIn("update tb_product set status_code", sql)
+
+    def test_top_rank_score_weights_recent_views_over_lifetime_views(self):
+        sql = _batch_sql()
+
+        self.assertIn("최근 24시간 조회수 90%, 누적 조회수 10%", sql)
+        self.assertIn("90 * CASE WHEN z.max_recent_24h_count_hit > 0", sql)
+        self.assertIn("+ 10 * CASE WHEN z.max_count_hit > 0", sql)
+        self.assertNotIn("최근 24시간 조회수 70%, 누적 조회수 30%", sql)
+        self.assertNotIn("70 * CASE WHEN z.max_recent_24h_count_hit > 0", sql)
+        self.assertNotIn("+ 30 * CASE WHEN z.max_count_hit > 0", sql)
