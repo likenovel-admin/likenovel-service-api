@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any
 
 from app.rdb import get_likenovel_db
-from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.auth import analysis_logger, chk_cur_user, chk_optional_cur_user_strict
 import app.services.ai.recommendation_service as recommendation_service
 import app.services.ai.ai_chat_service as ai_chat_service
 import app.schemas.ai_recommendation as ai_schema
@@ -129,15 +129,10 @@ async def post_ai_recommend(
 )
 async def post_ai_chat(
     req_body: ai_schema.PostAiChatReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
-    kc_user_id = user.get("sub")
-    if not kc_user_id:
-        raise CustomResponseException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            message=ErrorMessages.LOGIN_REQUIRED,
-        )
+    kc_user_id = user.get("sub") or None
 
     result = await ai_chat_service.handle_chat(
         kc_user_id=kc_user_id,
@@ -156,15 +151,16 @@ async def post_ai_chat(
         last_msg = req_body.messages[-1]
         if last_msg.role == "user":
             last_user_content = last_msg.content
-    try:
-        await ai_chat_service.save_chat_messages(
-            kc_user_id=kc_user_id,
-            user_content=last_user_content,
-            assistant_result=result,
-            db=db,
-        )
-    except Exception as e:
-        error_logger.error(f"Failed to save chat history: {e}")
+    if kc_user_id:
+        try:
+            await ai_chat_service.save_chat_messages(
+                kc_user_id=kc_user_id,
+                user_content=last_user_content,
+                assistant_result=result,
+                db=db,
+            )
+        except Exception as e:
+            error_logger.error(f"Failed to save chat history: {e}")
 
     return {"data": result}
 

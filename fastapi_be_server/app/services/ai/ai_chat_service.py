@@ -1643,7 +1643,7 @@ async def _dispatch_tool(
 
 async def handle_chat(
     *,
-    kc_user_id: str,
+    kc_user_id: str | None,
     messages: list[dict] | None,
     context: dict | None,
     preset: str | None,
@@ -1654,7 +1654,7 @@ async def handle_chat(
     normalized_adult = _normalize_adult_yn(adult_yn)
     normalized_preset = str(preset or "").strip() or None
 
-    user_id = await recommendation_service._get_user_id_by_kc(kc_user_id, db)
+    user_id = await recommendation_service._get_user_id_by_kc(kc_user_id, db) if kc_user_id else None
     profile = await recommendation_service.get_user_taste_profile(user_id, db) if user_id else None
 
     exclude_set = set(_as_int_list(exclude_ids))
