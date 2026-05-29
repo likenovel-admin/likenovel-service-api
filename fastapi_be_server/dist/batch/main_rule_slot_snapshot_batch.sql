@@ -53,9 +53,16 @@ UPDATE tb_cms_batch_job_process a
 SET @snapshot_ref_at = CURDATE();
 SET @snapshot_start_date = @snapshot_ref_at;
 SET @snapshot_end_date = @snapshot_ref_at;
+SET @snapshot_refresh_after_minutes = 330;
 
 SELECT COUNT(DISTINCT CONCAT(slot_key, ':', adult_yn))
   INTO @current_snapshot_slot_count
+  FROM tb_main_rule_slot_snapshot
+ WHERE snapshot_start_date = @snapshot_start_date
+   AND snapshot_end_date = @snapshot_end_date;
+
+SELECT MAX(updated_date)
+  INTO @current_snapshot_last_updated_at
   FROM tb_main_rule_slot_snapshot
  WHERE snapshot_start_date = @snapshot_start_date
    AND snapshot_end_date = @snapshot_end_date;
@@ -163,7 +170,14 @@ SELECT (
     ) THEN 1 ELSE 0 END
 ) INTO @stale_placeholder_slot_count;
 
-SET @should_build = IF(@current_snapshot_slot_count >= 4 AND @stale_placeholder_slot_count = 0, 0, 1);
+SET @should_build = IF(
+    @current_snapshot_slot_count >= 4
+    AND @stale_placeholder_slot_count = 0
+    AND @current_snapshot_last_updated_at IS NOT NULL
+    AND TIMESTAMPDIFF(MINUTE, @current_snapshot_last_updated_at, NOW()) < @snapshot_refresh_after_minutes,
+    0,
+    1
+);
 
 DELETE FROM tb_main_rule_slot_snapshot
  WHERE snapshot_start_date = @snapshot_start_date
