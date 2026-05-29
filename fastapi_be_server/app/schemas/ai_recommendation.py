@@ -219,6 +219,7 @@ class BrowsingContext(BaseModel):
     pathname: Optional[str] = Field(default=None, max_length=200)
     current_product_id: Optional[int] = Field(default=None)
     current_episode_id: Optional[int] = Field(default=None)
+    focus_product_card: bool = Field(default=False)
 
     @field_validator("browsed_product_ids")
     @classmethod
