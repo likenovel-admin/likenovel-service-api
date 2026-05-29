@@ -9,6 +9,7 @@ import logging
 import re
 from datetime import date, datetime
 from decimal import Decimal
+from html import unescape
 from typing import Any
 
 import httpx
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 6
 MAX_QUERY_TOOL_CALLS = 2
 MAX_DETAIL_TOOL_CALLS = 1
+MAX_EPISODE_PREVIEW_COUNT = 3
+MAX_EPISODE_PREVIEW_CHARS = 1200
 FINAL_RESPONSE_TOOL_NAME = "submit_final_recommendation"
 FINAL_RESPONSE_MODES = {"recommend", "weak_recommend", "no_match"}
 
@@ -172,10 +175,21 @@ DATA_AGENT_TOOLS = [
     },
     {
         "name": "get_product_info",
-        "description": "최종 후보 작품 1개의 카드/상세 메타를 조회한다.",
+        "description": "최종 후보 작품 1개의 카드/상세 메타를 조회한다. 현재 작품의 특정 회차 줄거리를 물으면 include_episode_previews=true와 episode_numbers를 함께 사용해 공개 무료 회차 미리보기를 확인한다.",
         "input_schema": {
             "type": "object",
-            "properties": {"product_id": {"type": "integer"}},
+            "properties": {
+                "product_id": {"type": "integer"},
+                "include_episode_previews": {
+                    "type": "boolean",
+                    "description": "현재 작품의 회차별 내용 질문에만 true. 공개 무료 회차의 제한된 미리보기만 반환한다.",
+                },
+                "episode_numbers": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "확인할 회차 번호. 최대 3개.",
+                },
+            },
             "required": ["product_id"],
         },
     },
@@ -277,6 +291,64 @@ def _compact_text(value: Any, max_length: int = 120) -> str:
     if not text_value:
         return ""
     return text_value[:max_length]
+
+
+def _plain_text_from_episode_html(value: Any, max_length: int = MAX_EPISODE_PREVIEW_CHARS) -> str:
+    text_value = str(value or "")
+    if not text_value:
+        return ""
+    text_value = re.sub(r"(?i)<br\s*/?>", "\n", text_value)
+    text_value = re.sub(r"(?i)</p\s*>", "\n", text_value)
+    text_value = re.sub(r"<[^>]+>", " ", text_value)
+    text_value = unescape(text_value).replace("\xa0", " ")
+    text_value = re.sub(r"\s+", " ", text_value).strip()
+    return text_value[:max_length]
+
+
+def _normalize_episode_numbers(values: Any) -> list[int]:
+    episode_numbers: list[int] = []
+    for value in values or []:
+        episode_no = _safe_int(value, 0)
+        if episode_no <= 0 or episode_no in episode_numbers:
+            continue
+        episode_numbers.append(episode_no)
+        if len(episode_numbers) >= MAX_EPISODE_PREVIEW_COUNT:
+            break
+    return episode_numbers or [1, 2, 3]
+
+
+def _extract_episode_numbers_from_query(text_value: str) -> list[int]:
+    matches = re.findall(r"(\d{1,4})\s*화", str(text_value or ""))
+    return _normalize_episode_numbers(matches)
+
+
+def _resolve_conversation_product_id(page_context: dict, session_state: dict) -> int:
+    current_product_id = _safe_int(page_context.get("current_product_id"), 0)
+    if current_product_id > 0:
+        return current_product_id
+
+    for value in reversed(session_state.get("recommended_product_ids") or []):
+        product_id = _safe_int(value, 0)
+        if product_id > 0:
+            return product_id
+    return 0
+
+
+def _is_current_product_episode_detail_request(
+    messages: list[dict] | None,
+    conversation_product_id: int,
+) -> bool:
+    if _safe_int(conversation_product_id, 0) <= 0:
+        return False
+    latest_query = _latest_user_query(messages)
+    if not latest_query:
+        return False
+    has_episode_hint = bool(re.search(r"\d{1,4}\s*화", latest_query)) or "회차" in latest_query
+    has_detail_hint = any(
+        keyword in latest_query
+        for keyword in ["내용", "줄거리", "뭔데", "무슨 얘기", "무슨 내용", "요약"]
+    )
+    return has_episode_hint and has_detail_hint
 
 
 def _is_similar_request(text: str) -> bool:
@@ -540,6 +612,7 @@ async def _build_page_context(context: dict | None, db: AsyncSession) -> dict:
     pathname = _compact_text(raw.get("pathname"), 120) or None
     current_product_id = _safe_int(raw.get("current_product_id"), 0) or None
     current_episode_id = _safe_int(raw.get("current_episode_id"), 0) or None
+    focus_product_card = bool(raw.get("focus_product_card")) and bool(current_product_id)
     current_product_title = None
 
     if current_product_id:
@@ -561,6 +634,7 @@ async def _build_page_context(context: dict | None, db: AsyncSession) -> dict:
         "current_product_id": current_product_id,
         "current_episode_id": current_episode_id,
         "current_product_title": current_product_title,
+        "focus_product_card": focus_product_card,
     }
 
 
@@ -616,6 +690,8 @@ def _build_data_agent_system_prompt(
         "tb_product에는 premise, hook, reading_rate, evaluation_score, episode_total 컬럼이 없다. 이 값들은 각각 메타/트렌드/평가/회차 집계 테이블에서 가져와야 한다.",
         "작품 추천이면 SQL 결과에서 직접 product_id를 고르고, 근거 2개 이상을 reply에 녹여라.",
         "작품을 추천할 때는 submit_final_recommendation 전에 get_product_info를 한 번 호출해 premise, hook, synopsis_text, episode_summary_text, 7축 태그, 장르, 연독/연재주기 지표를 확인한다.",
+        "현재 작품의 회차 내용 질문(예: 1화/2화 줄거리)이면 현재 페이지 작품 ID로 get_product_info(product_id=..., include_episode_previews=true, episode_numbers=[...])를 호출해 episode_previews를 근거로 답한다.",
+        "episode_previews는 공개 무료 회차의 제한된 미리보기다. 원문 전문을 길게 옮기지 말고 회차당 1~2문장으로 요약한다. 미리보기가 없으면 확인 가능한 공개 회차 미리보기가 없다고 말한다.",
         "submit_final_recommendation.mode 규칙: recommend/weak_recommend면 product_id가 필수이고, no_match면 product_id는 null이어야 한다.",
         "조회 결과에 추천 가능한 후보가 1개라도 있으면 no_match보다 weak_recommend를 우선한다. no_match는 SQL 결과가 0건이거나, 모든 후보가 핵심 조건을 명백히 위반할 때만 사용한다.",
         "질문에 없는 숫자 임계치(예: 조회수 50,000 이상, 연독률 12% 이상)를 임의로 만들지 않는다. 작품 비교는 반드시 지금 조회한 DB 결과 내부의 상대 비교와 상위 후보 비교로 설명한다.",
@@ -654,6 +730,8 @@ def _build_data_agent_system_prompt(
         lines.append(f"이미 읽은 작품 ID: {reader_context['read_product_ids']}")
     if session_state.get("recommended_product_ids"):
         lines.append(f"이번 세션 이미 추천한 작품 ID: {session_state['recommended_product_ids']}")
+        if not page_context.get("current_product_id"):
+            lines.append(f"현재 대화 대상 작품 ID: {session_state['recommended_product_ids'][-1]}")
     if session_state.get("exclude_product_ids"):
         lines.append(f"이번 세션 제외 작품 ID: {session_state['exclude_product_ids']}")
     if page_context.get("current_product_id"):
@@ -1434,11 +1512,97 @@ async def _build_product_and_taste(
     return product, taste_match
 
 
+async def _attach_focus_product_card_if_needed(
+    *,
+    product: dict | None,
+    taste_match: dict,
+    page_context: dict,
+    profile: dict | None,
+    db: AsyncSession,
+    factor_scores: dict | None,
+    adult_yn: str,
+) -> tuple[dict | None, dict]:
+    if product is not None or not page_context.get("focus_product_card"):
+        return product, taste_match
+
+    current_product_id = _safe_int(page_context.get("current_product_id"), 0)
+    if current_product_id <= 0:
+        return product, taste_match
+
+    return await _build_product_and_taste(
+        selected_product_id=current_product_id,
+        last_search_candidates=[],
+        profile=profile,
+        db=db,
+        factor_scores=factor_scores,
+        adult_yn=adult_yn,
+        fallback_to_search=False,
+    )
+
+
+async def _get_public_episode_previews(
+    db: AsyncSession,
+    *,
+    product_id: int,
+    episode_numbers: list[int] | None,
+    adult_yn: str = "N",
+) -> list[dict[str, Any]]:
+    normalized_adult = _normalize_adult_yn(adult_yn)
+    normalized_episode_numbers = _normalize_episode_numbers(episode_numbers)
+    placeholders = ", ".join(
+        f":episode_no_{index}" for index, _ in enumerate(normalized_episode_numbers)
+    )
+    query_sql = text(
+        f"""
+        SELECT
+            e.episode_no,
+            e.episode_title,
+            e.episode_content
+        FROM tb_product_episode e
+        INNER JOIN tb_product p ON p.product_id = e.product_id
+        WHERE e.product_id = :product_id
+          AND p.open_yn = 'Y'
+          AND COALESCE(p.blind_yn, 'N') = 'N'
+          {"AND p.ratings_code = 'all'" if normalized_adult == "N" else ""}
+          AND e.use_yn = 'Y'
+          AND e.open_yn = 'Y'
+          AND (e.publish_reserve_date IS NULL OR e.publish_reserve_date <= CURRENT_TIMESTAMP)
+          AND COALESCE(e.price_type, 'free') = 'free'
+          AND e.episode_no IN ({placeholders})
+        ORDER BY e.episode_no
+        LIMIT {MAX_EPISODE_PREVIEW_COUNT}
+        """
+    )
+    params = {"product_id": product_id}
+    params.update(
+        {f"episode_no_{index}": episode_no for index, episode_no in enumerate(normalized_episode_numbers)}
+    )
+    result = await db.execute(query_sql, params)
+    rows = await _result_mappings_all(result)
+
+    previews: list[dict[str, Any]] = []
+    for row in rows:
+        row_dict = dict(row)
+        preview_text = _plain_text_from_episode_html(row_dict.get("episode_content"))
+        if not preview_text:
+            continue
+        previews.append(
+            {
+                "episode_no": _safe_int(row_dict.get("episode_no"), 0),
+                "title": row_dict.get("episode_title") or "",
+                "preview_text": preview_text,
+            }
+        )
+    return previews
+
+
 async def get_product_info(
     db: AsyncSession,
     *,
     product_id: int,
     adult_yn: str = "N",
+    include_episode_previews: bool = False,
+    episode_numbers: list[int] | None = None,
 ) -> dict:
     normalized_adult = _normalize_adult_yn(adult_yn)
     query_sql = text(
@@ -1558,7 +1722,7 @@ async def get_product_info(
         f"연독률 {_safe_float(row_dict.get('reading_rate'), 0.0):.2f}"
     ).strip(" |")
 
-    return {
+    product_info = {
         "product_id": row_dict.get("product_id"),
         "title": row_dict.get("title"),
         "author_name": row_dict.get("author_name"),
@@ -1614,6 +1778,14 @@ async def get_product_info(
         "axis_style_tags": _load_json_list(row_dict.get("axis_style_tags")),
         "summary_line": summary_line,
     }
+    if include_episode_previews:
+        product_info["episode_previews"] = await _get_public_episode_previews(
+            db,
+            product_id=product_id,
+            episode_numbers=episode_numbers,
+            adult_yn=adult_yn,
+        )
+    return product_info
 
 
 async def _dispatch_tool(
@@ -1636,14 +1808,22 @@ async def _dispatch_tool(
         product_id = _safe_int(tool_input.get("product_id"))
         if product_id <= 0:
             return {"error": "product_id가 유효하지 않습니다."}
-        return await get_product_info(db, product_id=product_id, adult_yn=adult_yn)
+        raw_episode_numbers = tool_input.get("episode_numbers")
+        episode_numbers = raw_episode_numbers if isinstance(raw_episode_numbers, list) else None
+        return await get_product_info(
+            db,
+            product_id=product_id,
+            adult_yn=adult_yn,
+            include_episode_previews=bool(tool_input.get("include_episode_previews")),
+            episode_numbers=episode_numbers,
+        )
 
     return {"error": f"지원하지 않는 도구입니다: {tool_name}"}
 
 
 async def handle_chat(
     *,
-    kc_user_id: str,
+    kc_user_id: str | None,
     messages: list[dict] | None,
     context: dict | None,
     preset: str | None,
@@ -1654,7 +1834,7 @@ async def handle_chat(
     normalized_adult = _normalize_adult_yn(adult_yn)
     normalized_preset = str(preset or "").strip() or None
 
-    user_id = await recommendation_service._get_user_id_by_kc(kc_user_id, db)
+    user_id = await recommendation_service._get_user_id_by_kc(kc_user_id, db) if kc_user_id else None
     profile = await recommendation_service.get_user_taste_profile(user_id, db) if user_id else None
 
     exclude_set = set(_as_int_list(exclude_ids))
@@ -1666,7 +1846,7 @@ async def handle_chat(
     if normalized_preset and not _latest_user_query(normalized_messages):
         normalized_messages = [{"role": "user", "content": "조건에 맞는 작품 추천해줘"}]
 
-    session_state = _build_session_state(normalized_messages, context, combined_exclude)
+    session_state = _build_session_state(messages, context, combined_exclude)
     page_context = await _build_page_context(context, db)
     reader_context = await _build_reader_context(user_id, profile, db)
     system_prompt = _build_data_agent_system_prompt(
@@ -1731,6 +1911,25 @@ async def handle_chat(
                 )
                 force_finalize_allowed_tool_names = [FINAL_RESPONSE_TOOL_NAME]
                 continue
+            current_product_id = _resolve_conversation_product_id(page_context, session_state)
+            if (
+                _is_current_product_episode_detail_request(normalized_messages, current_product_id)
+                and current_product_id > 0
+                and current_product_id not in detail_cache
+                and detail_calls < MAX_DETAIL_TOOL_CALLS
+                and not forced_finalize_attempted
+            ):
+                logger.warning("[ai_chat] final tool skipped current product episode previews; requiring detail lookup")
+                _append_assistant_text_message(anthropic_messages, last_text)
+                episode_numbers = _extract_episode_numbers_from_query(_latest_user_query(normalized_messages))
+                force_finalize_reason = (
+                    f"현재 페이지 작품 ID {current_product_id}의 {episode_numbers}화 내용을 묻는 질문입니다. "
+                    f"get_product_info(product_id={current_product_id}, include_episode_previews=true, episode_numbers={episode_numbers})를 먼저 호출한 뒤 "
+                    "episode_previews를 근거로 회차당 1~2문장으로 요약해 답하세요. "
+                    "원문 전문을 길게 인용하지 말고, episode_previews가 비어 있을 때만 확인 가능한 공개 회차 미리보기가 없다고 말하세요."
+                )
+                force_finalize_allowed_tool_names = ["get_product_info", FINAL_RESPONSE_TOOL_NAME]
+                continue
             if _should_reask_final_with_product_id(
                 final_tool_input=final_tool_input,
                 detail_cache=detail_cache,
@@ -1779,6 +1978,15 @@ async def handle_chat(
                 adult_yn=normalized_adult,
                 fallback_to_search=False,
                 prefetched_product_info=detail_cache.get(selected_product_id) if selected_product_id else None,
+            )
+            product, taste_match = await _attach_focus_product_card_if_needed(
+                product=product,
+                taste_match=taste_match,
+                page_context=page_context,
+                profile=profile,
+                db=db,
+                factor_scores=reader_context.get("factor_scores"),
+                adult_yn=normalized_adult,
             )
             raw_reply = str(final_tool_input.get("reply") or last_text or "").strip()
             if product:
