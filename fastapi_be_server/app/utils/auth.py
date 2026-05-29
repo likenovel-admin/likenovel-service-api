@@ -199,6 +199,15 @@ async def chk_cur_user(
     return decoded_token
 
 
+async def chk_optional_cur_user_strict(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(auth_req_header)],
+):
+    if credentials is None:
+        return dict()
+
+    return await chk_jwt_token(credentials.credentials)
+
+
 async def login_required(
     user: Annotated[dict, Depends(chk_cur_user)],
 ) -> str:
