@@ -357,6 +357,16 @@ for batch_script in "$BATCH_DST"/*.sh; do
   chmod +x "$batch_script"
 done
 
+# prod 메인 룰 구좌 snapshot cron 보장 (기존 1일 1회 라인만 교체)
+MAIN_RULE_SLOT_CRON_LINE='45 1,7,13,19 * * * bash /home/ln-admin/likenovel/batch/main_rule_slot_snapshot_batch.sh >> /home/ln-admin/likenovel/batch/main_rule_slot_snapshot_batch.log 2>&1'
+current_cron="$(crontab -l 2>/dev/null || true)"
+if ! printf '%s\n' "$current_cron" | grep -Fqx "$MAIN_RULE_SLOT_CRON_LINE"; then
+  {
+    printf '%s\n' "$current_cron" | grep -Fv "/home/ln-admin/likenovel/batch/main_rule_slot_snapshot_batch.sh" || true
+    echo "$MAIN_RULE_SLOT_CRON_LINE"
+  } | crontab -
+fi
+
 # prod 웹소챗 컨텍스트 배치 cron 보장 (중복 등록 방지)
 STORYCTX_CRON_LINE='10 * * * * STORYCTX_MAX_PARALLEL=2 bash /home/ln-admin/likenovel/batch/build_story_agent_context_batch.sh >> /home/ln-admin/likenovel/batch/build_story_agent_context_batch.log 2>&1'
 if ! crontab -l 2>/dev/null | grep -Fq "/home/ln-admin/likenovel/batch/build_story_agent_context_batch.sh"; then
