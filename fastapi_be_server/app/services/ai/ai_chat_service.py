@@ -1382,7 +1382,7 @@ def _build_focus_product_intro_reply(product: dict) -> str:
         meta_parts.append(serial_cycle)
 
     if synopsis:
-        reply = f"현재 보고 계신 '{title}'은 {synopsis}"
+        reply = f"현재 보고 계신 '{title}' 작품은 {synopsis}"
     else:
         reply = f"현재 보고 계신 '{title}' 작품 정보를 카드로 정리해드렸습니다."
 
