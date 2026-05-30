@@ -22,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.const import settings
+from app.services.common.genre_policy import can_use_as_primary_genre
 from app.services.common import comm_service
 from app.utils.query import get_file_path_sub_query
 
@@ -168,10 +169,7 @@ async def preview_bulk_upload(
             errors.append("작가이메일 필수")
         if not title:
             errors.append("작품제목 필수")
-        if not genre1:
-            errors.append("1차장르 필수")
-        elif genre1 not in genre_map:
-            errors.append(f"1차장르 '{genre1}' 없음")
+        errors.extend(_validate_primary_genre(genre1, genre_map))
         if genre2 and genre2 not in genre_map:
             errors.append(f"2차장르 '{genre2}' 없음")
         if not schedule_days:
@@ -331,6 +329,16 @@ def _normalize_episode_no_map(episodes: dict[int, str]) -> dict[int, str]:
     return {index: content for index, (_, content) in enumerate(sorted(episodes.items()), start=1)}
 
 
+def _validate_primary_genre(genre1: str, genre_map: dict[str, int]) -> list[str]:
+    if not genre1:
+        return ["1차장르 필수"]
+    if genre1 not in genre_map:
+        return [f"1차장르 '{genre1}' 없음"]
+    if not can_use_as_primary_genre(genre1):
+        return [f"1차장르로 사용할 수 없는 장르입니다: {genre1}"]
+    return []
+
+
 async def _load_genre_map(db: AsyncSession) -> dict[str, int]:
     result = await db.execute(text(
         "SELECT keyword_id, keyword_name FROM tb_standard_keyword "
@@ -469,6 +477,9 @@ async def _create_product(
     cover_bytes: bytes | None = None,
 ) -> int:
     """작품 생성 + 키워드 매핑 + 표지 업로드."""
+    if not can_use_as_primary_genre(row["genre1"]):
+        raise ValueError(f"1차 장르로 사용할 수 없는 장르입니다: {row['genre1']}")
+
     primary_genre_id = genre_map.get(row["genre1"], 0)
     sub_genre_id = genre_map.get(row["genre2"]) if row["genre2"] else None
     ratings_code = "adult" if row["rating"] == "19" else ("15" if row["rating"] == "15" else "all")
