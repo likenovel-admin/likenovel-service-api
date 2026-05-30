@@ -7,6 +7,7 @@ _STUBBED_MODULE_NAMES = (
     "bs4",
     "app.const",
     "app.services.common",
+    "app.services.common.genre_policy",
     "app.utils.query",
     "sqlalchemy",
     "sqlalchemy.ext",
@@ -37,8 +38,15 @@ const_stub.settings = SimpleNamespace()
 sys.modules["app.const"] = const_stub
 
 common_stub = ModuleType("app.services.common")
+common_stub.__path__ = []
 common_stub.comm_service = SimpleNamespace()
 sys.modules["app.services.common"] = common_stub
+
+genre_policy_stub = ModuleType("app.services.common.genre_policy")
+genre_policy_stub.can_use_as_primary_genre = lambda genre_name: (
+    bool((genre_name or "").strip()) and (genre_name or "").strip() != "로맨스"
+)
+sys.modules["app.services.common.genre_policy"] = genre_policy_stub
 
 query_stub = ModuleType("app.utils.query")
 query_stub.get_file_path_sub_query = lambda *args, **kwargs: None
@@ -59,6 +67,7 @@ try:
     from app.services.admin.admin_bulk_upload_service import (
         _normalize_episode_no_map,
         _txt_to_html,
+        _validate_primary_genre,
     )
 finally:
     _restore_stubbed_modules()
@@ -94,6 +103,13 @@ class AdminBulkUploadServiceUnitTest(unittest.TestCase):
             _normalize_episode_no_map(episodes),
             {1: "prologue", 2: "one", 3: "two"},
         )
+
+    def test_validate_primary_genre_rejects_romance(self):
+        errors = _validate_primary_genre("로맨스", {"로맨스": 21})
+        self.assertEqual(errors, ["1차장르로 사용할 수 없는 장르입니다: 로맨스"])
+
+    def test_validate_primary_genre_allows_non_romance_primary(self):
+        self.assertEqual(_validate_primary_genre("현대판타지", {"현대판타지": 19}), [])
 
 
 if __name__ == "__main__":
