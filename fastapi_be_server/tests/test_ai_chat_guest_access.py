@@ -301,6 +301,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             2020,
         )
         self.assertIn("잿빛 길을 걷다", result["reply"])
+        self.assertIn("'잿빛 길을 걷다' 작품은", result["reply"])
         self.assertIn("포스트 아포칼립스", result["reply"])
         self.assertEqual(call_claude_messages.await_count, 3)
         self.assertEqual(result["finalMode"], "weak_recommend")
