@@ -269,9 +269,9 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                             "id": "final-2",
                             "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
                             "input": {
-                                "mode": "weak_recommend",
+                                "mode": "no_match",
                                 "product_id": 2020,
-                                "reply": "'잿빛 길을 걷다'는 멸망한 도시를 걷는 생존자들의 포스트 아포칼립스 생존 서사입니다.",
+                                "reply": "'잿빛 길을 걷다'는 멸망한 도시를 걷는 생존자들의 포스트 아포칼립스 생존 서사입니다. 현재 조회 가능한 데이터 범위 내에서 유사한 다른 작품을 찾기 어려워 비교 후보를 제시하기 어렵습니다.",
                             },
                         }
                     ]
@@ -303,7 +303,10 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("잿빛 길을 걷다", result["reply"])
         self.assertIn("포스트 아포칼립스", result["reply"])
         self.assertEqual(call_claude_messages.await_count, 3)
+        self.assertEqual(result["finalMode"], "weak_recommend")
         self.assertNotIn("비교 데이터", result["reply"])
+        self.assertNotIn("유사한 다른 작품", result["reply"])
+        self.assertNotIn("비교 후보", result["reply"])
         self.assertNotIn("추천하기 위한", result["reply"])
 
     async def test_get_product_info_tool_accepts_optional_public_episode_previews(self):
