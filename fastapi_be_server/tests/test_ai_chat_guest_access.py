@@ -181,7 +181,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
 
             result = await ai_chat_service.handle_chat(
                 kc_user_id=None,
-                messages=[{"role": "user", "content": "이 작품 어떤 작품인지 알려줘"}],
+                messages=[{"role": "user", "content": "조건에 맞는 작품 찾아줘"}],
                 context={
                     "trigger": "manual",
                     "page_type": "product",
@@ -200,6 +200,111 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             build_product_and_taste.await_args_list[-1].kwargs["selected_product_id"],
             2020,
         )
+
+    async def test_handle_chat_replaces_no_match_reply_when_focus_product_card_attached(self):
+        with (
+            patch.object(
+                ai_chat_service,
+                "_build_page_context",
+                new_callable=AsyncMock,
+            ) as build_page_context,
+            patch.object(
+                ai_chat_service,
+                "_dispatch_tool",
+                new_callable=AsyncMock,
+            ) as dispatch_tool,
+            patch.object(
+                ai_chat_service,
+                "_call_claude_messages",
+                new_callable=AsyncMock,
+            ) as call_claude_messages,
+        ):
+            build_page_context.return_value = {
+                "page_type": "product",
+                "pathname": "/product/free/normal",
+                "current_product_id": 2020,
+                "current_episode_id": None,
+                "current_product_title": "잿빛 길을 걷다",
+                "focus_product_card": True,
+            }
+            dispatch_tool.return_value = {
+                "product_id": 2020,
+                "title": "잿빛 길을 걷다",
+                "author_name": "Avalanche",
+                "episode_total": 333,
+                "writing_count_per_week": 7.0,
+                "status_code": "scheduled_serial",
+                "synopsis_text": "멸망한 도시를 걷는 생존자들이 긴장감 있는 여정을 이어가는 포스트 아포칼립스 작품입니다.",
+                "taste_tags": ["강한 주인공", "서사적", "긴장감"],
+            }
+            call_claude_messages.side_effect = [
+                {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "final-1",
+                            "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                            "input": {
+                                "mode": "no_match",
+                                "product_id": None,
+                                "reply": "현재 확인한 정보는 '잿빛 길을 걷다' 작품 자체에 대한 것뿐이며, 유사 작품을 추천하기 위한 비교 데이터가 없습니다.",
+                            },
+                        }
+                    ]
+                },
+                {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "detail-1",
+                            "name": "get_product_info",
+                            "input": {"product_id": 2020},
+                        }
+                    ]
+                },
+                {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "final-2",
+                            "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                            "input": {
+                                "mode": "weak_recommend",
+                                "product_id": 2020,
+                                "reply": "'잿빛 길을 걷다'는 멸망한 도시를 걷는 생존자들의 포스트 아포칼립스 생존 서사입니다.",
+                            },
+                        }
+                    ]
+                },
+            ]
+
+            result = await ai_chat_service.handle_chat(
+                kc_user_id=None,
+                messages=[{"role": "user", "content": "잿빛 길을 걷다 이 작품 어떤 작품인지 알려줘"}],
+                context={
+                    "trigger": "manual",
+                    "page_type": "product",
+                    "pathname": "/product/free/normal",
+                    "current_product_id": 2020,
+                    "focus_product_card": True,
+                },
+                preset=None,
+                exclude_ids=[],
+                adult_yn="N",
+                db=AsyncMock(),
+            )
+
+        self.assertEqual(result["product"]["productId"], 2020)
+        self.assertEqual(dispatch_tool.await_args.kwargs["tool_name"], "get_product_info")
+        self.assertEqual(
+            dispatch_tool.await_args.kwargs["tool_input"]["product_id"],
+            2020,
+        )
+        self.assertIn("잿빛 길을 걷다", result["reply"])
+        self.assertIn("포스트 아포칼립스", result["reply"])
+        self.assertEqual(call_claude_messages.await_count, 3)
+        self.assertNotIn("비교 데이터", result["reply"])
+        self.assertNotIn("추천하기 위한", result["reply"])
 
     async def test_get_product_info_tool_accepts_optional_public_episode_previews(self):
         db = AsyncMock()

@@ -351,6 +351,28 @@ def _is_current_product_episode_detail_request(
     return has_episode_hint and has_detail_hint
 
 
+def _is_current_product_overview_request(
+    messages: list[dict] | None,
+    page_context: dict,
+) -> bool:
+    current_product_id = _safe_int(page_context.get("current_product_id"), 0)
+    if current_product_id <= 0 or not page_context.get("focus_product_card"):
+        return False
+    latest_query = _latest_user_query(messages)
+    if not latest_query or _is_similar_request(latest_query):
+        return False
+    current_title = str(page_context.get("current_product_title") or "").strip()
+    has_current_anchor = any(
+        keyword in latest_query
+        for keyword in ["이 작품", "이거", "현재 작품", "보고 있는 작품"]
+    ) or bool(current_title and current_title in latest_query)
+    has_overview_intent = any(
+        keyword in latest_query
+        for keyword in ["어떤 작품", "무슨 작품", "알려줘", "소개", "설명", "줄거리", "내용", "키워드", "장르"]
+    )
+    return has_current_anchor and has_overview_intent
+
+
 def _is_similar_request(text: str) -> bool:
     normalized = str(text or "").strip().lower()
     if not normalized:
@@ -1325,6 +1347,44 @@ def _sanitize_reply_text(reply: str) -> str:
     return text_value
 
 
+def _build_focus_product_intro_reply(product: dict) -> str:
+    title = str(product.get("title") or "현재 작품").strip()
+    synopsis = _compact_text(
+        product.get("synopsisText")
+        or product.get("premise")
+        or product.get("hook")
+        or product.get("episodeSummaryText")
+        or "",
+        180,
+    )
+    taste_tags = [
+        str(tag).strip()
+        for tag in (product.get("tasteTags") or [])
+        if str(tag).strip()
+    ][:3]
+    meta_parts: list[str] = []
+    author = str(product.get("authorNickname") or "").strip()
+    if author:
+        meta_parts.append(f"{author} 작가")
+    episode_count = _safe_int(product.get("episodeCount"), 0)
+    if episode_count > 0:
+        meta_parts.append(f"총 {episode_count}화")
+    serial_cycle = str(product.get("serialCycle") or "").strip()
+    if serial_cycle:
+        meta_parts.append(serial_cycle)
+
+    if synopsis:
+        reply = f"현재 보고 계신 '{title}'은 {synopsis}"
+    else:
+        reply = f"현재 보고 계신 '{title}' 작품 정보를 카드로 정리해드렸습니다."
+
+    if taste_tags:
+        reply = f"{reply} 키워드는 {', '.join(taste_tags)} 쪽으로 잡혀 있습니다."
+    if meta_parts:
+        reply = f"{reply} ({' · '.join(meta_parts)})"
+    return reply
+
+
 def _build_axis_taste_context(
     dna: dict,
     profile: dict | None,
@@ -1930,6 +1990,23 @@ async def handle_chat(
                 )
                 force_finalize_allowed_tool_names = ["get_product_info", FINAL_RESPONSE_TOOL_NAME]
                 continue
+            if (
+                _is_current_product_overview_request(normalized_messages, page_context)
+                and current_product_id > 0
+                and current_product_id not in detail_cache
+                and detail_calls < MAX_DETAIL_TOOL_CALLS
+                and not forced_finalize_attempted
+            ):
+                logger.warning("[ai_chat] final tool skipped current product info; requiring detail lookup")
+                _append_assistant_text_message(anthropic_messages, last_text)
+                force_finalize_reason = (
+                    f"현재 페이지 작품 ID {current_product_id}에 대한 질문입니다. "
+                    f"get_product_info(product_id={current_product_id})를 먼저 호출한 뒤 "
+                    "작품의 synopsis_text, premise, hook, episode_summary_text, 장르/키워드, 회차 수/연재주기를 근거로 답하세요. "
+                    "현재 작품 자체를 묻는 질문이므로 유사 작품 비교 데이터가 없다는 이유로 no_match를 제출하지 마세요."
+                )
+                force_finalize_allowed_tool_names = ["get_product_info", FINAL_RESPONSE_TOOL_NAME]
+                continue
             if _should_reask_final_with_product_id(
                 final_tool_input=final_tool_input,
                 detail_cache=detail_cache,
@@ -1969,6 +2046,16 @@ async def handle_chat(
             selected_product_id: int | None = None
             if parsed_product_id is not None:
                 selected_product_id = parsed_product_id
+            selected_from_current_product_context = False
+            if (
+                selected_product_id is None
+                and final_mode == "no_match"
+                and _is_current_product_overview_request(normalized_messages, page_context)
+            ):
+                current_product_id = _safe_int(page_context.get("current_product_id"), 0)
+                if current_product_id > 0:
+                    selected_product_id = current_product_id
+                    selected_from_current_product_context = True
             product, taste_match = await _build_product_and_taste(
                 selected_product_id=selected_product_id,
                 last_search_candidates=[],
@@ -1979,18 +2066,22 @@ async def handle_chat(
                 fallback_to_search=False,
                 prefetched_product_info=detail_cache.get(selected_product_id) if selected_product_id else None,
             )
-            product, taste_match = await _attach_focus_product_card_if_needed(
-                product=product,
-                taste_match=taste_match,
-                page_context=page_context,
-                profile=profile,
-                db=db,
-                factor_scores=reader_context.get("factor_scores"),
-                adult_yn=normalized_adult,
-            )
+            if not selected_from_current_product_context:
+                product, taste_match = await _attach_focus_product_card_if_needed(
+                    product=product,
+                    taste_match=taste_match,
+                    page_context=page_context,
+                    profile=profile,
+                    db=db,
+                    factor_scores=reader_context.get("factor_scores"),
+                    adult_yn=normalized_adult,
+                )
             raw_reply = str(final_tool_input.get("reply") or last_text or "").strip()
             if product:
-                reply = _sanitize_reply_text(raw_reply)
+                if selected_from_current_product_context:
+                    reply = _build_focus_product_intro_reply(product)
+                else:
+                    reply = _sanitize_reply_text(raw_reply)
                 if not reply:
                     logger.warning("[ai_chat] final tool reply empty with product_id=%s", selected_product_id)
                     reply = f"지금까지 조회 결과 기준으로는 '{product['title']}'이 가장 가깝습니다."
