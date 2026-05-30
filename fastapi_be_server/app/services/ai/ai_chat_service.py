@@ -373,6 +373,14 @@ def _is_current_product_overview_request(
     return has_current_anchor and has_overview_intent
 
 
+def _has_comparison_failure_text(reply: str) -> bool:
+    text_value = str(reply or "")
+    return any(
+        keyword in text_value
+        for keyword in ["비교 데이터", "유사한 다른 작품", "비교 후보", "추천하기 위한"]
+    )
+
+
 def _is_similar_request(text: str) -> bool:
     normalized = str(text or "").strip().lower()
     if not normalized:
@@ -1917,7 +1925,7 @@ async def handle_chat(
         page_context=page_context,
     )
 
-    anthropic_messages = normalized_messages
+    anthropic_messages = list(normalized_messages)
     last_text = ""
     last_query_rows: list[dict[str, Any]] = []
     detail_cache: dict[int, dict[str, Any]] = {}
@@ -2043,6 +2051,8 @@ async def handle_chat(
                 )
                 force_finalize_allowed_tool_names = ["get_product_info", FINAL_RESPONSE_TOOL_NAME]
                 continue
+            current_overview_request = _is_current_product_overview_request(normalized_messages, page_context)
+            current_overview_product_id = _safe_int(page_context.get("current_product_id"), 0)
             selected_product_id: int | None = None
             if parsed_product_id is not None:
                 selected_product_id = parsed_product_id
@@ -2050,12 +2060,19 @@ async def handle_chat(
             if (
                 selected_product_id is None
                 and final_mode == "no_match"
-                and _is_current_product_overview_request(normalized_messages, page_context)
+                and current_overview_request
             ):
-                current_product_id = _safe_int(page_context.get("current_product_id"), 0)
-                if current_product_id > 0:
-                    selected_product_id = current_product_id
+                if current_overview_product_id > 0:
+                    selected_product_id = current_overview_product_id
                     selected_from_current_product_context = True
+            if (
+                current_overview_request
+                and selected_product_id == current_overview_product_id
+                and current_overview_product_id > 0
+                and final_mode == "no_match"
+            ):
+                final_mode = "weak_recommend"
+                selected_from_current_product_context = True
             product, taste_match = await _build_product_and_taste(
                 selected_product_id=selected_product_id,
                 last_search_candidates=[],
@@ -2075,10 +2092,16 @@ async def handle_chat(
                     db=db,
                     factor_scores=reader_context.get("factor_scores"),
                     adult_yn=normalized_adult,
-                )
+            )
             raw_reply = str(final_tool_input.get("reply") or last_text or "").strip()
             if product:
-                if selected_from_current_product_context:
+                if final_mode == "no_match" and selected_product_id is not None:
+                    final_mode = "weak_recommend"
+                if selected_from_current_product_context or (
+                    current_overview_request
+                    and selected_product_id == current_overview_product_id
+                    and _has_comparison_failure_text(raw_reply)
+                ):
                     reply = _build_focus_product_intro_reply(product)
                 else:
                     reply = _sanitize_reply_text(raw_reply)
@@ -2091,6 +2114,14 @@ async def handle_chat(
                 if not reply:
                     logger.warning("[ai_chat] final tool reply empty without product selection")
                     reply = "지금까지 조회 결과만으로는 작품을 확정하지 못했습니다. 조건 하나만 더 알려주시면 다시 찾겠습니다."
+
+            if (
+                product
+                and current_overview_request
+                and selected_product_id == current_overview_product_id
+                and final_mode == "no_match"
+            ):
+                final_mode = "weak_recommend"
 
             return {
                 "reply": reply,
