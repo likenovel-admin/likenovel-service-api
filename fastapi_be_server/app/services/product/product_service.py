@@ -20,6 +20,7 @@ from app.services.common.cp_link_service import (
     get_accepted_cp_info_by_user_id,
     normalize_cp_nickname,
 )
+from app.services.common.genre_policy import can_use_as_primary_genre
 
 from app.config.log_config import service_error_logger
 
@@ -2884,7 +2885,10 @@ async def post_products(
                 primary_genre_id = None
                 if db_rst:
                     for row in db_rst:
-                        if req_body.primary_genre == row["keyword_name"]:
+                        if (
+                            req_body.primary_genre == row["keyword_name"]
+                            and can_use_as_primary_genre(row["keyword_name"])
+                        ):
                             primary_genre_id = row["keyword_id"]
                             break
 
@@ -3387,7 +3391,10 @@ async def put_products_product_id(
                 primary_genre_id = None
                 if db_rst:
                     for row in db_rst:
-                        if req_body.primary_genre == row["keyword_name"]:
+                        if (
+                            req_body.primary_genre == row["keyword_name"]
+                            and can_use_as_primary_genre(row["keyword_name"])
+                        ):
                             primary_genre_id = row["keyword_id"]
                             break
 

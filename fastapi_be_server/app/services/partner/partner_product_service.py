@@ -15,6 +15,7 @@ from app.utils.query import (
 from app.utils.response import build_paginated_response, check_exists_or_404
 from app.const import CommonConstants
 from app.const import ErrorMessages
+from app.services.common.genre_policy import can_use_as_primary_genre
 
 logger = logging.getLogger("partner_app")  # 커스텀 로거 생성
 
@@ -546,7 +547,7 @@ async def put_product(
             query, {"primary_genre_id": req_body.primary_genre_id}
         )
         rows = result.mappings().all()
-        if len(rows) == 0:
+        if len(rows) == 0 or not can_use_as_primary_genre(rows[0]["keyword_name"]):
             raise CustomResponseException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 message=f"유효하지 않은 1차 장르입니다. ({req_body.primary_genre_id})",
