@@ -566,6 +566,192 @@ def get_select_fields_and_joins_for_product(
     }
 
 
+def get_select_fields_and_joins_for_home_card_product(
+    user_id: int | None = None,
+    rank_area_code: str | None = None,
+):
+    join_rank_enabled = rank_area_code is not None
+    return {
+        "select_fields": ",".join(
+            [
+                "p.product_id as productId",
+                "if(p.ratings_code = 'adult', 'Y', 'N') as adultYn",
+                "p.title",
+                "p.synopsis_text as synopsis",
+                "p.author_name as authorNickname",
+                "p.price_type as priceType",
+                "p.paid_episode_no as paidEpisodeNo",
+                "COALESCE(p.single_regular_price, 0) as singleRegularPrice",
+                "COALESCE(p.single_rental_price, 0) as singleRentalPrice",
+                "COALESCE(p.series_regular_price, 0) as seriesRegularPrice",
+                "p.illustrator_name as illustratorNickname",
+                "ifnull(p.product_type, 'free') as productType",
+                "p.created_date as createdDate",
+                "p.updated_date as updatedDate",
+                "p.author_id as authorId",
+                "(SELECT GROUP_CONCAT(DISTINCT sk2.keyword_name SEPARATOR '|') FROM tb_mapped_product_keyword mpk2 LEFT JOIN tb_standard_keyword sk2 ON sk2.keyword_id = mpk2.keyword_id WHERE mpk2.product_id = p.product_id) as keywords",
+                "pg.keyword_name as primary_genre",
+                "sg.keyword_name as sub_genre",
+                "pr.current_rank" if join_rank_enabled else "NULL as current_rank",
+                "(pr.previous_rank - pr.current_rank) as rank_indicator"
+                if join_rank_enabled
+                else "NULL as rank_indicator",
+                "cf.file_path as coverImagePath",
+                "p.count_hit",
+                "p.count_cp_hit",
+                "p.count_recommend",
+                "p.count_bookmark",
+                "COALESCE(episode_stats.episode_count, 0) as hasEpisodeCount",
+                "CASE WHEN p.price_type = 'free' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(episode_stats.episode_count, 0) >= 5 AND COALESCE(episode_stats.episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
+                "COALESCE(episode_stats.open_episode_count, 0) as totalOpenEpisodeCount",
+                "wff.status as waitingForFreeStatus",
+                "p69.status as sixNinePathStatus",
+                "if(p.created_date >= DATE_SUB(NOW(), INTERVAL 3 DAY), 'Y', 'N') as newReleaseYn",
+                "COALESCE(ut.ticket_count, 0) as freeEpisodeTicketCount"
+                if user_id
+                else "0 as freeEpisodeTicketCount",
+                "NULL as authorEventLevelBadgeImagePath",
+                "NULL as authorInterestLevelBadgeImagePath",
+                f"(SELECT DATE_ADD(MAX(upu2.updated_date), INTERVAL 3 DAY) FROM tb_user_product_usage upu2 WHERE upu2.product_id = p.product_id AND upu2.user_id = {user_id} AND upu2.use_yn = 'Y') as interestEndDate"
+                if user_id
+                else "NULL as interestEndDate",
+                f"""CASE
+                    WHEN (SELECT DATE_ADD(MAX(upu2.updated_date), INTERVAL 3 DAY) FROM tb_user_product_usage upu2 WHERE upu2.product_id = p.product_id AND upu2.user_id = {user_id} AND upu2.use_yn = 'Y') IS NULL THEN 'no_interest'
+                    WHEN (SELECT DATE_ADD(MAX(upu2.updated_date), INTERVAL 3 DAY) FROM tb_user_product_usage upu2 WHERE upu2.product_id = p.product_id AND upu2.user_id = {user_id} AND upu2.use_yn = 'Y') > NOW() THEN
+                        CASE
+                            WHEN (SELECT DATE_ADD(MAX(upu2.updated_date), INTERVAL 3 DAY) FROM tb_user_product_usage upu2 WHERE upu2.product_id = p.product_id AND upu2.user_id = {user_id} AND upu2.use_yn = 'Y') <= DATE_ADD(NOW(), INTERVAL 72 HOUR) THEN 'interest_ending_soon'
+                            ELSE 'interest_active'
+                        END
+                    ELSE 'no_interest'
+                END as interestStatus"""
+                if user_id
+                else "'no_interest' as interestStatus",
+                "0 as readThroughRate",
+                "0 as readThroughIndicator",
+                "0 as cpHitIndicator",
+                "0 as totalInterestCount",
+                "0 as totalInterestIndicator",
+                "0 as interestSustainCount",
+                "0 as interestSustainIndicator",
+                "0 as interestLossCount",
+                "0 as interestLossIndicator",
+                "0 as hitIndicator",
+                "0 as recommendIndicator",
+                "0 as bookmarkIndicator",
+                "0 as averageWeeklyEpisodes",
+                "NULL as primaryReaderGroup",
+                "COALESCE(readed_count.count, 0) as readedEpisodeCount"
+                if user_id
+                else "0 as readedEpisodeCount",
+                "0 as advancePayment",
+                "0 as totalSales",
+                "p.publish_days",
+                "p.last_episode_date",
+                "COALESCE(ub.use_yn, 'N') as bookmarkYn"
+                if user_id
+                else "'N' as bookmarkYn",
+                "p.monopoly_yn",
+                "p.contract_yn",
+                "p.status_code",
+                "p.publish_regular_yn",
+                "0 as offerCount",
+                "NULL as offerId",
+                "NULL as offerDate",
+                "0 as offerAdvancePayment",
+                "NULL as settlementRatioSnippet",
+                "'review' as offerDecisionState",
+                "'not_applied' as convertToPaidState",
+                "'Y' as canApplyForPaid",
+                "5 as remainingNotificationCount",
+                "episode_stats.latest_episode_no as latestEpisodeNo",
+                "episode_stats.latest_episode_id as latestEpisodeId",
+                "episode_stats.first_episode_id as firstEpisodeId",
+                "recent_read_episode.episode_id as recentReadEpisodeId"
+                if user_id
+                else "NULL as recentReadEpisodeId",
+                "recent_read_episode.episode_no as recentReadEpisodeNo"
+                if user_id
+                else "NULL as recentReadEpisodeNo",
+            ]
+        ),
+        "joins": """
+            LEFT JOIN tb_standard_keyword pg ON pg.keyword_id = p.primary_genre_id AND pg.use_yn = 'Y' AND pg.major_genre_yn = 'Y'
+            LEFT JOIN tb_standard_keyword sg ON sg.keyword_id = p.sub_genre_id AND sg.use_yn = 'Y' AND sg.major_genre_yn = 'Y'
+            """
+        + (
+            f"""
+            INNER JOIN (
+                SELECT r1.product_id, r1.current_rank, r1.previous_rank
+                FROM tb_product_rank_area r1
+                INNER JOIN (
+                    SELECT product_id, MAX(created_date) AS max_created_date
+                    FROM tb_product_rank_area
+                    WHERE area_code = '{rank_area_code}'
+                    GROUP BY product_id
+                ) r2
+                  ON r1.product_id = r2.product_id
+                 AND r1.created_date = r2.max_created_date
+                WHERE r1.area_code = '{rank_area_code}'
+            ) pr ON pr.product_id = p.product_id
+            """
+            if rank_area_code is not None
+            else ""
+        )
+        + """
+            LEFT JOIN (
+                SELECT cf.file_group_id, cfi.file_path
+                FROM tb_common_file cf
+                JOIN tb_common_file_item cfi ON cf.file_group_id = cfi.file_group_id
+                WHERE cf.use_yn = 'Y' AND cfi.use_yn = 'Y' AND cf.group_type = 'cover'
+            ) cf ON cf.file_group_id = p.thumbnail_file_id
+            LEFT JOIN (
+                SELECT
+                    product_id,
+                    COUNT(*) as episode_count,
+                    SUM(episode_text_count) as episode_text_count,
+                    SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) as open_episode_count,
+                    MAX(CASE WHEN open_yn = 'Y' THEN episode_no ELSE NULL END) as latest_episode_no,
+                    CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN open_yn = 'Y' THEN episode_id END ORDER BY episode_no DESC, episode_id DESC SEPARATOR ','), ',', 1) AS UNSIGNED) as latest_episode_id,
+                    CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN open_yn = 'Y' THEN episode_id END ORDER BY episode_no ASC, episode_id ASC SEPARATOR ','), ',', 1) AS UNSIGNED) as first_episode_id
+                FROM tb_product_episode
+                WHERE use_yn = 'Y'
+                GROUP BY product_id
+            ) episode_stats ON episode_stats.product_id = p.product_id
+            LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+            LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND p69.status = 'ing' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
+            """
+        + (
+            f"""
+            LEFT JOIN (
+                SELECT product_id, COUNT(*) as ticket_count
+                FROM tb_user_ticketbook
+                WHERE user_id = {user_id} AND ticket_type = 'free' AND use_yn = 'Y'
+                  AND (use_expired_date IS NULL OR use_expired_date > NOW())
+                GROUP BY product_id
+            ) ut ON ut.product_id = p.product_id
+            LEFT JOIN (
+                SELECT product_id, user_id, COUNT(DISTINCT episode_id) as count, MAX(updated_date) as updated_date
+                FROM tb_user_product_usage
+                WHERE user_id = {user_id} AND use_yn = 'Y'
+                GROUP BY product_id, user_id
+            ) readed_count ON readed_count.product_id = p.product_id
+            LEFT JOIN tb_user_bookmark ub ON ub.product_id = p.product_id AND ub.user_id = {user_id}
+            LEFT JOIN (
+                SELECT DISTINCT
+                    upb.product_id,
+                    FIRST_VALUE(pe.episode_id) OVER (PARTITION BY upb.product_id ORDER BY upb.updated_date DESC, upb.episode_id DESC) as episode_id,
+                    FIRST_VALUE(pe.episode_no) OVER (PARTITION BY upb.product_id ORDER BY upb.updated_date DESC, upb.episode_id DESC) as episode_no
+                FROM tb_user_productbook upb
+                INNER JOIN tb_product_episode pe ON upb.episode_id = pe.episode_id
+                WHERE upb.user_id = {user_id} AND upb.use_yn = 'Y'
+            ) recent_read_episode ON recent_read_episode.product_id = p.product_id
+            """
+            if user_id
+            else ""
+        ),
+    }
+
+
 TOP_MANAGED_AREA_ALIASES = {
     "freeTop": "freeSerialTop",
     "paidTop": "paidSerialTop",
@@ -790,6 +976,36 @@ def convert_product_data(row: RowMapping):
     return data
 
 
+def convert_home_card_product_data(row: RowMapping):
+    defaults = {
+        "readThroughRate": 0,
+        "readThroughIndicator": 0,
+        "cpHitIndicator": 0,
+        "totalInterestCount": 0,
+        "totalInterestIndicator": 0,
+        "interestSustainCount": 0,
+        "interestSustainIndicator": 0,
+        "interestLossCount": 0,
+        "interestLossIndicator": 0,
+        "hitIndicator": 0,
+        "recommendIndicator": 0,
+        "bookmarkIndicator": 0,
+        "readedEpisodeCount": 0,
+        "advancePayment": 0,
+        "totalSales": 0,
+        "offerCount": 0,
+        "offerId": None,
+        "offerDate": None,
+        "offerAdvancePayment": 0,
+        "settlementRatioSnippet": None,
+        "offerDecisionState": "review",
+        "convertToPaidState": "not_applied",
+        "canApplyForNormal": "N",
+        "canApplyForPaid": "Y",
+    }
+    return convert_product_data({**defaults, **dict(row)})
+
+
 async def get_user_id(kc_user_id: str, db: AsyncSession):
     query = text("select user_id from tb_user where kc_user_id = :kc_user_id")
     result = await db.execute(query, {"kc_user_id": kc_user_id})
@@ -854,8 +1070,8 @@ async def products_of_managed(
         order_by = "pr.current_rank ASC"
         rank_area_code = rule["rank_area_code"]
 
-    query_parts = get_select_fields_and_joins_for_product(
-        user_id=user_id, join_rank=join_rank, rank_area_code=rank_area_code
+    query_parts = get_select_fields_and_joins_for_home_card_product(
+        user_id=user_id, rank_area_code=rank_area_code
     )
     query = text(f"""
         SELECT {query_parts["select_fields"]}, "{resolved_area}" as area
@@ -869,7 +1085,7 @@ async def products_of_managed(
     rows = result.mappings().all()
 
     res_body = dict()
-    res_data = [convert_product_data(row) for row in rows]
+    res_data = [convert_home_card_product_data(row) for row in rows]
 
     # 鍮꾧났媛??묓뭹 ?꾪꽣留????쒖쐞 ?ы븷??(freeTop, paidTop??寃쎌슦)
     if join_rank or rank_area_code is not None:
@@ -2066,8 +2282,8 @@ async def suggest_managed_products(
                             await get_user_id(kc_user_id, db) if kc_user_id else None
                         )
 
-                        query_parts = get_select_fields_and_joins_for_product(
-                            user_id=user_id, join_rank=False
+                        query_parts = get_select_fields_and_joins_for_home_card_product(
+                            user_id=user_id
                         )
                         adult_filter = (
                             "AND p.ratings_code = 'all'" if adult_yn == "N" else ""
@@ -2080,7 +2296,7 @@ async def suggest_managed_products(
                         """)
                         result = await db.execute(query, {})
                         rows = result.mappings().all()
-                        products = [convert_product_data(row) for row in rows]
+                        products = [convert_home_card_product_data(row) for row in rows]
 
                     suggested_results.append(
                         {
@@ -4176,9 +4392,7 @@ async def products_in_publisher_promotion(
     """
     user_id = await get_user_id(kc_user_id, db)
 
-    query_parts = get_select_fields_and_joins_for_product(
-        user_id=user_id, join_rank=False
-    )
+    query_parts = get_select_fields_and_joins_for_home_card_product(user_id=user_id)
     adult_filter = "AND p.ratings_code = 'all'" if adult_yn == "N" else ""
     query = text(f"""
         SELECT {query_parts["select_fields"]}
@@ -4205,7 +4419,7 @@ async def products_in_publisher_promotion(
     )
 
     res_body = dict()
-    res_body["data"] = [convert_product_data(row) for row in rows]
+    res_body["data"] = [convert_home_card_product_data(row) for row in rows]
     res_body["title"] = section_title
 
     return res_body
@@ -4219,9 +4433,7 @@ async def products_in_latest_update(
     """
     user_id = await get_user_id(kc_user_id, db)
 
-    query_parts = get_select_fields_and_joins_for_product(
-        user_id=user_id, join_rank=False
-    )
+    query_parts = get_select_fields_and_joins_for_home_card_product(user_id=user_id)
     adult_filter = "AND p.ratings_code = 'all'" if adult_yn == "N" else ""
     query = text(f"""
         SELECT {query_parts["select_fields"]}
@@ -4234,7 +4446,7 @@ async def products_in_latest_update(
     rows = result.mappings().all()
 
     res_body = dict()
-    res_body["data"] = [convert_product_data(row) for row in rows]
+    res_body["data"] = [convert_home_card_product_data(row) for row in rows]
 
     return res_body
 
@@ -4244,9 +4456,7 @@ async def products_in_main_rule_slots(
 ):
     user_id = await get_user_id(kc_user_id, db) if kc_user_id else None
 
-    query_parts = get_select_fields_and_joins_for_product(
-        user_id=user_id, join_rank=False
-    )
+    query_parts = get_select_fields_and_joins_for_home_card_product(user_id=user_id)
     adult_filter = (
         "AND p.ratings_code = 'all'"
         if adult_yn == "N"
@@ -4296,7 +4506,7 @@ async def products_in_main_rule_slots(
                 "suggestName": slot["suggest_name"],
                 "suggestTarget": "free",
                 "suggestTitle": slot["suggest_title"],
-                "products": [convert_product_data(row) for row in rows],
+                "products": [convert_home_card_product_data(row) for row in rows],
             }
         )
 
@@ -4709,8 +4919,8 @@ async def get_direct_recommend_products(
                 else f"p.product_id = {product_ids[0]} AND p.open_yn = 'Y' {adult_filter}"
             )
 
-            query_parts = get_select_fields_and_joins_for_product(
-                user_id=user_id, join_rank=False
+            query_parts = get_select_fields_and_joins_for_home_card_product(
+                user_id=user_id
             )
 
             products_query = text(f"""
@@ -4730,7 +4940,9 @@ async def get_direct_recommend_products(
                     "recommendId": recommend_row["id"],
                     "title": recommend_row["name"],
                     "order": recommend_row["order"],
-                    "productList": [convert_product_data(row) for row in product_rows],
+                    "productList": [
+                        convert_home_card_product_data(row) for row in product_rows
+                    ],
                 }
             )
 
