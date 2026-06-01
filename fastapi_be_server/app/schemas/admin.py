@@ -28,6 +28,14 @@ class PutBadgeReqBody(AdminBase):
     )
 
 
+class PostApplyPaidConversionReqBody(AdminBase):
+    paid_episode_no: int = Field(
+        examples=[25],
+        description="운영자가 대신 설정하는 유료 시작 회차",
+        gt=0,
+    )
+
+
 class PutProductReviewReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
     product_id: Optional[int] = Field(

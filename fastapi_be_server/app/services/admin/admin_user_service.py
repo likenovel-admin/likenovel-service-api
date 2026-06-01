@@ -959,6 +959,116 @@ async def deny_apply_rank_up(apply_id: int, db: AsyncSession):
     return {"result": True}
 
 
+async def apply_paid_conversion_by_admin(
+    apply_id: int,
+    req_body: admin_schema.PostApplyPaidConversionReqBody,
+    admin_user_id: int,
+    db: AsyncSession,
+):
+    query = text("""
+                 SELECT
+                     ppa.id,
+                     ppa.product_id,
+                     ppa.status_code,
+                     p.product_type,
+                     p.price_type,
+                     p.paid_open_date,
+                     p.paid_episode_no,
+                     COALESCE(ep.episode_count, 0) AS episode_count
+                   FROM tb_product_paid_apply ppa
+                   INNER JOIN tb_product p
+                      ON p.product_id = ppa.product_id
+                   LEFT JOIN (
+                       SELECT product_id, COUNT(*) AS episode_count
+                         FROM tb_product_episode
+                        WHERE use_yn = 'Y'
+                        GROUP BY product_id
+                   ) ep
+                      ON ep.product_id = p.product_id
+                  WHERE ppa.id = :apply_id
+                    AND ppa.use_yn = 'Y'
+                  LIMIT 1
+                  FOR UPDATE
+                 """)
+    result = await db.execute(query, {"apply_id": apply_id})
+    row = result.mappings().one_or_none()
+    check_exists_or_404(
+        [row] if row else [], ErrorMessages.PROMOTION_UPGRADE_INFO_NOT_FOUND
+    )
+
+    if row["status_code"] != "accepted":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="승인된 유료전환 신청만 적용할 수 있습니다.",
+        )
+    if row["price_type"] != "free":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="이미 유료 적용된 작품입니다.",
+        )
+    if row["product_type"] != "normal":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="일반연재 작품만 유료전환 적용이 가능합니다.",
+        )
+    if row["paid_episode_no"] is not None or row["paid_open_date"] is not None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="이미 유료전환 설정이 적용된 작품입니다.",
+        )
+
+    product_id = row["product_id"]
+    paid_episode_no = req_body.paid_episode_no
+    max_paid_episode_no = int(row["episode_count"] or 0) + 1
+    if paid_episode_no > max_paid_episode_no:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="유료 시작 회차는 현재 회차수의 다음 회차까지만 설정할 수 있습니다.",
+        )
+
+    query = text("""
+                 UPDATE tb_product p
+                    SET p.paid_open_date = NOW(),
+                        p.paid_episode_no = :paid_episode_no,
+                        p.updated_id = :updated_id,
+                        p.updated_date = NOW()
+                  WHERE p.product_id = :product_id
+                    AND p.price_type = 'free'
+                    AND p.product_type = 'normal'
+                    AND p.paid_open_date IS NULL
+                    AND p.paid_episode_no IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                          FROM tb_product_paid_apply ppa
+                         WHERE ppa.id = :apply_id
+                           AND ppa.product_id = p.product_id
+                           AND ppa.use_yn = 'Y'
+                           AND ppa.status_code = 'accepted'
+                    )
+                 """)
+    update_result = await db.execute(
+        query,
+        {
+            "apply_id": apply_id,
+            "product_id": product_id,
+            "paid_episode_no": paid_episode_no,
+            "updated_id": admin_user_id,
+        },
+    )
+    if update_result.rowcount != 1:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="유료전환 적용 대상 작품을 확인할 수 없습니다.",
+        )
+
+    return {
+        "data": {
+            "productId": product_id,
+            "paidEpisodeNo": paid_episode_no,
+        }
+    }
+
+
 @handle_exceptions
 async def put_auth_identity_password_reset(
     req_body: auth_schema.IdentityPasswordResetReqBody, user_id: int, db: AsyncSession
