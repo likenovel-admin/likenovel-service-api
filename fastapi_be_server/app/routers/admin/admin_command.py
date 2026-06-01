@@ -315,6 +315,35 @@ async def deny_apply_rank_up(
     return await admin_user_service.deny_apply_rank_up(id, db)
 
 
+@router.post(
+    "/apply-rank-up/{id}/apply-paid",
+    tags=["CMS - 승급 신청"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def apply_paid_conversion_by_admin(
+    req_body: admin_schema.PostApplyPaidConversionReqBody,
+    id: int = Path(..., description="유료전환 신청 번호"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    유료전환 승인 후 작가가 직접 설정하지 못한 경우 운영자가 대신 적용
+    """
+    try:
+        current_user = await check_user(
+            kc_user_id=user.get("sub"), db=db, role="admin"
+        )
+    except Exception as e:
+        raise e
+
+    return await admin_user_service.apply_paid_conversion_by_admin(
+        id,
+        req_body,
+        current_user["user_id"],
+        db,
+    )
+
+
 @router.put(
     "/reviews/{id}", tags=["CMS - 리뷰"], dependencies=[Depends(analysis_logger)]
 )
