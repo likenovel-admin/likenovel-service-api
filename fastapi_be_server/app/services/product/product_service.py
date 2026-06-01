@@ -298,7 +298,7 @@ def get_select_fields_and_joins_for_product(
                 "p.count_recommend",
                 "p.count_bookmark",
                 "COALESCE(ep_count.episode_count, 0) as hasEpisodeCount",
-                "CASE WHEN p.price_type = 'free' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(ep_count.episode_count, 0) >= 5 AND COALESCE(ep_count.episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
+                "CASE WHEN p.price_type = 'free' AND p.open_yn = 'Y' AND COALESCE(p.blind_yn, 'N') = 'N' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(ep_count.episode_count, 0) >= 5 AND COALESCE(ep_count.episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
                 "COALESCE(ep_count.open_episode_count, 0) as totalOpenEpisodeCount",
                 "wff.status as waitingForFreeStatus",
                 "p69.status as sixNinePathStatus",
@@ -3471,6 +3471,7 @@ async def put_products_product_id(
                     if blind_yn_in_request
                     else current_blind_yn
                 )
+                next_open_yn = "N" if requested_blind_yn == "Y" else req_body.open_yn
                 if current_user_role != "admin":
                     if blind_yn_in_request and requested_blind_yn != current_blind_yn:
                         raise CustomResponseException(
@@ -3771,7 +3772,7 @@ async def put_products_product_id(
                             "ratings_code": "adult"
                             if req_body.adult_yn == "Y"
                             else "all",
-                            "open_yn": "N" if requested_blind_yn == "Y" else req_body.open_yn,
+                            "open_yn": next_open_yn,
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": next_contract_yn,
@@ -3845,7 +3846,7 @@ async def put_products_product_id(
                             "ratings_code": "adult"
                             if req_body.adult_yn == "Y"
                             else "all",
-                            "open_yn": "N" if requested_blind_yn == "Y" else req_body.open_yn,
+                            "open_yn": next_open_yn,
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": next_contract_yn,
@@ -3866,6 +3867,13 @@ async def put_products_product_id(
                             status_code=status.HTTP_403_FORBIDDEN,
                             message=ErrorMessages.FORBIDDEN,
                         )
+
+                if current_open_yn == "N" and next_open_yn == "Y":
+                    await promote_product_to_normal_if_eligible(
+                        product_id=product_id_to_int,
+                        user_id=user_id,
+                        db=db,
+                    )
 
                 if "websochat_enabled_yn" in fields_set:
                     await _sync_websochat_context_enabled_state(
@@ -3973,6 +3981,59 @@ async def put_products_product_id(
     return
 
 
+async def promote_product_to_normal_if_eligible(
+    product_id: int, user_id: int, db: AsyncSession
+):
+    query = text("""
+        UPDATE tb_product p
+           SET p.product_type = 'normal',
+               p.apply_date = COALESCE(p.apply_date, NOW()),
+               p.updated_id = :user_id,
+               p.updated_date = NOW()
+         WHERE p.product_id = :product_id
+           AND p.user_id = :user_id
+           AND p.price_type = 'free'
+           AND p.open_yn = 'Y'
+           AND COALESCE(p.blind_yn, 'N') = 'N'
+           AND COALESCE(p.product_type, 'free') = 'free'
+           AND EXISTS (
+               SELECT 1
+                 FROM tb_product_episode e
+                WHERE e.product_id = p.product_id
+                  AND e.use_yn = 'Y'
+                GROUP BY e.product_id
+               HAVING COUNT(*) >= 5
+                  AND COALESCE(SUM(e.episode_text_count), 0) >= 20000
+           )
+    """)
+    result = await db.execute(query, {"product_id": product_id, "user_id": user_id})
+
+    if result.rowcount != 1:
+        return {"promoted": False}
+
+    notification_query = text("""
+        INSERT INTO tb_user_notification_item
+            (user_id, noti_type, title, content, read_yn, created_id, created_date)
+        SELECT
+            p.user_id,
+            'system',
+            CONCAT('[', p.title, '] 일반연재로 자동승급되었습니다.'),
+            '일반연재 조건을 충족했습니다.',
+            'N',
+            :user_id,
+            NOW()
+          FROM tb_product p
+         WHERE p.product_id = :product_id
+           AND p.user_id = :user_id
+    """)
+    await db.execute(
+        notification_query,
+        {"product_id": product_id, "user_id": user_id},
+    )
+
+    return {"promoted": True}
+
+
 async def put_products_product_id_conversion(
     category: str, product_id: str, kc_user_id: str, db: AsyncSession
 ):
@@ -3990,36 +4051,12 @@ async def put_products_product_id_conversion(
                     )
 
                 if category == "rank-up":
-                    # ?쇰컲?밴툒: 湲?먯닔 20,000???댁긽, 5?뚯감 ?댁긽 (議곌굔留?留뚯”?섎㈃ 諛붾줈 ?밴툒 泥섎━)
-                    query = text("""
-                                     select a.product_id
-                                       from tb_product a
-                                      inner join tb_product_episode b on a.product_id = b.product_id
-                                        and b.use_yn = 'Y'
-                                      where a.user_id = :user_id
-                                        and a.product_id = :product_id
-                                      group by a.product_id
-                                      having count(1) >= 5 and sum(b.episode_text_count) >= 20000
-                                     """)
-
-                    result = await db.execute(
-                        query, {"user_id": user_id, "product_id": product_id_to_int}
+                    promotion_result = await promote_product_to_normal_if_eligible(
+                        product_id=product_id_to_int,
+                        user_id=user_id,
+                        db=db,
                     )
-                    db_rst = result.mappings().all()
-
-                    if db_rst:
-                        query = text("""
-                                         update tb_product
-                                            set product_type = 'normal'
-                                              , updated_id = :user_id
-                                              , apply_date = now()
-                                          where product_id = :product_id
-                                         """)
-
-                        await db.execute(
-                            query, {"user_id": user_id, "product_id": product_id_to_int}
-                        )
-
+                    if promotion_result.get("promoted"):
                         res_data = {
                             "productId": product_id_to_int,
                             "productType": "normal",

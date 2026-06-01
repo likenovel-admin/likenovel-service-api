@@ -1987,6 +1987,16 @@ async def post_episodes_products_product_id(
 
                     await db.execute(query, {"product_id": product_id_to_int})
 
+                auto_normal_promotion = (
+                    await product_service.promote_product_to_normal_if_eligible(
+                        product_id=product_id_to_int,
+                        user_id=user_id,
+                        db=db,
+                    )
+                )
+                if auto_normal_promotion.get("promoted"):
+                    res_data["autoNormalPromotion"] = auto_normal_promotion
+
                 # TODO: cleaned garbled comment (encoding issue).
                 query = text(f"""
                                  select {get_file_path_sub_query("b.thumbnail_file_id", "cover_image_path", "cover")}
@@ -4248,6 +4258,12 @@ async def put_episodes_episode_id(
                                          """)
 
                         await db.execute(query, {"product_id": product_id})
+
+                await product_service.promote_product_to_normal_if_eligible(
+                    product_id=product_id,
+                    user_id=user_id,
+                    db=db,
+                )
 
                 # TODO: cleaned garbled comment (encoding issue).
                 query = text(f"""
