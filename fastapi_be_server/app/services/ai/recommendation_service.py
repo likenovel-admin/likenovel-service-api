@@ -369,6 +369,12 @@ def _parse_json_from_llm(raw: str) -> dict:
 # ──────────────────────────────────────────────────────────
 
 MAX_PRODUCT_BRIEF_IDS = 60
+PUBLIC_OPEN_EPISODE_COUNT_SQL = (
+    "(SELECT COUNT(*) FROM tb_product_episode e "
+    "WHERE e.product_id = p.product_id "
+    "AND e.use_yn = 'Y' "
+    "AND e.open_yn = 'Y')"
+)
 
 
 def _normalize_product_brief_ids(product_ids: list[int]) -> list[int]:
@@ -2960,14 +2966,13 @@ def _format_serial_cycle(writing_per_week: float, status_code: str = "") -> str 
 
 
 async def _get_product_brief(product_id: int, db: AsyncSession) -> dict | None:
-    query = text("""
+    query = text(f"""
         SELECT
             p.product_id, p.title, p.status_code,
             p.price_type, p.monopoly_yn, p.contract_yn, p.last_episode_date,
             IF(p.last_episode_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR), 'Y', 'N') AS new_release_yn,
             p.author_name AS author_nickname,
-            (SELECT COUNT(*) FROM tb_product_episode e
-             WHERE e.product_id = p.product_id AND e.use_yn = 'Y') AS episode_count,
+            {PUBLIC_OPEN_EPISODE_COUNT_SQL} AS episode_count,
             COALESCE(pti.writing_count_per_week, 0) AS writing_count_per_week,
             IF(wff.product_id IS NOT NULL, 'Y', 'N') AS waiting_for_free_yn,
             IF(p69.product_id IS NOT NULL, 'Y', 'N') AS six_nine_path_yn,
@@ -3016,8 +3021,7 @@ async def _get_product_briefs(product_ids: list[int], db: AsyncSession) -> dict[
         SELECT
             p.product_id, p.title, p.status_code,
             p.author_name AS author_nickname,
-            (SELECT COUNT(*) FROM tb_product_episode e
-             WHERE e.product_id = p.product_id AND e.use_yn = 'Y') AS episode_count,
+            {PUBLIC_OPEN_EPISODE_COUNT_SQL} AS episode_count,
             IF(p.thumbnail_file_id IS NULL, NULL,
                (SELECT CASE
                          WHEN w.file_path IS NULL OR w.file_path = '' THEN NULL
@@ -3101,7 +3105,7 @@ async def _save_ai_slot_serving_logs(user_id: int, sections: list[dict], db: Asy
 # ──────────────────────────────────────────────────────────
 
 PRESET_FILTERS = {
-    "stacked-chapters": "(SELECT COUNT(*) FROM tb_product_episode e WHERE e.product_id = p.product_id AND e.use_yn = 'Y') >= 50",
+    "stacked-chapters": f"{PUBLIC_OPEN_EPISODE_COUNT_SQL} >= 50",
     "good-schedule": "pti.writing_count_per_week >= 3",
     "completed": "1=1",
     "trending": "1=1",  # count_hit 기준 정렬로 처리
@@ -3982,8 +3986,7 @@ async def _preset_recommend(
             p.monopoly_yn, p.contract_yn, p.last_episode_date, p.count_hit,
             IF(p.last_episode_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR), 'Y', 'N') AS new_release_yn,
             p.author_name AS author_nickname,
-            (SELECT COUNT(*) FROM tb_product_episode e
-             WHERE e.product_id = p.product_id AND e.use_yn = 'Y') AS episode_count,
+            {PUBLIC_OPEN_EPISODE_COUNT_SQL} AS episode_count,
             IF(p.thumbnail_file_id IS NULL, NULL,
                (SELECT CASE
                          WHEN w.file_path IS NULL OR w.file_path = '' THEN NULL
