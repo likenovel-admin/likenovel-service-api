@@ -14,6 +14,9 @@ class AiProductBriefsUnitTest(unittest.IsolatedAsyncioTestCase):
         def all(self):
             return self._rows
 
+        def one_or_none(self):
+            return self._rows[0] if self._rows else None
+
     async def test_get_product_ai_briefs_returns_public_successful_metadata(self):
         class FakeDb:
             def __init__(self):
@@ -93,3 +96,67 @@ class AiProductBriefsUnitTest(unittest.IsolatedAsyncioTestCase):
         await recommendation_service.get_product_ai_briefs([1158], db, adult_yn="Y")
 
         self.assertIn("p.ratings_code = 'all'", db.executed_sql)
+
+    async def test_product_brief_episode_count_uses_public_open_episodes(self):
+        class FakeDb:
+            def __init__(self):
+                self.executed_sql = ""
+
+            async def execute(self, query, params):
+                self.executed_sql = str(query)
+                return AiProductBriefsUnitTest._FakeMappingsResult(
+                    [
+                        {
+                            "product_id": 1156,
+                            "title": "잿빛 길을 걷다",
+                            "status_code": "serialize",
+                            "price_type": "free",
+                            "monopoly_yn": "N",
+                            "contract_yn": "N",
+                            "last_episode_date": None,
+                            "new_release_yn": "N",
+                            "author_nickname": "Avalanche",
+                            "episode_count": 29,
+                            "writing_count_per_week": 7,
+                            "waiting_for_free_yn": "N",
+                            "six_nine_path_yn": "N",
+                            "cover_url": None,
+                        }
+                    ]
+                )
+
+        db = FakeDb()
+
+        brief = await recommendation_service._get_product_brief(1156, db)
+
+        self.assertEqual(brief["episode_count"], 29)
+        self.assertIn("e.use_yn = 'Y'", db.executed_sql)
+        self.assertIn("e.open_yn = 'Y'", db.executed_sql)
+
+    async def test_product_briefs_episode_count_uses_public_open_episodes(self):
+        class FakeDb:
+            def __init__(self):
+                self.executed_sql = ""
+
+            async def execute(self, query, params):
+                self.executed_sql = str(query)
+                return AiProductBriefsUnitTest._FakeMappingsResult(
+                    [
+                        {
+                            "product_id": 1156,
+                            "title": "잿빛 길을 걷다",
+                            "status_code": "serialize",
+                            "author_nickname": "Avalanche",
+                            "episode_count": 29,
+                            "cover_url": None,
+                        }
+                    ]
+                )
+
+        db = FakeDb()
+
+        briefs = await recommendation_service._get_product_briefs([1156], db)
+
+        self.assertEqual(briefs[1156]["episode_count"], 29)
+        self.assertIn("e.use_yn = 'Y'", db.executed_sql)
+        self.assertIn("e.open_yn = 'Y'", db.executed_sql)
