@@ -18,6 +18,9 @@ class _FakeMappings:
     def all(self):
         return self._rows
 
+    def one_or_none(self):
+        return self._rows[0] if self._rows else None
+
 
 class _FakeResult:
     def __init__(self, rows):
@@ -339,6 +342,34 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             include_episode_previews=True,
             episode_numbers=[1, 2],
         )
+
+    async def test_get_product_info_counts_public_open_episodes_only(self):
+        db = AsyncMock()
+        db.execute.return_value = _FakeResult(
+            [
+                {
+                    "product_id": 2020,
+                    "title": "잿빛 길을 걷다",
+                    "author_name": "Avalanche",
+                    "episode_total": 29,
+                    "free_episode_count": 25,
+                    "paid_episode_count": 4,
+                }
+            ]
+        )
+
+        product_info = await ai_chat_service.get_product_info(
+            db,
+            product_id=2020,
+            adult_yn="N",
+        )
+
+        query_text = str(db.execute.await_args.args[0])
+        self.assertEqual(product_info["episode_total"], 29)
+        self.assertEqual(product_info["free_episode_count"], 25)
+        self.assertEqual(product_info["paid_episode_count"], 4)
+        self.assertEqual(query_text.count("AND e.open_yn = 'Y'"), 3)
+        self.assertIn("AS episode_total", query_text)
 
     async def test_public_episode_previews_strip_html_and_limit_requested_episodes(self):
         db = AsyncMock()
