@@ -1216,10 +1216,7 @@ async def get_similar_products(
             IF(p.last_episode_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR), 'Y', 'N') AS new_release_yn,
             p.count_hit,
             {get_file_path_sub_query("p.thumbnail_file_id", "cover_path", "cover")},
-            (SELECT COUNT(*)
-             FROM tb_product_episode e
-             WHERE e.product_id = p.product_id
-               AND e.use_yn = 'Y') AS episode_count,
+            {recommendation_service.PUBLIC_OPEN_EPISODE_COUNT_SQL} AS episode_count,
             COALESCE(pti.reading_rate, 0) AS reading_rate,
             COALESCE(pti.writing_count_per_week, 0) AS writing_count_per_week,
             {recommendation_service.LATEST_ENGAGEMENT_SELECT_SQL},
@@ -1695,19 +1692,18 @@ async def get_product_info(
             p.count_recommend,
             p.ratings_code,
             {get_file_path_sub_query("p.thumbnail_file_id", "cover_path", "cover")},
-            (SELECT COUNT(*)
-             FROM tb_product_episode e
-             WHERE e.product_id = p.product_id
-               AND e.use_yn = 'Y') AS episode_total,
+            {recommendation_service.PUBLIC_OPEN_EPISODE_COUNT_SQL} AS episode_total,
             (SELECT COUNT(*)
              FROM tb_product_episode e
              WHERE e.product_id = p.product_id
                AND e.use_yn = 'Y'
+               AND e.open_yn = 'Y'
                AND e.price_type = 'free') AS free_episode_count,
             (SELECT COUNT(*)
              FROM tb_product_episode e
              WHERE e.product_id = p.product_id
                AND e.use_yn = 'Y'
+               AND e.open_yn = 'Y'
                AND e.price_type = 'paid') AS paid_episode_count,
             COALESCE(pti.reading_rate, 0) AS reading_rate,
             COALESCE(pti.writing_count_per_week, 0) AS writing_count_per_week,
