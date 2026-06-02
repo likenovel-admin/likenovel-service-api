@@ -9,6 +9,7 @@ import app.services.product.product_service as product_service
 import app.services.product.product_comment_service as product_comment_service
 import app.services.product.product_bookmark_service as product_bookmark_service
 import app.services.product.product_notice_service as product_notice_service
+import app.services.product.main_single_slot_service as main_single_slot_service
 from app.const import LOGGER_TYPE, ErrorMessages
 from app.config.log_config import service_error_logger
 
@@ -108,6 +109,24 @@ async def products_of_managed(
         limit=limit,
         adult_yn=adult_yn,
         kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.get(
+    "/main-single-slots",
+    tags=["작품"],
+    responses={200: {"description": "메인 단일구좌 목록 조회"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def products_of_main_single_slots(
+    adult_yn: str = Query("N", description="성인등급 작품 포함 여부 (Y/N)"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await main_single_slot_service.get_public_main_single_slots(
+        kc_user_id=user.get("sub"),
+        adult_yn=adult_yn,
         db=db,
     )
 

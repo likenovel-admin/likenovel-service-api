@@ -299,6 +299,102 @@ class PutDirectRecommendReqBody(AdminBase):
     )
 
 
+class PostMainSingleSlotReqBody(AdminBase):
+    slot_key: str = Field(
+        examples=["before_paid_top"],
+        description="단일구좌 위치 키",
+        min_length=1,
+        max_length=50,
+    )
+    slot_name: str = Field(
+        examples=["유료 Top 이전"],
+        description="단일구좌 이름",
+        min_length=1,
+        max_length=100,
+    )
+    slot_order: int = Field(examples=[1], description="노출 순서", gt=0)
+    product_id: int = Field(examples=[1117], description="작품 ID", gt=0)
+    summary_text: str = Field(
+        examples=["돌아온 지구는 많은 것이 달라져 있었다."],
+        description="구좌 소개글",
+        min_length=1,
+        max_length=500,
+    )
+    publish_start_at: datetime = Field(
+        examples=["2026-06-02T12:00:00+09:00"], description="예약 공개 시작"
+    )
+    publish_end_at: Optional[datetime] = Field(
+        default=None,
+        examples=["2026-06-03T12:00:00+09:00"],
+        description="예약 공개 종료(NULL이면 항시)",
+    )
+
+    @field_validator("publish_end_at", mode="before")
+    def validate_publish_end_at(cls, value):
+        if value in (None, "", "Invalid Date"):
+            return None
+        return value
+
+    @field_validator("slot_key", "slot_name", "summary_text")
+    def validate_non_empty_text(cls, value):
+        normalized = value.strip()
+        if normalized == "":
+            raise ValueError("빈 값은 허용되지 않습니다.")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_publish_period(self):
+        publish_start_at = self.publish_start_at
+        publish_end_at = self.publish_end_at
+        if publish_start_at is None or publish_end_at is None:
+            return self
+        if publish_start_at.tzinfo is not None and publish_end_at.tzinfo is None:
+            publish_end_at = publish_end_at.replace(tzinfo=publish_start_at.tzinfo)
+        elif publish_start_at.tzinfo is None and publish_end_at.tzinfo is not None:
+            publish_start_at = publish_start_at.replace(tzinfo=publish_end_at.tzinfo)
+        if publish_start_at >= publish_end_at:
+            raise ValueError("노출 종료일은 시작일보다 뒤여야 합니다.")
+        return self
+
+
+class PostMainSingleSlotPublishNowReqBody(AdminBase):
+    slot_key: str = Field(
+        examples=["before_paid_top"],
+        description="단일구좌 위치 키",
+        min_length=1,
+        max_length=50,
+    )
+    slot_name: str = Field(
+        examples=["유료 Top 이전"],
+        description="단일구좌 이름",
+        min_length=1,
+        max_length=100,
+    )
+    slot_order: int = Field(examples=[1], description="노출 순서", gt=0)
+    product_id: int = Field(examples=[1117], description="작품 ID", gt=0)
+    summary_text: str = Field(
+        examples=["돌아온 지구는 많은 것이 달라져 있었다."],
+        description="구좌 소개글",
+        min_length=1,
+        max_length=500,
+    )
+
+    @field_validator("slot_key", "slot_name", "summary_text")
+    def validate_non_empty_text(cls, value):
+        normalized = value.strip()
+        if normalized == "":
+            raise ValueError("빈 값은 허용되지 않습니다.")
+        return normalized
+
+
+class PutMainSingleSlotReqBody(PostMainSingleSlotReqBody):
+    publish_start_at: Optional[datetime] = Field(
+        default=None,
+        examples=["2026-06-02T12:00:00+09:00"],
+        description="예약 공개 시작(NULL이면 기존 시작일 유지)",
+    )
+
+
 class PostAppliedPromotionReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
     product_id: int = Field(examples=[1], description="작품 id")
