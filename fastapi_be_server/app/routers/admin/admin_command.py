@@ -26,6 +26,7 @@ from app.services.admin import (
     admin_system_service,
     admin_user_service,
 )
+import app.services.product.main_single_slot_service as main_single_slot_service
 import app.services.auth.auth_service as auth_service
 from app.utils.common import check_user
 
@@ -749,6 +750,80 @@ async def post_direct_recommend(
         raise e
 
     return await admin_recommend_service.post_direct_recommend(req_body, db=db)
+
+
+@router.post(
+    "/main-single-slots",
+    tags=["CMS - 단일구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_main_single_slot(
+    req_body: admin_schema.PostMainSingleSlotReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_single_slot_service.post_admin_main_single_slot(
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.post(
+    "/main-single-slots/publish-now",
+    tags=["CMS - 단일구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_main_single_slot_publish_now(
+    req_body: admin_schema.PostMainSingleSlotPublishNowReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_single_slot_service.publish_admin_main_single_slot_now(
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.put(
+    "/main-single-slots/{single_slot_id}",
+    tags=["CMS - 단일구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_main_single_slot(
+    req_body: admin_schema.PutMainSingleSlotReqBody,
+    single_slot_id: int = Path(..., description="단일구좌 큐 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_single_slot_service.update_admin_main_single_slot(
+        single_slot_id=single_slot_id,
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.delete(
+    "/main-single-slots/{single_slot_id}",
+    tags=["CMS - 단일구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def delete_main_single_slot(
+    single_slot_id: int = Path(..., description="단일구좌 큐 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_single_slot_service.cancel_admin_main_single_slot(
+        single_slot_id=single_slot_id,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
 
 
 @router.put(

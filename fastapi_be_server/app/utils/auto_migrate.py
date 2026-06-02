@@ -116,6 +116,11 @@ def _split_sql_statements(sql_content: str) -> list[str]:
     return statements
 
 
+def _migration_sort_key(path: Path):
+    parts = re.split(r"(\d+)", path.name)
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
 async def run_auto_migrations():
     """pending SQL 마이그레이션을 자동 실행."""
     if not INIT_DIR.exists():
@@ -158,7 +163,7 @@ async def _execute_pending(conn):
     applied = {row[0] for row in result.fetchall()}
 
     # 3) 대상 SQL 파일 수집 (번호순)
-    sql_files = sorted(INIT_DIR.glob("*.sql"))
+    sql_files = sorted(INIT_DIR.glob("*.sql"), key=_migration_sort_key)
     pending = [
         f for f in sql_files
         if f.name not in applied
