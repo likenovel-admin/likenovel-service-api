@@ -36,6 +36,28 @@ def test_ai_reader_phase1_migration_parses_all_create_table_statements():
     assert all(statement.startswith("CREATE TABLE IF NOT EXISTS") for statement in statements)
 
 
+def test_migration_sort_key_orders_three_digit_migrations_after_two_digit_migrations():
+    from app.utils.auto_migrate import _migration_sort_key
+
+    files = [
+        Path("100-add-site-page-view-product-entry-attribution.sql"),
+        Path("10-create_product_review_like_comment_tables.sql"),
+        Path("99a-add-site-page-view-marketing-attribution.sql"),
+        Path("103-create-main-single-slot.sql"),
+        Path("102-backfill-auto-normal-promotion.sql"),
+    ]
+
+    ordered = [path.name for path in sorted(files, key=_migration_sort_key)]
+
+    assert ordered == [
+        "10-create_product_review_like_comment_tables.sql",
+        "99a-add-site-page-view-marketing-attribution.sql",
+        "100-add-site-page-view-product-entry-attribution.sql",
+        "102-backfill-auto-normal-promotion.sql",
+        "103-create-main-single-slot.sql",
+    ]
+
+
 class ProductHitSnapshotMigrationTest(unittest.TestCase):
     def test_product_hit_snapshot_migration_parses_all_create_table_statements(self):
         from app.utils.auto_migrate import _parse_statements
