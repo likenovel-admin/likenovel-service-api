@@ -803,6 +803,13 @@ TOP_MANAGED_AREA_RULES = {
     },
 }
 
+TOP50_RANK_HISTORY_AREA_CODES = {
+    "freeSerialTop",
+    "paidSerialTop",
+    "paidEndTop",
+    "paidStandaloneTop",
+}
+
 
 def convert_product_data(row: RowMapping):
     data = dict(row)
@@ -4419,6 +4426,117 @@ async def get_product_rank(db: AsyncSession):
     result = await db.execute(query, {})
     rows = result.mappings().all()
     return build_list_response(rows)
+
+
+async def get_product_rank_history(
+    area_code: str,
+    basis_date: str | None,
+    limit: int,
+    db: AsyncSession,
+):
+    """
+    Top50 영역별 시간대 랭킹 스냅샷 조회.
+    """
+    resolved_area = TOP_MANAGED_AREA_ALIASES.get(area_code, area_code)
+    if resolved_area not in TOP50_RANK_HISTORY_AREA_CODES:
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_INFO,
+        )
+
+    safe_limit = min(max(int(limit or 50), 1), 50)
+    try:
+        target_date = (
+            datetime.strptime(basis_date, "%Y-%m-%d").date()
+            if basis_date
+            else datetime.now().date()
+        )
+    except ValueError:
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_INFO,
+        )
+
+    start_at = datetime.combine(target_date, datetime.min.time())
+    end_at = start_at + timedelta(days=1)
+
+    query = text("""
+        SELECT basis_at AS basisAt
+             , area_code AS areaCode
+             , rank_no AS rankNo
+             , product_id AS productId
+             , title_snapshot AS title
+             , author_name_snapshot AS authorNickname
+             , count_hit AS countHit
+             , recent_24h_count_hit AS recent24hCountHit
+             , previous_rank AS previousRank
+          FROM tb_product_rank_snapshot_hourly
+         WHERE area_code = :area_code
+           AND basis_at >= :start_at
+           AND basis_at < :end_at
+           AND rank_no <= :limit
+         ORDER BY basis_at ASC, rank_no ASC
+    """)
+    result = await db.execute(
+        query,
+        {
+            "area_code": resolved_area,
+            "start_at": start_at,
+            "end_at": end_at,
+            "limit": safe_limit,
+        },
+    )
+    rows = result.mappings().all()
+
+    basis_times = []
+    basis_key_set = set()
+    cells_by_rank_and_basis = defaultdict(dict)
+    for row in rows:
+        basis_at = row["basisAt"]
+        basis_key = basis_at.strftime("%Y-%m-%d %H:%M:%S")
+        if basis_key not in basis_key_set:
+            basis_key_set.add(basis_key)
+            basis_times.append(
+                {
+                    "basisAt": basis_key,
+                    "label": basis_at.strftime("%H시"),
+                }
+            )
+
+        cells_by_rank_and_basis[row["rankNo"]][basis_key] = {
+            "basisAt": basis_key,
+            "productId": row["productId"],
+            "title": row["title"],
+            "authorNickname": row["authorNickname"],
+            "previousRank": row["previousRank"],
+            "countHit": row["countHit"],
+            "recent24hCountHit": row["recent24hCountHit"],
+        }
+
+    history_rows = []
+    if basis_times:
+        for rank_no in range(1, safe_limit + 1):
+            history_rows.append(
+                {
+                    "rankNo": rank_no,
+                    "cells": [
+                        cells_by_rank_and_basis.get(rank_no, {}).get(
+                            basis_time["basisAt"]
+                        )
+                        for basis_time in basis_times
+                    ],
+                }
+            )
+
+    return {
+        "data": {
+            "areaCode": resolved_area,
+            "date": target_date.isoformat(),
+            "limit": safe_limit,
+            "basisTimes": basis_times,
+            "rows": history_rows,
+        }
+    }
 
 
 async def products_in_publisher_promotion(

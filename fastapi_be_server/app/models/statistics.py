@@ -492,3 +492,67 @@ class ProductEpisodeHitSnapshotHourly(Base):
         nullable=False,
         server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
     )
+
+
+class ProductRankSnapshotHourly(Base):
+    __tablename__ = "tb_product_rank_snapshot_hourly"
+    __table_args__ = (
+        Index(
+            "idx_product_rank_snapshot_product_basis",
+            "product_id",
+            "basis_at",
+        ),
+        Index(
+            "idx_product_rank_snapshot_area_basis",
+            "area_code",
+            "basis_at",
+        ),
+    )
+
+    basis_at: Mapped[datetime] = mapped_column(
+        DateTime, primary_key=True, nullable=False, comment="Top50 기준시각(HH:30)"
+    )
+    area_code: Mapped[str] = mapped_column(
+        String(100), primary_key=True, nullable=False, comment="랭킹 영역 코드"
+    )
+    rank_no: Mapped[int] = mapped_column(
+        Integer, primary_key=True, nullable=False, comment="기준시점 순위"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="작품 ID"
+    )
+    title_snapshot: Mapped[str] = mapped_column(
+        String(100), nullable=False, comment="기준시점 작품명"
+    )
+    author_name_snapshot: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, comment="기준시점 작가명"
+    )
+    count_hit: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True),
+        nullable=False,
+        server_default="0",
+        comment="기준시점 작품 누적 조회수",
+    )
+    recent_24h_count_hit: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True),
+        nullable=False,
+        server_default="0",
+        comment="기준시점 최근 24시간 조회수",
+    )
+    previous_rank: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="기준시점 이전 순위"
+    )
+    created_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
