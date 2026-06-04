@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from datetime import datetime, date, timedelta
 from typing import Any
@@ -20,6 +21,108 @@ from app.services.ai import reader_agent_session_service
 
 
 IMMEDIATE_SCHEDULE_MIN_WINDOW_MINUTES = 30
+AI_READER_PROFILE_NICKNAME_POOL = (
+    "Stock고수가될꺼야",
+    "장투에는낭만이있다",
+    "제대로물렸음",
+    "마이너스15고인물",
+    "flyingDogKR",
+    "BabyGoat전사",
+    "RghtHipSnpr",
+    "뽑이89",
+    "vhrhvhrh고수",
+    "gkituxgwkfjvgg",
+    "퍼플헤이즈",
+    "우주방어",
+    "꾸깽이",
+    "삼십육살아기",
+    "리쿠리쿠",
+    "나마비루",
+    "Sepia",
+    "Nikon떼배",
+    "urgent16",
+    "cheap465",
+    "tycoon10",
+    "pill6058",
+    "listen05",
+    "height82",
+    "kvwajz0r",
+    "kimi0000",
+    "거시팀김씨1",
+    "오늘도무사히",
+    "moSSol",
+    "뭉몽이",
+    "반반이",
+    "주식하는오타쿠",
+    "돌리다",
+    "독도수면팩",
+    "뚀로롱",
+    "아주작은개미",
+    "사막여우",
+    "이몸등장",
+    "순카기",
+    "삿포로특파원",
+    "조선닌자핫토리",
+    "BURGERKING",
+    "오릭스히타치",
+    "팔중앵",
+    "터키튀르키예",
+    "오백원짜리CD",
+    "넨도",
+    "기미김",
+    "쿠라쿠라",
+    "최하영",
+    "NEWS",
+    "자산운용사",
+    "Mistea",
+    "또사때야",
+    "milan",
+    "진성고수",
+    "복뚝분",
+    "헤놀로지",
+    "TlM",
+    "시이나링고잼",
+    "까모투자증권",
+    "asodmd",
+    "서비",
+    "프로켈",
+    "이응미음",
+    "알타리무배추",
+    "OTC",
+    "투어독러버",
+    "Stock고인물",
+    "마이너스15전사",
+    "flyingDog고수",
+    "BabyGoat고인물",
+    "RghtHipSnprKR",
+    "vhrhvhrh러너",
+    "gkituxgwkfjvgg고수",
+    "퍼플헤이즈고인물",
+    "우주방어1337",
+    "꾸깽이워리어",
+    "삼십육살아기고인물",
+    "Nikon떼배고수",
+    "tycoon10고인물",
+    "pill6058전사",
+    "오늘도손절",
+    "내일은반등",
+    "차트보는밤",
+    "물린개미",
+    "초단타금지",
+    "배당먹는사람",
+    "종가매수러",
+    "시장은몰라",
+    "빨간봉기원",
+    "파란봉친구",
+    "계좌방어중",
+    "본전만찾자",
+    "소액장투러",
+    "호가창멍때림",
+    "커피값수익",
+    "새벽독서러",
+    "회차수집가",
+    "다음화못참음",
+)
 
 
 def _now_in_kst() -> datetime:
@@ -275,6 +378,106 @@ def _generate_ai_reader_account_password() -> str:
     return f"Ai{secrets.randbelow(10_000_000_000):010d}!"
 
 
+def _combined_ai_reader_profile_nickname_pool(
+    profile_nickname_pool: list[str] | None = None,
+) -> list[str]:
+    combined: list[str] = []
+    seen: set[str] = set()
+    for nickname in [
+        *AI_READER_PROFILE_NICKNAME_POOL,
+        *(profile_nickname_pool or []),
+    ]:
+        normalized_nickname = str(nickname).strip()
+        if not normalized_nickname or normalized_nickname in seen:
+            continue
+        combined.append(normalized_nickname)
+        seen.add(normalized_nickname)
+    return combined
+
+
+def _ai_reader_profile_nickname_start_index(email: str, *, pool_size: int) -> int:
+    if pool_size <= 0:
+        return 0
+    local_part = email.split("@", 1)[0]
+    match = re.search(r"(\d+)$", local_part)
+    if not match:
+        return 0
+    suffix_number = int(match.group(1))
+    return max(0, suffix_number - 1) % pool_size
+
+
+def _ai_reader_profile_nickname_candidates(
+    email: str,
+    *,
+    profile_nickname_pool: list[str] | None = None,
+) -> list[str]:
+    nickname_pool = _combined_ai_reader_profile_nickname_pool(profile_nickname_pool)
+    start_index = _ai_reader_profile_nickname_start_index(
+        email,
+        pool_size=len(nickname_pool),
+    )
+    return [
+        *nickname_pool[start_index:],
+        *nickname_pool[:start_index],
+    ]
+
+
+async def _assign_ai_reader_profile_nickname(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    email: str,
+    profile_nickname_pool: list[str] | None = None,
+) -> str:
+    for nickname in _ai_reader_profile_nickname_candidates(
+        email,
+        profile_nickname_pool=profile_nickname_pool,
+    ):
+        duplicate_result = await db.execute(
+            text("""
+                select profile_id
+                  from tb_user_profile
+                 where nickname = :nickname
+                   and user_id <> :user_id
+                 limit 1
+            """),
+            {
+                "nickname": nickname,
+                "user_id": user_id,
+            },
+        )
+        if duplicate_result.mappings().one_or_none():
+            continue
+
+        update_result = await db.execute(
+            text("""
+                update tb_user_profile
+                   set nickname = :nickname,
+                       updated_id = :updated_id,
+                       updated_date = current_timestamp
+                 where user_id = :user_id
+                   and default_yn = 'Y'
+                   and role_type = 'user'
+            """),
+            {
+                "nickname": nickname,
+                "updated_id": settings.DB_DML_DEFAULT_ID,
+                "user_id": user_id,
+            },
+        )
+        if int(getattr(update_result, "rowcount", 0) or 0) <= 0:
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message=f"AI reader profile was not found for user: {user_id}",
+            )
+        return nickname
+
+    raise CustomResponseException(
+        status_code=status.HTTP_409_CONFLICT,
+        message="AI reader nickname pool is exhausted.",
+    )
+
+
 async def _fetch_bootstrap_candidate_users(
     db: AsyncSession,
     *,
@@ -318,6 +521,7 @@ async def _create_ai_reader_dedicated_user(
     db: AsyncSession,
     *,
     email: str,
+    profile_nickname_pool: list[str] | None = None,
 ) -> int:
     await auth_service.post_auth_signup(
         req_body=auth_schema.SignupReqBody(
@@ -347,6 +551,12 @@ async def _create_ai_reader_dedicated_user(
             message=f"AI reader account was created but user row was not found: {email}",
         )
     user_id = int(user_row["user_id"])
+    await _assign_ai_reader_profile_nickname(
+        db,
+        user_id=user_id,
+        email=email,
+        profile_nickname_pool=profile_nickname_pool,
+    )
     await db.execute(
         text("""
             delete from tb_user_social
@@ -365,6 +575,7 @@ async def _provision_missing_ai_reader_users(
     email_prefix: str,
     missing_count: int,
     allowed_domains: list[str],
+    profile_nickname_pool: list[str] | None = None,
 ) -> int:
     if missing_count <= 0:
         return 0
@@ -401,7 +612,11 @@ async def _provision_missing_ai_reader_users(
         if len(email) > 100 or email.lower() in used_emails:
             continue
         try:
-            await _create_ai_reader_dedicated_user(db, email=email)
+            await _create_ai_reader_dedicated_user(
+                db,
+                email=email,
+                profile_nickname_pool=profile_nickname_pool,
+            )
         except CustomResponseException as exc:
             if exc.status_code == status.HTTP_409_CONFLICT:
                 used_emails.add(email.lower())
@@ -430,6 +645,7 @@ def build_ai_reader_bootstrap_dry_run_token(
     immediate_schedule_start_at: str | None = None,
     age_group_ratios: dict[str, int] | None = None,
     gender_ratios: dict[str, int] | None = None,
+    profile_nickname_pool: list[str] | None = None,
     user_fingerprints: list[dict[str, Any]] | None = None,
 ) -> str:
     normalized_active_hours = active_hours or list(admin_schema.DEFAULT_AI_READER_ACTIVE_HOURS)
@@ -440,7 +656,7 @@ def build_ai_reader_bootstrap_dry_run_token(
         admin_schema.DEFAULT_AI_READER_GENDER_RATIOS
     )
     payload = {
-        "v": 3,
+        "v": 4,
         "email_prefix": email_prefix,
         "agent_count": agent_count,
         "schedule_date": schedule_date,
@@ -457,6 +673,7 @@ def build_ai_reader_bootstrap_dry_run_token(
         "immediate_schedule_start_at": immediate_schedule_start_at,
         "age_group_ratios": normalized_age_group_ratios,
         "gender_ratios": normalized_gender_ratios,
+        "profile_nickname_pool": profile_nickname_pool or [],
         "user_fingerprints": sorted(
             user_fingerprints or [],
             key=lambda item: (str(item.get("agent_key")), int(item.get("user_id") or 0)),
@@ -499,6 +716,7 @@ def _expected_bootstrap_dry_run_token(
         immediate_schedule_start_at=immediate_schedule_start_at,
         age_group_ratios=req_body.age_group_ratios,
         gender_ratios=req_body.gender_ratios,
+        profile_nickname_pool=req_body.profile_nickname_pool,
         user_fingerprints=user_fingerprints,
     )
 
@@ -2198,6 +2416,7 @@ async def bootstrap_ai_reader_agents(
             email_prefix=req_body.email_prefix,
             missing_count=req_body.agent_count - len(users),
             allowed_domains=allowed_domains,
+            profile_nickname_pool=req_body.profile_nickname_pool,
         )
         users = await _fetch_bootstrap_candidate_users(
             db,
