@@ -4603,6 +4603,13 @@ async def put_episodes_episode_id_open(
                                 logger.error(
                                     f"Failed to send episode update notification: {e}"
                                 )
+
+                        if episode_open_yn == "Y":
+                            await product_service.promote_product_to_normal_if_eligible(
+                                product_id=product_id,
+                                user_id=user_id,
+                                db=db,
+                            )
         except CustomResponseException:
             raise
         except OperationalError:

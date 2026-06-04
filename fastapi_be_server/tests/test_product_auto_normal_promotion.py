@@ -22,9 +22,9 @@ def test_auto_normal_promotion_helper_uses_existing_rank_up_conditions():
     assert "COALESCE(p.blind_yn, 'N') = 'N'" in helper
     assert "COALESCE(p.product_type, 'free') = 'free'" in helper
     assert "e.use_yn = 'Y'" in helper
+    assert "e.open_yn = 'Y'" in helper
     assert "COUNT(*) >= 5" in helper
     assert "COALESCE(SUM(e.episode_text_count), 0) >= 20000" in helper
-    assert "e.open_yn = 'Y'" not in helper
 
 
 def test_auto_normal_promotion_updates_once_and_notifies_author_with_title():
@@ -39,12 +39,25 @@ def test_auto_normal_promotion_updates_once_and_notifies_author_with_title():
     assert "CONCAT('[', p.title, '] 일반연재로 자동승급되었습니다.')" in helper
 
 
-def test_auto_normal_promotion_runs_after_plain_episode_writes_only():
-    source = _read(ROOT / "app/services/product/episode_service.py")
+def _function_block(source: str, name: str) -> str:
+    block = source.split(f"async def {name}", 1)[1]
+    return block.split("\nasync def ", 1)[0]
 
-    assert "product_service.promote_product_to_normal_if_eligible" in source
-    assert source.count("promote_product_to_normal_if_eligible") == 2
-    assert "post_episodes_products_product_id_epub" in source
+
+def test_auto_normal_promotion_runs_after_episode_public_state_changes():
+    source = _read(ROOT / "app/services/product/episode_service.py")
+    call = "await product_service.promote_product_to_normal_if_eligible("
+
+    single_create = _function_block(source, "post_episodes_products_product_id(")
+    assert call in single_create
+
+    update_episode = _function_block(source, "put_episodes_episode_id(")
+    assert call in update_episode
+
+    toggle_open = _function_block(source, "put_episodes_episode_id_open(")
+    public_toggle_block = toggle_open.split('if episode_open_yn == "Y":', 1)[1]
+    public_toggle_block = public_toggle_block.split("\n        except ", 1)[0]
+    assert call in public_toggle_block
 
 
 def test_auto_normal_promotion_runs_when_existing_product_becomes_public():
@@ -63,18 +76,26 @@ def test_auto_normal_promotion_runs_when_existing_product_becomes_public():
     assert "await promote_product_to_normal_if_eligible(" in update_product
 
 
-def test_can_apply_normal_state_uses_same_public_not_blind_gate():
+def test_can_apply_normal_state_uses_same_public_episode_gate():
     source = _read(ROOT / "app/services/product/product_service.py")
 
-    state_expr = source.split("END as canApplyForNormal", 1)[0]
-    state_expr = state_expr.rsplit("CASE WHEN", 1)[1]
+    state_exprs = []
+    remaining = source
+    while "END as canApplyForNormal" in remaining:
+        state_expr = remaining.split("END as canApplyForNormal", 1)[0]
+        state_exprs.append(state_expr.rsplit("CASE WHEN", 1)[1])
+        remaining = remaining.split("END as canApplyForNormal", 1)[1]
 
-    assert "p.price_type = 'free'" in state_expr
-    assert "p.open_yn = 'Y'" in state_expr
-    assert "COALESCE(p.blind_yn, 'N') = 'N'" in state_expr
-    assert "COALESCE(p.product_type, 'free') = 'free'" in state_expr
-    assert "COALESCE(ep_count.episode_count, 0) >= 5" in state_expr
-    assert "COALESCE(ep_count.episode_text_count, 0) >= 20000" in state_expr
+    assert len(state_exprs) == 2
+    for state_expr in state_exprs:
+        assert "p.price_type = 'free'" in state_expr
+        assert "p.open_yn = 'Y'" in state_expr
+        assert "COALESCE(p.blind_yn, 'N') = 'N'" in state_expr
+        assert "COALESCE(p.product_type, 'free') = 'free'" in state_expr
+        assert "open_episode_count, 0) >= 5" in state_expr
+        assert "open_episode_text_count, 0) >= 20000" in state_expr
+        assert ".episode_count, 0) >= 5" not in state_expr
+        assert ".episode_text_count, 0) >= 20000" not in state_expr
 
 
 def test_backfill_migration_promotes_existing_eligible_free_products_once():
@@ -89,11 +110,11 @@ def test_backfill_migration_promotes_existing_eligible_free_products_once():
     assert "COALESCE(p.blind_yn, 'N') = 'N'" in migration
     assert "COALESCE(p.product_type, 'free') = 'free'" in migration
     assert "e.use_yn = 'Y'" in migration
+    assert "e.open_yn = 'Y'" in migration
     assert "COUNT(*) >= 5" in migration
     assert "COALESCE(SUM(e.episode_text_count), 0) >= 20000" in migration
     assert "INSERT INTO tb_user_notification_item" in migration
     assert "일반연재로 자동승급되었습니다" in migration
-    assert "e.open_yn = 'Y'" not in migration
 
 
 def test_backfill_migration_can_recover_after_product_update_before_notification():
