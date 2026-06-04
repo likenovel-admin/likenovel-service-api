@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -3707,6 +3708,63 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(token_a, token_b)
 
+    def test_bootstrap_dry_run_token_includes_profile_nickname_pool(self):
+        from app.services.admin import admin_ai_reader_service
+
+        common_kwargs = {
+            "email_prefix": "prod-ai-reader-",
+            "agent_count": 20,
+            "schedule_date": "2026-05-14",
+            "allow_partial": False,
+            "agent_index_offset": 0,
+            "daily_llm_budget": 8,
+        }
+
+        token_a = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            profile_nickname_pool=["추가닉네임1"],
+        )
+        token_b = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            profile_nickname_pool=["추가닉네임2"],
+        )
+
+        self.assertNotEqual(token_a, token_b)
+
+    def test_bootstrap_request_normalizes_profile_nickname_pool(self):
+        from app.schemas.admin import PostAiReaderBootstrapReqBody
+
+        req_body = PostAiReaderBootstrapReqBody(
+            email_prefix="prod-ai-reader-",
+            agent_count=10,
+            schedule_date="2026-05-14",
+            apply=False,
+            profile_nickname_pool=[" 추가개미1 ", "추가개미1", "", "NightReader77"],
+        )
+
+        self.assertEqual(req_body.profile_nickname_pool, ["추가개미1", "NightReader77"])
+
+    def test_bootstrap_request_rejects_invalid_profile_nickname_pool(self):
+        from app.schemas.admin import PostAiReaderBootstrapReqBody
+
+        with self.assertRaises(ValueError):
+            PostAiReaderBootstrapReqBody(
+                email_prefix="prod-ai-reader-",
+                agent_count=10,
+                schedule_date="2026-05-14",
+                apply=False,
+                profile_nickname_pool=["주갤러고수"],
+            )
+
+        with self.assertRaises(ValueError):
+            PostAiReaderBootstrapReqBody(
+                email_prefix="prod-ai-reader-",
+                agent_count=10,
+                schedule_date="2026-05-14",
+                apply=False,
+                profile_nickname_pool=["분홍빤쓰147!"],
+            )
+
     def test_ai_reader_schedule_duration_defaults_to_30_days(self):
         from app.schemas.admin import (
             PostAiReaderBootstrapReqBody,
@@ -4761,6 +4819,8 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         db = AsyncMock()
         db.execute.side_effect = [
             self._FakeMappingsResult([{"user_id": 123}]),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult([], rowcount=1),
             self._FakeMappingsResult([], rowcount=1),
         ]
 
@@ -4778,11 +4838,77 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         signup_body = signup.await_args.kwargs["req_body"]
         self.assertEqual(signup_body.email, "prod-ai-reader-0001@ai-reader.likenovel.net")
         self.assertEqual(signup_body.ad_info_agree_yn, "N")
-        delete_sql = str(db.execute.call_args_list[1].args[0]).lower()
+        update_sql = str(db.execute.call_args_list[2].args[0]).lower()
+        self.assertIn("update tb_user_profile", update_sql)
+        self.assertEqual(
+            db.execute.call_args_list[2].args[1]["nickname"],
+            admin_ai_reader_service.AI_READER_PROFILE_NICKNAME_POOL[0],
+        )
+        delete_sql = str(db.execute.call_args_list[3].args[0]).lower()
         self.assertIn("delete from tb_user_social", delete_sql)
         self.assertIn("sns_type = 'likenovel'", delete_sql)
         self.assertEqual(user_id, 123)
         db.commit.assert_awaited_once()
+
+    def test_ai_reader_profile_nickname_pool_has_100_valid_entries(self):
+        from app.services.admin import admin_ai_reader_service
+
+        nickname_pool = admin_ai_reader_service.AI_READER_PROFILE_NICKNAME_POOL
+        joined_pool = "\n".join(nickname_pool)
+
+        self.assertEqual(len(nickname_pool), 100)
+        self.assertEqual(len(set(nickname_pool)), 100)
+        for nickname in nickname_pool:
+            self.assertIsNotNone(re.match(r"^[가-힣a-zA-Z0-9]+$", nickname))
+        self.assertNotIn("디씨", joined_pool)
+        self.assertNotIn("주갤", joined_pool)
+        self.assertNotIn("주갤러", joined_pool)
+
+    async def test_assign_ai_reader_profile_nickname_skips_duplicate_pool_entry(self):
+        from app.services.admin import admin_ai_reader_service
+
+        db = AsyncMock()
+        db.execute.side_effect = [
+            self._FakeMappingsResult([{"profile_id": 99}]),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult([], rowcount=1),
+        ]
+
+        nickname = await admin_ai_reader_service._assign_ai_reader_profile_nickname(
+            db,
+            user_id=123,
+            email="prod-ai-reader-0001@ai-reader.likenovel.net",
+        )
+
+        self.assertEqual(
+            nickname,
+            admin_ai_reader_service.AI_READER_PROFILE_NICKNAME_POOL[1],
+        )
+        update_sql = str(db.execute.call_args_list[2].args[0]).lower()
+        self.assertIn("update tb_user_profile", update_sql)
+        self.assertEqual(
+            db.execute.call_args_list[2].args[1]["nickname"],
+            admin_ai_reader_service.AI_READER_PROFILE_NICKNAME_POOL[1],
+        )
+
+    async def test_assign_ai_reader_profile_nickname_uses_extra_pool_after_default_pool(self):
+        from app.services.admin import admin_ai_reader_service
+
+        db = AsyncMock()
+        db.execute.side_effect = [
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult([], rowcount=1),
+        ]
+
+        nickname = await admin_ai_reader_service._assign_ai_reader_profile_nickname(
+            db,
+            user_id=123,
+            email="prod-ai-reader-0101@ai-reader.likenovel.net",
+            profile_nickname_pool=["새후보1", "새후보2"],
+        )
+
+        self.assertEqual(nickname, "새후보1")
+        self.assertEqual(db.execute.call_args_list[1].args[1]["nickname"], "새후보1")
 
     async def test_provision_missing_ai_reader_users_generates_dedicated_domain_emails(self):
         from app.services.admin import admin_ai_reader_service
@@ -4810,6 +4936,28 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
                 "prod-ai-reader-0002@ai-reader.likenovel.net",
             ],
         )
+
+    async def test_provision_missing_ai_reader_users_passes_profile_nickname_pool(self):
+        from app.services.admin import admin_ai_reader_service
+
+        db = AsyncMock()
+        db.execute.return_value = self._FakeMappingsResult([])
+
+        with patch.object(
+            admin_ai_reader_service,
+            "_create_ai_reader_dedicated_user",
+            AsyncMock(return_value=101),
+        ) as create_user:
+            created_count = await admin_ai_reader_service._provision_missing_ai_reader_users(
+                db,
+                email_prefix="prod-ai-reader-",
+                missing_count=1,
+                allowed_domains=["ai-reader.likenovel.net"],
+                profile_nickname_pool=["새후보1"],
+            )
+
+        self.assertEqual(created_count, 1)
+        self.assertEqual(create_user.await_args.kwargs["profile_nickname_pool"], ["새후보1"])
 
     async def test_bootstrap_ai_reader_agents_rejects_like_wildcard_prefix(self):
         from app.schemas.admin import PostAiReaderBootstrapReqBody
