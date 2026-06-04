@@ -132,6 +132,28 @@ async def products_of_main_single_slots(
 
 
 @router.get(
+    "/rank-history",
+    tags=["작품"],
+    responses={200: {"description": "Top50 시간대별 랭킹 히스토리 조회"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_products_rank_history(
+    area_code: str = Query(..., alias="areaCode", description="Top50 영역 코드"),
+    basis_date: Optional[str] = Query(
+        None, alias="date", description="조회 날짜(YYYY-MM-DD)"
+    ),
+    limit: int = Query(50, ge=1, le=50, description="순위 개수(최대 50)"),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await product_service.get_product_rank_history(
+        area_code=area_code,
+        basis_date=basis_date,
+        limit=limit,
+        db=db,
+    )
+
+
+@router.get(
     "/can-create-normal",
     tags=["작품"],
     responses={200: {"description": "일반연재 자격 확인"}},

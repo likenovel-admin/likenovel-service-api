@@ -1033,6 +1033,8 @@ DEFAULT_AI_READER_GENDER_RATIOS = {
 }
 ALLOWED_AI_READER_AGE_GROUPS = set(DEFAULT_AI_READER_AGE_GROUP_RATIOS)
 ALLOWED_AI_READER_GENDERS = {"M", "F", "X"}
+AI_READER_NICKNAME_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9]+$")
+FORBIDDEN_AI_READER_NICKNAME_TERMS = ("디씨", "주갤", "주갤러")
 
 
 class AiReaderTimeBlock(AdminBase):
@@ -1156,6 +1158,11 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         default_factory=lambda: dict(DEFAULT_AI_READER_GENDER_RATIOS),
         description="성별 비율. 허용값: M,F,X. 합계 100",
     )
+    profile_nickname_pool: Optional[List[str]] = Field(
+        default=None,
+        max_length=1000,
+        description="AI 독자 자동생성 계정에 추가로 사용할 프로필 닉네임 후보",
+    )
     dry_run_token: Optional[str] = Field(
         default=None,
         max_length=128,
@@ -1170,6 +1177,24 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         if "%" in prefix or "_" in prefix:
             raise ValueError("email_prefix must not contain SQL LIKE wildcards")
         return prefix
+
+    @field_validator("profile_nickname_pool")
+    def validate_profile_nickname_pool(cls, value):
+        if value is None:
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_nickname in value:
+            nickname = str(raw_nickname).strip()
+            if not nickname or nickname in seen:
+                continue
+            if not AI_READER_NICKNAME_PATTERN.match(nickname):
+                raise ValueError("profile_nickname_pool must use Korean, English, or numbers only")
+            if any(term in nickname for term in FORBIDDEN_AI_READER_NICKNAME_TERMS):
+                raise ValueError("profile_nickname_pool contains a forbidden term")
+            normalized.append(nickname)
+            seen.add(nickname)
+        return normalized or None
 
     @field_validator("active_hours")
     def validate_active_hours(cls, value):

@@ -351,6 +351,51 @@ select 'paidMainTop'
   ) t
 ;
 
+DELETE FROM tb_product_rank_snapshot_hourly
+ WHERE basis_at = @recent_24h_basis_at
+   AND area_code IN ('freeSerialTop', 'paidSerialTop', 'paidEndTop', 'paidStandaloneTop');
+
+INSERT INTO tb_product_rank_snapshot_hourly (
+    basis_at,
+    area_code,
+    rank_no,
+    product_id,
+    title_snapshot,
+    author_name_snapshot,
+    count_hit,
+    recent_24h_count_hit,
+    previous_rank,
+    created_id,
+    updated_id
+)
+SELECT @recent_24h_basis_at
+     , r.area_code
+     , r.current_rank
+     , r.product_id
+     , p.title
+     , p.author_name
+     , GREATEST(COALESCE(b.count_hit, p.count_hit, 0), 0)
+     , GREATEST(COALESCE(b.recent_24h_count_hit, 0), 0)
+     , r.previous_rank
+     , 0
+     , 0
+  FROM tb_product_rank_area r
+ INNER JOIN tb_product p
+    ON p.product_id = r.product_id
+  LEFT JOIN tmp_product_rank_basis b
+    ON b.product_id = r.product_id
+ WHERE r.current_rank <= 50
+   AND r.area_code IN ('freeSerialTop', 'paidSerialTop', 'paidEndTop', 'paidStandaloneTop')
+ON DUPLICATE KEY UPDATE
+    product_id = VALUES(product_id),
+    title_snapshot = VALUES(title_snapshot),
+    author_name_snapshot = VALUES(author_name_snapshot),
+    count_hit = VALUES(count_hit),
+    recent_24h_count_hit = VALUES(recent_24h_count_hit),
+    previous_rank = VALUES(previous_rank),
+    updated_id = 0,
+    updated_date = CURRENT_TIMESTAMP;
+
 -- 임시 테이블 삭제
 DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank;
 DROP TEMPORARY TABLE IF EXISTS tmp_previous_rank_area;
@@ -397,6 +442,9 @@ DELETE FROM tb_product_episode_hit_snapshot_hourly
 
 DELETE FROM tb_product_hit_snapshot_hourly
  WHERE basis_at < DATE_SUB(@recent_24h_basis_at, INTERVAL 7 DAY);
+
+DELETE FROM tb_product_rank_snapshot_hourly
+ WHERE basis_at < DATE_SUB(@recent_24h_basis_at, INTERVAL 365 DAY);
 
 update tb_cms_batch_job_process a
    set a.completed_yn = 'Y'
