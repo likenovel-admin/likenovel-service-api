@@ -95,6 +95,42 @@ class StoryAgentContextDeltaValidationTest(TestCase):
         self.assertTrue(args.refresh_rp)
         self.assertTrue(module.should_refresh_delta_rp(args))
 
+    def test_delta_cli_accepts_max_delta_episode_cap(self):
+        module = load_module()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "build_story_agent_context.py",
+                "--build-mode",
+                "delta",
+                "--product-id",
+                "687",
+                "--max-delta-episodes",
+                "5",
+            ],
+        ):
+            args = module.parse_args()
+
+        self.assertEqual(args.max_delta_episodes, 5)
+
+    def test_delta_candidate_filter_limits_rows_per_product_by_episode_no(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 103, "episode_no": 3},
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+            {"product_id": 687, "episode_id": 104, "episode_no": 4},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value={101, 102, 103, 104}), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()):
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=2)
+
+        self.assertEqual([row["episode_no"] for row in filtered], [1, 2])
+        self.assertEqual([row["_delta_reason"] for row in filtered], ["open_add", "open_add"])
+
     def test_delta_mode_allows_product_only_apply_for_internal_changed_row_filtering(self):
         module = load_module()
         args = SimpleNamespace(
@@ -103,6 +139,7 @@ class StoryAgentContextDeltaValidationTest(TestCase):
             product_ids=[687],
             episode_ids=None,
             episode_nos=None,
+            max_delta_episodes=0,
         )
 
         module.validate_delta_args(args)

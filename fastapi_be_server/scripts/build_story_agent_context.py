@@ -366,6 +366,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-id", type=int, action="append", dest="episode_ids", help="대상 회차 ID. 여러 번 지정 가능")
     parser.add_argument("--episode-no", type=int, action="append", dest="episode_nos", help="delta 대상 회차 번호. 여러 번 지정 가능")
     parser.add_argument("--limit", type=int, default=0, help="대상 제한 건수")
+    parser.add_argument(
+        "--max-delta-episodes",
+        type=int,
+        default=0,
+        help="delta 모드에서 작품별 이번 실행에 처리할 최대 회차 수. 0은 제한 없음.",
+    )
     parser.add_argument("--apply", action="store_true", help="실제 DB 적재 수행")
     parser.add_argument("--verbose", action="store_true", help="상세 로그 출력")
     parser.add_argument("--use-epub-fallback", action="store_true", help="episode_content가 비어 있으면 EPUB에서 임시 원문 추출")
@@ -1265,6 +1271,8 @@ def validate_delta_args(args: argparse.Namespace) -> None:
         raise ValueError("--build-mode delta 에서는 --limit를 지원하지 않습니다.")
     if not args.product_ids:
         raise ValueError("--build-mode delta 에서는 --product-id가 필수입니다.")
+    if args.max_delta_episodes < 0:
+        raise ValueError("--max-delta-episodes 는 0 이상이어야 합니다.")
 
 
 def should_refresh_delta_rp(args: argparse.Namespace) -> bool:
@@ -1330,7 +1338,11 @@ def build_sync_repair_episode_id_set(cur, *, product_id: int, product_rows: list
     return repair_episode_ids
 
 
-def filter_delta_candidate_rows(cur, rows: Iterable[dict]) -> list[dict]:
+def delta_episode_sort_key(row: dict) -> tuple[int, int]:
+    return (int(row.get("episode_no") or 0), int(row.get("episode_id") or 0))
+
+
+def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes: int = 0) -> list[dict]:
     rows_by_product: dict[int, list[dict]] = {}
     for row in rows:
         rows_by_product.setdefault(int(row["product_id"]), []).append(row)
@@ -1347,16 +1359,20 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict]) -> list[dict]:
             product_id=product_id,
             product_rows=product_rows,
         )
-        for row in product_rows:
+        product_filtered_rows: list[dict] = []
+        for row in sorted(product_rows, key=delta_episode_sort_key):
             episode_id = int(row.get("episode_id") or 0)
             if episode_id in open_add_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "open_add"
-                filtered_rows.append(next_row)
+                product_filtered_rows.append(next_row)
             elif episode_id in repair_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "sync_repair"
-                filtered_rows.append(next_row)
+                product_filtered_rows.append(next_row)
+        if max_delta_episodes > 0:
+            product_filtered_rows = product_filtered_rows[:max_delta_episodes]
+        filtered_rows.extend(product_filtered_rows)
     return filtered_rows
 
 
@@ -6301,7 +6317,11 @@ async def main() -> int:
             cur.execute(query, params)
             rows = list(cur.fetchall())
             if args.build_mode == "delta":
-                rows = filter_delta_candidate_rows(cur, rows)
+                rows = filter_delta_candidate_rows(
+                    cur,
+                    rows,
+                    max_delta_episodes=args.max_delta_episodes,
+                )
             if args.build_mode == "delta" and not args.apply:
                 plans = build_delta_scope_plans(cur, rows)
                 print_delta_scope_plans(plans)
