@@ -66,6 +66,16 @@ def _normalize_websochat_enabled_yn(value: str | None) -> str:
     return normalized
 
 
+def _normalize_ai_consent_yn(value: str | None) -> str:
+    normalized = (value or "N").upper()
+    if normalized not in ("Y", "N"):
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=ErrorMessages.INVALID_PRODUCT_INFO,
+        )
+    return normalized
+
+
 def _resolve_reenabled_websochat_context_status(
     *,
     ready_episode_count: int | None,
@@ -2856,6 +2866,8 @@ async def get_products_product_id_info(
                                     , a.paid_episode_no
                                     , a.price_type
                                     , a.product_type
+                                    , coalesce(a.ai_content_service_enabled_yn, 'N') as ai_content_service_enabled_yn
+                                    , coalesce(a.ai_external_promotion_yn, 'N') as ai_external_promotion_yn
                                     , case when coalesce((
                                         select sacp.context_status
                                           from tb_story_agent_context_product sacp
@@ -2926,6 +2938,8 @@ async def get_products_product_id_info(
                     "paidApprovedYn": db_rst[0].get("paid_approved_yn"),
                     "productType": db_rst[0].get("product_type"),
                     "websochatEnabledYn": db_rst[0].get("websochat_enabled_yn"),
+                    "aiContentServiceEnabledYn": db_rst[0].get("ai_content_service_enabled_yn"),
+                    "aiExternalPromotionYn": db_rst[0].get("ai_external_promotion_yn"),
                 }
         except CustomResponseException as e:
             logger.error(e)
@@ -3206,9 +3220,16 @@ async def post_products(
                 else:
                     product_type = None
 
+                ai_content_service_enabled_yn = _normalize_ai_consent_yn(
+                    req_body.ai_content_service_enabled_yn
+                )
+                ai_external_promotion_yn = _normalize_ai_consent_yn(
+                    req_body.ai_external_promotion_yn
+                )
+
                 query = text("""
-                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, blind_yn, monopoly_yn, contract_yn, cp_user_id, series_regular_price, single_regular_price, single_rental_price, created_id, updated_id)
-                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :blind_yn, :monopoly_yn, :contract_yn, :cp_user_id, :series_regular_price, :single_regular_price, :single_rental_price, :created_id, :updated_id
+                                 insert into tb_product (title, price_type, product_type, status_code, ratings_code, synopsis_text, user_id, author_id, author_name, illustrator_name, publish_regular_yn, publish_days, thumbnail_file_id, primary_genre_id, sub_genre_id, open_yn, blind_yn, monopoly_yn, contract_yn, ai_content_service_enabled_yn, ai_external_promotion_yn, cp_user_id, series_regular_price, single_regular_price, single_rental_price, created_id, updated_id)
+                                 select :title, :price_type, :product_type, :status_code, :ratings_code, :synopsis_text, user_id, :author_id, :author_name, :illustrator_name, :publish_regular_yn, :publish_days, :thumbnail_file_id, :primary_genre_id, :sub_genre_id, :open_yn, :blind_yn, :monopoly_yn, :contract_yn, :ai_content_service_enabled_yn, :ai_external_promotion_yn, :cp_user_id, :series_regular_price, :single_regular_price, :single_rental_price, :created_id, :updated_id
                                    from tb_user
                                   where kc_user_id = :kc_user_id
                                     and use_yn = 'Y'
@@ -3241,6 +3262,8 @@ async def post_products(
                         "blind_yn": requested_blind_yn,
                         "monopoly_yn": req_body.monopoly_yn,
                         "contract_yn": req_body.cp_contract_yn,
+                        "ai_content_service_enabled_yn": ai_content_service_enabled_yn,
+                        "ai_external_promotion_yn": ai_external_promotion_yn,
                         "cp_user_id": cp_link_info.get("user_id") if cp_link_info else None,
                         "series_regular_price": series_regular_price,
                         "single_regular_price": single_regular_price,
@@ -3429,6 +3452,8 @@ async def put_products_product_id(
                                       , monopoly_yn
                                       , contract_yn
                                       , cp_user_id
+                                      , coalesce(ai_content_service_enabled_yn, 'N') as ai_content_service_enabled_yn
+                                      , coalesce(ai_external_promotion_yn, 'N') as ai_external_promotion_yn
                                       , price_type
                                       , story_agent_setting_text
                                       , (
@@ -3456,6 +3481,8 @@ async def put_products_product_id(
                 current_monopoly_yn = (current_product.get("monopoly_yn") or "N").upper()
                 current_contract_yn = (current_product.get("contract_yn") or "N").upper()
                 current_cp_user_id = current_product.get("cp_user_id")
+                current_ai_content_service_enabled_yn = current_product.get("ai_content_service_enabled_yn")
+                current_ai_external_promotion_yn = current_product.get("ai_external_promotion_yn")
                 current_paid_apply_status = current_product.get("paid_apply_status")
                 current_price_type = current_product.get("price_type")
                 current_story_agent_setting_text = current_product.get("story_agent_setting_text")
@@ -3573,6 +3600,16 @@ async def put_products_product_id(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         message="스토리 에이전트 보조 설정은 무료 작품에서만 저장할 수 있습니다.",
                     )
+                ai_content_service_enabled_yn = _normalize_ai_consent_yn(
+                    req_body.ai_content_service_enabled_yn
+                    if "ai_content_service_enabled_yn" in fields_set
+                    else current_ai_content_service_enabled_yn
+                )
+                ai_external_promotion_yn = _normalize_ai_consent_yn(
+                    req_body.ai_external_promotion_yn
+                    if "ai_external_promotion_yn" in fields_set
+                    else current_ai_external_promotion_yn
+                )
 
                 # ?곗옱?곹깭 寃利?
                 query = text("""
@@ -3748,6 +3785,8 @@ async def put_products_product_id(
                                           , a.blind_yn = :blind_yn
                                           , a.monopoly_yn = :monopoly_yn
                                           , a.contract_yn = :contract_yn
+                                          , a.ai_content_service_enabled_yn = :ai_content_service_enabled_yn
+                                          , a.ai_external_promotion_yn = :ai_external_promotion_yn
                                           , a.cp_user_id = :cp_user_id
                                           , a.paid_open_date = :paid_open_date
                                           , a.paid_episode_no = :paid_episode_no
@@ -3784,6 +3823,8 @@ async def put_products_product_id(
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": next_contract_yn,
+                            "ai_content_service_enabled_yn": ai_content_service_enabled_yn,
+                            "ai_external_promotion_yn": ai_external_promotion_yn,
                             "cp_user_id": next_cp_user_id,
                             "paid_open_date": convert_to_kor_time(
                                 req_body.paid_setting_date
@@ -3821,6 +3862,8 @@ async def put_products_product_id(
                                           , a.blind_yn = :blind_yn
                                           , a.monopoly_yn = :monopoly_yn
                                           , a.contract_yn = :contract_yn
+                                          , a.ai_content_service_enabled_yn = :ai_content_service_enabled_yn
+                                          , a.ai_external_promotion_yn = :ai_external_promotion_yn
                                           , a.cp_user_id = :cp_user_id
                                           , a.paid_open_date = :paid_open_date
                                           , a.paid_episode_no = :paid_episode_no
@@ -3858,6 +3901,8 @@ async def put_products_product_id(
                             "blind_yn": requested_blind_yn,
                             "monopoly_yn": req_body.monopoly_yn,
                             "contract_yn": next_contract_yn,
+                            "ai_content_service_enabled_yn": ai_content_service_enabled_yn,
+                            "ai_external_promotion_yn": ai_external_promotion_yn,
                             "cp_user_id": next_cp_user_id,
                             "paid_open_date": convert_to_kor_time(
                                 req_body.paid_setting_date

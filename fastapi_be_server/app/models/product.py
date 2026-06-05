@@ -108,6 +108,18 @@ class Product(Base):
     contract_yn: Mapped[str] = mapped_column(
         String(settings.VARCHAR_YN_SIZE), server_default="N", comment="계약 여부"
     )
+    ai_content_service_enabled_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE),
+        nullable=False,
+        server_default="N",
+        comment="플랫폼 내 AI 콘텐츠 서비스 활성화 동의 여부",
+    )
+    ai_external_promotion_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE),
+        nullable=False,
+        server_default="N",
+        comment="홍보·광고 목적 AI 생성 콘텐츠 외부 채널 게재 동의 여부",
+    )
     cp_user_id: Mapped[int] = mapped_column(
         Integer, index=True, nullable=True, comment="담당 CP 사용자 ID"
     )

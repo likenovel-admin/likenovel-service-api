@@ -15,6 +15,7 @@ from app.services.admin import (
     admin_event_service,
     admin_faq_service,
     admin_notification_service,
+    admin_product_ai_consent_service,
     admin_product_evaluation_service,
     admin_promotion_service,
     admin_quest_service,
@@ -4435,6 +4436,36 @@ async def cms_product_evaluation_list(
 
     return await admin_product_evaluation_service.cms_product_evaluation_list(
         price_type=price_type,
+        search_target=search_target,
+        search_word=search_word,
+        page=page,
+        count_per_page=count_per_page,
+        db=db,
+    )
+
+
+@router.get(
+    "/product-ai-consents",
+    tags=["CMS - AI 활용 동의 현황"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_ai_consent_list(
+    search_target: str = Query("", description="검색 타겟 (product-id|product-title|nickname)"),
+    search_word: str = Query("", description="검색어"),
+    page: int = Query(1, description="페이지"),
+    count_per_page: int = Query(8, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    작품별 AI 활용 동의 현황 조회
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_product_ai_consent_service.product_ai_consent_list(
         search_target=search_target,
         search_word=search_word,
         page=page,

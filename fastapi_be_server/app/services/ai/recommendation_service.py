@@ -25,6 +25,9 @@ from app.schemas.ai_recommendation import MAX_EVENT_PAYLOAD_LENGTH
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 logger = logging.getLogger(__name__)
 MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 3
+MIN_TASTE_RECOMMENDATION_SECTIONS = 2
+MAX_TASTE_RECOMMENDATION_SECTIONS = 3
+PRODUCT_DETAIL_EXIT_MIN_ACTIVE_SECONDS_FOR_SIGNAL = 12
 MIN_RECENT_READ_POOL_FOR_PROFILE = 3
 MIN_QUALIFIED_RECENT_READ_PRODUCTS = 2
 MIN_RECENT_READ_EPISODES_PER_PRODUCT = 2
@@ -921,6 +924,17 @@ def _compute_signal_factor_score_multiplier(
     progress_ratio: float = 0.0,
     active_seconds: float = 0.0,
 ) -> float:
+    normalized_event_type = str(event_type or "").strip().lower()
+    if normalized_event_type == "product_detail_exit":
+        active = max(0.0, _safe_float(active_seconds, 0.0))
+        if active < PRODUCT_DETAIL_EXIT_MIN_ACTIVE_SECONDS_FOR_SIGNAL:
+            return 0.0
+        if active >= 45:
+            return 0.25
+        if active >= 25:
+            return 0.22
+        return 0.18
+
     if not _is_exit_episode_view(event_type, payload):
         return 1.0
 
@@ -1035,7 +1049,7 @@ def _should_skip_signal_factor_generation(
     active_seconds: float = 0.0,
 ) -> bool:
     normalized_event_type = str(event_type or "").strip().lower()
-    if normalized_event_type in {"product_detail_view", "product_detail_exit"}:
+    if normalized_event_type == "product_detail_view":
         return True
 
     multiplier = _compute_signal_factor_score_multiplier(
@@ -1844,21 +1858,24 @@ async def get_taste_recommendations(kc_user_id: str, adult_yn: str, db: AsyncSes
         for section in sections
         if _section_has_collected_category(section, axis_strengths)
     ]
+    used_recent_read_minimum_fallback = False
     if not sections:
         if has_recent_reads and not has_onboarding_selection and original_sections:
             # 온보딩을 건너뛴 유저라도 열람 신호가 있으면 최소 1개 구좌는 노출한다.
             sections = original_sections[:1]
+            used_recent_read_minimum_fallback = True
         else:
             return {"sections": [], "needs_onboarding": needs_onboarding}
 
     read_ids = _to_int_set(profile.get("read_product_ids") or []) | recent_read_ids
     taste_tags = set(profile.get("taste_tags") or [])
     result_sections: list[dict] = []
-    section_candidates = sections
-    for attempt in range(2):
-        served_product_ids: set[int] = set()
-        result_sections = []
+    served_product_ids: set[int] = set()
+
+    async def append_matching_sections(section_candidates: list[dict], max_section_count: int) -> None:
         for section in section_candidates:
+            if len(result_sections) >= max_section_count:
+                break
             dimension = section.get("dimension", "")
             excluded_ids = read_ids | served_product_ids
             slot_axes = section.get("axes") if isinstance(section.get("axes"), list) else []
@@ -1948,6 +1965,12 @@ async def get_taste_recommendations(kc_user_id: str, adult_yn: str, db: AsyncSes
                     "products": products,
                 })
 
+    section_candidates = sections
+    for attempt in range(2):
+        result_sections = []
+        served_product_ids = set()
+        await append_matching_sections(section_candidates, MAX_TASTE_RECOMMENDATION_SECTIONS)
+
         if result_sections or not use_dynamic_slots or attempt == 1:
             break
         logger.info(
@@ -1956,6 +1979,34 @@ async def get_taste_recommendations(kc_user_id: str, adult_yn: str, db: AsyncSes
             total_signal_count,
         )
         section_candidates = _resolve_recommendation_sections(profile, factor_scores)
+
+    if (
+        use_dynamic_slots
+        and not used_recent_read_minimum_fallback
+        and 0 < len(result_sections) < MIN_TASTE_RECOMMENDATION_SECTIONS
+    ):
+        dynamic_fill_candidates = _build_dynamic_fill_slot_sections(
+            result_sections,
+            axis_strengths,
+        )
+        await append_matching_sections(dynamic_fill_candidates, MIN_TASTE_RECOMMENDATION_SECTIONS)
+
+    if (
+        use_dynamic_slots
+        and not used_recent_read_minimum_fallback
+        and 0 < len(result_sections) < MIN_TASTE_RECOMMENDATION_SECTIONS
+    ):
+        existing_dimensions = {
+            str(section.get("dimension") or "")
+            for section in result_sections
+        }
+        fill_candidates = [
+            section
+            for section in _resolve_recommendation_sections(profile, factor_scores)
+            if str(section.get("dimension") or "") not in existing_dimensions
+            and _section_has_collected_category(section, axis_strengths)
+        ]
+        await append_matching_sections(fill_candidates, MIN_TASTE_RECOMMENDATION_SECTIONS)
 
     if result_sections:
         try:
@@ -2404,6 +2455,37 @@ def _section_has_collected_category(section: dict, axis_strengths: dict[str, flo
     if not mapped_axes:
         return False
     return any(axis_strengths.get(axis, 0.0) > 0 for axis in mapped_axes)
+
+
+def _build_dynamic_fill_slot_sections(
+    result_sections: list[dict],
+    axis_strengths: dict[str, float],
+) -> list[dict]:
+    used_axes: set[str] = set()
+    for section in result_sections:
+        used_axes.update(_dimension_to_axes(str(section.get("dimension") or "")))
+
+    ranked_axes = sorted(
+        [
+            axis
+            for axis in AXIS_KEYS
+            if axis_strengths.get(axis, 0.0) > 0 and axis not in used_axes
+        ],
+        key=lambda axis: axis_strengths.get(axis, 0.0),
+        reverse=True,
+    )
+
+    sections = []
+    for axis in ranked_axes:
+        short_label = AXIS_SHORT_LABEL.get(axis, axis)
+        sections.append(
+            {
+                "dimension": axis,
+                "reason": f"{short_label} 축 행동 신호 기반",
+                "axes": [axis],
+            }
+        )
+    return sections
 
 
 def _top_axis_label(axis: str, factor_scores: dict[str, dict[str, float]], profile: dict) -> str:

@@ -5,6 +5,17 @@ from app.services.ai import recommendation_service
 
 
 class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
+    class _FakeNestedTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class _FakeDb:
+        def begin_nested(self):
+            return RecommendationFeedbackLoopUnitTest._FakeNestedTransaction()
+
     class _FakeMappingsResult:
         def __init__(self, rows):
             self._rows = rows
@@ -76,6 +87,41 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.execute.await_count, 1)
         executed_sql = str(db.execute.await_args_list[0].args[0])
         self.assertIn("SET target.clicked_yn = 'Y'", executed_sql)
+
+    async def test_product_detail_exit_generates_weak_factor_after_engagement_threshold(self):
+        self.assertTrue(
+            recommendation_service._should_skip_signal_factor_generation(
+                "product_detail_view",
+                {},
+                active_seconds=60,
+            )
+        )
+        self.assertTrue(
+            recommendation_service._should_skip_signal_factor_generation(
+                "product_detail_exit",
+                {},
+                active_seconds=5,
+            )
+        )
+        self.assertFalse(
+            recommendation_service._should_skip_signal_factor_generation(
+                "product_detail_exit",
+                {},
+                active_seconds=15,
+            )
+        )
+        self.assertLess(
+            recommendation_service._compute_signal_factor_score_multiplier(
+                "product_detail_exit",
+                {},
+                active_seconds=15,
+            ),
+            recommendation_service._compute_signal_factor_score_multiplier(
+                "episode_view",
+                {},
+                active_seconds=15,
+            ),
+        )
 
     async def test_score_engagement_for_recommendation_prefers_strong_read_signals(self):
         strong = {
@@ -469,6 +515,82 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LIMIT 80", query_sql)
         self.assertNotIn("RAND()", query_sql)
         self.assertEqual(result["product"]["productId"], 888)
+
+    async def test_taste_recommendations_fill_dynamic_axis_before_legacy_section(self):
+        profile = {
+            "onboarding_picks": ["성장형"],
+            "taste_tags": ["회귀", "마법"],
+            "read_product_ids": [],
+        }
+        factor_scores = {
+            "protagonist": {"성장형": 1.0},
+            "material": {"마법": 1.0},
+            "worldview": {"현대": 1.0},
+        }
+        dynamic_sections = [
+            {
+                "dimension": "type_material",
+                "axes": ["type", "material"],
+                "reason": "동적 슬롯",
+            }
+        ]
+        legacy_sections = [
+            {"dimension": "protagonist", "title": "당신 취향의 주인공", "reason": ""},
+            {"dimension": "material", "title": "당신이 좋아할 설정", "reason": ""},
+        ]
+        brief_source = {
+            101: {"product_id": 101, "title": "동적 추천작", "cover_url": None, "author_nickname": "작가A", "episode_count": 12},
+            201: {"product_id": 201, "title": "보강 추천작", "cover_url": None, "author_nickname": "작가B", "episode_count": 15},
+            301: {"product_id": 301, "title": "동적 축 보강작", "cover_url": None, "author_nickname": "작가C", "episode_count": 18},
+        }
+
+        async def get_product_briefs(product_ids, db):
+            return {pid: brief_source[pid] for pid in product_ids if pid in brief_source}
+
+        def match_products_by_axes(all_dna, axes, profile, excluded_ids, factor_scores, limit=6):
+            if axes == ["type", "material"]:
+                return [{"product_id": 101, "reason": "동적 매칭"}]
+            if axes == ["worldview"]:
+                return [{"product_id": 301, "reason": "동적 축 보강"}]
+            return []
+
+        def match_products_by_dimension(all_dna, dimension, profile, excluded_ids, taste_tags, factor_scores, limit=6):
+            if dimension == "protagonist":
+                return [{"product_id": 201, "reason": "legacy 보강"}]
+            return []
+
+        with (
+            patch.object(recommendation_service, "_get_user_id_by_kc", AsyncMock(return_value=7)),
+            patch.object(recommendation_service, "_is_ai_onboarding_dismissed", AsyncMock(return_value=True)),
+            patch.object(recommendation_service, "get_user_taste_profile", AsyncMock(return_value=profile)),
+            patch.object(recommendation_service, "_get_recent_read_product_ids", AsyncMock(return_value=set())),
+            patch.object(
+                recommendation_service,
+                "get_all_product_ai_metadata",
+                AsyncMock(return_value=[{"product_id": 101}, {"product_id": 201}, {"product_id": 301}]),
+            ),
+            patch.object(recommendation_service, "_get_user_factor_scores", AsyncMock(return_value=factor_scores)),
+            patch.object(recommendation_service, "_get_user_total_signal_count", AsyncMock(return_value=3)),
+            patch.object(recommendation_service, "_build_dynamic_slot_sections", return_value=dynamic_sections),
+            patch.object(recommendation_service, "_resolve_recommendation_sections", return_value=legacy_sections),
+            patch.object(recommendation_service, "_match_products_by_axes", side_effect=match_products_by_axes),
+            patch.object(recommendation_service, "_match_products_by_dimension", side_effect=match_products_by_dimension),
+            patch.object(recommendation_service, "_get_product_briefs", AsyncMock(side_effect=get_product_briefs)),
+            patch.object(recommendation_service, "_save_ai_slot_serving_logs", AsyncMock()) as save_logs,
+        ):
+            result = await recommendation_service.get_taste_recommendations(
+                "kc-user",
+                "N",
+                self._FakeDb(),
+            )
+
+        self.assertEqual(
+            [section["dimension"] for section in result["sections"]],
+            ["type_material", "worldview"],
+        )
+        self.assertEqual(result["sections"][0]["products"][0]["productId"], 101)
+        self.assertEqual(result["sections"][1]["products"][0]["productId"], 301)
+        self.assertEqual(len(save_logs.await_args.args[1]), 2)
 
     async def test_preset_recommend_uses_condition_first_fallback_when_no_taste_match(self):
         db = AsyncMock()

@@ -56,6 +56,12 @@ class PostProductsReqBody(ProductsBase):
     websochat_enabled_yn: Optional[str] = Field(
         default="Y", examples=["Y"], description="웹소챗 활성화 여부"
     )
+    ai_content_service_enabled_yn: Optional[str] = Field(
+        default="N", examples=["N"], description="플랫폼 내 AI 콘텐츠 서비스 활성화 동의 여부"
+    )
+    ai_external_promotion_yn: Optional[str] = Field(
+        default="N", examples=["N"], description="홍보·광고 목적 AI 생성 콘텐츠 외부 채널 게재 동의 여부"
+    )
     series_regular_price: Optional[int] = Field(
         default=None, examples=[0], description="연재 가격"
     )
@@ -110,6 +116,12 @@ class PutProductsProductIdReqBody(ProductsBase):
     )
     websochat_enabled_yn: Optional[str] = Field(
         default=None, examples=["Y"], description="웹소챗 활성화 여부"
+    )
+    ai_content_service_enabled_yn: Optional[str] = Field(
+        default="N", examples=["N"], description="플랫폼 내 AI 콘텐츠 서비스 활성화 동의 여부"
+    )
+    ai_external_promotion_yn: Optional[str] = Field(
+        default="N", examples=["N"], description="홍보·광고 목적 AI 생성 콘텐츠 외부 채널 게재 동의 여부"
     )
     paid_setting_date: Optional[datetime] = Field(
         default=None,
