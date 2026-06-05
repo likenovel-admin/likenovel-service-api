@@ -19,6 +19,7 @@ SELECT
           COALESCE(SUM(e.episode_text_count), 0) AS episode_text_count
         FROM tb_product_episode e
        WHERE e.use_yn = 'Y'
+         AND e.open_yn = 'Y'
        GROUP BY e.product_id
       HAVING COUNT(*) >= 5
          AND COALESCE(SUM(e.episode_text_count), 0) >= 20000

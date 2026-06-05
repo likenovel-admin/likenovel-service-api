@@ -298,7 +298,7 @@ def get_select_fields_and_joins_for_product(
                 "p.count_recommend",
                 "p.count_bookmark",
                 "COALESCE(ep_count.episode_count, 0) as hasEpisodeCount",
-                "CASE WHEN p.price_type = 'free' AND p.open_yn = 'Y' AND COALESCE(p.blind_yn, 'N') = 'N' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(ep_count.episode_count, 0) >= 5 AND COALESCE(ep_count.episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
+                "CASE WHEN p.price_type = 'free' AND p.open_yn = 'Y' AND COALESCE(p.blind_yn, 'N') = 'N' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(ep_count.open_episode_count, 0) >= 5 AND COALESCE(ep_count.open_episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
                 "COALESCE(ep_count.open_episode_count, 0) as totalOpenEpisodeCount",
                 "wff.status as waitingForFreeStatus",
                 "p69.status as sixNinePathStatus",
@@ -404,7 +404,7 @@ def get_select_fields_and_joins_for_product(
                 WHERE cf.use_yn = 'Y' AND cfi.use_yn = 'Y' AND cf.group_type = 'cover'
             ) cf ON cf.file_group_id = p.thumbnail_file_id
             LEFT JOIN (
-                SELECT product_id, COUNT(*) as episode_count, SUM(episode_text_count) as episode_text_count, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) as open_episode_count
+                SELECT product_id, COUNT(*) as episode_count, SUM(episode_text_count) as episode_text_count, SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) as open_episode_count, SUM(CASE WHEN open_yn = 'Y' THEN episode_text_count ELSE 0 END) as open_episode_text_count
                 FROM tb_product_episode
                 WHERE use_yn = 'Y'
                 GROUP BY product_id
@@ -602,7 +602,7 @@ def get_select_fields_and_joins_for_home_card_product(
                 "p.count_recommend",
                 "p.count_bookmark",
                 "COALESCE(episode_stats.episode_count, 0) as hasEpisodeCount",
-                "CASE WHEN p.price_type = 'free' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(episode_stats.episode_count, 0) >= 5 AND COALESCE(episode_stats.episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
+                "CASE WHEN p.price_type = 'free' AND p.open_yn = 'Y' AND COALESCE(p.blind_yn, 'N') = 'N' AND COALESCE(p.product_type, 'free') = 'free' AND COALESCE(episode_stats.open_episode_count, 0) >= 5 AND COALESCE(episode_stats.open_episode_text_count, 0) >= 20000 THEN 'Y' ELSE 'N' END as canApplyForNormal",
                 "COALESCE(episode_stats.open_episode_count, 0) as totalOpenEpisodeCount",
                 "wff.status as waitingForFreeStatus",
                 "p69.status as sixNinePathStatus",
@@ -710,6 +710,7 @@ def get_select_fields_and_joins_for_home_card_product(
                     COUNT(*) as episode_count,
                     SUM(episode_text_count) as episode_text_count,
                     SUM(CASE WHEN open_yn = 'Y' THEN 1 ELSE 0 END) as open_episode_count,
+                    SUM(CASE WHEN open_yn = 'Y' THEN episode_text_count ELSE 0 END) as open_episode_text_count,
                     MAX(CASE WHEN open_yn = 'Y' THEN episode_no ELSE NULL END) as latest_episode_no,
                     CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN open_yn = 'Y' THEN episode_id END ORDER BY episode_no DESC, episode_id DESC SEPARATOR ','), ',', 1) AS UNSIGNED) as latest_episode_id,
                     CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN open_yn = 'Y' THEN episode_id END ORDER BY episode_no ASC, episode_id ASC SEPARATOR ','), ',', 1) AS UNSIGNED) as first_episode_id
@@ -4008,6 +4009,7 @@ async def promote_product_to_normal_if_eligible(
                  FROM tb_product_episode e
                 WHERE e.product_id = p.product_id
                   AND e.use_yn = 'Y'
+                  AND e.open_yn = 'Y'
                 GROUP BY e.product_id
                HAVING COUNT(*) >= 5
                   AND COALESCE(SUM(e.episode_text_count), 0) >= 20000
