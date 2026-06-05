@@ -42,7 +42,7 @@ def test_product_ai_consent_migration_backfills_existing_products_opted_in_excep
    SET ai_content_service_enabled_yn = 'Y',
        ai_external_promotion_yn = 'Y';""" in migration
     assert """UPDATE tb_product
-   SET ai_content_service_enabled_yn = 'N',
+   SET ai_content_service_enabled_yn = 'Y',
        ai_external_promotion_yn = 'N'
  WHERE product_id = 1152;""" in migration
 
