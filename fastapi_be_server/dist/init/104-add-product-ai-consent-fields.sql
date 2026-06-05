@@ -9,6 +9,6 @@ UPDATE tb_product
        ai_external_promotion_yn = 'Y';
 
 UPDATE tb_product
-   SET ai_content_service_enabled_yn = 'N',
+   SET ai_content_service_enabled_yn = 'Y',
        ai_external_promotion_yn = 'N'
  WHERE product_id = 1152;
