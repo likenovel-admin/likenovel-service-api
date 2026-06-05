@@ -14,7 +14,7 @@ LOCK_PID_FILE="${LOCK_DIR}/pid"
 MAX_LOCK_AGE_SECONDS="${STORYCTX_MAX_LOCK_AGE_SECONDS:-21600}"
 MAX_PARALLEL="${STORYCTX_MAX_PARALLEL:-2}"
 BUILD_MODE="${STORYCTX_BUILD_MODE:-delta}"
-MAX_MISSING_EPISODES="${STORYCTX_MAX_MISSING_EPISODES:-5}"
+MAX_DELTA_EPISODES="${STORYCTX_MAX_DELTA_EPISODES:-${STORYCTX_MAX_MISSING_EPISODES:-5}}"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
@@ -111,11 +111,11 @@ normalize_build_mode() {
     exit 1
   fi
 
-  if ! [[ "${MAX_MISSING_EPISODES}" =~ ^[0-9]+$ ]]; then
-    MAX_MISSING_EPISODES=5
+  if ! [[ "${MAX_DELTA_EPISODES}" =~ ^[0-9]+$ ]]; then
+    MAX_DELTA_EPISODES=5
   fi
-  if [ "${MAX_MISSING_EPISODES}" -lt 1 ]; then
-    MAX_MISSING_EPISODES=1
+  if [ "${MAX_DELTA_EPISODES}" -lt 1 ]; then
+    MAX_DELTA_EPISODES=1
   fi
 }
 
@@ -156,7 +156,7 @@ fi
 normalize_parallel
 normalize_build_mode
 acquire_lock
-log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE} max_missing_episodes=${MAX_MISSING_EPISODES}"
+log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE} max_delta_episodes=${MAX_DELTA_EPISODES}"
 
 MYSQL_CMD=(
   mysql
@@ -205,9 +205,10 @@ FROM (
     p.title,
     sacp.context_status
   HAVING
-    missing_open_episode_count BETWEEN 1 AND ${MAX_MISSING_EPISODES}
+    missing_open_episode_count > 0
 ) candidates
 ORDER BY
+  CASE WHEN candidates.missing_open_episode_count <= ${MAX_DELTA_EPISODES} THEN 0 ELSE 1 END ASC,
   CASE candidates.context_status
     WHEN 'failed' THEN 0
     WHEN 'processing' THEN 1
@@ -240,6 +241,7 @@ run_product() {
     exec "${PYTHON_BIN}" "${BUILD_SCRIPT}" \
       --product-id "${product_id}" \
       --build-mode "${BUILD_MODE}" \
+      --max-delta-episodes "${MAX_DELTA_EPISODES}" \
       --apply \
       --verbose
   ) > >(append_timestamped_to_log) 2>&1 &

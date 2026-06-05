@@ -29,8 +29,14 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         script = _batch_sh()
 
         self.assertIn('BUILD_MODE="${STORYCTX_BUILD_MODE:-delta}"', script)
-        self.assertIn('MAX_MISSING_EPISODES="${STORYCTX_MAX_MISSING_EPISODES:-5}"', script)
+        self.assertIn('MAX_DELTA_EPISODES="${STORYCTX_MAX_DELTA_EPISODES:-${STORYCTX_MAX_MISSING_EPISODES:-5}}"', script)
         self.assertIn('STORYCTX_ALLOW_FULL', script)
         self.assertIn('--build-mode "${BUILD_MODE}"', script)
-        self.assertIn('missing_open_episode_count BETWEEN 1 AND ${MAX_MISSING_EPISODES}', script)
+        self.assertIn('--max-delta-episodes "${MAX_DELTA_EPISODES}"', script)
+        self.assertIn('missing_open_episode_count > 0', script)
+        self.assertIn(
+            'CASE WHEN candidates.missing_open_episode_count <= ${MAX_DELTA_EPISODES} THEN 0 ELSE 1 END ASC',
+            script,
+        )
+        self.assertNotIn('missing_open_episode_count BETWEEN 1 AND ${MAX_MISSING_EPISODES}', script)
         self.assertNotIn("--build-mode full", script)
