@@ -85,6 +85,8 @@ CREATE TABLE tb_product (
     approval_yn VARCHAR(1) DEFAULT 'N' COMMENT '유료 승인 여부',
     monopoly_yn VARCHAR(1) DEFAULT 'N' COMMENT '독점 여부',
     contract_yn VARCHAR(1) DEFAULT 'N' COMMENT '계약 여부',
+    ai_content_service_enabled_yn VARCHAR(1) NOT NULL DEFAULT 'N' COMMENT '플랫폼 내 AI 콘텐츠 서비스 활성화 동의 여부',
+    ai_external_promotion_yn VARCHAR(1) NOT NULL DEFAULT 'N' COMMENT '홍보·광고 목적 AI 생성 콘텐츠 외부 채널 게재 동의 여부',
     paid_open_date TIMESTAMP NULL COMMENT '유료회차 시작 일시',
     paid_episode_no INT COMMENT '유료시작 회차(episode)',
     last_episode_date TIMESTAMP NULL COMMENT '최근 회차 일자',
