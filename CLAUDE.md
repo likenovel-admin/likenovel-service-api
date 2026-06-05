@@ -1,4 +1,24 @@
-# Likenovel Service API - 배포 가이드
+# LEGACY - DO NOT EXECUTE
+
+> Status: LEGACY - DO NOT EXECUTE
+> Inside the root LikeNovel checkout, the current deployment SSOT is root
+> `AGENTS.md`, `docs/deployment-runbook.md`, and
+> `docs/wiki/deployment-and-batch.md`.
+>
+> In a standalone backend clone those root paths may not exist. In that case,
+> use backend source/workflow files as anchors and do not execute the historical
+> manual commands below:
+> - `.github/workflows/deploy_be_actions_dev.yml`
+> - `.github/workflows/deploy_be_actions.yml`
+> - `fastapi_be_server/dist/run_be.dev.sh`
+> - `fastapi_be_server/dist/run_be.sh`
+> - `fastapi_be_server/dist/verify_backend_prod_deploy.sh`
+> - `fastapi_be_server/dist/batch/cron_env.sh`
+>
+> The commands below are preserved only as historical context from the old
+> manual deployment era. Do not run them as a current runbook.
+
+# Likenovel Service API - Historical Deploy Notes
 
 ## 1단계: 코드 배포
 
