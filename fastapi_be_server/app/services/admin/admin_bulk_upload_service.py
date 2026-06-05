@@ -501,6 +501,7 @@ async def _create_product(
                 publish_regular_yn, publish_days,
                 primary_genre_id, sub_genre_id, thumbnail_file_id,
                 open_yn, blind_yn, monopoly_yn, contract_yn,
+                ai_content_service_enabled_yn, ai_external_promotion_yn,
                 series_regular_price, single_regular_price, single_rental_price,
                 created_id, updated_id
             ) VALUES (
@@ -509,6 +510,7 @@ async def _create_product(
                 'Y', :publish_days,
                 :primary_genre_id, :sub_genre_id, :thumbnail_file_id,
                 :open_yn, 'N', :monopoly_yn, :contract_yn,
+                :ai_content_service_enabled_yn, :ai_external_promotion_yn,
                 0, 0, 0,
                 :user_id, :user_id
             )
@@ -526,6 +528,8 @@ async def _create_product(
             "open_yn": row.get("open_yn", "N"),
             "monopoly_yn": row.get("monopoly", "N"),
             "contract_yn": row.get("contract", "N"),
+            "ai_content_service_enabled_yn": "Y",
+            "ai_external_promotion_yn": "Y",
         },
     )
     product_id_result = await db.execute(text("SELECT LAST_INSERT_ID() AS id"))
