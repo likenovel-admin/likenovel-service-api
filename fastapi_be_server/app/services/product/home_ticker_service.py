@@ -199,6 +199,23 @@ def build_new_product_query(adult_yn: str | None) -> tuple[str, dict[str, Any]]:
     return query, {}
 
 
+def build_new_notice_query(adult_yn: str | None = None) -> tuple[str, dict[str, Any]]:
+    query = """
+        SELECT
+            'new_notice' AS itemType,
+            NULL AS productId,
+            '새로운 공지사항이 등록되었습니다' AS message,
+            85 AS priority,
+            'near_real_time' AS freshness
+        FROM tb_notice n
+        WHERE n.use_yn = 'Y'
+          AND n.created_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        ORDER BY n.created_date DESC, n.id DESC
+        LIMIT 1
+    """
+    return query, {}
+
+
 def build_material_trend_query(adult_yn: str | None) -> tuple[str, dict[str, Any]]:
     query = f"""
         SELECT
@@ -332,6 +349,7 @@ async def get_home_ticker(adult_yn: str, db: AsyncSession) -> dict[str, Any]:
         build_popular_free_top_query,
         build_reader_momentum_query,
         build_new_product_query,
+        build_new_notice_query,
         build_material_trend_query,
     ):
         query, params = query_builder(adult_yn)

@@ -158,6 +158,22 @@ def test_new_product_query_contract():
     assert params == {}
 
 
+def test_new_notice_query_contract():
+    query, params = service.build_new_notice_query()
+
+    assert "tb_notice n" in query
+    assert "'new_notice' AS itemType" in query
+    assert "NULL AS productId" in query
+    assert "'새로운 공지사항이 등록되었습니다' AS message" in query
+    assert "n.use_yn = 'Y'" in query
+    assert "n.created_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR)" in query
+    assert "ORDER BY n.created_date DESC, n.id DESC" in query
+    assert "'near_real_time' AS freshness" in query
+    assert "LIMIT 1" in query
+    _assert_public_copy_has_no_internal_metric_terms(query)
+    assert params == {}
+
+
 def test_material_trend_query_contract():
     query, params = service.build_material_trend_query("N")
 
