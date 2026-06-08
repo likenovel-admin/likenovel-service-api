@@ -20,12 +20,32 @@ def _assert_public_copy_has_no_internal_metric_terms(copy: str):
         assert term not in copy
 
 
-def test_paid_conversion_copy_uses_public_celebration_count():
-    item = service.build_paid_conversion_summary_item()
+def test_paid_conversion_copy_uses_weekly_author_count():
+    item = service.build_paid_conversion_summary_item(3)
 
     assert item["message"] == "이번 주 유료전환 작가님 3명 축하드립니다."
     assert item["productId"] is None
     assert item["freshness"] == "weekly"
+
+
+def test_paid_conversion_copy_is_hidden_when_weekly_author_count_is_zero():
+    assert service.build_paid_conversion_summary_item(0) is None
+
+
+def test_paid_conversion_query_uses_monday_to_sunday_kst_window():
+    week_start, week_end = service.get_week_window_kst(datetime(2026, 6, 10, 12, 30))
+    query, params = service.build_paid_conversion_summary_query(week_start, week_end, "N")
+
+    assert week_start == datetime(2026, 6, 8)
+    assert week_end == datetime(2026, 6, 15)
+    assert "COUNT(DISTINCT p.author_id)" in query
+    assert "p.paid_open_date >= :week_start" in query
+    assert "p.paid_open_date < :week_end" in query
+    assert "p.paid_open_date IS NOT NULL" in query
+    assert "CONCAT('이번 주 유료전환 작가님 ', COUNT(DISTINCT p.author_id), '명 축하드립니다.')" in query
+    assert "HAVING COUNT(DISTINCT p.author_id) > 0" in query
+    assert "p.ratings_code = 'all'" in query
+    assert params == {"week_start": week_start, "week_end": week_end}
 
 
 def test_internal_metric_terms_are_blocked():

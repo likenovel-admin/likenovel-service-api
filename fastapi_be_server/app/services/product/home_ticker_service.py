@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import time
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -12,7 +12,6 @@ HOME_TICKER_REFRESH_AFTER_SECONDS = 60
 HOME_TICKER_ROTATE_EVERY_MS = 5000
 HOME_TICKER_LIMIT = 10
 HOME_TICKER_CACHE_TTL_SECONDS = 60
-HOME_TICKER_PAID_CONVERSION_CELEBRATION_COUNT = 3
 
 _KST = ZoneInfo("Asia/Seoul")
 _PUBLIC_COPY_BLOCK_TERMS = ("연독률", "재유입", "전환율")
@@ -58,16 +57,47 @@ def build_ticker_item(
     }
 
 
-def build_paid_conversion_summary_item() -> dict[str, Any] | None:
+def get_week_window_kst(now: datetime | None = None) -> tuple[datetime, datetime]:
+    basis = now or datetime.now(_KST)
+    if basis.tzinfo is not None:
+        basis = basis.astimezone(_KST).replace(tzinfo=None)
+    week_start = (basis - timedelta(days=basis.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return week_start, week_start + timedelta(days=7)
+
+
+def build_paid_conversion_summary_item(author_count: int) -> dict[str, Any] | None:
+    if author_count <= 0:
+        return None
     return build_ticker_item(
         item_type="paid_conversion_summary",
-        message=(
-            "이번 주 유료전환 작가님 "
-            f"{HOME_TICKER_PAID_CONVERSION_CELEBRATION_COUNT}명 축하드립니다."
-        ),
+        message=f"이번 주 유료전환 작가님 {author_count}명 축하드립니다.",
         priority=100,
         freshness="weekly",
     )
+
+
+def build_paid_conversion_summary_query(
+    week_start: datetime,
+    week_end: datetime,
+    adult_yn: str | None,
+) -> tuple[str, dict[str, Any]]:
+    query = f"""
+        SELECT
+            'paid_conversion_summary' AS itemType,
+            NULL AS productId,
+            CONCAT('이번 주 유료전환 작가님 ', COUNT(DISTINCT p.author_id), '명 축하드립니다.') AS message,
+            100 AS priority,
+            'weekly' AS freshness
+        FROM tb_product p
+        WHERE {_visibility_filter(adult_yn)}
+          AND p.paid_open_date IS NOT NULL
+          AND p.paid_open_date >= :week_start
+          AND p.paid_open_date < :week_end
+        HAVING COUNT(DISTINCT p.author_id) > 0
+    """
+    return query, {"week_start": week_start, "week_end": week_end}
 
 
 def build_recent_episode_query(adult_yn: str | None) -> tuple[str, dict[str, Any]]:
@@ -292,10 +322,11 @@ async def get_home_ticker(adult_yn: str, db: AsyncSession) -> dict[str, Any]:
     now = datetime.now(_KST).replace(tzinfo=None)
     rows: list[Mapping[str, Any]] = []
 
-    paid_item = build_paid_conversion_summary_item()
-    if paid_item is not None:
-        rows.append(paid_item)
-
+    week_start, week_end = get_week_window_kst(now)
+    paid_conversion_query, paid_conversion_params = build_paid_conversion_summary_query(
+        week_start, week_end, adult_yn
+    )
+    rows.extend(await _fetch_ticker_rows(db, paid_conversion_query, paid_conversion_params))
     for query_builder in (
         build_recent_episode_query,
         build_popular_free_top_query,
