@@ -160,21 +160,20 @@ def build_reader_momentum_query(adult_yn: str | None) -> tuple[str, dict[str, An
         SELECT
             'reader_momentum' AS itemType,
             p.product_id AS productId,
-            CONCAT('<', p.title, '>을 이어 읽는 독자가 늘고 있습니다.') AS message,
+            CONCAT('<', p.title, '>을 독자들이 이어 읽고 있습니다.') AS message,
             70 AS priority,
             'metric_snapshot' AS freshness
         FROM tb_product p
         INNER JOIN tb_product_trend_index pti ON pti.product_id = p.product_id
-        INNER JOIN tb_product_count_variance pcv ON pcv.product_id = p.product_id
         WHERE {_visibility_filter(adult_yn)}
-          AND pcv.reading_rate_indicator >= :min_reading_rate_indicator
+          AND pti.reading_rate >= :min_reading_rate
           AND p.count_hit >= :min_count_hit
-        ORDER BY pcv.reading_rate_indicator DESC, p.count_hit DESC, p.product_id DESC
+        ORDER BY pti.reading_rate DESC, p.count_hit DESC, p.product_id DESC
         LIMIT 5
     """
     return query, {
-        "min_reading_rate_indicator": 5,
-        "min_count_hit": 100,
+        "min_reading_rate": 50,
+        "min_count_hit": 30,
     }
 
 
@@ -221,12 +220,12 @@ def build_material_trend_query(adult_yn: str | None) -> tuple[str, dict[str, Any
         SELECT
             'material_trend' AS itemType,
             NULL AS productId,
-            CONCAT('최근 ', materials.materialTag, ' 소재 작품을 찾는 독자가 늘고 있습니다.') AS message,
+            materials.materialTag AS dedupeKey,
+            CONCAT('최근 ', materials.materialTag, ' 소재 작품이 주목받고 있습니다.') AS message,
             50 AS priority,
             'trend_snapshot' AS freshness
         FROM tb_product p
         INNER JOIN tb_product_ai_metadata m ON m.product_id = p.product_id
-        INNER JOIN tb_product_count_variance pcv ON pcv.product_id = p.product_id
         CROSS JOIN JSON_TABLE(
             IF(JSON_VALID(m.protagonist_material_tags), m.protagonist_material_tags, JSON_ARRAY()),
             '$[*]' COLUMNS(materialTag VARCHAR(100) PATH '$')
@@ -242,10 +241,16 @@ def build_material_trend_query(adult_yn: str | None) -> tuple[str, dict[str, Any
         LIMIT :limit_count
     """
     return query, {
-        "min_count_hit": 100,
+        "min_count_hit": 30,
         "min_product_count": 2,
         "limit_count": 3,
     }
+
+
+def _dedupe_key(row: Mapping[str, Any], item: Mapping[str, Any]) -> tuple[str, int | str | None]:
+    if item.get("type") == "material_trend":
+        return (str(item["type"]), _row_value(row, "dedupeKey") or item.get("message"))
+    return (str(item["type"]), item.get("productId"))
 
 
 def _row_value(row: Mapping[str, Any], *keys: str) -> Any:
@@ -269,12 +274,12 @@ def build_home_ticker_response(
     rows: list[Mapping[str, Any]], now: datetime | None = None
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
-    seen: set[tuple[str, int | None]] = set()
+    seen: set[tuple[str, int | str | None]] = set()
     for row in sorted(rows, key=lambda value: int(value.get("priority") or 0), reverse=True):
         item = _item_from_row(row)
         if item is None:
             continue
-        key = (item["type"], item.get("productId"))
+        key = _dedupe_key(row, item)
         if key in seen:
             continue
         seen.add(key)

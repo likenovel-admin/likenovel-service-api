@@ -133,14 +133,14 @@ def test_reader_momentum_query_contract():
     query, params = service.build_reader_momentum_query("N")
 
     assert "tb_product_trend_index pti" in query
-    assert "tb_product_count_variance pcv" in query
-    assert "<', p.title, '>을 이어 읽는 독자가 늘고 있습니다." in query
-    assert "pcv.reading_rate_indicator >= :min_reading_rate_indicator" in query
+    assert "tb_product_count_variance pcv" not in query
+    assert "<', p.title, '>을 독자들이 이어 읽고 있습니다." in query
+    assert "pti.reading_rate >= :min_reading_rate" in query
     assert "p.count_hit >= :min_count_hit" in query
+    assert "ORDER BY pti.reading_rate DESC, p.count_hit DESC, p.product_id DESC" in query
     assert "'metric_snapshot' AS freshness" in query
     _assert_public_copy_has_no_internal_metric_terms(query)
-    assert params["min_count_hit"] >= 100
-    assert params == {"min_reading_rate_indicator": 5, "min_count_hit": 100}
+    assert params == {"min_reading_rate": 50, "min_count_hit": 30}
 
 
 def test_new_product_query_contract():
@@ -180,19 +180,55 @@ def test_material_trend_query_contract():
     assert "tb_product_ai_metadata m" in query
     assert "m.protagonist_material_tags" in query
     assert "NULL AS productId" in query
-    assert "tb_product_count_variance pcv" in query
-    assert "최근 ', materials.materialTag, ' 소재 작품을 찾는 독자가 늘고 있습니다." in query
+    assert "tb_product_count_variance pcv" not in query
+    assert "materials.materialTag AS dedupeKey" in query
+    assert "최근 ', materials.materialTag, ' 소재 작품이 주목받고 있습니다." in query
     assert "JSON_VALID(m.protagonist_material_tags)" in query
     assert "HAVING COUNT(DISTINCT p.product_id) >= :min_product_count" in query
     assert "'trend_snapshot' AS freshness" in query
     assert "LIMIT :limit_count" in query
     _assert_public_copy_has_no_internal_metric_terms(query)
-    assert params["min_count_hit"] >= 100
     assert params == {
-        "min_count_hit": 100,
+        "min_count_hit": 30,
         "min_product_count": 2,
         "limit_count": 3,
     }
+
+
+def test_response_keeps_multiple_material_trend_messages():
+    rows = [
+        {
+            "itemType": "material_trend",
+            "productId": None,
+            "dedupeKey": "마법",
+            "message": "최근 마법 소재 작품이 주목받고 있습니다.",
+            "priority": 50,
+            "freshness": "trend_snapshot",
+        },
+        {
+            "itemType": "material_trend",
+            "productId": None,
+            "dedupeKey": "시스템",
+            "message": "최근 시스템 소재 작품이 주목받고 있습니다.",
+            "priority": 50,
+            "freshness": "trend_snapshot",
+        },
+    ]
+
+    response = service.build_home_ticker_response(rows, now=datetime(2026, 6, 8))
+
+    assert [item["message"] for item in response["items"]] == [
+        "최근 마법 소재 작품이 주목받고 있습니다.",
+        "최근 시스템 소재 작품이 주목받고 있습니다.",
+    ]
+    for item in response["items"]:
+        assert set(item.keys()) == {
+            "type",
+            "message",
+            "productId",
+            "priority",
+            "freshness",
+        }
 
 
 def test_response_sorts_by_priority_deduplicates_limits_and_falls_back():
