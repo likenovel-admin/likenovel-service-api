@@ -45,13 +45,25 @@ def build_ticker_item(
     priority: int,
     product_id: int | None = None,
     freshness: str = _DEFAULT_FRESHNESS,
+    target_type: str | None = None,
+    target_id: int | None = None,
 ) -> dict[str, Any] | None:
     if not message or _contains_internal_metric_term(message):
         return None
+    normalized_product_id = int(product_id) if product_id is not None else None
+    normalized_target_type = target_type or ("product" if normalized_product_id is not None else "none")
+    if target_id is not None:
+        normalized_target_id = int(target_id)
+    elif normalized_target_type == "product":
+        normalized_target_id = normalized_product_id
+    else:
+        normalized_target_id = None
     return {
         "type": item_type,
         "message": message,
-        "productId": int(product_id) if product_id is not None else None,
+        "productId": normalized_product_id,
+        "targetType": normalized_target_type,
+        "targetId": normalized_target_id,
         "priority": int(priority),
         "freshness": freshness,
     }
@@ -203,6 +215,8 @@ def build_new_notice_query(adult_yn: str | None = None) -> tuple[str, dict[str, 
         SELECT
             'new_notice' AS itemType,
             NULL AS productId,
+            'notice' AS targetType,
+            n.id AS targetId,
             '새로운 공지사항이 등록되었습니다' AS message,
             85 AS priority,
             'near_real_time' AS freshness
@@ -267,6 +281,8 @@ def _item_from_row(row: Mapping[str, Any]) -> dict[str, Any] | None:
         priority=_row_value(row, "priority") or 0,
         product_id=_row_value(row, "productId", "product_id"),
         freshness=_row_value(row, "freshness") or _DEFAULT_FRESHNESS,
+        target_type=_row_value(row, "targetType", "target_type"),
+        target_id=_row_value(row, "targetId", "target_id"),
     )
 
 

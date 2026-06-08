@@ -87,6 +87,8 @@ def test_reader_facing_term_is_accepted():
         "type": "reader_momentum",
         "message": "독자 반응이 이어지고 있습니다.",
         "productId": 123,
+        "targetType": "product",
+        "targetId": 123,
         "priority": 10,
         "freshness": "metric_snapshot",
     }
@@ -164,6 +166,8 @@ def test_new_notice_query_contract():
     assert "tb_notice n" in query
     assert "'new_notice' AS itemType" in query
     assert "NULL AS productId" in query
+    assert "'notice' AS targetType" in query
+    assert "n.id AS targetId" in query
     assert "'새로운 공지사항이 등록되었습니다' AS message" in query
     assert "n.use_yn = 'Y'" in query
     assert "n.created_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR)" in query
@@ -226,6 +230,8 @@ def test_response_keeps_multiple_material_trend_messages():
             "type",
             "message",
             "productId",
+            "targetType",
+            "targetId",
             "priority",
             "freshness",
         }
@@ -254,12 +260,27 @@ def test_response_sorts_by_priority_deduplicates_limits_and_falls_back():
             "priority": 10,
             "freshness": "metric_snapshot",
         },
+        {
+            "itemType": "new_notice",
+            "productId": None,
+            "targetType": "notice",
+            "targetId": 42,
+            "message": "새로운 공지사항이 등록되었습니다",
+            "priority": 9,
+            "freshness": "near_real_time",
+        },
     ]
 
     response = service.build_home_ticker_response(rows, now=datetime(2026, 6, 8))
     items = response["items"]
 
-    assert [item["message"] for item in items] == ["중복", "높은 우선순위"]
+    assert [item["message"] for item in items] == [
+        "중복",
+        "높은 우선순위",
+        "새로운 공지사항이 등록되었습니다",
+    ]
+    assert items[2]["targetType"] == "notice"
+    assert items[2]["targetId"] == 42
     assert response["asOf"] == "2026-06-08T00:00:00"
     assert response["refreshAfterSeconds"] == service.HOME_TICKER_REFRESH_AFTER_SECONDS
     assert response["rotateEveryMs"] == service.HOME_TICKER_ROTATE_EVERY_MS
@@ -274,6 +295,8 @@ def test_response_sorts_by_priority_deduplicates_limits_and_falls_back():
             "type",
             "message",
             "productId",
+            "targetType",
+            "targetId",
             "priority",
             "freshness",
         }
@@ -285,6 +308,8 @@ def test_response_sorts_by_priority_deduplicates_limits_and_falls_back():
             "type": "fallback",
             "message": "오늘도 새로운 이야기가 라이크노벨에서 독자를 만나고 있습니다.",
             "productId": None,
+            "targetType": "none",
+            "targetId": None,
             "priority": 0,
             "freshness": "fallback",
         }
