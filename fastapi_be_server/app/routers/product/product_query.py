@@ -9,6 +9,7 @@ import app.services.product.product_service as product_service
 import app.services.product.product_comment_service as product_comment_service
 import app.services.product.product_bookmark_service as product_bookmark_service
 import app.services.product.product_notice_service as product_notice_service
+import app.services.product.home_ticker_service as home_ticker_service
 import app.services.product.main_single_slot_service as main_single_slot_service
 from app.const import LOGGER_TYPE, ErrorMessages
 from app.config.log_config import service_error_logger
@@ -129,6 +130,19 @@ async def products_of_main_single_slots(
         adult_yn=adult_yn,
         db=db,
     )
+
+
+@router.get(
+    "/home-ticker",
+    tags=["작품"],
+    responses={200: {"description": "홈 인게이지먼트 전광판 조회"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_products_home_ticker(
+    adult_yn: str = Query("N", description="성인등급 작품 포함 여부 (Y/N)"),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await home_ticker_service.get_home_ticker(adult_yn=adult_yn, db=db)
 
 
 @router.get(

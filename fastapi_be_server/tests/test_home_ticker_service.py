@@ -1,0 +1,296 @@
+from datetime import datetime, timedelta
+import asyncio
+
+from app.services.product import home_ticker_service as service
+
+
+FRESHNESS_ENUM = {
+    "weekly",
+    "near_real_time",
+    "ranking_snapshot",
+    "metric_snapshot",
+    "trend_snapshot",
+    "fallback",
+}
+INTERNAL_METRIC_TERMS = ("연독률", "재유입", "전환율")
+
+
+def _assert_public_copy_has_no_internal_metric_terms(copy: str):
+    for term in INTERNAL_METRIC_TERMS:
+        assert term not in copy
+
+
+def test_paid_conversion_copy_uses_public_celebration_count():
+    item = service.build_paid_conversion_summary_item()
+
+    assert item["message"] == "이번 주 유료전환 작가님 3명 축하드립니다."
+    assert item["productId"] is None
+    assert item["freshness"] == "weekly"
+
+
+def test_internal_metric_terms_are_blocked():
+    assert (
+        service.build_ticker_item(
+            item_type="reader_momentum",
+            message="연독률이 오른 작품입니다.",
+            priority=10,
+        )
+        is None
+    )
+    assert (
+        service.build_ticker_item(
+            item_type="reader_momentum",
+            message="재유입 흐름이 있는 작품입니다.",
+            priority=10,
+        )
+        is None
+    )
+    assert (
+        service.build_ticker_item(
+            item_type="reader_momentum",
+            message="전환율이 오른 작품입니다.",
+            priority=10,
+        )
+        is None
+    )
+
+
+def test_reader_facing_term_is_accepted():
+    item = service.build_ticker_item(
+        item_type="reader_momentum",
+        message="독자 반응이 이어지고 있습니다.",
+        priority=10,
+        product_id=123,
+    )
+
+    assert item == {
+        "type": "reader_momentum",
+        "message": "독자 반응이 이어지고 있습니다.",
+        "productId": 123,
+        "priority": 10,
+        "freshness": "metric_snapshot",
+    }
+
+
+def test_recent_episode_query_contract():
+    query, params = service.build_recent_episode_query("Y")
+
+    assert "tb_product_episode e" in query
+    assert "ELSE CONCAT(p.author_name, ' 작가님이 <" in query
+    assert ">의 신규 회차를 업로드했습니다." in query
+    assert "THEN CONCAT('작가님이 <" in query
+    assert "e.open_yn = 'Y'" in query
+    assert "e.use_yn = 'Y'" in query
+    assert "e.publish_reserve_date <= NOW()" in query
+    assert "DATE_SUB(NOW(), INTERVAL 2 HOUR)" in query
+    assert "'near_real_time' AS freshness" in query
+    assert "LIMIT 5" in query
+    assert "p.ratings_code = 'all'" not in query
+    _assert_public_copy_has_no_internal_metric_terms(query)
+    assert params == {}
+
+
+def test_popular_free_top_query_contract():
+    query, params = service.build_popular_free_top_query("N")
+
+    assert "tb_product_rank_area r" in query
+    assert "area_code = 'freeSerialTop'" in query
+    assert "ELSE CONCAT(p.author_name, ' 작가님의 <" in query
+    assert ">이 인기무료 TOP 1위에 올랐습니다." in query
+    assert "THEN CONCAT('작가님의 <" in query
+    assert "r.current_rank = 1" in query
+    assert "p.price_type = 'free'" in query
+    assert "p.status_code = 'ongoing'" in query
+    assert "MAX(created_date)" in query
+    assert "basis_at" not in query
+    assert "'ranking_snapshot' AS freshness" in query
+    assert "p.ratings_code = 'all'" in query
+    _assert_public_copy_has_no_internal_metric_terms(query)
+    assert params == {}
+
+
+def test_reader_momentum_query_contract():
+    query, params = service.build_reader_momentum_query("N")
+
+    assert "tb_product_trend_index pti" in query
+    assert "tb_product_count_variance pcv" in query
+    assert "<', p.title, '>을 이어 읽는 독자가 늘고 있습니다." in query
+    assert "pcv.reading_rate_indicator >= :min_reading_rate_indicator" in query
+    assert "p.count_hit >= :min_count_hit" in query
+    assert "'metric_snapshot' AS freshness" in query
+    _assert_public_copy_has_no_internal_metric_terms(query)
+    assert params["min_count_hit"] >= 100
+    assert params == {"min_reading_rate_indicator": 5, "min_count_hit": 100}
+
+
+def test_new_product_query_contract():
+    query, params = service.build_new_product_query("N")
+
+    assert "ELSE CONCAT(p.author_name, ' 작가님의 신규작 <" in query
+    assert ">이 등록되었습니다." in query
+    assert "THEN CONCAT('작가님의 신규작 <" in query
+    assert "p.created_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR)" in query
+    assert "ORDER BY p.created_date DESC, p.product_id DESC" in query
+    assert "'near_real_time' AS freshness" in query
+    assert "LIMIT 3" in query
+    assert "p.ratings_code = 'all'" in query
+    _assert_public_copy_has_no_internal_metric_terms(query)
+    assert params == {}
+
+
+def test_material_trend_query_contract():
+    query, params = service.build_material_trend_query("N")
+
+    assert "tb_product_ai_metadata m" in query
+    assert "m.protagonist_material_tags" in query
+    assert "NULL AS productId" in query
+    assert "tb_product_count_variance pcv" in query
+    assert "최근 ', materials.materialTag, ' 소재 작품을 찾는 독자가 늘고 있습니다." in query
+    assert "JSON_VALID(m.protagonist_material_tags)" in query
+    assert "HAVING COUNT(DISTINCT p.product_id) >= :min_product_count" in query
+    assert "'trend_snapshot' AS freshness" in query
+    assert "LIMIT :limit_count" in query
+    _assert_public_copy_has_no_internal_metric_terms(query)
+    assert params["min_count_hit"] >= 100
+    assert params == {
+        "min_count_hit": 100,
+        "min_product_count": 2,
+        "limit_count": 3,
+    }
+
+
+def test_response_sorts_by_priority_deduplicates_limits_and_falls_back():
+    rows = [
+        {
+            "itemType": "new_product",
+            "productId": 1,
+            "message": "낮은 우선순위",
+            "priority": 1,
+            "freshness": "near_real_time",
+        },
+        {
+            "itemType": "new_product",
+            "productId": 1,
+            "message": "중복",
+            "priority": 99,
+            "freshness": "near_real_time",
+        },
+        {
+            "itemType": "reader_momentum",
+            "productId": 2,
+            "message": "높은 우선순위",
+            "priority": 10,
+            "freshness": "metric_snapshot",
+        },
+    ]
+
+    response = service.build_home_ticker_response(rows, now=datetime(2026, 6, 8))
+    items = response["items"]
+
+    assert [item["message"] for item in items] == ["중복", "높은 우선순위"]
+    assert response["asOf"] == "2026-06-08T00:00:00"
+    assert response["refreshAfterSeconds"] == service.HOME_TICKER_REFRESH_AFTER_SECONDS
+    assert response["rotateEveryMs"] == service.HOME_TICKER_ROTATE_EVERY_MS
+    assert set(response.keys()) == {
+        "asOf",
+        "refreshAfterSeconds",
+        "rotateEveryMs",
+        "items",
+    }
+    for item in items:
+        assert set(item.keys()) == {
+            "type",
+            "message",
+            "productId",
+            "priority",
+            "freshness",
+        }
+        assert item["freshness"] in FRESHNESS_ENUM
+
+    fallback = service.build_home_ticker_response([], now=datetime(2026, 6, 8))
+    assert fallback["items"] == [
+        {
+            "type": "fallback",
+            "message": "오늘도 새로운 이야기가 라이크노벨에서 독자를 만나고 있습니다.",
+            "productId": None,
+            "priority": 0,
+            "freshness": "fallback",
+        }
+    ]
+
+
+def test_response_limits_to_home_ticker_limit():
+    rows = [
+        {
+            "itemType": "new_product",
+            "productId": product_id,
+            "message": f"작품 {product_id}",
+            "priority": product_id,
+            "freshness": "near_real_time",
+        }
+        for product_id in range(service.HOME_TICKER_LIMIT + 3)
+    ]
+
+    response = service.build_home_ticker_response(rows, now=datetime(2026, 6, 8))
+
+    assert len(response["items"]) == service.HOME_TICKER_LIMIT
+
+
+def test_cache_helpers_return_deep_copy():
+    service.reset_home_ticker_cache_for_tests()
+    response = {
+        "items": [
+            {
+                "type": "fallback",
+                "message": "테스트",
+                "productId": None,
+                "priority": 0,
+                "freshness": "fallback",
+            }
+        ],
+    }
+
+    service.set_home_ticker_cache_for_tests(
+        "N", response, expires_at=(datetime.now() + timedelta(days=1)).timestamp()
+    )
+    cached = service.get_cached_home_ticker("N")
+    cached["items"][0]["message"] = "변경"
+
+    assert service.get_cached_home_ticker("N")["items"][0]["message"] == "테스트"
+
+
+def test_expired_cache_returns_none():
+    service.reset_home_ticker_cache_for_tests()
+    service.set_home_ticker_cache_for_tests(
+        "N",
+        {"items": []},
+        expires_at=(datetime.now() - timedelta(seconds=1)).timestamp(),
+    )
+
+    assert service.get_cached_home_ticker("N") is None
+
+
+def test_get_home_ticker_uses_cache_without_db_execute():
+    service.reset_home_ticker_cache_for_tests()
+    expected = {
+        "items": [
+            {
+                "type": "fallback",
+                "message": "테스트",
+                "productId": None,
+                "priority": 0,
+                "freshness": "fallback",
+            }
+        ]
+    }
+    service.set_home_ticker_cache_for_tests(
+        "N", expected, expires_at=(datetime.now() + timedelta(days=1)).timestamp()
+    )
+
+    class NoExecuteDb:
+        async def execute(self, *args, **kwargs):
+            raise AssertionError("cached response should not execute SQL")
+
+    result = asyncio.run(service.get_home_ticker("N", NoExecuteDb()))
+
+    assert result == expected
