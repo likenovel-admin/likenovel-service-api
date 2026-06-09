@@ -12,8 +12,10 @@ async def product_ai_consent_list(
     db: AsyncSession,
 ) -> dict[str, Any]:
     """작품별 AI 활용 동의 현황 조회."""
-    page = max(page, 1)
-    count_per_page = max(1, min(count_per_page, 100))
+    download_all = page == -1 or count_per_page == -1
+    if not download_all:
+        page = max(page, 1)
+        count_per_page = max(1, min(count_per_page, 100))
 
     where_clauses = ["1 = 1"]
     params: dict[str, Any] = {}
@@ -34,8 +36,6 @@ async def product_ai_consent_list(
             params["search_word"] = f"%{normalized_search_word}%"
 
     where_sql = " AND ".join(where_clauses)
-    offset = (page - 1) * count_per_page
-
     count_query = text(
         f"""
         SELECT COUNT(*) AS total_count
@@ -52,6 +52,7 @@ async def product_ai_consent_list(
             p.product_id,
             p.title,
             p.author_name AS nickname,
+            COALESCE(u.email, '') AS author_email,
             (
                 SELECT COUNT(*)
                 FROM tb_product_episode e
@@ -74,13 +75,16 @@ async def product_ai_consent_list(
                 ELSE 'Y'
             END AS websochat_enabled_yn
         FROM tb_product p
+        LEFT JOIN tb_user u
+          ON u.user_id = p.user_id
         WHERE {where_sql}
         ORDER BY p.product_id DESC
-        LIMIT :limit OFFSET :offset
+        {"LIMIT :limit OFFSET :offset" if not download_all else ""}
         """
     )
-    params["limit"] = count_per_page
-    params["offset"] = offset
+    if not download_all:
+        params["limit"] = count_per_page
+        params["offset"] = (page - 1) * count_per_page
     result = await db.execute(list_query, params)
     rows = [dict(row) for row in result.mappings().all()]
 

@@ -4485,6 +4485,34 @@ async def product_ai_consent_list(
 
 
 @router.get(
+    "/product-ai-consents/all",
+    tags=["CMS - AI 활용 동의 현황"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_ai_consent_list_for_download(
+    search_target: str = Query("", description="검색 타겟 (product-id|product-title|nickname)"),
+    search_word: str = Query("", description="검색어"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    작품별 AI 활용 동의 현황 엑셀 다운로드
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_product_ai_consent_service.product_ai_consent_list(
+        search_target=search_target,
+        search_word=search_word,
+        page=-1,
+        count_per_page=-1,
+        db=db,
+    )
+
+
+@router.get(
     "/ai-onboarding-products",
     tags=["CMS - AI 온보딩 작품"],
     dependencies=[Depends(analysis_logger)],
