@@ -1163,13 +1163,14 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
             db_rst = result.mappings().all()
 
             if db_rst:
-                if (db_rst[0].get("episode_no") or 0) > 5:
+                episode_no = int(db_rst[0].get("episode_no") or 0)
+                episode_price_type = db_rst[0].get("price_type")
+                if episode_price_type == "paid" or episode_no > 5:
                     raise CustomResponseException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         message=ErrorMessages.LOGIN_REQUIRED,
                     )
 
-                episode_no = int(db_rst[0].get("episode_no") or 0)
                 product_price_type = db_rst[0].get("product_price_type")
                 websochat_context_status = db_rst[0].get("websochat_context_status")
                 websochat_published_latest_episode_no = int(
