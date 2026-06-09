@@ -5,7 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db
 from app.schemas.statistics import PostSitePageDwellReqBody, PostSitePageViewReqBody
-from app.utils.auth import chk_cur_user
+from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.common import check_user
+from app.services.common import ai_provider_health_service
 import app.services.common.statistics_service as statistics_service
 
 router = APIRouter(prefix="/statistics")
@@ -47,6 +49,20 @@ async def post_site_page_view(
         entry_source_group=req_body.entry_source_group,
     )
     return {"data": {"ok": True}}
+
+
+@router.post(
+    "/ai-provider-health/check",
+    tags=["AI API 사용량 통계"],
+    dependencies=[Depends(analysis_logger)],
+    responses={200: {"description": "AI provider 상태 점검 실행"}},
+)
+async def post_ai_provider_health_check(
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await ai_provider_health_service.run_ai_provider_health_checks(db)
 
 
 @router.post(

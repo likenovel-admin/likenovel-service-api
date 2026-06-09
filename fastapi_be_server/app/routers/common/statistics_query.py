@@ -3,6 +3,7 @@ from typing import Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db
+from app.services.common import ai_provider_health_service
 from app.utils.common import check_user
 from app.utils.auth import analysis_logger, chk_cur_user
 import app.services.common.statistics_service as statistics_service
@@ -638,6 +639,20 @@ async def ai_api_usage_statistics(
         end_date,
         db,
     )
+
+
+@router.get(
+    "/ai-provider-health",
+    tags=["AI API 사용량 통계"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def ai_provider_health_statistics(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """AI Provider 최신 상태."""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return {"results": await ai_provider_health_service.get_ai_provider_health_summary(db)}
 
 
 @router.get(

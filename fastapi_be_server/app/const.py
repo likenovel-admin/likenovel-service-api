@@ -243,6 +243,18 @@ class Settings(BaseSettings):
         ),
     )
     STORY_AGENT_GEMINI_MODEL: str = WEBSOCHAT_GEMINI_MODEL
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    AI_PROVIDER_HEALTH_DEEPSEEK_MODEL: str = os.getenv(
+        "AI_PROVIDER_HEALTH_DEEPSEEK_MODEL",
+        os.getenv(
+            "STORY_AGENT_RP_DEEPSEEK_FALLBACK_MODEL",
+            os.getenv("AI_DNA_DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-flash"),
+        ),
+    )
+    AI_PROVIDER_HEALTH_TIMEOUT_SECONDS: float = float(
+        os.getenv("AI_PROVIDER_HEALTH_TIMEOUT_SECONDS", "10")
+    )
 
 
 settings = Settings()

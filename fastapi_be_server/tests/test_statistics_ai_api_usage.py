@@ -60,11 +60,16 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
             ]),
         ]
 
-        result = await statistics_service.ai_api_usage_statistics(
-            start_date="2026-05-01",
-            end_date="2026-05-26",
-            db=db,
-        )
+        with patch.object(
+            statistics_service.ai_provider_health_service,
+            "get_ai_provider_health_summary",
+            new=AsyncMock(return_value=[{"provider": "gemini", "status": "ok"}]),
+        ):
+            result = await statistics_service.ai_api_usage_statistics(
+                start_date="2026-05-01",
+                end_date="2026-05-26",
+                db=db,
+            )
 
         self.assertEqual(result["summary"]["request_count"], 5)
         self.assertEqual(result["summary"]["tracked_cost_usd"], 0.123456)
@@ -72,6 +77,7 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["results"][0]["source_key"], "dna_batch")
         self.assertEqual(result["results"][1]["source_key"], "websochat_chat")
         self.assertEqual(result["model_summary"][0]["model_name"], "deepseek/deepseek-v3.2")
+        self.assertEqual(result["provider_health"][0]["provider"], "gemini")
         executed_sql = "\n".join(str(call.args[0]) for call in db.execute.call_args_list)
         self.assertIn("$._llm_meta.total_cost", executed_sql)
         self.assertIn("$._llm_meta.calls[0].provider", executed_sql)
@@ -86,11 +92,16 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(statistics_service, "date") as mock_date:
             mock_date.today.return_value = date(2026, 5, 26)
-            result = await statistics_service.ai_api_usage_statistics(
-                start_date=None,
-                end_date=None,
-                db=db,
-            )
+            with patch.object(
+                statistics_service.ai_provider_health_service,
+                "get_ai_provider_health_summary",
+                new=AsyncMock(return_value=[]),
+            ):
+                result = await statistics_service.ai_api_usage_statistics(
+                    start_date=None,
+                    end_date=None,
+                    db=db,
+                )
 
         self.assertEqual(result["summary"]["request_count"], 0)
         first_params = db.execute.call_args_list[0].args[1]
@@ -101,11 +112,16 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
         db = AsyncMock()
         db.execute.side_effect = [FakeResult([]), FakeResult([])]
 
-        await statistics_service.ai_api_usage_statistics(
-            start_date="2026-05-26",
-            end_date="2026-05-26",
-            db=db,
-        )
+        with patch.object(
+            statistics_service.ai_provider_health_service,
+            "get_ai_provider_health_summary",
+            new=AsyncMock(return_value=[]),
+        ):
+            await statistics_service.ai_api_usage_statistics(
+                start_date="2026-05-26",
+                end_date="2026-05-26",
+                db=db,
+            )
 
         first_params = db.execute.call_args_list[0].args[1]
         self.assertEqual(first_params["start_date"], "2026-05-26")
