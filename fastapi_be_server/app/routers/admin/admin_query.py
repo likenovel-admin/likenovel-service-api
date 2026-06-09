@@ -4186,13 +4186,23 @@ async def get_platform_service_rate_config(
     tags=["CMS - 작품"],
     responses={
         200: {
-            "description": "작품 리스트 조회 (작품 ID, 제목만 포함)",
+            "description": "작품 리스트 조회 (작품 ID, 제목, 작가명, 회차수, 최근 회차 일자 포함)",
             "content": {
                 "application/json": {
                     "examples": {
                         "success_1": {
                             "summary": "",
-                            "value": {"data": [{"product_id": 1, "title": "제목"}]},
+                            "value": {
+                                "data": [
+                                    {
+                                        "product_id": 1,
+                                        "title": "제목",
+                                        "author_nickname": "작가명",
+                                        "count_episode": 10,
+                                        "last_episode_date": "2026-06-09T12:00:00",
+                                    }
+                                ]
+                            },
                         }
                     }
                 }
@@ -4232,7 +4242,7 @@ async def get_product_simple_list(
     user: Dict[str, Any] = Depends(chk_cur_user),
 ):
     """
-    작품 리스트 조회 (작품 ID, 제목만 포함)
+    작품 리스트 조회 (작품 ID, 제목, 작가명, 회차수, 최근 회차 일자 포함)
     """
     try:
         await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
