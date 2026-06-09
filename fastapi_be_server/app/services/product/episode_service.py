@@ -56,6 +56,39 @@ async def _transaction_scope(db: AsyncSession):
         yield
 
 
+async def _resolve_episode_sale_actor(
+    kc_user_id: str, db: AsyncSession
+) -> tuple[int, dict[str, bool]]:
+    query = text("""
+        select
+            u.user_id,
+            u.role_type,
+            exists(
+                select 1
+                  from tb_user_profile_apply upa
+                 where upa.user_id = u.user_id
+                   and upa.apply_type = 'cp'
+                   and upa.approval_code = 'accepted'
+                   and upa.approval_date IS NOT NULL
+                 limit 1
+            ) as is_cp
+          from tb_user u
+         where u.kc_user_id = :kc_user_id
+           and u.use_yn = 'Y'
+         limit 1
+    """)
+    result = await db.execute(query, {"kc_user_id": kc_user_id})
+    row = result.mappings().one_or_none()
+
+    if row is None:
+        return -1, {"is_admin": False, "is_cp": False}
+
+    return int(row["user_id"]), {
+        "is_admin": row.get("role_type") == "admin",
+        "is_cp": bool(row.get("is_cp")),
+    }
+
+
 def _to_kst_naive(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
         return None
@@ -1130,13 +1163,14 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
             db_rst = result.mappings().all()
 
             if db_rst:
-                if (db_rst[0].get("episode_no") or 0) > 5:
+                episode_no = int(db_rst[0].get("episode_no") or 0)
+                episode_price_type = db_rst[0].get("price_type")
+                if episode_price_type == "paid" or episode_no > 5:
                     raise CustomResponseException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         message=ErrorMessages.LOGIN_REQUIRED,
                     )
 
-                episode_no = int(db_rst[0].get("episode_no") or 0)
                 product_price_type = db_rst[0].get("product_price_type")
                 websochat_context_status = db_rst[0].get("websochat_context_status")
                 websochat_published_latest_episode_no = int(
@@ -3398,8 +3432,8 @@ async def post_episodes_sale_start(
     if kc_user_id:
         try:
             async with _transaction_scope(db):
-                user_id, user_info = await comm_service.get_user_from_kc(
-                    kc_user_id, db, addUserInfo=["role_type"]
+                user_id, actor_flags = await _resolve_episode_sale_actor(
+                    kc_user_id, db
                 )
                 if user_id == -1:
                     raise CustomResponseException(
@@ -3426,8 +3460,11 @@ async def post_episodes_sale_start(
                         message=ErrorMessages.INVALID_EPISODE_INFO,
                     )
 
-                is_admin = (user_info or {}).get("role_type") == "admin"
-                params = {"user_id": user_id, "is_admin": 1 if is_admin else 0}
+                params = {
+                    "user_id": user_id,
+                    "is_admin": 1 if actor_flags["is_admin"] else 0,
+                    "is_cp": 1 if actor_flags["is_cp"] else 0,
+                }
                 placeholders = []
                 for idx, episode_id in enumerate(episode_ids):
                     key = f"episode_id_{idx}"
@@ -3464,7 +3501,11 @@ async def post_episodes_sale_start(
                       on pea_latest.episode_id = e.episode_id
                     where e.use_yn = 'Y'
                       and e.episode_id in ({in_clause})
-                      and (:is_admin = 1 or p.user_id = :user_id)
+                      and (
+                          :is_admin = 1
+                          or p.user_id = :user_id
+                          or (:is_cp = 1 and p.cp_user_id = :user_id)
+                      )
                     for update
                     """
                 )
@@ -3595,8 +3636,8 @@ async def post_episodes_sale_reserve(
     if kc_user_id:
         try:
             async with _transaction_scope(db):
-                user_id, user_info = await comm_service.get_user_from_kc(
-                    kc_user_id, db, addUserInfo=["role_type"]
+                user_id, actor_flags = await _resolve_episode_sale_actor(
+                    kc_user_id, db
                 )
                 if user_id == -1:
                     raise CustomResponseException(
@@ -3623,8 +3664,11 @@ async def post_episodes_sale_reserve(
                         message=ErrorMessages.INVALID_EPISODE_INFO,
                     )
 
-                is_admin = (user_info or {}).get("role_type") == "admin"
-                params = {"user_id": user_id, "is_admin": 1 if is_admin else 0}
+                params = {
+                    "user_id": user_id,
+                    "is_admin": 1 if actor_flags["is_admin"] else 0,
+                    "is_cp": 1 if actor_flags["is_cp"] else 0,
+                }
                 placeholders = []
                 for idx, episode_id in enumerate(episode_ids):
                     key = f"episode_id_{idx}"
@@ -3660,7 +3704,11 @@ async def post_episodes_sale_reserve(
                       on pea_latest.episode_id = e.episode_id
                     where e.use_yn = 'Y'
                       and e.episode_id in ({in_clause})
-                      and (:is_admin = 1 or p.user_id = :user_id)
+                      and (
+                          :is_admin = 1
+                          or p.user_id = :user_id
+                          or (:is_cp = 1 and p.cp_user_id = :user_id)
+                      )
                     for update
                     """
                 )
@@ -3764,8 +3812,8 @@ async def post_episodes_publish_reserve_bulk(
     if kc_user_id:
         try:
             async with _transaction_scope(db):
-                user_id, user_info = await comm_service.get_user_from_kc(
-                    kc_user_id, db, addUserInfo=["role_type"]
+                user_id, actor_flags = await _resolve_episode_sale_actor(
+                    kc_user_id, db
                 )
                 if user_id == -1:
                     raise CustomResponseException(
@@ -3804,8 +3852,11 @@ async def post_episodes_publish_reserve_bulk(
                     normalized_schedule_map[episode_id] = publish_reserve_date
 
                 episode_ids = sorted(normalized_schedule_map.keys())
-                is_admin = (user_info or {}).get("role_type") == "admin"
-                params = {"user_id": user_id, "is_admin": 1 if is_admin else 0}
+                params = {
+                    "user_id": user_id,
+                    "is_admin": 1 if actor_flags["is_admin"] else 0,
+                    "is_cp": 1 if actor_flags["is_cp"] else 0,
+                }
                 placeholders = []
                 for idx, episode_id in enumerate(episode_ids):
                     key = f"episode_id_{idx}"
@@ -3827,7 +3878,11 @@ async def post_episodes_publish_reserve_bulk(
                        on p.product_id = e.product_id
                     where e.use_yn = 'Y'
                       and e.episode_id in ({in_clause})
-                      and (:is_admin = 1 or p.user_id = :user_id)
+                      and (
+                          :is_admin = 1
+                          or p.user_id = :user_id
+                          or (:is_cp = 1 and p.cp_user_id = :user_id)
+                      )
                     for update
                     """
                 )
@@ -3936,8 +3991,8 @@ async def post_episodes_sale_reserve_cancel(
     if kc_user_id:
         try:
             async with _transaction_scope(db):
-                user_id, user_info = await comm_service.get_user_from_kc(
-                    kc_user_id, db, addUserInfo=["role_type"]
+                user_id, actor_flags = await _resolve_episode_sale_actor(
+                    kc_user_id, db
                 )
                 if user_id == -1:
                     raise CustomResponseException(
@@ -3964,8 +4019,11 @@ async def post_episodes_sale_reserve_cancel(
                         message=ErrorMessages.INVALID_EPISODE_INFO,
                     )
 
-                is_admin = (user_info or {}).get("role_type") == "admin"
-                params = {"user_id": user_id, "is_admin": 1 if is_admin else 0}
+                params = {
+                    "user_id": user_id,
+                    "is_admin": 1 if actor_flags["is_admin"] else 0,
+                    "is_cp": 1 if actor_flags["is_cp"] else 0,
+                }
                 placeholders = []
                 for idx, episode_id in enumerate(episode_ids):
                     key = f"episode_id_{idx}"
@@ -3986,7 +4044,11 @@ async def post_episodes_sale_reserve_cancel(
                       and e.open_yn = 'N'
                       and e.publish_reserve_date IS NOT NULL
                       and e.episode_id in ({in_clause})
-                      and (:is_admin = 1 or p.user_id = :user_id)
+                      and (
+                          :is_admin = 1
+                          or p.user_id = :user_id
+                          or (:is_cp = 1 and p.cp_user_id = :user_id)
+                      )
                     for update
                     """
                 )
