@@ -32,20 +32,30 @@ def test_paid_conversion_copy_is_hidden_when_weekly_author_count_is_zero():
     assert service.build_paid_conversion_summary_item(0) is None
 
 
-def test_paid_conversion_query_uses_monday_to_sunday_kst_window():
+def test_paid_conversion_query_uses_weekly_paid_new_event_product_authors():
     week_start, week_end = service.get_week_window_kst(datetime(2026, 6, 10, 12, 30))
     query, params = service.build_paid_conversion_summary_query(week_start, week_end, "N")
 
     assert week_start == datetime(2026, 6, 8)
     assert week_end == datetime(2026, 6, 15)
+    assert "tb_event_v2" in query
+    assert "e.product_ids" in query
+    assert "JSON_TABLE" in query
+    assert "e.show_yn_product = 'Y'" in query
+    assert "e.start_date >= :week_start" in query
+    assert "e.start_date < :week_end" in query
+    assert "e.end_date > NOW()" in query
+    assert "e.title REGEXP :event_title_pattern" in query
     assert "COUNT(DISTINCT p.author_id)" in query
-    assert "p.paid_open_date >= :week_start" in query
-    assert "p.paid_open_date < :week_end" in query
-    assert "p.paid_open_date IS NOT NULL" in query
+    assert "p.paid_open_date" not in query
     assert "CONCAT('이번 주 유료전환 작가님 ', COUNT(DISTINCT p.author_id), '명 축하드립니다.')" in query
     assert "HAVING COUNT(DISTINCT p.author_id) > 0" in query
     assert "p.ratings_code = 'all'" in query
-    assert params == {"week_start": week_start, "week_end": week_end}
+    assert params == {
+        "week_start": week_start,
+        "week_end": week_end,
+        "event_title_pattern": service.WEEKLY_PAID_NEW_EVENT_TITLE_PATTERN,
+    }
 
 
 def test_internal_metric_terms_are_blocked():

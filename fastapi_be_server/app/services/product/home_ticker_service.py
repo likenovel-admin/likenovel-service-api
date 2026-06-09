@@ -15,6 +15,9 @@ HOME_TICKER_CACHE_TTL_SECONDS = 60
 
 _KST = ZoneInfo("Asia/Seoul")
 _PUBLIC_COPY_BLOCK_TERMS = ("연독률", "재유입", "전환율")
+WEEKLY_PAID_NEW_EVENT_TITLE_PATTERN = (
+    r"^[0-9]+월[[:space:]]*[0-9]+주차?[[:space:]]*유료(화|전환)?[[:space:]]*신작$"
+)
 _FALLBACK_MESSAGE = "오늘도 새로운 이야기가 라이크노벨에서 독자를 만나고 있습니다."
 _HOME_TICKER_CACHE: dict[str, dict[str, Any]] = {}
 _DEFAULT_FRESHNESS = "metric_snapshot"
@@ -102,14 +105,30 @@ def build_paid_conversion_summary_query(
             CONCAT('이번 주 유료전환 작가님 ', COUNT(DISTINCT p.author_id), '명 축하드립니다.') AS message,
             100 AS priority,
             'weekly' AS freshness
-        FROM tb_product p
+        FROM (
+            SELECT e.id, e.product_ids
+            FROM tb_event_v2 e
+            WHERE e.show_yn_product = 'Y'
+              AND e.start_date >= :week_start
+              AND e.start_date < :week_end
+              AND e.end_date > NOW()
+              AND e.title REGEXP :event_title_pattern
+            ORDER BY e.start_date DESC, e.id DESC
+            LIMIT 1
+        ) e
+        INNER JOIN JSON_TABLE(
+            IF(JSON_VALID(e.product_ids), CAST(e.product_ids AS JSON), JSON_ARRAY()),
+            '$[*]' COLUMNS(product_id INT PATH '$')
+        ) event_products
+        INNER JOIN tb_product p ON p.product_id = event_products.product_id
         WHERE {_visibility_filter(adult_yn)}
-          AND p.paid_open_date IS NOT NULL
-          AND p.paid_open_date >= :week_start
-          AND p.paid_open_date < :week_end
         HAVING COUNT(DISTINCT p.author_id) > 0
     """
-    return query, {"week_start": week_start, "week_end": week_end}
+    return query, {
+        "week_start": week_start,
+        "week_end": week_end,
+        "event_title_pattern": WEEKLY_PAID_NEW_EVENT_TITLE_PATTERN,
+    }
 
 
 def build_recent_episode_query(adult_yn: str | None) -> tuple[str, dict[str, Any]]:
