@@ -38,14 +38,28 @@ def test_paid_conversion_query_uses_monday_to_sunday_kst_window():
 
     assert week_start == datetime(2026, 6, 8)
     assert week_end == datetime(2026, 6, 15)
+    assert "weekly_paid_event AS" in query
+    assert "FROM tb_event_v2 e" in query
+    assert "e.start_date >= :week_start" in query
+    assert "e.start_date < :week_end" in query
+    assert "e.title LIKE :paid_event_keyword" in query
+    assert "e.account_name LIKE :paid_event_keyword" in query
+    assert "e.title LIKE :paid_event_compact_keyword" in query
+    assert "JSON_VALID(e.product_ids)" in query
+    assert "JSON_TABLE" in query
+    assert "e.product_ids" in query
+    assert "INNER JOIN tb_product p ON p.product_id = event_products.productId" in query
     assert "COUNT(DISTINCT p.author_id)" in query
-    assert "p.paid_open_date >= :week_start" in query
-    assert "p.paid_open_date < :week_end" in query
-    assert "p.paid_open_date IS NOT NULL" in query
     assert "CONCAT('이번 주 유료전환 작가님 ', COUNT(DISTINCT p.author_id), '명 축하드립니다.')" in query
     assert "HAVING COUNT(DISTINCT p.author_id) > 0" in query
     assert "p.ratings_code = 'all'" in query
-    assert params == {"week_start": week_start, "week_end": week_end}
+    assert "p.paid_open_date" not in query
+    assert params == {
+        "week_start": week_start,
+        "week_end": week_end,
+        "paid_event_keyword": "%유료화 신작%",
+        "paid_event_compact_keyword": "%유료신작%",
+    }
 
 
 def test_internal_metric_terms_are_blocked():

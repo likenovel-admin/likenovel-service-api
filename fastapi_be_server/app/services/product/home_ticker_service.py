@@ -96,20 +96,46 @@ def build_paid_conversion_summary_query(
     adult_yn: str | None,
 ) -> tuple[str, dict[str, Any]]:
     query = f"""
+        WITH weekly_paid_event AS (
+            SELECT
+                e.id,
+                e.product_ids,
+                e.start_date,
+                e.updated_date
+            FROM tb_event_v2 e
+            WHERE e.start_date >= :week_start
+              AND e.start_date < :week_end
+              AND (
+                  e.title LIKE :paid_event_keyword
+                  OR e.account_name LIKE :paid_event_keyword
+                  OR e.title LIKE :paid_event_compact_keyword
+                  OR e.account_name LIKE :paid_event_compact_keyword
+              )
+              AND JSON_VALID(e.product_ids)
+            ORDER BY e.start_date DESC, e.updated_date DESC, e.id DESC
+            LIMIT 1
+        )
         SELECT
             'paid_conversion_summary' AS itemType,
             NULL AS productId,
             CONCAT('이번 주 유료전환 작가님 ', COUNT(DISTINCT p.author_id), '명 축하드립니다.') AS message,
             100 AS priority,
             'weekly' AS freshness
-        FROM tb_product p
+        FROM weekly_paid_event e
+        INNER JOIN JSON_TABLE(
+            e.product_ids,
+            '$[*]' COLUMNS(productId INT PATH '$')
+        ) event_products
+        INNER JOIN tb_product p ON p.product_id = event_products.productId
         WHERE {_visibility_filter(adult_yn)}
-          AND p.paid_open_date IS NOT NULL
-          AND p.paid_open_date >= :week_start
-          AND p.paid_open_date < :week_end
         HAVING COUNT(DISTINCT p.author_id) > 0
     """
-    return query, {"week_start": week_start, "week_end": week_end}
+    return query, {
+        "week_start": week_start,
+        "week_end": week_end,
+        "paid_event_keyword": "%유료화 신작%",
+        "paid_event_compact_keyword": "%유료신작%",
+    }
 
 
 def build_recent_episode_query(adult_yn: str | None) -> tuple[str, dict[str, Any]]:
