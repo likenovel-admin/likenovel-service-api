@@ -136,13 +136,25 @@ async def get_product_simple_list(db: AsyncSession):
         db: 데이터베이스 세션
 
     Returns:
-        상품 ID와 제목이 포함된 간단 리스트
+        CMS 검색과 직접추천 preview에 필요한 작품 요약 리스트
     """
     query = text("""
+        WITH tmp_product_episode_summary AS (
+            SELECT product_id
+                 , COUNT(1) AS count_episode
+              FROM tb_product_episode
+             WHERE use_yn = 'Y'
+             GROUP BY product_id
+        )
         SELECT
-            product_id, title
-        FROM tb_product
-        ORDER BY created_date DESC
+            p.product_id,
+            p.title,
+            p.author_name AS author_nickname,
+            COALESCE(pe.count_episode, 0) AS count_episode,
+            p.last_episode_date
+        FROM tb_product p
+        LEFT JOIN tmp_product_episode_summary pe ON p.product_id = pe.product_id
+        ORDER BY p.created_date DESC
     """)
     result = await db.execute(query, {})
     rows = result.mappings().all()

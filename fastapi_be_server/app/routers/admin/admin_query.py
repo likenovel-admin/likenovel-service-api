@@ -4186,13 +4186,23 @@ async def get_platform_service_rate_config(
     tags=["CMS - 작품"],
     responses={
         200: {
-            "description": "작품 리스트 조회 (작품 ID, 제목만 포함)",
+            "description": "작품 리스트 조회 (작품 ID, 제목, 작가명, 회차수, 최근 회차 일자 포함)",
             "content": {
                 "application/json": {
                     "examples": {
                         "success_1": {
                             "summary": "",
-                            "value": {"data": [{"product_id": 1, "title": "제목"}]},
+                            "value": {
+                                "data": [
+                                    {
+                                        "product_id": 1,
+                                        "title": "제목",
+                                        "author_nickname": "작가명",
+                                        "count_episode": 10,
+                                        "last_episode_date": "2026-06-09T12:00:00",
+                                    }
+                                ]
+                            },
                         }
                     }
                 }
@@ -4232,7 +4242,7 @@ async def get_product_simple_list(
     user: Dict[str, Any] = Depends(chk_cur_user),
 ):
     """
-    작품 리스트 조회 (작품 ID, 제목만 포함)
+    작품 리스트 조회 (작품 ID, 제목, 작가명, 회차수, 최근 회차 일자 포함)
     """
     try:
         await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
@@ -4470,6 +4480,34 @@ async def product_ai_consent_list(
         search_word=search_word,
         page=page,
         count_per_page=count_per_page,
+        db=db,
+    )
+
+
+@router.get(
+    "/product-ai-consents/all",
+    tags=["CMS - AI 활용 동의 현황"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def product_ai_consent_list_for_download(
+    search_target: str = Query("", description="검색 타겟 (product-id|product-title|nickname)"),
+    search_word: str = Query("", description="검색어"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    작품별 AI 활용 동의 현황 엑셀 다운로드
+    """
+    try:
+        await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    except Exception as e:
+        raise e
+
+    return await admin_product_ai_consent_service.product_ai_consent_list(
+        search_target=search_target,
+        search_word=search_word,
+        page=-1,
+        count_per_page=-1,
         db=db,
     )
 
