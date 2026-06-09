@@ -60,12 +60,16 @@ def test_product_ai_consent_cms_admin_contract_exposes_all_products():
 
     assert "admin_product_ai_consent_service" in router
     assert '"/product-ai-consents"' in router
+    assert '"/product-ai-consents/all"' in router
     assert 'role="admin"' in router
 
     assert "FROM tb_product p" in service
     assert 'where_clauses = ["p.open_yn = ' not in service
     assert "WHERE p.open_yn = 'Y'" not in service
     assert "p.author_name AS nickname" in service
+    assert "COALESCE(u.email, '') AS author_email" in service
+    assert "LEFT JOIN tb_user u" in service
+    assert "u.user_id = p.user_id" in service
     assert "tb_product_episode e" in service
     assert "e.use_yn = 'Y'" in service
     assert "CASE WHEN p.open_yn = 'Y' THEN 'Y' ELSE 'N' END AS open_yn" in service
@@ -75,6 +79,7 @@ def test_product_ai_consent_cms_admin_contract_exposes_all_products():
     assert "context_status" in service
     assert "END AS websochat_enabled_yn" in service
     assert 'search_target == "product-id"' in service
+    assert "download_all = page == -1 or count_per_page == -1" in service
 
 
 def test_bulk_upload_products_default_ai_consents_to_yes():
