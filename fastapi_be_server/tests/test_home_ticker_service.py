@@ -145,14 +145,23 @@ def test_reader_momentum_query_contract():
     query, params = service.build_reader_momentum_query("N")
 
     assert "tb_product_trend_index pti" in query
-    assert "tb_product_count_variance pcv" not in query
-    assert "<', p.title, '>을 독자들이 이어 읽고 있습니다." in query
+    assert "tb_product_count_variance pcv" in query
+    assert "<', p.title, '>을 계속 읽는 독자가 늘고 있습니다." in query
     assert "pti.reading_rate >= :min_reading_rate" in query
     assert "p.count_hit >= :min_count_hit" in query
-    assert "ORDER BY pti.reading_rate DESC, p.count_hit DESC, p.product_id DESC" in query
+    assert "pcv.reading_rate_indicator > :min_reading_rate_indicator" in query
+    assert (
+        "ORDER BY pcv.reading_rate_indicator DESC, "
+        "pcv.count_hit_indicator DESC, pti.reading_rate DESC, p.product_id DESC"
+    ) in query
+    assert "LIMIT 3" in query
     assert "'metric_snapshot' AS freshness" in query
     _assert_public_copy_has_no_internal_metric_terms(query)
-    assert params == {"min_reading_rate": 50, "min_count_hit": 30}
+    assert params == {
+        "min_reading_rate": 50,
+        "min_count_hit": 30,
+        "min_reading_rate_indicator": 0,
+    }
 
 
 def test_new_product_query_contract():

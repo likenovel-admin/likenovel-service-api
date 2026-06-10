@@ -191,20 +191,23 @@ def build_reader_momentum_query(adult_yn: str | None) -> tuple[str, dict[str, An
         SELECT
             'reader_momentum' AS itemType,
             p.product_id AS productId,
-            CONCAT('<', p.title, '>을 독자들이 이어 읽고 있습니다.') AS message,
+            CONCAT('<', p.title, '>을 계속 읽는 독자가 늘고 있습니다.') AS message,
             70 AS priority,
             'metric_snapshot' AS freshness
         FROM tb_product p
         INNER JOIN tb_product_trend_index pti ON pti.product_id = p.product_id
+        INNER JOIN tb_product_count_variance pcv ON pcv.product_id = p.product_id
         WHERE {_visibility_filter(adult_yn)}
           AND pti.reading_rate >= :min_reading_rate
           AND p.count_hit >= :min_count_hit
-        ORDER BY pti.reading_rate DESC, p.count_hit DESC, p.product_id DESC
-        LIMIT 5
+          AND pcv.reading_rate_indicator > :min_reading_rate_indicator
+        ORDER BY pcv.reading_rate_indicator DESC, pcv.count_hit_indicator DESC, pti.reading_rate DESC, p.product_id DESC
+        LIMIT 3
     """
     return query, {
         "min_reading_rate": 50,
         "min_count_hit": 30,
+        "min_reading_rate_indicator": 0,
     }
 
 
