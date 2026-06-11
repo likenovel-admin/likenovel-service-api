@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from app.const import CommonConstants, settings
 from app.exceptions import CustomResponseException
+from app.services.common import ai_provider_health_service
 from app.utils.query import get_nickname_sub_query
 from app.utils.response import build_paginated_response
 
@@ -1796,6 +1797,7 @@ async def ai_api_usage_statistics(
         "summary": summary,
         "results": rows,
         "model_summary": model_rows,
+        "provider_health": await ai_provider_health_service.get_ai_provider_health_summary(db),
     }
 
 
