@@ -1,15 +1,7 @@
 import jwt
 import time
 
-# AuthKey_C9HZUNW6B4.p8
-"""
------BEGIN PRIVATE KEY-----
-MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgi38CZLAvp6HQKbWc
-F2ntisvLcHwp5zPDsClf93f4vumgCgYIKoZIzj0DAQehRANCAAR1LW1HdWMzEja3
-UKa6jm82VeSB/+ns8imk3OtPm32o1Gle+emW+T+LaIDuZAmY9dqFnghb0DoI7pDE
-wDzTAFEJ
------END PRIVATE KEY-----
-"""
+# Reads the Apple private key from an untracked .p8 file.
 
 with open('AuthKey_C9HZUNW6B4.p8', 'r') as kf:
     pri_key = kf.read()
@@ -31,4 +23,3 @@ client_secret = jwt.encode(jwt_payload, pri_key, algorithm="ES256", headers=jwt_
 
 # 새로 생성된 애플 시크릿 키 값
 print(client_secret)
-

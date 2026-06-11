@@ -200,7 +200,7 @@ class SignoutReqBody(AuthBase):
     # 로그아웃 요청 시 클라이언트에서 보내는 request body
     refresh_token: str = Field(
         examples=[
-            "eyJhbGciOiJIUzUxMiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICI4ZmRiZDhjNS1iOTNkLTRmN2EtYWNmOS0xNjljYzc5YzZiNzgifQ.eyJleHAiOjE3Mjk0MjMzMDUsImlhdCI6MTcyOTQyMTUwNSwianRpIjoiMDQyZWRmMWYtZWJmNS00ODQyLTg4Y2YtOTRmNWIyMzUwNGZlIiwiaXNzIjoiaHR0cHM6Ly9hdXRoLmxpa2Vub3ZlbC5kZXYvcmVhbG1zL2xpa2Vub3ZlbCIsImF1ZCI6Imh0dHBzOi8vYXV0aC5saWtlbm92ZWwuZGV2L3JlYWxtcy9saWtlbm92ZWwiLCJzdWIiOiI2NWY2MzVmYS00ZGQzLTQxOTYtOGYwMS1iOGIyNzFiMTEzMjgiLCJ0eXAiOiJSZWZyZXNoIiwiYXpwIjoic2VydmljZSIsInNpZCI6IjQ0YTA2OGRkLTIyOGEtNGY2Zi1iMjdkLWVkZGU2ZjY3YzBlOSIsInNjb3BlIjoib3BlbmlkIGVtYWlsIGJhc2ljIHdlYi1vcmlnaW5zIHJvbGVzIGFjciBwcm9maWxlIn0.NOXFilbGjROEXmq5T8_922WCaADl0c68cqsvgrhxIMrJwbV6Qhhhk2X2gszbFOkbLlFyZSpD6GuMuRrkAYarOQ"
+            "<JWT_EXAMPLE>"
         ],
         description="발급받은 리프레시 토큰",
     )
@@ -210,13 +210,13 @@ class TokenReissueReqBody(AuthBase):
     # access 토큰 재발급 요청 시 클라이언트에서 보내는 request body
     access_token: str = Field(
         examples=[
-            "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJ4VUZDMmdJenVMM0c5X0tFb3o4YkJEcFRUOGM5ME1aUHZCWEdKRzZ4dGdZIn0.eyJleHAiOjE3Mjk0MjI3MDUsImlhdCI6MTcyOTQyMTUwNSwianRpIjoiNjY0MmY5ZWQtYTVjOC00NzhkLWFlZjYtZWNjNmZlMGZmNzRiIiwiaXNzIjoiaHR0cHM6Ly9hdXRoLmxpa2Vub3ZlbC5kZXYvcmVhbG1zL2xpa2Vub3ZlbCIsImF1ZCI6ImFjY291bnQiLCJzdWIiOiI2NWY2MzVmYS00ZGQzLTQxOTYtOGYwMS1iOGIyNzFiMTEzMjgiLCJ0eXAiOiJCZWFyZXIiLCJhenAiOiJzZXJ2aWNlIiwic2lkIjoiNDRhMDY4ZGQtMjI4YS00ZjZmLWIyN2QtZWRkZTZmNjdjMGU5IiwiYWNyIjoiMSIsImFsbG93ZWQtb3JpZ2lucyI6WyIiXSwicmVzb3VyY2VfYWNjZXNzIjp7ImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyJdfX0sInNjb3BlIjoib3BlbmlkIGVtYWlsIHByb2ZpbGUiLCJlbWFpbF92ZXJpZmllZCI6ZmFsc2UsInByZWZlcnJlZF91c2VybmFtZSI6InRlc3RAdGVzdC5jb20iLCJlbWFpbCI6InRlc3RAdGVzdC5jb20ifQ.GXdRaDNZaaXhUvtSB_O26KtlHzT5PxzoEdVG_EfPBpkOD7Q191989H9QmimMR3_jfmepVbQKXIiEAa2-RP1MGEC5y4Iw6Lk73q-zSssKfHugvk8DEvAAOR98BK8nqEKC2Sdw9Q3ehrQQqwBfDwL8IpZsD9IXJhQj3Wzm_wvpSWDnTXP5graXgyHb6yMPLpbtknSfPNmaPpfPOoTSdqzclWGy1mReufoE1FOFKa_HJaf-YeV5AXtuJkORUGCdTsHNofgkQ89qrPwexvyB-uKxrz5UrzE6tKLmcR7l1t13bUtJ-_gJkAhzOQVG4fZhsfezFpcXRNuhD9J3K1wyDZdWYQ"
+            "<JWT_EXAMPLE>"
         ],
         description="발급받은 액세스 토큰",
     )
     refresh_token: str = Field(
         examples=[
-            "eyJhbGciOiJIUzUxMiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICI4ZmRiZDhjNS1iOTNkLTRmN2EtYWNmOS0xNjljYzc5YzZiNzgifQ.eyJleHAiOjE3Mjk0MjMzMDUsImlhdCI6MTcyOTQyMTUwNSwianRpIjoiMDQyZWRmMWYtZWJmNS00ODQyLTg4Y2YtOTRmNWIyMzUwNGZlIiwiaXNzIjoiaHR0cHM6Ly9hdXRoLmxpa2Vub3ZlbC5kZXYvcmVhbG1zL2xpa2Vub3ZlbCIsImF1ZCI6Imh0dHBzOi8vYXV0aC5saWtlbm92ZWwuZGV2L3JlYWxtcy9saWtlbm92ZWwiLCJzdWIiOiI2NWY2MzVmYS00ZGQzLTQxOTYtOGYwMS1iOGIyNzFiMTEzMjgiLCJ0eXAiOiJSZWZyZXNoIiwiYXpwIjoic2VydmljZSIsInNpZCI6IjQ0YTA2OGRkLTIyOGEtNGY2Zi1iMjdkLWVkZGU2ZjY3YzBlOSIsInNjb3BlIjoib3BlbmlkIGVtYWlsIGJhc2ljIHdlYi1vcmlnaW5zIHJvbGVzIGFjciBwcm9maWxlIn0.NOXFilbGjROEXmq5T8_922WCaADl0c68cqsvgrhxIMrJwbV6Qhhhk2X2gszbFOkbLlFyZSpD6GuMuRrkAYarOQ"
+            "<JWT_EXAMPLE>"
         ],
         description="발급받은 리프레시 토큰",
     )
@@ -232,7 +232,7 @@ class TokenPartnerRelayIssueReqBody(AuthBase):
     # Service -> Partner 릴레이 발급 요청
     refresh_token: str = Field(
         examples=[
-            "eyJhbGciOiJIUzUxMiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICI4ZmRiZDhjNS1iOTNkLTRmN2EtYWNmOS0xNjljYzc5YzZiNzgifQ.eyJleHAiOjE3Mjk0MjMzMDUsImlhdCI6MTcyOTQyMTUwNSwianRpIjoiMDQyZWRmMWYtZWJmNS00ODQyLTg4Y2YtOTRmNWIyMzUwNGZlIiwiaXNzIjoiaHR0cHM6Ly9hdXRoLmxpa2Vub3ZlbC5kZXYvcmVhbG1zL2xpa2Vub3ZlbCIsImF1ZCI6Imh0dHBzOi8vYXV0aC5saWtlbm92ZWwuZGV2L3JlYWxtcy9saWtlbm92ZWwiLCJzdWIiOiI2NWY2MzVmYS00ZGQzLTQxOTYtOGYwMS1iOGIyNzFiMTEzMjgiLCJ0eXAiOiJSZWZyZXNoIiwiYXpwIjoic2VydmljZSIsInNpZCI6IjQ0YTA2OGRkLTIyOGEtNGY2Zi1iMjdkLWVkZGU2ZjY3YzBlOSIsInNjb3BlIjoib3BlbmlkIGVtYWlsIGJhc2ljIHdlYi1vcmlnaW5zIHJvbGVzIGFjciBwcm9maWxlIn0.NOXFilbGjROEXmq5T8_922WCaADl0c68cqsvgrhxIMrJwbV6Qhhhk2X2gszbFOkbLlFyZSpD6GuMuRrkAYarOQ"
+            "<JWT_EXAMPLE>"
         ],
         description="릴레이 발급용 리프레시 토큰",
     )
