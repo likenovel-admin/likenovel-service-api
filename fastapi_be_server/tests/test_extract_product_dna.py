@@ -679,3 +679,80 @@ class AiDnaEmptyAxisPolicyTest(TestCase):
             self.assertEqual(schema["properties"]["axis_labels"]["properties"][axis]["minItems"], 0)
         self.assertIn("unmapped_concepts", schema["properties"])
         self.assertIn("unmapped_concepts", schema["required"])
+
+
+class AiDnaLibrarianCopyTest(TestCase):
+    """AI 사서 노출 카피(librarian) 검증: 금칙어/개수 미달은 None 강등(프론트 fallback), 분석 실패 아님."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module()
+
+    def test_valid_librarian_passes_through(self):
+        result = self.module._normalize_librarian({
+            "librarian": {
+                "intro": "해고된 날 머릿속에 대문호가 깃들었어요. 유쾌한 이야기를 좋아하면 잘 맞아요.",
+                "points": ["출발점은 게임 개발이에요.", "주인공은 개발자예요.", "코미디를 좋아하면 어울려요."],
+                "chips": ["먼치킨", "게임개발", "코미디"],
+            }
+        })
+        self.assertTrue(result["librarian_intro"].startswith("해고된 날"))
+        self.assertEqual(len(result["librarian_points"]), 3)
+        self.assertEqual(result["librarian_chips"], ["먼치킨", "게임개발", "코미디"])
+
+    def test_banned_words_demote_to_none_not_failure(self):
+        result = self.module._normalize_librarian({
+            "librarian": {
+                "intro": "성장 서사가 강하게 깔린 작품이에요.",
+                "points": ["이 결이 좋아요.", "축으로 움직여요.", "정상 문장이에요."],
+                "chips": ["먼치킨", "서사", "텍스트", "회귀"],
+            }
+        })
+        self.assertIsNone(result["librarian_intro"])  # 서사 포함
+        self.assertIsNone(result["librarian_points"])  # 결이/축으로 포함
+        self.assertEqual(result["librarian_chips"], ["먼치킨", "회귀"])  # 금칙 칩만 제거
+
+    def test_banned_re_does_not_flag_normal_words(self):
+        # 결혼/대결/축제 같은 정상 단어는 오탐하지 않는다
+        for text in ("결혼을 앞둔 주인공이에요.", "축제에서 사건이 벌어져요.", "대결 구도가 뚜렷해요."):
+            self.assertIsNone(self.module._LIBRARIAN_BANNED_RE.search(text), text)
+
+    def test_missing_or_short_librarian_falls_back(self):
+        self.assertEqual(
+            self.module._normalize_librarian({}),
+            {"librarian_intro": None, "librarian_points": None, "librarian_chips": None},
+        )
+        result = self.module._normalize_librarian({
+            "librarian": {"intro": "한 줄이에요.", "points": ["하나", "둘"], "chips": []}
+        })
+        self.assertIsNone(result["librarian_points"])  # 3개 미만
+        self.assertIsNone(result["librarian_chips"])
+
+    def test_normalize_payload_includes_librarian_keys(self):
+        allowed = {axis: {"성장"} if axis == "목" else {"현대"} for axis in ("세", "직", "능", "연", "작", "타", "목")}
+        payload = {
+            "summary": {
+                "protagonist_type": "개발자",
+                "protagonist_desc": "설명",
+                "heroine_type": "없음",
+                "heroine_weight": "none",
+                "mood": "유쾌",
+                "pacing": "fast",
+                "premise": "전제",
+                "hook": "훅",
+                "themes": ["성장"],
+                "taste_tags": ["먼치킨"],
+                "librarian": {
+                    "intro": "유쾌한 이야기예요.",
+                    "points": ["하나예요.", "둘이에요.", "셋이에요."],
+                    "chips": ["먼치킨", "코미디", "현대판타지"],
+                },
+            },
+            "axis_labels": {axis: [] for axis in ("세", "직", "능", "연", "작", "타", "목")},
+            "axis_confidence": {},
+            "overall_confidence": 0.9,
+        }
+        dna = self.module.normalize_payload(payload, allowed)
+        self.assertEqual(dna["librarian_intro"], "유쾌한 이야기예요.")
+        self.assertEqual(len(dna["librarian_points"]), 3)
+        self.assertEqual(len(dna["librarian_chips"]), 3)

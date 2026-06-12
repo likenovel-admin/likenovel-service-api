@@ -425,6 +425,9 @@ def _product_ai_brief_row_to_dict(row) -> dict:
         "protagonistMaterialTags": _as_list(data.get("protagonist_material_tags")),
         "styleTags": _as_list(data.get("axis_style_tags")),
         "romanceTags": _as_list(data.get("axis_romance_tags")),
+        "librarianIntro": _compact_brief_text(data.get("librarian_intro"), 300),
+        "librarianPoints": _as_list(data.get("librarian_points")),
+        "librarianChips": _as_list(data.get("librarian_chips")),
     }
 
 
@@ -452,7 +455,10 @@ async def get_product_ai_briefs(
             m.protagonist_job_tags,
             m.protagonist_material_tags,
             m.axis_style_tags,
-            m.axis_romance_tags
+            m.axis_romance_tags,
+            m.librarian_intro,
+            m.librarian_points,
+            m.librarian_chips
         FROM tb_product_ai_metadata m
         INNER JOIN tb_product p ON p.product_id = m.product_id
         WHERE m.product_id IN :product_ids
