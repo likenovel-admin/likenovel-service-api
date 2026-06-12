@@ -54,6 +54,88 @@ MAIN_RULE_SLOT_DEFINITIONS = [
 ]
 
 WEBSOCHAT_CONTEXT_DISABLED_STATUS = "disabled"
+OWNER_EPISODE_DETAIL_ROLES = {"admin", "CP", "editor"}
+EPISODE_LIST_ORDER_BY_ALLOWLIST = {
+    "episodeNo": "episodeNo",
+    "createdDate": "createdDate",
+    "date": "createdDate",
+    "episodeId": "episodeId",
+}
+EPISODE_LIST_ORDER_DIR_ALLOWLIST = {"asc", "desc"}
+EPISODE_LIST_MAX_LIMIT = 100
+
+
+def _raise_invalid_product_query() -> None:
+    raise CustomResponseException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        message=ErrorMessages.INVALID_PRODUCT_INFO,
+    )
+
+
+def _normalize_episode_list_query_options(
+    *,
+    page: int | None,
+    limit: int | None,
+    order_by: str | None,
+    order_dir: str | None,
+) -> dict[str, int | str]:
+    normalized_page = page if page else settings.PAGINATION_DEFAULT_PAGE_NO
+    normalized_limit = limit if limit else settings.PAGINATION_DEFAULT_LIMIT
+    if normalized_page < 1 or normalized_limit < 1 or normalized_limit > EPISODE_LIST_MAX_LIMIT:
+        _raise_invalid_product_query()
+
+    order_by_key = order_by or "episodeNo"
+    normalized_order_by = EPISODE_LIST_ORDER_BY_ALLOWLIST.get(order_by_key)
+    if normalized_order_by is None:
+        _raise_invalid_product_query()
+
+    normalized_order_dir = (order_dir or settings.PAGINATION_ORDER_DIRECTION_ASC).lower()
+    if normalized_order_dir not in EPISODE_LIST_ORDER_DIR_ALLOWLIST:
+        _raise_invalid_product_query()
+
+    return {
+        "page": normalized_page,
+        "limit": normalized_limit,
+        "order_by": normalized_order_by,
+        "order_dir": normalized_order_dir,
+    }
+
+
+def _can_read_owner_product_detail_episodes(
+    *,
+    user_id: int | None,
+    current_user_role: str | None,
+    product_owner_user_id: int | None,
+    product_author_id: int | None,
+) -> bool:
+    if user_id is None:
+        return False
+    if current_user_role in OWNER_EPISODE_DETAIL_ROLES:
+        return True
+    return user_id in {product_owner_user_id, product_author_id}
+
+
+def _build_product_detail_episode_visibility_predicate(
+    *, can_read_owner_episodes: bool
+) -> str:
+    if can_read_owner_episodes:
+        return "1=1"
+
+    return """
+        (
+            e.open_yn = 'Y'
+            OR EXISTS (
+                select 1 from tb_user_productbook pb
+                where (pb.episode_id = e.episode_id
+                       OR (pb.episode_id IS NULL
+                           AND (pb.product_id = e.product_id
+                                OR pb.product_id IS NULL)))
+                  AND pb.user_id = :user_id
+                  AND pb.use_yn = 'Y'
+                  AND (pb.rental_expired_date IS NULL OR pb.rental_expired_date > NOW())
+            )
+        )
+    """
 
 
 def _normalize_websochat_enabled_yn(value: str | None) -> str:
@@ -179,6 +261,9 @@ async def _resolve_current_user_role(kc_user_id: str, db: AsyncSession) -> str:
 
     if row.get("apply_type") == "cp":
         return "CP"
+
+    if row.get("apply_type") == "editor":
+        return "editor"
 
     return "author"
 
@@ -1261,10 +1346,16 @@ async def episodes_by_product_id(
     """
     ?묓뭹 - ?먰뵾?뚮뱶 紐⑸줉
     """
-    page = page if page else settings.PAGINATION_DEFAULT_PAGE_NO
-    limit = limit if limit else settings.PAGINATION_DEFAULT_LIMIT
-    order_by = order_by if order_by else "episodeNo"
-    order_dir = order_dir if order_dir else settings.PAGINATION_ORDER_DIRECTION_ASC
+    options = _normalize_episode_list_query_options(
+        page=page,
+        limit=limit,
+        order_by=order_by,
+        order_dir=order_dir,
+    )
+    page = int(options["page"])
+    limit = int(options["limit"])
+    order_by = str(options["order_by"])
+    order_dir = str(options["order_dir"])
 
     user_id = await get_user_id(kc_user_id, db)
 
@@ -1328,9 +1419,17 @@ async def episodes_by_product_id(
                     )
                 )
             order by {order_by} {order_dir}
-            limit {limit} offset {(page - 1) * limit}
+            limit :limit offset :offset
         """)
-        result = await db.execute(query, {"user_id": user_id, "product_id": product_id})
+        result = await db.execute(
+            query,
+            {
+                "user_id": user_id,
+                "product_id": product_id,
+                "limit": limit,
+                "offset": (page - 1) * limit,
+            },
+        )
         rows = result.mappings().all()
         episodes = [dict(row) for row in rows]
 
@@ -1507,6 +1606,24 @@ async def product_details_group_by_product_id(
         result = await db.execute(query, {"product_id": product_id, "user_id": user_id})
         rows = result.mappings().all()
         product = convert_product_data(rows[0]) if rows else None
+        can_read_owner_episodes = False
+
+        if product:
+            owner_scope_query = text("""
+                select user_id as ownerUserId, author_id as authorId
+                from tb_product
+                where product_id = :product_id
+            """)
+            owner_scope_result = await db.execute(
+                owner_scope_query, {"product_id": product_id}
+            )
+            owner_scope_row = owner_scope_result.mappings().first() or {}
+            can_read_owner_episodes = _can_read_owner_product_detail_episodes(
+                user_id=user_id,
+                current_user_role=current_user_role,
+                product_owner_user_id=owner_scope_row.get("ownerUserId"),
+                product_author_id=owner_scope_row.get("authorId"),
+            )
 
         if product:
             synced_latest_episode_query = text(
@@ -1557,10 +1674,9 @@ async def product_details_group_by_product_id(
                 }
 
         # 濡쒓렇?명븳 ?ъ슜?먯씤 寃쎌슦 ownType 議고쉶瑜??꾪빐 user_id ?꾨떖
-        episode_query_params = {"product_id": product_id}
+        episode_query_params = {"product_id": product_id, "user_id": user_id}
         own_type_query = ""
         if user_id and user_id != -1:
-            episode_query_params["user_id"] = user_id
             own_type_query = """
                 , (select own_type from tb_user_productbook where (
                     episode_id = e.episode_id
@@ -1635,6 +1751,10 @@ async def product_details_group_by_product_id(
                   on pea_accepted.episode_id = e.episode_id
             """
 
+        episode_visibility_predicate = _build_product_detail_episode_visibility_predicate(
+            can_read_owner_episodes=can_read_owner_episodes
+        )
+
         query = text(f"""
             select
                 e.episode_id as episodeId,
@@ -1705,6 +1825,7 @@ async def product_details_group_by_product_id(
             from tb_product_episode e
             {latest_apply_join_query}
             where e.product_id = :product_id and e.use_yn = 'Y'
+              and {episode_visibility_predicate}
         """)
         result = await db.execute(query, episode_query_params)
         rows = result.mappings().all()
