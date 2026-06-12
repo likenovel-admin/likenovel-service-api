@@ -26,45 +26,64 @@ ALLOWED_EXCLUDE_YN = {"Y", "N"}
 ALLOWED_HEROINE_WEIGHT = {"high", "mid", "low", "none"}
 ALLOWED_PACING = {"fast", "medium", "slow"}
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
+# min은 전 축 0 — 부합 라벨이 없으면 빈 배열이 정답(근접 라벨 강제 매핑 금지)
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
-    "세": (1, 3),
-    "직": (1, 2),
-    "능": (1, 4),
+    "세": (0, 3),
+    "직": (0, 2),
+    "능": (0, 4),
     "연": (0, 2),
-    "작": (1, 3),
-    "타": (1, 3),
-    "목": (1, 1),
+    "작": (0, 3),
+    "타": (0, 3),
+    "목": (0, 1),
 }
-DEFAULT_GOAL_LABEL = "성장"
 
 DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EXTRACTOR_V1이다.
-입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 7축 메타를 추출한다.
-출력은 반드시 JSON 단일 객체만 허용한다. 설명문/마크다운/코드블록 금지.
+입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 작품 신호와 설명 메타를 추출한다.
+출력은 반드시 JSON 단일 객체만 허용한다. 설명문, 마크다운, 코드블록 금지.
 
 핵심 규칙:
 1) 허용 라벨 목록 외 신규 라벨 생성 금지.
 1-1) 각 라벨의 의미는 "라벨 정의" 섹션을 참고하여 판단한다. 이름만으로 추측하지 않는다.
-1-2) summary의 모든 필드를 빈 값 없이 채운다. null 금지. themes/taste_tags도 각각 1개 이상.
-1-3) heroine이 없는 작품은 heroine_type에 주요 여성 캐릭터를 기재하고, heroine_weight는 "none"으로 설정한다.
-2) 출력 JSON 스키마를 정확히 지킨다.
-3) 목표축(목)은 1개만 선택. 라벨 정의를 참고하여 작품의 핵심 목표에 가장 부합하는 라벨을 선택한다.
-4) 연애축(연)은 연애/케미가 드러날 때만 선택 가능. 없으면 빈 배열 가능.
+1-2) 라벨은 상호배타 장르 분류가 아니라 AI추천구좌와 AI사서에서 작품을 엮는 작품 신호다.
+1-2-1) 내부 그룹 키 의미는 다음과 같다. 세=무대, 세계관, 기관, 세력, 반복 배경, 직=직업, 직위, 사회적 역할, 전투 클래스, 능=능력, 시스템 메커니즘, 전투·성장 도구, 연=히로인·관계·애정 구도 신호, 작=작풍·정서·전개감·서사 질감, 타=주인공 상태, 서사 포지션, 핵심 세력과 속성, 목=반복 목표, 메인 루프, 주된 활동.
+1-3) 주인공, 핵심 인물, 핵심 세력, 반복 소재, 갈등 축, 주요 배경이 강하게 연결되면 같은 작품에 여러 라벨을 동시에 부여한다.
+1-4) 문파, 세력, 공간 라벨은 주인공 소속으로만 한정하지 않는다. 단순 언급이나 스쳐 지나가는 배경만으로는 선택하지 않는다.
+1-4-1) 단순 언급, 비유 표현, 지나가는 배경, 1회성 몬스터, 직업, 장소, 농담성 대사만으로는 라벨을 선택하지 않는다.
+1-5) 조합 라벨을 새로 만들지 않는다. 예: "아카데미빙의" 대신 "아카데미"와 "빙의"를 각각 선택한다.
+1-6) 라벨 배열은 강한 근거 순서로 정렬한다. 제목, 태그, 줄거리, 초반 회차에서 반복되거나 갈등·목표·배경에 직접 연결된 라벨을 앞에 둔다.
+1-6-1) 최대 개수를 채우려 하지 않는다. 두 번째 이후 라벨은 제목, 태그, 줄거리, 초반 회차에서 독립 근거가 확인될 때만 선택한다.
+1-6-2) 시대 배경 라벨과 기관, 세력, 반복 공간 라벨은 서로 대체하지 않는다. 중세 세계에서 전사 아카데미 입학이 초반 목표라면 중세와 아카데미를 함께 선택한다.
+1-7) 근거가 약하면 라벨을 선택하지 않는다. 어떤 그룹이든 부합하는 허용 라벨이 없으면 빈 배열로 둔다. 가장 가까운 라벨로 대체하지 않는다.
+1-7-1) 상태창은 스탯, 스킬, 업적을 보여주는 정보 창이고, 시스템은 퀘스트·보상·페널티·상점·레벨업을 집행하는 메커니즘이다. 정보 표시만 있으면 상태창만 선택한다.
+1-7-2) 회귀는 과거 특정 시점으로 돌아오는 1회성 또는 제한적 인생 재시작, 무한회귀는 실패 때마다 반복 재시도, 루프는 특정 사건·하루·구간 반복, 빙의는 타인의 몸이나 작품 속 인물 신분, 환생은 새 육체와 생애, 귀환자는 장기 생존 후 원래 세계 복귀, 차원이동은 살아 있는 상태의 세계 이동으로 구분한다.
+1-7-3) 아카데미는 특수능력 교육기관, 학원은 현대 학교생활, 청춘, 교우관계, 학교는 물리적 학교 공간 사건이 중심일 때만 선택한다.
+1-7-4) 하렘은 복수의 이성 캐릭터가 명확한 애정, 소유욕, 관계 긴장을 보일 때만, 조력자는 단순 도움 제공이 아니라 동등한 파트너십과 반복 동행이 작품 매력일 때만 선택한다.
+1-7-5) 직 라벨은 실제 직업, 신분, 역할, 전투 클래스가 직접 확인될 때만 선택한다. 세계를 구하거나 사람을 구하는 목표만으로 소방관, 의사, 경찰 같은 직업을 추정하지 않는다.
+1-7-6) 아카데미 입학, 편입, 선발시험, 평가전, 수련, 교사, 교수, 교관 활동이 초반 목표나 반복 사건이면 물리적 캠퍼스 장면이 적어도 아카데미를 선택한다.
+1-8) summary의 모든 필드를 빈 값 없이 채운다. null 금지. themes와 taste_tags도 각각 1개 이상.
+1-9) heroine이 없는 작품은 heroine_type에 주요 여성 캐릭터를 기재하고, heroine_weight는 "none"으로 설정한다.
+2) 출력 JSON 스키마를 정확히 지킨다. axis_* 이름은 저장용 내부 키이며 판단 기준은 작품 신호와 작품 연결 라벨이다.
+3) 목표 라벨 그룹(목)은 최대 1개. 라벨 정의를 참고하여 작품의 핵심 목표에 가장 부합하는 라벨을 선택하고, 부합하는 허용 라벨이 없으면 빈 배열로 둔다.
+4) 관계와 케미 라벨 그룹(연)은 연애와 케미가 드러날 때만 선택 가능. 없으면 빈 배열 가능.
 5) confidence는 0~1 범위 숫자.
-6) axis_label_scores는 축별 라벨 점수 목록으로 작성하고 각 score는 0~1 범위 숫자다.
-7) evidence는 회차 근거 중심으로 짧게 작성한다.
-8) episode_summary_text는 웹소설 전문 편집자 관점으로 작성한다.
-9) episode_summary_text는 분석 대상 각 회차마다 정확히 3문장으로 요약한다.
-10) 각 문장은 반드시 "누가 / 무엇을 / 왜" 구조가 드러나야 한다.
-11) 갈등 심화, 전환점, 복선 배치·회수, 관계 변화 같은 서사적 기능을 우선 반영한다.
-12) 플롯에 영향 없는 묘사/감상은 제외한다.
-13) 복선 또는 클리프행어가 있으면 해당 회차의 마지막 문장에서 암시한다.
-14) 고유명사(인물명, 지명, 스킬명 등)는 원문 그대로 유지한다.
-15) summary.protagonist_desc와 summary.episode_summary_text는 존댓말 없이 간결한 서술체(~했다, ~이다)로 작성한다.
-15-1) summary.premise와 summary.hook은 AI 사서 공개 소개에 그대로 쓰이므로 독자에게 말하듯 자연스러운 해요체로 작성한다. "다", "합니다", "입니다" 종결을 쓰지 않는다.
-16) episode_summary_text는 줄바꿈 단위로 "<회차번호>화: <3문장 요약>" 형식을 지키고 최대 10화까지만 작성한다.
-17) 설명형 메타(summary.protagonist_desc/premise/hook/episode_summary_text)는 한국어로만 작성하고, 고유명사 외 영문 표현을 남발하지 않는다.
-18) 설명형 메타는 코드북 라벨 나열/복붙이 아니라 서사 정보 중심으로 작성한다.
-19) 문자열 값 앞뒤에 불필요한 따옴표/백틱 문자를 넣지 않는다.
+6) axis_label_scores는 작품 연결 라벨별 확신도 목록으로 작성하고 각 score는 0~1 범위 숫자다.
+7) evidence는 작품 신호를 선택한 회차 근거 중심으로 짧게 작성한다.
+8) summary.premise는 핵심 설정이다. 작품을 움직이는 기본 전제, 규칙, 상황을 구체적으로 쓴다.
+9) summary.hook은 초반 진입 포인트다. 광고 카피가 아니라 초반 1~3화에서 독자가 다음 화를 누르게 되는 구체적 사건, 위기, 목표, 반전, 보상 약속을 쓴다.
+10) summary.hook에 "흥미진진한", "몰입감 있는", "기대되는" 같은 추상 홍보문구, 장르와 라벨 나열, 본문에 없는 기대감 생성을 쓰지 않는다.
+11) episode_summary_text는 웹소설 전문 편집자 관점으로 작성한다.
+12) episode_summary_text는 분석 대상 각 회차마다 정확히 3문장으로 요약한다.
+13) 각 문장은 반드시 "누가, 무엇을, 왜" 구조가 드러나야 한다.
+14) 갈등 심화, 전환점, 복선 배치·회수, 관계 변화 같은 서사적 기능을 우선 반영한다.
+15) 플롯에 영향 없는 묘사와 감상은 제외한다.
+16) 복선 또는 클리프행어가 있으면 해당 회차의 마지막 문장에서 암시한다.
+17) 고유명사(인물명, 지명, 스킬명 등)는 원문 그대로 유지한다.
+18) summary.protagonist_desc와 summary.episode_summary_text는 존댓말 없이 간결한 서술체(~했다, ~이다)로 작성한다.
+18-1) summary.premise(핵심 설정)와 summary.hook(초반 진입 포인트)은 AI 사서 공개 소개에 그대로 쓰이므로 독자에게 말하듯 자연스러운 해요체로 작성한다. "다", "합니다", "입니다" 종결을 쓰지 않는다.
+19) episode_summary_text는 줄바꿈 단위로 "<회차번호>화: <3문장 요약>" 형식을 지키고 최대 10화까지만 작성한다.
+20) 설명형 메타(summary.protagonist_desc, premise, hook, episode_summary_text)는 한국어로만 작성하고, 고유명사 외 영문 표현을 남발하지 않는다.
+21) 설명형 메타는 코드북 라벨 나열이나 복붙이 아니라 서사 정보 중심으로 작성한다.
+22) 문자열 값 앞뒤에 불필요한 따옴표와 백틱 문자를 넣지 않는다.
 """
 
 DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하세요.
@@ -78,10 +97,10 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
 분석요청 회차수: {n_requested}
 실제 분석 회차수: {n_received}
 
-허용 라벨(축별 SSOT JSON):
+허용 작품 연결 라벨(내부 그룹 키 SSOT JSON):
 {allowed_labels_json}
 
-라벨 정의(분류 기준):
+라벨 정의(작품 신호 판정 기준):
 {label_definitions_text}
 
 분석 회차 본문:
@@ -418,6 +437,152 @@ def _safe_axis_labels(
     return items
 
 
+def _flatten_text_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            parts.extend(_flatten_text_values(item))
+        return parts
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for item in value.values():
+            parts.extend(_flatten_text_values(item))
+        return parts
+    return []
+
+
+def _payload_evidence_text(payload: dict[str, Any], source_text: str = "") -> str:
+    parts = [source_text]
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        parts.extend(_flatten_text_values(summary))
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict):
+        parts.extend(_flatten_text_values(evidence))
+    return "\n".join(part for part in parts if part)
+
+
+def _has_academy_evidence(text: str) -> bool:
+    if "아카데미" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "입학",
+            "편입",
+            "선발시험",
+            "평가전",
+            "강의",
+            "수련",
+            "교사",
+            "교수",
+            "교관",
+            "아카데미생",
+            "아카데미 학생",
+            "아카데미 파티",
+            "전사 아카데미",
+            "마법 아카데미",
+        )
+    )
+
+
+def _has_status_window_evidence(text: str) -> bool:
+    negative_markers = ("상태창이나 시스템은 없", "상태창은 없", "상태창 없음")
+    if any(marker in text for marker in negative_markers):
+        return False
+    return any(
+        marker in text
+        for marker in ("상태창", "스탯", "능력치", "업적", "눈앞 UI", "정보 인터페이스")
+    )
+
+
+def _has_buff_evidence(text: str) -> bool:
+    return "버프" in text or ("계약" in text and any(marker in text for marker in ("힘을 얻", "강화", "능력")))
+
+
+def _has_possession_evidence(text: str) -> bool:
+    negative_markers = ("시스템이 빙의", "프로그램이 설치", "빙의한 형태")
+    if any(marker in text for marker in negative_markers):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "몸에 빙의",
+            "몸으로 빙의",
+            "몸에 들어",
+            "몸으로 들어",
+            "빙의해",
+            "빙의한",
+            "빙의되",
+            "빙의한다",
+            "소설 속",
+            "작품 속",
+            "게임 속",
+            "타인의 몸",
+            "남의 몸",
+            "다른 사람의 몸",
+        )
+    )
+
+
+def _has_growth_evidence(text: str) -> bool:
+    return any(marker in text for marker in ("성장", "데뷔", "훈련", "수련", "레벨업", "퀘스트", "목표"))
+
+
+def _has_monster_hunter_evidence(text: str) -> bool:
+    return any(marker in text for marker in ("괴물사냥꾼", "괴물 사냥", "괴물을 사냥", "몬스터 사냥"))
+
+
+def _apply_axis_label_evidence_guards(
+    axis_labels: dict[str, list[str]],
+    allowed_labels: dict[str, set[str]],
+    source_text: str = "",
+) -> dict[str, list[str]]:
+    if not source_text:
+        return axis_labels
+
+    guarded = {axis: list(labels) for axis, labels in axis_labels.items()}
+
+    firefighter_markers = ("소방서", "화재", "구급", "119", "구조 출동", "재난 현장", "소방 공무원", "소방대")
+    if "소방관" in guarded["직"] and not any(marker in source_text for marker in firefighter_markers):
+        guarded["직"] = [label for label in guarded["직"] if label != "소방관"]
+
+    knight_negative_markers = (
+        "자신은 기사가 아님",
+        "주인공은 기사가 아님",
+        "로머 자신은 기사가 아님",
+        "주인공의 아버지가 기사",
+        "아버지가 기사",
+    )
+    if "기사" in guarded["직"] and any(marker in source_text for marker in knight_negative_markers):
+        guarded["직"] = [label for label in guarded["직"] if label != "기사"]
+        if "헌터" in allowed_labels["직"] and "헌터" not in guarded["직"] and _has_monster_hunter_evidence(source_text):
+            guarded["직"].append("헌터")
+
+    if "상태창" in guarded["능"] and not _has_status_window_evidence(source_text):
+        guarded["능"] = [label for label in guarded["능"] if label != "상태창"]
+        if "버프" in allowed_labels["능"] and "버프" not in guarded["능"] and _has_buff_evidence(source_text):
+            guarded["능"].append("버프")
+
+    if "빙의" in guarded["타"] and not _has_possession_evidence(source_text):
+        guarded["타"] = [label for label in guarded["타"] if label != "빙의"]
+        if not guarded["타"] and "성장형" in allowed_labels["타"] and _has_growth_evidence(source_text):
+            guarded["타"].append("성장형")
+
+    _, worldview_max_items = AXIS_LIMITS["세"]
+    if (
+        "아카데미" in allowed_labels["세"]
+        and "아카데미" not in guarded["세"]
+        and len(guarded["세"]) < worldview_max_items
+        and _has_academy_evidence(source_text)
+    ):
+        guarded["세"].append("아카데미")
+
+    return guarded
+
+
 def _normalize_axis_label_scores(
     raw_scores: Any,
     axis_labels: dict[str, list[str]],
@@ -502,6 +667,7 @@ def _normalize_ai_payload(
     enforce_axis_minimum: bool,
     enforce_legacy_required: bool,
     drop_unsupported_axis_labels: bool = False,
+    source_text: str = "",
 ) -> dict[str, Any]:
     summary = payload.get("summary")
     if not isinstance(summary, dict):
@@ -533,13 +699,17 @@ def _normalize_ai_payload(
             drop_unsupported=drop_unsupported_axis_labels,
         )
 
+    axis_labels = _apply_axis_label_evidence_guards(
+        axis_labels,
+        allowed,
+        _payload_evidence_text(payload, source_text),
+    )
+
     goal_labels = axis_labels["목"]
     if not goal_labels:
         fallback_goal = _safe_text(pick("protagonist_goal_primary"), "protagonist_goal_primary", 30)
         if fallback_goal and fallback_goal in allowed["목"]:
             goal_labels = [fallback_goal]
-        elif enforce_axis_minimum:
-            goal_labels = [DEFAULT_GOAL_LABEL if DEFAULT_GOAL_LABEL in allowed["목"] else sorted(allowed["목"])[0]]
         axis_labels["목"] = goal_labels
 
     axis_confidence = payload.get("axis_confidence")
@@ -1249,6 +1419,15 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                 enforce_axis_minimum=True,
                 enforce_legacy_required=True,
                 drop_unsupported_axis_labels=True,
+                source_text="\n".join(
+                    [
+                        str(product.get("title") or ""),
+                        str(product.get("genres") or ""),
+                        str(product.get("keywords") or ""),
+                        str(product.get("synopsis_text") or ""),
+                        episode_context,
+                    ]
+                ),
             )
 
             upsert_query = text(

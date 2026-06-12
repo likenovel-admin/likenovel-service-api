@@ -40,6 +40,9 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 AI_DNA_OPENROUTER_MODEL = os.getenv("AI_DNA_OPENROUTER_MODEL", "deepseek/deepseek-v3.2").strip()
 AI_DNA_OPENROUTER_PROVIDER_ONLY = os.getenv("AI_DNA_OPENROUTER_PROVIDER_ONLY", "friendli").strip()
+# OpenRouter reasoning(thinking) 제어. 비어있으면 미전송(기존 동작 유지).
+# "low"/"medium"/"high" → {"effort": ...}, "enabled"/"on"/"true"/"1" → {"enabled": true}
+AI_DNA_OPENROUTER_REASONING = os.getenv("AI_DNA_OPENROUTER_REASONING", "").strip().lower()
 AI_DNA_RESPONSE_FORMAT = os.getenv("AI_DNA_RESPONSE_FORMAT", "json_schema").strip().lower()
 AI_DNA_TIMEOUT_SECONDS = float(os.getenv("AI_DNA_TIMEOUT_SECONDS", "120.0"))
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -52,21 +55,21 @@ MAX_ANALYZE_CHARS = 60000
 MAX_LLM_OUTPUT_TOKENS = int(os.getenv("AI_METADATA_MAX_TOKENS", "4096"))
 MIN_REQUIRED_EPISODES = 3
 MIN_FIRST_EPISODE_TEXT_COUNT = 1000
-DEFAULT_GOAL_LABEL = "성장"
 FAILED_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_FAILED_RETRY_COOLDOWN_DAYS", "3"))
 INCOMPLETE_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_INCOMPLETE_RETRY_COOLDOWN_DAYS", "3"))
-ANALYSIS_PIPELINE_VERSION = os.getenv("AI_METADATA_PIPELINE_VERSION", "dna-v20260320-r1")
+ANALYSIS_PIPELINE_VERSION = os.getenv("AI_METADATA_PIPELINE_VERSION", "dna-v20260611-r2")
 UNSUPPORTED_LABEL_ERROR_PREFIX = "unsupported_label:"
 
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
+# min은 전 축 0 — 부합 라벨이 없으면 빈 배열이 정답(근접 라벨 강제 매핑 금지)
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
-    "세": (1, 3),
-    "직": (1, 2),
-    "능": (1, 4),
+    "세": (0, 3),
+    "직": (0, 2),
+    "능": (0, 4),
     "연": (0, 2),
-    "작": (1, 3),
-    "타": (1, 3),
-    "목": (1, 1),
+    "작": (0, 3),
+    "타": (0, 3),
+    "목": (0, 1),
 }
 ALLOWED_HEROINE_WEIGHT = {"high", "mid", "low", "none"}
 ALLOWED_PACING = {"fast", "medium", "slow"}
@@ -100,17 +103,40 @@ LABEL_DEFS_JSON_CANDIDATES = [
 ]
 
 DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EXTRACTOR_V1이다.
-입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 7축 메타를 추출한다.
-출력은 반드시 JSON 단일 객체만 허용한다. 설명문/마크다운/코드블록 금지.
+입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 작품 신호와 설명 메타를 추출한다.
+출력은 반드시 JSON 단일 객체만 허용한다. 설명문, 마크다운, 코드블록 금지.
 
 핵심 규칙:
 1) 허용 라벨 목록 외 신규 라벨 생성 금지.
 1-1) 각 라벨의 의미는 "라벨 정의" 섹션을 참고하여 판단한다. 이름만으로 추측하지 않는다.
-2) 목표축(목)은 1개만 선택. 라벨 정의를 참고하여 작품의 핵심 목표에 가장 부합하는 라벨을 선택한다.
-3) 연애축(연)은 연애/케미가 드러날 때만 선택 가능. 없으면 빈 배열 가능.
+1-2) 라벨은 상호배타 장르 분류가 아니라 AI추천구좌와 AI사서에서 작품을 엮는 작품 신호다.
+1-2-1) 내부 그룹 키 의미는 다음과 같다. 세=무대, 세계관, 기관, 세력, 반복 배경, 직=직업, 직위, 사회적 역할, 전투 클래스, 능=능력, 시스템 메커니즘, 전투·성장 도구, 연=히로인·관계·애정 구도 신호, 작=작풍·정서·전개감·서사 질감, 타=주인공 상태, 서사 포지션, 핵심 세력과 속성, 목=반복 목표, 메인 루프, 주된 활동.
+1-3) 주인공, 핵심 인물, 핵심 세력, 반복 소재, 갈등 축, 주요 배경이 강하게 연결되면 같은 작품에 여러 라벨을 동시에 부여한다.
+1-4) 문파, 세력, 공간 라벨은 주인공 소속으로만 한정하지 않는다. 단순 언급이나 스쳐 지나가는 배경만으로는 선택하지 않는다.
+1-4-1) 단순 언급, 비유 표현, 지나가는 배경, 1회성 몬스터, 직업, 장소, 농담성 대사만으로는 라벨을 선택하지 않는다.
+1-5) 조합 라벨을 새로 만들지 않는다. 예: "아카데미빙의" 대신 "아카데미"와 "빙의"를 각각 선택한다.
+1-6) 라벨 배열은 강한 근거 순서로 정렬한다. 제목, 태그, 줄거리, 초반 회차에서 반복되거나 갈등·목표·배경에 직접 연결된 라벨을 앞에 둔다.
+1-6-1) 최대 개수를 채우려 하지 않는다. 두 번째 이후 라벨은 제목, 태그, 줄거리, 초반 회차에서 독립 근거가 확인될 때만 선택한다.
+1-6-2) 시대 배경 라벨과 기관, 세력, 반복 공간 라벨은 서로 대체하지 않는다. 중세 세계에서 전사 아카데미 입학이 초반 목표라면 중세와 아카데미를 함께 선택한다.
+1-7) 근거가 약하면 라벨을 선택하지 않는다. 어떤 그룹이든 부합하는 허용 라벨이 없으면 빈 배열로 둔다. 가장 가까운 라벨로 대체하지 않는다.
+1-7-1) 상태창은 스탯, 스킬, 업적을 보여주는 정보 창이고, 시스템은 퀘스트·보상·페널티·상점·레벨업을 집행하는 메커니즘이다. 정보 표시만 있으면 상태창만 선택한다.
+1-7-2) 회귀는 과거 특정 시점으로 돌아오는 1회성 또는 제한적 인생 재시작, 무한회귀는 실패 때마다 반복 재시도, 루프는 특정 사건·하루·구간 반복, 빙의는 타인의 몸이나 작품 속 인물 신분, 환생은 새 육체와 생애, 귀환자는 장기 생존 후 원래 세계 복귀, 차원이동은 살아 있는 상태의 세계 이동으로 구분한다.
+1-7-3) 아카데미는 특수능력 교육기관, 학원은 현대 학교생활, 청춘, 교우관계, 학교는 물리적 학교 공간 사건이 중심일 때만 선택한다.
+1-7-4) 하렘은 복수의 이성 캐릭터가 명확한 애정, 소유욕, 관계 긴장을 보일 때만, 조력자는 단순 도움 제공이 아니라 동등한 파트너십과 반복 동행이 작품 매력일 때만 선택한다.
+1-7-5) 직 라벨은 실제 직업, 신분, 역할, 전투 클래스가 직접 확인될 때만 선택한다. 세계를 구하거나 사람을 구하는 목표만으로 소방관, 의사, 경찰 같은 직업을 추정하지 않는다.
+1-7-6) 아카데미 입학, 편입, 선발시험, 평가전, 수련, 교사, 교수, 교관 활동이 초반 목표나 반복 사건이면 물리적 캠퍼스 장면이 적어도 아카데미를 선택한다.
+2) 목표 라벨 그룹(목)은 최대 1개. 라벨 정의를 참고하여 작품의 핵심 목표에 가장 부합하는 라벨을 선택하고, 부합하는 허용 라벨이 없으면 빈 배열로 두고 unmapped_concepts에 기록한다.
+3) 관계와 케미 라벨 그룹(연)은 연애와 케미가 드러날 때만 선택 가능. 없으면 빈 배열 가능.
 4) confidence는 0~1 범위 숫자.
-5) summary의 모든 필드를 빈 값 없이 채운다. null 금지. themes/taste_tags도 각각 1개 이상.
+5) summary의 모든 필드를 빈 값 없이 채운다. null 금지. themes와 taste_tags도 각각 1개 이상.
 6) heroine이 없는 작품은 heroine_type에 주요 여성 캐릭터를 기재하고, heroine_weight는 "none"으로 설정한다.
+7) 출력 JSON 스키마를 정확히 지킨다. axis_* 이름은 저장용 내부 키이며 판단 기준은 작품 신호와 작품 연결 라벨이다.
+8) axis_label_scores는 작품 연결 라벨별 확신도 목록으로 작성하고 각 score는 0~1 범위 숫자다.
+9) evidence는 작품 신호를 선택한 회차 근거 중심으로 짧게 작성한다.
+10) summary.premise는 핵심 설정이다. 작품을 움직이는 기본 전제, 규칙, 상황을 구체적으로 쓴다.
+11) summary.hook은 초반 진입 포인트다. 광고 카피가 아니라 초반 1~3화에서 독자가 다음 화를 누르게 되는 구체적 사건, 위기, 목표, 반전, 보상 약속을 쓴다.
+12) summary.hook에 "흥미진진한", "몰입감 있는", "기대되는" 같은 추상 홍보문구, 장르와 라벨 나열, 본문에 없는 기대감 생성을 쓰지 않는다.
+13) 작품의 핵심 반복 개념(주인공 직업, 능력, 소재, 상태)이 허용 라벨에 없으면 근처 라벨로 대체하지 말고 unmapped_concepts 배열에 원문 표현 그대로 기록한다. 최대 5개, 없으면 빈 배열.
 """
 
 DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하세요.
@@ -124,10 +150,10 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
 분석요청 회차수: {n_requested}
 실제 분석 회차수: {n_received}
 
-허용 라벨(축별 SSOT JSON):
+허용 작품 연결 라벨(내부 그룹 키 SSOT JSON):
 {allowed_labels_json}
 
-라벨 정의(분류 기준):
+라벨 정의(작품 신호 판정 기준):
 {label_definitions_text}
 
 분석 회차 본문:
@@ -165,7 +191,26 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
     "타": 0.0,
     "목": 0.0
   }},
-  "overall_confidence": 0.0
+  "axis_label_scores": {{
+    "세": [{{"label": "string", "score": 0.0}}],
+    "직": [{{"label": "string", "score": 0.0}}],
+    "능": [{{"label": "string", "score": 0.0}}],
+    "연": [{{"label": "string", "score": 0.0}}],
+    "작": [{{"label": "string", "score": 0.0}}],
+    "타": [{{"label": "string", "score": 0.0}}],
+    "목": [{{"label": "string", "score": 0.0}}]
+  }},
+  "overall_confidence": 0.0,
+  "evidence": {{
+    "세": ["string"],
+    "직": ["string"],
+    "능": ["string"],
+    "연": ["string"],
+    "작": ["string"],
+    "타": ["string"],
+    "목": ["string"]
+  }},
+  "unmapped_concepts": ["string"]
 }}"""
 
 DNA_REPAIR_TEMPLATE = """아래는 1차 분석 결과 JSON이다.
@@ -187,8 +232,8 @@ DNA_REPAIR_TEMPLATE = """아래는 1차 분석 결과 JSON이다.
 수정 규칙:
 1) 허용 라벨 목록 외 값은 절대 사용하지 않는다.
 2) axis_labels의 정상 라벨은 최대한 유지한다.
-3) 문제 축과 문제 라벨을 교정하고, 각 축의 최소 개수를 충족한다.
-4) goal(목) 축은 정확히 1개만 남긴다.
+3) 문제 축과 문제 라벨을 교정한다. 부합하는 허용 라벨이 없으면 해당 축을 빈 배열로 둔다.
+4) goal(목) 축은 최대 1개만 남긴다.
 5) 전체 출력은 반드시 JSON 단일 객체만 반환한다.
 6) 설명문, 코드블록, 주석 금지.
 """
@@ -412,6 +457,195 @@ def _safe_list(value: Any, field_name: str, max_items: int = 15, max_item_length
     return list(dict.fromkeys(normalized_items))
 
 
+def _flatten_text_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            parts.extend(_flatten_text_values(item))
+        return parts
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for item in value.values():
+            parts.extend(_flatten_text_values(item))
+        return parts
+    return []
+
+
+def _payload_evidence_text(payload: dict[str, Any], source_text: str = "") -> str:
+    parts = [source_text]
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        parts.extend(_flatten_text_values(summary))
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict):
+        parts.extend(_flatten_text_values(evidence))
+    return "\n".join(part for part in parts if part)
+
+
+def _has_academy_evidence(text: str) -> bool:
+    if "아카데미" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "입학",
+            "편입",
+            "선발시험",
+            "평가전",
+            "강의",
+            "수련",
+            "교사",
+            "교수",
+            "교관",
+            "아카데미생",
+            "아카데미 학생",
+            "아카데미 파티",
+            "전사 아카데미",
+            "마법 아카데미",
+        )
+    )
+
+
+def _has_status_window_evidence(text: str) -> bool:
+    negative_markers = ("상태창이나 시스템은 없", "상태창은 없", "상태창 없음")
+    if any(marker in text for marker in negative_markers):
+        return False
+    return any(
+        marker in text
+        for marker in ("상태창", "스탯", "능력치", "업적", "눈앞 UI", "정보 인터페이스")
+    )
+
+
+def _has_buff_evidence(text: str) -> bool:
+    return "버프" in text or ("계약" in text and any(marker in text for marker in ("힘을 얻", "강화", "능력")))
+
+
+def _has_possession_evidence(text: str) -> bool:
+    negative_markers = ("시스템이 빙의", "프로그램이 설치", "빙의한 형태")
+    if any(marker in text for marker in negative_markers):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "몸에 빙의",
+            "몸으로 빙의",
+            "몸에 들어",
+            "몸으로 들어",
+            "빙의해",
+            "빙의한",
+            "빙의되",
+            "빙의한다",
+            "소설 속",
+            "작품 속",
+            "게임 속",
+            "타인의 몸",
+            "남의 몸",
+            "다른 사람의 몸",
+        )
+    )
+
+
+def _has_growth_evidence(text: str) -> bool:
+    return any(marker in text for marker in ("성장", "데뷔", "훈련", "수련", "레벨업", "퀘스트", "목표"))
+
+
+def _has_monster_hunter_evidence(text: str) -> bool:
+    return any(marker in text for marker in ("괴물사냥꾼", "괴물 사냥", "괴물을 사냥", "몬스터 사냥"))
+
+
+def _apply_axis_label_evidence_guards(
+    axis_labels: dict[str, list[str]],
+    allowed_labels: dict[str, set[str]],
+    source_text: str = "",
+) -> dict[str, list[str]]:
+    if not source_text:
+        return axis_labels
+
+    guarded = {axis: list(labels) for axis, labels in axis_labels.items()}
+
+    firefighter_markers = ("소방서", "화재", "구급", "119", "구조 출동", "재난 현장", "소방 공무원", "소방대")
+    if "소방관" in guarded["직"] and not any(marker in source_text for marker in firefighter_markers):
+        guarded["직"] = [label for label in guarded["직"] if label != "소방관"]
+
+    knight_negative_markers = (
+        "자신은 기사가 아님",
+        "주인공은 기사가 아님",
+        "로머 자신은 기사가 아님",
+        "주인공의 아버지가 기사",
+        "아버지가 기사",
+    )
+    if "기사" in guarded["직"] and any(marker in source_text for marker in knight_negative_markers):
+        guarded["직"] = [label for label in guarded["직"] if label != "기사"]
+        if "헌터" in allowed_labels["직"] and "헌터" not in guarded["직"] and _has_monster_hunter_evidence(source_text):
+            guarded["직"].append("헌터")
+
+    if "상태창" in guarded["능"] and not _has_status_window_evidence(source_text):
+        guarded["능"] = [label for label in guarded["능"] if label != "상태창"]
+        if "버프" in allowed_labels["능"] and "버프" not in guarded["능"] and _has_buff_evidence(source_text):
+            guarded["능"].append("버프")
+
+    if "빙의" in guarded["타"] and not _has_possession_evidence(source_text):
+        guarded["타"] = [label for label in guarded["타"] if label != "빙의"]
+        if not guarded["타"] and "성장형" in allowed_labels["타"] and _has_growth_evidence(source_text):
+            guarded["타"].append("성장형")
+
+    _, worldview_max_items = AXIS_LIMITS["세"]
+    if (
+        "아카데미" in allowed_labels["세"]
+        and "아카데미" not in guarded["세"]
+        and len(guarded["세"]) < worldview_max_items
+        and _has_academy_evidence(source_text)
+    ):
+        guarded["세"].append("아카데미")
+
+    return guarded
+
+
+def _normalize_axis_label_scores(
+    raw_scores: Any,
+    axis_labels: dict[str, list[str]],
+    axis_confidence: dict[str, float | None],
+) -> dict[str, list[dict[str, float]]]:
+    if not isinstance(raw_scores, dict):
+        raw_scores = {}
+
+    normalized_scores: dict[str, list[dict[str, float]]] = {}
+    for axis in AXIS_ORDER:
+        labels = axis_labels[axis]
+        axis_raw = raw_scores.get(axis)
+
+        parsed: dict[str, float] = {}
+        candidates: list[dict[str, Any]] = []
+        if isinstance(axis_raw, list):
+            candidates = [item for item in axis_raw if isinstance(item, dict)]
+        elif isinstance(axis_raw, dict):
+            candidates = [{"label": key, "score": value} for key, value in axis_raw.items()]
+
+        for item in candidates:
+            label = item.get("label")
+            if not isinstance(label, str):
+                continue
+            key = label.strip()
+            if not key or key not in labels:
+                continue
+            try:
+                score = _safe_confidence(item.get("score"), f"axis_label_scores.{axis}.{key}")
+            except ValueError:
+                continue
+            if score is None:
+                continue
+            parsed[key] = score
+
+        fallback = axis_confidence.get(axis)
+        if fallback is None:
+            fallback = 0.0
+        normalized_scores[axis] = [{"label": label, "score": parsed.get(label, fallback)} for label in labels]
+
+    return normalized_scores
+
+
 def _format_allowed_labels_json(allowed_labels: dict[str, set[str]]) -> str:
     return json.dumps(
         {axis: sorted(allowed_labels[axis]) for axis in AXIS_ORDER},
@@ -517,6 +751,32 @@ def _build_openrouter_response_format(allowed_labels: dict[str, set[str]]) -> di
         axis: {"type": "number", "minimum": 0, "maximum": 1}
         for axis in AXIS_ORDER
     }
+    axis_label_score_properties = {
+        axis: {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "label": {"type": "string", "enum": sorted(allowed_labels[axis])},
+                    "score": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": ["label", "score"],
+            },
+            "minItems": min_items,
+            "maxItems": max_items,
+        }
+        for axis, (min_items, max_items) in AXIS_LIMITS.items()
+    }
+    evidence_properties = {
+        axis: {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 0,
+            "maxItems": max_items,
+        }
+        for axis, (_, max_items) in AXIS_LIMITS.items()
+    }
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -572,9 +832,35 @@ def _build_openrouter_response_format(allowed_labels: dict[str, set[str]]) -> di
                 "properties": confidence_properties,
                 "required": list(AXIS_ORDER),
             },
+            "axis_label_scores": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": axis_label_score_properties,
+                "required": list(AXIS_ORDER),
+            },
             "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": evidence_properties,
+                "required": list(AXIS_ORDER),
+            },
+            "unmapped_concepts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 0,
+                "maxItems": 10,
+            },
         },
-        "required": ["summary", "axis_labels", "axis_confidence", "overall_confidence"],
+        "required": [
+            "summary",
+            "axis_labels",
+            "axis_confidence",
+            "axis_label_scores",
+            "overall_confidence",
+            "evidence",
+            "unmapped_concepts",
+        ],
     }
     return {
         "type": "json_schema",
@@ -604,7 +890,11 @@ def _validate_runtime_config(allowed_labels: dict[str, set[str]]) -> None:
     _build_openrouter_response_format(allowed_labels)
 
 
-def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str]]) -> dict[str, Any]:
+def normalize_payload(
+    payload: dict[str, Any],
+    allowed_labels: dict[str, set[str]],
+    source_text: str = "",
+) -> dict[str, Any]:
     summary = payload.get("summary")
     if not isinstance(summary, dict):
         summary = {}
@@ -614,25 +904,39 @@ def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str
 
     normalized_axis: dict[str, list[str]] = {}
     for axis in AXIS_ORDER:
-        min_items, max_items = AXIS_LIMITS[axis]
+        _, max_items = AXIS_LIMITS[axis]
         labels = _safe_list(axis_labels.get(axis), f"axis_labels.{axis}", max_items=max_items, max_item_length=50)
         for label in labels:
             if label not in allowed_labels[axis]:
                 raise UnsupportedLabelError(axis, label)
-        if len(labels) < min_items:
-            if axis == "목":
-                fallback = DEFAULT_GOAL_LABEL if DEFAULT_GOAL_LABEL in allowed_labels["목"] else sorted(allowed_labels["목"])[0]
-                labels = [fallback]
-            else:
-                raise ValueError(f"axis_labels.{axis} requires at least {min_items} labels")
         normalized_axis[axis] = labels[:max_items]
+
+    normalized_axis = _apply_axis_label_evidence_guards(
+        normalized_axis,
+        allowed_labels,
+        _payload_evidence_text(payload, source_text),
+    )
 
     axis_confidence = payload.get("axis_confidence")
     if not isinstance(axis_confidence, dict):
         axis_confidence = {}
+    normalized_confidence = {
+        axis: _safe_confidence(axis_confidence.get(axis), f"axis_confidence.{axis}")
+        for axis in AXIS_ORDER
+    }
+    axis_label_scores = _normalize_axis_label_scores(
+        payload.get("axis_label_scores"),
+        normalized_axis,
+        normalized_confidence,
+    )
+    unmapped_concepts = _safe_list(
+        payload.get("unmapped_concepts"), "unmapped_concepts", max_items=10, max_item_length=50
+    )
 
     protagonist_type = _safe_text(summary.get("protagonist_type"), "summary.protagonist_type", 200)
     if protagonist_type is None:
+        if not normalized_axis["타"]:
+            raise ValueError("summary.protagonist_type is required when 타 axis is empty")
         protagonist_type = normalized_axis["타"][0]
 
     mood = _safe_text(summary.get("mood"), "summary.mood", 200, required=True)
@@ -672,9 +976,11 @@ def normalize_payload(payload: dict[str, Any], allowed_labels: dict[str, set[str
         "themes": themes,
         "similar_famous": [],
         "taste_tags": taste_tags,
-        "protagonist_goal_primary": normalized_axis["목"][0],
-        "goal_confidence": _safe_confidence(axis_confidence.get("목"), "axis_confidence.목"),
+        "protagonist_goal_primary": normalized_axis["목"][0] if normalized_axis["목"] else None,
+        "goal_confidence": normalized_confidence["목"],
         "overall_confidence": _safe_confidence(payload.get("overall_confidence"), "overall_confidence"),
+        "axis_label_scores": axis_label_scores,
+        "unmapped_concepts": unmapped_concepts,
         "protagonist_material_tags": normalized_axis["능"],
         "worldview_tags": normalized_axis["세"],
         "protagonist_type_tags": normalized_axis["타"],
@@ -793,6 +1099,11 @@ def call_openrouter(
             {"role": "user", "content": user_prompt},
         ],
     }
+    if AI_DNA_OPENROUTER_REASONING:
+        if AI_DNA_OPENROUTER_REASONING in ("low", "medium", "high"):
+            payload["reasoning"] = {"effort": AI_DNA_OPENROUTER_REASONING}
+        elif AI_DNA_OPENROUTER_REASONING in ("enabled", "on", "true", "1"):
+            payload["reasoning"] = {"enabled": True}
     provider_only = _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY)
     if provider_only:
         payload["provider"] = {
@@ -1001,12 +1312,21 @@ def analyze_product(
     used_count: int,
 ) -> tuple[dict, dict]:
     """작품 1개 분석."""
+    source_text = "\n".join(
+        [
+            str(product.get("title") or ""),
+            str(product.get("genres") or ""),
+            str(product.get("keywords") or ""),
+            str(product.get("synopsis_text") or ""),
+            episodes_text,
+        ]
+    )
     user_prompt = _build_analysis_prompt(product, allowed_labels, episodes_text, used_count)
     raw, call_meta = _call_llm(DNA_SYSTEM_PROMPT, user_prompt, allowed_labels)
     llm_calls = [{"stage": "analysis", **call_meta}]
     parsed = parse_json(raw)
     try:
-        normalized = normalize_payload(parsed, allowed_labels)
+        normalized = normalize_payload(parsed, allowed_labels, source_text=source_text)
     except UnsupportedLabelError as repair_error:
         repair_prompt = _build_repair_prompt(product, allowed_labels, parsed, repair_error)
         repaired_raw, repair_call_meta = _call_llm(DNA_SYSTEM_PROMPT, repair_prompt, allowed_labels)
@@ -1019,7 +1339,7 @@ def analyze_product(
             }
         )
         repaired_parsed = parse_json(repaired_raw)
-        normalized = normalize_payload(repaired_parsed, allowed_labels)
+        normalized = normalize_payload(repaired_parsed, allowed_labels, source_text=source_text)
         parsed = repaired_parsed
     parsed = _attach_llm_meta(parsed, llm_calls)
     return normalized, parsed
@@ -1027,6 +1347,10 @@ def analyze_product(
 
 def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int):
     """분석 결과 저장 (UPSERT)."""
+    raw_analysis = dict(parsed) if isinstance(parsed, dict) else parsed
+    if isinstance(raw_analysis, dict):
+        raw_analysis["unmapped_concepts"] = dna.get("unmapped_concepts", [])
+
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1034,7 +1358,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 product_id,
                 protagonist_type, protagonist_desc, heroine_type, heroine_weight, romance_chemistry_weight,
                 mood, pacing, premise, hook,
-                protagonist_goal_primary, goal_confidence, overall_confidence,
+                protagonist_goal_primary, goal_confidence, overall_confidence, axis_label_scores,
                 protagonist_material_tags, worldview_tags, protagonist_type_tags, protagonist_job_tags, axis_style_tags, axis_romance_tags,
                 themes, similar_famous, taste_tags,
                 raw_analysis, analyzed_at, model_version,
@@ -1042,7 +1366,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
-                %s, %s, %s,
+                %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, NOW(), %s,
@@ -1061,6 +1385,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 protagonist_goal_primary = VALUES(protagonist_goal_primary),
                 goal_confidence = VALUES(goal_confidence),
                 overall_confidence = VALUES(overall_confidence),
+                axis_label_scores = VALUES(axis_label_scores),
                 protagonist_material_tags = VALUES(protagonist_material_tags),
                 worldview_tags = VALUES(worldview_tags),
                 protagonist_type_tags = VALUES(protagonist_type_tags),
@@ -1091,6 +1416,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 dna.get("protagonist_goal_primary"),
                 dna.get("goal_confidence"),
                 dna.get("overall_confidence"),
+                json.dumps(dna.get("axis_label_scores", {}), ensure_ascii=False),
                 json.dumps(dna.get("protagonist_material_tags", []), ensure_ascii=False),
                 json.dumps(dna.get("worldview_tags", []), ensure_ascii=False),
                 json.dumps(dna.get("protagonist_type_tags", []), ensure_ascii=False),
@@ -1100,7 +1426,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 json.dumps(dna.get("themes", []), ensure_ascii=False),
                 json.dumps(dna.get("similar_famous", []), ensure_ascii=False),
                 json.dumps(dna.get("taste_tags", []), ensure_ascii=False),
-                json.dumps(parsed, ensure_ascii=False),
+                json.dumps(raw_analysis, ensure_ascii=False),
                 CURRENT_ANALYSIS_VERSION,
                 attempt_count,
             ),
