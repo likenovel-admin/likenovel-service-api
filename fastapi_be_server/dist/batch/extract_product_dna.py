@@ -137,6 +137,12 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 11) summary.hook은 초반 진입 포인트다. 광고 카피가 아니라 초반 1~3화에서 독자가 다음 화를 누르게 되는 구체적 사건, 위기, 목표, 반전, 보상 약속을 쓴다.
 12) summary.hook에 "흥미진진한", "몰입감 있는", "기대되는" 같은 추상 홍보문구, 장르와 라벨 나열, 본문에 없는 기대감 생성을 쓰지 않는다.
 13) 작품의 핵심 반복 개념(주인공 직업, 능력, 소재, 상태)이 허용 라벨에 없으면 근처 라벨로 대체하지 말고 unmapped_concepts 배열에 원문 표현 그대로 기록한다. 최대 5개, 없으면 빈 배열.
+14) summary.librarian은 작품 상세페이지의 "AI 사서" 카드에 그대로 노출되는 독자용 소개다.
+14-1) 말투: 서점 직원이 단골 독자에게 권하듯 자연스러운 한국어 존댓말("~요"). 분석가 말투 금지.
+14-2) 금칙어: "결", "축", "서사", "동력", "몰입감", "감각적", "텍스트", "콘텐츠", "신호", "라벨". 이 단어들이 들어간 문장을 쓰지 않는다.
+14-3) intro는 2문장 이내. 첫 문장은 작품의 초반 사건·상황을 구체적으로, 둘째 문장은 어떤 독자에게 맞는지. 추상 홍보문구 금지(11~12번 규칙과 동일 기준).
+14-4) points는 정확히 3개. 각 1문장. ①이야기의 출발점(설정) ②주인공이 어떤 인물이고 무엇을 향해 가는지 ③어떤 취향의 독자에게 어울리는지.
+14-5) chips는 독자에게 익숙한 키워드 3~4개. 장르·트롭·소재 어휘만(예: 먼치킨, 아카데미, 회귀, 게이트). 고유명사(인명·작품명), 두 단어 초과 구, 금칙어 사용 금지.
 """
 
 DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하세요.
@@ -171,7 +177,12 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
     "premise": "string",
     "hook": "string",
     "themes": ["string"],
-    "taste_tags": ["string"]
+    "taste_tags": ["string"],
+    "librarian": {{
+      "intro": "string",
+      "points": ["string", "string", "string"],
+      "chips": ["string"]
+    }}
   }},
   "axis_labels": {{
     "세": ["string"],
@@ -806,6 +817,26 @@ def _build_openrouter_response_format(allowed_labels: dict[str, set[str]]) -> di
                         "items": {"type": "string"},
                         "minItems": 1,
                     },
+                    "librarian": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "intro": {"type": "string"},
+                            "points": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 3,
+                                "maxItems": 3,
+                            },
+                            "chips": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 3,
+                                "maxItems": 4,
+                            },
+                        },
+                        "required": ["intro", "points", "chips"],
+                    },
                 },
                 "required": [
                     "protagonist_type",
@@ -818,6 +849,7 @@ def _build_openrouter_response_format(allowed_labels: dict[str, set[str]]) -> di
                     "hook",
                     "themes",
                     "taste_tags",
+                    "librarian",
                 ],
             },
             "axis_labels": {
@@ -888,6 +920,39 @@ def _validate_runtime_config(allowed_labels: dict[str, set[str]]) -> None:
     if AI_DNA_TIMEOUT_SECONDS <= 0:
         raise RuntimeError("AI_DNA_TIMEOUT_SECONDS must be > 0")
     _build_openrouter_response_format(allowed_labels)
+
+
+# AI 사서 카피 금칙어. "결혼/축제" 같은 정상 단어 오탐을 피하려 결/축은 조사 패턴으로만 검사.
+_LIBRARIAN_BANNED_RE = re.compile(
+    r"결[이을의은]\s|축[이을의]\s|축으로|서사|동력|몰입감|감각적|텍스트|콘텐츠|신호|라벨"
+)
+
+
+def _normalize_librarian(summary: dict) -> dict[str, Any]:
+    """AI 사서 노출용 카피 검증. 품질 미달 필드는 None으로 강등해 프론트 템플릿 fallback을 태운다.
+
+    사서 카피 불량이 분석 전체 실패가 되지 않도록 ValueError를 밖으로 내보내지 않는다.
+    """
+    empty = {"librarian_intro": None, "librarian_points": None, "librarian_chips": None}
+    raw = summary.get("librarian")
+    if not isinstance(raw, dict):
+        return empty
+    try:
+        intro = _safe_text(raw.get("intro"), "summary.librarian.intro", 300)
+        points = _safe_list(raw.get("points"), "summary.librarian.points", max_items=3, max_item_length=200)
+        chips = _safe_list(raw.get("chips"), "summary.librarian.chips", max_items=4, max_item_length=20)
+    except ValueError:
+        return empty
+    if intro and _LIBRARIAN_BANNED_RE.search(intro):
+        intro = None
+    if points and (len(points) < 3 or any(_LIBRARIAN_BANNED_RE.search(p) for p in points)):
+        points = None
+    chips = [c for c in (chips or []) if not _LIBRARIAN_BANNED_RE.search(c) and len(c.split()) <= 2]
+    return {
+        "librarian_intro": intro,
+        "librarian_points": points or None,
+        "librarian_chips": chips or None,
+    }
 
 
 def normalize_payload(
@@ -987,6 +1052,7 @@ def normalize_payload(
         "protagonist_job_tags": normalized_axis["직"],
         "axis_style_tags": normalized_axis["작"],
         "axis_romance_tags": normalized_axis["연"],
+        **_normalize_librarian(summary),
     }
 
 
@@ -1361,6 +1427,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 protagonist_goal_primary, goal_confidence, overall_confidence, axis_label_scores,
                 protagonist_material_tags, worldview_tags, protagonist_type_tags, protagonist_job_tags, axis_style_tags, axis_romance_tags,
                 themes, similar_famous, taste_tags,
+                librarian_intro, librarian_points, librarian_chips,
                 raw_analysis, analyzed_at, model_version,
                 analysis_status, analysis_attempt_count, analysis_error_message
             ) VALUES (
@@ -1368,6 +1435,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s,
+                %s, %s, %s,
                 %s, %s, %s,
                 %s, NOW(), %s,
                 'success', %s, NULL
@@ -1395,6 +1463,9 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 themes = VALUES(themes),
                 similar_famous = VALUES(similar_famous),
                 taste_tags = VALUES(taste_tags),
+                librarian_intro = VALUES(librarian_intro),
+                librarian_points = VALUES(librarian_points),
+                librarian_chips = VALUES(librarian_chips),
                 raw_analysis = VALUES(raw_analysis),
                 analyzed_at = NOW(),
                 model_version = VALUES(model_version),
@@ -1426,6 +1497,9 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 json.dumps(dna.get("themes", []), ensure_ascii=False),
                 json.dumps(dna.get("similar_famous", []), ensure_ascii=False),
                 json.dumps(dna.get("taste_tags", []), ensure_ascii=False),
+                dna.get("librarian_intro"),
+                json.dumps(dna["librarian_points"], ensure_ascii=False) if dna.get("librarian_points") else None,
+                json.dumps(dna["librarian_chips"], ensure_ascii=False) if dna.get("librarian_chips") else None,
                 json.dumps(raw_analysis, ensure_ascii=False),
                 CURRENT_ANALYSIS_VERSION,
                 attempt_count,
