@@ -49,6 +49,9 @@ DB_NAME = os.getenv("BATCH_DB_NAME", "likenovel")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 EPISODE_SUMMARY_MODEL = os.getenv("STORY_AGENT_SUMMARY_MODEL", "deepseek/deepseek-v3.2").strip()
+RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma-4-31b-it").strip()
+RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
+RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "3"))
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 RP_DEEPSEEK_FALLBACK_MODEL = (
@@ -82,6 +85,7 @@ DIALOGUE_QUOTE_RE = re.compile(r'["“](.*?)["”]', re.S)
 FIRST_PERSON_MONOLOGUE_RE = re.compile(r"\b(나는|내가|난|나를|내게|내겐|내 마음|내 생각|내 판단)\b")
 RP_SIMPLE_VOCATIVE_RE = re.compile(r"^[가-힣A-Za-z0-9]{2,12}(?:아|야)?[!?.…~]*$")
 RP_NOISE_ONLY_RE = re.compile(r"^[!?.…~ㅋㅎㅠㅜ\s]+$")
+RP_GENERIC_DISPLAY_NAMES = {"지금", "오늘", "그때", "나", "내", "그", "그녀", "그들", "현재", "이번"}
 RANGE_SUMMARY_EPISODE_SPAN = 20
 EPISODE_SUMMARY_FIRST_LINE_RE = re.compile(r"^\[(?P<label>\d+화)\]\s+(?P<title>.+)$")
 EPISODE_TITLE_LABEL_RE = re.compile(r"^\s*(?P<label>\d+화)\s*(?P<title>.+?)\s*$")
@@ -756,6 +760,71 @@ def deepseek_headers(*, title: str) -> dict[str, str]:
     }
 
 
+def split_csv_values(value: str) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def require_paid_rp_openrouter_model() -> str:
+    model = str(RP_OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("STORY_AGENT_RP_OPENROUTER_MODEL is empty")
+    if model.lower().endswith(":free"):
+        raise RuntimeError("STORY_AGENT_RP_OPENROUTER_MODEL must not use :free")
+    return model
+
+
+def build_rp_openrouter_payload(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model": require_paid_rp_openrouter_model(),
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "reasoning": {"effort": "none", "exclude": True},
+        "messages": [
+            {"role": "system", "content": f"{system_prompt}\n\n반드시 유효한 JSON object만 반환하라."},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    provider_only = split_csv_values(RP_OPENROUTER_PROVIDER_ONLY)
+    if provider_only:
+        payload["provider"] = {
+            "only": provider_only,
+            "order": provider_only,
+            "allow_fallbacks": len(provider_only) > 1,
+        }
+    return payload
+
+
+async def request_rp_openrouter_json_payload(
+    client: AsyncClient,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    title: str,
+) -> dict | None:
+    response = await client.post(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "X-Title": title,
+        },
+        json=build_rp_openrouter_payload(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+        ),
+    )
+    response.raise_for_status()
+    return extract_json_object(extract_openrouter_message_text(response.json()))
+
+
 async def request_deepseek_json_payload(
     client: AsyncClient,
     *,
@@ -1148,6 +1217,17 @@ def build_rp_reasoning_signature() -> str:
             RP_REASONING_MODEL,
             RP_REASONING_EFFORT,
             RP_REASONING_THINKING_DISPLAY,
+        ]
+    )
+
+
+def build_rp_profile_model_signature() -> str:
+    return "|".join(
+        [
+            require_paid_rp_openrouter_model(),
+            RP_OPENROUTER_PROVIDER_ONLY,
+            f"min_examples:{RP_PROFILE_MIN_EXAMPLE_TEXTS}",
+            "reasoning:none",
         ]
     )
 
@@ -1860,6 +1940,21 @@ def normalize_rp_character_plan(
             break
 
     return normalized_targets[:5]
+
+
+def normalize_rp_guard_token(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip().lower()
+
+
+def get_rp_target_skip_reason(target: dict[str, object]) -> str:
+    display_name = str(target.get("display_name") or target.get("reference_name") or "").strip()
+    if normalize_rp_guard_token(display_name) in RP_GENERIC_DISPLAY_NAMES:
+        return "generic_display_name"
+    return ""
+
+
+def has_enough_rp_example_texts(example_texts: list[str]) -> bool:
+    return len([text for text in example_texts if str(text or "").strip()]) >= RP_PROFILE_MIN_EXAMPLE_TEXTS
 
 
 def extract_json_object(raw_text: str) -> dict | None:
@@ -2596,67 +2691,13 @@ async def request_rp_character_plan_payload(
     episode_texts_by_no: dict[int, str],
 ) -> dict | None:
     user_prompt = build_rp_character_plan_user_prompt(episode_rows, episode_texts_by_no)
-
-    if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
-        try:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": settings.ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": RP_REASONING_MODEL,
-                    "max_tokens": 2400,
-                    "system": RP_CHARACTER_PLAN_PROMPT,
-                    "messages": [{"role": "user", "content": user_prompt}],
-                    **build_anthropic_reasoning_options(RP_REASONING_MODEL),
-                },
-            )
-            response.raise_for_status()
-            parsed = extract_json_object(extract_anthropic_message_text(response.json()))
-            if parsed:
-                return parsed
-        except (HTTPStatusError, RequestError, ValueError):
-            pass
-
-    try:
-        parsed = await request_deepseek_json_payload(
-            client,
-            system_prompt=RP_CHARACTER_PLAN_PROMPT,
-            user_prompt=user_prompt,
-            max_tokens=1800,
-            title="LikeNovel Story Agent RP Character Plan DeepSeek Fallback",
-        )
-        if parsed:
-            logger.info(
-                "[storyctx] rp_character_plan fallback=deepseek model=%s",
-                RP_DEEPSEEK_FALLBACK_MODEL,
-            )
-            return parsed
-    except (HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("[storyctx] rp_character_plan deepseek fallback failed: %s", exc)
-
-    response = await client.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "X-Title": "LikeNovel Story Agent RP Character Plan Batch",
-        },
-        json={
-            "model": EPISODE_SUMMARY_MODEL,
-            "temperature": 0.0,
-            "max_completion_tokens": 1400,
-            "messages": [
-                {"role": "system", "content": RP_CHARACTER_PLAN_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
+    return await request_rp_openrouter_json_payload(
+        client,
+        system_prompt=RP_CHARACTER_PLAN_PROMPT,
+        user_prompt=user_prompt,
+        max_tokens=1800,
+        title="LikeNovel Story Agent RP Character Plan Batch",
     )
-    response.raise_for_status()
-    return extract_json_object(extract_openrouter_message_text(response.json()))
 
 
 async def request_episode_character_signals_payload(
@@ -2800,67 +2841,13 @@ async def request_rp_profile_payload(
         inventory_item,
         relation_context_lines,
     )
-
-    if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
-        try:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": settings.ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": RP_REASONING_MODEL,
-                    "max_tokens": 1800,
-                    "system": RP_PROFILE_SYNTHESIS_PROMPT,
-                    "messages": [{"role": "user", "content": user_prompt}],
-                    **build_anthropic_reasoning_options(RP_REASONING_MODEL),
-                },
-            )
-            response.raise_for_status()
-            parsed = extract_json_object(extract_anthropic_message_text(response.json()))
-            if parsed:
-                return parsed
-        except (HTTPStatusError, RequestError, ValueError):
-            pass
-
-    try:
-        parsed = await request_deepseek_json_payload(
-            client,
-            system_prompt=RP_PROFILE_SYNTHESIS_PROMPT,
-            user_prompt=user_prompt,
-            max_tokens=1200,
-            title="LikeNovel Story Agent RP Profile DeepSeek Fallback",
-        )
-        if parsed:
-            logger.info(
-                "[storyctx] rp_profile fallback=deepseek model=%s",
-                RP_DEEPSEEK_FALLBACK_MODEL,
-            )
-            return parsed
-    except (HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("[storyctx] rp_profile deepseek fallback failed: %s", exc)
-
-    response = await client.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "X-Title": "LikeNovel Story Agent RP Profile Batch",
-        },
-        json={
-            "model": EPISODE_SUMMARY_MODEL,
-            "temperature": 0.0,
-            "max_completion_tokens": 1000,
-            "messages": [
-                {"role": "system", "content": RP_PROFILE_SYNTHESIS_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
+    return await request_rp_openrouter_json_payload(
+        client,
+        system_prompt=RP_PROFILE_SYNTHESIS_PROMPT,
+        user_prompt=user_prompt,
+        max_tokens=1200,
+        title="LikeNovel Story Agent RP Profile Batch",
     )
-    response.raise_for_status()
-    return extract_json_object(extract_openrouter_message_text(response.json()))
 
 
 def build_rp_inventory_signature_parts(inventory_item: dict[str, object] | None) -> list[str]:
@@ -2888,7 +2875,7 @@ def build_rp_profile_source_hash(
         CHARACTER_RP_PROFILE_FORMAT_VERSION,
         [
             character_key,
-            build_rp_reasoning_signature(),
+            build_rp_profile_model_signature(),
             *build_rp_inventory_signature_parts(inventory_item),
             *(f"summary:{line}" for line in summary_context_lines[:8]),
             *(f"relation:{line}" for line in relation_context_lines[:6]),
@@ -2909,7 +2896,7 @@ def build_rp_examples_source_hash(
         CHARACTER_RP_EXAMPLES_FORMAT_VERSION,
         [
             character_key,
-            build_rp_reasoning_signature(),
+            build_rp_profile_model_signature(),
             *build_rp_inventory_signature_parts(inventory_item),
             *(f"summary:{line}" for line in summary_context_lines[:8]),
             *(f"relation:{line}" for line in relation_context_lines[:6]),
@@ -2973,9 +2960,8 @@ async def build_rp_target_map(
 ) -> dict[str, dict[str, object]]:
     target_map: dict[str, dict[str, object]] = {}
     prioritized_targets: list[dict[str, object]] = []
-    fallback_targets = build_rp_character_targets(episode_rows, episode_texts_by_no)
 
-    if summary_client is not None and OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL:
+    if summary_client is not None and OPENROUTER_API_KEY and RP_OPENROUTER_MODEL:
         try:
             plan_payload = await request_rp_character_plan_payload(
                 summary_client,
@@ -2985,11 +2971,16 @@ async def build_rp_target_map(
             prioritized_targets = normalize_rp_character_plan(plan_payload, episode_rows, episode_texts_by_no)
         except Exception as exc:
             if verbose:
-                print(f"[rp-plan-fallback] error={str(exc)[:160]}")
+                print(f"[rp-plan-skip] error={str(exc)[:160]}")
 
-    for target in [*prioritized_targets, *fallback_targets]:
+    for target in prioritized_targets:
         character_key = str(target.get("character_key") or "").strip()
         if not character_key:
+            continue
+        skip_reason = get_rp_target_skip_reason(target)
+        if skip_reason:
+            if verbose:
+                print(f"[rp-target-skip] character={character_key} reason={skip_reason}")
             continue
         if character_key not in target_map:
             target_map[character_key] = dict(target)
@@ -3151,7 +3142,7 @@ async def build_rp_summaries(
         "profile": [0, 0],
         "examples": [0, 0],
     }
-    if summary_client is None or not OPENROUTER_API_KEY or not EPISODE_SUMMARY_MODEL:
+    if summary_client is None or not OPENROUTER_API_KEY or not RP_OPENROUTER_MODEL:
         return {key: (value[0], value[1]) for key, value in counts.items()}
 
     targets: list[dict[str, object]] = []
@@ -3164,14 +3155,25 @@ async def build_rp_summaries(
         targets = normalize_rp_character_plan(plan_payload, episode_rows, episode_texts_by_no)
     except Exception as exc:
         if verbose:
-            print(f"[rp-plan-fallback] product_id={product_id} error={str(exc)[:160]}")
+            print(f"[rp-plan-skip] product_id={product_id} error={str(exc)[:160]}")
     if not targets:
-        targets = build_rp_character_targets(episode_rows, episode_texts_by_no)
+        logger.info("story_agent_rp_keep_old product_id=%s reason=%s", product_id, "plan_targets_missing")
+        return {key: (value[0], value[1]) for key, value in counts.items()}
 
     valid_scope_keys: set[str] = set()
     for target in targets:
         character_key = str(target.get("character_key") or "").strip()
         if not character_key:
+            continue
+        valid_scope_keys.add(character_key)
+        skip_reason = get_rp_target_skip_reason(target)
+        if skip_reason:
+            logger.info(
+                "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s",
+                product_id,
+                character_key,
+                skip_reason,
+            )
             continue
         inventory_item = dict((inventory_map or {}).get(character_key) or {})
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
@@ -3201,6 +3203,12 @@ async def build_rp_summaries(
         )
 
         if not dialogue_items:
+            logger.info(
+                "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s",
+                product_id,
+                character_key,
+                "dialogue_items_missing",
+            )
             continue
 
         try:
@@ -3217,6 +3225,12 @@ async def build_rp_summaries(
                 print(f"[rp-profile-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
             continue
         if not payload:
+            logger.info(
+                "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s",
+                product_id,
+                character_key,
+                "profile_payload_missing",
+            )
             continue
 
         profile_payload = {
@@ -3228,7 +3242,15 @@ async def build_rp_summaries(
             "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
         }
         example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
-        if not example_texts:
+        if not has_enough_rp_example_texts(example_texts):
+            logger.info(
+                "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s selected_examples=%s min_examples=%s",
+                product_id,
+                character_key,
+                "example_texts_below_min",
+                len(example_texts),
+                RP_PROFILE_MIN_EXAMPLE_TEXTS,
+            )
             continue
         example_payload = {
             "character_key": character_key,
@@ -3259,7 +3281,6 @@ async def build_rp_summaries(
             summary_context_lines=summary_context_lines,
             relation_context_lines=relation_context_lines,
         )
-        valid_scope_keys.add(character_key)
         with work_cursor(conn) as cur:
             _, profile_inserted = upsert_summary(
                 cur,
@@ -3318,7 +3339,7 @@ async def build_rp_summaries_delta(
         not affected_scope_keys
         or summary_client is None
         or not OPENROUTER_API_KEY
-        or not EPISODE_SUMMARY_MODEL
+        or not RP_OPENROUTER_MODEL
     ):
         return counts
 
@@ -3367,6 +3388,16 @@ async def build_rp_summaries_delta(
         if not target:
             target = dict(build_inventory_rp_target(scope_key=scope_key, inventory_item=inventory_item) or {})
         if not target:
+            continue
+        skip_reason = get_rp_target_skip_reason(target)
+        if skip_reason:
+            logger.info(
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s",
+                product_id,
+                scope_key,
+                skip_reason,
+            )
+            counts["keep_old_examples_missing_count"] += 1
             continue
 
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
@@ -3429,12 +3460,14 @@ async def build_rp_summaries_delta(
             "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
         }
         example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
-        if not example_texts:
+        if not has_enough_rp_example_texts(example_texts):
             logger.info(
-                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s",
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s selected_examples=%s min_examples=%s",
                 product_id,
                 scope_key,
-                "example_texts_missing",
+                "example_texts_below_min",
+                len(example_texts),
+                RP_PROFILE_MIN_EXAMPLE_TEXTS,
             )
             counts["keep_old_examples_missing_count"] += 1
             continue
@@ -5605,7 +5638,11 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
         rows_by_product.setdefault(int(row["product_id"]), []).append(row)
 
     summary_client: AsyncClient | None = None
-    if (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL) or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL):
+    if (
+        (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL)
+        or (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
+        or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
+    ):
         summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)
 
     work_conn = db_connect()
@@ -5876,7 +5913,11 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
         rows_by_product.setdefault(int(row["product_id"]), []).append(row)
 
     summary_client: AsyncClient | None = None
-    if (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL) or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL):
+    if (
+        (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL)
+        or (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
+        or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
+    ):
         summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)
 
     work_conn = db_connect()
