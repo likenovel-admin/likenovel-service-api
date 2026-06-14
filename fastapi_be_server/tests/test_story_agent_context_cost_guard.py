@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,6 +33,36 @@ class FakeConnection:
 @contextmanager
 def fake_work_cursor(_conn):
     yield object()
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class FakeOpenRouterClient:
+    def __init__(self, content):
+        self.content = content
+        self.calls = []
+
+    async def post(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": json.dumps(self.content, ensure_ascii=False)},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
 
 
 class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
@@ -76,8 +107,94 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         activate_existing.assert_called_once_with(ANY, 123, 687, "episode_character_signals", "episode:1001")
         self.assertEqual(conn.commit_count, 1)
 
+    async def test_rp_profile_uses_paid_gemma_openrouter_payload(self):
+        module = load_module()
+        client = FakeOpenRouterClient(
+            {
+                "speech_style": {"tone": ["차분한"], "formality": "반말", "sentence_length": "보통", "habit": [], "address": ""},
+                "personality_core": ["경계심이 강함"],
+                "baseline_attitude": "경계",
+                "example_dialogues": ["그게 정말 가능하다고?"],
+            }
+        )
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"):
+            payload = await module.request_rp_profile_payload(
+                client,
+                target={"display_name": "백이현", "aliases": ["백이현"]},
+                dialogue_items=[{"kind": "dialogue", "context": "질문", "text": "그게 정말 가능하다고?", "example_score": 8}],
+                summary_context_lines=["[1화] 백이현이 상황을 의심한다."],
+            )
+
+        self.assertEqual(payload["baseline_attitude"], "경계")
+        self.assertEqual(len(client.calls), 1)
+        request_json = client.calls[0]["json"]
+        self.assertEqual(request_json["model"], "google/gemma-4-31b-it")
+        self.assertEqual(
+            request_json["provider"],
+            {
+                "only": ["deepinfra", "together"],
+                "order": ["deepinfra", "together"],
+                "allow_fallbacks": True,
+            },
+        )
+        self.assertEqual(request_json["reasoning"], {"effort": "none", "exclude": True})
+        self.assertEqual(request_json["response_format"], {"type": "json_object"})
+        self.assertNotIn(":free", request_json["model"])
+
+    async def test_rp_openrouter_rejects_free_model_variant_before_network_call(self):
+        module = load_module()
+        client = FakeOpenRouterClient({"characters": []})
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it:free"):
+            with self.assertRaisesRegex(RuntimeError, "must not use :free"):
+                await module.request_rp_character_plan_payload(
+                    client,
+                    episode_rows=[],
+                    episode_texts_by_no={},
+                )
+
+        self.assertEqual(client.calls, [])
+
+    async def test_rp_build_keeps_old_profiles_when_plan_targets_missing(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "request_rp_character_plan_payload", AsyncMock(return_value={"characters": []})), \
+             patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
+            counts = await module.build_rp_summaries(
+                conn,
+                product_id=687,
+                episode_rows=[],
+                episode_texts_by_no={},
+                summary_client=object(),
+            )
+
+        self.assertEqual(counts, {"profile": (0, 0), "examples": (0, 0)})
+        deactivate_missing.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
+
 
 class StoryAgentContextDeltaValidationTest(TestCase):
+    def test_rp_target_quality_guard_rejects_generic_display_name(self):
+        module = load_module()
+
+        self.assertEqual(module.get_rp_target_skip_reason({"display_name": "지금"}), "generic_display_name")
+        self.assertEqual(module.get_rp_target_skip_reason({"display_name": " 오늘 "}), "generic_display_name")
+        self.assertEqual(module.get_rp_target_skip_reason({"display_name": "백이현"}), "")
+        self.assertEqual(module.get_rp_target_skip_reason({"display_name": "주인공", "aliases": ["나"]}), "")
+
+    def test_rp_profile_requires_minimum_exact_examples(self):
+        module = load_module()
+
+        self.assertFalse(module.has_enough_rp_example_texts(["첫 번째", "두 번째"]))
+        self.assertTrue(module.has_enough_rp_example_texts(["첫 번째", "두 번째", "세 번째"]))
+
     def test_delta_rp_refresh_is_opt_in_cli_flag(self):
         module = load_module()
 
