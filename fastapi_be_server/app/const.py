@@ -243,6 +243,7 @@ class Settings(BaseSettings):
         ),
     )
     STORY_AGENT_GEMINI_MODEL: str = WEBSOCHAT_GEMINI_MODEL
+    AI_CHAT_GEMINI_MODEL: str = os.getenv("AI_CHAT_GEMINI_MODEL", WEBSOCHAT_GEMINI_MODEL)
     DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
     DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
     AI_PROVIDER_HEALTH_DEEPSEEK_MODEL: str = os.getenv(

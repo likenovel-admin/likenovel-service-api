@@ -604,7 +604,7 @@ async def _call_gemini_text(
     }
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         response = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.WEBSOCHAT_GEMINI_MODEL}:generateContent",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.AI_CHAT_GEMINI_MODEL}:generateContent",
             headers={
                 "content-type": "application/json",
                 "x-goog-api-key": settings.GEMINI_API_KEY,
