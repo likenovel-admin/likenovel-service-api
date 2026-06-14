@@ -581,8 +581,8 @@ async def _call_gemini_text(
     *,
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 900,
-    temperature: float = 0.35,
+    max_tokens: int = 2048,
+    temperature: float = 1.0,
     timeout_seconds: float = 45.0,
 ) -> str:
     if not settings.GEMINI_API_KEY:
@@ -597,6 +597,9 @@ async def _call_gemini_text(
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
+            "thinkingConfig": {
+                "thinkingLevel": "low",
+            },
         },
     }
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
