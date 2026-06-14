@@ -566,6 +566,163 @@ async def _call_claude_messages(
     return response.json()
 
 
+def _extract_gemini_text(response_json: dict[str, Any]) -> str:
+    texts: list[str] = []
+    for candidate in response_json.get("candidates") or []:
+        content = candidate.get("content") or {}
+        for part in content.get("parts") or []:
+            text_value = str(part.get("text") or "").strip()
+            if text_value:
+                texts.append(text_value)
+    return "\n".join(texts).strip()
+
+
+async def _call_gemini_text(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 900,
+    temperature: float = 0.35,
+    timeout_seconds: float = 45.0,
+) -> str:
+    if not settings.GEMINI_API_KEY:
+        raise CustomResponseException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            message="AI 추천 서비스가 설정되지 않았습니다.",
+        )
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        response = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.WEBSOCHAT_GEMINI_MODEL}:generateContent",
+            headers={
+                "content-type": "application/json",
+                "x-goog-api-key": settings.GEMINI_API_KEY,
+            },
+            json=payload,
+        )
+
+    if response.status_code != 200:
+        error_logger.error("Gemini generateContent API error: %s %s", response.status_code, response.text)
+        raise CustomResponseException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            message="AI 서비스 호출에 실패했습니다.",
+        )
+
+    reply = _extract_gemini_text(response.json())
+    if not reply:
+        raise CustomResponseException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            message="AI 서비스 응답이 비어 있습니다.",
+        )
+    return reply
+
+
+def _build_current_product_overview_gemini_prompt(
+    *,
+    product_info: dict[str, Any],
+    user_query: str,
+) -> tuple[str, str]:
+    title = str(product_info.get("title") or "이 작품").strip() or "이 작품"
+    fields = {
+        "title": title,
+        "author": product_info.get("author_name"),
+        "episodeTotal": product_info.get("episode_total"),
+        "primaryGenre": product_info.get("primary_genre"),
+        "subGenre": product_info.get("sub_genre"),
+        "synopsis": product_info.get("synopsis_text"),
+        "premise": product_info.get("premise"),
+        "hook": product_info.get("hook"),
+        "episodeSummary": product_info.get("episode_summary_text"),
+        "mood": product_info.get("mood"),
+        "pacing": product_info.get("pacing"),
+        "tasteTags": product_info.get("taste_tags"),
+        "worldviewTags": product_info.get("worldview_tags"),
+        "protagonistTypeTags": product_info.get("protagonist_type_tags"),
+        "protagonistJobTags": product_info.get("protagonist_job_tags"),
+        "protagonistMaterialTags": product_info.get("protagonist_material_tags"),
+        "styleTags": product_info.get("axis_style_tags"),
+        "romanceTags": product_info.get("axis_romance_tags"),
+    }
+    compact_fields = {
+        key: value
+        for key, value in fields.items()
+        if value not in (None, "", [], {})
+    }
+    system_prompt = (
+        "너는 라이크노벨의 AI사서다. 사용자가 현재 작품 상세페이지에서 묻는 질문에 답한다. "
+        "제공된 작품 정보 안에서만 말하고, 없는 정보는 단정하지 않는다. "
+        "추천봇처럼 다른 작품을 억지로 권하지 말고 현재 작품의 매력을 독자에게 자연스럽게 설명한다. "
+        "한국어 해요체로 2~4문장만 답한다."
+    )
+    user_prompt = (
+        f"사용자 질문: {user_query}\n\n"
+        f"현재 작품 정보:\n{json.dumps(_to_json_safe(compact_fields), ensure_ascii=False)}"
+    )
+    return system_prompt, user_prompt
+
+
+async def _handle_current_product_overview_with_gemini(
+    *,
+    normalized_messages: list[dict],
+    page_context: dict,
+    profile: dict | None,
+    reader_context: dict,
+    db: AsyncSession,
+    adult_yn: str,
+) -> dict:
+    current_product_id = _safe_int(page_context.get("current_product_id"), 0)
+    if current_product_id <= 0:
+        raise CustomResponseException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            message="AI 서비스 호출에 실패했습니다.",
+        )
+
+    product_info = await get_product_info(
+        db,
+        product_id=current_product_id,
+        adult_yn=adult_yn,
+        include_episode_previews=False,
+        episode_numbers=None,
+    )
+    system_prompt, user_prompt = _build_current_product_overview_gemini_prompt(
+        product_info=product_info,
+        user_query=_latest_user_query(normalized_messages),
+    )
+    raw_reply = await _call_gemini_text(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    reply = _sanitize_reply_text(raw_reply) or f"{product_info.get('title') or '이 작품'}의 핵심 정보를 확인했습니다."
+    product, taste_match = await _build_product_and_taste(
+        selected_product_id=current_product_id,
+        last_search_candidates=[],
+        profile=profile,
+        db=db,
+        factor_scores=reader_context.get("factor_scores"),
+        adult_yn=adult_yn,
+        fallback_to_search=False,
+        prefetched_product_info=product_info,
+    )
+    if product:
+        product["matchReason"] = reply
+    return {
+        "reply": reply,
+        "product": product,
+        "tasteMatch": taste_match,
+        "taste_match": taste_match,
+        "finalMode": "weak_recommend",
+        "providerFallback": "gemini",
+    }
+
+
 def _build_session_state(messages: list[dict] | None, context: dict | None, exclude_ids: list[int]) -> dict:
     recommended_product_ids: list[int] = []
     for message in messages or []:
@@ -1943,13 +2100,25 @@ async def handle_chat(
             force_finalize_reason = None
             force_finalize_allowed_tool_names = None
         else:
-            response = await _call_claude_messages(
-                system_prompt=system_prompt,
-                messages=anthropic_messages,
-                tools=DATA_AGENT_TOOLS,
-                tool_choice={"type": "any"},
-                max_tokens=1400,
-            )
+            try:
+                response = await _call_claude_messages(
+                    system_prompt=system_prompt,
+                    messages=anthropic_messages,
+                    tools=DATA_AGENT_TOOLS,
+                    tool_choice={"type": "any"},
+                    max_tokens=1400,
+                )
+            except CustomResponseException:
+                if _is_current_product_overview_request(normalized_messages, page_context):
+                    return await _handle_current_product_overview_with_gemini(
+                        normalized_messages=normalized_messages,
+                        page_context=page_context,
+                        profile=profile,
+                        reader_context=reader_context,
+                        db=db,
+                        adult_yn=normalized_adult,
+                    )
+                raise
         content = response.get("content") or []
         last_text = _extract_text(content)
         tool_uses = _extract_tool_use_blocks(content)

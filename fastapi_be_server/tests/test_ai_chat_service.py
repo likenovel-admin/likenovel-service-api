@@ -175,6 +175,102 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_handle_chat_falls_back_to_gemini_for_current_product_overview_when_claude_fails(self):
+        async def run():
+            with (
+                patch.object(
+                    ai_chat_service,
+                    "_build_page_context",
+                    AsyncMock(
+                        return_value={
+                            "page_type": "product",
+                            "pathname": "/product/1106",
+                            "current_product_id": 1106,
+                            "current_product_title": "마법사 인생 2회차는 소드마스터",
+                            "focus_product_card": True,
+                        }
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_reader_context",
+                    AsyncMock(return_value={"taste_summary": None, "top_factors": [], "recent_reads": [], "read_product_ids": [], "factor_scores": {}}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_call_claude_messages",
+                    AsyncMock(
+                        side_effect=CustomResponseException(
+                            status_code=502,
+                            message="AI 서비스 호출에 실패했습니다.",
+                        )
+                    ),
+                ) as mocked_call_claude,
+                patch.object(
+                    ai_chat_service,
+                    "get_product_info",
+                    AsyncMock(
+                        return_value={
+                            "product_id": 1106,
+                            "title": "마법사 인생 2회차는 소드마스터",
+                            "author_name": "퀀퀀",
+                            "episode_total": 77,
+                            "synopsis_text": "잘못 살았다. 이번 생엔 반드시 마법사가 아닌, 소드마스터가 돼야 한다.",
+                            "premise": "회귀한 마법사가 검의 길을 선택한다.",
+                            "hook": "마법사였던 전생을 뒤집는 소드마스터 성장담.",
+                            "taste_tags": ["회귀", "성장"],
+                            "worldview_tags": ["아카데미"],
+                        }
+                    ),
+                ) as mocked_product_info,
+                patch.object(
+                    ai_chat_service,
+                    "_call_gemini_text",
+                    AsyncMock(return_value="회귀한 대마법사가 검으로 다시 길을 여는 성장 판타지예요."),
+                ) as mocked_call_gemini,
+                patch.object(
+                    ai_chat_service,
+                    "_build_product_and_taste",
+                    AsyncMock(
+                        return_value=(
+                            {
+                                "productId": 1106,
+                                "title": "마법사 인생 2회차는 소드마스터",
+                                "matchReason": "",
+                            },
+                            {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
+                        )
+                    ),
+                ),
+            ):
+                payload = await ai_chat_service.handle_chat(
+                    kc_user_id=None,
+                    messages=[{"role": "user", "content": "마법사 인생 2회차는 소드마스터 이 작품 어떤 작품인지 알려줘"}],
+                    context={
+                        "trigger": "manual",
+                        "page_type": "product",
+                        "pathname": "/product/1106",
+                        "current_product_id": 1106,
+                        "focus_product_card": True,
+                    },
+                    preset=None,
+                    exclude_ids=[],
+                    adult_yn="N",
+                    db=AsyncMock(),
+                )
+
+                mocked_call_claude.assert_awaited_once()
+                mocked_product_info.assert_awaited_once()
+                mocked_call_gemini.assert_awaited_once()
+                self.assertEqual(payload["providerFallback"], "gemini")
+                self.assertEqual(payload["reply"], "회귀한 대마법사가 검으로 다시 길을 여는 성장 판타지예요.")
+                self.assertEqual(payload["product"]["productId"], 1106)
+                self.assertEqual(payload["product"]["matchReason"], payload["reply"])
+
+        import asyncio
+
+        asyncio.run(run())
+
     def test_extract_final_tool_input(self):
         tool_uses = [
             {"type": "tool_use", "name": "get_fact_catalog", "input": {}},
