@@ -271,6 +271,53 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_call_gemini_text_uses_low_thinking_and_larger_output_budget(self):
+        class FakeGeminiResponse:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "완성된 답변"}]}}]}
+
+        class FakeAsyncClient:
+            calls = []
+
+            def __init__(self, *, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *args, **kwargs):
+                self.__class__.calls.append({"args": args, "kwargs": kwargs})
+                return FakeGeminiResponse()
+
+        async def run():
+            FakeAsyncClient.calls = []
+            with (
+                patch.object(ai_chat_service.settings, "GEMINI_API_KEY", "test-key"),
+                patch.object(ai_chat_service.settings, "WEBSOCHAT_GEMINI_MODEL", "gemini-3.1-pro-preview"),
+                patch.object(ai_chat_service.httpx, "AsyncClient", FakeAsyncClient),
+            ):
+                reply = await ai_chat_service._call_gemini_text(
+                    system_prompt="system",
+                    user_prompt="user",
+                )
+
+            self.assertEqual(reply, "완성된 답변")
+            request_json = FakeAsyncClient.calls[0]["kwargs"]["json"]
+            generation_config = request_json["generationConfig"]
+            self.assertEqual(generation_config["maxOutputTokens"], 2048)
+            self.assertEqual(generation_config["temperature"], 1.0)
+            self.assertEqual(generation_config["thinkingConfig"]["thinkingLevel"], "low")
+
+        import asyncio
+
+        asyncio.run(run())
+
     def test_extract_final_tool_input(self):
         tool_uses = [
             {"type": "tool_use", "name": "get_fact_catalog", "input": {}},
