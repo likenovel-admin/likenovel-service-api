@@ -57,7 +57,7 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").r
 RP_DEEPSEEK_FALLBACK_MODEL = (
     os.getenv("STORY_AGENT_RP_DEEPSEEK_FALLBACK_MODEL", "").strip() or "deepseek-v4-pro"
 )
-RP_REASONING_MODEL = (os.getenv("STORY_AGENT_RP_REASONING_MODEL", "").strip() or "claude-sonnet-4-6")
+RP_REASONING_MODEL = os.getenv("STORY_AGENT_RP_REASONING_MODEL", "").strip()
 if RP_REASONING_MODEL.startswith("anthropic."):
     RP_REASONING_MODEL = RP_REASONING_MODEL.split(".", 1)[1].strip()
 RP_REASONING_EFFORT = (os.getenv("STORY_AGENT_RP_REASONING_EFFORT", "medium").strip() or "medium")
@@ -1212,8 +1212,16 @@ def build_compound_summary_source_hash(format_version: str, components: list[str
 
 
 def build_rp_reasoning_signature() -> str:
+    if not RP_REASONING_MODEL:
+        return "|".join(
+            [
+                "deepseek",
+                RP_DEEPSEEK_FALLBACK_MODEL,
+            ]
+        )
     return "|".join(
         [
+            "anthropic",
             RP_REASONING_MODEL,
             RP_REASONING_EFFORT,
             RP_REASONING_THINKING_DISPLAY,
@@ -2794,11 +2802,11 @@ async def request_episode_character_signals_payload(
             tool_schema=EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA,
             tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME,
             max_tokens=1400,
-            title="LikeNovel Story Agent Episode Character Signals DeepSeek Fallback",
+            title="LikeNovel Story Agent Episode Character Signals DeepSeek",
         )
         if deepseek_payload:
             logger.info(
-                "[storyctx] episode_character_signals fallback=deepseek model=%s episode_no=%s",
+                "[storyctx] episode_character_signals provider=deepseek model=%s episode_no=%s",
                 RP_DEEPSEEK_FALLBACK_MODEL,
                 episode_no,
             )
@@ -2813,7 +2821,7 @@ async def request_episode_character_signals_payload(
     diagnostics = build_episode_character_signals_parse_diagnostics(raw_text)
     raise EpisodeCharacterSignalsParseError(
         episode_no=episode_no,
-        model=RP_REASONING_MODEL,
+        model=RP_REASONING_MODEL or RP_DEEPSEEK_FALLBACK_MODEL,
         request_id=request_id,
         json_parse_ok=bool(diagnostics["json_parse_ok"]),
         line_parse_ok=bool(diagnostics["line_parse_ok"]),
@@ -5641,6 +5649,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
     if (
         (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL)
         or (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
+        or (DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL)
         or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
     ):
         summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)
@@ -5916,6 +5925,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
     if (
         (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL)
         or (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
+        or (DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL)
         or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
     ):
         summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)
