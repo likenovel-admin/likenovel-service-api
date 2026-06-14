@@ -299,7 +299,8 @@ class AiChatServiceUnitTest(unittest.TestCase):
             FakeAsyncClient.calls = []
             with (
                 patch.object(ai_chat_service.settings, "GEMINI_API_KEY", "test-key"),
-                patch.object(ai_chat_service.settings, "WEBSOCHAT_GEMINI_MODEL", "gemini-3.1-pro-preview"),
+                patch.object(ai_chat_service.settings, "WEBSOCHAT_GEMINI_MODEL", "gemini-3.1-flash-lite"),
+                patch.object(ai_chat_service.settings, "AI_CHAT_GEMINI_MODEL", "gemini-3.1-pro-preview"),
                 patch.object(ai_chat_service.httpx, "AsyncClient", FakeAsyncClient),
             ):
                 reply = await ai_chat_service._call_gemini_text(
@@ -308,6 +309,8 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 )
 
             self.assertEqual(reply, "완성된 답변")
+            request_url = FakeAsyncClient.calls[0]["args"][0]
+            self.assertIn("/models/gemini-3.1-pro-preview:generateContent", request_url)
             request_json = FakeAsyncClient.calls[0]["kwargs"]["json"]
             generation_config = request_json["generationConfig"]
             self.assertEqual(generation_config["maxOutputTokens"], 2048)
