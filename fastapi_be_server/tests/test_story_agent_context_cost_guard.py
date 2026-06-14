@@ -107,6 +107,64 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         activate_existing.assert_called_once_with(ANY, 123, 687, "episode_character_signals", "episode:1001")
         self.assertEqual(conn.commit_count, 1)
 
+    async def test_episode_character_signals_defaults_to_deepseek_direct(self):
+        module = load_module()
+        client = FakeOpenRouterClient(
+            {
+                "episode_no": 1,
+                "mentioned_characters": [
+                    {
+                        "display_name": "백이현",
+                        "aliases": ["백이현"],
+                        "is_protagonist": True,
+                        "is_first_person": False,
+                        "entity_kind": "person",
+                        "scene_weight": "high",
+                        "role_in_episode": "lead",
+                        "voice_mode": "dialogue",
+                        "action_tags": ["질문"],
+                        "affect_tags": ["경계"],
+                        "relation_edges": [],
+                    }
+                ],
+                "cliffhanger_hooks": ["다음 선택이 남는다."],
+            }
+        )
+
+        with patch.object(module.settings, "ANTHROPIC_API_KEY", "anthropic-key"), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "DEEPSEEK_API_KEY", "deepseek-key"), \
+             patch.object(module, "DEEPSEEK_BASE_URL", "https://api.deepseek.com"), \
+             patch.object(module, "RP_DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-pro"):
+            payload = await module.request_episode_character_signals_payload(
+                client,
+                row={"episode_no": 1, "title": "테스트", "episode_title": "1화"},
+                summary_text="[1화] 테스트\n백이현이 경계하며 질문한다.\n핵심: 백이현, 경계, 질문, 선택, 사건, 단서",
+            )
+
+        self.assertEqual(payload["mentioned_characters"][0]["display_name"], "백이현")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["url"], "https://api.deepseek.com/chat/completions")
+        self.assertNotIn("api.anthropic.com", client.calls[0]["url"])
+        self.assertEqual(client.calls[0]["json"]["model"], "deepseek-v4-pro")
+        self.assertEqual(client.calls[0]["json"]["response_format"], {"type": "json_object"})
+        self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals DeepSeek")
+
+    def test_episode_character_signals_source_hash_uses_primary_model(self):
+        module = load_module()
+
+        with patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "RP_DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-pro"):
+            self.assertEqual(module.build_rp_reasoning_signature(), "deepseek|deepseek-v4-pro")
+
+        with patch.object(module, "RP_REASONING_MODEL", "claude-sonnet-4-6"), \
+             patch.object(module, "RP_REASONING_EFFORT", "medium"), \
+             patch.object(module, "RP_REASONING_THINKING_DISPLAY", "omitted"):
+            self.assertEqual(
+                module.build_rp_reasoning_signature(),
+                "anthropic|claude-sonnet-4-6|medium|omitted",
+            )
+
     async def test_rp_profile_uses_paid_gemma_openrouter_payload(self):
         module = load_module()
         client = FakeOpenRouterClient(
