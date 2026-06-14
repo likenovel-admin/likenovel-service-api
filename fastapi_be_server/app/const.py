@@ -243,6 +243,7 @@ class Settings(BaseSettings):
         ),
     )
     STORY_AGENT_GEMINI_MODEL: str = WEBSOCHAT_GEMINI_MODEL
+    AI_CHAT_GEMINI_MODEL: str = os.getenv("AI_CHAT_GEMINI_MODEL", WEBSOCHAT_GEMINI_MODEL)
 
 
 settings = Settings()
