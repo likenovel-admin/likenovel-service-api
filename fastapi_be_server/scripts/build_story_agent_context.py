@@ -1240,6 +1240,55 @@ def build_rp_profile_model_signature() -> str:
     )
 
 
+def _log_value(value: object) -> str:
+    text = str(value or "").strip()
+    return text if text else "none"
+
+
+def build_storyctx_provider_summary_line() -> str:
+    episode_summary_provider = "openrouter" if OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL else "local_fallback"
+    rp_openrouter_provider = "openrouter" if OPENROUTER_API_KEY and RP_OPENROUTER_MODEL else "disabled"
+    if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
+        signal_provider = "anthropic"
+        signal_model = RP_REASONING_MODEL
+        signal_fallback_provider = "deepseek" if DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL else "none"
+        signal_fallback_model = RP_DEEPSEEK_FALLBACK_MODEL if signal_fallback_provider == "deepseek" else "none"
+    elif DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
+        signal_provider = "deepseek"
+        signal_model = RP_DEEPSEEK_FALLBACK_MODEL
+        signal_fallback_provider = "none"
+        signal_fallback_model = "none"
+    else:
+        signal_provider = "unavailable"
+        signal_model = "none"
+        signal_fallback_provider = "none"
+        signal_fallback_model = "none"
+
+    return (
+        "storyctx-provider "
+        f"episode_summary_provider={episode_summary_provider} "
+        f"episode_summary_model={_log_value(EPISODE_SUMMARY_MODEL)} "
+        f"episode_character_signals_provider={signal_provider} "
+        f"episode_character_signals_model={_log_value(signal_model)} "
+        f"episode_character_signals_fallback_provider={signal_fallback_provider} "
+        f"episode_character_signals_fallback_model={_log_value(signal_fallback_model)} "
+        f"rp_character_plan_provider={rp_openrouter_provider} "
+        f"rp_character_plan_model={_log_value(RP_OPENROUTER_MODEL)} "
+        f"rp_profile_provider={rp_openrouter_provider} "
+        f"rp_profile_model={_log_value(RP_OPENROUTER_MODEL)} "
+        f"rp_openrouter_provider_only={_log_value(RP_OPENROUTER_PROVIDER_ONLY)}"
+    )
+
+
+def build_summary_product_ids(results: dict[str, object]) -> str:
+    product_ids = [
+        str(product.get("product_id"))
+        for product in list(results.get("products") or [])[:20]
+        if isinstance(product, dict) and product.get("product_id") is not None
+    ]
+    return ",".join(product_ids) if product_ids else "none"
+
+
 def parse_summary_text(summary_text: str) -> dict[str, object]:
     lines = [line.strip() for line in (summary_text or "").splitlines() if line.strip()]
     header = lines[0] if lines else ""
@@ -6238,8 +6287,10 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
 
 
 def print_summary(results: dict[str, object], apply: bool) -> None:
+    print(build_storyctx_provider_summary_line())
     print(
         f"mode={'apply' if apply else 'dry-run'} "
+        f"product_ids={build_summary_product_ids(results)} "
         f"inserted_docs={results['inserted_docs']} reused_docs={results['reused_docs']} "
         f"inserted_summaries={results['inserted_summaries']} reused_summaries={results['reused_summaries']} "
         f"llm_generated_summaries={results['llm_generated_summaries']} "
