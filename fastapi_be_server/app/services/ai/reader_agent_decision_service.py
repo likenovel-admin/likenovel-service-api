@@ -83,7 +83,7 @@ def build_reader_decision_prompt(input_snapshot: dict[str, Any]) -> tuple[str, s
 반드시 JSON 객체만 반환한다. 마크다운, 설명문, 주석은 금지한다.
 필수 JSON 필드:
 - continue_reading: boolean
-- next_episode_count: integer, 0 또는 1
+- next_episode_count: integer, 0~2
 - drop_product: boolean
 - bookmark_action: "none" | "add" | "remove"
 - recommend_action: "none" | "press" | "remove"
@@ -106,7 +106,7 @@ def build_reader_decision_prompt(input_snapshot: dict[str, Any]) -> tuple[str, s
 - 모든 행동은 과장하지 말고 독자 한 명의 자연스러운 반응으로 결정한다.
 - 강하게 마음에 든 독자는 첫 회차나 초반부에도 선호작/추천을 할 수 있다. 평가는 보통 3회차 이상 읽은 뒤 판단한다.
 - 추천은 선호작보다 가벼운 긍정 신호다. 몇 화를 읽고 계속 볼 마음이 들면 추천을 누를 수 있다.
-- 다음 회차를 볼지 말지만 판단한다. 한 번의 판단에서 next_episode_count는 0 또는 1이어야 한다.
+- 다음 회차를 볼지 판단한다. 강하게 마음에 들면 한 번의 판단에서 next_episode_count를 2까지 줄 수 있다.
 - 다음 회차를 보지 않으면 next_episode_count는 0이어야 한다.
 - drop_product가 true면 continue_reading은 false여야 한다.
 prompt_version={READER_DECISION_PROMPT_VERSION}
@@ -154,7 +154,7 @@ def parse_llm_decision(raw_response: str | dict[str, Any]) -> ReaderLlmDecision:
 
     continue_reading = _require_bool(payload, "continue_reading")
     drop_product = _require_bool(payload, "drop_product")
-    next_episode_count = _require_int(payload, "next_episode_count", minimum=0, maximum=1)
+    next_episode_count = _require_int(payload, "next_episode_count", minimum=0, maximum=2)
     bookmark_action = _require_choice(payload, "bookmark_action", BOOKMARK_ACTIONS)
     recommend_action = _require_choice(payload, "recommend_action", RECOMMEND_ACTIONS)
 

@@ -1031,8 +1031,29 @@ DEFAULT_AI_READER_GENDER_RATIOS = {
     "M": 52,
     "F": 48,
 }
+DEFAULT_AI_READER_PRODUCT_TYPE_WEIGHTS = {
+    "free_serial": 100,
+    "paid_serial": 0,
+}
+DEFAULT_AI_READER_FREE_PRODUCT_TYPE_WEIGHTS = {
+    "normal_serial": 85,
+    "free_serial": 15,
+}
+DEFAULT_AI_READER_PRODUCT_STATUS_WEIGHTS = {
+    "ongoing": 80,
+    "rest": 10,
+    "end": 10,
+    "stop": 0,
+}
 ALLOWED_AI_READER_AGE_GROUPS = set(DEFAULT_AI_READER_AGE_GROUP_RATIOS)
 ALLOWED_AI_READER_GENDERS = {"M", "F", "X"}
+ALLOWED_AI_READER_PRODUCT_TYPE_WEIGHT_KEYS = set(DEFAULT_AI_READER_PRODUCT_TYPE_WEIGHTS)
+ALLOWED_AI_READER_FREE_PRODUCT_TYPE_WEIGHT_KEYS = set(
+    DEFAULT_AI_READER_FREE_PRODUCT_TYPE_WEIGHTS
+)
+ALLOWED_AI_READER_PRODUCT_STATUS_WEIGHT_KEYS = set(
+    DEFAULT_AI_READER_PRODUCT_STATUS_WEIGHTS
+)
 AI_READER_NICKNAME_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9]+$")
 FORBIDDEN_AI_READER_NICKNAME_TERMS = ("디씨", "주갤", "주갤러")
 
@@ -1085,6 +1106,69 @@ def _validate_ai_reader_ratio_map(
     return normalized
 
 
+def _validate_ai_reader_product_type_weights(value: Dict[str, int]) -> Dict[str, int]:
+    normalized = {str(key): int(raw_value) for key, raw_value in value.items()}
+    unknown_keys = sorted(set(normalized) - ALLOWED_AI_READER_PRODUCT_TYPE_WEIGHT_KEYS)
+    missing_keys = sorted(ALLOWED_AI_READER_PRODUCT_TYPE_WEIGHT_KEYS - set(normalized))
+    if unknown_keys:
+        raise ValueError(
+            f"product_type_weights contains unsupported keys: {', '.join(unknown_keys)}"
+        )
+    if missing_keys:
+        raise ValueError(
+            f"product_type_weights is missing required keys: {', '.join(missing_keys)}"
+        )
+    if any(weight < 0 for weight in normalized.values()):
+        raise ValueError("product_type_weights must not contain negative values")
+    if sum(normalized.values()) != 100:
+        raise ValueError("product_type_weights must sum to 100")
+    if not any(weight > 0 for weight in normalized.values()):
+        raise ValueError("product_type_weights must include at least one positive value")
+    return normalized
+
+
+def _validate_ai_reader_free_product_type_weights(value: Dict[str, int]) -> Dict[str, int]:
+    normalized = {str(key): int(raw_value) for key, raw_value in value.items()}
+    unknown_keys = sorted(set(normalized) - ALLOWED_AI_READER_FREE_PRODUCT_TYPE_WEIGHT_KEYS)
+    missing_keys = sorted(ALLOWED_AI_READER_FREE_PRODUCT_TYPE_WEIGHT_KEYS - set(normalized))
+    if unknown_keys:
+        raise ValueError(
+            f"free_product_type_weights contains unsupported keys: {', '.join(unknown_keys)}"
+        )
+    if missing_keys:
+        raise ValueError(
+            f"free_product_type_weights is missing required keys: {', '.join(missing_keys)}"
+        )
+    if any(weight < 0 for weight in normalized.values()):
+        raise ValueError("free_product_type_weights must not contain negative values")
+    if sum(normalized.values()) != 100:
+        raise ValueError("free_product_type_weights must sum to 100")
+    if not any(weight > 0 for weight in normalized.values()):
+        raise ValueError("free_product_type_weights must include at least one positive value")
+    return normalized
+
+
+def _validate_ai_reader_product_status_weights(value: Dict[str, int]) -> Dict[str, int]:
+    normalized = {str(key): int(raw_value) for key, raw_value in value.items()}
+    unknown_keys = sorted(set(normalized) - ALLOWED_AI_READER_PRODUCT_STATUS_WEIGHT_KEYS)
+    missing_keys = sorted(ALLOWED_AI_READER_PRODUCT_STATUS_WEIGHT_KEYS - set(normalized))
+    if unknown_keys:
+        raise ValueError(
+            f"product_status_weights contains unsupported keys: {', '.join(unknown_keys)}"
+        )
+    if missing_keys:
+        raise ValueError(
+            f"product_status_weights is missing required keys: {', '.join(missing_keys)}"
+        )
+    if any(weight < 0 for weight in normalized.values()):
+        raise ValueError("product_status_weights must not contain negative values")
+    if sum(normalized.values()) != 100:
+        raise ValueError("product_status_weights must sum to 100")
+    if not any(weight > 0 for weight in normalized.values()):
+        raise ValueError("product_status_weights must include at least one positive value")
+    return normalized
+
+
 class PostAiReaderBootstrapReqBody(AdminBase):
     email_prefix: str = Field(
         min_length=1,
@@ -1092,7 +1176,7 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         examples=["ai-reader-"],
         description="AI 전용 계정 이메일 prefix",
     )
-    agent_count: int = Field(default=100, ge=1, le=100, description="투입할 AI 독자 수")
+    agent_count: int = Field(default=100, ge=1, le=200, description="투입할 AI 독자 수")
     schedule_date: Optional[str] = Field(
         default=None,
         examples=["2026-05-13"],
@@ -1128,6 +1212,18 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         min_length=1,
         max_length=24,
         description="시간표 블록. 있으면 active_hours/daily_session_target보다 우선 사용",
+    )
+    product_type_weights: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="작품 타입 가중치. free_serial(무료연재), paid_serial(유료연재) 합계 100",
+    )
+    free_product_type_weights: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="무료연재 내부 가중치. normal_serial(일반연재), free_serial(자유연재) 합계 100",
+    )
+    product_status_weights: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="작품 연재 상태 가중치. ongoing(연재중), rest(휴재), end(완결), stop(연재중지) 합계 100",
     )
     start_immediately: bool = Field(
         default=False,
@@ -1221,9 +1317,27 @@ class PostAiReaderBootstrapReqBody(AdminBase):
             field_name="gender_ratios",
         )
 
+    @field_validator("product_type_weights")
+    def validate_product_type_weights(cls, value):
+        if value is None:
+            return None
+        return _validate_ai_reader_product_type_weights(value)
+
+    @field_validator("free_product_type_weights")
+    def validate_free_product_type_weights(cls, value):
+        if value is None:
+            return None
+        return _validate_ai_reader_free_product_type_weights(value)
+
+    @field_validator("product_status_weights")
+    def validate_product_status_weights(cls, value):
+        if value is None:
+            return None
+        return _validate_ai_reader_product_status_weights(value)
+
 
 class PostAiReaderResumePausedReqBody(AdminBase):
-    agent_count: int = Field(default=100, ge=1, le=100, description="재가동할 paused AI 독자 수")
+    agent_count: int = Field(default=100, ge=1, le=200, description="재가동할 paused AI 독자 수")
     schedule_date: Optional[str] = Field(
         default=None,
         examples=["2026-05-14"],
@@ -1276,6 +1390,18 @@ class PostAiReaderResumePausedReqBody(AdminBase):
         max_length=24,
         description="재가동 시 덮어쓸 시간표 블록",
     )
+    product_type_weights: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="재가동 시 덮어쓸 작품 타입 가중치. free_serial(무료연재), paid_serial(유료연재) 합계 100",
+    )
+    free_product_type_weights: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="재가동 시 덮어쓸 무료연재 내부 가중치. normal_serial(일반연재), free_serial(자유연재) 합계 100",
+    )
+    product_status_weights: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="재가동 시 덮어쓸 작품 연재 상태 가중치. ongoing(연재중), rest(휴재), end(완결), stop(연재중지) 합계 100",
+    )
     daily_llm_budget: Optional[int] = Field(
         default=None,
         ge=1,
@@ -1299,12 +1425,30 @@ class PostAiReaderResumePausedReqBody(AdminBase):
             raise ValueError("active_hours must be between 0 and 23")
         return normalized
 
+    @field_validator("product_type_weights")
+    def validate_product_type_weights(cls, value):
+        if value is None:
+            return None
+        return _validate_ai_reader_product_type_weights(value)
+
+    @field_validator("free_product_type_weights")
+    def validate_free_product_type_weights(cls, value):
+        if value is None:
+            return None
+        return _validate_ai_reader_free_product_type_weights(value)
+
+    @field_validator("product_status_weights")
+    def validate_product_status_weights(cls, value):
+        if value is None:
+            return None
+        return _validate_ai_reader_product_status_weights(value)
+
 
 class PostAiReaderRefreshSchedulesReqBody(PostAiReaderResumePausedReqBody):
     agent_count: int = Field(
         default=100,
         ge=1,
-        le=100,
+        le=200,
         description="새 스케줄을 생성할 active AI 독자 수",
     )
 
@@ -1313,7 +1457,7 @@ class PostAiReaderRestartReqBody(PostAiReaderResumePausedReqBody):
     agent_count: int = Field(
         default=100,
         ge=1,
-        le=100,
+        le=200,
         description="전체 AI 독자를 정리한 뒤 새로 active 전환할 AI 독자 수",
     )
 

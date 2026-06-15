@@ -74,20 +74,38 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
         self.assertEqual(decision.bayesian_update["recommend"]["prior"], 1.0)
         self.assertEqual(decision.bayesian_update["recommend"]["posterior"], 0.0)
 
-    def test_parse_llm_decision_rejects_multi_episode_followup(self):
+    def test_parse_llm_decision_accepts_two_episode_followup(self):
+        from app.services.ai import reader_agent_decision_service as service
+
+        decision = service.parse_llm_decision(
+            {
+                "continue_reading": True,
+                "next_episode_count": 2,
+                "drop_product": False,
+                "bookmark_action": "none",
+                "recommend_action": "none",
+                "evaluation": {"should_evaluate": False, "eval_code": None},
+                "taste_delta": {"positive": [], "negative": []},
+                "reason": "강하게 마음에 들어 두 화 더 읽고 싶음",
+            }
+        )
+
+        self.assertEqual(decision.next_episode_count, 2)
+
+    def test_parse_llm_decision_rejects_over_two_episode_followup(self):
         from app.services.ai import reader_agent_decision_service as service
 
         with self.assertRaises(service.InvalidReaderDecisionError):
             service.parse_llm_decision(
                 {
                     "continue_reading": True,
-                    "next_episode_count": 2,
+                    "next_episode_count": 3,
                     "drop_product": False,
                     "bookmark_action": "none",
                     "recommend_action": "none",
                     "evaluation": {"should_evaluate": False, "eval_code": None},
                     "taste_delta": {"positive": [], "negative": []},
-                    "reason": "두 화 더 읽고 싶음",
+                    "reason": "세 화 더 읽고 싶음",
                 }
             )
 
@@ -160,7 +178,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
         self.assertIn("suggested=false는 금지가 아니다", system_prompt)
         self.assertIn("Bayesian 사후확률", system_prompt)
         self.assertIn("추천은 선호작보다 가벼운 긍정 신호", system_prompt)
-        self.assertIn("0 또는 1", system_prompt)
+        self.assertIn("0~2", system_prompt)
         self.assertIn("1~10화 초반 요약", system_prompt)
         self.assertIn("테스트 작품", user_prompt)
 
@@ -1586,7 +1604,7 @@ class AiReaderActionApplierTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("last_decision_id", executed_sql)
 
-    async def test_next_episode_action_caps_followup_read_to_one_episode(self):
+    async def test_next_episode_action_caps_followup_read_to_two_episodes(self):
         from app.services.ai import reader_agent_action_service as service
 
         db = AsyncMock()
@@ -1624,7 +1642,7 @@ class AiReaderActionApplierTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.applied)
         self.assertTrue(limit_params)
         self.assertTrue(
-            all(params["next_episode_count"] == 1 for params in limit_params)
+            all(params["next_episode_count"] == 2 for params in limit_params)
         )
 
     async def test_next_episode_action_does_not_apply_when_no_followup_episode_exists(self):
@@ -3731,6 +3749,85 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(token_a, token_b)
 
+    def test_bootstrap_dry_run_token_includes_product_type_weights(self):
+        from app.services.admin import admin_ai_reader_service
+
+        common_kwargs = {
+            "email_prefix": "prod-ai-reader-",
+            "agent_count": 20,
+            "schedule_date": "2026-05-14",
+            "allow_partial": False,
+            "agent_index_offset": 0,
+            "daily_llm_budget": 8,
+        }
+
+        token_a = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            product_type_weights={"free_serial": 80, "paid_serial": 20},
+        )
+        token_b = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            product_type_weights={"free_serial": 20, "paid_serial": 80},
+        )
+
+        self.assertNotEqual(token_a, token_b)
+
+    def test_bootstrap_dry_run_token_includes_free_product_type_weights(self):
+        from app.services.admin import admin_ai_reader_service
+
+        common_kwargs = {
+            "email_prefix": "prod-ai-reader-",
+            "agent_count": 20,
+            "schedule_date": "2026-05-14",
+            "allow_partial": False,
+            "agent_index_offset": 0,
+            "daily_llm_budget": 8,
+        }
+
+        token_a = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            free_product_type_weights={"normal_serial": 85, "free_serial": 15},
+        )
+        token_b = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            free_product_type_weights={"normal_serial": 50, "free_serial": 50},
+        )
+
+        self.assertNotEqual(token_a, token_b)
+
+    def test_bootstrap_dry_run_token_includes_product_status_weights(self):
+        from app.services.admin import admin_ai_reader_service
+
+        common_kwargs = {
+            "email_prefix": "prod-ai-reader-",
+            "agent_count": 20,
+            "schedule_date": "2026-05-14",
+            "allow_partial": False,
+            "agent_index_offset": 0,
+            "daily_llm_budget": 8,
+        }
+
+        token_a = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            product_status_weights={
+                "ongoing": 100,
+                "rest": 0,
+                "end": 0,
+                "stop": 0,
+            },
+        )
+        token_b = admin_ai_reader_service.build_ai_reader_bootstrap_dry_run_token(
+            **common_kwargs,
+            product_status_weights={
+                "ongoing": 40,
+                "rest": 10,
+                "end": 50,
+                "stop": 0,
+            },
+        )
+
+        self.assertNotEqual(token_a, token_b)
+
     def test_bootstrap_request_normalizes_profile_nickname_pool(self):
         from app.schemas.admin import PostAiReaderBootstrapReqBody
 
@@ -3763,6 +3860,141 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
                 schedule_date="2026-05-14",
                 apply=False,
                 profile_nickname_pool=["분홍빤쓰147!"],
+            )
+
+    def test_ai_reader_request_validates_product_type_weights(self):
+        from app.schemas.admin import (
+            DEFAULT_AI_READER_PRODUCT_TYPE_WEIGHTS,
+            DEFAULT_AI_READER_FREE_PRODUCT_TYPE_WEIGHTS,
+            PostAiReaderBootstrapReqBody,
+            PostAiReaderResumePausedReqBody,
+        )
+
+        self.assertEqual(
+            DEFAULT_AI_READER_PRODUCT_TYPE_WEIGHTS,
+            {"free_serial": 100, "paid_serial": 0},
+        )
+        self.assertEqual(
+            DEFAULT_AI_READER_FREE_PRODUCT_TYPE_WEIGHTS,
+            {"normal_serial": 85, "free_serial": 15},
+        )
+
+        bootstrap_req = PostAiReaderBootstrapReqBody(
+            email_prefix="prod-ai-reader-",
+            agent_count=200,
+            schedule_date="2026-05-14",
+            apply=False,
+            product_type_weights={"free_serial": 70, "paid_serial": 30},
+            free_product_type_weights={"normal_serial": 85, "free_serial": 15},
+        )
+        resume_req = PostAiReaderResumePausedReqBody(
+            agent_count=200,
+            schedule_date="2026-05-14",
+            apply=False,
+            product_type_weights={"free_serial": 40, "paid_serial": 60},
+            free_product_type_weights={"normal_serial": 60, "free_serial": 40},
+        )
+
+        self.assertEqual(bootstrap_req.agent_count, 200)
+        self.assertEqual(
+            bootstrap_req.product_type_weights,
+            {"free_serial": 70, "paid_serial": 30},
+        )
+        self.assertEqual(
+            bootstrap_req.free_product_type_weights,
+            {"normal_serial": 85, "free_serial": 15},
+        )
+        self.assertEqual(resume_req.agent_count, 200)
+        self.assertEqual(
+            resume_req.product_type_weights,
+            {"free_serial": 40, "paid_serial": 60},
+        )
+        self.assertEqual(
+            resume_req.free_product_type_weights,
+            {"normal_serial": 60, "free_serial": 40},
+        )
+
+        with self.assertRaises(ValueError):
+            PostAiReaderBootstrapReqBody(
+                email_prefix="prod-ai-reader-",
+                agent_count=10,
+                product_type_weights={"free_serial": 100},
+            )
+
+        with self.assertRaises(ValueError):
+            PostAiReaderResumePausedReqBody(
+                agent_count=10,
+                product_type_weights={"free_serial": 50, "paid_serial": 40},
+            )
+
+        with self.assertRaises(ValueError):
+            PostAiReaderBootstrapReqBody(
+                email_prefix="prod-ai-reader-",
+                agent_count=10,
+                free_product_type_weights={"normal_serial": 100},
+            )
+
+        with self.assertRaises(ValueError):
+            PostAiReaderResumePausedReqBody(
+                agent_count=10,
+                free_product_type_weights={"normal_serial": 80, "free_serial": 10},
+            )
+
+    def test_ai_reader_request_validates_product_status_weights(self):
+        from app.schemas.admin import (
+            PostAiReaderBootstrapReqBody,
+            PostAiReaderResumePausedReqBody,
+        )
+
+        bootstrap_req = PostAiReaderBootstrapReqBody(
+            email_prefix="prod-ai-reader-",
+            agent_count=10,
+            schedule_date="2026-05-14",
+            apply=False,
+            product_status_weights={
+                "ongoing": 80,
+                "rest": 10,
+                "end": 10,
+                "stop": 0,
+            },
+        )
+        resume_req = PostAiReaderResumePausedReqBody(
+            agent_count=10,
+            schedule_date="2026-05-14",
+            apply=False,
+            product_status_weights={
+                "ongoing": 100,
+                "rest": 0,
+                "end": 0,
+                "stop": 0,
+            },
+        )
+
+        self.assertEqual(
+            bootstrap_req.product_status_weights,
+            {"ongoing": 80, "rest": 10, "end": 10, "stop": 0},
+        )
+        self.assertEqual(
+            resume_req.product_status_weights,
+            {"ongoing": 100, "rest": 0, "end": 0, "stop": 0},
+        )
+
+        with self.assertRaises(ValueError):
+            PostAiReaderBootstrapReqBody(
+                email_prefix="prod-ai-reader-",
+                agent_count=10,
+                product_status_weights={"ongoing": 100},
+            )
+
+        with self.assertRaises(ValueError):
+            PostAiReaderResumePausedReqBody(
+                agent_count=10,
+                product_status_weights={
+                    "ongoing": 50,
+                    "rest": 10,
+                    "end": 30,
+                    "stop": 0,
+                },
             )
 
     def test_ai_reader_schedule_duration_defaults_to_30_days(self):
@@ -5026,13 +5258,20 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["available_user_count"], 1)
 
-    def test_bootstrap_ai_reader_agents_caps_agent_count_at_100(self):
+    def test_bootstrap_ai_reader_agents_caps_agent_count_at_200(self):
         from app.schemas.admin import PostAiReaderBootstrapReqBody
+
+        req_body = PostAiReaderBootstrapReqBody(
+            email_prefix="prod-ai-reader-",
+            agent_count=200,
+        )
+
+        self.assertEqual(req_body.agent_count, 200)
 
         with self.assertRaises(ValueError):
             PostAiReaderBootstrapReqBody(
                 email_prefix="prod-ai-reader-",
-                agent_count=101,
+                agent_count=201,
             )
 
     async def test_bootstrap_ai_reader_agents_dry_run_applies_activity_preset(self):
@@ -7054,7 +7293,16 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("e.episode_id = (", target_sql)
+        self.assertIn("p.open_yn = 'y'", target_sql)
+        self.assertIn("coalesce(p.blind_yn, 'n') = 'n'", target_sql)
+        self.assertIn("e.use_yn = 'y'", target_sql)
+        self.assertIn("e.open_yn = 'y'", target_sql)
+        self.assertIn("e.publish_reserve_date <= current_timestamp", target_sql)
+        self.assertIn("e_next.use_yn = 'y'", target_sql)
+        self.assertIn("e_next.open_yn = 'y'", target_sql)
+        self.assertIn("e_next.publish_reserve_date <= current_timestamp", target_sql)
         self.assertIn("select e_next.episode_id", target_sql)
+        self.assertIn("p.product_type", target_sql)
         self.assertIn("e.price_type", target_sql)
         self.assertIn("e_next.price_type", target_sql)
         self.assertIn("p.paid_episode_no", target_sql)
@@ -7294,6 +7542,276 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(selected["product_id"], 100)
+
+    def test_reader_candidate_choice_without_product_type_weights_uses_legacy_ranking(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        free_strong_row = {
+            "product_id": 100,
+            "title": "무료연재 취향 후보",
+            "price_type": "free",
+            "count_hit": 100,
+            "protagonist_type_tags": '["성장형"]',
+            "protagonist_job_tags": '["헌터"]',
+            "protagonist_material_tags": '["상태창"]',
+            "worldview_tags": '["현대"]',
+            "axis_style_tags": '["빠른전개"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "탑등반",
+            "ai_reader_product_state_id": None,
+        }
+        paid_weak_row = {
+            "product_id": 200,
+            "title": "유료연재 약한 후보",
+            "price_type": "paid",
+            "count_hit": 10,
+            "protagonist_type_tags": '["구원자"]',
+            "protagonist_job_tags": '["요리"]',
+            "protagonist_material_tags": '["마법"]',
+            "worldview_tags": '["중세"]',
+            "axis_style_tags": '["일상"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "생존",
+            "ai_reader_product_state_id": None,
+        }
+        persona = {
+            "initial_axis_bias": {
+                "세": {"현대": 0.9},
+                "직": {"헌터": 0.9},
+                "능": {"상태창": 0.9},
+                "연": {},
+                "작": {"빠른전개": 0.9},
+                "타": {"성장형": 0.9},
+                "목": {"탑등반": 0.9},
+            },
+        }
+
+        selected = service._choose_reader_candidate(
+            [free_strong_row, paid_weak_row],
+            persona=persona,
+            taste_factors=[],
+            session=service.ReaderClaimedSession(
+                ai_reader_schedule_id=1,
+                ai_reader_agent_id=3,
+                user_id=1,
+                age_group="20s",
+                gender="X",
+                persona_json="{}",
+                taste_memory_json="{}",
+                activity_pattern_json="{}",
+            ),
+        )
+
+        self.assertEqual(selected["product_id"], 100)
+
+    def test_reader_candidate_choice_applies_product_type_weights_to_new_products(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        free_strong_row = {
+            "product_id": 100,
+            "title": "무료연재 취향 후보",
+            "price_type": "free",
+            "count_hit": 100,
+            "protagonist_type_tags": '["성장형"]',
+            "protagonist_job_tags": '["헌터"]',
+            "protagonist_material_tags": '["상태창"]',
+            "worldview_tags": '["현대"]',
+            "axis_style_tags": '["빠른전개"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "탑등반",
+            "ai_reader_product_state_id": None,
+        }
+        paid_weak_row = {
+            "product_id": 200,
+            "title": "유료연재 가중치 후보",
+            "price_type": "paid",
+            "count_hit": 10,
+            "protagonist_type_tags": '["구원자"]',
+            "protagonist_job_tags": '["요리"]',
+            "protagonist_material_tags": '["마법"]',
+            "worldview_tags": '["중세"]',
+            "axis_style_tags": '["일상"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "생존",
+            "ai_reader_product_state_id": None,
+        }
+        persona = {
+            "initial_axis_bias": {
+                "세": {"현대": 0.9},
+                "직": {"헌터": 0.9},
+                "능": {"상태창": 0.9},
+                "연": {},
+                "작": {"빠른전개": 0.9},
+                "타": {"성장형": 0.9},
+                "목": {"탑등반": 0.9},
+            },
+        }
+
+        selected = service._choose_reader_candidate(
+            [free_strong_row, paid_weak_row],
+            persona=persona,
+            taste_factors=[],
+            session=service.ReaderClaimedSession(
+                ai_reader_schedule_id=1,
+                ai_reader_agent_id=1,
+                user_id=1,
+                age_group="20s",
+                gender="X",
+                persona_json="{}",
+                taste_memory_json="{}",
+                activity_pattern_json=json.dumps(
+                    {"product_type_weights": {"free_serial": 0, "paid_serial": 100}}
+                ),
+            ),
+        )
+
+        self.assertEqual(selected["product_id"], 200)
+
+    def test_reader_candidate_choice_applies_free_product_type_weights_to_new_products(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        normal_strong_row = {
+            "product_id": 100,
+            "title": "일반연재 취향 후보",
+            "price_type": "free",
+            "product_type": "normal",
+            "count_hit": 100,
+            "protagonist_type_tags": '["성장형"]',
+            "protagonist_job_tags": '["헌터"]',
+            "protagonist_material_tags": '["상태창"]',
+            "worldview_tags": '["현대"]',
+            "axis_style_tags": '["빠른전개"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "탑등반",
+            "ai_reader_product_state_id": None,
+        }
+        free_weak_row = {
+            "product_id": 200,
+            "title": "자유연재 가중치 후보",
+            "price_type": "free",
+            "product_type": "free",
+            "count_hit": 10,
+            "protagonist_type_tags": '["구원자"]',
+            "protagonist_job_tags": '["요리"]',
+            "protagonist_material_tags": '["마법"]',
+            "worldview_tags": '["중세"]',
+            "axis_style_tags": '["일상"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "생존",
+            "ai_reader_product_state_id": None,
+        }
+        persona = {
+            "initial_axis_bias": {
+                "세": {"현대": 0.9},
+                "직": {"헌터": 0.9},
+                "능": {"상태창": 0.9},
+                "연": {},
+                "작": {"빠른전개": 0.9},
+                "타": {"성장형": 0.9},
+                "목": {"탑등반": 0.9},
+            },
+        }
+
+        selected = service._choose_reader_candidate(
+            [normal_strong_row, free_weak_row],
+            persona=persona,
+            taste_factors=[],
+            session=service.ReaderClaimedSession(
+                ai_reader_schedule_id=1,
+                ai_reader_agent_id=1,
+                user_id=1,
+                age_group="20s",
+                gender="X",
+                persona_json="{}",
+                taste_memory_json="{}",
+                activity_pattern_json=json.dumps(
+                    {
+                        "product_type_weights": {
+                            "free_serial": 100,
+                            "paid_serial": 0,
+                        },
+                        "free_product_type_weights": {
+                            "normal_serial": 0,
+                            "free_serial": 100,
+                        },
+                    }
+                ),
+            ),
+        )
+
+        self.assertEqual(selected["product_id"], 200)
+
+    def test_reader_candidate_choice_applies_status_weights_to_new_products(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        completed_strong_row = {
+            "product_id": 100,
+            "title": "완결 취향 후보",
+            "price_type": "free",
+            "status_code": "end",
+            "count_hit": 100,
+            "protagonist_type_tags": '["성장형"]',
+            "protagonist_job_tags": '["헌터"]',
+            "protagonist_material_tags": '["상태창"]',
+            "worldview_tags": '["현대"]',
+            "axis_style_tags": '["빠른전개"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "탑등반",
+            "ai_reader_product_state_id": None,
+        }
+        ongoing_weak_row = {
+            "product_id": 200,
+            "title": "연재중 가중치 후보",
+            "price_type": "free",
+            "status_code": "ongoing",
+            "count_hit": 10,
+            "protagonist_type_tags": '["구원자"]',
+            "protagonist_job_tags": '["요리"]',
+            "protagonist_material_tags": '["마법"]',
+            "worldview_tags": '["중세"]',
+            "axis_style_tags": '["일상"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "생존",
+            "ai_reader_product_state_id": None,
+        }
+        persona = {
+            "initial_axis_bias": {
+                "세": {"현대": 0.9},
+                "직": {"헌터": 0.9},
+                "능": {"상태창": 0.9},
+                "연": {},
+                "작": {"빠른전개": 0.9},
+                "타": {"성장형": 0.9},
+                "목": {"탑등반": 0.9},
+            },
+        }
+
+        selected = service._choose_reader_candidate(
+            [completed_strong_row, ongoing_weak_row],
+            persona=persona,
+            taste_factors=[],
+            session=service.ReaderClaimedSession(
+                ai_reader_schedule_id=1,
+                ai_reader_agent_id=1,
+                user_id=1,
+                age_group="20s",
+                gender="X",
+                persona_json="{}",
+                taste_memory_json="{}",
+                activity_pattern_json=json.dumps(
+                    {
+                        "product_status_weights": {
+                            "ongoing": 100,
+                            "rest": 0,
+                            "end": 0,
+                            "stop": 0,
+                        }
+                    }
+                ),
+            ),
+        )
+
+        self.assertEqual(selected["product_id"], 200)
 
     async def test_mark_reader_session_success_and_failure_require_running_worker_owner(self):
         from app.services.ai import reader_agent_session_service as service

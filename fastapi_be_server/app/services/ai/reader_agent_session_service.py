@@ -76,8 +76,19 @@ SessionFailedFunc = Callable[..., Awaitable[None]]
 PostSuccessFunc = Callable[[AsyncSession], Awaitable[None]]
 
 BAYESIAN_BOOKMARK_SUGGEST_THRESHOLD = 0.60
+BAYESIAN_CONTINUE_SUGGEST_THRESHOLD = 0.50
 BAYESIAN_RECOMMEND_SUGGEST_THRESHOLD = 0.55
 BAYESIAN_EVALUATE_SUGGEST_THRESHOLD = 0.55
+POPULARITY_SCORE_WEIGHT = 0.18
+DEFAULT_PRODUCT_TYPE_WEIGHTS = {
+    "free_serial": 100,
+    "paid_serial": 0,
+}
+DEFAULT_FREE_PRODUCT_TYPE_WEIGHTS = {
+    "normal_serial": 85,
+    "free_serial": 15,
+}
+PRODUCT_STATUS_WEIGHT_KEYS = ("ongoing", "rest", "end", "stop")
 
 
 def _allowed_ai_reader_account_domains() -> list[str]:
@@ -1033,6 +1044,8 @@ async def build_reader_decision_snapshot(
         "product": {
             "product_id": target["product_id"],
             "title": target.get("title"),
+            "product_type": target.get("product_type"),
+            "price_type": target.get("price_type"),
             "status_code": target.get("status_code"),
             "early_episode_summary_text": target.get("episode_summary_text"),
             "public_counts": {
@@ -1076,6 +1089,8 @@ async def _select_reader_target_episode(
         text("""
             select p.product_id
                  , p.title
+                 , coalesce(p.product_type, 'free') as product_type
+                 , coalesce(p.price_type, 'free') as price_type
                  , p.status_code
                  , p.count_hit
                  , p.count_bookmark
@@ -1237,7 +1252,10 @@ def _score_reader_candidate(
     state_score = 10.0 if row.get("ai_reader_product_state_id") else 0.0
     persona_score = _score_candidate_by_persona(row, persona)
     taste_score = _score_candidate_by_taste(row, taste_factors)
-    popularity_score = min(float(row.get("count_hit") or 0) / 100000.0, 1.0) * 0.05
+    popularity_score = (
+        min(float(row.get("count_hit") or 0) / 100000.0, 1.0)
+        * POPULARITY_SCORE_WEIGHT
+    )
     return state_score + persona_score + taste_score + popularity_score
 
 
@@ -1264,11 +1282,23 @@ def _choose_reader_candidate(
     if continuing_rows:
         return max(continuing_rows, key=lambda row: ranking(row, jitter_scale=0.02))
 
+    candidate_rows = _filter_reader_candidates_by_product_type_weight(
+        rows,
+        session=session,
+    )
+    candidate_rows = _filter_reader_candidates_by_free_product_type_weight(
+        candidate_rows,
+        session=session,
+    )
+    candidate_rows = _filter_reader_candidates_by_status_weight(
+        candidate_rows,
+        session=session,
+    )
     novelty_seeking = _clamp_probability(
         _safe_float(persona.get("novelty_seeking"), 0.0)
     )
     if novelty_seeking < 0.55:
-        return max(rows, key=lambda row: ranking(row, jitter_scale=0.35))
+        return max(candidate_rows, key=lambda row: ranking(row, jitter_scale=0.35))
 
     scored_rows = sorted(
         (
@@ -1280,7 +1310,7 @@ def _choose_reader_candidate(
                 ),
                 row,
             )
-            for row in rows
+            for row in candidate_rows
         ),
         key=lambda item: item[0],
         reverse=True,
@@ -1294,6 +1324,253 @@ def _choose_reader_candidate(
         exploration_pool,
         key=lambda row: _stable_reader_candidate_jitter(session, row),
     )
+
+
+def _filter_reader_candidates_by_product_type_weight(
+    rows: list[dict[str, Any]],
+    *,
+    session: ReaderClaimedSession,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+
+    activity_pattern = _parse_json_field(session.activity_pattern_json, {})
+    raw_product_type_weights = (
+        activity_pattern.get("product_type_weights")
+        if isinstance(activity_pattern, dict)
+        else None
+    )
+    weights = _normalize_reader_product_type_weights(
+        raw_product_type_weights
+    )
+    if weights is None:
+        return rows
+
+    buckets: dict[str, list[dict[str, Any]]] = {
+        "free_serial": [],
+        "paid_serial": [],
+    }
+    for row in rows:
+        buckets[_reader_candidate_product_type_key(row)].append(row)
+
+    available_buckets = [
+        (key, bucket_rows, weights.get(key, 0.0))
+        for key, bucket_rows in buckets.items()
+        if bucket_rows and weights.get(key, 0.0) > 0
+    ]
+    if not available_buckets:
+        return rows
+
+    total_weight = sum(weight for _, _, weight in available_buckets)
+    threshold = _stable_reader_product_type_selector(session) * total_weight
+    cursor = 0.0
+    for _, bucket_rows, weight in available_buckets:
+        cursor += weight
+        if threshold <= cursor:
+            return bucket_rows
+    return available_buckets[-1][1]
+
+
+def _normalize_reader_product_type_weights(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+
+    weights: dict[str, float] = {}
+    for key in DEFAULT_PRODUCT_TYPE_WEIGHTS:
+        raw_weight = value.get(key)
+        try:
+            weight = float(raw_weight)
+        except (TypeError, ValueError):
+            weight = 0.0
+        weights[key] = max(0.0, weight)
+
+    if sum(weights.values()) <= 0:
+        return None
+    return weights
+
+
+def _filter_reader_candidates_by_free_product_type_weight(
+    rows: list[dict[str, Any]],
+    *,
+    session: ReaderClaimedSession,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+
+    activity_pattern = _parse_json_field(session.activity_pattern_json, {})
+    raw_weights = (
+        activity_pattern.get("free_product_type_weights")
+        if isinstance(activity_pattern, dict)
+        else None
+    )
+    weights = _normalize_reader_free_product_type_weights(raw_weights)
+    if weights is None:
+        return rows
+
+    non_free_rows: list[dict[str, Any]] = []
+    buckets: dict[str, list[dict[str, Any]]] = {
+        "normal_serial": [],
+        "free_serial": [],
+    }
+    for row in rows:
+        if _reader_candidate_product_type_key(row) != "free_serial":
+            non_free_rows.append(row)
+            continue
+        buckets[_reader_candidate_free_product_type_key(row)].append(row)
+
+    available_buckets = [
+        (key, bucket_rows, weights.get(key, 0.0))
+        for key, bucket_rows in buckets.items()
+        if bucket_rows and weights.get(key, 0.0) > 0
+    ]
+    if not available_buckets:
+        return rows
+
+    total_weight = sum(weight for _, _, weight in available_buckets)
+    threshold = _stable_reader_free_product_type_selector(session) * total_weight
+    cursor = 0.0
+    selected_free_rows = available_buckets[-1][1]
+    for _, bucket_rows, weight in available_buckets:
+        cursor += weight
+        if threshold <= cursor:
+            selected_free_rows = bucket_rows
+            break
+    return selected_free_rows + non_free_rows
+
+
+def _normalize_reader_free_product_type_weights(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+
+    weights: dict[str, float] = {}
+    for key in DEFAULT_FREE_PRODUCT_TYPE_WEIGHTS:
+        raw_weight = value.get(key)
+        try:
+            weight = float(raw_weight)
+        except (TypeError, ValueError):
+            weight = 0.0
+        weights[key] = max(0.0, weight)
+
+    if sum(weights.values()) <= 0:
+        return None
+    return weights
+
+
+def _filter_reader_candidates_by_status_weight(
+    rows: list[dict[str, Any]],
+    *,
+    session: ReaderClaimedSession,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+
+    activity_pattern = _parse_json_field(session.activity_pattern_json, {})
+    raw_status_weights = (
+        activity_pattern.get("product_status_weights")
+        if isinstance(activity_pattern, dict)
+        else None
+    )
+    weights = _normalize_reader_product_status_weights(raw_status_weights)
+    if weights is None:
+        return rows
+
+    buckets: dict[str, list[dict[str, Any]]] = {
+        key: [] for key in PRODUCT_STATUS_WEIGHT_KEYS
+    }
+    for row in rows:
+        status_key = _reader_candidate_status_key(row)
+        if status_key in buckets:
+            buckets[status_key].append(row)
+
+    available_buckets = [
+        (key, bucket_rows, weights.get(key, 0.0))
+        for key, bucket_rows in buckets.items()
+        if bucket_rows and weights.get(key, 0.0) > 0
+    ]
+    if not available_buckets:
+        return rows
+
+    total_weight = sum(weight for _, _, weight in available_buckets)
+    threshold = _stable_reader_status_selector(session) * total_weight
+    cursor = 0.0
+    for _, bucket_rows, weight in available_buckets:
+        cursor += weight
+        if threshold <= cursor:
+            return bucket_rows
+    return available_buckets[-1][1]
+
+
+def _normalize_reader_product_status_weights(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+
+    weights: dict[str, float] = {}
+    for key in PRODUCT_STATUS_WEIGHT_KEYS:
+        raw_weight = value.get(key)
+        try:
+            weight = float(raw_weight)
+        except (TypeError, ValueError):
+            weight = 0.0
+        weights[key] = max(0.0, weight)
+
+    if sum(weights.values()) <= 0:
+        return None
+    return weights
+
+
+def _reader_candidate_product_type_key(row: dict[str, Any]) -> str:
+    price_type = str(row.get("price_type") or "").lower()
+    return "paid_serial" if price_type == "paid" else "free_serial"
+
+
+def _reader_candidate_free_product_type_key(row: dict[str, Any]) -> str:
+    product_type = str(row.get("product_type") or "").lower()
+    return "normal_serial" if product_type == "normal" else "free_serial"
+
+
+def _reader_candidate_status_key(row: dict[str, Any]) -> str:
+    status_code = str(row.get("status_code") or "").lower()
+    if status_code == "serializing":
+        return "ongoing"
+    if status_code == "completed":
+        return "end"
+    return status_code
+
+
+def _stable_reader_product_type_selector(session: ReaderClaimedSession) -> float:
+    seed = (
+        f"{session.ai_reader_schedule_id}:"
+        f"{session.ai_reader_agent_id}:"
+        f"{session.user_id}:"
+        f"{session.claimed_session_no}:"
+        "product_type"
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
+
+
+def _stable_reader_free_product_type_selector(session: ReaderClaimedSession) -> float:
+    seed = (
+        f"{session.ai_reader_schedule_id}:"
+        f"{session.ai_reader_agent_id}:"
+        f"{session.user_id}:"
+        f"{session.claimed_session_no}:"
+        "free_product_type"
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
+
+
+def _stable_reader_status_selector(session: ReaderClaimedSession) -> float:
+    seed = (
+        f"{session.ai_reader_schedule_id}:"
+        f"{session.ai_reader_agent_id}:"
+        f"{session.user_id}:"
+        f"{session.claimed_session_no}:"
+        "product_status"
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
 
 
 def _stable_reader_candidate_jitter(
@@ -1399,6 +1676,10 @@ def _build_reader_engagement_context(
         already_recommended=already_recommended,
         already_evaluated=already_evaluated,
     )
+    continue_posterior_hint = _action_posterior_hint(
+        bayesian_action_model,
+        "continue_next_episode",
+    )
     bookmark_posterior_hint = _action_posterior_hint(
         bayesian_action_model,
         "bookmark",
@@ -1420,6 +1701,12 @@ def _build_reader_engagement_context(
         "matched_persona_labels": _matched_persona_labels(row, persona),
         "bayesian_action_model": bayesian_action_model,
         "action_affordances": {
+            "continue_next_episode": {
+                "posterior_hint": round(continue_posterior_hint, 3),
+                "posterior_threshold": BAYESIAN_CONTINUE_SUGGEST_THRESHOLD,
+                "max_next_episode_count": 2,
+                "suggested": continue_posterior_hint >= BAYESIAN_CONTINUE_SUGGEST_THRESHOLD,
+            },
             "bookmark": {
                 "current": "Y" if already_bookmarked else "N",
                 "threshold": round(bookmark_threshold, 3),
