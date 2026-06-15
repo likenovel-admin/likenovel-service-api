@@ -273,6 +273,41 @@ def _time_blocks_payload(time_blocks: Any) -> list[dict[str, Any]] | None:
     return payload
 
 
+def _product_type_weights_payload(
+    product_type_weights: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if product_type_weights is None:
+        return None
+    return {
+        "free_serial": int(product_type_weights.get("free_serial") or 0),
+        "paid_serial": int(product_type_weights.get("paid_serial") or 0),
+    }
+
+
+def _free_product_type_weights_payload(
+    free_product_type_weights: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if free_product_type_weights is None:
+        return None
+    return {
+        "normal_serial": int(free_product_type_weights.get("normal_serial") or 0),
+        "free_serial": int(free_product_type_weights.get("free_serial") or 0),
+    }
+
+
+def _product_status_weights_payload(
+    product_status_weights: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if product_status_weights is None:
+        return None
+    return {
+        "ongoing": int(product_status_weights.get("ongoing") or 0),
+        "rest": int(product_status_weights.get("rest") or 0),
+        "end": int(product_status_weights.get("end") or 0),
+        "stop": int(product_status_weights.get("stop") or 0),
+    }
+
+
 def _operation_auto_pause_after(
     *,
     schedule_end_date: date,
@@ -294,6 +329,9 @@ def _activity_pattern_with_auto_pause_after(
     auto_pause_after: datetime | None,
     auto_pause_schedule_end_date: date | None = None,
     time_blocks: list[dict[str, Any]] | None = None,
+    product_type_weights: dict[str, int] | None = None,
+    free_product_type_weights: dict[str, int] | None = None,
+    product_status_weights: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     pattern = _parse_json_field(pattern_value, {})
     if not isinstance(pattern, dict):
@@ -302,6 +340,25 @@ def _activity_pattern_with_auto_pause_after(
         pattern = {
             **pattern,
             "time_blocks": time_blocks,
+        }
+    if product_type_weights is not None:
+        pattern = {
+            **pattern,
+            "product_type_weights": _product_type_weights_payload(product_type_weights),
+        }
+    if free_product_type_weights is not None:
+        pattern = {
+            **pattern,
+            "free_product_type_weights": _free_product_type_weights_payload(
+                free_product_type_weights
+            ),
+        }
+    if product_status_weights is not None:
+        pattern = {
+            **pattern,
+            "product_status_weights": _product_status_weights_payload(
+                product_status_weights
+            ),
         }
     if auto_pause_after is not None:
         pattern = {
@@ -639,6 +696,9 @@ def build_ai_reader_bootstrap_dry_run_token(
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
     time_blocks: list[dict[str, Any]] | None = None,
+    product_type_weights: dict[str, int] | None = None,
+    free_product_type_weights: dict[str, int] | None = None,
+    product_status_weights: dict[str, int] | None = None,
     start_immediately: bool = False,
     immediate_batch_size: int = 20,
     immediate_batch_interval_minutes: int = 10,
@@ -656,7 +716,7 @@ def build_ai_reader_bootstrap_dry_run_token(
         admin_schema.DEFAULT_AI_READER_GENDER_RATIOS
     )
     payload = {
-        "v": 4,
+        "v": 6,
         "email_prefix": email_prefix,
         "agent_count": agent_count,
         "schedule_date": schedule_date,
@@ -667,6 +727,13 @@ def build_ai_reader_bootstrap_dry_run_token(
         "active_hours": sorted(normalized_active_hours),
         "daily_session_target": daily_session_target or 2,
         "time_blocks": time_blocks,
+        "product_type_weights": _product_type_weights_payload(product_type_weights),
+        "free_product_type_weights": _free_product_type_weights_payload(
+            free_product_type_weights
+        ),
+        "product_status_weights": _product_status_weights_payload(
+            product_status_weights
+        ),
         "start_immediately": bool(start_immediately),
         "immediate_batch_size": immediate_batch_size,
         "immediate_batch_interval_minutes": immediate_batch_interval_minutes,
@@ -710,6 +777,9 @@ def _expected_bootstrap_dry_run_token(
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
         time_blocks=_time_blocks_payload(req_body.time_blocks),
+        product_type_weights=req_body.product_type_weights,
+        free_product_type_weights=req_body.free_product_type_weights,
+        product_status_weights=req_body.product_status_weights,
         start_immediately=req_body.start_immediately,
         immediate_batch_size=req_body.immediate_batch_size,
         immediate_batch_interval_minutes=req_body.immediate_batch_interval_minutes,
@@ -756,11 +826,14 @@ def build_ai_reader_resume_paused_dry_run_token(
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
     time_blocks: list[dict[str, Any]] | None = None,
+    product_type_weights: dict[str, int] | None = None,
+    free_product_type_weights: dict[str, int] | None = None,
+    product_status_weights: dict[str, int] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
 ) -> str:
     payload = {
-        "v": 3,
+        "v": 5,
         "agent_count": agent_count,
         "schedule_date": schedule_date,
         "schedule_duration_days": schedule_duration_days,
@@ -771,6 +844,13 @@ def build_ai_reader_resume_paused_dry_run_token(
         "active_hours": sorted(active_hours) if active_hours else None,
         "daily_session_target": daily_session_target,
         "time_blocks": time_blocks,
+        "product_type_weights": _product_type_weights_payload(product_type_weights),
+        "free_product_type_weights": _free_product_type_weights_payload(
+            free_product_type_weights
+        ),
+        "product_status_weights": _product_status_weights_payload(
+            product_status_weights
+        ),
         "daily_llm_budget": daily_llm_budget,
         "agent_fingerprints": sorted(
             agent_fingerprints or [],
@@ -808,6 +888,9 @@ def _expected_resume_paused_dry_run_token(
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
         time_blocks=_time_blocks_payload(req_body.time_blocks),
+        product_type_weights=req_body.product_type_weights,
+        free_product_type_weights=req_body.free_product_type_weights,
+        product_status_weights=req_body.product_status_weights,
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
     )
@@ -848,11 +931,13 @@ def build_ai_reader_refresh_schedules_dry_run_token(
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
     time_blocks: list[dict[str, Any]] | None = None,
+    product_type_weights: dict[str, int] | None = None,
+    product_status_weights: dict[str, int] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
 ) -> str:
     payload = {
-        "v": 1,
+        "v": 3,
         "operation": "refresh_active_schedules",
         "agent_count": agent_count,
         "schedule_date": schedule_date,
@@ -864,6 +949,10 @@ def build_ai_reader_refresh_schedules_dry_run_token(
         "active_hours": sorted(active_hours) if active_hours else None,
         "daily_session_target": daily_session_target,
         "time_blocks": time_blocks,
+        "product_type_weights": _product_type_weights_payload(product_type_weights),
+        "product_status_weights": _product_status_weights_payload(
+            product_status_weights
+        ),
         "daily_llm_budget": daily_llm_budget,
         "agent_fingerprints": sorted(
             agent_fingerprints or [],
@@ -901,6 +990,8 @@ def _expected_refresh_schedules_dry_run_token(
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
         time_blocks=_time_blocks_payload(req_body.time_blocks),
+        product_type_weights=req_body.product_type_weights,
+        product_status_weights=req_body.product_status_weights,
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
     )
@@ -941,11 +1032,13 @@ def build_ai_reader_restart_dry_run_token(
     active_hours: list[int] | None = None,
     daily_session_target: int | None = None,
     time_blocks: list[dict[str, Any]] | None = None,
+    product_type_weights: dict[str, int] | None = None,
+    product_status_weights: dict[str, int] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
 ) -> str:
     payload = {
-        "v": 1,
+        "v": 3,
         "operation": "restart_ai_readers",
         "agent_count": agent_count,
         "schedule_date": schedule_date,
@@ -957,6 +1050,10 @@ def build_ai_reader_restart_dry_run_token(
         "active_hours": sorted(active_hours) if active_hours else None,
         "daily_session_target": daily_session_target,
         "time_blocks": time_blocks,
+        "product_type_weights": _product_type_weights_payload(product_type_weights),
+        "product_status_weights": _product_status_weights_payload(
+            product_status_weights
+        ),
         "daily_llm_budget": daily_llm_budget,
         "agent_fingerprints": sorted(
             agent_fingerprints or [],
@@ -994,6 +1091,8 @@ def _expected_restart_dry_run_token(
         active_hours=req_body.active_hours,
         daily_session_target=req_body.daily_session_target,
         time_blocks=_time_blocks_payload(req_body.time_blocks),
+        product_type_weights=req_body.product_type_weights,
+        product_status_weights=req_body.product_status_weights,
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
     )
@@ -1061,6 +1160,18 @@ def _resume_activity_pattern_for_agent(
         "sleep_hours": _sleep_hours(active_hours),
         "daily_session_target": int(daily_session_target),
     }
+    if req_body.product_type_weights is not None:
+        next_pattern["product_type_weights"] = _product_type_weights_payload(
+            req_body.product_type_weights
+        )
+    if req_body.free_product_type_weights is not None:
+        next_pattern["free_product_type_weights"] = _free_product_type_weights_payload(
+            req_body.free_product_type_weights
+        )
+    if req_body.product_status_weights is not None:
+        next_pattern["product_status_weights"] = _product_status_weights_payload(
+            req_body.product_status_weights
+        )
     requested_time_blocks = _time_blocks_payload(req_body.time_blocks)
     if requested_time_blocks is not None:
         next_pattern["time_blocks"] = requested_time_blocks
@@ -2374,6 +2485,9 @@ async def bootstrap_ai_reader_agents(
                 initial_auto_pause_after,
                 schedule_end_date,
                 requested_time_blocks,
+                req_body.product_type_weights,
+                req_body.free_product_type_weights,
+                req_body.product_status_weights,
             ),
         }
         for user, seed in zip(initial_users, initial_seeds, strict=True)
@@ -2483,6 +2597,9 @@ async def bootstrap_ai_reader_agents(
                 auto_pause_after,
                 schedule_end_date,
                 requested_time_blocks,
+                req_body.product_type_weights,
+                req_body.free_product_type_weights,
+                req_body.product_status_weights,
             ),
         }
         for user, seed in zip(target_users, seeds, strict=True)
@@ -2553,6 +2670,9 @@ async def bootstrap_ai_reader_agents(
                         auto_pause_after,
                         schedule_end_date,
                         requested_time_blocks,
+                        req_body.product_type_weights,
+                        req_body.free_product_type_weights,
+                        req_body.product_status_weights,
                     ),
                     ensure_ascii=False,
                 ),
