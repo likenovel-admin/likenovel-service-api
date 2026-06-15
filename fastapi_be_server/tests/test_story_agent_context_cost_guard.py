@@ -1,7 +1,8 @@
 import importlib.util
+import io
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
@@ -164,6 +165,58 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 module.build_rp_reasoning_signature(),
                 "anthropic|claude-sonnet-4-6|medium|omitted",
             )
+
+    def test_provider_summary_reports_direct_deepseek_signal_path(self):
+        module = load_module()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "EPISODE_SUMMARY_MODEL", "deepseek/deepseek-v3.2"), \
+             patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "DEEPSEEK_API_KEY", "deepseek-key"), \
+             patch.object(module, "RP_DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-pro"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"):
+            line = module.build_storyctx_provider_summary_line()
+
+        self.assertIn("episode_summary_provider=openrouter", line)
+        self.assertIn("episode_summary_model=deepseek/deepseek-v3.2", line)
+        self.assertIn("episode_character_signals_provider=deepseek", line)
+        self.assertIn("episode_character_signals_model=deepseek-v4-pro", line)
+        self.assertIn("rp_profile_provider=openrouter", line)
+        self.assertIn("rp_profile_model=google/gemma-4-31b-it", line)
+        self.assertIn("rp_openrouter_provider_only=deepinfra,together", line)
+
+    def test_print_summary_includes_provider_line_and_product_ids(self):
+        module = load_module()
+        results = module.build_empty_results()
+        results["inserted_docs"] = 2
+        results["inserted_episode_character_signals"] = 2
+        results["products"] = [
+            {
+                "product_id": 687,
+                "context_status": "processing",
+                "ready_episode_count": 12,
+                "total_episode_count": 20,
+            }
+        ]
+        stdout = io.StringIO()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "EPISODE_SUMMARY_MODEL", "deepseek/deepseek-v3.2"), \
+             patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "DEEPSEEK_API_KEY", "deepseek-key"), \
+             patch.object(module, "RP_DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-pro"), \
+             redirect_stdout(stdout):
+            module.print_summary(results=results, apply=True)
+
+        output = stdout.getvalue()
+        self.assertIn("storyctx-provider", output)
+        self.assertIn("episode_character_signals_provider=deepseek", output)
+        self.assertIn("mode=apply product_ids=687 inserted_docs=2", output)
+        self.assertIn("inserted_episode_character_signals=2", output)
+        self.assertIn("product product_id=687 status=processing ready=12 total=20", output)
 
     async def test_rp_profile_uses_paid_gemma_openrouter_payload(self):
         module = load_module()
