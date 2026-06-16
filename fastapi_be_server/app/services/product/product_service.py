@@ -273,6 +273,7 @@ def get_select_fields_and_joins_for_product(
     user_id: int | None = None,
     join_rank: bool = False,
     rank_area_code: str | None = None,
+    include_paid_open_date: bool = False,
 ):
     join_rank_enabled = join_rank or rank_area_code is not None
     return {
@@ -285,6 +286,11 @@ def get_select_fields_and_joins_for_product(
                 "p.author_name as authorNickname",
                 "p.price_type as priceType",
                 "p.paid_episode_no as paidEpisodeNo",
+                *(
+                    ["p.paid_open_date as paidOpenDate"]
+                    if include_paid_open_date
+                    else []
+                ),
                 "COALESCE(p.single_regular_price, 0) as singleRegularPrice",
                 "COALESCE(p.single_rental_price, 0) as singleRentalPrice",
                 "COALESCE(p.series_regular_price, 0) as seriesRegularPrice",
@@ -1488,7 +1494,7 @@ async def product_details_group_by_product_id(
         current_user_role = await _resolve_current_user_role(kc_user_id, db)
 
         query_parts = get_select_fields_and_joins_for_product(
-            user_id=user_id, join_rank=False
+            user_id=user_id, join_rank=False, include_paid_open_date=True
         )
         product_visibility_condition = (
             "1=1"
