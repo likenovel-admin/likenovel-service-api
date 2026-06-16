@@ -343,6 +343,42 @@ class StoryAgentContextDeltaValidationTest(TestCase):
 
         self.assertEqual(args.max_delta_episodes, 5)
 
+    def test_target_queries_include_paid_ongoing_products(self):
+        module = load_module()
+
+        args = SimpleNamespace(product_ids=[], episode_ids=[], episode_nos=[], limit=0)
+        query, params = module.build_target_query(args=args, use_epub_fallback=False)
+
+        self.assertEqual(params, [])
+        self.assertIn("p.price_type IN ('free', 'paid')", query)
+        self.assertIn("p.status_code = 'ongoing'", query)
+        self.assertIn("pe.open_yn = 'Y'", query)
+        self.assertNotIn("p.price_type = 'free'", query)
+
+    def test_total_episode_count_matches_paid_ongoing_scope(self):
+        module = load_module()
+
+        class FakeCursor:
+            def __init__(self):
+                self.query = ""
+                self.params = None
+
+            def execute(self, query, params):
+                self.query = query
+                self.params = params
+
+            def fetchone(self):
+                return {"total_episode_count": 7}
+
+        cur = FakeCursor()
+        count = module.fetch_total_episode_count(cur, product_id=1101)
+
+        self.assertEqual(count, 7)
+        self.assertEqual(cur.params, (1101,))
+        self.assertIn("p.price_type IN ('free', 'paid')", cur.query)
+        self.assertIn("p.status_code = 'ongoing'", cur.query)
+        self.assertNotIn("p.price_type = 'free'", cur.query)
+
     def test_delta_candidate_filter_limits_rows_per_product_by_episode_no(self):
         module = load_module()
         rows = [

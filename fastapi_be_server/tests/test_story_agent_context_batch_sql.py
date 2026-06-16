@@ -17,6 +17,8 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
 
         self.assertIn("pe.use_yn = 'Y'", script)
         self.assertIn("pe.open_yn = 'Y'", script)
+        self.assertIn("p.price_type IN ('free', 'paid')", script)
+        self.assertIn("p.status_code = 'ongoing'", script)
         self.assertIn("p.blind_yn = 'N'", script)
         self.assertIn("tb_story_agent_context_summary", script)
         self.assertIn("sacs.summary_type = 'episode_summary'", script)
@@ -24,6 +26,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("sacs.scope_key = CONCAT('episode:', pe.episode_id)", script)
         self.assertIn("missing_open_episode_count", script)
         self.assertNotIn("MAX(pe.episode_no)", script)
+        self.assertNotIn("p.price_type = 'free'", script)
 
     def test_batch_defaults_to_delta_and_requires_explicit_full_opt_in(self):
         script = _batch_sh()

@@ -446,7 +446,8 @@ def release_product_lock(cur, product_id: int) -> None:
 
 def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tuple[str, list[object]]:
     where = [
-        "p.price_type = 'free'",
+        "p.price_type IN ('free', 'paid')",
+        "p.status_code = 'ongoing'",
         "pe.use_yn = 'Y'",
         "pe.open_yn = 'Y'",
         "p.open_yn = 'Y'",
@@ -5597,7 +5598,8 @@ def fetch_total_episode_count(cur, product_id: int) -> int:
           JOIN tb_product_episode pe
             ON pe.product_id = p.product_id
          WHERE p.product_id = %s
-           AND p.price_type = 'free'
+           AND p.price_type IN ('free', 'paid')
+           AND p.status_code = 'ongoing'
            AND pe.use_yn = 'Y'
            AND pe.open_yn = 'Y'
         """,
