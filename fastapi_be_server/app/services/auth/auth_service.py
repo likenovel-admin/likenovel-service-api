@@ -13,7 +13,7 @@ import logging
 
 from app.const import settings, CommonConstants, ErrorMessages
 from app.exceptions import CustomResponseException
-from app.utils.auth import get_kc_signing_key
+from app.utils.auth import KC_TOKEN_CLOCK_SKEW_LEEWAY_SECONDS, get_kc_signing_key
 from app.utils.time import get_cur_time
 from app.utils.email import send_password_reset_email
 import app.services.common.comm_service as comm_service
@@ -3353,6 +3353,7 @@ async def put_auth_token_reissue(req_body: auth_schema.TokenReissueReqBody):
             issuer=settings.KC_ISSUER_BASE_URL,
             audience=settings.KC_AUDIENCE,
             options={"verify_exp": False},
+            leeway=KC_TOKEN_CLOCK_SKEW_LEEWAY_SECONDS,
         )
     except jwt.InvalidTokenError:
         raise CustomResponseException(
@@ -3374,8 +3375,11 @@ async def put_auth_token_reissue(req_body: auth_schema.TokenReissueReqBody):
         method="POST", type=type, data_dict=data
     )
     access_token = res_json.get("access_token")
-    access_expires_in = res_json.get("access_expires_in")
+    access_expires_in = res_json.get("expires_in")
+    if access_expires_in is None:
+        access_expires_in = res_json.get("access_expires_in")
     refresh_token = res_json.get("refresh_token")
+    refresh_expires_in = res_json.get("refresh_expires_in")
 
     if access_token is None or refresh_token is None:
         raise CustomResponseException(
@@ -3386,6 +3390,8 @@ async def put_auth_token_reissue(req_body: auth_schema.TokenReissueReqBody):
     token_data = {
         "accessToken": access_token,
         "accessTokenExpiresIn": access_expires_in,
+        "refreshToken": refresh_token,
+        "refreshTokenExpiresIn": refresh_expires_in,
     }
 
     res_data = {"token": token_data}
