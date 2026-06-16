@@ -446,6 +446,22 @@ async def product_detail_by_id(id: int, db: AsyncSession, user_data: dict):
                 where e.product_id = a.product_id
                   and e.use_yn = 'Y'
                   and e.price_type = 'free') as free_episode_end_no
+            , COALESCE((
+                select 'Y'
+                  from tb_product_free_episode_campaign c
+                 where c.product_id = a.product_id
+                   and c.active_yn = 'Y'
+                 order by c.ends_at desc, c.id desc
+                 limit 1
+            ), 'N') as hundred_free_campaign_active_yn
+            , (
+                select c.ends_at
+                  from tb_product_free_episode_campaign c
+                 where c.product_id = a.product_id
+                   and c.active_yn = 'Y'
+                 order by c.ends_at desc, c.id desc
+                 limit 1
+            ) as hundred_free_campaign_ends_at
             , a.monopoly_yn
             , a.blind_yn
             , {get_file_path_sub_query("a.thumbnail_file_id", "cover_image_path", "cover")}
@@ -710,6 +726,14 @@ async def put_product(
 
     free_episode_start_no = req_body.free_episode_start_no
     free_episode_end_no = req_body.free_episode_end_no
+    has_hundred_free_campaign_input = "hundred_free_campaign_enabled" in fields_set
+    hundred_free_campaign_enabled = bool(req_body.hundred_free_campaign_enabled)
+    hundred_free_campaign_ends_at = req_body.hundred_free_campaign_ends_at
+    restore_free_start_no = 1
+    restore_free_end_no = 25
+    if has_hundred_free_campaign_input and hundred_free_campaign_enabled:
+        free_episode_start_no = 1
+        free_episode_end_no = 100
     blind_yn_in_request = "blind_yn" in fields_set
     open_yn_in_request = "open_yn" in fields_set
 
@@ -726,6 +750,7 @@ async def put_product(
             )
     has_free_episode_range_input = (
         "free_episode_start_no" in fields_set or "free_episode_end_no" in fields_set
+        or (has_hundred_free_campaign_input and hundred_free_campaign_enabled)
     )
     has_free_episode_range = (
         free_episode_start_no is not None and free_episode_end_no is not None
@@ -741,6 +766,28 @@ async def put_product(
             status_code=status.HTTP_400_BAD_REQUEST,
             message="무료회차 시작/종료 회차를 모두 입력해주세요.",
         )
+
+    if has_hundred_free_campaign_input and hundred_free_campaign_enabled:
+        if next_price_type != "paid":
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="백화무료 지정은 유료 연재 작품에서만 사용할 수 있습니다.",
+            )
+        if hundred_free_campaign_ends_at is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="백화무료 종료 일시를 입력해주세요.",
+            )
+        now_for_campaign = (
+            datetime.now(tz=hundred_free_campaign_ends_at.tzinfo)
+            if hundred_free_campaign_ends_at.tzinfo
+            else datetime.now()
+        )
+        if hundred_free_campaign_ends_at <= now_for_campaign:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="백화무료 종료 일시는 현재 이후로 입력해주세요.",
+            )
 
     if has_free_episode_range:
         if free_episode_start_no is None or free_episode_end_no is None:
@@ -994,6 +1041,99 @@ async def put_product(
                     "cp_offered_price": req_body.cp_offered_price,
                     "product_id": product_id,
                     "cp_company_name": requested_cp_company_name,
+                },
+            )
+
+    if has_hundred_free_campaign_input:
+        operator_id = user_data.get("user_id") if user_data else -1
+        query = text("""
+                     UPDATE tb_product_free_episode_campaign
+                        SET active_yn = 'N',
+                            ended_at = COALESCE(ended_at, NOW()),
+                            updated_id = :updated_id,
+                            updated_date = NOW()
+                      WHERE product_id = :product_id
+                        AND active_yn = 'Y'
+                     """)
+        await db.execute(
+            query,
+            {"product_id": product_id, "updated_id": operator_id},
+        )
+
+        if hundred_free_campaign_enabled:
+            query = text("""
+                         INSERT INTO tb_product_free_episode_campaign (
+                             product_id,
+                             active_yn,
+                             campaign_free_start_no,
+                             campaign_free_end_no,
+                             restore_free_start_no,
+                             restore_free_end_no,
+                             started_at,
+                             ends_at,
+                             created_id,
+                             updated_id
+                         ) VALUES (
+                             :product_id,
+                             'Y',
+                             :campaign_free_start_no,
+                             :campaign_free_end_no,
+                             :restore_free_start_no,
+                             :restore_free_end_no,
+                             NOW(),
+                             :ends_at,
+                             :created_id,
+                             :updated_id
+                         )
+                         """)
+            await db.execute(
+                query,
+                {
+                    "product_id": product_id,
+                    "campaign_free_start_no": free_episode_start_no,
+                    "campaign_free_end_no": free_episode_end_no,
+                    "restore_free_start_no": restore_free_start_no,
+                    "restore_free_end_no": restore_free_end_no,
+                    "ends_at": hundred_free_campaign_ends_at,
+                    "created_id": operator_id,
+                    "updated_id": operator_id,
+                },
+            )
+        else:
+            query = text("""
+                         UPDATE tb_product
+                            SET paid_episode_no = :paid_episode_no,
+                                updated_id = :updated_id,
+                                updated_date = NOW()
+                          WHERE product_id = :product_id
+                            AND price_type = 'paid'
+                         """)
+            await db.execute(
+                query,
+                {
+                    "product_id": product_id,
+                    "paid_episode_no": restore_free_end_no + 1,
+                    "updated_id": operator_id,
+                },
+            )
+            query = text("""
+                         UPDATE tb_product_episode
+                            SET price_type = CASE
+                                WHEN episode_no BETWEEN :restore_free_start_no AND :restore_free_end_no THEN 'free'
+                                ELSE 'paid'
+                            END,
+                                updated_id = :updated_id,
+                                updated_date = NOW()
+                          WHERE product_id = :product_id
+                            AND use_yn = 'Y'
+                         """)
+            await db.execute(
+                query,
+                {
+                    "product_id": product_id,
+                    "restore_free_start_no": restore_free_start_no,
+                    "restore_free_end_no": restore_free_end_no,
+                    "updated_id": operator_id,
                 },
             )
 
