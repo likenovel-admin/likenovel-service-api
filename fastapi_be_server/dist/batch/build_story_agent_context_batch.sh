@@ -15,6 +15,7 @@ MAX_LOCK_AGE_SECONDS="${STORYCTX_MAX_LOCK_AGE_SECONDS:-21600}"
 MAX_PARALLEL="${STORYCTX_MAX_PARALLEL:-2}"
 BUILD_MODE="${STORYCTX_BUILD_MODE:-delta}"
 MAX_DELTA_EPISODES="${STORYCTX_MAX_DELTA_EPISODES:-${STORYCTX_MAX_MISSING_EPISODES:-5}}"
+BACKLOG_PRIORITY_THRESHOLD="${STORYCTX_BACKLOG_PRIORITY_THRESHOLD:-20}"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
@@ -117,6 +118,12 @@ normalize_build_mode() {
   if [ "${MAX_DELTA_EPISODES}" -lt 1 ]; then
     MAX_DELTA_EPISODES=1
   fi
+  if ! [[ "${BACKLOG_PRIORITY_THRESHOLD}" =~ ^[0-9]+$ ]]; then
+    BACKLOG_PRIORITY_THRESHOLD=20
+  fi
+  if [ "${BACKLOG_PRIORITY_THRESHOLD}" -lt 1 ]; then
+    BACKLOG_PRIORITY_THRESHOLD=1
+  fi
 }
 
 API_ROOT="$(resolve_api_root)"
@@ -156,7 +163,7 @@ fi
 normalize_parallel
 normalize_build_mode
 acquire_lock
-log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE} max_delta_episodes=${MAX_DELTA_EPISODES}"
+log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE} max_delta_episodes=${MAX_DELTA_EPISODES} backlog_priority_threshold=${BACKLOG_PRIORITY_THRESHOLD}"
 
 MYSQL_CMD=(
   mysql
@@ -208,12 +215,16 @@ FROM (
     missing_open_episode_count > 0
 ) candidates
 ORDER BY
-  CASE WHEN candidates.missing_open_episode_count <= ${MAX_DELTA_EPISODES} THEN 0 ELSE 1 END ASC,
-  CASE candidates.context_status
-    WHEN 'failed' THEN 0
-    WHEN 'processing' THEN 1
-    WHEN 'pending' THEN 2
+  CASE
+    WHEN candidates.context_status = 'failed' THEN 0
+    WHEN candidates.missing_open_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1
+    WHEN candidates.missing_open_episode_count < ${BACKLOG_PRIORITY_THRESHOLD} THEN 2
     ELSE 3
+  END ASC,
+  CASE candidates.context_status
+    WHEN 'processing' THEN 0
+    WHEN 'pending' THEN 1
+    ELSE 2
   END ASC,
   candidates.missing_open_episode_count DESC,
   candidates.product_id ASC
