@@ -203,7 +203,8 @@ FROM (
    AND sacs.summary_type = 'episode_summary'
    AND sacs.is_active = 'Y'
    AND sacs.scope_key = CONCAT('episode:', pe.episode_id)
-  WHERE p.price_type = 'free'
+  WHERE p.price_type IN ('free', 'paid')
+    AND p.status_code = 'ongoing'
     AND p.open_yn = 'Y'
     AND p.blind_yn = 'N'
     AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
