@@ -28,6 +28,7 @@ _KC_JWKS_CACHE = None
 _KC_JWKS_CACHE_AT = 0.0
 _KC_JWKS_CACHE_TTL_SECONDS = 60 * 5
 _KC_JWKS_LOCK = asyncio.Lock()
+KC_TOKEN_CLOCK_SKEW_LEEWAY_SECONDS = 30
 
 
 async def _get_kc_jwks():
@@ -165,8 +166,8 @@ async def chk_jwt_token(token: str):
             algorithms=settings.KC_PK_ALGORITHMS,
             issuer=settings.KC_ISSUER_BASE_URL,
             audience=settings.KC_AUDIENCE,
-            # 컨테이너/호스트 시계 미세 오차(수초)로 인한 iat 검증 실패 방지
-            leeway=5,
+            # Keycloak/백엔드 시계 오차로 인한 로그인 직후 iat 경계 실패 방지
+            leeway=KC_TOKEN_CLOCK_SKEW_LEEWAY_SECONDS,
         )
 
         await chk_revoked_token(token, decoded_token)
