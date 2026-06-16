@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field
+from datetime import datetime
 from typing import Optional
 
 
@@ -77,6 +78,14 @@ class PutProductReqBody(AdminBase):
     )
     free_episode_end_no: Optional[int] = Field(
         default=None, examples=[20], description="무료회차 종료 번호"
+    )
+    hundred_free_campaign_enabled: Optional[bool] = Field(
+        default=None, examples=[True], description="기간 한정 1~100화 무료 지정 여부"
+    )
+    hundred_free_campaign_ends_at: Optional[datetime] = Field(
+        default=None,
+        examples=["2026-06-23T23:59:00"],
+        description="기간 한정 1~100화 무료 종료 일시",
     )
 
 
