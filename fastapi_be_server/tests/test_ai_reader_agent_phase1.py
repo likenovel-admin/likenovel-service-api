@@ -92,22 +92,23 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
         self.assertEqual(decision.next_episode_count, 2)
 
-    def test_parse_llm_decision_rejects_over_two_episode_followup(self):
+    def test_parse_llm_decision_clamps_over_two_episode_followup(self):
         from app.services.ai import reader_agent_decision_service as service
 
-        with self.assertRaises(service.InvalidReaderDecisionError):
-            service.parse_llm_decision(
-                {
-                    "continue_reading": True,
-                    "next_episode_count": 3,
-                    "drop_product": False,
-                    "bookmark_action": "none",
-                    "recommend_action": "none",
-                    "evaluation": {"should_evaluate": False, "eval_code": None},
-                    "taste_delta": {"positive": [], "negative": []},
-                    "reason": "세 화 더 읽고 싶음",
-                }
-            )
+        decision = service.parse_llm_decision(
+            {
+                "continue_reading": True,
+                "next_episode_count": 3,
+                "drop_product": False,
+                "bookmark_action": "none",
+                "recommend_action": "none",
+                "evaluation": {"should_evaluate": False, "eval_code": None},
+                "taste_delta": {"positive": [], "negative": []},
+                "reason": "세 화 더 읽고 싶음",
+            }
+        )
+
+        self.assertEqual(decision.next_episode_count, 2)
 
     def test_invalid_llm_decision_raises_without_creating_actions(self):
         from app.services.ai import reader_agent_decision_service as service
@@ -316,6 +317,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
         self.assertEqual(captured["payload"]["model"], "deepseek/deepseek-v3.2")
         self.assertEqual(captured["payload"]["temperature"], 0.4)
         self.assertEqual(captured["payload"]["max_tokens"], 123)
+        self.assertEqual(captured["payload"]["response_format"], {"type": "json_object"})
         self.assertEqual(
             captured["payload"]["messages"],
             [

@@ -154,7 +154,7 @@ def parse_llm_decision(raw_response: str | dict[str, Any]) -> ReaderLlmDecision:
 
     continue_reading = _require_bool(payload, "continue_reading")
     drop_product = _require_bool(payload, "drop_product")
-    next_episode_count = _require_int(payload, "next_episode_count", minimum=0, maximum=2)
+    next_episode_count = _coerce_next_episode_count(payload)
     bookmark_action = _require_choice(payload, "bookmark_action", BOOKMARK_ACTIONS)
     recommend_action = _require_choice(payload, "recommend_action", RECOMMEND_ACTIONS)
 
@@ -323,6 +323,25 @@ def _require_int(
     return value
 
 
+def _coerce_next_episode_count(payload: dict[str, Any]) -> int:
+    value = _require_int(
+        payload,
+        "next_episode_count",
+        minimum=0,
+        maximum=100,
+    )
+    if value <= 2:
+        return value
+    logger.warning(
+        "ai reader next_episode_count exceeded max; clamping",
+        extra={
+            "raw_next_episode_count": value,
+            "max_next_episode_count": 2,
+        },
+    )
+    return 2
+
+
 def _require_choice(payload: dict[str, Any], key: str, choices: set[str]) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or value not in choices:
@@ -438,6 +457,7 @@ async def _call_openrouter_chat_completion(
         "model": settings.AI_READER_OPENROUTER_MODEL,
         "temperature": settings.AI_READER_OPENROUTER_TEMPERATURE,
         "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
