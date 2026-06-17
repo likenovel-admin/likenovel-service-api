@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any, Optional
 
 from app.rdb import get_likenovel_db
-from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.auth import analysis_logger, chk_cur_user, chk_optional_cur_user_strict
 import app.services.user.user_service as user_service
 import app.services.user.user_notification_service as user_notification_service
 import app.services.gift.author_service as author_service
@@ -80,7 +80,7 @@ router = APIRouter(prefix="/user")
     dependencies=[Depends(analysis_logger)],
 )
 async def get_user(
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     """
