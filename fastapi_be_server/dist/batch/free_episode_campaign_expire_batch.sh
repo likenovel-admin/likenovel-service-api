@@ -10,7 +10,16 @@ enable_timestamped_logging
 
 BATCH_NAME="free_episode_campaign_expire_batch"
 RUN_STARTED_AT="$(date +%s)"
-trap 'rc=$?; duration=$(( $(date +%s) - RUN_STARTED_AT )); echo "[INFO] ${BATCH_NAME} completed with exit=${rc} in ${duration}s"; exit "$rc"' EXIT
+
+log_exit() {
+  local rc=$?
+  local duration
+  duration=$(( $(date +%s) - RUN_STARTED_AT ))
+  echo "[INFO] ${BATCH_NAME} completed with exit=${rc} in ${duration}s"
+  exit "$rc"
+}
+
+trap log_exit EXIT
 
 echo "[INFO] ${BATCH_NAME} started"
 
