@@ -3795,6 +3795,44 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(token_a, token_b)
 
+    def test_refresh_schedules_dry_run_token_includes_free_product_type_weights(self):
+        from app.services.admin import admin_ai_reader_service
+
+        common_kwargs = {
+            "agent_count": 20,
+            "schedule_date": "2026-05-14",
+        }
+
+        token_a = admin_ai_reader_service.build_ai_reader_refresh_schedules_dry_run_token(
+            **common_kwargs,
+            free_product_type_weights={"normal_serial": 85, "free_serial": 15},
+        )
+        token_b = admin_ai_reader_service.build_ai_reader_refresh_schedules_dry_run_token(
+            **common_kwargs,
+            free_product_type_weights={"normal_serial": 50, "free_serial": 50},
+        )
+
+        self.assertNotEqual(token_a, token_b)
+
+    def test_restart_dry_run_token_includes_free_product_type_weights(self):
+        from app.services.admin import admin_ai_reader_service
+
+        common_kwargs = {
+            "agent_count": 20,
+            "schedule_date": "2026-05-14",
+        }
+
+        token_a = admin_ai_reader_service.build_ai_reader_restart_dry_run_token(
+            **common_kwargs,
+            free_product_type_weights={"normal_serial": 85, "free_serial": 15},
+        )
+        token_b = admin_ai_reader_service.build_ai_reader_restart_dry_run_token(
+            **common_kwargs,
+            free_product_type_weights={"normal_serial": 50, "free_serial": 50},
+        )
+
+        self.assertNotEqual(token_a, token_b)
+
     def test_bootstrap_dry_run_token_includes_product_status_weights(self):
         from app.services.admin import admin_ai_reader_service
 

@@ -932,6 +932,7 @@ def build_ai_reader_refresh_schedules_dry_run_token(
     daily_session_target: int | None = None,
     time_blocks: list[dict[str, Any]] | None = None,
     product_type_weights: dict[str, int] | None = None,
+    free_product_type_weights: dict[str, int] | None = None,
     product_status_weights: dict[str, int] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
@@ -950,6 +951,9 @@ def build_ai_reader_refresh_schedules_dry_run_token(
         "daily_session_target": daily_session_target,
         "time_blocks": time_blocks,
         "product_type_weights": _product_type_weights_payload(product_type_weights),
+        "free_product_type_weights": _free_product_type_weights_payload(
+            free_product_type_weights
+        ),
         "product_status_weights": _product_status_weights_payload(
             product_status_weights
         ),
@@ -991,6 +995,7 @@ def _expected_refresh_schedules_dry_run_token(
         daily_session_target=req_body.daily_session_target,
         time_blocks=_time_blocks_payload(req_body.time_blocks),
         product_type_weights=req_body.product_type_weights,
+        free_product_type_weights=req_body.free_product_type_weights,
         product_status_weights=req_body.product_status_weights,
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
@@ -1033,6 +1038,7 @@ def build_ai_reader_restart_dry_run_token(
     daily_session_target: int | None = None,
     time_blocks: list[dict[str, Any]] | None = None,
     product_type_weights: dict[str, int] | None = None,
+    free_product_type_weights: dict[str, int] | None = None,
     product_status_weights: dict[str, int] | None = None,
     daily_llm_budget: int | None = None,
     agent_fingerprints: list[dict[str, Any]] | None = None,
@@ -1051,6 +1057,9 @@ def build_ai_reader_restart_dry_run_token(
         "daily_session_target": daily_session_target,
         "time_blocks": time_blocks,
         "product_type_weights": _product_type_weights_payload(product_type_weights),
+        "free_product_type_weights": _free_product_type_weights_payload(
+            free_product_type_weights
+        ),
         "product_status_weights": _product_status_weights_payload(
             product_status_weights
         ),
@@ -1092,6 +1101,7 @@ def _expected_restart_dry_run_token(
         daily_session_target=req_body.daily_session_target,
         time_blocks=_time_blocks_payload(req_body.time_blocks),
         product_type_weights=req_body.product_type_weights,
+        free_product_type_weights=req_body.free_product_type_weights,
         product_status_weights=req_body.product_status_weights,
         daily_llm_budget=req_body.daily_llm_budget,
         agent_fingerprints=agent_fingerprints,
