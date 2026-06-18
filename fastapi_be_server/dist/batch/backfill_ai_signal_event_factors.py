@@ -6,6 +6,7 @@ factor row 없는 raw AI signal을 현재 metadata 기준으로 backfill한다.
   python3 /app/dist/batch/backfill_ai_signal_event_factors.py --dry-run
   python3 /app/dist/batch/backfill_ai_signal_event_factors.py --product-id 673
   python3 /app/dist/batch/backfill_ai_signal_event_factors.py --event-id-from 900 --event-id-to 1200
+  python3 /app/dist/batch/backfill_ai_signal_event_factors.py --limit 500
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ SUPPORTED_EVENT_TYPES = (
     "next_episode_click",
     "revisit_24h",
     "taste_slot_click",
+    "product_detail_exit",
 )
 
 
@@ -49,6 +51,7 @@ def parse_args() -> argparse.Namespace:
 def build_where_clause(args: argparse.Namespace) -> tuple[str, dict]:
     clauses = [
         "e.event_type IN :supported_event_types",
+        "NOT EXISTS (SELECT 1 FROM tb_user_ai_signal_event_factor f WHERE f.event_id = e.id)",
     ]
     params: dict[str, object] = {
         "supported_event_types": SUPPORTED_EVENT_TYPES,

@@ -160,6 +160,52 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_taste_recommendations_fill_to_three_sections_when_axes_available(self):
+        profile = {
+            "onboarding_moods": ["현대"],
+            "recommendation_sections": [],
+            "read_product_ids": [],
+        }
+        factor_scores = {
+            "protagonist": {"성장형": 6.0},
+            "material": {"마법": 6.0},
+            "worldview": {"현대": 6.0},
+            "style": {"통쾌": 6.0},
+        }
+        product_briefs = {
+            1: {"product_id": 1, "title": "A", "author_nickname": "aa", "episode_count": 10},
+            2: {"product_id": 2, "title": "B", "author_nickname": "bb", "episode_count": 10},
+            3: {"product_id": 3, "title": "C", "author_nickname": "cc", "episode_count": 10},
+        }
+
+        def match_by_axes(_all_dna, axes, _profile, _excluded_ids, _factor_scores, limit=6):
+            axis = axes[0]
+            product_id = {"type": 1, "material": 2, "worldview": 3}.get(axis)
+            return [{"product_id": product_id, "reason": axis}] if product_id else []
+
+        with patch.object(recommendation_service, "_get_user_id_by_kc", AsyncMock(return_value=100)), \
+            patch.object(recommendation_service, "_is_ai_onboarding_dismissed", AsyncMock(return_value=True)), \
+            patch.object(recommendation_service, "get_user_taste_profile", AsyncMock(return_value=profile)), \
+            patch.object(recommendation_service, "_get_recent_read_product_ids", AsyncMock(return_value=set())), \
+            patch.object(recommendation_service, "get_all_product_ai_metadata", AsyncMock(return_value=[{"product_id": 1}])), \
+            patch.object(recommendation_service, "_get_user_factor_scores", AsyncMock(return_value=factor_scores)), \
+            patch.object(recommendation_service, "_get_user_total_signal_count", AsyncMock(return_value=3)), \
+            patch.object(
+                recommendation_service,
+                "_build_dynamic_slot_sections",
+                return_value=[{"dimension": "type", "reason": "", "axes": ["type"]}],
+            ), \
+            patch.object(recommendation_service, "_match_products_by_axes", side_effect=match_by_axes), \
+            patch.object(recommendation_service, "_get_product_briefs", AsyncMock(return_value=product_briefs)), \
+            patch.object(recommendation_service, "_save_ai_slot_serving_logs", AsyncMock()):
+            result = await recommendation_service.get_taste_recommendations("kc-user", "N", self._FakeDb())
+
+        self.assertEqual(len(result["sections"]), 3)
+        self.assertEqual(
+            [section["products"][0]["productId"] for section in result["sections"]],
+            [1, 2, 3],
+        )
+
     async def test_score_engagement_for_recommendation_prefers_strong_read_signals(self):
         strong = {
             "binge_rate": 0.72,
@@ -623,11 +669,12 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [section["dimension"] for section in result["sections"]],
-            ["type_material", "worldview"],
+            ["type_material", "worldview", "protagonist"],
         )
         self.assertEqual(result["sections"][0]["products"][0]["productId"], 101)
         self.assertEqual(result["sections"][1]["products"][0]["productId"], 301)
-        self.assertEqual(len(save_logs.await_args.args[1]), 2)
+        self.assertEqual(result["sections"][2]["products"][0]["productId"], 201)
+        self.assertEqual(len(save_logs.await_args.args[1]), 3)
 
     async def test_preset_recommend_uses_condition_first_fallback_when_no_taste_match(self):
         db = AsyncMock()

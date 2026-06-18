@@ -37,6 +37,17 @@ DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-}"
 DB_PW="${DB_PW:-}"
 DB_NAME="${DB_NAME:-likenovel}"
+APP_DIR="${SCRIPT_DIR}/../api"
+if [[ "$SCRIPT_DIR" == *"batch-dev"* ]]; then
+  APP_DIR="${SCRIPT_DIR}/../api-dev"
+elif [ ! -d "$APP_DIR" ]; then
+  APP_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+fi
+PYTHON_BIN="${APP_DIR}/.venv/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3 || command -v python || true)"
+fi
+FACTOR_BACKFILL_LIMIT="${AI_TASTE_FACTOR_BACKFILL_LIMIT:-500}"
 
 # SSL: MariaDB(--skip-ssl) vs MySQL 8.0+(--ssl-mode=DISABLED)
 if [ -z "${MYSQL_SSL_OPT:-}" ]; then
@@ -46,6 +57,23 @@ fi
 if [ -z "$DB_USER" ] || [ -z "$DB_PW" ]; then
   echo "[ERROR] Missing DB_USER or DB_PW env for batch." 1>&2
   exit 1
+fi
+
+if [ -x "$PYTHON_BIN" ] && [ -f "${SCRIPT_DIR}/backfill_ai_signal_event_factors.py" ]; then
+  echo "[INFO] backfilling missing AI signal factor rows before aggregation (limit=${FACTOR_BACKFILL_LIMIT})"
+  if ! (
+    cd "$APP_DIR" && \
+    DB_IP="$DB_HOST" \
+    DB_PORT="$DB_PORT" \
+    DB_USER_ID="$DB_USER" \
+    DB_USER_PW="$DB_PW" \
+    DB_NAME="$DB_NAME" \
+    "$PYTHON_BIN" "${SCRIPT_DIR}/backfill_ai_signal_event_factors.py" --limit "$FACTOR_BACKFILL_LIMIT"
+  ); then
+    echo "[WARN] missing AI signal factor backfill failed; continuing with existing factor aggregation." 1>&2
+  fi
+else
+  echo "[WARN] missing AI signal factor backfill skipped; python or script not found." 1>&2
 fi
 
 MAX_RETRIES=3

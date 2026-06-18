@@ -25,7 +25,7 @@ from app.schemas.ai_recommendation import MAX_EVENT_PAYLOAD_LENGTH
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 logger = logging.getLogger(__name__)
 MIN_SIGNAL_COUNT_FOR_DYNAMIC_SLOTS = 3
-MIN_TASTE_RECOMMENDATION_SECTIONS = 2
+MIN_TASTE_RECOMMENDATION_SECTIONS = 3
 MAX_TASTE_RECOMMENDATION_SECTIONS = 3
 PRODUCT_DETAIL_EXIT_MIN_ACTIVE_SECONDS_FOR_SIGNAL = 12
 MIN_RECENT_READ_POOL_FOR_PROFILE = 3
@@ -1989,8 +1989,7 @@ async def get_taste_recommendations(kc_user_id: str, adult_yn: str, db: AsyncSes
         section_candidates = _resolve_recommendation_sections(profile, factor_scores)
 
     if (
-        use_dynamic_slots
-        and not used_recent_read_minimum_fallback
+        not used_recent_read_minimum_fallback
         and 0 < len(result_sections) < MIN_TASTE_RECOMMENDATION_SECTIONS
     ):
         dynamic_fill_candidates = _build_dynamic_fill_slot_sections(
@@ -2000,8 +1999,7 @@ async def get_taste_recommendations(kc_user_id: str, adult_yn: str, db: AsyncSes
         await append_matching_sections(dynamic_fill_candidates, MIN_TASTE_RECOMMENDATION_SECTIONS)
 
     if (
-        use_dynamic_slots
-        and not used_recent_read_minimum_fallback
+        not used_recent_read_minimum_fallback
         and 0 < len(result_sections) < MIN_TASTE_RECOMMENDATION_SECTIONS
     ):
         existing_dimensions = {
