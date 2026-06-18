@@ -44,6 +44,9 @@ class AiProductBriefsUnitTest(unittest.IsolatedAsyncioTestCase):
                             "protagonist_material_tags": "[\"마신\"]",
                             "axis_style_tags": "[\"비장\", \"피폐\"]",
                             "axis_romance_tags": "[]",
+                            "librarian_intro": "AI사서 소개",
+                            "librarian_points": "[\"복수\", \"무공\"]",
+                            "librarian_chips": "[\"복수\", \"무협\"]",
                         }
                     ]
                 )
@@ -78,6 +81,9 @@ class AiProductBriefsUnitTest(unittest.IsolatedAsyncioTestCase):
                     "protagonistMaterialTags": ["마신"],
                     "styleTags": ["비장", "피폐"],
                     "romanceTags": [],
+                    "librarianIntro": "AI사서 소개",
+                    "librarianPoints": ["복수", "무공"],
+                    "librarianChips": ["복수", "무협"],
                 }
             ],
         )
@@ -146,8 +152,16 @@ class AiProductBriefsUnitTest(unittest.IsolatedAsyncioTestCase):
                             "product_id": 1156,
                             "title": "잿빛 길을 걷다",
                             "status_code": "serialize",
+                            "price_type": "free",
+                            "monopoly_yn": "N",
+                            "contract_yn": "Y",
+                            "last_episode_date": "2026-06-19 01:20:00",
+                            "new_release_yn": "Y",
                             "author_nickname": "Avalanche",
                             "episode_count": 29,
+                            "writing_count_per_week": 7,
+                            "waiting_for_free_yn": "N",
+                            "six_nine_path_yn": "Y",
                             "cover_url": None,
                         }
                     ]
@@ -158,5 +172,12 @@ class AiProductBriefsUnitTest(unittest.IsolatedAsyncioTestCase):
         briefs = await recommendation_service._get_product_briefs([1156], db)
 
         self.assertEqual(briefs[1156]["episode_count"], 29)
+        self.assertEqual(briefs[1156]["new_release_yn"], "Y")
+        self.assertEqual(briefs[1156]["last_episode_date"], "2026-06-19 01:20:00")
+        self.assertEqual(briefs[1156]["contract_yn"], "Y")
+        self.assertEqual(briefs[1156]["six_nine_path_yn"], "Y")
+        self.assertIn("IF(p.last_episode_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR)", db.executed_sql)
+        self.assertIn("LEFT JOIN tb_product_trend_index", db.executed_sql)
+        self.assertIn("LEFT JOIN tb_applied_promotion wff", db.executed_sql)
         self.assertIn("e.use_yn = 'Y'", db.executed_sql)
         self.assertIn("e.open_yn = 'Y'", db.executed_sql)

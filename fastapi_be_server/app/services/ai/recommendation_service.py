@@ -1954,14 +1954,12 @@ async def get_taste_recommendations(kc_user_id: str, adult_yn: str, db: AsyncSes
                 except (TypeError, ValueError):
                     product_info = None
                 if product_info:
-                    products.append({
-                        "productId": product_info["product_id"],
-                        "title": product_info["title"],
-                        "coverUrl": product_info.get("cover_url"),
-                        "authorNickname": product_info.get("author_nickname"),
-                        "episodeCount": product_info.get("episode_count", 0),
-                        "matchReason": m.get("reason", ""),
-                    })
+                    products.append(
+                        _build_recommend_product_from_brief(
+                            product_info,
+                            m.get("reason", ""),
+                        )
+                    )
                     served_product_ids.add(int(product_info["product_id"]))
 
             if products:
@@ -2220,14 +2218,10 @@ async def _build_weak_recent_read_section(
                 if not product_info:
                     continue
                 products.append(
-                    {
-                        "productId": product_info["product_id"],
-                        "title": product_info["title"],
-                        "coverUrl": product_info.get("cover_url"),
-                        "authorNickname": product_info.get("author_nickname"),
-                        "episodeCount": product_info.get("episode_count", 0),
-                        "matchReason": item.get("reason", ""),
-                    }
+                    _build_recommend_product_from_brief(
+                        product_info,
+                        item.get("reason", ""),
+                    )
                 )
 
             if not products:
@@ -3053,6 +3047,30 @@ def _format_serial_cycle(writing_per_week: float, status_code: str = "") -> str 
     return None
 
 
+def _build_recommend_product_from_brief(product_info: dict, match_reason: str = "") -> dict:
+    last_episode_date = product_info.get("last_episode_date")
+    return {
+        "productId": product_info["product_id"],
+        "title": product_info["title"],
+        "coverUrl": product_info.get("cover_url"),
+        "authorNickname": product_info.get("author_nickname"),
+        "episodeCount": product_info.get("episode_count", 0),
+        "matchReason": match_reason,
+        "serialCycle": _format_serial_cycle(
+            _safe_float(product_info.get("writing_count_per_week"), 0.0),
+            str(product_info.get("status_code") or ""),
+        ),
+        "priceType": product_info.get("price_type"),
+        "ongoingState": product_info.get("status_code"),
+        "monopolyYn": product_info.get("monopoly_yn"),
+        "lastEpisodeDate": str(last_episode_date) if last_episode_date else None,
+        "newReleaseYn": product_info.get("new_release_yn", "N"),
+        "cpContractYn": product_info.get("contract_yn", "N"),
+        "waitingForFreeYn": product_info.get("waiting_for_free_yn", "N"),
+        "sixNinePathYn": product_info.get("six_nine_path_yn", "N"),
+    }
+
+
 async def _get_product_brief(product_id: int, db: AsyncSession) -> dict | None:
     query = text(f"""
         SELECT
@@ -3108,8 +3126,13 @@ async def _get_product_briefs(product_ids: list[int], db: AsyncSession) -> dict[
         f"""
         SELECT
             p.product_id, p.title, p.status_code,
+            p.price_type, p.monopoly_yn, p.contract_yn, p.last_episode_date,
+            IF(p.last_episode_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR), 'Y', 'N') AS new_release_yn,
             p.author_name AS author_nickname,
             {PUBLIC_OPEN_EPISODE_COUNT_SQL} AS episode_count,
+            COALESCE(pti.writing_count_per_week, 0) AS writing_count_per_week,
+            IF(wff.product_id IS NOT NULL, 'Y', 'N') AS waiting_for_free_yn,
+            IF(p69.product_id IS NOT NULL, 'Y', 'N') AS six_nine_path_yn,
             IF(p.thumbnail_file_id IS NULL, NULL,
                (SELECT CASE
                          WHEN w.file_path IS NULL OR w.file_path = '' THEN NULL
@@ -3122,6 +3145,9 @@ async def _get_product_briefs(product_ids: list[int], db: AsyncSession) -> dict[
                   AND q.group_type = 'cover'
                   AND q.file_group_id = p.thumbnail_file_id)) AS cover_url
         FROM tb_product p
+        LEFT JOIN tb_product_trend_index pti ON pti.product_id = p.product_id
+        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+        LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND p69.status = 'ing' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
         WHERE p.product_id IN ({placeholders})
           AND p.open_yn = 'Y'
         """
