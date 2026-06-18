@@ -172,6 +172,8 @@ def _allowed_axis_labels_candidates() -> list[Path]:
 
     candidates: list[Path] = [
         Path(settings.ROOT_PATH) / "dist" / "ai" / "allowed-labels-by-axis.json",
+        Path(settings.ROOT_PATH) / "batch" / "allowed-labels-by-axis.json",
+        Path.cwd() / "batch" / "allowed-labels-by-axis.json",
         app_root / "dist" / "ai" / "allowed-labels-by-axis.json",
     ]
     for parent in parents:

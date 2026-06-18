@@ -1,4 +1,7 @@
+import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
 from app.services.ai import recommendation_service
@@ -25,6 +28,40 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
 
         def all(self):
             return self._rows
+
+    def test_allowed_axis_labels_load_from_deployed_batch_directory(self):
+        original_cache = recommendation_service._ALLOWED_AXIS_LABELS_CACHE
+        original_warned = recommendation_service._ALLOWED_AXIS_LABELS_WARNED
+        original_cwd = Path.cwd()
+        try:
+            with TemporaryDirectory() as tmp_dir:
+                batch_dir = Path(tmp_dir) / "batch"
+                batch_dir.mkdir()
+                (batch_dir / "allowed-labels-by-axis.json").write_text(
+                    """{
+  "세": ["현대"],
+  "직": ["헌터"],
+  "목": ["생존"],
+  "능": ["마법"],
+  "타": ["성장형"],
+  "연": ["동료"],
+  "작": ["통쾌"]
+}""",
+                    encoding="utf-8",
+                )
+                recommendation_service._ALLOWED_AXIS_LABELS_CACHE = None
+                recommendation_service._ALLOWED_AXIS_LABELS_WARNED = False
+                os.chdir(tmp_dir)
+
+                labels = recommendation_service._load_allowed_axis_labels()
+
+            self.assertIn("헌터", labels["job"])
+            self.assertNotIn("헌터", labels["type"])
+            self.assertIn("성장형", labels["type"])
+        finally:
+            os.chdir(original_cwd)
+            recommendation_service._ALLOWED_AXIS_LABELS_CACHE = original_cache
+            recommendation_service._ALLOWED_AXIS_LABELS_WARNED = original_warned
 
     async def test_update_ai_slot_feedback_flags_skips_unsupported_event(self):
         db = AsyncMock()
