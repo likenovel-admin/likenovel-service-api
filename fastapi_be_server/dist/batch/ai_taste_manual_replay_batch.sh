@@ -129,7 +129,12 @@ and trim(json_unquote(json_extract(event_payload, '$.signal_score'))) regexp '^-
 STATS=$(MYSQL_PWD="$DB_PW" "${MYSQL_CMD[@]}" -N -e "
   SELECT
       COUNT(1) AS total_count,
-      SUM(CASE WHEN ${VALID_EVENT_CONDITION} THEN 1 ELSE 0 END) AS valid_count,
+      (
+        SELECT COUNT(DISTINCT f.event_id)
+          FROM tb_user_ai_signal_event_factor f
+         WHERE f.event_id >= ${FROM_ID}
+           AND f.event_id <= ${TO_ID}
+      ) + SUM(CASE WHEN ${VALID_EVENT_CONDITION} THEN 1 ELSE 0 END) AS valid_count,
       COALESCE(DATE_FORMAT(MIN(created_date), '%Y-%m-%dT%H:%i:%s'), '') AS min_created_date,
       COALESCE(DATE_FORMAT(MAX(created_date), '%Y-%m-%dT%H:%i:%s'), '') AS max_created_date
     FROM tb_user_ai_signal_event
