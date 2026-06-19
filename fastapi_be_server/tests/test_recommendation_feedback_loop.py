@@ -29,6 +29,30 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         def all(self):
             return self._rows
 
+    def test_user_facing_slot_title_uses_natural_goal_particle(self):
+        title = recommendation_service._build_user_facing_slot_title(
+            ["goal"],
+            {"goal": {"여행": 1.0}},
+            {},
+        )
+
+        self.assertEqual(title, "요즘 주인공의 목표가 '여행'인 작품을 좋아하나봐요")
+
+    def test_user_facing_slot_title_joins_axis_clauses_naturally(self):
+        title = recommendation_service._build_user_facing_slot_title(
+            ["type", "job"],
+            {
+                "protagonist": {"성장형": 1.0},
+                "job": {"공무원": 1.0},
+            },
+            {},
+        )
+
+        self.assertEqual(
+            title,
+            "요즘 주인공 유형이 '성장형'이고 주인공 직업이 '공무원'인 작품을 좋아하나봐요",
+        )
+
     def test_allowed_axis_labels_load_from_deployed_batch_directory(self):
         original_cache = recommendation_service._ALLOWED_AXIS_LABELS_CACHE
         original_warned = recommendation_service._ALLOWED_AXIS_LABELS_WARNED
