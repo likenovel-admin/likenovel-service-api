@@ -2520,6 +2520,11 @@ def _subject_particle(text: str) -> str:
 
 
 def _build_slot_title_clause(axis: str, label: str, *, is_final: bool) -> str:
+    if axis == "worldview":
+        return f"'{label}' 세계관의" if is_final else f"'{label}' 세계관이고"
+    if axis == "style":
+        return f"'{label}' 작풍의" if is_final else f"'{label}' 작풍이고"
+
     subject = AXIS_TITLE_SUBJECT.get(axis, AXIS_DISPLAY_LABEL.get(axis, axis))
     particle = _subject_particle(subject)
     ending = "인" if is_final else "이고"
