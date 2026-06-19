@@ -59,6 +59,15 @@ AXIS_DISPLAY_LABEL = {
     "romance": "관계/로맨스",
     "style": "작풍",
 }
+AXIS_TITLE_SUBJECT = {
+    "type": "주인공 유형",
+    "job": "주인공 직업",
+    "goal": "주인공의 목표",
+    "material": "핵심 소재",
+    "worldview": "세계관",
+    "romance": "관계 구도",
+    "style": "작풍",
+}
 GOAL_LABEL_KEYS = {
     "복수",
     "탑등반",
@@ -2495,6 +2504,28 @@ def _top_axis_label(axis: str, factor_scores: dict[str, dict[str, float]], profi
     return str(top_entries[0].get("label") or "").strip()
 
 
+def _has_final_consonant(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    last_char = stripped[-1]
+    code_point = ord(last_char)
+    if 0xAC00 <= code_point <= 0xD7A3:
+        return (code_point - 0xAC00) % 28 != 0
+    return False
+
+
+def _subject_particle(text: str) -> str:
+    return "이" if _has_final_consonant(text) else "가"
+
+
+def _build_slot_title_clause(axis: str, label: str, *, is_final: bool) -> str:
+    subject = AXIS_TITLE_SUBJECT.get(axis, AXIS_DISPLAY_LABEL.get(axis, axis))
+    particle = _subject_particle(subject)
+    ending = "인" if is_final else "이고"
+    return f"{subject}{particle} '{label}'{ending}"
+
+
 def _build_user_facing_slot_title(
     axes: list[str],
     factor_scores: dict[str, dict[str, float]],
@@ -2509,29 +2540,20 @@ def _build_user_facing_slot_title(
     if not normalized_axes:
         return "최근 읽은 작품 기반 추천"
 
-    first_axis = normalized_axes[0]
-    first_label = _top_axis_label(first_axis, factor_scores, profile)
-    first_axis_label = AXIS_DISPLAY_LABEL.get(first_axis, first_axis)
+    clauses: list[str] = []
+    for axis in normalized_axes[:2]:
+        label = _top_axis_label(axis, factor_scores, profile)
+        if label:
+            clauses.append((axis, label))
 
-    if len(normalized_axes) >= 2:
-        second_axis = normalized_axes[1]
-        second_label = _top_axis_label(second_axis, factor_scores, profile)
-        second_axis_label = AXIS_DISPLAY_LABEL.get(second_axis, second_axis)
-
-        if first_label and second_label:
-            return (
-                f"요즘 '{first_label}' {first_axis_label}과 "
-                f"'{second_label}' {second_axis_label} 조합을 좋아하시나봐요"
-            )
-        if first_label:
-            return f"요즘 '{first_label}' {first_axis_label}을 특히 좋아하시나봐요"
-        if second_label:
-            return f"요즘 '{second_label}' {second_axis_label}을 특히 좋아하시나봐요"
+    if not clauses:
         return "최근 읽은 작품 기반 추천"
 
-    if first_label:
-        return f"요즘 '{first_label}' {first_axis_label} 작품을 특히 좋아하시나봐요"
-    return f"요즘 {first_axis_label} 취향 작품을 추천해드려요"
+    clause_texts = [
+        _build_slot_title_clause(axis, label, is_final=index == len(clauses) - 1)
+        for index, (axis, label) in enumerate(clauses)
+    ]
+    return f"요즘 {' '.join(clause_texts)} 작품을 좋아하나봐요"
 
 
 def _axis_to_legacy_dimension(axis: str) -> str:
