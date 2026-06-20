@@ -293,6 +293,64 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertNotIn("완결 판타지 5화 이하 작품 추천해줘", [item["userMessage"] for item in actions])
         self.assertNotIn("완결 판타지 5화 이하 작품 추천해줘", [item["label"] for item in actions])
 
+    def test_normalize_no_match_suggested_actions_forces_recommend_intent(self):
+        raw_actions = [
+            {
+                "id": "bad-intent-1",
+                "label": "연재중도 포함해볼까요?",
+                "user_message": "연재중도 포함해서 판타지 추천해줘",
+                "intent": "explain_attribute",
+            },
+            {
+                "id": "bad-intent-2",
+                "label": "장르를 넓혀볼까요?",
+                "user_message": "장르 제한 없이 완결작 추천해줘",
+                "intent": "explain_entry",
+            },
+            {
+                "id": "ok-intent",
+                "label": "초반 쉬운 작품만 볼까요?",
+                "user_message": "초반 진입 쉬운 작품 위주로 추천해줘",
+                "intent": "recommend_similar",
+            },
+        ]
+
+        actions = ai_chat_service._normalize_no_match_suggested_actions(raw_actions)
+
+        self.assertEqual([item["intent"] for item in actions], ["recommend_similar"] * 3)
+
+    def test_normalize_no_match_suggested_actions_drops_explain_only_actions(self):
+        raw_actions = [
+            {
+                "id": "detail-settings",
+                "label": "작품의 상세 설정 보기",
+                "user_message": "작품의 상세 설정을 더 알려줘",
+                "intent": "recommend_similar",
+            },
+            {
+                "id": "similar-strategy",
+                "label": "비슷한 전략물 추천",
+                "user_message": "비슷한 전략물 추천해줘",
+                "intent": "recommend_similar",
+            },
+            {
+                "id": "ongoing-fantasy",
+                "label": "다른 연재 중인 판타지 보기",
+                "user_message": "다른 연재 중인 판타지 작품도 추천해줘",
+                "intent": "recommend_similar",
+            },
+        ]
+
+        actions = ai_chat_service._normalize_no_match_suggested_actions(
+            raw_actions,
+            latest_user_query="연재 중인 5화 이하 판타지 작품을 추천해줘",
+        )
+
+        visible_text = " ".join(item["label"] for item in actions)
+        self.assertIn(len(actions), {3, 4})
+        self.assertNotIn("작품의 상세 설정 보기", visible_text)
+        self.assertTrue(all(item["intent"] == "recommend_similar" for item in actions))
+
     def test_normalize_no_match_suggested_actions_uses_service_episode_terms(self):
         raw_actions = [
             {
@@ -310,7 +368,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
             {
                 "id": "long-work",
                 "label": "장편소설도 볼래요",
-                "user_message": "장편소설 추천해줘",
+                "user_message": "장편소설 100화 이상 작품 추천해줘",
                 "intent": "recommend_similar",
             },
             {
@@ -330,8 +388,24 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertIn(len(actions), {3, 4})
         self.assertIn("5화 이하 작품", visible_text)
         self.assertIn("100화 이상 작품", visible_text)
-        self.assertNotRegex(visible_text, r"단편소설|초단편|장편소설|짧은 소설")
+        self.assertNotRegex(visible_text, r"단편소설|초단편|장편소설|짧은 소설|100화 이상 100화 이상 작품")
         self.assertEqual([item["intent"] for item in actions], ["recommend_similar"] * len(actions))
+
+    def test_normalize_no_match_reply_uses_service_episode_terms(self):
+        reply = ai_chat_service._normalize_no_match_reply(
+            "완결된 초단편 판타지 작품은 부족합니다. "
+            "대신 완결된 판타지 작품 중에서 100화 이상인 100화 이상 작품을 볼 수 있어요."
+        )
+
+        self.assertIn("5화 이하 작품", reply)
+        self.assertIn("100화 이상인 작품", reply)
+        self.assertNotRegex(reply, r"초단편|단편소설|100화 이상인 100화 이상 작품")
+
+    def test_rewrite_episode_length_terms_drops_duplicate_episode_phrases(self):
+        self.assertEqual(
+            ai_chat_service._rewrite_episode_length_terms_for_service("판타지 장르의 100화 이상 100화 이상 작품 추천"),
+            "판타지 장르의 100화 이상 작품 추천",
+        )
 
     def test_generate_no_match_suggested_actions_uses_llm_action_tool(self):
         async def run():

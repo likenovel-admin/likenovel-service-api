@@ -1758,6 +1758,11 @@ def _is_repeated_no_match_action(action: dict[str, Any], latest_user_query: str)
     return bool(label and label == query) or bool(user_message and user_message == query)
 
 
+def _is_explain_only_no_match_action(label: str, user_message: str) -> bool:
+    text_value = f"{label} {user_message}"
+    return bool(re.search(r"(상세\s*설정|상세\s*보기|포인트|왜\s|이유|매력|줄거리)", text_value))
+
+
 def _fallback_no_match_suggested_actions(latest_user_query: str) -> list[dict[str, Any]]:
     normalized_query = _normalize_no_match_action_text(latest_user_query)
     candidates: list[dict[str, Any]] = []
@@ -1851,7 +1856,9 @@ def _normalize_no_match_suggested_actions(
         user_message = _compact_text(_rewrite_episode_length_terms_for_service(action.get("userMessage")), 80)
         if not label or not user_message or label in seen_labels:
             continue
-        action = {**action, "label": label, "userMessage": user_message}
+        if _is_explain_only_no_match_action(label, user_message):
+            continue
+        action = {**action, "label": label, "userMessage": user_message, "intent": "recommend_similar"}
         if _is_repeated_no_match_action(action, latest_user_query):
             continue
         sanitized.append(action)
@@ -1890,6 +1897,8 @@ def _rewrite_episode_length_terms_for_service(value: Any) -> str:
     for pattern, replacement in replacements:
         text_value = re.sub(pattern, replacement, text_value)
     text_value = re.sub(r"(5화 이하 작품|100화 이상 작품)\s*작품", r"\1", text_value)
+    text_value = re.sub(r"(5화 이하|100화 이상)인\s+\1\s*작품", r"\1인 작품", text_value)
+    text_value = re.sub(r"(5화 이하|100화 이상)\s+\1\s*작품", r"\1 작품", text_value)
     text_value = re.sub(r"\s{2,}", " ", text_value).strip()
     return text_value
 
@@ -3766,7 +3775,7 @@ def _normalize_product_reply(
 
 def _normalize_no_match_reply(reply: str) -> str:
     fallback = "지금 조건만으로는 작품 카드를 확정하지 못했습니다.\n원하는 결을 하나만 더 좁혀주시면 다시 골라드릴게요."
-    text_value = _limit_readable_reply(_sanitize_reply_text(reply))
+    text_value = _limit_readable_reply(_rewrite_episode_length_terms_for_service(_sanitize_reply_text(reply)))
     if not text_value:
         return fallback
     success_pattern = re.compile(r"(추천(?:합니다|드려요|할게요|해요)|골랐(?:어요|습니다)|후보를 찾(?:았습니다|았어요)|작품을 찾(?:았습니다|았어요))")
