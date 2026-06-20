@@ -2106,16 +2106,21 @@ def _normalize_llm_suggested_actions(
     require_min: bool = True,
     dedupe_by_intent: bool = True,
 ) -> list[dict[str, Any]]:
+    def dedupe_key(action: dict[str, Any]) -> tuple[str, str]:
+        intent = str(action.get("intent") or "")
+        if dedupe_by_intent:
+            return (intent, "")
+        return (intent, str(action.get("label") or ""))
+
+    def stable_action_id(intent: str, label: str, topic: str) -> str:
+        if dedupe_by_intent:
+            return intent
+        base = topic or label or intent
+        label_key = re.sub(r"[^0-9A-Za-z가-힣]+", "_", base).strip("_")[:24]
+        return f"{intent}_{label_key or 'action'}"
+
     normalized: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str, str]] = {
-        (
-            str(action.get("intent") or ""),
-            str(action.get("topic") or "")
-            if str(action.get("intent") or "") == "explain_attribute"
-            else ("" if dedupe_by_intent else str(action.get("label") or "")),
-        )
-        for action in existing_actions or []
-    }
+    seen_keys: set[tuple[str, str]] = {dedupe_key(action) for action in existing_actions or []}
 
     def append_action(raw_action: Any) -> None:
         if len(normalized) >= MAX_SUGGESTED_ACTIONS or not isinstance(raw_action, dict):
@@ -2135,19 +2140,13 @@ def _normalize_llm_suggested_actions(
         topic = _normalize_visible_tag(raw_action.get("topic"))
         if topic and valid_topics is not None and topic not in valid_topics:
             topic = ""
-        key = (intent, topic if intent == "explain_attribute" else ("" if dedupe_by_intent else label))
+        key = dedupe_key({"intent": intent, "label": label, "topic": topic})
         if key in seen_keys:
             return
         seen_keys.add(key)
         default_priority = SUGGESTED_ACTION_DEFAULT_PRIORITIES.get(intent, 99)
         action_priority = _safe_int(raw_action.get("priority"), default_priority)
-        raw_action_id = (
-            raw_action.get("actionId")
-            or raw_action.get("action_id")
-            or raw_action.get("id")
-            or intent
-        )
-        action_id = _compact_text(raw_action_id, 40) or intent
+        action_id = stable_action_id(intent, label, topic)
         action = {
             "id": action_id,
             "actionId": action_id,

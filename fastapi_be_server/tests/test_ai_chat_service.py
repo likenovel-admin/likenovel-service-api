@@ -325,6 +325,33 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertEqual([item["priority"] for item in actions], [10, 20, 30, 40])
         self.assertTrue(all(item["id"] and item["actionId"] for item in actions))
 
+    def test_normalize_suggested_actions_limits_model_attributes_to_one_canonical_slot(self):
+        product = {
+            "title": "추천작",
+            "matchTags": ["헌터", "회귀", "복수", "아카데미"],
+            "tasteTags": ["성장"],
+        }
+        raw_actions = [
+            {
+                "id": f"model-random-{index}",
+                "label": f"#{topic} 포인트는?",
+                "user_message": f"{topic} 포인트 알려줘",
+                "intent": "explain_attribute",
+                "topic": topic,
+                "priority": 1,
+            }
+            for index, topic in enumerate(["헌터", "회귀", "복수", "아카데미"])
+        ]
+
+        actions = ai_chat_service._normalize_suggested_actions(product, raw_actions)
+
+        self.assertEqual(
+            [item["intent"] for item in actions],
+            ["explain_match", "explain_entry", "explain_attribute", "recommend_similar"],
+        )
+        self.assertEqual([item["actionId"] for item in actions], [item["intent"] for item in actions])
+        self.assertEqual(sum(1 for item in actions if item["intent"] == "explain_attribute"), 1)
+
     def test_normalize_no_match_suggested_actions_fills_deterministic_fallback(self):
         raw_actions = [
             {
