@@ -52,7 +52,13 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
     async def test_post_ai_chat_allows_guest_and_skips_history_save(self):
         req_body = PostAiChatReqBody(
             messages=[{"role": "user", "content": "요즘 뜨는 작품 추천해줘"}],
-            context={"trigger": "manual", "page_type": "home", "pathname": "/"},
+            context={
+                "trigger": "manual",
+                "page_type": "home",
+                "pathname": "/",
+                "source_action_id": "followup-1",
+                "source_action_intent": "explain_match",
+            },
             exclude_product_ids=[],
             adult_yn="N",
         )
@@ -85,6 +91,8 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["reply"], "추천 후보를 찾았습니다.")
         handle_chat.assert_awaited_once()
         self.assertIsNone(handle_chat.await_args.kwargs["kc_user_id"])
+        self.assertEqual(handle_chat.await_args.kwargs["context"]["source_action_id"], "followup-1")
+        self.assertEqual(handle_chat.await_args.kwargs["context"]["source_action_intent"], "explain_match")
         save_chat_messages.assert_not_awaited()
 
     async def test_handle_chat_guest_does_not_resolve_user_profile(self):
@@ -96,14 +104,14 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             ) as get_user_id_by_kc,
             patch.object(
                 ai_chat_service,
-                "_call_claude_messages",
+                "_call_gemini_messages",
                 new_callable=AsyncMock,
-            ) as call_claude_messages,
+            ) as call_gemini_messages,
         ):
             get_user_id_by_kc.side_effect = AssertionError(
                 "guest chat must not resolve a user profile"
             )
-            call_claude_messages.return_value = {
+            call_gemini_messages.return_value = {
                 "content": [
                     {
                         "type": "tool_use",
@@ -151,9 +159,9 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             ) as build_product_and_taste,
             patch.object(
                 ai_chat_service,
-                "_call_claude_messages",
+                "_call_gemini_messages",
                 new_callable=AsyncMock,
-            ) as call_claude_messages,
+            ) as call_gemini_messages,
         ):
             build_page_context.return_value = {
                 "page_type": "product",
@@ -167,7 +175,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 (None, empty_taste_match),
                 (focus_product, empty_taste_match),
             ]
-            call_claude_messages.return_value = {
+            call_gemini_messages.return_value = {
                 "content": [
                     {
                         "type": "tool_use",
@@ -204,7 +212,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             2020,
         )
 
-    async def test_handle_chat_replaces_no_match_reply_when_focus_product_card_attached(self):
+    async def test_handle_chat_current_product_overview_uses_fast_path(self):
         with (
             patch.object(
                 ai_chat_service,
@@ -213,14 +221,24 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             ) as build_page_context,
             patch.object(
                 ai_chat_service,
-                "_dispatch_tool",
+                "get_product_info",
                 new_callable=AsyncMock,
-            ) as dispatch_tool,
+            ) as get_product_info,
             patch.object(
                 ai_chat_service,
-                "_call_claude_messages",
+                "_call_gemini_text",
                 new_callable=AsyncMock,
-            ) as call_claude_messages,
+            ) as call_gemini_text,
+            patch.object(
+                ai_chat_service,
+                "_build_product_and_taste",
+                new_callable=AsyncMock,
+            ) as build_product_and_taste,
+            patch.object(
+                ai_chat_service,
+                "_call_gemini_messages",
+                new_callable=AsyncMock,
+            ) as call_gemini_messages,
         ):
             build_page_context.return_value = {
                 "page_type": "product",
@@ -230,7 +248,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 "current_product_title": "잿빛 길을 걷다",
                 "focus_product_card": True,
             }
-            dispatch_tool.return_value = {
+            get_product_info.return_value = {
                 "product_id": 2020,
                 "title": "잿빛 길을 걷다",
                 "author_name": "Avalanche",
@@ -240,46 +258,11 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 "synopsis_text": "멸망한 도시를 걷는 생존자들이 긴장감 있는 여정을 이어가는 포스트 아포칼립스 작품입니다.",
                 "taste_tags": ["강한 주인공", "서사적", "긴장감"],
             }
-            call_claude_messages.side_effect = [
-                {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "final-1",
-                            "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
-                            "input": {
-                                "mode": "no_match",
-                                "product_id": None,
-                                "reply": "현재 확인한 정보는 '잿빛 길을 걷다' 작품 자체에 대한 것뿐이며, 유사 작품을 추천하기 위한 비교 데이터가 없습니다.",
-                            },
-                        }
-                    ]
-                },
-                {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "detail-1",
-                            "name": "get_product_info",
-                            "input": {"product_id": 2020},
-                        }
-                    ]
-                },
-                {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "final-2",
-                            "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
-                            "input": {
-                                "mode": "no_match",
-                                "product_id": 2020,
-                                "reply": "'잿빛 길을 걷다'는 멸망한 도시를 걷는 생존자들의 포스트 아포칼립스 생존 서사입니다. 현재 조회 가능한 데이터 범위 내에서 유사한 다른 작품을 찾기 어려워 비교 후보를 제시하기 어렵습니다.",
-                            },
-                        }
-                    ]
-                },
-            ]
+            call_gemini_text.return_value = "'잿빛 길을 걷다' 작품은 포스트 아포칼립스 생존 서사입니다."
+            build_product_and_taste.return_value = (
+                {"productId": 2020, "title": "잿빛 길을 걷다", "matchReason": ""},
+                {"protagonist": 0, "mood": 0, "pacing": 0},
+            )
 
             result = await ai_chat_service.handle_chat(
                 kc_user_id=None,
@@ -298,16 +281,13 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["product"]["productId"], 2020)
-        self.assertEqual(dispatch_tool.await_args.kwargs["tool_name"], "get_product_info")
-        self.assertEqual(
-            dispatch_tool.await_args.kwargs["tool_input"]["product_id"],
-            2020,
-        )
-        self.assertIn("잿빛 길을 걷다", result["reply"])
+        get_product_info.assert_awaited_once()
+        call_gemini_text.assert_awaited_once()
+        call_gemini_messages.assert_not_awaited()
         self.assertIn("'잿빛 길을 걷다' 작품은", result["reply"])
         self.assertIn("포스트 아포칼립스", result["reply"])
-        self.assertEqual(call_claude_messages.await_count, 3)
         self.assertEqual(result["finalMode"], "weak_recommend")
+        self.assertNotIn("providerFallback", result)
         self.assertNotIn("비교 데이터", result["reply"])
         self.assertNotIn("유사한 다른 작품", result["reply"])
         self.assertNotIn("비교 후보", result["reply"])
@@ -453,9 +433,9 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             ) as build_product_and_taste,
             patch.object(
                 ai_chat_service,
-                "_call_claude_messages",
+                "_call_gemini_messages",
                 new_callable=AsyncMock,
-            ) as call_claude_messages,
+            ) as call_gemini_messages,
         ):
             build_page_context.return_value = {
                 "page_type": "product",
@@ -465,7 +445,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 "current_product_title": "이종족 일꾼 테이밍",
                 "focus_product_card": True,
             }
-            call_claude_messages.side_effect = [
+            call_gemini_messages.side_effect = [
                 {
                     "content": [
                         {
@@ -539,8 +519,8 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["product"]["productId"], 2020)
         self.assertIn("1화는", result["reply"])
-        self.assertEqual(call_claude_messages.await_count, 3)
-        self.assertIn("include_episode_previews=true", call_claude_messages.await_args_list[1].kwargs["messages"][-1]["content"])
+        self.assertEqual(call_gemini_messages.await_count, 3)
+        self.assertIn("include_episode_previews=true", call_gemini_messages.await_args_list[1].kwargs["messages"][-1]["content"])
         self.assertEqual(dispatch_tool.await_args.kwargs["tool_input"]["episode_numbers"], [1, 2])
 
     async def test_handle_chat_reasks_episode_question_from_previous_product_card(self):
@@ -569,9 +549,9 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             ) as build_product_and_taste,
             patch.object(
                 ai_chat_service,
-                "_call_claude_messages",
+                "_call_gemini_messages",
                 new_callable=AsyncMock,
-            ) as call_claude_messages,
+            ) as call_gemini_messages,
         ):
             build_page_context.return_value = {
                 "page_type": "product",
@@ -581,7 +561,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 "current_product_title": None,
                 "focus_product_card": False,
             }
-            call_claude_messages.side_effect = [
+            call_gemini_messages.side_effect = [
                 {
                     "content": [
                         {
@@ -660,5 +640,5 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["product"]["productId"], 2020)
         self.assertIn("1화는", result["reply"])
-        self.assertEqual(call_claude_messages.await_count, 3)
-        self.assertIn("작품 ID 2020", call_claude_messages.await_args_list[1].kwargs["messages"][-1]["content"])
+        self.assertEqual(call_gemini_messages.await_count, 3)
+        self.assertIn("작품 ID 2020", call_gemini_messages.await_args_list[1].kwargs["messages"][-1]["content"])

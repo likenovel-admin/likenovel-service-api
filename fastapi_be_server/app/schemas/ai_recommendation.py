@@ -220,6 +220,10 @@ class BrowsingContext(BaseModel):
     current_product_id: Optional[int] = Field(default=None)
     current_episode_id: Optional[int] = Field(default=None)
     focus_product_card: bool = Field(default=False)
+    source_action_id: Optional[str] = Field(default=None, max_length=80)
+    source_action_intent: Optional[
+        Literal["explain_match", "explain_entry", "explain_attribute", "recommend_similar"]
+    ] = None
 
     @field_validator("browsed_product_ids")
     @classmethod
@@ -242,6 +246,14 @@ class BrowsingContext(BaseModel):
     @field_validator("pathname")
     @classmethod
     def normalize_pathname(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("source_action_id")
+    @classmethod
+    def normalize_source_action_id(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         normalized = value.strip()

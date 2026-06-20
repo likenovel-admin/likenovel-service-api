@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import datetime
 from decimal import Decimal
@@ -32,6 +33,47 @@ class AiChatServiceUnitTest(unittest.TestCase):
             ai_chat_service._normalize_adult_yn("X")
         self.assertEqual(getattr(exc.exception, "status_code", None), 400)
 
+    def test_sanitize_readonly_sql_requires_public_cardable_product_filters(self):
+        with self.assertRaises(CustomResponseException) as exc:
+            ai_chat_service._sanitize_readonly_sql(
+                "SELECT p.product_id, p.title FROM tb_product p WHERE p.ratings_code = 'all' LIMIT 5",
+                adult_yn="N",
+            )
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("open_yn", exc.exception.message)
+
+        sanitized = ai_chat_service._sanitize_readonly_sql(
+            """
+            SELECT p.product_id, p.title
+            FROM tb_product p
+            WHERE p.ratings_code = 'all'
+              AND p.open_yn = 'Y'
+              AND p.author_name IS NOT NULL
+              AND TRIM(p.author_name) <> ''
+            LIMIT 5
+            """,
+            adult_yn="N",
+        )
+        self.assertIn("p.open_yn = 'Y'", sanitized)
+
+    def test_sanitize_readonly_sql_requires_successful_recommendable_metadata(self):
+        with self.assertRaises(CustomResponseException) as exc:
+            ai_chat_service._sanitize_readonly_sql(
+                """
+                SELECT p.product_id, p.title
+                FROM tb_product p
+                JOIN tb_product_ai_metadata m ON m.product_id = p.product_id
+                WHERE p.ratings_code = 'all'
+                  AND p.open_yn = 'Y'
+                  AND p.author_name IS NOT NULL
+                  AND TRIM(p.author_name) <> ''
+                LIMIT 5
+                """,
+                adult_yn="N",
+            )
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("analysis_status", exc.exception.message)
+
     def test_parse_final_payload_from_json_text(self):
         reply, product_id, mode = ai_chat_service._parse_final_payload(
             '{"reply":"이 작품이 잘 맞아요.","mode":"recommend","product_id":123}'
@@ -45,6 +87,177 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertEqual(reply, "그냥 텍스트 응답")
         self.assertIsNone(product_id)
         self.assertEqual(mode, "no_match")
+
+    def test_build_match_tags_prioritizes_query_visible_evidence(self):
+        tags = ai_chat_service._build_match_tags(
+            {
+                "protagonist_job_tags": ["선생님", "헌터"],
+                "taste_tags": ["아카데미", "전투"],
+            },
+            ["헌터물", "헌터"],
+        )
+
+        self.assertEqual(tags[0], "헌터")
+        self.assertIn("아카데미", tags)
+
+    def test_final_response_tool_schema_limits_suggested_actions_to_three_or_four(self):
+        final_tool = next(
+            tool for tool in ai_chat_service.DATA_AGENT_TOOLS
+            if tool["name"] == ai_chat_service.FINAL_RESPONSE_TOOL_NAME
+        )
+        suggested_actions_schema = final_tool["input_schema"]["properties"]["suggested_actions"]
+
+        self.assertEqual(suggested_actions_schema["minItems"], 3)
+        self.assertEqual(suggested_actions_schema["maxItems"], 4)
+        self.assertEqual(
+            set(suggested_actions_schema["items"]["properties"]["intent"]["enum"]),
+            ai_chat_service.SUGGESTED_ACTION_INTENTS,
+        )
+        self.assertIn("action_id", suggested_actions_schema["items"]["properties"])
+        self.assertIn("priority", suggested_actions_schema["items"]["properties"])
+
+    def test_normalize_suggested_actions_enforces_three_or_four_and_falls_back(self):
+        product = {
+            "title": "추천작",
+            "matchTags": ["헌터", "아카데미"],
+            "tasteTags": ["성장"],
+        }
+        raw_actions = [
+            {
+                "id": "bad-topic",
+                "label": "#없는태그 포인트는?",
+                "user_message": "#없는태그 포인트는?",
+                "intent": "explain_attribute",
+                "topic": "없는태그",
+            },
+            {
+                "id": "duplicate-match",
+                "label": "취향 근거는?",
+                "user_message": "취향 근거는?",
+                "intent": "explain_match",
+            },
+            {
+                "id": "same-intent",
+                "label": "왜 맞나요?",
+                "user_message": "왜 맞나요?",
+                "intent": "explain_match",
+            },
+            {
+                "id": "bad-intent",
+                "label": "아무거나",
+                "user_message": "아무거나",
+                "intent": "open_browser",
+            },
+            {
+                "id": "similar",
+                "label": "비슷한 것도?",
+                "user_message": "비슷한 것도?",
+                "intent": "recommend_similar",
+            },
+        ]
+
+        actions = ai_chat_service._normalize_suggested_actions(product, raw_actions)
+
+        self.assertIn(len(actions), {3, 4})
+        self.assertLess(len(actions), 5)
+        self.assertEqual(len({(item["intent"], item.get("topic", "")) for item in actions}), len(actions))
+        self.assertNotIn("없는태그", [item.get("topic") for item in actions])
+        self.assertEqual(
+            [item["intent"] for item in actions],
+            ["explain_match", "explain_entry", "explain_attribute", "recommend_similar"],
+        )
+        self.assertEqual([item["priority"] for item in actions], [10, 20, 30, 40])
+        self.assertTrue(all(item["id"] and item["actionId"] for item in actions))
+
+    def test_build_page_context_keeps_followup_action_metadata(self):
+        context = asyncio.run(
+            ai_chat_service._build_page_context(
+                {
+                    "source_action_id": "followup-match-1",
+                    "source_action_intent": "explain_match",
+                },
+                AsyncMock(),
+            )
+        )
+
+        self.assertEqual(context["source_action_id"], "followup-match-1")
+        self.assertEqual(context["source_action_intent"], "explain_match")
+
+    def test_normalize_product_reply_blocks_uncarded_candidate_title_and_limits_readability(self):
+        reply = ai_chat_service._normalize_product_reply(
+            raw_reply="'추천작'이 좋습니다. 카드가 없는 작품도 좋아요. 세 번째 문장입니다.",
+            product={"title": "추천작", "matchTags": ["헌터"]},
+            unselected_candidate_titles=["카드가 없는 작품"],
+        )
+
+        self.assertIn("추천작", reply)
+        self.assertIn("헌터", reply)
+        self.assertNotIn("카드가 없는 작품", reply)
+        self.assertLessEqual(len(reply), ai_chat_service.MAX_RECOMMENDATION_REPLY_CHARS)
+
+    def test_normalize_product_reply_compacts_overlong_reply_for_panel_readability(self):
+        reply = ai_chat_service._normalize_product_reply(
+            raw_reply=(
+                "헌터 육성학교를 배경으로 한 아주 긴 설명입니다. "
+                "이 작품은 다음 화로 이어서 보는 비율과 주인공의 목표와 세계관의 상세한 맥락을 모두 길게 풀어내서 "
+                "모바일 말풍선에서 읽기 부담스러운 답변입니다. "
+                "여기에 전투 방식, 학원 배경, 조력자 관계까지 다시 한 번 길게 덧붙입니다."
+            ),
+            product={
+                "title": "요정이야기~규격파괴 사제의 임시동맹~",
+                "matchTags": ["헌터", "선생님", "마법"],
+            },
+        )
+
+        self.assertLessEqual(len(reply), ai_chat_service.MAX_REPLY_CHARS)
+        self.assertIn("헌터", reply)
+        self.assertIn("선생님", reply)
+        self.assertNotIn("요정이야기~규격파괴 사제의 임시동맹~", reply)
+        self.assertIn("\n", reply)
+        self.assertNotIn("읽기 부담스러운", reply)
+
+    def test_normalize_no_match_reply_removes_success_language_without_product(self):
+        reply = ai_chat_service._normalize_no_match_reply("'비공개 후보작'을 추천합니다.")
+
+        self.assertNotIn("비공개 후보작", reply)
+        self.assertNotIn("추천합니다", reply)
+        self.assertIn("작품 카드를 확정하지 못했습니다", reply)
+
+    def test_limit_readable_reply_keeps_two_sentences(self):
+        reply = ai_chat_service._limit_readable_reply("첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다.")
+
+        self.assertEqual(reply, "첫 문장입니다.\n둘째 문장입니다.")
+
+    def test_tool_result_to_gemini_preserves_function_response_id(self):
+        parts = ai_chat_service._internal_user_content_to_gemini_parts(
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-query-1",
+                    "name": "run_readonly_query",
+                    "content": '{"rows":[]}',
+                }
+            ]
+        )
+
+        self.assertEqual(parts[0]["functionResponse"]["id"], "tool-query-1")
+        self.assertEqual(parts[0]["functionResponse"]["name"], "run_readonly_query")
+
+    def test_should_not_reask_explicit_no_match_after_detail_lookup(self):
+        detail_cache = {777: {"product_id": 777, "title": "후보작"}}
+
+        self.assertFalse(
+            ai_chat_service._should_reask_final_with_product_id(
+                final_tool_input={"mode": "no_match", "product_id": None},
+                detail_cache=detail_cache,
+            )
+        )
+        self.assertTrue(
+            ai_chat_service._should_reask_final_with_product_id(
+                final_tool_input={"product_id": None},
+                detail_cache=detail_cache,
+            )
+        )
 
     def test_normalize_messages_defaults_for_browsing_trigger(self):
         normalized = ai_chat_service._normalize_messages([], {"trigger": "browsing"})
@@ -110,7 +323,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         return_value={
                             "content": [
@@ -123,7 +336,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             ]
                         }
                     ),
-                ) as mocked_call_claude,
+                ) as mocked_call_gemini,
                 patch.object(
                     ai_chat_service,
                     "_build_product_and_taste",
@@ -166,7 +379,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     db=AsyncMock(),
                 )
 
-                system_prompt = mocked_call_claude.await_args.kwargs["system_prompt"]
+                system_prompt = mocked_call_gemini.await_args.kwargs["system_prompt"]
                 self.assertIn("현재 페이지 작품 ID: 326", system_prompt)
                 self.assertIn("현재 보고 있던 작품: 퍼펙트 메이지", system_prompt)
                 self.assertEqual(payload["product"]["productId"], 521)
@@ -175,7 +388,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_handle_chat_falls_back_to_gemini_for_current_product_overview_when_claude_fails(self):
+    def test_handle_chat_uses_gemini_fast_path_for_current_product_overview(self):
         async def run():
             with (
                 patch.object(
@@ -198,14 +411,9 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
-                    AsyncMock(
-                        side_effect=CustomResponseException(
-                            status_code=502,
-                            message="AI 서비스 호출에 실패했습니다.",
-                        )
-                    ),
-                ) as mocked_call_claude,
+                    "_call_gemini_messages",
+                    AsyncMock(side_effect=AssertionError("current product overview must use Gemini fast path")),
+                ) as mocked_call_gemini_messages,
                 patch.object(
                     ai_chat_service,
                     "get_product_info",
@@ -227,7 +435,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     ai_chat_service,
                     "_call_gemini_text",
                     AsyncMock(return_value="회귀한 대마법사가 검으로 다시 길을 여는 성장 판타지예요."),
-                ) as mocked_call_gemini,
+                ) as mocked_call_gemini_text,
                 patch.object(
                     ai_chat_service,
                     "_build_product_and_taste",
@@ -259,10 +467,10 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     db=AsyncMock(),
                 )
 
-                mocked_call_claude.assert_awaited_once()
+                mocked_call_gemini_messages.assert_not_awaited()
                 mocked_product_info.assert_awaited_once()
-                mocked_call_gemini.assert_awaited_once()
-                self.assertEqual(payload["providerFallback"], "gemini")
+                mocked_call_gemini_text.assert_awaited_once()
+                self.assertNotIn("providerFallback", payload)
                 self.assertEqual(payload["reply"], "회귀한 대마법사가 검으로 다시 길을 여는 성장 판타지예요.")
                 self.assertEqual(payload["product"]["productId"], 1106)
                 self.assertEqual(payload["product"]["matchReason"], payload["reply"])
@@ -321,6 +529,37 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_gemini_tool_response_preserves_thought_signature(self):
+        internal = ai_chat_service._gemini_response_to_internal(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "functionCall": {
+                                        "name": "get_fact_catalog",
+                                        "args": {},
+                                    },
+                                    "thoughtSignature": "sig-a",
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+
+        contents = ai_chat_service._to_gemini_contents(
+            [{"role": "assistant", "content": internal["content"]}]
+        )
+
+        self.assertEqual(contents[0]["parts"][0]["thoughtSignature"], "sig-a")
+        self.assertEqual(
+            contents[0]["parts"][0]["functionCall"]["name"],
+            "get_fact_catalog",
+        )
+
     def test_extract_final_tool_input(self):
         tool_uses = [
             {"type": "tool_use", "name": "get_fact_catalog", "input": {}},
@@ -352,6 +591,18 @@ class AiChatServiceUnitTest(unittest.TestCase):
             any(table["table"] == "tb_cms_product_evaluation" for table in catalog["tables"])
         )
 
+    def test_build_fact_catalog_guides_public_metadata_wide_search(self):
+        catalog = ai_chat_service._build_fact_catalog()
+        guidance_text = "\n".join(catalog["rules"]["guidance"])
+
+        self.assertIn("p.open_yn = 'Y'", guidance_text)
+        self.assertIn("m.analysis_status = 'success'", guidance_text)
+        self.assertIn("protagonist_job_tags", guidance_text)
+        self.assertIn("protagonist_material_tags", guidance_text)
+        self.assertIn("episode_summary_text", guidance_text)
+        self.assertIn("tb_product_user_keyword.keyword_name", guidance_text)
+        self.assertNotIn("similar_famous를 넓게", guidance_text)
+
     def test_build_data_agent_system_prompt_forbids_generic_reply_and_requires_context_comparison(self):
         prompt = ai_chat_service._build_data_agent_system_prompt(
             adult_yn="N",
@@ -374,15 +625,23 @@ class AiChatServiceUnitTest(unittest.TestCase):
         )
         self.assertIn("빈 답변 금지", prompt)
         self.assertIn("공통점 2개와 차이점 1개", prompt)
-        self.assertIn("get_fact_catalog에 나온 컬럼명만 사용", prompt)
+        self.assertIn("내장 데이터 카탈로그", prompt)
+        self.assertIn('"tb_product_ai_metadata"', prompt)
         self.assertIn("tb_product_episode에서 COUNT(*)", prompt)
         self.assertIn("tb_product에는 premise, hook, reading_rate, evaluation_score, episode_total 컬럼이 없다", prompt)
         self.assertIn("submit_final_recommendation.mode 규칙", prompt)
+        self.assertIn("카드가 없는 다른 후보 작품명은 쓰지 않는다", prompt)
+        self.assertIn("reply는 2문장, 220자 이내", prompt)
+        self.assertIn("suggested_actions를 반드시 3개 또는 4개", prompt)
+        self.assertNotIn("similar_famous를 넓게", prompt)
         self.assertIn("조회 결과에 추천 가능한 후보가 1개라도 있으면 no_match보다 weak_recommend를 우선한다", prompt)
         self.assertIn("질문에 없는 숫자 임계치", prompt)
         self.assertIn("strict AND로 0건을 만들지 않는다", prompt)
         self.assertIn("2/3 이상 맞는 후보를 우선 비교해 weak_recommend", prompt)
         self.assertIn("DB 결과 내부의 상대 비교", prompt)
+        self.assertIn("공개 작품 카드로 보여줄 수 있는 후보만", prompt)
+        self.assertIn("protagonist_job_tags", prompt)
+        self.assertIn("episode_summary_text", prompt)
 
     def test_build_axis_taste_context_uses_factor_scores_and_7_axes(self):
         dna = {
@@ -454,19 +713,9 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ) as mocked_recommend_chat,
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
-                            {
-                                "content": [
-                                    {
-                                        "type": "tool_use",
-                                        "id": "tool-catalog-1",
-                                        "name": "get_fact_catalog",
-                                        "input": {},
-                                    }
-                                ]
-                            },
                             {
                                 "content": [
                                     {
@@ -500,7 +749,6 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_dispatch_tool",
                     AsyncMock(
                         side_effect=[
-                            {"tables": ["tb_product", "tb_product_ai_metadata"]},
                             {
                                 "sql": "SELECT product_id, title FROM tb_product WHERE status_code = 'end' LIMIT 5",
                                 "row_count": 1,
@@ -558,21 +806,17 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 )
 
                 mocked_recommend_chat.assert_not_awaited()
-                self.assertEqual(mocked_dispatch_tool.await_count, 2)
+                self.assertEqual(mocked_dispatch_tool.await_count, 1)
                 self.assertEqual(
                     mocked_dispatch_tool.await_args_list[0].kwargs["tool_name"],
-                    "get_fact_catalog",
-                )
-                self.assertEqual(
-                    mocked_dispatch_tool.await_args_list[1].kwargs["tool_name"],
                     "run_readonly_query",
                 )
-                self.assertEqual(
-                    ai_chat_service._call_claude_messages.await_args_list[0].kwargs["tool_choice"],
-                    {"type": "any"},
+                self.assertNotIn(
+                    "get_fact_catalog",
+                    [tool["name"] for tool in ai_chat_service._call_gemini_messages.await_args_list[0].kwargs["tools"]],
                 )
                 self.assertEqual(
-                    ai_chat_service._call_claude_messages.await_args_list[1].kwargs["tool_choice"],
+                    ai_chat_service._call_gemini_messages.await_args_list[0].kwargs["tool_choice"],
                     {"type": "any"},
                 )
                 self.assertEqual(payload["product"]["productId"], 888)
@@ -614,7 +858,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {
@@ -673,7 +917,8 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
                 self.assertIsNone(payload["product"])
                 self.assertIsNone(build_product_and_taste.await_args.kwargs["selected_product_id"])
-                self.assertEqual(payload["reply"], "후보를 찾았습니다.")
+                self.assertIn("작품 카드를 확정하지 못했습니다", payload["reply"])
+                self.assertNotIn("후보를 찾았습니다", payload["reply"])
 
         import asyncio
 
@@ -704,7 +949,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
@@ -731,7 +976,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             },
                         ]
                     ),
-                ) as mocked_call_claude,
+                ) as mocked_call_gemini,
                 patch.object(
                     ai_chat_service,
                     "_dispatch_tool",
@@ -769,16 +1014,383 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
                 self.assertEqual(payload["product"]["productId"], 777)
                 self.assertEqual(payload["reply"], "후보작을 추천합니다.")
-                self.assertEqual(mocked_call_claude.await_count, 4)
-                self.assertEqual(mocked_call_claude.await_args_list[2].kwargs["tool_choice"], {"type": "any"})
+                self.assertEqual(mocked_call_gemini.await_count, 4)
+                self.assertEqual(mocked_call_gemini.await_args_list[2].kwargs["tool_choice"], {"type": "any"})
                 self.assertEqual(
-                    sorted(tool["name"] for tool in mocked_call_claude.await_args_list[2].kwargs["tools"]),
+                    sorted(tool["name"] for tool in mocked_call_gemini.await_args_list[2].kwargs["tools"]),
                     ["get_product_info", ai_chat_service.FINAL_RESPONSE_TOOL_NAME],
                 )
                 self.assertIn(
                     "후보 작품 ID [777] 중 가장 가까운 작품을 확인하려면 get_product_info(product_id=...)를 먼저 호출한 뒤 recommend 또는 weak_recommend로 submit_final_recommendation을 제출하세요.",
-                    mocked_call_claude.await_args_list[2].kwargs["messages"][-1]["content"],
+                    mocked_call_gemini.await_args_list[2].kwargs["messages"][-1]["content"],
                 )
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_dispatch_readonly_query_attaches_candidate_details_for_model_selection(self):
+        async def run():
+            with (
+                patch.object(
+                    ai_chat_service,
+                    "_run_readonly_query",
+                    AsyncMock(
+                        return_value={
+                            "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
+                            "row_count": 1,
+                            "rows": [{"product_id": 777, "title": "후보작"}],
+                        }
+                    ),
+                ) as run_query,
+                patch.object(
+                    ai_chat_service,
+                    "get_product_info",
+                    AsyncMock(
+                        return_value={
+                            "product_id": 777,
+                            "title": "후보작",
+                            "author_name": "작가A",
+                            "status_code": "ongoing",
+                            "monopoly_yn": "Y",
+                            "contract_yn": "Y",
+                            "episode_total": 80,
+                            "new_release_yn": "Y",
+                            "waiting_for_free_yn": "Y",
+                            "six_nine_path_yn": "N",
+                            "primary_genre": "현대판타지",
+                            "sub_genre": "미스터리",
+                            "premise": "사건을 추적하는 성장형 주인공",
+                            "hook": "초반 단서 회수가 빠르게 이어진다",
+                            "episode_summary_text": "사건의 단서를 따라가며 세계관이 열린다",
+                            "taste_tags": ["성장형", "미스터리"],
+                            "worldview_tags": ["현대"],
+                            "protagonist_type_tags": ["성장형"],
+                            "protagonist_job_tags": ["탐정"],
+                            "axis_style_tags": ["미스터리"],
+                        }
+                    ),
+                ) as get_product_info,
+            ):
+                result = await ai_chat_service._dispatch_tool(
+                    db=AsyncMock(),
+                    tool_name="run_readonly_query",
+                    tool_input={"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"},
+                    exclude_ids=[],
+                    adult_yn="N",
+                )
+
+            run_query.assert_awaited_once()
+            get_product_info.assert_awaited_once()
+            self.assertEqual(result["candidate_details"][0]["product_id"], 777)
+            self.assertEqual(result["candidate_details"][0]["premise"], "사건을 추적하는 성장형 주인공")
+            self.assertEqual(result["candidate_details"][0]["monopoly_yn"], "Y")
+            self.assertEqual(result["candidate_details"][0]["new_release_yn"], "Y")
+            self.assertEqual(result["candidate_details"][0]["waiting_for_free_yn"], "Y")
+            self.assertIn("모델이 선택", result["candidate_detail_policy"])
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_dispatch_readonly_query_filters_uncardable_rows_and_continues(self):
+        async def run():
+            with (
+                patch.object(
+                    ai_chat_service,
+                    "_run_readonly_query",
+                    AsyncMock(
+                        return_value={
+                            "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
+                            "row_count": 3,
+                            "rows": [
+                                {"product_id": 315, "title": "숨긴 후보"},
+                                {"product_id": 777, "title": "공개 후보"},
+                                {"product_id": 888, "title": "두번째 공개 후보"},
+                            ],
+                        }
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "get_product_info",
+                    AsyncMock(
+                        side_effect=[
+                            CustomResponseException(status_code=404, message="작품 정보를 찾을 수 없습니다."),
+                            {"product_id": 777, "title": "공개 후보", "author_name": "작가A"},
+                            {"product_id": 888, "title": "두번째 공개 후보", "author_name": "작가B"},
+                        ]
+                    ),
+                ) as get_product_info,
+            ):
+                result = await ai_chat_service._dispatch_tool(
+                    db=AsyncMock(),
+                    tool_name="run_readonly_query",
+                    tool_input={"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"},
+                    exclude_ids=[],
+                    adult_yn="N",
+                )
+
+            self.assertEqual(get_product_info.await_count, 3)
+            self.assertEqual([row["product_id"] for row in result["rows"]], [777, 888])
+            self.assertEqual(result["row_count"], 2)
+            self.assertEqual(result["candidate_product_ids"], [777, 888])
+            self.assertEqual([item["product_id"] for item in result["candidate_details"]], [777, 888])
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_dispatch_readonly_query_returns_empty_candidates_when_all_rows_uncardable(self):
+        async def run():
+            with (
+                patch.object(
+                    ai_chat_service,
+                    "_run_readonly_query",
+                    AsyncMock(
+                        return_value={
+                            "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
+                            "row_count": 1,
+                            "rows": [{"product_id": 315, "title": "숨긴 후보"}],
+                        }
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "get_product_info",
+                    AsyncMock(
+                        side_effect=[
+                            CustomResponseException(status_code=404, message="작품 정보를 찾을 수 없습니다."),
+                        ]
+                    ),
+                ),
+            ):
+                result = await ai_chat_service._dispatch_tool(
+                    db=AsyncMock(),
+                    tool_name="run_readonly_query",
+                    tool_input={"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"},
+                    exclude_ids=[],
+                    adult_yn="N",
+                )
+
+            self.assertEqual(result["rows"], [])
+            self.assertEqual(result["row_count"], 0)
+            self.assertEqual(result["candidate_product_ids"], [])
+            self.assertEqual(result["candidate_details"], [])
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_handle_chat_uses_query_candidate_details_without_extra_detail_roundtrip(self):
+        async def run():
+            build_product_and_taste = AsyncMock(
+                return_value=(
+                    {"productId": 777, "title": "후보작"},
+                    {"protagonist": 0.2, "mood": 0.1, "pacing": 0.0},
+                )
+            )
+            with (
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "_get_user_id_by_kc",
+                    AsyncMock(return_value=1),
+                ),
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "get_user_taste_profile",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_reader_context",
+                    AsyncMock(return_value={"taste_summary": None, "top_factors": [], "recent_reads": [], "read_product_ids": [], "factor_scores": {}}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_page_context",
+                    AsyncMock(return_value={"page_type": "home", "pathname": "/"}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_call_gemini_messages",
+                    AsyncMock(
+                        side_effect=[
+                            {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "tool-final-1",
+                                        "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                                        "input": {"reply": "후보작을 추천합니다.", "product_id": None},
+                                    }
+                                ]
+                            },
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "tool-final-2",
+                                        "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                                        "input": {"reply": "후보작을 추천합니다.", "product_id": 777},
+                                    }
+                                ]
+                            },
+                        ]
+                    ),
+                ) as mocked_call_gemini,
+                patch.object(
+                    ai_chat_service,
+                    "_dispatch_tool",
+                    AsyncMock(
+                        return_value={
+                            "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
+                            "row_count": 1,
+                            "rows": [{"product_id": 777, "title": "후보작"}],
+                            "candidate_details": [
+                                {
+                                    "product_id": 777,
+                                    "title": "후보작",
+                                    "premise": "사건을 추적하는 성장형 주인공",
+                                    "hook": "초반 단서 회수가 빠르게 이어진다",
+                                }
+                            ],
+                        }
+                    ),
+                ),
+                patch.object(ai_chat_service, "_build_product_and_taste", build_product_and_taste),
+            ):
+                payload = await ai_chat_service.handle_chat(
+                    kc_user_id="kc-user",
+                    messages=[{"role": "user", "content": "현대 미스터리 작품 추천해줘"}],
+                    context={"page_type": "home"},
+                    preset=None,
+                    exclude_ids=[],
+                    adult_yn="N",
+                    db=AsyncMock(),
+                )
+
+            self.assertEqual(payload["product"]["productId"], 777)
+            self.assertEqual(mocked_call_gemini.await_count, 3)
+            self.assertEqual(
+                [tool["name"] for tool in mocked_call_gemini.await_args_list[-1].kwargs["tools"]],
+                [ai_chat_service.FINAL_RESPONSE_TOOL_NAME],
+            )
+            self.assertIn(
+                "이미 get_product_info로 확인한 작품이 있습니다.",
+                mocked_call_gemini.await_args_list[-1].kwargs["messages"][-1]["content"],
+            )
+            self.assertEqual(
+                build_product_and_taste.await_args.kwargs["prefetched_product_info"]["product_id"],
+                777,
+            )
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_handle_chat_reasks_when_final_product_is_outside_candidates(self):
+        async def run():
+            with (
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "_get_user_id_by_kc",
+                    AsyncMock(return_value=1),
+                ),
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "get_user_taste_profile",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_reader_context",
+                    AsyncMock(return_value={"taste_summary": None, "top_factors": [], "recent_reads": [], "read_product_ids": [], "factor_scores": {}}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_page_context",
+                    AsyncMock(return_value={"page_type": "home", "pathname": "/"}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_call_gemini_messages",
+                    AsyncMock(
+                        side_effect=[
+                            {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "tool-final-1",
+                                        "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                                        "input": {"reply": "후보 밖 작품을 추천합니다.", "product_id": 999},
+                                    }
+                                ]
+                            },
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "tool-final-2",
+                                        "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                                        "input": {"reply": "후보 안 작품을 추천합니다.", "product_id": 777},
+                                    }
+                                ]
+                            },
+                        ]
+                    ),
+                ) as mocked_call_gemini,
+                patch.object(
+                    ai_chat_service,
+                    "_dispatch_tool",
+                    AsyncMock(return_value={"rows": [{"product_id": 777, "title": "후보작"}]}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_product_and_taste",
+                    AsyncMock(
+                        return_value=(
+                            {
+                                "productId": 777,
+                                "title": "후보작",
+                                "coverUrl": None,
+                                "authorNickname": "작가B",
+                                "episodeCount": 33,
+                                "matchReason": "",
+                                "tasteTags": [],
+                                "serialCycle": None,
+                                "priceType": "free",
+                                "ongoingState": "serial",
+                                "monopolyYn": "N",
+                                "lastEpisodeDate": None,
+                                "newReleaseYn": "N",
+                                "cpContractYn": "N",
+                                "waitingForFreeYn": "N",
+                                "sixNinePathYn": "N",
+                            },
+                            {"protagonist": 0.3, "mood": 0.2, "pacing": 0.0},
+                        )
+                    ),
+                ) as mocked_build_product_and_taste,
+            ):
+                payload = await ai_chat_service.handle_chat(
+                    kc_user_id="kc-user",
+                    messages=[{"role": "user", "content": "현대 미스터리 작품 추천해줘"}],
+                    context={"page_type": "home"},
+                    preset=None,
+                    exclude_ids=[],
+                    adult_yn="N",
+                    db=AsyncMock(),
+                )
+
+            self.assertEqual(payload["product"]["productId"], 777)
+            self.assertEqual(mocked_build_product_and_taste.await_args.kwargs["selected_product_id"], 777)
+            self.assertIn(
+                "제출한 product_id 999는 확보한 후보 목록 [777]에 없습니다.",
+                mocked_call_gemini.await_args_list[2].kwargs["messages"][-1]["content"],
+            )
 
         import asyncio
 
@@ -809,7 +1421,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {
@@ -834,7 +1446,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             },
                         ]
                     ),
-                ) as mocked_call_claude,
+                ) as mocked_call_gemini,
                 patch.object(
                     ai_chat_service,
                     "_build_product_and_taste",
@@ -858,19 +1470,91 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
                 self.assertEqual(payload["product"]["productId"], 555)
                 self.assertEqual(payload["finalMode"], "weak_recommend")
-                self.assertEqual(mocked_call_claude.await_count, 2)
+                self.assertEqual(mocked_call_gemini.await_count, 2)
                 self.assertEqual(
-                    mocked_call_claude.await_args_list[1].kwargs["tool_choice"],
+                    mocked_call_gemini.await_args_list[1].kwargs["tool_choice"],
                     {"type": "any"},
                 )
                 self.assertEqual(
-                    [tool["name"] for tool in mocked_call_claude.await_args_list[1].kwargs["tools"]],
+                    [tool["name"] for tool in mocked_call_gemini.await_args_list[1].kwargs["tools"]],
                     [ai_chat_service.FINAL_RESPONSE_TOOL_NAME],
                 )
                 self.assertEqual(
-                    mocked_call_claude.await_args_list[1].kwargs["messages"][-1]["content"],
+                    mocked_call_gemini.await_args_list[1].kwargs["messages"][-1]["content"],
                     "추가 조회는 허용되지 않습니다. submit_final_recommendation 계약이 잘못됐습니다. recommend/weak_recommend면 product_id를 반드시 넣고, no_match면 product_id를 null로 제출하세요. 지금까지 확보한 조회 결과만 근거로 반드시 submit_final_recommendation을 호출하세요.",
                 )
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_handle_chat_does_not_return_recommend_mode_without_product_card(self):
+        async def run():
+            with (
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "_get_user_id_by_kc",
+                    AsyncMock(return_value=1),
+                ),
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "get_user_taste_profile",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_reader_context",
+                    AsyncMock(return_value={"taste_summary": None, "top_factors": [], "recent_reads": [], "read_product_ids": [], "factor_scores": {}}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_page_context",
+                    AsyncMock(return_value={"page_type": "home", "pathname": "/"}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_call_gemini_messages",
+                    AsyncMock(
+                        return_value={
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-final-1",
+                                    "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                                    "input": {
+                                        "reply": "비공개 후보작을 추천합니다.",
+                                        "mode": "recommend",
+                                        "product_id": 315,
+                                    },
+                                }
+                            ]
+                        }
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_product_and_taste",
+                    AsyncMock(
+                        return_value=(
+                            None,
+                            {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
+                        )
+                    ),
+                ),
+            ):
+                payload = await ai_chat_service.handle_chat(
+                    kc_user_id="kc-user",
+                    messages=[{"role": "user", "content": "헌터물 추천해줘"}],
+                    context={"page_type": "home"},
+                    preset=None,
+                    exclude_ids=[],
+                    adult_yn="N",
+                    db=AsyncMock(),
+                )
+
+                self.assertIsNone(payload["product"])
+                self.assertEqual(payload["finalMode"], "no_match")
+                self.assertNotIn("비공개 후보작", payload["reply"])
 
         import asyncio
 
@@ -901,7 +1585,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
@@ -928,7 +1612,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             },
                         ]
                     ),
-                ) as mocked_call_claude,
+                ) as mocked_call_gemini,
                 patch.object(
                     ai_chat_service,
                     "_dispatch_tool",
@@ -966,9 +1650,9 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
                 self.assertEqual(payload["product"]["productId"], 321)
                 self.assertEqual(payload["reply"], "후보작을 추천합니다.")
-                self.assertEqual(mocked_call_claude.await_count, 4)
+                self.assertEqual(mocked_call_gemini.await_count, 4)
                 self.assertEqual(
-                    mocked_call_claude.await_args_list[-1].kwargs["tool_choice"],
+                    mocked_call_gemini.await_args_list[-1].kwargs["tool_choice"],
                     {"type": "tool", "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME},
                 )
 
@@ -1001,7 +1685,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {
@@ -1085,7 +1769,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
@@ -1206,7 +1890,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
@@ -1224,7 +1908,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             },
                         ]
                     ),
-                ) as mocked_call_claude,
+                ) as mocked_call_gemini,
                 patch.object(
                     ai_chat_service,
                     "_dispatch_tool",
@@ -1251,9 +1935,67 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 self.assertEqual(payload["product"]["productId"], 909)
                 self.assertIn("루프 종결작", payload["reply"])
                 self.assertEqual(
-                    mocked_call_claude.await_args_list[-1].kwargs["tool_choice"],
+                    mocked_call_gemini.await_args_list[-1].kwargs["tool_choice"],
                     {"type": "tool", "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME},
                 )
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_handle_chat_does_not_fallback_to_first_query_row_when_forced_finalize_has_no_tool(self):
+        async def run():
+            with (
+                patch.object(ai_chat_service, "MAX_TOOL_ROUNDS", 1),
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "_get_user_id_by_kc",
+                    AsyncMock(return_value=1),
+                ),
+                patch.object(
+                    ai_chat_service.recommendation_service,
+                    "get_user_taste_profile",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_reader_context",
+                    AsyncMock(return_value={"taste_summary": None, "top_factors": [], "recent_reads": [], "read_product_ids": [], "factor_scores": {}}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_page_context",
+                    AsyncMock(return_value={"page_type": "home", "pathname": "/"}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_call_gemini_messages",
+                    AsyncMock(
+                        side_effect=[
+                            {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
+                            {"content": [{"type": "text", "text": "후보를 확정하지 못했습니다."}]},
+                        ]
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_dispatch_tool",
+                    AsyncMock(return_value={"rows": [{"product_id": 909, "title": "첫 후보"}]}),
+                ),
+                patch.object(ai_chat_service, "_build_product_and_taste", AsyncMock()) as mocked_build_product_and_taste,
+            ):
+                payload = await ai_chat_service.handle_chat(
+                    kc_user_id="kc-user",
+                    messages=[{"role": "user", "content": "현대 미스터리 작품 추천해줘"}],
+                    context={"page_type": "home"},
+                    preset=None,
+                    exclude_ids=[],
+                    adult_yn="N",
+                    db=AsyncMock(),
+                )
+
+            self.assertIsNone(payload["product"])
+            mocked_build_product_and_taste.assert_not_awaited()
 
         import asyncio
 
@@ -1284,7 +2026,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
-                    "_call_claude_messages",
+                    "_call_gemini_messages",
                     AsyncMock(
                         side_effect=[
                             {"content": [{"type": "tool_use", "id": "tool-query-1", "name": "run_readonly_query", "input": {"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"}}]},
@@ -1315,7 +2057,12 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 patch.object(
                     ai_chat_service,
                     "_build_product_and_taste",
-                    AsyncMock(return_value=(None, {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0})),
+                    AsyncMock(
+                        return_value=(
+                            {"productId": 321, "title": "후보작"},
+                            {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
+                        )
+                    ),
                 ) as mocked_build_product_and_taste,
             ):
                 await ai_chat_service.handle_chat(
@@ -1338,19 +2085,30 @@ class AiChatServiceUnitTest(unittest.TestCase):
         asyncio.run(run())
 
     def test_sanitize_readonly_sql_allows_order_by_desc(self):
-        sql = "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' ORDER BY product_id DESC LIMIT 10"
+        sql = (
+            "SELECT product_id, title FROM tb_product "
+            "WHERE ratings_code = 'all' "
+            "AND open_yn = 'Y' "
+            "AND author_name IS NOT NULL "
+            "AND TRIM(author_name) <> '' "
+            "ORDER BY product_id DESC LIMIT 10"
+        )
         normalized = ai_chat_service._sanitize_readonly_sql(sql, adult_yn="N")
         self.assertEqual(normalized, sql)
 
     def test_sanitize_readonly_sql_normalizes_nulls_last_for_mysql(self):
         sql = (
             "SELECT product_id, title FROM tb_product "
-            "WHERE ratings_code = 'all' ORDER BY count_hit DESC NULLS LAST LIMIT 10"
+            "WHERE ratings_code = 'all' "
+            "AND open_yn = 'Y' "
+            "AND author_name IS NOT NULL "
+            "AND TRIM(author_name) <> '' "
+            "ORDER BY count_hit DESC NULLS LAST LIMIT 10"
         )
         normalized = ai_chat_service._sanitize_readonly_sql(sql, adult_yn="N")
         self.assertEqual(
             normalized,
-            "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' ORDER BY count_hit DESC LIMIT 10",
+            "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' AND open_yn = 'Y' AND author_name IS NOT NULL AND TRIM(author_name) <> '' ORDER BY count_hit DESC LIMIT 10",
         )
 
     def test_sanitize_readonly_sql_blocks_server_variables_and_file_functions(self):
@@ -1369,7 +2127,11 @@ class AiChatServiceUnitTest(unittest.TestCase):
     def test_sanitize_readonly_sql_normalizes_status_code_alias_eq(self):
         sql = (
             "SELECT product_id, title FROM tb_product "
-            "WHERE ratings_code = 'all' AND status_code = 'completed' LIMIT 5"
+            "WHERE ratings_code = 'all' "
+            "AND open_yn = 'Y' "
+            "AND author_name IS NOT NULL "
+            "AND TRIM(author_name) <> '' "
+            "AND status_code = 'completed' LIMIT 5"
         )
         normalized = ai_chat_service._sanitize_readonly_sql(sql, adult_yn="N")
         self.assertIn("status_code = 'end'", normalized)
@@ -1377,7 +2139,11 @@ class AiChatServiceUnitTest(unittest.TestCase):
     def test_sanitize_readonly_sql_normalizes_status_code_alias_in(self):
         sql = (
             "SELECT product_id, title FROM tb_product "
-            "WHERE ratings_code = 'all' AND status_code IN ('serial', 'paused', 'end') LIMIT 5"
+            "WHERE ratings_code = 'all' "
+            "AND open_yn = 'Y' "
+            "AND author_name IS NOT NULL "
+            "AND TRIM(author_name) <> '' "
+            "AND status_code IN ('serial', 'paused', 'end') LIMIT 5"
         )
         normalized = ai_chat_service._sanitize_readonly_sql(sql, adult_yn="N")
         self.assertIn("status_code IN ('ongoing', 'rest', 'end')", normalized)
@@ -1397,7 +2163,13 @@ class AiChatServiceUnitTest(unittest.TestCase):
             "SELECT p.product_id, p.title, pam.premise "
             "FROM tb_product p "
             "JOIN tb_product_ai_metadata pam ON pam.product_id = p.product_id "
-            "WHERE p.ratings_code = 'all' LIMIT 5"
+            "WHERE p.ratings_code = 'all' "
+            "AND p.open_yn = 'Y' "
+            "AND p.author_name IS NOT NULL "
+            "AND TRIM(p.author_name) <> '' "
+            "AND pam.analysis_status = 'success' "
+            "AND COALESCE(pam.exclude_from_recommend_yn, 'N') = 'N' "
+            "LIMIT 5"
         )
         normalized = ai_chat_service._sanitize_readonly_sql(sql, adult_yn="N")
         self.assertIn("pam.premise", normalized)
@@ -1529,6 +2301,66 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     adult_yn="N",
                 )
             self.assertEqual(exc.exception.status_code, 400)
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_run_readonly_query_broadens_empty_metadata_keyword_search(self):
+        class FakeResult:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def mappings(self):
+                return self
+
+            def all(self):
+                return self._rows
+
+        async def run():
+            db = AsyncMock()
+            db.execute.side_effect = [
+                FakeResult([]),
+                FakeResult(
+                    [
+                        {
+                            "product_id": 2020,
+                            "title": "이종족 일꾼 테이밍 dev개행정합성0424",
+                            "protagonist_job_tags": '["헌터", "조련사"]',
+                            "relevance_score": 6,
+                        }
+                    ]
+                ),
+            ]
+
+            result = await ai_chat_service._run_readonly_query(
+                db,
+                """
+                SELECT p.product_id, p.title
+                FROM tb_product p
+                JOIN tb_product_ai_metadata m ON p.product_id = m.product_id
+                WHERE p.open_yn = 'Y'
+                  AND p.author_name IS NOT NULL
+                  AND TRIM(p.author_name) <> ''
+                  AND p.ratings_code = 'all'
+                  AND m.analysis_status = 'success'
+                  AND COALESCE(m.exclude_from_recommend_yn, 'N') = 'N'
+                  AND (p.title LIKE '%헌터%' OR m.taste_tags LIKE '%헌터%' OR m.worldview_tags LIKE '%헌터%')
+                ORDER BY p.product_id DESC
+                LIMIT 5
+                """,
+                adult_yn="N",
+            )
+
+            self.assertEqual(db.execute.await_count, 2)
+            fallback_sql = str(db.execute.await_args_list[1].args[0])
+            self.assertIn("m.protagonist_job_tags", fallback_sql)
+            self.assertIn("m.protagonist_material_tags", fallback_sql)
+            self.assertIn("m.episode_summary_text", fallback_sql)
+            self.assertEqual(result["row_count"], 1)
+            self.assertTrue(result["metadata_keyword_fallback"])
+            self.assertEqual(result["metadata_keyword_terms"], ["헌터"])
+            self.assertEqual(result["rows"][0]["product_id"], 2020)
 
         import asyncio
 
