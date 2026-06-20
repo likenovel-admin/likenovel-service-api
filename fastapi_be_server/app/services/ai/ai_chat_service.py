@@ -34,7 +34,6 @@ MAX_QUERY_CANDIDATE_DETAILS = 3
 MAX_QUERY_CANDIDATE_SCAN = 10
 MAX_REPLY_SENTENCES = 2
 MAX_REPLY_CHARS = 220
-MAX_RECOMMENDATION_REPLY_CHARS = 140
 MAX_MATCH_TAGS = 5
 MAX_CONVERSATION_MEMORY_MESSAGES = 10
 MAX_CONVERSATION_MEMORY_LINE_CHARS = 140
@@ -220,6 +219,17 @@ BROAD_RECOMMENDATION_KEYWORD_HINTS = (
     "회귀",
     "빙의",
 )
+EXPLICIT_GENRE_ALIASES = {
+    "현대판타지": ("현대판타지",),
+    "다크 판타지": ("다크 판타지",),
+    "판타지": ("판타지", "현대판타지", "다크 판타지", "로맨스판타지"),
+    "무협": ("무협",),
+    "로맨스판타지": ("로맨스판타지",),
+    "로판": ("로맨스판타지",),
+    "로맨스": ("로맨스", "로맨스판타지"),
+    "미스터리": ("미스터리",),
+    "공포": ("공포",),
+}
 AI_LIBRARIAN_SERVICE_CONTEXT_LINES = (
     "라이크노벨은 회차 단위로 연재되고 유료/무료 회차가 나뉘는 웹소설·웹소챗 서비스다.",
     "답변과 후속질문은 출판 분류어보다 작품/회차/완결/연재중/무료/유료 같은 서비스 언어로 쓴다.",
@@ -531,7 +541,7 @@ def _extract_required_status_codes(text: str) -> set[str]:
 
 def _extract_episode_total_constraint(text: str) -> dict[str, Any] | None:
     raw_text = str(text or "")
-    if re.search(r"초\s*단편|단편|짧은\s*(작품|소설|웹소설)", raw_text):
+    if re.search(r"초\s*단편|단편\s*(?:소설|작품|웹소설|추천|으로|도|만|위주|찾|보|볼|골라|$)|짧은\s*(작품|소설|웹소설)", raw_text):
         return {"op": "<=", "value": 5, "source": "short_work_alias"}
     if re.search(r"장편|긴\s*(작품|소설|웹소설)", raw_text):
         return {"op": ">=", "value": 100, "source": "long_work_alias"}
@@ -545,8 +555,12 @@ def _extract_episode_total_constraint(text: str) -> dict[str, Any] | None:
         if episode_count <= 0:
             continue
         operator_word = match.group(2)
-        if operator_word in {"이상", "넘게", "넘는", "초과"}:
+        if operator_word == "초과":
+            return {"op": ">", "value": episode_count, "source": "explicit"}
+        if operator_word in {"이상", "넘게", "넘는"}:
             return {"op": ">=", "value": episode_count, "source": "explicit"}
+        if operator_word == "미만":
+            return {"op": "<", "value": episode_count, "source": "explicit"}
         return {"op": "<=", "value": episode_count, "source": "explicit"}
 
     if any(keyword in normalized for keyword in ["5화 이하 작품", "짧은 작품", "짧은 웹소설"]):
@@ -567,6 +581,95 @@ def _extract_price_type_constraints(text: str) -> list[str]:
     return []
 
 
+def _extract_genre_constraints(text: str) -> list[str]:
+    normalized = str(text or "").strip()
+    genres: list[str] = []
+    for alias, allowed_genres in EXPLICIT_GENRE_ALIASES.items():
+        if alias not in normalized:
+            continue
+        for genre in allowed_genres:
+            if genre not in genres:
+                genres.append(genre)
+    return genres
+
+
+EPISODE_CONSTRAINT_CLEAR_PATTERNS = [
+    r"(?:완결\s*/\s*)?\d{1,4}\s*화\s*이하\s*조건(?:은|을)?\s*(?:빼고|빼줘|빼\s*주세요|제외하고|제외해|풀고|풀어)",
+    r"(?:짧은\s*작품|회차\s*수|회차수|회차|분량)\s*조건(?:은|을)?\s*(?:빼고|빼줘|빼\s*주세요|제외하고|제외해|풀고|풀어)",
+    r"(?:회차\s*수|회차수|회차|분량)\s*(?:제한\s*)?(?:없이|상관\s*없)",
+]
+
+STATUS_CONSTRAINT_CLEAR_PATTERNS = [
+    r"(?:완결|연재\s*중|연재중|휴재|상태|작품\s*상태)\s*조건(?:은|을)?\s*(?:빼고|빼줘|빼\s*주세요|제외하고|제외해|풀고|풀어|없이)",
+    r"(?:완결|연재\s*중|연재중|휴재)\s*(?:아니어도|작품도\s*포함|도\s*포함)",
+    r"(?:연재작|연재\s*중|연재중)\s*도\s*(?:포함|봐|추천)",
+    r"완결\s*/\s*\d{1,4}\s*화\s*이하\s*조건(?:은|을)?\s*(?:빼고|빼줘|빼\s*주세요|제외하고|제외해|풀고|풀어)",
+]
+
+FULL_CONSTRAINT_RESET_PATTERNS = [
+    r"아무\s*조건\s*없이",
+    r"조건\s*(?:없이|전부\s*초기화|다\s*초기화|초기화)",
+    r"(?:처음부터|새로)\s*(?:다시\s*)?(?:추천|찾아줘|골라줘)",
+]
+
+
+def _matches_any_pattern(text: str, patterns: list[str]) -> bool:
+    normalized = _rewrite_episode_length_terms_for_service(text)
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _remove_patterns(text: str, patterns: list[str]) -> str:
+    normalized = _rewrite_episode_length_terms_for_service(text)
+    for pattern in patterns:
+        normalized = re.sub(pattern, " ", normalized)
+    return re.sub(r"\s{2,}", " ", normalized).strip()
+
+
+def _should_clear_episode_total_constraint(text: str) -> bool:
+    return _matches_any_pattern(text, EPISODE_CONSTRAINT_CLEAR_PATTERNS)
+
+
+def _should_clear_status_constraint(text: str) -> bool:
+    return _matches_any_pattern(text, STATUS_CONSTRAINT_CLEAR_PATTERNS)
+
+
+def _remove_episode_total_clear_phrases(text: str) -> str:
+    return _remove_patterns(text, EPISODE_CONSTRAINT_CLEAR_PATTERNS)
+
+
+def _remove_status_clear_phrases(text: str) -> str:
+    return _remove_patterns(text, STATUS_CONSTRAINT_CLEAR_PATTERNS)
+
+
+def _should_force_reset_hard_constraints(text: str) -> bool:
+    return _matches_any_pattern(text, FULL_CONSTRAINT_RESET_PATTERNS)
+
+
+def _should_reset_hard_constraints_for_new_recommendation(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if _should_force_reset_hard_constraints(normalized):
+        return True
+    if not _is_new_recommendation_request(normalized):
+        return False
+    contextual_patterns = [
+        r"그거",
+        r"그런\s*작품",
+        r"비슷",
+        r"방금",
+        r"같은\s*조건",
+        r"조건\s*유지",
+        r"유지하고",
+        r"말고",
+        r"빼고",
+        r"제외하고",
+        r"풀어",
+        r"좁혀",
+        r"넓혀",
+        r"이어서",
+    ]
+    return not any(re.search(pattern, normalized) for pattern in contextual_patterns)
+
+
 def _build_exploration_state(messages: list[dict] | None, context: dict | None = None) -> dict[str, Any]:
     state: dict[str, Any] = {
         "hard": {},
@@ -584,16 +687,26 @@ def _build_exploration_state(messages: list[dict] | None, context: dict | None =
             continue
         normalized_text = _rewrite_episode_length_terms_for_service(raw_text)
 
-        if any(keyword in raw_text for keyword in ["회차수는 풀어", "회차 수는 풀어", "분량은 풀어", "몇 화인지는 상관"]):
+        if _should_reset_hard_constraints_for_new_recommendation(raw_text):
+            state["hard"].clear()
+            state["weak"].clear()
+            state["negative"].clear()
+            soft_keywords.clear()
+
+        clear_episode_constraint = _should_clear_episode_total_constraint(raw_text)
+        if clear_episode_constraint:
             state["hard"].pop("episode_total", None)
-        episode_constraint = _extract_episode_total_constraint(raw_text)
+        episode_text = _remove_episode_total_clear_phrases(raw_text) if clear_episode_constraint else raw_text
+        episode_constraint = _extract_episode_total_constraint(episode_text)
         if episode_constraint:
             state["hard"]["episode_total"] = episode_constraint
 
-        if any(keyword in raw_text for keyword in ["상태는 상관", "연재작도", "연재중도 포함", "완결 아니어도"]):
+        clear_status_constraint = _should_clear_status_constraint(raw_text)
+        if clear_status_constraint:
             state["hard"].pop("status_codes", None)
             state["negative"].pop("status_codes", None)
-        status_codes = _extract_required_status_codes(raw_text)
+        status_text = _remove_status_clear_phrases(raw_text) if clear_status_constraint else raw_text
+        status_codes = _extract_required_status_codes(status_text)
         if status_codes:
             state["hard"]["status_codes"] = sorted(status_codes)
         if any(keyword in raw_text for keyword in ["비완결 싫", "연재중 싫", "완결만"]):
@@ -603,6 +716,9 @@ def _build_exploration_state(messages: list[dict] | None, context: dict | None =
         price_types = _extract_price_type_constraints(raw_text)
         if price_types:
             state["hard"]["price_types"] = price_types
+        genres = _extract_genre_constraints(raw_text)
+        if genres:
+            state["hard"]["genres"] = genres
 
         if any(keyword in raw_text for keyword in ["초반 진입", "진입 쉬", "시작하기 쉬"]):
             state["weak"]["entry_easy"] = True
@@ -671,6 +787,31 @@ def _candidate_price_type(candidate: dict[str, Any] | None) -> str:
     return str(candidate.get("priceType") or candidate.get("price_type") or "").strip().lower()
 
 
+def _candidate_genres(candidate: dict[str, Any] | None) -> set[str]:
+    if not isinstance(candidate, dict):
+        return set()
+    raw_values = [
+        candidate.get("primaryGenre"),
+        candidate.get("subGenre"),
+        candidate.get("primary_genre"),
+        candidate.get("sub_genre"),
+    ]
+    return {
+        str(value).strip()
+        for value in raw_values
+        if str(value or "").strip()
+    }
+
+
+def _candidate_matches_genre_constraint(candidate: dict[str, Any] | None, genres: set[str]) -> bool:
+    if not genres:
+        return True
+    candidate_genres = _candidate_genres(candidate)
+    if not candidate_genres:
+        return False
+    return bool(candidate_genres.intersection(genres))
+
+
 def _candidate_matches_episode_constraint(candidate: dict[str, Any] | None, episode_rule: dict[str, Any] | None) -> bool:
     if not episode_rule:
         return True
@@ -681,8 +822,12 @@ def _candidate_matches_episode_constraint(candidate: dict[str, Any] | None, epis
     if value <= 0:
         return True
     op = str(episode_rule.get("op") or "").strip()
+    if op == ">":
+        return episode_count > value
     if op == ">=":
         return episode_count >= value
+    if op == "<":
+        return episode_count < value
     return episode_count <= value
 
 
@@ -700,6 +845,9 @@ def _product_hard_constraint_violations(product: dict[str, Any] | None, explorat
     price_types = set(str(value).strip().lower() for value in hard.get("price_types") or [] if str(value or "").strip())
     if price_types and _candidate_price_type(product) not in price_types:
         violations.append("price_type")
+    genres = set(str(value).strip() for value in hard.get("genres") or [] if str(value or "").strip())
+    if genres and not _candidate_matches_genre_constraint(product, genres):
+        violations.append("genre")
     return violations
 
 
@@ -722,6 +870,7 @@ def _hard_constraint_violation_label(violations: list[str]) -> str:
         "status": "작품 상태",
         "episode_total": "회차 수",
         "price_type": "무료/유료",
+        "genre": "1차/2차 장르",
     }
     return ", ".join(labels.get(value, value) for value in violations) or "조건"
 
@@ -1763,11 +1912,23 @@ def _is_explain_only_no_match_action(label: str, user_message: str) -> bool:
     return bool(re.search(r"(상세\s*설정|상세\s*보기|포인트|왜\s|이유|매력|줄거리)", text_value))
 
 
+def _reintroduces_cleared_no_match_constraint(action: dict[str, Any], latest_user_query: str) -> bool:
+    action_text = _normalize_no_match_action_text(
+        f"{action.get('label') or ''} {action.get('userMessage') or action.get('user_message') or ''}"
+    )
+    if _should_clear_episode_total_constraint(latest_user_query) and re.search(r"5\s*화\s*이하|짧은\s*작품|단편|초단편", action_text):
+        return True
+    if _should_clear_status_constraint(latest_user_query) and re.search(r"완결|연재\s*중|연재중|휴재", action_text):
+        return True
+    return False
+
+
 def _fallback_no_match_suggested_actions(latest_user_query: str) -> list[dict[str, Any]]:
     normalized_query = _normalize_no_match_action_text(latest_user_query)
+    effective_query = _remove_status_clear_phrases(_remove_episode_total_clear_phrases(normalized_query))
     candidates: list[dict[str, Any]] = []
 
-    def add(action_id: str, label: str, user_message: str) -> None:
+    def add(action_id: str, label: str, user_message: str, priority: int = 40) -> None:
         candidates.append(
             {
                 "id": action_id,
@@ -1775,13 +1936,29 @@ def _fallback_no_match_suggested_actions(latest_user_query: str) -> list[dict[st
                 "label": label,
                 "user_message": user_message,
                 "intent": "recommend_similar",
+                "priority": priority,
             }
         )
 
-    has_completed = "완결" in normalized_query
-    has_short = bool(re.search(r"5\s*화\s*이하|짧은\s*작품", normalized_query))
-    has_free = "무료" in normalized_query
+    has_completed = "완결" in effective_query
+    has_short = bool(re.search(r"5\s*화\s*이하|짧은\s*작품", effective_query))
+    has_free = "무료" in effective_query
+    has_fantasy = "판타지" in effective_query
+    genre_suffix = " 판타지" if has_fantasy else ""
 
+    if has_completed and has_short:
+        add(
+            "drop-short-ongoing",
+            f"5화 이하 빼고 연재중{genre_suffix} 추천",
+            f"5화 이하 조건은 빼고 연재 중인{genre_suffix} 작품 추천해줘",
+            10,
+        )
+        add(
+            "drop-completed-short",
+            f"완결/5화 이하 빼고{genre_suffix} 추천",
+            f"완결/5화 이하 조건은 빼고{genre_suffix} 작품 추천해줘",
+            20,
+        )
     if has_short:
         add(
             "keep-short-broaden-genre",
@@ -1832,7 +2009,16 @@ def _fallback_no_match_suggested_actions(latest_user_query: str) -> list[dict[st
     return [
         action for action in normalized
         if not _is_repeated_no_match_action(action, latest_user_query)
+        and not _reintroduces_cleared_no_match_constraint(action, latest_user_query)
     ][:MAX_SUGGESTED_ACTIONS]
+
+
+def _should_seed_no_match_recovery_actions(latest_user_query: str) -> bool:
+    normalized_query = _normalize_no_match_action_text(latest_user_query)
+    effective_query = _remove_status_clear_phrases(_remove_episode_total_clear_phrases(normalized_query))
+    has_status = bool(_extract_required_status_codes(effective_query))
+    has_episode = _extract_episode_total_constraint(effective_query) is not None
+    return has_status and has_episode
 
 
 def _normalize_no_match_suggested_actions(
@@ -1851,6 +2037,21 @@ def _normalize_no_match_suggested_actions(
     )
     sanitized: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
+
+    if allow_fallback and _should_seed_no_match_recovery_actions(latest_user_query):
+        for fallback_action in _fallback_no_match_suggested_actions(latest_user_query):
+            label = fallback_action["label"]
+            if (
+                label in seen_labels
+                or _is_repeated_no_match_action(fallback_action, latest_user_query)
+                or _reintroduces_cleared_no_match_constraint(fallback_action, latest_user_query)
+            ):
+                continue
+            sanitized.append(fallback_action)
+            seen_labels.add(label)
+            if len(sanitized) >= 2:
+                break
+
     for action in normalized:
         label = _compact_text(_rewrite_episode_length_terms_for_service(action.get("label")), 34)
         user_message = _compact_text(_rewrite_episode_length_terms_for_service(action.get("userMessage")), 80)
@@ -1861,13 +2062,19 @@ def _normalize_no_match_suggested_actions(
         action = {**action, "label": label, "userMessage": user_message, "intent": "recommend_similar"}
         if _is_repeated_no_match_action(action, latest_user_query):
             continue
+        if _reintroduces_cleared_no_match_constraint(action, latest_user_query):
+            continue
         sanitized.append(action)
         seen_labels.add(label)
 
     if allow_fallback and len(sanitized) < MIN_SUGGESTED_ACTIONS:
         for fallback_action in _fallback_no_match_suggested_actions(latest_user_query):
             label = fallback_action["label"]
-            if label in seen_labels or _is_repeated_no_match_action(fallback_action, latest_user_query):
+            if (
+                label in seen_labels
+                or _is_repeated_no_match_action(fallback_action, latest_user_query)
+                or _reintroduces_cleared_no_match_constraint(fallback_action, latest_user_query)
+            ):
                 continue
             sanitized.append(fallback_action)
             seen_labels.add(label)
@@ -1887,12 +2094,11 @@ def _rewrite_episode_length_terms_for_service(value: Any) -> str:
         (r"초\s*단편\s*소설", "5화 이하 작품"),
         (r"초\s*단편", "5화 이하 작품"),
         (r"단편\s*소설", "5화 이하 작품"),
-        (r"단편", "5화 이하 작품"),
+        (r"단편(?=\s*(?:작품|웹소설|추천|으로|도|만|위주|찾|보|볼|골라|$))", "5화 이하 작품"),
         (r"짧은\s*소설", "5화 이하 작품"),
         (r"장편\s*소설", "100화 이상 작품"),
         (r"장편", "100화 이상 작품"),
         (r"긴\s*소설", "100화 이상 작품"),
-        (r"(?<!웹)소설", "작품"),
     )
     for pattern, replacement in replacements:
         text_value = re.sub(pattern, replacement, text_value)
@@ -1946,7 +2152,7 @@ def _normalize_llm_suggested_actions(
             return
         seen_keys.add(key)
         default_priority = SUGGESTED_ACTION_DEFAULT_PRIORITIES.get(intent, 99)
-        action_priority = default_priority
+        action_priority = _safe_int(raw_action.get("priority"), default_priority)
         raw_action_id = (
             raw_action.get("actionId")
             or raw_action.get("action_id")
@@ -2535,22 +2741,35 @@ async def _handle_similar_product_request(
     if not similar_products:
         return None
 
-    selected_candidate = similar_products[0]
-    selected_product_id = _safe_int(selected_candidate.get("product_id"), 0)
-    if selected_product_id <= 0:
-        return None
+    exploration_state = session_state.get("exploration_state") or {}
+    selected_candidate: dict[str, Any] | None = None
+    selected_product_id = 0
+    product: dict | None = None
+    taste_match: dict = {"protagonist": 0, "mood": 0, "pacing": 0}
+    for similar_candidate in similar_products:
+        candidate_id = _safe_int(similar_candidate.get("product_id"), 0)
+        if candidate_id <= 0:
+            continue
+        candidate_product, candidate_taste_match = await _build_product_and_taste(
+            selected_product_id=candidate_id,
+            last_search_candidates=[],
+            profile=profile,
+            db=db,
+            factor_scores=reader_context.get("factor_scores"),
+            adult_yn=adult_yn,
+            fallback_to_search=False,
+            query_terms=query_terms,
+            require_recommendation_metadata=True,
+        )
+        if not candidate_product or _product_hard_constraint_violations(candidate_product, exploration_state):
+            continue
+        selected_candidate = similar_candidate
+        selected_product_id = candidate_id
+        product = candidate_product
+        taste_match = candidate_taste_match
+        break
 
-    product, taste_match = await _build_product_and_taste(
-        selected_product_id=selected_product_id,
-        last_search_candidates=[],
-        profile=profile,
-        db=db,
-        factor_scores=reader_context.get("factor_scores"),
-        adult_yn=adult_yn,
-        fallback_to_search=False,
-        query_terms=query_terms,
-    )
-    if not product:
+    if not product or not selected_candidate:
         return None
 
     reply = _build_similar_product_reply(
@@ -3272,7 +3491,8 @@ async def _generate_no_match_suggested_actions(
                 + " ".join(AI_LIBRARIAN_SERVICE_CONTEXT_LINES)
                 + " "
                 "추천 카드가 없는 no_match 답변 아래에 붙일 버튼 질문만 만든다. "
-                "고정 문구를 반복하지 말고 사용자 질문과 실패 조건을 바탕으로 조건을 넓히거나 좁히는 질문을 만든다."
+                "고정 문구를 반복하지 말고 사용자 질문과 실패 조건을 바탕으로 조건을 넓히거나 좁히는 질문을 만든다. "
+                "실패한 조건을 푸는 user_message에는 '5화 이하 조건은 빼고', '완결 조건은 빼고', '회차수 제한 없이'처럼 해제할 조건을 명시한다."
             ),
             messages=[
                 {
@@ -3578,6 +3798,7 @@ async def get_similar_products(
             m.protagonist_material_tags,
             m.axis_romance_tags,
             m.axis_style_tags,
+            IF(m.product_id IS NOT NULL, 'Y', 'N') AS recommendation_metadata_yn,
             IF(wff.product_id IS NOT NULL, 'Y', 'N') AS waiting_for_free_yn,
             IF(p69.product_id IS NOT NULL, 'Y', 'N') AS six_nine_path_yn
         FROM tb_product p
@@ -3766,15 +3987,34 @@ def _normalize_product_reply(
     reply = _limit_readable_reply(sanitized_reply)
     if reply and _reply_mentions_any_title(reply, unselected_candidate_titles or []):
         reply = ""
-    if reply and len(sanitized_reply) > MAX_RECOMMENDATION_REPLY_CHARS:
-        return _build_compact_product_reply(product)
     if reply:
         return reply
     return _build_compact_product_reply(product)
 
 
+NO_MATCH_NEXT_STEP_PROMPT = "다른 조건으로도 찾아볼까요?"
+
+
+def _ensure_no_match_next_step(reply: str) -> str:
+    text_value = str(reply or "").strip()
+    if not text_value:
+        return NO_MATCH_NEXT_STEP_PROMPT
+    if "?" in text_value or "까요" in text_value or "골라드릴게요" in text_value or "찾아볼게요" in text_value:
+        return text_value
+    raw_parts = re.split(r"(?<=[.!?。！？])\s+|\n+", text_value)
+    parts = [part.strip() for part in raw_parts if part and part.strip()]
+    lead = next((part for part in parts if "죄송" not in part), parts[0] if parts else text_value)
+    suffix = f"\n{NO_MATCH_NEXT_STEP_PROMPT}"
+    max_lead_chars = max(40, MAX_REPLY_CHARS - len(suffix))
+    if len(lead) > max_lead_chars:
+        lead = f"{lead[:max_lead_chars].rstrip(' .,!?。！？')}..."
+    return f"{lead}{suffix}"
+
+
 def _normalize_no_match_reply(reply: str) -> str:
-    fallback = "지금 조건만으로는 작품 카드를 확정하지 못했습니다.\n원하는 결을 하나만 더 좁혀주시면 다시 골라드릴게요."
+    fallback = _ensure_no_match_next_step(
+        "지금 조건만으로는 작품 카드를 확정하지 못했습니다."
+    )
     text_value = _limit_readable_reply(_rewrite_episode_length_terms_for_service(_sanitize_reply_text(reply)))
     if not text_value:
         return fallback
@@ -3782,7 +4022,7 @@ def _normalize_no_match_reply(reply: str) -> str:
     quoted_title_pattern = re.compile(r"[「『'“\"]([^」』'”\"]{2,60})[」』'”\"]")
     if success_pattern.search(text_value) or quoted_title_pattern.search(text_value):
         return fallback
-    return text_value
+    return _ensure_no_match_next_step(text_value)
 
 
 def _build_focus_product_intro_reply(product: dict) -> str:
@@ -3884,6 +4124,12 @@ def _build_axis_taste_context(
     return legacy_match, axis_scores, taste_summary
 
 
+def _product_has_recommendation_metadata(product_info: dict[str, Any] | None) -> bool:
+    if not isinstance(product_info, dict):
+        return False
+    return str(product_info.get("recommendation_metadata_yn") or "").strip().upper() == "Y"
+
+
 async def _build_product_and_taste(
     *,
     selected_product_id: int | None,
@@ -3895,6 +4141,7 @@ async def _build_product_and_taste(
     fallback_to_search: bool = True,
     prefetched_product_info: dict | None = None,
     query_terms: list[str] | None = None,
+    require_recommendation_metadata: bool = False,
 ) -> tuple[dict | None, dict]:
     taste_match = {"protagonist": 0, "mood": 0, "pacing": 0}
     product = None
@@ -3906,6 +4153,8 @@ async def _build_product_and_taste(
                 product_info = await get_product_info(db, product_id=selected_product_id, adult_yn=adult_yn)
             except CustomResponseException:
                 product_info = None
+        if product_info and require_recommendation_metadata and not _product_has_recommendation_metadata(product_info):
+            product_info = None
         if product_info:
             selected_dna = {
                 "protagonist_type": product_info.get("protagonist_type"),
@@ -4008,43 +4257,18 @@ async def _build_product_and_taste(
                 "protagonistMaterialTags": _load_json_list(fallback_dna.get("protagonist_material_tags")),
                 "axisRomanceTags": _load_json_list(fallback_dna.get("axis_romance_tags")),
                 "axisStyleTags": _load_json_list(fallback_dna.get("axis_style_tags")),
+                "primaryGenre": fallback_candidate.get("primary_genre") or fallback_candidate.get("primaryGenre"),
+                "subGenre": fallback_candidate.get("sub_genre") or fallback_candidate.get("subGenre"),
             }
 
     return product, taste_match
-
-
-async def _attach_focus_product_card_if_needed(
-    *,
-    product: dict | None,
-    taste_match: dict,
-    page_context: dict,
-    profile: dict | None,
-    db: AsyncSession,
-    factor_scores: dict | None,
-    adult_yn: str,
-) -> tuple[dict | None, dict]:
-    if product is not None or not page_context.get("focus_product_card"):
-        return product, taste_match
-
-    current_product_id = _safe_int(page_context.get("current_product_id"), 0)
-    if current_product_id <= 0:
-        return product, taste_match
-
-    return await _build_product_and_taste(
-        selected_product_id=current_product_id,
-        last_search_candidates=[],
-        profile=profile,
-        db=db,
-        factor_scores=factor_scores,
-        adult_yn=adult_yn,
-        fallback_to_search=False,
-    )
 
 
 async def _build_status_keyword_fallback_recommendation(
     *,
     latest_user_query: str,
     required_status_codes: set[str],
+    exploration_state: dict | None,
     query_terms: list[str],
     profile: dict | None,
     db: AsyncSession,
@@ -4064,7 +4288,10 @@ async def _build_status_keyword_fallback_recommendation(
     except (TimeoutError, SQLAlchemyError) as exc:
         logger.warning("[ai_chat] status keyword fallback failed: %s", exc)
         return None
-    matching_rows = _filter_candidate_rows_by_required_status(rows, required_status_codes)
+    matching_rows = _filter_candidate_rows_by_hard_constraints(
+        _filter_candidate_rows_by_required_status(rows, required_status_codes),
+        exploration_state,
+    )
     if not matching_rows:
         return None
 
@@ -4080,8 +4307,9 @@ async def _build_status_keyword_fallback_recommendation(
         adult_yn=adult_yn,
         fallback_to_search=False,
         query_terms=query_terms or keywords,
+        require_recommendation_metadata=True,
     )
-    if not product or not _candidate_matches_required_status(product, required_status_codes):
+    if not product or _product_hard_constraint_violations(product, exploration_state):
         return None
 
     keyword_label = ", ".join(keywords[:2])
@@ -4243,6 +4471,7 @@ async def get_product_info(
             m.protagonist_material_tags,
             m.axis_romance_tags,
             m.axis_style_tags,
+            IF(m.product_id IS NOT NULL, 'Y', 'N') AS recommendation_metadata_yn,
             IF(wff.product_id IS NOT NULL, 'Y', 'N') AS waiting_for_free_yn,
             IF(p69.product_id IS NOT NULL, 'Y', 'N') AS six_nine_path_yn
         FROM tb_product p
@@ -4352,6 +4581,7 @@ async def get_product_info(
         "protagonist_material_tags": _load_json_list(row_dict.get("protagonist_material_tags")),
         "axis_romance_tags": _load_json_list(row_dict.get("axis_romance_tags")),
         "axis_style_tags": _load_json_list(row_dict.get("axis_style_tags")),
+        "recommendation_metadata_yn": row_dict.get("recommendation_metadata_yn"),
         "waiting_for_free_yn": row_dict.get("waiting_for_free_yn"),
         "six_nine_path_yn": row_dict.get("six_nine_path_yn"),
         "summary_line": summary_line,
@@ -4415,8 +4645,46 @@ def _compact_candidate_detail(product_info: dict[str, Any]) -> dict[str, Any]:
         "protagonist_material_tags": product_info.get("protagonist_material_tags") or [],
         "axis_romance_tags": product_info.get("axis_romance_tags") or [],
         "axis_style_tags": product_info.get("axis_style_tags") or [],
+        "recommendation_metadata_yn": product_info.get("recommendation_metadata_yn"),
         "story_context": _compact_story_context(product_info.get("story_context")),
         "summary_line": product_info.get("summary_line"),
+    }
+
+
+async def _filter_product_ids_with_recommendation_metadata(
+    db: AsyncSession,
+    product_ids: list[int],
+) -> set[int]:
+    normalized_ids: list[int] = []
+    seen: set[int] = set()
+    for product_id in product_ids:
+        normalized_id = _safe_int(product_id, 0)
+        if normalized_id <= 0 or normalized_id in seen:
+            continue
+        normalized_ids.append(normalized_id)
+        seen.add(normalized_id)
+    if not normalized_ids:
+        return set()
+
+    placeholders = ", ".join(f":product_id_{index}" for index, _ in enumerate(normalized_ids))
+    params = {f"product_id_{index}": product_id for index, product_id in enumerate(normalized_ids)}
+    result = await db.execute(
+        text(
+            f"""
+            SELECT product_id
+            FROM tb_product_ai_metadata
+            WHERE product_id IN ({placeholders})
+              AND analysis_status = 'success'
+              AND COALESCE(exclude_from_recommend_yn, 'N') = 'N'
+            """
+        ),
+        params,
+    )
+    rows = await _result_mappings_all(result)
+    return {
+        _safe_int(row.get("product_id"), 0)
+        for row in rows
+        if _safe_int(row.get("product_id"), 0) > 0
     }
 
 
@@ -4441,9 +4709,28 @@ async def _attach_query_candidate_details(
     if not product_ids:
         return query_result
 
+    metadata_product_ids = await _filter_product_ids_with_recommendation_metadata(db, product_ids)
+    if not metadata_product_ids:
+        enriched = dict(query_result)
+        enriched["rows"] = []
+        enriched["row_count"] = 0
+        enriched["candidate_product_ids"] = []
+        enriched["candidate_details"] = []
+        enriched["candidate_detail_policy"] = (
+            f"rows의 product_id를 최대 {MAX_QUERY_CANDIDATE_SCAN}개까지 확인했지만 "
+            "추천 메타데이터가 검증된 공개 후보가 없었다. candidate_product_ids 밖의 작품은 최종 추천하지 않는다."
+        )
+        return enriched
+
     candidate_details: list[dict[str, Any]] = []
     certified_product_ids: list[int] = []
     for product_id in product_ids:
+        if product_id not in metadata_product_ids:
+            logger.info(
+                "[ai_chat] candidate detail skipped product_id=%s reason=no_recommendation_metadata",
+                product_id,
+            )
+            continue
         try:
             product_info = await get_product_info(
                 db,
@@ -4460,6 +4747,12 @@ async def _attach_query_candidate_details(
                 )
                 continue
             raise
+        if not _product_has_recommendation_metadata(product_info):
+            logger.info(
+                "[ai_chat] candidate detail skipped product_id=%s reason=no_recommendation_metadata",
+                product_id,
+            )
+            continue
         certified_product_ids.append(product_id)
         candidate_details.append(product_info)
         if len(candidate_details) >= MAX_QUERY_CANDIDATE_DETAILS:
@@ -4793,16 +5086,7 @@ async def handle_chat(
                 fallback_to_search=False,
                 prefetched_product_info=detail_cache.get(selected_product_id) if selected_product_id else None,
                 query_terms=query_terms,
-            )
-            if not selected_from_current_product_context and selected_product_id is None:
-                product, taste_match = await _attach_focus_product_card_if_needed(
-                    product=product,
-                    taste_match=taste_match,
-                    page_context=page_context,
-                    profile=profile,
-                    db=db,
-                    factor_scores=reader_context.get("factor_scores"),
-                    adult_yn=normalized_adult,
+                require_recommendation_metadata=not current_overview_request,
             )
             if (
                 product
@@ -4918,6 +5202,7 @@ async def handle_chat(
                     await _build_status_keyword_fallback_recommendation(
                         latest_user_query=latest_user_query,
                         required_status_codes=required_status_codes,
+                        exploration_state=exploration_state,
                         query_terms=query_terms,
                         profile=profile,
                         db=db,
@@ -4952,7 +5237,7 @@ async def handle_chat(
                     raw_suggested_actions,
                     blocked_intents=blocked_intents,
                     latest_user_query=latest_user_query,
-                    allow_fallback=False,
+                    allow_fallback=True,
                 )
                 if final_mode == "no_match" and not suggested_actions and not forced_finalize_attempted:
                     _append_assistant_text_message(model_messages, last_text)
@@ -4996,6 +5281,7 @@ async def handle_chat(
                     fallback_to_search=False,
                     prefetched_product_info=detail_cache.get(selected_product_id) if selected_product_id else None,
                     query_terms=query_terms,
+                    require_recommendation_metadata=not _is_current_product_overview_request(normalized_messages, page_context),
                 )
                 hard_violations = _product_hard_constraint_violations(product, exploration_state)
                 if product and hard_violations and selected_product_id is not None:
@@ -5027,6 +5313,7 @@ async def handle_chat(
                         await _build_status_keyword_fallback_recommendation(
                             latest_user_query=latest_user_query,
                             required_status_codes=required_status_codes,
+                            exploration_state=exploration_state,
                             query_terms=query_terms,
                             profile=profile,
                             db=db,
@@ -5219,6 +5506,7 @@ async def handle_chat(
             fallback_to_search=False,
             prefetched_product_info=detail_cache.get(selected_product_id) if selected_product_id else None,
             query_terms=query_terms,
+            require_recommendation_metadata=not _is_current_product_overview_request(normalized_messages, page_context),
         )
         if (
             selected_product_id is not None
@@ -5278,6 +5566,7 @@ async def handle_chat(
                 await _build_status_keyword_fallback_recommendation(
                     latest_user_query=latest_user_query,
                     required_status_codes=required_status_codes,
+                    exploration_state=exploration_state,
                     query_terms=query_terms,
                     profile=profile,
                     db=db,

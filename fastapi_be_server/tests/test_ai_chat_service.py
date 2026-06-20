@@ -113,9 +113,76 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertEqual(state["hard"]["status_codes"], ["end"])
         self.assertEqual(state["hard"]["episode_total"], {"op": "<=", "value": 5, "source": "explicit"})
         self.assertEqual(state["hard"]["price_types"], ["free"])
+        self.assertIn("판타지", state["hard"]["genres"])
         self.assertTrue(state["weak"]["light_read"])
         self.assertIn("판타지", state["soft"]["keywords"])
         self.assertEqual(state["last_action"]["source_action_intent"], "recommend_similar")
+
+    def test_build_exploration_state_resets_hard_conditions_for_new_recommendation(self):
+        state = ai_chat_service._build_exploration_state(
+            [
+                {"role": "user", "content": "완결됐고 5화 이하인 판타지 추천해줘"},
+                {"role": "assistant", "content": "조건을 모두 만족하는 작품은 지금 찾기 어려워요."},
+                {"role": "user", "content": "판타지 장르의 인기 작품을 추천해줘"},
+            ],
+            None,
+        )
+
+        self.assertEqual(state["hard"]["genres"], ["판타지", "현대판타지", "다크 판타지", "로맨스판타지"])
+        self.assertEqual(state["soft"]["keywords"], ["판타지"])
+
+    def test_build_exploration_state_resets_for_explicit_no_condition_request(self):
+        state = ai_chat_service._build_exploration_state(
+            [
+                {"role": "user", "content": "완결됐고 5화 이하인 판타지 추천해줘"},
+                {"role": "assistant", "content": "조건을 모두 만족하는 작품은 지금 찾기 어려워요."},
+                {"role": "user", "content": "아무 조건 없이 판타지 추천해줘"},
+            ],
+            None,
+        )
+
+        self.assertEqual(state["hard"]["genres"], ["판타지", "현대판타지", "다크 판타지", "로맨스판타지"])
+        self.assertEqual(state["soft"]["keywords"], ["판타지"])
+
+    def test_build_exploration_state_clears_episode_when_relaxing_to_ongoing(self):
+        state = ai_chat_service._build_exploration_state(
+            [
+                {"role": "user", "content": "완결됐고 5화 이하인 판타지 추천해줘"},
+                {"role": "assistant", "content": "조건을 모두 만족하는 작품은 지금 찾기 어려워요."},
+                {"role": "user", "content": "5화 이하 조건은 빼고 연재 중인 판타지 작품 추천해줘"},
+            ],
+            None,
+        )
+
+        self.assertEqual(
+            state["hard"],
+            {
+                "status_codes": ["ongoing"],
+                "genres": ["판타지", "현대판타지", "다크 판타지", "로맨스판타지"],
+            },
+        )
+        self.assertEqual(state["soft"]["keywords"], ["판타지"])
+
+    def test_build_exploration_state_keeps_replacement_constraints_after_clear(self):
+        episode_state = ai_chat_service._build_exploration_state(
+            [
+                {"role": "user", "content": "완결됐고 5화 이하인 판타지 추천해줘"},
+                {"role": "user", "content": "5화 이하 조건은 빼고 100화 이상 판타지 추천해줘"},
+            ],
+            None,
+        )
+        status_state = ai_chat_service._build_exploration_state(
+            [
+                {"role": "user", "content": "완결됐고 5화 이하인 판타지 추천해줘"},
+                {"role": "user", "content": "완결 조건은 빼고 연재 중인 판타지 작품 추천해줘"},
+            ],
+            None,
+        )
+
+        self.assertEqual(episode_state["hard"]["episode_total"], {"op": ">=", "value": 100, "source": "explicit"})
+        self.assertEqual(status_state["hard"]["status_codes"], ["ongoing"])
+        self.assertIn("판타지", episode_state["hard"]["genres"])
+        self.assertIn("판타지", status_state["hard"]["genres"])
 
     def test_build_exploration_state_maps_short_and_long_service_aliases(self):
         short_state = ai_chat_service._build_exploration_state(
@@ -130,17 +197,30 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertEqual(short_state["hard"]["episode_total"], {"op": "<=", "value": 5, "source": "short_work_alias"})
         self.assertEqual(long_state["hard"]["episode_total"], {"op": ">=", "value": 100, "source": "long_work_alias"})
 
+    def test_extract_episode_total_constraint_uses_strict_miman_and_chogwa(self):
+        self.assertEqual(
+            ai_chat_service._extract_episode_total_constraint("5화 미만 작품 추천"),
+            {"op": "<", "value": 5, "source": "explicit"},
+        )
+        self.assertEqual(
+            ai_chat_service._extract_episode_total_constraint("100화 초과 작품 추천"),
+            {"op": ">", "value": 100, "source": "explicit"},
+        )
+
     def test_product_hard_constraint_violations_only_blocks_explicit_hard(self):
         product = {
             "ongoingState": "ongoing",
             "episodeCount": 6,
             "priceType": "paid",
+            "primaryGenre": "로맨스",
+            "subGenre": "드라마",
         }
         hard_state = {
             "hard": {
                 "status_codes": ["end"],
                 "episode_total": {"op": "<=", "value": 5},
                 "price_types": ["free"],
+                "genres": ["판타지"],
             },
             "weak": {"light_read": True},
         }
@@ -148,9 +228,32 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         self.assertEqual(
             ai_chat_service._product_hard_constraint_violations(product, hard_state),
-            ["status", "episode_total", "price_type"],
+            ["status", "episode_total", "price_type", "genre"],
         )
         self.assertEqual(ai_chat_service._product_hard_constraint_violations(product, weak_only_state), [])
+
+    def test_genre_hard_constraint_uses_primary_and_sub_genre_only(self):
+        tag_only_product = {
+            "primaryGenre": "로맨스",
+            "subGenre": "드라마",
+            "matchTags": ["판타지"],
+            "tasteTags": ["마법"],
+        }
+        sub_genre_product = {
+            "primaryGenre": "로맨스",
+            "subGenre": "현대판타지",
+        }
+        state = {"hard": {"genres": ["판타지", "현대판타지"]}}
+
+        self.assertEqual(ai_chat_service._product_hard_constraint_violations(tag_only_product, state), ["genre"])
+        self.assertEqual(ai_chat_service._product_hard_constraint_violations(sub_genre_product, state), [])
+
+    def test_product_has_recommendation_metadata_is_fail_closed(self):
+        self.assertTrue(ai_chat_service._product_has_recommendation_metadata({"recommendation_metadata_yn": "Y"}))
+        self.assertFalse(ai_chat_service._product_has_recommendation_metadata({"recommendation_metadata_yn": "N"}))
+        self.assertFalse(ai_chat_service._product_has_recommendation_metadata({"recommendation_metadata_yn": None}))
+        self.assertFalse(ai_chat_service._product_has_recommendation_metadata({}))
+        self.assertFalse(ai_chat_service._product_has_recommendation_metadata(None))
 
     def test_final_response_tool_schema_limits_suggested_actions_to_three_or_four(self):
         final_tool = next(
@@ -261,6 +364,81 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertIn(len(empty_actions), {3, 4})
         self.assertTrue(all(item["intent"] == "recommend_similar" for item in empty_actions))
         self.assertNotIn("왜 제 취향에 맞나요?", [item["label"] for item in actions])
+
+    def test_normalize_no_match_suggested_actions_seeds_recovery_for_compound_hard_constraints(self):
+        raw_actions = [
+            {
+                "id": "still-short",
+                "label": "연재 중인 5화 이하 판타지 추천",
+                "user_message": "연재 중인 5화 이하 판타지 작품 추천해줘",
+                "intent": "recommend_similar",
+            },
+            {
+                "id": "still-completed",
+                "label": "완결된 5화 이하 다른 장르 추천",
+                "user_message": "완결된 5화 이하 다른 장르 작품 추천해줘",
+                "intent": "recommend_similar",
+            },
+            {
+                "id": "long-completed",
+                "label": "완결된 100화 이상 판타지 추천",
+                "user_message": "완결된 100화 이상 판타지 추천해줘",
+                "intent": "recommend_similar",
+            },
+        ]
+
+        actions = ai_chat_service._normalize_no_match_suggested_actions(
+            raw_actions,
+            latest_user_query="완결됐고 5화 이하인 판타지 추천해줘",
+        )
+
+        self.assertEqual(actions[0]["label"], "5화 이하 빼고 연재중 판타지 추천")
+        self.assertIn("5화 이하 조건은 빼고", actions[0]["userMessage"])
+        self.assertEqual(actions[1]["label"], "완결/5화 이하 빼고 판타지 추천")
+        self.assertIn("완결/5화 이하 조건은 빼고", actions[1]["userMessage"])
+        self.assertIn(len(actions), {3, 4})
+
+    def test_normalize_no_match_suggested_actions_seeds_recovery_without_raw_actions(self):
+        actions = ai_chat_service._normalize_no_match_suggested_actions(
+            None,
+            latest_user_query="완결됐고 5화 이하인 무협 추천해줘",
+        )
+
+        self.assertEqual(actions[0]["label"], "5화 이하 빼고 연재중 추천")
+        self.assertEqual(actions[1]["label"], "완결/5화 이하 빼고 추천")
+        self.assertIn(len(actions), {3, 4})
+
+    def test_normalize_no_match_suggested_actions_uses_effective_query_after_clear(self):
+        actions = ai_chat_service._normalize_no_match_suggested_actions(
+            None,
+            latest_user_query="5화 이하 조건은 빼고 100화 이상 판타지 추천해줘",
+        )
+
+        visible_text = " ".join(item["label"] for item in actions)
+        self.assertNotIn("5화 이하 조건은 유지", visible_text)
+
+    def test_normalize_no_match_suggested_actions_drops_cleared_constraint_reintroduction(self):
+        actions = ai_chat_service._normalize_no_match_suggested_actions(
+            [
+                {
+                    "id": "bad-short",
+                    "label": "완결된 짧은 판타지 추천",
+                    "user_message": "완결된 5화 이하 판타지 추천해줘",
+                    "intent": "recommend_similar",
+                },
+                {
+                    "id": "good-long",
+                    "label": "100화 이상 판타지 추천",
+                    "user_message": "100화 이상 판타지 추천해줘",
+                    "intent": "recommend_similar",
+                },
+            ],
+            latest_user_query="5화 이하 조건은 빼고 100화 이상 판타지 추천해줘",
+        )
+
+        visible_text = " ".join(item["label"] for item in actions)
+        self.assertNotIn("짧은", visible_text)
+        self.assertNotIn("5화 이하", visible_text)
 
     def test_normalize_no_match_suggested_actions_drops_repeated_prompt(self):
         raw_actions = [
@@ -398,13 +576,41 @@ class AiChatServiceUnitTest(unittest.TestCase):
         )
 
         self.assertIn("5화 이하 작품", reply)
-        self.assertIn("100화 이상인 작품", reply)
+        self.assertIn("다른 조건으로도 찾아볼까요?", reply)
         self.assertNotRegex(reply, r"초단편|단편소설|100화 이상인 100화 이상 작품")
+
+    def test_normalize_no_match_reply_adds_next_step_prompt(self):
+        reply = ai_chat_service._normalize_no_match_reply(
+            "요청하신 조건에 정확히 부합하는 작품을 찾지 못했습니다."
+        )
+
+        self.assertIn("작품을 찾지 못했습니다", reply)
+        self.assertTrue(reply.endswith("다른 조건으로도 찾아볼까요?"))
+        self.assertLessEqual(len(reply), ai_chat_service.MAX_REPLY_CHARS)
+
+    def test_normalize_no_match_reply_prefers_informative_sentence_over_apology(self):
+        reply = ai_chat_service._normalize_no_match_reply(
+            "죄송합니다. 요청하신 조건에 정확히 부합하는 작품을 찾지 못했습니다."
+        )
+
+        self.assertNotIn("죄송합니다", reply)
+        self.assertIn("작품을 찾지 못했습니다", reply)
+        self.assertTrue(reply.endswith("다른 조건으로도 찾아볼까요?"))
 
     def test_rewrite_episode_length_terms_drops_duplicate_episode_phrases(self):
         self.assertEqual(
             ai_chat_service._rewrite_episode_length_terms_for_service("판타지 장르의 100화 이상 100화 이상 작품 추천"),
             "판타지 장르의 100화 이상 작품 추천",
+        )
+
+    def test_rewrite_episode_length_terms_does_not_mutate_unrelated_words(self):
+        self.assertEqual(
+            ai_chat_service._rewrite_episode_length_terms_for_service("소설가 주인공의 단편적인 분위기"),
+            "소설가 주인공의 단편적인 분위기",
+        )
+        self.assertEqual(
+            ai_chat_service._rewrite_episode_length_terms_for_service("완결 단편 추천"),
+            "완결 5화 이하 작품 추천",
         )
 
     def test_generate_no_match_suggested_actions_uses_llm_action_tool(self):
@@ -572,9 +778,9 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertIn("추천작", reply)
         self.assertIn("헌터", reply)
         self.assertNotIn("카드가 없는 작품", reply)
-        self.assertLessEqual(len(reply), ai_chat_service.MAX_RECOMMENDATION_REPLY_CHARS)
+        self.assertLessEqual(len(reply), ai_chat_service.MAX_REPLY_CHARS)
 
-    def test_normalize_product_reply_compacts_overlong_reply_for_panel_readability(self):
+    def test_normalize_product_reply_limits_overlong_reply_for_panel_readability(self):
         reply = ai_chat_service._normalize_product_reply(
             raw_reply=(
                 "헌터 육성학교를 배경으로 한 아주 긴 설명입니다. "
@@ -590,10 +796,9 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         self.assertLessEqual(len(reply), ai_chat_service.MAX_REPLY_CHARS)
         self.assertIn("헌터", reply)
-        self.assertIn("선생님", reply)
+        self.assertIn("헌터 육성학교", reply)
         self.assertNotIn("요정이야기~규격파괴 사제의 임시동맹~", reply)
         self.assertIn("\n", reply)
-        self.assertNotIn("읽기 부담스러운", reply)
 
     def test_normalize_no_match_reply_removes_success_language_without_product(self):
         reply = ai_chat_service._normalize_no_match_reply("'비공개 후보작'을 추천합니다.")
@@ -601,6 +806,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertNotIn("비공개 후보작", reply)
         self.assertNotIn("추천합니다", reply)
         self.assertIn("작품 카드를 확정하지 못했습니다", reply)
+        self.assertIn("다른 조건으로도 찾아볼까요?", reply)
 
     def test_limit_readable_reply_keeps_two_sentences(self):
         reply = ai_chat_service._limit_readable_reply("첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다.")
@@ -738,6 +944,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                                 "cpContractYn": "N",
                                 "waitingForFreeYn": "N",
                                 "sixNinePathYn": "N",
+                                "primaryGenre": "판타지",
                             },
                             {"protagonist": 0.5, "mood": 0.25, "pacing": 0.5},
                         )
@@ -1157,6 +1364,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                                 "title": "완결 판타지 후보작",
                                 "matchReason": "",
                                 "ongoingState": "end",
+                                "primaryGenre": "판타지",
                             },
                             {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
                         )
@@ -1213,13 +1421,14 @@ class AiChatServiceUnitTest(unittest.TestCase):
                         "ongoingState": ongoing_state,
                         "monopolyYn": "N",
                         "lastEpisodeDate": None,
-                        "newReleaseYn": "N",
-                        "cpContractYn": "N",
-                        "waitingForFreeYn": "N",
-                        "sixNinePathYn": "N",
-                    },
-                    {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
-                )
+                                "newReleaseYn": "N",
+                                "cpContractYn": "N",
+                                "waitingForFreeYn": "N",
+                                "sixNinePathYn": "N",
+                                "primaryGenre": "판타지",
+                            },
+                            {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
+                        )
 
             with (
                 patch.object(
@@ -1314,6 +1523,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                         "cpContractYn": "N",
                         "waitingForFreeYn": "N",
                         "sixNinePathYn": "N",
+                        "primaryGenre": "판타지",
                     },
                     {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
                 )
@@ -1362,7 +1572,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 patch.object(
                     ai_chat_service,
                     "_run_broad_metadata_keyword_query",
-                    AsyncMock(return_value=[{"product_id": 777, "title": "완결 판타지 후보작", "status_code": "end"}]),
+                    AsyncMock(return_value=[{"product_id": 777, "title": "완결 판타지 후보작", "status_code": "end", "primary_genre": "판타지"}]),
                 ) as mocked_broad_query,
                 patch.object(
                     ai_chat_service,
@@ -1481,28 +1691,8 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_handle_chat_reasks_no_match_finalize_when_suggested_actions_missing(self):
+    def test_handle_chat_uses_fallback_no_match_actions_when_suggested_actions_missing(self):
         async def run():
-            forced_actions = [
-                {
-                    "id": "broaden-status",
-                    "label": "연재중도 포함해볼까요?",
-                    "user_message": "연재중도 포함해서 판타지 추천해줘",
-                    "intent": "recommend_similar",
-                },
-                {
-                    "id": "broaden-genre",
-                    "label": "완결작 전체로 넓혀볼까요?",
-                    "user_message": "장르 제한 없이 완결작 추천해줘",
-                    "intent": "recommend_similar",
-                },
-                {
-                    "id": "narrow-magic",
-                    "label": "마법 중심으로 좁혀볼까요?",
-                    "user_message": "완결작 중 마법 중심으로 찾아줘",
-                    "intent": "recommend_similar",
-                },
-            ]
             with (
                 patch.object(
                     ai_chat_service.recommendation_service,
@@ -1552,23 +1742,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 patch.object(
                     ai_chat_service,
                     "_force_finalize_response",
-                    AsyncMock(
-                        return_value={
-                            "content": [
-                                {
-                                    "type": "tool_use",
-                                    "id": "tool-final-2",
-                                    "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
-                                    "input": {
-                                        "reply": "조건에 맞는 공개 작품을 확정하지 못했습니다.",
-                                        "mode": "no_match",
-                                        "product_id": None,
-                                        "suggested_actions": forced_actions,
-                                    },
-                                }
-                            ]
-                        }
-                    ),
+                    AsyncMock(),
                 ) as mocked_force_finalize,
             ):
                 payload = await ai_chat_service.handle_chat(
@@ -1581,38 +1755,18 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     db=AsyncMock(),
                 )
 
-            mocked_force_finalize.assert_awaited_once()
+            mocked_force_finalize.assert_not_awaited()
             self.assertIsNone(payload["product"])
             self.assertEqual(payload["finalMode"], "no_match")
-            self.assertEqual([item["label"] for item in payload["suggestedActions"]], [item["label"] for item in forced_actions])
-            self.assertIn("suggested_actions를 3개 또는 4개", mocked_force_finalize.await_args.kwargs["reason"])
+            self.assertIn(len(payload["suggestedActions"]), {3, 4})
+            self.assertTrue(all(item["intent"] == "recommend_similar" for item in payload["suggestedActions"]))
 
         import asyncio
 
         asyncio.run(run())
 
-    def test_handle_chat_generates_no_match_actions_when_forced_finalize_omits_them(self):
+    def test_handle_chat_uses_fallback_actions_when_forced_finalize_omits_them(self):
         async def run():
-            generated_actions = [
-                {
-                    "id": "broaden-status",
-                    "label": "연재중도 포함해볼까요?",
-                    "user_message": "연재중도 포함해서 판타지 추천해줘",
-                    "intent": "recommend_similar",
-                },
-                {
-                    "id": "broaden-genre",
-                    "label": "완결작 전체로 넓혀볼까요?",
-                    "user_message": "장르 제한 없이 완결작 추천해줘",
-                    "intent": "recommend_similar",
-                },
-                {
-                    "id": "narrow-magic",
-                    "label": "마법 중심으로 좁혀볼까요?",
-                    "user_message": "완결작 중 마법 중심으로 찾아줘",
-                    "intent": "recommend_similar",
-                },
-            ]
             with (
                 patch.object(
                     ai_chat_service.recommendation_service,
@@ -1643,32 +1797,20 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     ai_chat_service,
                     "_call_gemini_messages",
                     AsyncMock(
-                        side_effect=[
-                            {
-                                "content": [
-                                    {
-                                        "type": "tool_use",
-                                        "id": "tool-final-1",
-                                        "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
-                                        "input": {
-                                            "reply": "조건에 맞는 공개 작품을 확정하지 못했습니다.",
-                                            "mode": "no_match",
-                                            "product_id": None,
-                                        },
-                                    }
-                                ]
-                            },
-                            {
-                                "content": [
-                                    {
-                                        "type": "tool_use",
-                                        "id": "tool-actions-1",
-                                        "name": ai_chat_service.NO_MATCH_SUGGESTED_ACTION_TOOL_NAME,
-                                        "input": {"suggested_actions": generated_actions},
-                                    }
-                                ]
-                            },
-                        ]
+                        return_value={
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-final-1",
+                                    "name": ai_chat_service.FINAL_RESPONSE_TOOL_NAME,
+                                    "input": {
+                                        "reply": "조건에 맞는 공개 작품을 확정하지 못했습니다.",
+                                        "mode": "no_match",
+                                        "product_id": None,
+                                    },
+                                }
+                            ]
+                        }
                     ),
                 ) as mocked_call,
                 patch.object(
@@ -1702,10 +1844,11 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     db=AsyncMock(),
                 )
 
-            self.assertEqual(mocked_call.await_count, 2)
+            self.assertEqual(mocked_call.await_count, 1)
             self.assertIsNone(payload["product"])
             self.assertEqual(payload["finalMode"], "no_match")
-            self.assertEqual([item["label"] for item in payload["suggestedActions"]], [item["label"] for item in generated_actions])
+            self.assertIn(len(payload["suggestedActions"]), {3, 4})
+            self.assertTrue(all(item["intent"] == "recommend_similar" for item in payload["suggestedActions"]))
 
         import asyncio
 
@@ -1799,6 +1942,93 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "비슷한 작품도 볼래요",
                     [item["label"] for item in payload["suggestedActions"]],
                 )
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_handle_chat_similar_request_respects_carried_primary_sub_genre_constraint(self):
+        async def run():
+            async def build_product_and_taste(**kwargs):
+                product_id = kwargs.get("selected_product_id")
+                genre = "로맨스" if product_id == 888 else "현대판타지"
+                return (
+                    {
+                        "productId": product_id,
+                        "title": "장르 불일치 후보" if product_id == 888 else "장르 일치 후보",
+                        "matchReason": "",
+                        "matchTags": ["판타지"],
+                        "tasteTags": ["마법"],
+                        "primaryGenre": genre,
+                        "subGenre": "드라마" if product_id == 888 else "성장",
+                    },
+                    {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
+                )
+
+            with (
+                patch.object(
+                    ai_chat_service,
+                    "_build_page_context",
+                    AsyncMock(
+                        return_value={
+                            "page_type": "product",
+                            "pathname": "/product/326",
+                            "current_product_id": 326,
+                            "current_product_title": "퍼펙트 메이지",
+                            "focus_product_card": False,
+                        }
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_reader_context",
+                    AsyncMock(return_value={"taste_summary": None, "top_factors": [], "recent_reads": [], "read_product_ids": [], "factor_scores": {}}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_call_gemini_messages",
+                    AsyncMock(side_effect=AssertionError("valid similar candidate should be selected before LLM path")),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "get_similar_products",
+                    AsyncMock(
+                        return_value=(
+                            {"product_id": 326, "title": "퍼펙트 메이지"},
+                            [
+                                {"product_id": 888, "title": "장르 불일치 후보", "matched_signals": ["태그"]},
+                                {"product_id": 889, "title": "장르 일치 후보", "matched_signals": ["세계관"]},
+                            ],
+                        )
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_build_product_and_taste",
+                    AsyncMock(side_effect=build_product_and_taste),
+                ) as mocked_build_product,
+            ):
+                payload = await ai_chat_service.handle_chat(
+                    kc_user_id=None,
+                    messages=[
+                        {"role": "user", "content": "판타지 작품 추천해줘"},
+                        {"role": "assistant", "content": "먼저 이 작품을 볼 만합니다.", "product_id": 326},
+                        {"role": "user", "content": "비슷한 작품도 보여줘"},
+                    ],
+                    context={
+                        "trigger": "manual",
+                        "page_type": "product",
+                        "pathname": "/product/326",
+                        "current_product_id": 326,
+                    },
+                    preset=None,
+                    exclude_ids=[],
+                    adult_yn="N",
+                    db=AsyncMock(),
+                )
+
+            self.assertEqual(payload["product"]["productId"], 889)
+            self.assertEqual(mocked_build_product.await_count, 2)
 
         import asyncio
 
@@ -2342,9 +2572,9 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             {
                                 "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
                                 "row_count": 1,
-                                "rows": [{"product_id": 777, "title": "후보작"}],
+                                "rows": [{"product_id": 777, "title": "후보작", "sub_genre": "미스터리"}],
                             },
-                            {"product_id": 777, "title": "후보작", "status_code": "ongoing"},
+                            {"product_id": 777, "title": "후보작", "status_code": "ongoing", "sub_genre": "미스터리"},
                         ]
                     ),
                 ),
@@ -2353,7 +2583,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_build_product_and_taste",
                     AsyncMock(
                         return_value=(
-                            {"productId": 777, "title": "후보작"},
+                            {"productId": 777, "title": "후보작", "subGenre": "미스터리"},
                             {"protagonist": 0.2, "mood": 0.1, "pacing": 0.0},
                         )
                     ),
@@ -2396,10 +2626,15 @@ class AiChatServiceUnitTest(unittest.TestCase):
                         return_value={
                             "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
                             "row_count": 1,
-                            "rows": [{"product_id": 777, "title": "후보작"}],
+                            "rows": [{"product_id": 777, "title": "후보작", "sub_genre": "미스터리"}],
                         }
                     ),
                 ) as run_query,
+                patch.object(
+                    ai_chat_service,
+                    "_filter_product_ids_with_recommendation_metadata",
+                    AsyncMock(return_value={777}),
+                ),
                 patch.object(
                     ai_chat_service,
                     "get_product_info",
@@ -2425,6 +2660,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             "protagonist_type_tags": ["성장형"],
                             "protagonist_job_tags": ["탐정"],
                             "axis_style_tags": ["미스터리"],
+                            "recommendation_metadata_yn": "Y",
                         }
                     ),
                 ) as get_product_info,
@@ -2504,12 +2740,17 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 ),
                 patch.object(
                     ai_chat_service,
+                    "_filter_product_ids_with_recommendation_metadata",
+                    AsyncMock(return_value={315, 777, 888}),
+                ),
+                patch.object(
+                    ai_chat_service,
                     "get_product_info",
                     AsyncMock(
                         side_effect=[
                             CustomResponseException(status_code=404, message="작품 정보를 찾을 수 없습니다."),
-                            {"product_id": 777, "title": "공개 후보", "author_name": "작가A"},
-                            {"product_id": 888, "title": "두번째 공개 후보", "author_name": "작가B"},
+                            {"product_id": 777, "title": "공개 후보", "author_name": "작가A", "recommendation_metadata_yn": "Y"},
+                            {"product_id": 888, "title": "두번째 공개 후보", "author_name": "작가B", "recommendation_metadata_yn": "Y"},
                         ]
                     ),
                 ) as get_product_info,
@@ -2573,11 +2814,104 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_dispatch_readonly_query_skips_candidates_without_recommendation_metadata(self):
+        async def run():
+            with (
+                patch.object(
+                    ai_chat_service,
+                    "_run_readonly_query",
+                    AsyncMock(
+                        return_value={
+                            "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
+                            "row_count": 2,
+                            "rows": [
+                                {"product_id": 2011, "title": "[TEST] paid-reserve-flow"},
+                                {"product_id": 777, "title": "공개 후보"},
+                            ],
+                        }
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_filter_product_ids_with_recommendation_metadata",
+                    AsyncMock(return_value={777}),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "get_product_info",
+                    AsyncMock(
+                        return_value={
+                            "product_id": 777,
+                            "title": "공개 후보",
+                            "author_name": "작가A",
+                            "recommendation_metadata_yn": "Y",
+                        }
+                    ),
+                ),
+            ):
+                result = await ai_chat_service._dispatch_tool(
+                    db=AsyncMock(),
+                    tool_name="run_readonly_query",
+                    tool_input={"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"},
+                    exclude_ids=[],
+                    adult_yn="N",
+                )
+
+            self.assertEqual([row["product_id"] for row in result["rows"]], [777])
+            self.assertEqual(result["candidate_product_ids"], [777])
+            self.assertEqual([item["product_id"] for item in result["candidate_details"]], [777])
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_dispatch_readonly_query_does_not_fetch_details_without_metadata_ids(self):
+        async def run():
+            get_product_info = AsyncMock()
+            with (
+                patch.object(
+                    ai_chat_service,
+                    "_run_readonly_query",
+                    AsyncMock(
+                        return_value={
+                            "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
+                            "row_count": 2,
+                            "rows": [
+                                {"product_id": 2011, "title": "[TEST] paid-reserve-flow"},
+                                {"product_id": 2012, "title": "[TEST] no-metadata"},
+                            ],
+                        }
+                    ),
+                ),
+                patch.object(
+                    ai_chat_service,
+                    "_filter_product_ids_with_recommendation_metadata",
+                    AsyncMock(return_value=set()),
+                ),
+                patch.object(ai_chat_service, "get_product_info", get_product_info),
+            ):
+                result = await ai_chat_service._dispatch_tool(
+                    db=AsyncMock(),
+                    tool_name="run_readonly_query",
+                    tool_input={"sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5"},
+                    exclude_ids=[],
+                    adult_yn="N",
+                )
+
+            get_product_info.assert_not_awaited()
+            self.assertEqual(result["rows"], [])
+            self.assertEqual(result["candidate_product_ids"], [])
+            self.assertEqual(result["candidate_details"], [])
+
+        import asyncio
+
+        asyncio.run(run())
+
     def test_handle_chat_uses_query_candidate_details_without_extra_detail_roundtrip(self):
         async def run():
             build_product_and_taste = AsyncMock(
                 return_value=(
-                    {"productId": 777, "title": "후보작"},
+                    {"productId": 777, "title": "후보작", "subGenre": "미스터리"},
                     {"protagonist": 0.2, "mood": 0.1, "pacing": 0.0},
                 )
             )
@@ -2643,6 +2977,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                                 {
                                     "product_id": 777,
                                     "title": "후보작",
+                                    "sub_genre": "미스터리",
                                     "premise": "사건을 추적하는 성장형 주인공",
                                     "hook": "초반 단서 회수가 빠르게 이어진다",
                                 }
@@ -2736,7 +3071,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 patch.object(
                     ai_chat_service,
                     "_dispatch_tool",
-                    AsyncMock(return_value={"rows": [{"product_id": 777, "title": "후보작"}]}),
+                    AsyncMock(return_value={"rows": [{"product_id": 777, "title": "후보작", "sub_genre": "미스터리"}]}),
                 ),
                 patch.object(
                     ai_chat_service,
@@ -2760,6 +3095,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                                 "cpContractYn": "N",
                                 "waitingForFreeYn": "N",
                                 "sixNinePathYn": "N",
+                                "subGenre": "미스터리",
                             },
                             {"protagonist": 0.3, "mood": 0.2, "pacing": 0.0},
                         )
@@ -2843,7 +3179,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_build_product_and_taste",
                     AsyncMock(
                         return_value=(
-                            {"productId": 555, "title": "후보작"},
+                            {"productId": 555, "title": "후보작", "subGenre": "미스터리"},
                             {"protagonist": 0.1, "mood": 0.0, "pacing": 0.0},
                         )
                     ),
@@ -3012,9 +3348,9 @@ class AiChatServiceUnitTest(unittest.TestCase):
                             {
                                 "sql": "SELECT product_id, title FROM tb_product WHERE ratings_code = 'all' LIMIT 5",
                                 "row_count": 1,
-                                "rows": [{"product_id": 321, "title": "후보작"}],
+                                "rows": [{"product_id": 321, "title": "후보작", "sub_genre": "미스터리"}],
                             },
-                            {"product_id": 321, "title": "후보작", "status_code": "end"},
+                            {"product_id": 321, "title": "후보작", "status_code": "end", "sub_genre": "미스터리"},
                         ]
                     ),
                 ),
@@ -3023,7 +3359,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_build_product_and_taste",
                     AsyncMock(
                         return_value=(
-                            {"productId": 321, "title": "후보작"},
+                            {"productId": 321, "title": "후보작", "subGenre": "미스터리"},
                             {"protagonist": 0.2, "mood": 0.1, "pacing": 0.0},
                         )
                     ),
@@ -3206,7 +3542,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_dispatch_tool",
                     AsyncMock(
                         side_effect=[
-                            {"rows": [{"product_id": 909, "title": "루프 종결작"}]},
+                            {"rows": [{"product_id": 909, "title": "루프 종결작", "sub_genre": "미스터리"}]},
                         ]
                     ),
                 ),
@@ -3232,6 +3568,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                                 "cpContractYn": "N",
                                 "waitingForFreeYn": "N",
                                 "sixNinePathYn": "N",
+                                "subGenre": "미스터리",
                             },
                             {"protagonist": 0.3, "mood": 0.2, "pacing": 0.0},
                         )
@@ -3278,6 +3615,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                         "cpContractYn": "N",
                         "waitingForFreeYn": "N",
                         "sixNinePathYn": "N",
+                        "subGenre": "미스터리",
                     },
                     {"protagonist": 0.3, "mood": 0.2, "pacing": 0.0},
                 )
@@ -3329,8 +3667,8 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_dispatch_tool",
                     AsyncMock(
                         side_effect=[
-                            {"rows": [{"product_id": 909, "title": "루프 종결작"}]},
-                            {"rows": [{"product_id": 909, "title": "루프 종결작"}]},
+                            {"rows": [{"product_id": 909, "title": "루프 종결작", "sub_genre": "미스터리"}]},
+                            {"rows": [{"product_id": 909, "title": "루프 종결작", "sub_genre": "미스터리"}]},
                         ]
                     ),
                 ) as mocked_dispatch_tool,
@@ -3496,8 +3834,8 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_dispatch_tool",
                     AsyncMock(
                         side_effect=[
-                            {"rows": [{"product_id": 321, "title": "후보작"}]},
-                            {"product_id": 321, "title": "후보작", "status_code": "serial"},
+                            {"rows": [{"product_id": 321, "title": "후보작", "sub_genre": "미스터리"}]},
+                            {"product_id": 321, "title": "후보작", "status_code": "serial", "sub_genre": "미스터리"},
                         ]
                     ),
                 ),
@@ -3506,7 +3844,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     "_build_product_and_taste",
                     AsyncMock(
                         return_value=(
-                            {"productId": 321, "title": "후보작"},
+                            {"productId": 321, "title": "후보작", "subGenre": "미스터리"},
                             {"protagonist": 0.0, "mood": 0.0, "pacing": 0.0},
                         )
                     ),
@@ -3524,7 +3862,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
                 self.assertEqual(
                     mocked_build_product_and_taste.await_args.kwargs["prefetched_product_info"],
-                    {"product_id": 321, "title": "후보작", "status_code": "serial"},
+                    {"product_id": 321, "title": "후보작", "status_code": "serial", "sub_genre": "미스터리"},
                 )
 
         import asyncio
