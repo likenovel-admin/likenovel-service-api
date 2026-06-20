@@ -56,6 +56,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 "trigger": "manual",
                 "page_type": "home",
                 "pathname": "/",
+                "active_focus_product_id": 326,
                 "source_action_id": "followup-1",
                 "source_action_intent": "explain_match",
             },
@@ -91,6 +92,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["reply"], "추천 후보를 찾았습니다.")
         handle_chat.assert_awaited_once()
         self.assertIsNone(handle_chat.await_args.kwargs["kc_user_id"])
+        self.assertEqual(handle_chat.await_args.kwargs["context"]["active_focus_product_id"], 326)
         self.assertEqual(handle_chat.await_args.kwargs["context"]["source_action_id"], "followup-1")
         self.assertEqual(handle_chat.await_args.kwargs["context"]["source_action_intent"], "explain_match")
         save_chat_messages.assert_not_awaited()
