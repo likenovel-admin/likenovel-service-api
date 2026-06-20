@@ -1285,6 +1285,39 @@ class AiChatServiceUnitTest(unittest.TestCase):
             )
         )
 
+    def test_current_product_overview_request_routes_explanation_intents_to_focus_product(self):
+        for intent, query in [
+            ("explain_match", "왜 제 취향에 맞나요?"),
+            ("explain_entry", "초반 진입 포인트는?"),
+            ("explain_attribute", "#마법사 포인트는?"),
+        ]:
+            with self.subTest(intent=intent):
+                self.assertTrue(
+                    ai_chat_service._is_current_product_overview_request(
+                        [{"role": "user", "content": query}],
+                        {
+                            "page_type": "product",
+                            "current_product_id": 326,
+                            "current_product_title": "퍼펙트 메이지",
+                            "focus_product_card": True,
+                            "source_action_intent": intent,
+                        },
+                    )
+                )
+
+        self.assertFalse(
+            ai_chat_service._is_current_product_overview_request(
+                [{"role": "user", "content": "비슷한 작품도 볼래요"}],
+                {
+                    "page_type": "product",
+                    "current_product_id": 326,
+                    "current_product_title": "퍼펙트 메이지",
+                    "focus_product_card": False,
+                    "source_action_intent": "recommend_similar",
+                },
+            )
+        )
+
     def test_current_product_overview_request_rejects_new_recommendation_on_product_page(self):
         messages = [
             {"role": "user", "content": "퍼펙트 메이지 이 작품 어떤 작품인지 알려줘"},
