@@ -1745,10 +1745,97 @@ def _normalize_suggested_actions(
     )
 
 
+def _normalize_no_match_action_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", _rewrite_episode_length_terms_for_service(value)).strip()
+
+
+def _is_repeated_no_match_action(action: dict[str, Any], latest_user_query: str) -> bool:
+    query = _normalize_no_match_action_text(latest_user_query)
+    if not query:
+        return False
+    label = _normalize_no_match_action_text(action.get("label"))
+    user_message = _normalize_no_match_action_text(action.get("userMessage") or action.get("user_message"))
+    return bool(label and label == query) or bool(user_message and user_message == query)
+
+
+def _fallback_no_match_suggested_actions(latest_user_query: str) -> list[dict[str, Any]]:
+    normalized_query = _normalize_no_match_action_text(latest_user_query)
+    candidates: list[dict[str, Any]] = []
+
+    def add(action_id: str, label: str, user_message: str) -> None:
+        candidates.append(
+            {
+                "id": action_id,
+                "action_id": action_id,
+                "label": label,
+                "user_message": user_message,
+                "intent": "recommend_similar",
+            }
+        )
+
+    has_completed = "완결" in normalized_query
+    has_short = bool(re.search(r"5\s*화\s*이하|짧은\s*작품", normalized_query))
+    has_free = "무료" in normalized_query
+
+    if has_short:
+        add(
+            "keep-short-broaden-genre",
+            "5화 이하 조건은 유지하고 장르만 넓혀줘",
+            "5화 이하 작품 조건은 유지하고 장르만 넓혀서 추천해줘",
+        )
+    if has_completed:
+        add(
+            "keep-completed-relax-episode",
+            "완결 조건은 유지하고 회차수는 풀어줘",
+            "완결 조건은 유지하고 회차수 제한 없이 추천해줘",
+        )
+    if has_free:
+        add(
+            "keep-free-broaden-genre",
+            "무료 조건은 유지하고 장르만 넓혀줘",
+            "무료 작품 조건은 유지하고 장르만 넓혀서 추천해줘",
+        )
+
+    add(
+        "broaden-one-condition",
+        "조건을 하나만 풀고 다시 찾아줘",
+        "방금 조건에서 가장 덜 중요한 조건 하나만 풀고 다시 추천해줘",
+    )
+    add(
+        "easy-entry",
+        "초반 진입 쉬운 작품으로 다시 찾아줘",
+        "초반 진입 쉬운 작품 위주로 다시 추천해줘",
+    )
+    add(
+        "keep-mood-broaden",
+        "분위기는 유지하고 조건을 넓혀줘",
+        "방금 분위기는 유지하고 조건만 넓혀서 추천해줘",
+    )
+    if has_completed:
+        add(
+            "include-ongoing",
+            "연재중 작품도 포함해줘",
+            "비슷한 조건에서 연재중 작품도 포함해서 추천해줘",
+        )
+
+    normalized = _normalize_llm_suggested_actions(
+        candidates,
+        blocked_intents=set(),
+        valid_topics=None,
+        dedupe_by_intent=False,
+    )
+    return [
+        action for action in normalized
+        if not _is_repeated_no_match_action(action, latest_user_query)
+    ][:MAX_SUGGESTED_ACTIONS]
+
+
 def _normalize_no_match_suggested_actions(
     raw_actions: Any,
     *,
     blocked_intents: set[str] | None = None,
+    latest_user_query: str = "",
+    allow_fallback: bool = True,
 ) -> list[dict[str, Any]]:
     del blocked_intents
     normalized = _normalize_llm_suggested_actions(
@@ -1765,8 +1852,21 @@ def _normalize_no_match_suggested_actions(
         if not label or not user_message or label in seen_labels:
             continue
         action = {**action, "label": label, "userMessage": user_message}
+        if _is_repeated_no_match_action(action, latest_user_query):
+            continue
         sanitized.append(action)
         seen_labels.add(label)
+
+    if allow_fallback and len(sanitized) < MIN_SUGGESTED_ACTIONS:
+        for fallback_action in _fallback_no_match_suggested_actions(latest_user_query):
+            label = fallback_action["label"]
+            if label in seen_labels or _is_repeated_no_match_action(fallback_action, latest_user_query):
+                continue
+            sanitized.append(fallback_action)
+            seen_labels.add(label)
+            if len(sanitized) >= MAX_SUGGESTED_ACTIONS:
+                break
+
     if len(sanitized) < MIN_SUGGESTED_ACTIONS:
         return []
     return sanitized[:MAX_SUGGESTED_ACTIONS]
@@ -3156,31 +3256,40 @@ async def _generate_no_match_suggested_actions(
     reply: str,
     blocked_intents: set[str],
 ) -> list[dict[str, Any]]:
-    response = await _call_gemini_messages(
-        system_prompt=(
-            "너는 라이크노벨 AI 사서의 후속질문 생성기다. "
-            + " ".join(AI_LIBRARIAN_SERVICE_CONTEXT_LINES)
-            + " "
-            "추천 카드가 없는 no_match 답변 아래에 붙일 버튼 질문만 만든다. "
-            "고정 문구를 반복하지 말고 사용자 질문과 실패 조건을 바탕으로 조건을 넓히거나 좁히는 질문을 만든다."
-        ),
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"사용자 질문: {latest_user_query}\n"
-                    f"AI 사서 no_match 답변: {reply}\n"
-                    "submit_no_match_suggested_actions tool로 suggested_actions 3개 또는 4개만 제출하세요. "
-                    "label은 짧은 한국어 질문, user_message는 클릭 즉시 보낼 사용자 프롬프트입니다. "
-                    "새 추천을 다시 탐색하는 질문이면 intent는 recommend_similar를 우선 사용하세요."
-                ),
-            }
-        ],
-        tools=[NO_MATCH_SUGGESTED_ACTION_TOOL],
-        tool_choice={"type": "tool", "name": NO_MATCH_SUGGESTED_ACTION_TOOL_NAME},
-        max_tokens=500,
-        timeout_seconds=20.0,
-    )
+    try:
+        response = await _call_gemini_messages(
+            system_prompt=(
+                "너는 라이크노벨 AI 사서의 후속질문 생성기다. "
+                + " ".join(AI_LIBRARIAN_SERVICE_CONTEXT_LINES)
+                + " "
+                "추천 카드가 없는 no_match 답변 아래에 붙일 버튼 질문만 만든다. "
+                "고정 문구를 반복하지 말고 사용자 질문과 실패 조건을 바탕으로 조건을 넓히거나 좁히는 질문을 만든다."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"사용자 질문: {latest_user_query}\n"
+                        f"AI 사서 no_match 답변: {reply}\n"
+                        "submit_no_match_suggested_actions tool로 suggested_actions 3개 또는 4개만 제출하세요. "
+                        "label은 짧은 한국어 질문, user_message는 클릭 즉시 보낼 사용자 프롬프트입니다. "
+                        "직전 사용자 질문과 같은 label/user_message는 반복하지 마세요. "
+                        "새 추천을 다시 탐색하는 질문이면 intent는 recommend_similar를 우선 사용하세요."
+                    ),
+                }
+            ],
+            tools=[NO_MATCH_SUGGESTED_ACTION_TOOL],
+            tool_choice={"type": "tool", "name": NO_MATCH_SUGGESTED_ACTION_TOOL_NAME},
+            max_tokens=500,
+            timeout_seconds=20.0,
+        )
+    except Exception as exc:
+        logger.warning("[ai_chat] no_match_suggested_actions_fallback reason=%s", exc)
+        return _normalize_no_match_suggested_actions(
+            None,
+            blocked_intents=blocked_intents,
+            latest_user_query=latest_user_query,
+        )
     for tool_use in _extract_tool_use_blocks(response.get("content") or []):
         if str(tool_use.get("name") or "") != NO_MATCH_SUGGESTED_ACTION_TOOL_NAME:
             continue
@@ -3188,8 +3297,13 @@ async def _generate_no_match_suggested_actions(
         return _normalize_no_match_suggested_actions(
             tool_input.get("suggested_actions") or tool_input.get("suggestedActions"),
             blocked_intents=blocked_intents,
+            latest_user_query=latest_user_query,
         )
-    return []
+    return _normalize_no_match_suggested_actions(
+        None,
+        blocked_intents=blocked_intents,
+        latest_user_query=latest_user_query,
+    )
 
 
 def _should_reask_final_with_detail_lookup(
@@ -4828,6 +4942,8 @@ async def handle_chat(
                 suggested_actions = _normalize_no_match_suggested_actions(
                     raw_suggested_actions,
                     blocked_intents=blocked_intents,
+                    latest_user_query=latest_user_query,
+                    allow_fallback=False,
                 )
                 if final_mode == "no_match" and not suggested_actions and not forced_finalize_attempted:
                     _append_assistant_text_message(model_messages, last_text)
@@ -5177,6 +5293,8 @@ async def handle_chat(
             suggested_actions = _normalize_no_match_suggested_actions(
                 raw_suggested_actions,
                 blocked_intents=blocked_intents,
+                latest_user_query=latest_user_query,
+                allow_fallback=False,
             )
             if final_mode == "no_match" and not suggested_actions:
                 suggested_actions = await _generate_no_match_suggested_actions(

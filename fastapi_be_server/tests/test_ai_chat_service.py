@@ -222,7 +222,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertEqual([item["priority"] for item in actions], [10, 20, 30, 40])
         self.assertTrue(all(item["id"] and item["actionId"] for item in actions))
 
-    def test_normalize_no_match_suggested_actions_uses_llm_actions_without_fallback(self):
+    def test_normalize_no_match_suggested_actions_fills_deterministic_fallback(self):
         raw_actions = [
             {
                 "id": "broaden-status",
@@ -248,9 +248,50 @@ class AiChatServiceUnitTest(unittest.TestCase):
 
         self.assertCountEqual([item["label"] for item in actions], [item["label"] for item in raw_actions])
         self.assertEqual([item["intent"] for item in actions], ["recommend_similar"] * 3)
-        self.assertEqual(ai_chat_service._normalize_no_match_suggested_actions(raw_actions[:2]), [])
-        self.assertEqual(ai_chat_service._normalize_no_match_suggested_actions(None), [])
+        short_actions = ai_chat_service._normalize_no_match_suggested_actions(
+            raw_actions[:2],
+            latest_user_query="완결 판타지 5화 이하 작품 추천해줘",
+        )
+        empty_actions = ai_chat_service._normalize_no_match_suggested_actions(
+            None,
+            latest_user_query="완결 판타지 5화 이하 작품 추천해줘",
+        )
+
+        self.assertIn(len(short_actions), {3, 4})
+        self.assertIn(len(empty_actions), {3, 4})
+        self.assertTrue(all(item["intent"] == "recommend_similar" for item in empty_actions))
         self.assertNotIn("왜 제 취향에 맞나요?", [item["label"] for item in actions])
+
+    def test_normalize_no_match_suggested_actions_drops_repeated_prompt(self):
+        raw_actions = [
+            {
+                "id": "repeat",
+                "label": "완결 판타지 5화 이하 작품 추천해줘",
+                "user_message": "완결 판타지 5화 이하 작품 추천해줘",
+                "intent": "recommend_similar",
+            },
+            {
+                "id": "broaden-status",
+                "label": "연재중도 포함해볼까요?",
+                "user_message": "연재중도 포함해서 판타지 추천해줘",
+                "intent": "recommend_similar",
+            },
+            {
+                "id": "broaden-genre",
+                "label": "장르를 넓혀볼까요?",
+                "user_message": "장르 제한 없이 완결작 추천해줘",
+                "intent": "recommend_similar",
+            },
+        ]
+
+        actions = ai_chat_service._normalize_no_match_suggested_actions(
+            raw_actions,
+            latest_user_query="완결 판타지 5화 이하 작품 추천해줘",
+        )
+
+        self.assertIn(len(actions), {3, 4})
+        self.assertNotIn("완결 판타지 5화 이하 작품 추천해줘", [item["userMessage"] for item in actions])
+        self.assertNotIn("완결 판타지 5화 이하 작품 추천해줘", [item["label"] for item in actions])
 
     def test_normalize_no_match_suggested_actions_uses_service_episode_terms(self):
         raw_actions = [
@@ -348,6 +389,28 @@ class AiChatServiceUnitTest(unittest.TestCase):
             self.assertIn("라이크노벨은 회차 단위", mocked_call.await_args.kwargs["system_prompt"])
             self.assertIn("5화 이하 작품", mocked_call.await_args.kwargs["system_prompt"])
             self.assertCountEqual([item["label"] for item in actions], [item["label"] for item in raw_actions])
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_generate_no_match_suggested_actions_falls_back_when_llm_fails(self):
+        async def run():
+            with patch.object(
+                ai_chat_service,
+                "_call_gemini_messages",
+                AsyncMock(side_effect=RuntimeError("provider down")),
+            ):
+                actions = await ai_chat_service._generate_no_match_suggested_actions(
+                    latest_user_query="완결 판타지 5화 이하 작품 추천해줘",
+                    reply="조건에 맞는 작품을 찾지 못했습니다.",
+                    blocked_intents=set(),
+                )
+
+            self.assertIn(len(actions), {3, 4})
+            visible_text = " ".join(f"{item['label']} {item['userMessage']}" for item in actions)
+            self.assertIn("5화 이하 작품", visible_text)
+            self.assertTrue(all(item["intent"] == "recommend_similar" for item in actions))
 
         import asyncio
 
