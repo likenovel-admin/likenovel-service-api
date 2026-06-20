@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.services.ai.ai_chat_service import _call_claude_messages, _extract_text
 from app.services.websochat.websochat_game_memory import _normalize_websochat_session_memory
 from app.services.websochat.websochat_llm import (
     WEBSOCHAT_RP_TEMPERATURE,
@@ -223,6 +222,7 @@ def build_websochat_rp_system_prompt(
             "- 대사는 1~3문장 중심으로 쓰고, 짧은 질문에는 짧게 받아쳐도 된다.",
             "- 한 응답은 보통 2~5문장 안에서 끝내라.",
             "- 장면이 필요하면 `짧은 지문 -> 대사`로, 즉답이 더 자연스러우면 대사 위주로 답하라.",
+            "- 인물이 입으로 말하는 대사와 속으로 하는 독백·생각·질문은 모두 큰따옴표(\" \")로 감싸라. 큰따옴표 없이 쓰는 것은 행동·표정·상황을 묘사하는 서술(지문)뿐이다.",
         ],
     )
     _append_prompt_block(
@@ -306,24 +306,3 @@ async def generate_websochat_rp_reply_with_gemini(
         max_tokens=WEBSOCHAT_RP_REPLY_MAX_TOKENS,
         temperature=WEBSOCHAT_RP_TEMPERATURE,
     )
-
-
-async def generate_websochat_rp_reply_with_claude(
-    *,
-    product_row: dict[str, Any],
-    user_prompt: str,
-    rp_context: dict[str, Any],
-    recent_messages: list[dict[str, str]],
-) -> str:
-    messages = list(recent_messages)
-    messages.append({"role": "user", "content": user_prompt})
-    response = await _call_claude_messages(
-        system_prompt=build_websochat_rp_system_prompt(
-            product_row=product_row,
-            rp_context=rp_context,
-            recent_messages=recent_messages,
-        ),
-        messages=messages,
-        max_tokens=WEBSOCHAT_RP_REPLY_MAX_TOKENS,
-    )
-    return _extract_text(response.get("content") or []).strip()

@@ -30,6 +30,19 @@ class _FakeDb:
 
 
 class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
+    def test_character_resolution_clarify_reply_hides_internal_scope_keys(self):
+        reply = websochat_service._build_websochat_rp_character_resolution_clarify_reply(
+            active_character_label="마법사",
+            resolution_source="ambiguous",
+            protagonist_intent=False,
+            candidate_names=["named:이유진", "protagonist:first_person", "이소라"],
+        )
+
+        self.assertIn("이유진", reply)
+        self.assertIn("주인공", reply)
+        self.assertNotIn("named:", reply)
+        self.assertNotIn("protagonist:", reply)
+
     async def test_post_message_acquires_actor_lock_for_billing_window(self):
         req_body = PostWebsochatMessageReqBody(
             client_message_id="client-actor-lock-1",

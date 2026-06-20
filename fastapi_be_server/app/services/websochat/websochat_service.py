@@ -606,6 +606,17 @@ def _build_websochat_rp_character_selection_guide_reply() -> str:
     return "누구랑 대화하고 싶어? 인물 이름만 말해주면 바로 그 인물과 대화를 시작할게."
 
 
+def _humanize_websochat_candidate_name(raw_name: str) -> str:
+    """내부 scope_key(named:X, protagonist:first_person 등)를 사용자에게 보일 이름으로 정리."""
+    name = str(raw_name or "").strip()
+    if not name or ":" not in name:
+        return name
+    if name.startswith("protagonist") and "named" not in name:
+        return "주인공"
+    tail = name.rsplit(":", 1)[-1].strip()
+    return tail or name
+
+
 def _build_websochat_rp_character_resolution_clarify_reply(
     *,
     active_character_label: str | None,
@@ -615,7 +626,12 @@ def _build_websochat_rp_character_resolution_clarify_reply(
 ) -> str:
     normalized_label = re.sub(r"\s+", " ", str(active_character_label or "").strip())
     if candidate_names and len(candidate_names) >= 2:
-        candidate_preview = ", ".join(candidate_names[:3])
+        humanized_names: list[str] = []
+        for name in candidate_names:
+            humanized = _humanize_websochat_candidate_name(name)
+            if humanized and humanized not in humanized_names:
+                humanized_names.append(humanized)
+        candidate_preview = ", ".join(humanized_names[:3])
         return (
             f"비슷한 인물이 여러 명 보여요. {candidate_preview}"
             f"{' 중' if candidate_preview else ''} 누구랑 대화하고 싶어?"

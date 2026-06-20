@@ -5,6 +5,7 @@ from app.exceptions import CustomResponseException
 from app.services.websochat import (
     websochat_game_memory,
     websochat_qa_executor,
+    websochat_rp_renderer,
     websochat_service,
 )
 from app.services.websochat.websochat_planner import _build_websochat_qa_plan
@@ -31,20 +32,12 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
             "intent": "factual",
         }
 
-        with (
-            patch.object(
-                websochat_qa_executor,
-                "_generate_websochat_reply_with_gemini",
-                new_callable=AsyncMock,
-            ) as generate_gemini,
-            patch.object(
-                websochat_qa_executor,
-                "_generate_websochat_reply_with_claude",
-                new_callable=AsyncMock,
-            ) as generate_claude,
-        ):
+        with patch.object(
+            websochat_qa_executor,
+            "_generate_websochat_reply_with_gemini",
+            new_callable=AsyncMock,
+        ) as generate_gemini:
             generate_gemini.side_effect = RuntimeError("gemini unavailable")
-            generate_claude.return_value = ("claude reply", [])
 
             with self.assertRaises(RuntimeError):
                 await websochat_qa_executor.execute_websochat_qa(
@@ -70,7 +63,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
                     tools=[],
                 )
 
-        generate_claude.assert_not_awaited()
+        self.assertFalse(hasattr(websochat_qa_executor, "_generate_websochat_reply_with_claude"))
 
     async def test_rp_does_not_fallback_to_claude_after_gemini_failure(self):
         rp_context = {
@@ -124,6 +117,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertFalse(hasattr(websochat_service, "generate_websochat_rp_reply_with_claude"))
+        self.assertFalse(hasattr(websochat_rp_renderer, "generate_websochat_rp_reply_with_claude"))
 
     async def test_read_scope_guard_marks_session_after_first_unknown_prompt(self):
         reply, model_used, route_mode, _, intent, next_memory = await websochat_service._generate_websochat_reply(
