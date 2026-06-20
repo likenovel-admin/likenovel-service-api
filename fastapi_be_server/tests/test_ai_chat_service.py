@@ -169,6 +169,52 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertEqual([item["priority"] for item in actions], [10, 20, 30, 40])
         self.assertTrue(all(item["id"] and item["actionId"] for item in actions))
 
+    def test_current_product_suggested_actions_follow_manual_topic(self):
+        product = {
+            "title": "퍼펙트 메이지",
+            "matchTags": ["마법사", "이세계"],
+            "tasteTags": ["성장"],
+        }
+
+        actions = ai_chat_service._normalize_suggested_actions(
+            product,
+            ai_chat_service._build_current_product_suggested_actions(
+                product=product,
+                latest_query="그럼 주인공은?",
+            ),
+        )
+        labels = [item["label"] for item in actions]
+        fallback_labels = [
+            item["label"]
+            for item in ai_chat_service._normalize_suggested_actions(product, None)
+        ]
+
+        self.assertIn(len(actions), {3, 4})
+        self.assertLess(len(actions), 5)
+        self.assertTrue(any("주인공" in label for label in labels))
+        self.assertNotEqual(labels, fallback_labels)
+
+    def test_current_product_suggested_actions_block_source_intent(self):
+        product = {
+            "title": "퍼펙트 메이지",
+            "matchTags": ["마법사", "이세계"],
+            "tasteTags": ["성장"],
+        }
+
+        actions = ai_chat_service._normalize_suggested_actions(
+            product,
+            ai_chat_service._build_current_product_suggested_actions(
+                product=product,
+                latest_query="초반 진입 포인트는?",
+            ),
+            blocked_intents={"explain_entry"},
+        )
+
+        self.assertIn(len(actions), {3, 4})
+        self.assertLess(len(actions), 5)
+        self.assertNotIn("explain_entry", [item["intent"] for item in actions])
+        self.assertNotIn("초반 진입 포인트는?", [item["label"] for item in actions])
+
     def test_build_page_context_keeps_followup_action_metadata(self):
         context = asyncio.run(
             ai_chat_service._build_page_context(
@@ -576,6 +622,15 @@ class AiChatServiceUnitTest(unittest.TestCase):
                 self.assertEqual(payload["reply"], "초반은 아이작이 낯선 세계에서 힘과 정체성을 확인하는 진입부예요.")
                 self.assertEqual(payload["product"]["productId"], 326)
                 self.assertEqual(payload["product"]["matchReason"], payload["reply"])
+                self.assertIn(len(payload["suggestedActions"]), {3, 4})
+                self.assertNotIn(
+                    "explain_entry",
+                    [item["intent"] for item in payload["suggestedActions"]],
+                )
+                self.assertNotIn(
+                    "초반 진입 포인트는?",
+                    [item["label"] for item in payload["suggestedActions"]],
+                )
 
         import asyncio
 

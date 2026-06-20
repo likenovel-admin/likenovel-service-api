@@ -1191,10 +1191,106 @@ def _fallback_suggested_actions(product: dict) -> list[dict[str, Any]]:
     ]
 
 
-def _normalize_suggested_actions(product: dict | None, raw_actions: Any) -> list[dict[str, Any]]:
+def _build_current_product_suggested_actions(
+    *,
+    product: dict | None,
+    latest_query: str,
+) -> list[dict[str, Any]]:
     if not isinstance(product, dict):
         return []
 
+    query = str(latest_query or "")
+    tags = _product_visible_tags(product)
+    primary_tag = tags[0] if tags else ""
+    secondary_tag = tags[1] if len(tags) > 1 else ""
+
+    def action(
+        intent: str,
+        label: str,
+        user_message: str | None = None,
+        topic: str = "",
+    ) -> dict[str, Any]:
+        label_key = re.sub(r"[^0-9A-Za-z가-힣]+", "_", label).strip("_")[:24] or intent
+        action_id = f"current_product_{intent}_{label_key}"
+        payload = {
+            "id": action_id,
+            "actionId": action_id,
+            "label": label,
+            "userMessage": user_message or label,
+            "intent": intent,
+            "priority": SUGGESTED_ACTION_DEFAULT_PRIORITIES[intent],
+        }
+        if topic:
+            payload["topic"] = topic
+        return payload
+
+    actions: list[dict[str, Any]] = []
+
+    if any(keyword in query for keyword in ["주인공", "인물", "캐릭터"]):
+        actions.extend(
+            [
+                action("explain_match", "주인공이 취향에 맞는 이유는?", "주인공이 왜 제 취향에 맞는지 더 알려줘"),
+                action("explain_entry", "초반에 주인공은 어때요?", "초반에 주인공이 어떻게 움직이는지 알려줘"),
+                action("explain_attribute", "주인공 매력은?", "주인공의 매력을 더 알려줘"),
+                action("recommend_similar", "비슷한 주인공 작품도 볼래요", "비슷한 주인공이 나오는 작품도 보여줘"),
+            ]
+        )
+    elif any(keyword in query for keyword in ["세계관", "설정", "배경"]):
+        actions.extend(
+            [
+                action("explain_match", "세계관이 취향에 맞는 이유는?", "세계관이 왜 제 취향에 맞는지 알려줘"),
+                action("explain_entry", "초반 세계관 진입은 쉬워요?", "초반에 세계관을 따라가기 쉬운지 알려줘"),
+                action("explain_attribute", "설정 포인트는?", "설정 포인트를 더 알려줘", primary_tag),
+                action("recommend_similar", "비슷한 세계관도 볼래요", "비슷한 세계관의 작품도 보여줘"),
+            ]
+        )
+    elif any(keyword in query for keyword in ["초반", "진입", "전개", "시작"]):
+        actions.extend(
+            [
+                action("explain_match", "초반부가 취향에 맞는 이유는?", "초반부가 왜 제 취향에 맞는지 알려줘"),
+                action("explain_entry", "전개 속도는 어때요?", "전개 속도가 어떤지 알려줘"),
+                action("explain_attribute", "초반 관전 포인트는?", "초반 관전 포인트를 더 알려줘", primary_tag),
+                action("recommend_similar", "진입 쉬운 작품도 볼래요", "초반 진입이 쉬운 비슷한 작품도 보여줘"),
+            ]
+        )
+    else:
+        actions.extend(
+            [
+                action("explain_match", "왜 이어볼 만해요?", "왜 이 작품을 이어볼 만한지 알려줘"),
+                action("explain_entry", "초반 전개는 어떤가요?", "초반 전개가 어떤지 알려줘"),
+                action(
+                    "explain_attribute",
+                    f"#{primary_tag} 포인트는?" if primary_tag else "작품 매력은?",
+                    f"{primary_tag} 포인트를 알려줘" if primary_tag else "작품 매력을 알려줘",
+                    primary_tag,
+                ),
+                action("recommend_similar", "비슷한 작품도 볼래요", "비슷한 작품도 보여줘"),
+            ]
+        )
+
+    if secondary_tag and all(item.get("topic") != secondary_tag for item in actions):
+        actions.append(
+            action(
+                "explain_attribute",
+                f"#{secondary_tag} 포인트는?",
+                f"{secondary_tag} 포인트를 알려줘",
+                secondary_tag,
+            )
+        )
+
+    return actions
+
+
+def _normalize_suggested_actions(
+    product: dict | None,
+    raw_actions: Any,
+    *,
+    blocked_intents: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    if not isinstance(product, dict):
+        return []
+
+    blocked_intents = blocked_intents or set()
     valid_topics = set(_product_visible_tags(product))
     normalized: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
@@ -1204,6 +1300,8 @@ def _normalize_suggested_actions(product: dict | None, raw_actions: Any) -> list
             return
         intent = str(raw_action.get("intent") or "").strip()
         if intent not in SUGGESTED_ACTION_INTENTS:
+            return
+        if intent in blocked_intents:
             return
         label = _compact_text(raw_action.get("label"), 34)
         user_message = _compact_text(
@@ -1732,7 +1830,20 @@ async def _handle_current_product_overview_with_gemini(
     )
     if product:
         product["matchReason"] = reply
-    suggested_actions = _normalize_suggested_actions(product, None)
+    source_action_intent = str(page_context.get("source_action_intent") or "").strip()
+    blocked_intents = (
+        {source_action_intent}
+        if source_action_intent in SUGGESTED_ACTION_INTENTS
+        else set()
+    )
+    suggested_actions = _normalize_suggested_actions(
+        product,
+        _build_current_product_suggested_actions(
+            product=product,
+            latest_query=_latest_user_query(normalized_messages),
+        ),
+        blocked_intents=blocked_intents,
+    )
     _log_suggested_actions(
         product_id=current_product_id,
         final_mode="weak_recommend",
