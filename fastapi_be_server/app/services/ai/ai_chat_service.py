@@ -1063,18 +1063,6 @@ def _is_similar_request(text: str) -> bool:
     return any(keyword in normalized for keyword in keywords)
 
 
-def _extract_anchor_product_id(messages: list[dict] | None) -> int | None:
-    for message in reversed(messages or []):
-        value = message.get("product_id")
-        try:
-            product_id = int(value)
-        except (TypeError, ValueError):
-            continue
-        if product_id > 0:
-            return product_id
-    return None
-
-
 def _latest_user_query(messages: list[dict] | None) -> str:
     for message in reversed(messages or []):
         if str(message.get("role") or "").strip().lower() != "user":
@@ -2851,20 +2839,6 @@ async def _get_recent_read_samples(user_id: int, db: AsyncSession, limit: int = 
             }
         )
     return rows
-
-
-async def _build_behavior_summary(user_id: int | None, profile: dict | None, db: AsyncSession) -> dict:
-    if not user_id:
-        return {}
-
-    recent_read_ids = await recommendation_service._get_recent_read_product_ids(user_id, db, limit=30)
-    recent_read_samples = await _get_recent_read_samples(user_id, db, limit=3) if recent_read_ids else []
-
-    return {
-        "has_profile": bool(profile),
-        "recent_read_count": len(recent_read_ids),
-        "recent_reads": recent_read_samples,
-    }
 
 
 async def _build_page_context(context: dict | None, db: AsyncSession) -> dict:

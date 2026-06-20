@@ -2239,13 +2239,6 @@ class AiChatServiceUnitTest(unittest.TestCase):
         self.assertTrue(ai_chat_service._is_similar_request("유사작 알려줘"))
         self.assertFalse(ai_chat_service._is_similar_request("요즘 뜨는 작품 추천해줘"))
 
-    def test_extract_anchor_product_id(self):
-        messages = [
-            {"role": "assistant", "content": "추천", "product_id": 123},
-            {"role": "user", "content": "비슷한 거", "product_id": ""},
-        ]
-        self.assertEqual(ai_chat_service._extract_anchor_product_id(messages), 123)
-
     def test_handle_chat_freeform_query_uses_tool_loop_instead_of_preset_shortcut(self):
         async def run():
             with (
