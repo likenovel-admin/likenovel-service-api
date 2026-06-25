@@ -154,6 +154,11 @@ def build_websochat_rp_system_prompt(
             inventory_lines.append(f"- 관계 존재감: {relation_presence}")
         if action_presence:
             inventory_lines.append(f"- 행동 존재감: {action_presence}")
+    character_relation_lines = [
+        str(item).strip()
+        for item in (rp_context.get("character_relation_lines") or [])
+        if str(item).strip()
+    ]
     anchor_episode_no = int(rp_context.get("anchor_episode_no") or 0)
     anchor_summary_text = str(rp_context.get("anchor_summary_text") or "").strip()
     trajectory_history = [
@@ -246,6 +251,7 @@ def build_websochat_rp_system_prompt(
     _append_prompt_block(blocks, "말투", speech_lines)
     _append_prompt_block(blocks, "성격", [f"- {item}" for item in personality_core])
     _append_prompt_block(blocks, "인물 맥락", inventory_lines)
+    _append_prompt_block(blocks, "관계 맥락", [f"- {item}" for item in character_relation_lines[:6]])
 
     relation_lines: list[str] = []
     if relationship_stage:

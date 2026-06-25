@@ -116,6 +116,43 @@ class _FakeInventoryOnlyRpContextDb:
         params = params or {}
         if "summary_type = 'character_inventory_v3'" in query:
             return _FakeResult([])
+        if "summary_type = 'relation_inventory'" in query:
+            return _FakeResult(
+                [
+                    {
+                        "scopeKey": "protagonist:named:아델리트->named:제일황자",
+                        "summaryText": json.dumps(
+                            {
+                                "source_key": "protagonist:named:아델리트",
+                                "target_key": "named:제일황자",
+                                "source_display_name": "아델리트",
+                                "target_display_name": "제일황자",
+                                "dominant_relation_tags": ["간호", "경계"],
+                                "distinct_episode_count": 5,
+                                "edge_count": 7,
+                                "latest_seen_episode_no": 12,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                    {
+                        "scopeKey": "named:율리아나->protagonist:named:아델리트",
+                        "summaryText": json.dumps(
+                            {
+                                "source_key": "named:율리아나",
+                                "target_key": "protagonist:named:아델리트",
+                                "source_display_name": "율리아나",
+                                "target_display_name": "아델리트",
+                                "dominant_relation_tags": ["견제"],
+                                "distinct_episode_count": 2,
+                                "edge_count": 2,
+                                "latest_seen_episode_no": 8,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ]
+            )
 
         summary_type = params.get("summary_type")
         scope_key = params.get("scope_key")
@@ -399,7 +436,16 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context["display_name"], "아델리트")
         self.assertTrue(context["speech_style"].get("tone"))
         self.assertIn("냉정", context["personality_core"])
+        self.assertIn("제일황자", "\n".join(context["character_relation_lines"]))
         self.assertEqual(context["anchor_episode_no"], 12)
+
+        prompt = websochat_rp_renderer.build_websochat_rp_system_prompt(
+            product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 12},
+            rp_context=context,
+            recent_messages=[],
+        )
+        self.assertIn("[관계 맥락]", prompt)
+        self.assertIn("제일황자", prompt)
 
     async def test_unsafe_inventory_v3_does_not_seed_new_rp_context_without_profile(self):
         db = _FakeUnsafeInventorySeedDb()
