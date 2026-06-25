@@ -3478,18 +3478,7 @@ def _merge_websochat_protagonist_inventory_payload(cluster_rows: list[dict[str, 
     }
 
 
-def _build_websochat_fallback_protagonist_profile(
-    *,
-    scope_key: str,
-    inventory_payload: dict[str, Any],
-) -> dict[str, Any]:
-    return _build_websochat_fallback_character_profile(
-        scope_key=scope_key,
-        inventory_payload=inventory_payload,
-    )
-
-
-def _build_websochat_fallback_character_profile(
+def _build_websochat_inventory_seed_profile(
     *,
     scope_key: str,
     inventory_payload: dict[str, Any],
@@ -3506,6 +3495,7 @@ def _build_websochat_fallback_character_profile(
         if str(item).strip()
     ]
     baseline_parts = affect_tags[:2] or action_tags[:2]
+    tone_tags = _merge_websochat_ordered_texts(affect_tags[:3], action_tags[:2])
     return {
         "display_name": display_name,
         "aliases": [
@@ -3513,7 +3503,7 @@ def _build_websochat_fallback_character_profile(
             for item in (inventory_payload.get("aliases") or [])
             if str(item).strip()
         ],
-        "speech_style": {},
+        "speech_style": {"tone": tone_tags[:4]} if tone_tags else {},
         "personality_core": (affect_tags[:3] + action_tags[:2])[:4],
         "baseline_attitude": ", ".join(baseline_parts),
     }
@@ -3524,6 +3514,15 @@ def _is_websochat_inventory_rp_eligible(
 ) -> bool:
     if not isinstance(payload, dict) or not payload:
         return False
+    if payload.get("public_chat_eligible") is False:
+        return False
+    display_safety = payload.get("display_safety")
+    if isinstance(display_safety, dict):
+        display_safety_status = str(display_safety.get("status") or "").strip().lower()
+        if display_safety_status and display_safety_status != "pass":
+            return False
+    if payload.get("public_chat_eligible") is True:
+        return True
     entity_kind = str(payload.get("entity_kind") or "").strip().lower()
     if entity_kind and entity_kind != "person":
         return False
@@ -3814,6 +3813,69 @@ async def _get_websochat_first_available_summary_row(
     return None
 
 
+def _build_websochat_inventory_v3_scope_aliases(
+    *,
+    scope_key: str,
+    payload: dict[str, Any],
+) -> list[str]:
+    raw_source_keys = payload.get("source_character_keys") or []
+    source_keys = [raw_source_keys] if isinstance(raw_source_keys, str) else list(raw_source_keys)
+    return _merge_websochat_ordered_texts(
+        [str(payload.get("canonical_character_key") or "").strip(), str(scope_key or "").strip()],
+        [str(source_key or "").strip() for source_key in source_keys],
+    )
+
+
+async def _resolve_websochat_inventory_v3_scope_alias(
+    *,
+    product_id: int,
+    scope_key: str,
+    db: AsyncSession,
+) -> dict[str, Any] | None:
+    normalized_scope_key = str(scope_key or "").strip()
+    if not normalized_scope_key:
+        return None
+    result = await db.execute(
+        text(
+            """
+            SELECT scope_key AS scopeKey, summary_text AS summaryText
+            FROM tb_story_agent_context_summary
+            WHERE product_id = :product_id
+              AND summary_type = 'character_inventory_v3'
+              AND is_active = 'Y'
+            ORDER BY summary_id DESC
+            """
+        ),
+        {"product_id": product_id},
+    )
+    for row in result.mappings().all():
+        row_scope_key = str(row.get("scopeKey") or "").strip()
+        payload = _extract_websochat_json_object(str(row.get("summaryText") or "")) or {}
+        alias_scope_keys = _build_websochat_inventory_v3_scope_aliases(
+            scope_key=row_scope_key,
+            payload=payload,
+        )
+        if normalized_scope_key not in set(alias_scope_keys):
+            continue
+        canonical_scope_key = str(payload.get("canonical_character_key") or row_scope_key).strip() or row_scope_key
+        display_name = str(payload.get("display_name") or "").strip()
+        if not display_name and "named:" in normalized_scope_key:
+            display_name = normalized_scope_key.split("named:", 1)[1].strip()
+        if not display_name:
+            display_name = canonical_scope_key.split(":", 1)[-1].strip() or canonical_scope_key
+        return {
+            "scopeKey": canonical_scope_key,
+            "displayName": display_name,
+            "aliasScopeKeys": _merge_websochat_ordered_texts(
+                [canonical_scope_key],
+                alias_scope_keys,
+                [normalized_scope_key],
+            ),
+            "inventoryPayload": payload,
+        }
+    return None
+
+
 async def _build_websochat_rp_trajectory_context(
     *,
     product_id: int,
@@ -3996,6 +4058,22 @@ async def _resolve_websochat_active_character_resolution(
             "candidateCount": 0,
         }
     if ":" in raw_value:
+        inventory_v3_alias = await _resolve_websochat_inventory_v3_scope_alias(
+            product_id=product_id,
+            scope_key=raw_value,
+            db=db,
+        )
+        if inventory_v3_alias:
+            return {
+                "scopeKey": inventory_v3_alias["scopeKey"],
+                "displayName": inventory_v3_alias["displayName"],
+                "candidateNames": [],
+                "resolutionSource": "explicit_scope_inventory_v3_alias",
+                "protagonistIntent": False,
+                "candidateCount": 1,
+                "aliasScopeKeys": list(inventory_v3_alias.get("aliasScopeKeys") or []),
+                "inventoryPayload": dict(inventory_v3_alias.get("inventoryPayload") or {}),
+            }
         return {
             "scopeKey": raw_value,
             "displayName": raw_value.split("named:", 1)[1].strip() if "named:" in raw_value else raw_value,
@@ -4003,6 +4081,7 @@ async def _resolve_websochat_active_character_resolution(
             "resolutionSource": "explicit_scope",
             "protagonistIntent": False,
             "candidateCount": 1,
+            "aliasScopeKeys": [raw_value],
         }
 
     protagonist_resolution = await _resolve_websochat_protagonist_scope_key(
@@ -4248,7 +4327,15 @@ async def _load_websochat_rp_context(
     if not resolved_active_character:
         return None
     protagonist_cluster_rows: list[dict[str, Any]] = []
-    cluster_scope_keys: list[str] = [resolved_active_character]
+    alias_scope_keys = [
+        str(scope_key or "").strip()
+        for scope_key in list(resolution.get("aliasScopeKeys") or [])
+        if str(scope_key or "").strip()
+    ]
+    cluster_scope_keys: list[str] = _merge_websochat_ordered_texts(
+        alias_scope_keys,
+        [resolved_active_character],
+    )
     if resolved_active_character.startswith("protagonist:"):
         protagonist_rows = await _load_websochat_protagonist_inventory_rows(
             product_id=product_id,
@@ -4284,43 +4371,54 @@ async def _load_websochat_rp_context(
     profile = _extract_websochat_json_object(str((profile_row or {}).get("summaryText") or ""))
     examples_payload = _extract_websochat_json_object(str((examples_row or {}).get("summaryText") or ""))
     inventory_payload = _extract_websochat_json_object(str((inventory_row or {}).get("summaryText") or ""))
+    canonical_inventory_payload = dict(resolution.get("inventoryPayload") or {})
+    if not inventory_payload and canonical_inventory_payload:
+        inventory_payload = canonical_inventory_payload
     if protagonist_cluster_rows:
         merged_inventory_payload = _merge_websochat_protagonist_inventory_payload(protagonist_cluster_rows)
         if merged_inventory_payload:
             inventory_payload = merged_inventory_payload
     inventory_is_protagonist = bool((inventory_payload or {}).get("is_protagonist"))
     inventory_rp_eligible = _is_websochat_inventory_rp_eligible(inventory_payload)
-    fallback_used = False
-    if inventory_is_protagonist and not profile:
-        profile = _build_websochat_fallback_protagonist_profile(
+    inventory_has_public_gate = (
+        isinstance((inventory_payload or {}).get("display_safety"), dict)
+        or "public_chat_eligible" in (inventory_payload or {})
+    )
+    protagonist_seed_eligible = bool(
+        inventory_is_protagonist
+        and (inventory_rp_eligible or not inventory_has_public_gate)
+    )
+    inventory_seed_used = False
+    if protagonist_seed_eligible and not profile:
+        profile = _build_websochat_inventory_seed_profile(
             scope_key=resolved_active_character,
             inventory_payload=inventory_payload or {},
         )
-        fallback_used = True
-    if inventory_is_protagonist and not examples_payload:
+        inventory_seed_used = True
+    if protagonist_seed_eligible and not examples_payload:
         examples_payload = {"examples": []}
-        fallback_used = True
+        inventory_seed_used = True
     if not inventory_is_protagonist and inventory_rp_eligible and not profile:
-        profile = _build_websochat_fallback_character_profile(
+        profile = _build_websochat_inventory_seed_profile(
             scope_key=resolved_active_character,
             inventory_payload=inventory_payload or {},
         )
-        fallback_used = True
+        inventory_seed_used = True
     if not inventory_is_protagonist and inventory_rp_eligible and examples_payload is None:
         examples_payload = {"examples": []}
-        fallback_used = True
+        inventory_seed_used = True
     if not profile or examples_payload is None:
         return None
 
     logger.info(
-        "websochat rp_resolution product_id=%s raw=%s resolved=%s resolution_source=%s protagonist_intent=%s cluster_size=%s fallback_used=%s",
+        "websochat rp_resolution product_id=%s raw=%s resolved=%s resolution_source=%s protagonist_intent=%s cluster_size=%s inventory_seed_used=%s",
         product_id,
         active_character,
         resolved_active_character,
         str(resolution.get("resolutionSource") or "none"),
         bool(resolution.get("protagonistIntent")),
         len(cluster_scope_keys),
-        fallback_used,
+        inventory_seed_used,
     )
 
     context: dict[str, Any] = {
