@@ -170,8 +170,117 @@ class _FakeUnsafeInventorySeedDb:
                     }
                 ]
             )
+        if "summary_type = 'character_inventory'" in query:
+            return _FakeResult(
+                [
+                    {
+                        "scopeKey": "protagonist:named:산군",
+                        "summaryText": json.dumps(
+                            {
+                                "display_name": "산군",
+                                "aliases": ["산군", "대전사"],
+                                "is_protagonist": True,
+                                "distinct_episode_count": 20,
+                                "voice_evidence_count": 8,
+                                "summary_mention_count": 20,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+            )
         if "summary_type = 'relation_inventory'" in query:
             return _FakeResult([])
+        return _FakeResult([])
+
+
+class _FakeUnsafeInventoryV3WithLegacyRpDb:
+    async def execute(self, statement, params=None):
+        query = str(statement)
+        params = params or {}
+        if "summary_type = 'character_inventory_v3'" in query:
+            return _FakeResult(
+                [
+                    {
+                        "scopeKey": "character:산군",
+                        "summaryText": json.dumps(
+                            {
+                                "canonical_character_key": "character:산군",
+                                "source_character_keys": ["protagonist:named:산군"],
+                                "display_name": "대전사",
+                                "aliases": ["대전사", "산군"],
+                                "is_protagonist": True,
+                                "distinct_episode_count": 20,
+                                "display_safety": {"status": "review", "reason": "stable_role_identity"},
+                                "public_chat_eligible": False,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+            )
+        if "summary_type = 'character_inventory'" in query:
+            return _FakeResult(
+                [
+                    {
+                        "scopeKey": "protagonist:named:산군",
+                        "summaryText": json.dumps(
+                            {
+                                "display_name": "산군",
+                                "aliases": ["산군", "대전사"],
+                                "is_protagonist": True,
+                                "distinct_episode_count": 20,
+                                "voice_evidence_count": 8,
+                                "summary_mention_count": 20,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+            )
+        if "summary_type = 'relation_inventory'" in query:
+            return _FakeResult([])
+
+        summary_type = params.get("summary_type")
+        scope_key = params.get("scope_key")
+        if summary_type == "character_rp_profile" and scope_key == "protagonist:named:산군":
+            return _FakeResult(
+                [
+                    {
+                        "summaryId": 31,
+                        "summaryText": json.dumps(
+                            {
+                                "display_name": "산군",
+                                "speech_style": {"tone": ["거칠고 단호함"]},
+                                "personality_core": ["생존 본능이 강함"],
+                                "baseline_attitude": "경계",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+            )
+        if summary_type == "character_rp_examples" and scope_key == "protagonist:named:산군":
+            return _FakeResult(
+                [
+                    {
+                        "summaryId": 32,
+                        "summaryText": json.dumps(
+                            {
+                                "examples": [
+                                    {
+                                        "episode_no": 3,
+                                        "source_kind": "dialogue",
+                                        "text": "나는 물러서지 않는다.",
+                                        "confidence": 0.8,
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+            )
         return _FakeResult([])
 
 
@@ -305,6 +414,52 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
                 session_memory={
                     "active_mode": "rp",
                     "active_character": "protagonist:named:산군",
+                    "active_character_label": "산군",
+                    "rp_mode": "free",
+                    "read_episode_to": 20,
+                },
+                db=db,
+            )
+
+        self.assertIsNone(context)
+
+    async def test_unsafe_inventory_v3_blocks_legacy_profile_examples_bypass(self):
+        db = _FakeUnsafeInventoryV3WithLegacyRpDb()
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1108, "title": "산군이 되었다", "latestEpisodeNo": 20},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:산군",
+                    "active_character_label": "산군",
+                    "rp_mode": "free",
+                    "read_episode_to": 20,
+                },
+                db=db,
+            )
+
+        self.assertIsNone(context)
+
+    async def test_unsafe_inventory_v3_blocks_plain_name_legacy_resolution_bypass(self):
+        db = _FakeUnsafeInventoryV3WithLegacyRpDb()
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1108, "title": "산군이 되었다", "latestEpisodeNo": 20},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "산군",
                     "active_character_label": "산군",
                     "rp_mode": "free",
                     "read_episode_to": 20,
