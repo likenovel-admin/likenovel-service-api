@@ -2649,6 +2649,41 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             [],
         )
 
+    def test_inventory_v3_source_hash_changes_when_public_gate_changes(self):
+        module = load_module()
+        base_item = {
+            "canonical_character_key": "character:산군",
+            "display_name": "산군",
+            "display_name_source": "persona_names",
+            "aliases": ["산군"],
+            "source_character_keys": ["protagonist:named:산군"],
+            "identity_status": "RESOLVED_NAMED",
+            "entity_kind": "person",
+            "work_role": "main_protagonist",
+            "role_confidence": "high",
+            "is_protagonist": True,
+            "protagonist_confidence": "high",
+            "rp_signal_quality": {"status": "summary_ready"},
+            "evidence_episode_nos": [1, 2, 3],
+        }
+        pass_item = {
+            **base_item,
+            "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+            "public_chat_eligible": True,
+            "public_slot_eligible": True,
+        }
+        blocked_item = {
+            **base_item,
+            "display_safety": {"status": "review", "reason": "stable_role_identity"},
+            "public_chat_eligible": False,
+            "public_slot_eligible": False,
+        }
+
+        self.assertNotEqual(
+            module.build_character_inventory_v3_source_hash(pass_item),
+            module.build_character_inventory_v3_source_hash(blocked_item),
+        )
+
     def test_inventory_v3_public_chat_gate_rejects_ordinal_title_display_name(self):
         module = load_module()
         rows = [
