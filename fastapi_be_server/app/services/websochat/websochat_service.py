@@ -3509,6 +3509,101 @@ def _build_websochat_inventory_seed_profile(
     }
 
 
+async def _load_websochat_character_relation_payloads(
+    *,
+    product_id: int,
+    scope_keys: list[str],
+    display_name: str,
+    db: AsyncSession,
+) -> list[dict[str, Any]]:
+    scope_key_set = {str(scope_key or "").strip() for scope_key in scope_keys if str(scope_key or "").strip()}
+    normalized_display_name = _normalize_websochat_character_name(display_name)
+    result = await db.execute(
+        text(
+            """
+            SELECT scope_key AS scopeKey, summary_text AS summaryText
+            FROM tb_story_agent_context_summary
+            WHERE product_id = :product_id
+              AND summary_type = 'relation_inventory'
+              AND is_active = 'Y'
+            ORDER BY summary_id DESC
+            """
+        ),
+        {"product_id": product_id},
+    )
+
+    relation_payloads: list[dict[str, Any]] = []
+    for row in result.mappings().all():
+        payload = _extract_websochat_json_object(str(row.get("summaryText") or "")) or {}
+        source_key = str(payload.get("source_key") or "").strip()
+        target_key = str(payload.get("target_key") or "").strip()
+        source_display_name = str(payload.get("source_display_name") or "").strip()
+        target_display_name = str(payload.get("target_display_name") or "").strip()
+        source_matches = source_key in scope_key_set
+        target_matches = target_key in scope_key_set
+        if normalized_display_name:
+            source_matches = source_matches or (
+                _normalize_websochat_character_name(source_display_name) == normalized_display_name
+            )
+            target_matches = target_matches or (
+                _normalize_websochat_character_name(target_display_name) == normalized_display_name
+            )
+        if not source_matches and not target_matches:
+            continue
+        relation_payloads.append(
+            {
+                **payload,
+                "_active_side": "source" if source_matches else "target",
+            }
+        )
+
+    return sorted(
+        relation_payloads,
+        key=lambda payload: (
+            int(payload.get("distinct_episode_count") or 0),
+            int(payload.get("edge_count") or 0),
+            int(payload.get("latest_seen_episode_no") or 0),
+        ),
+        reverse=True,
+    )[:6]
+
+
+def _build_websochat_character_relation_lines(relation_payloads: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    seen_keys: set[str] = set()
+    for payload in relation_payloads:
+        active_side = str(payload.get("_active_side") or "").strip()
+        if active_side == "source":
+            other_name = str(payload.get("target_display_name") or payload.get("target_key") or "").strip()
+        else:
+            other_name = str(payload.get("source_display_name") or payload.get("source_key") or "").strip()
+        if not other_name:
+            continue
+        relation_tags = [
+            str(item).strip()
+            for item in (payload.get("dominant_relation_tags") or [])
+            if str(item).strip()
+        ]
+        intensity = str(payload.get("relation_intensity") or "").strip()
+        distinct_episode_count = int(payload.get("distinct_episode_count") or 0)
+        line_parts = [other_name]
+        if relation_tags:
+            line_parts.append(", ".join(relation_tags[:3]))
+        if intensity:
+            line_parts.append(f"강도 {intensity}")
+        if distinct_episode_count > 0:
+            line_parts.append(f"반복 {distinct_episode_count}화")
+        line = ": ".join([line_parts[0], " / ".join(line_parts[1:])]) if len(line_parts) > 1 else line_parts[0]
+        seen_key = _normalize_websochat_character_name(line)
+        if seen_key in seen_keys:
+            continue
+        seen_keys.add(seen_key)
+        lines.append(line)
+        if len(lines) >= 6:
+            break
+    return lines
+
+
 def _is_websochat_inventory_rp_eligible(
     payload: dict[str, Any] | None,
 ) -> bool:
@@ -4514,6 +4609,16 @@ async def _load_websochat_rp_context(
         "inventory": inventory_payload or {},
         "session_memory": normalized_memory,
     }
+
+    relation_payloads = await _load_websochat_character_relation_payloads(
+        product_id=product_id,
+        scope_keys=cluster_scope_keys,
+        display_name=str(context.get("display_name") or "").strip(),
+        db=db,
+    )
+    character_relation_lines = _build_websochat_character_relation_lines(relation_payloads)
+    if character_relation_lines:
+        context["character_relation_lines"] = character_relation_lines
 
     trajectory_context = await _build_websochat_rp_trajectory_context(
         product_id=product_id,
