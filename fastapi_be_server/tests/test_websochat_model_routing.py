@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -11,7 +12,309 @@ from app.services.websochat import (
 from app.services.websochat.websochat_planner import _build_websochat_qa_plan
 
 
+class _FakeMappings:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+    def one_or_none(self):
+        return self._rows[0] if self._rows else None
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return _FakeMappings(self._rows)
+
+
+class _FakeRpContextDb:
+    def __init__(self, *, canonical_profile_ready=True):
+        self.exact_summary_requests = []
+        self.canonical_profile_ready = canonical_profile_ready
+
+    async def execute(self, statement, params=None):
+        query = str(statement)
+        params = params or {}
+        if "summary_type = 'character_inventory_v3'" in query:
+            return _FakeResult(
+                [
+                    {
+                        "scopeKey": "character:아델리트",
+                        "summaryText": json.dumps(
+                            {
+                                "canonical_character_key": "character:아델리트",
+                                "source_character_keys": ["protagonist:named:아델리트", "named:아델리트"],
+                                "display_name": "아델리트",
+                                "aliases": ["아델리트"],
+                                "is_protagonist": True,
+                                "distinct_episode_count": 4,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+            )
+        if "summary_type = 'relation_inventory'" in query:
+            return _FakeResult([])
+        summary_type = params.get("summary_type")
+        scope_key = params.get("scope_key")
+        self.exact_summary_requests.append((summary_type, scope_key))
+        profile_scope_key = "character:아델리트" if self.canonical_profile_ready else "protagonist:named:아델리트"
+        examples_scope_key = "character:아델리트" if self.canonical_profile_ready else "protagonist:named:아델리트"
+        if summary_type == "character_rp_profile" and scope_key == profile_scope_key:
+            return _FakeResult(
+                [
+                    {
+                        "summaryId": 10,
+                        "summaryText": json.dumps(
+                            {
+                                "display_name": "아델리트",
+                                "speech_style": {"tone": ["차분"]},
+                                "personality_core": ["상처를 숨김"],
+                                "baseline_attitude": "경계",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "episodeFrom": None,
+                        "episodeTo": None,
+                    }
+                ]
+            )
+        if summary_type == "character_rp_examples" and scope_key == examples_scope_key:
+            return _FakeResult(
+                [
+                    {
+                        "summaryId": 11,
+                        "summaryText": json.dumps(
+                            {
+                                "examples": [
+                                    {
+                                        "episode_no": 1,
+                                        "source_kind": "dialogue",
+                                        "text": "나는 아직 여기서 끝낼 생각 없어.",
+                                        "confidence": 0.9,
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "episodeFrom": None,
+                        "episodeTo": None,
+                    }
+                ]
+            )
+        return _FakeResult([])
+
+
+class _FakeInventoryOnlyRpContextDb:
+    async def execute(self, statement, params=None):
+        query = str(statement)
+        params = params or {}
+        if "summary_type = 'character_inventory_v3'" in query:
+            return _FakeResult([])
+
+        summary_type = params.get("summary_type")
+        scope_key = params.get("scope_key")
+        if summary_type == "character_inventory" and scope_key == "protagonist:named:아델리트":
+            return _FakeResult(
+                [
+                    {
+                        "summaryId": 21,
+                        "summaryText": json.dumps(
+                            {
+                                "display_name": "아델리트",
+                                "aliases": ["아델리트"],
+                                "is_protagonist": True,
+                                "first_seen_episode_no": 1,
+                                "latest_seen_episode_no": 12,
+                                "distinct_episode_count": 11,
+                                "relation_presence": "high",
+                                "action_presence": "high",
+                                "dominant_affect_tags": ["냉정", "경계"],
+                                "dominant_action_tags": ["명령", "돌봄"],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "episodeFrom": None,
+                        "episodeTo": None,
+                    }
+                ]
+            )
+        return _FakeResult([])
+
+
+class _FakeUnsafeInventorySeedDb:
+    async def execute(self, statement, params=None):
+        query = str(statement)
+        if "summary_type = 'character_inventory_v3'" in query:
+            return _FakeResult(
+                [
+                    {
+                        "scopeKey": "character:산군",
+                        "summaryText": json.dumps(
+                            {
+                                "canonical_character_key": "character:산군",
+                                "source_character_keys": ["protagonist:named:산군"],
+                                "display_name": "대전사",
+                                "aliases": ["대전사", "산군"],
+                                "is_protagonist": True,
+                                "distinct_episode_count": 20,
+                                "display_safety": {"status": "review", "reason": "stable_role_identity"},
+                                "public_chat_eligible": False,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+            )
+        if "summary_type = 'relation_inventory'" in query:
+            return _FakeResult([])
+        return _FakeResult([])
+
+
 class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inventory_rp_eligibility_respects_public_chat_gate_without_breaking_legacy_payload(self):
+        self.assertFalse(
+            websochat_service._is_websochat_inventory_rp_eligible(
+                {
+                    "display_name": "대전사",
+                    "entity_kind": "person",
+                    "distinct_episode_count": 20,
+                    "voice_evidence_count": 8,
+                    "summary_mention_count": 20,
+                    "display_safety": {"status": "review", "reason": "stable_role_identity"},
+                    "public_chat_eligible": False,
+                }
+            )
+        )
+        self.assertTrue(
+            websochat_service._is_websochat_inventory_rp_eligible(
+                {
+                    "display_name": "백이현",
+                    "entity_kind": "person",
+                    "distinct_episode_count": 3,
+                    "voice_evidence_count": 2,
+                    "summary_mention_count": 3,
+                }
+            )
+        )
+
+    async def test_legacy_rp_scope_loads_canonical_inventory_v3_profile_first(self):
+        db = _FakeRpContextDb()
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 5},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:아델리트",
+                    "active_character_label": "아델리트",
+                    "rp_mode": "free",
+                },
+                db=db,
+            )
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["active_character"], "character:아델리트")
+        self.assertEqual(context["display_name"], "아델리트")
+        self.assertEqual(context["examples"][0]["text"], "나는 아직 여기서 끝낼 생각 없어.")
+        self.assertIn(("character_rp_profile", "character:아델리트"), db.exact_summary_requests)
+        self.assertEqual(db.exact_summary_requests[0], ("character_rp_profile", "character:아델리트"))
+
+    async def test_legacy_rp_scope_keeps_legacy_profile_when_canonical_profile_is_missing(self):
+        db = _FakeRpContextDb(canonical_profile_ready=False)
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 5},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:아델리트",
+                    "active_character_label": "아델리트",
+                    "rp_mode": "free",
+                },
+                db=db,
+            )
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["active_character"], "character:아델리트")
+        self.assertEqual(context["display_name"], "아델리트")
+        self.assertIn(("character_rp_profile", "character:아델리트"), db.exact_summary_requests)
+        self.assertIn(("character_rp_profile", "protagonist:named:아델리트"), db.exact_summary_requests)
+
+    async def test_inventory_only_rp_context_keeps_character_grounding(self):
+        db = _FakeInventoryOnlyRpContextDb()
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = {
+                "anchor_episode_no": 12,
+                "anchor_summary_text": "아델리트는 제일황자의 처소에서 경계를 늦추지 않는다.",
+                "trajectory_history": [
+                    {
+                        "episode_no": 8,
+                        "summary_text": "아델리트는 율리아나의 견제를 받으면서도 침착하게 대응한다.",
+                    }
+                ],
+            }
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 12},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:아델리트",
+                    "active_character_label": "아델리트",
+                    "rp_mode": "free",
+                    "read_episode_to": 12,
+                },
+                db=db,
+            )
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["display_name"], "아델리트")
+        self.assertTrue(context["speech_style"].get("tone"))
+        self.assertIn("냉정", context["personality_core"])
+        self.assertEqual(context["anchor_episode_no"], 12)
+
+    async def test_unsafe_inventory_v3_does_not_seed_new_rp_context_without_profile(self):
+        db = _FakeUnsafeInventorySeedDb()
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1108, "title": "산군이 되었다", "latestEpisodeNo": 20},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:산군",
+                    "active_character_label": "산군",
+                    "rp_mode": "free",
+                    "read_episode_to": 20,
+                },
+                db=db,
+            )
+
+        self.assertIsNone(context)
+
     def test_qa_plan_uses_gemini_for_noncreative_answers_when_enabled(self):
         plan = _build_websochat_qa_plan(
             intent="factual",
