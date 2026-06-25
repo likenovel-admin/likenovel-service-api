@@ -226,6 +226,65 @@ class MainSingleSlot(Base):
     )
 
 
+class MainCharacterSlot(Base):
+    __tablename__ = "tb_main_character_slot"
+    __table_args__ = (
+        Index(
+            "idx_main_character_slot_active",
+            "cancelled_at",
+            "publish_start_at",
+            "publish_end_at",
+            "card_order",
+        ),
+        Index("idx_main_character_slot_product", "product_id"),
+    )
+
+    character_slot_id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="노출 작품 ID"
+    )
+    character_scope_key: Mapped[str] = mapped_column(
+        String(200), nullable=False, comment="웹소챗 캐릭터 scope_key (대화 진입 해소용)"
+    )
+    character_name: Mapped[str] = mapped_column(
+        String(100), nullable=False, comment="노출 캐릭터 이름(display_name)"
+    )
+    character_image_file_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="관리자 업로드 캐릭터 이미지 file_group_id"
+    )
+    card_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="캐러셀 카드 순서"
+    )
+    publish_start_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        comment="노출 시작 일시",
+    )
+    publish_end_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=True, comment="노출 종료 일시(NULL이면 항시)"
+    )
+    cancelled_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=True, comment="취소 일시"
+    )
+    created_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
 class ProductEpisode(Base):
     __tablename__ = "tb_product_episode"  # 회차 마스터 (회차 저장/등록에서 ins)
     __table_args__ = (

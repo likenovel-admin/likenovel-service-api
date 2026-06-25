@@ -395,6 +395,96 @@ class PutMainSingleSlotReqBody(PostMainSingleSlotReqBody):
     )
 
 
+class PostMainCharacterSlotReqBody(AdminBase):
+    product_id: int = Field(examples=[1117], description="작품 ID", gt=0)
+    character_scope_key: str = Field(
+        examples=["named:란"],
+        description="웹소챗 캐릭터 scope_key",
+        min_length=1,
+        max_length=200,
+    )
+    character_name: str = Field(
+        examples=["란"],
+        description="노출 캐릭터 이름",
+        min_length=1,
+        max_length=100,
+    )
+    character_image_file_id: int = Field(
+        examples=[12345], description="캐릭터 이미지 file_group_id", gt=0
+    )
+    card_order: int = Field(default=1, examples=[1], description="카드 순서", gt=0)
+    publish_start_at: datetime = Field(
+        examples=["2026-06-02T12:00:00+09:00"], description="예약 공개 시작"
+    )
+    publish_end_at: Optional[datetime] = Field(
+        default=None,
+        examples=["2026-06-03T12:00:00+09:00"],
+        description="예약 공개 종료(NULL이면 항시)",
+    )
+
+    @field_validator("publish_end_at", mode="before")
+    def validate_publish_end_at(cls, value):
+        if value in (None, "", "Invalid Date"):
+            return None
+        return value
+
+    @field_validator("character_scope_key", "character_name")
+    def validate_non_empty_text(cls, value):
+        normalized = value.strip()
+        if normalized == "":
+            raise ValueError("빈 값은 허용되지 않습니다.")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_publish_period(self):
+        publish_start_at = self.publish_start_at
+        publish_end_at = self.publish_end_at
+        if publish_start_at is None or publish_end_at is None:
+            return self
+        if publish_start_at.tzinfo is not None and publish_end_at.tzinfo is None:
+            publish_end_at = publish_end_at.replace(tzinfo=publish_start_at.tzinfo)
+        elif publish_start_at.tzinfo is None and publish_end_at.tzinfo is not None:
+            publish_start_at = publish_start_at.replace(tzinfo=publish_end_at.tzinfo)
+        if publish_start_at >= publish_end_at:
+            raise ValueError("노출 종료일은 시작일보다 뒤여야 합니다.")
+        return self
+
+
+class PostMainCharacterSlotPublishNowReqBody(AdminBase):
+    product_id: int = Field(examples=[1117], description="작품 ID", gt=0)
+    character_scope_key: str = Field(
+        examples=["named:란"],
+        description="웹소챗 캐릭터 scope_key",
+        min_length=1,
+        max_length=200,
+    )
+    character_name: str = Field(
+        examples=["란"],
+        description="노출 캐릭터 이름",
+        min_length=1,
+        max_length=100,
+    )
+    character_image_file_id: int = Field(
+        examples=[12345], description="캐릭터 이미지 file_group_id", gt=0
+    )
+    card_order: int = Field(default=1, examples=[1], description="카드 순서", gt=0)
+
+    @field_validator("character_scope_key", "character_name")
+    def validate_non_empty_text(cls, value):
+        normalized = value.strip()
+        if normalized == "":
+            raise ValueError("빈 값은 허용되지 않습니다.")
+        return normalized
+
+
+class PutMainCharacterSlotReqBody(PostMainCharacterSlotReqBody):
+    publish_start_at: Optional[datetime] = Field(
+        default=None,
+        examples=["2026-06-02T12:00:00+09:00"],
+        description="예약 공개 시작(NULL이면 기존 시작일 유지)",
+    )
+
+
 class PostAppliedPromotionReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
     product_id: int = Field(examples=[1], description="작품 id")
