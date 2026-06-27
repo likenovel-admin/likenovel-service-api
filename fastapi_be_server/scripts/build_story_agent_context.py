@@ -1795,6 +1795,35 @@ def build_sync_repair_episode_id_set(cur, *, product_id: int, product_rows: list
     return repair_episode_ids
 
 
+def build_signal_repair_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
+    active_signal_rows = fetch_active_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
+    active_signal_scope_keys = {
+        str(row.get("scope_key") or "").strip()
+        for row in active_signal_rows
+        if str(row.get("scope_key") or "").strip()
+    }
+
+    repair_episode_ids: set[int] = set()
+    for row in product_rows:
+        episode_id = int(row.get("episode_id") or 0)
+        episode_no = int(row.get("episode_no") or 0)
+        if episode_id <= 0:
+            continue
+        scope_key = f"episode:{episode_id}"
+        if scope_key not in active_signal_scope_keys:
+            logger.info(
+                "story_agent_delta_candidate product_id=%s episode_no=%s reason=signal_repair has_episode_character_signals=0",
+                product_id,
+                episode_no,
+            )
+            repair_episode_ids.add(episode_id)
+    return repair_episode_ids
+
+
 def delta_episode_sort_key(row: dict) -> tuple[int, int]:
     return (int(row.get("episode_no") or 0), int(row.get("episode_id") or 0))
 
@@ -1816,6 +1845,11 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
             product_id=product_id,
             product_rows=product_rows,
         )
+        signal_repair_episode_ids = build_signal_repair_episode_id_set(
+            cur,
+            product_id=product_id,
+            product_rows=product_rows,
+        )
         product_filtered_rows: list[dict] = []
         for row in sorted(product_rows, key=delta_episode_sort_key):
             episode_id = int(row.get("episode_id") or 0)
@@ -1826,6 +1860,10 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
             elif episode_id in repair_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "sync_repair"
+                product_filtered_rows.append(next_row)
+            elif episode_id in signal_repair_episode_ids:
+                next_row = dict(row)
+                next_row["_delta_reason"] = "signal_repair"
                 product_filtered_rows.append(next_row)
         if max_delta_episodes > 0:
             product_filtered_rows = product_filtered_rows[:max_delta_episodes]
