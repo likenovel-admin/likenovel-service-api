@@ -5298,11 +5298,53 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         ]
 
         with patch.object(module, "build_open_add_episode_id_set", return_value={101, 102, 103, 104}), \
-             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()):
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()):
             filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=2)
 
         self.assertEqual([row["episode_no"] for row in filtered], [1, 2])
         self.assertEqual([row["_delta_reason"] for row in filtered], ["open_add", "open_add"])
+
+    def test_delta_candidate_filter_includes_missing_episode_character_signals(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value={102}):
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=0)
+
+        self.assertEqual([row["episode_no"] for row in filtered], [2])
+        self.assertEqual([row["_delta_reason"] for row in filtered], ["signal_repair"])
+
+    def test_signal_repair_episode_id_set_uses_episode_character_signal_scope_keys(self):
+        module = load_module()
+        cur = object()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(
+            module,
+            "fetch_active_summary_rows",
+            return_value=[{"scope_key": "episode:101"}],
+        ) as fetch_rows:
+            repair_ids = module.build_signal_repair_episode_id_set(
+                cur,
+                product_id=687,
+                product_rows=rows,
+            )
+
+        fetch_rows.assert_called_once_with(
+            cur=cur,
+            product_id=687,
+            summary_type="episode_character_signals",
+        )
+        self.assertEqual(repair_ids, {102})
 
     def test_delta_mode_allows_product_only_apply_for_internal_changed_row_filtering(self):
         module = load_module()

@@ -190,7 +190,12 @@ FROM (
     p.product_id,
     REPLACE(REPLACE(p.title, '\t', ' '), '\n', ' ') AS title,
     COALESCE(sacp.context_status, 'pending') AS context_status,
-    SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count
+    SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count,
+    SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_character_signal_count,
+    GREATEST(
+      SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END),
+      SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END)
+    ) AS missing_foundation_episode_count
   FROM tb_product p
   JOIN tb_product_episode pe
     ON pe.product_id = p.product_id
@@ -203,6 +208,11 @@ FROM (
    AND sacs.summary_type = 'episode_summary'
    AND sacs.is_active = 'Y'
    AND sacs.scope_key = CONCAT('episode:', pe.episode_id)
+  LEFT JOIN tb_story_agent_context_summary sacs_signal
+    ON sacs_signal.product_id = p.product_id
+   AND sacs_signal.summary_type = 'episode_character_signals'
+   AND sacs_signal.is_active = 'Y'
+   AND sacs_signal.scope_key = CONCAT('episode:', pe.episode_id)
   WHERE p.price_type IN ('free', 'paid')
     AND p.status_code = 'ongoing'
     AND p.open_yn = 'Y'
@@ -213,13 +223,13 @@ FROM (
     p.title,
     sacp.context_status
   HAVING
-    missing_open_episode_count > 0
+    missing_foundation_episode_count > 0
 ) candidates
 ORDER BY
   CASE
     WHEN candidates.context_status = 'failed' THEN 0
-    WHEN candidates.missing_open_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1
-    WHEN candidates.missing_open_episode_count < ${BACKLOG_PRIORITY_THRESHOLD} THEN 2
+    WHEN candidates.missing_foundation_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1
+    WHEN candidates.missing_foundation_episode_count < ${BACKLOG_PRIORITY_THRESHOLD} THEN 2
     ELSE 3
   END ASC,
   CASE candidates.context_status
@@ -227,7 +237,8 @@ ORDER BY
     WHEN 'pending' THEN 1
     ELSE 2
   END ASC,
-  candidates.missing_open_episode_count DESC,
+  candidates.missing_foundation_episode_count DESC,
+  candidates.missing_open_character_signal_count DESC,
   candidates.product_id ASC
 LIMIT ${MAX_PARALLEL};
 SQL
