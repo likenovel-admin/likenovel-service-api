@@ -322,10 +322,34 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertIn("is_episode_focal은 이 회차의 중심 인물이면 true", prompt)
         self.assertIn("social_call_names에는 다른 인물이 그 인물을 부르는 호칭", prompt)
         self.assertIn("persona_names에 넣고, 현실/전생/본명은 real_names", prompt)
+        self.assertIn('display_name="나"로 두고', prompt)
+        self.assertIn("연구 주제/대화 주제/사건명/상태어를 이름처럼 쓰지 마라", prompt)
         self.assertIn("호영이 조렌 테이머의 부활 중 빙의된 수호자", prompt)
         self.assertIn('target_label="조렌 테이머"', prompt)
         self.assertIn('claim_type="possessed_as"', prompt)
         self.assertIn("단순 직책, 소속, 가족/상하관계, 상태 설명, 같은 장면 등장은 identity_claims로 만들지 않는다", prompt)
+
+    def test_work_protagonist_resolution_prompt_is_work_level_and_no_fallback(self):
+        module = load_module()
+
+        prompt = module.WORK_PROTAGONIST_RESOLUTION_PROMPT
+        schema = module.WORK_PROTAGONIST_RESOLUTION_TOOL_SCHEMA["input_schema"]
+
+        self.assertIn("작품 전체 주인공은 회차 단위 속성이 아니다", prompt)
+        self.assertIn("후보를 병합", prompt)
+        self.assertIn("UNRESOLVED", prompt)
+        self.assertIn("대표 주인공 판정과 캐릭터챗 가능 인물 수집은 별도", prompt)
+        self.assertIn("선택되지 않은 주요 인물도 캐릭터챗 후보로 남을 수 있다", prompt)
+        self.assertIn("뚜렷하게 우세하면 RESOLVED", prompt)
+        self.assertIn("resolution, selected_canonical_character_key, selected_display_name, reason 키는 금지", prompt)
+        self.assertIn('"work_protagonist_key": "첫 번째 후보 canonical_character_key" 또는 null', prompt)
+        self.assertIn('"work_protagonist_keys": ["후보 canonical_character_key"]', prompt)
+        self.assertIn('reason_code="co_main_protagonists"', prompt)
+        self.assertIn("히로인, 핵심 목표 인물이 강하게 등장해도", prompt)
+        self.assertIn("행동/결정/서술의 주체를 우선", prompt)
+        self.assertIn("removed_cross_candidate_aliases는 오염 제거 기록", prompt)
+        self.assertIn("틀린 주인공 노출보다 미해결이 낫다", prompt)
+        self.assertIn("work_protagonist_key", schema["properties"])
 
     def test_print_summary_includes_provider_line_and_product_ids(self):
         module = load_module()
@@ -841,7 +865,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         profile_mock.assert_awaited_once()
 
 
-class StoryAgentContextDeltaValidationTest(TestCase):
+class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
     def test_fetch_active_character_inventory_map_accepts_v3_summary_type(self):
         module = load_module()
         cur = object()
@@ -889,6 +913,137 @@ class StoryAgentContextDeltaValidationTest(TestCase):
         module.assert_story_agent_foundation_invariants(ready_cursor, product_id=687)
         self.assertIn("character_inventory_v3", ready_cursor.query)
 
+    async def test_build_character_inventory_v3_resolved_path_applies_work_resolution(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 6):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:존" if episode_no <= 3 else "named:존",
+                            display_name="존",
+                            is_protagonist=episode_no <= 3,
+                            is_work_protagonist=episode_no <= 3,
+                            is_episode_focal=episode_no <= 3,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="named:설총",
+                            display_name="설총",
+                            is_work_protagonist=episode_no >= 2,
+                            is_episode_focal=episode_no >= 2,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                    ],
+                )
+            )
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        seolchong_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "설총")
+        resolver_payload = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": seolchong_key,
+            "work_protagonist_keys": [seolchong_key],
+            "confidence": "high",
+            "reason_code": "single_clear",
+            "rationale": "작품 전체 행동 중심은 설총이다.",
+            "rejected": [],
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+        inserted_items = []
+
+        def fake_fetch(*, cur, product_id, summary_type):
+            self.assertEqual(product_id, 687)
+            self.assertEqual(summary_type, "episode_character_signals")
+            return rows
+
+        def fake_upsert(cur, *, product_id, item):
+            inserted_items.append(item)
+            return True
+
+        request_mock = AsyncMock(return_value=resolver_payload)
+
+        with patch.object(module, "fetch_active_summary_rows", side_effect=fake_fetch), \
+             patch.object(module, "DEEPSEEK_API_KEY", "deepseek-key"), \
+             patch.object(module, "request_work_protagonist_resolution_payload", request_mock), \
+             patch.object(module, "upsert_character_inventory_v3_item", side_effect=fake_upsert), \
+             patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
+            counts = await module.build_character_inventory_v3_summaries_resolved(
+                object(),
+                product_id=687,
+                product_title="테스트 작품",
+                summary_client=object(),
+                episode_summary_rows=[
+                    {
+                        "episode_from": 1,
+                        "summary_text": "1화\n- 존과 설총이 충돌한다.\n- 키워드: 존, 설총",
+                    }
+                ],
+            )
+
+        self.assertEqual(counts, (len(inserted_items), 0))
+        request_mock.assert_awaited_once()
+        resolver_input = request_mock.await_args.kwargs["resolver_input"]
+        self.assertEqual(resolver_input["product_title"], "테스트 작품")
+        self.assertGreaterEqual(len(resolver_input["candidates"]), 2)
+        main_rows = [item for item in inserted_items if item["work_role"] == "main_protagonist"]
+        self.assertEqual([item["display_name"] for item in main_rows], ["설총"])
+        self.assertEqual(main_rows[0]["work_protagonist_resolution"]["decision"], "RESOLVED")
+        deactivate_missing.assert_called_once()
+
+    async def test_build_character_inventory_v3_resolved_path_skips_resolver_when_provider_missing(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:named:존",
+                        display_name="존",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 6)
+        ]
+        inserted_items = []
+
+        with patch.object(module, "fetch_active_summary_rows", return_value=rows), \
+             patch.object(module, "DEEPSEEK_API_KEY", ""), \
+             patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module, "request_work_protagonist_resolution_payload", AsyncMock()) as request_mock, \
+             patch.object(module, "upsert_character_inventory_v3_item", side_effect=lambda cur, *, product_id, item: inserted_items.append(item) or True), \
+             patch.object(module, "deactivate_missing_active_scopes"):
+            await module.build_character_inventory_v3_summaries_resolved(
+                object(),
+                product_id=687,
+                product_title="테스트 작품",
+                summary_client=object(),
+            )
+
+        request_mock.assert_not_awaited()
+        self.assertEqual(
+            [item["display_name"] for item in inserted_items if item["work_role"] == "main_protagonist"],
+            ["존"],
+        )
+
     def test_rp_target_quality_guard_rejects_generic_display_name(self):
         module = load_module()
 
@@ -904,6 +1059,55 @@ class StoryAgentContextDeltaValidationTest(TestCase):
 
         self.assertFalse(module.has_enough_rp_example_texts(["첫 번째", "두 번째"]))
         self.assertTrue(module.has_enough_rp_example_texts(["첫 번째", "두 번째", "세 번째"]))
+
+    def test_character_chat_context_richness_report_compares_prod_baseline_and_shadow(self):
+        module = load_module()
+        baseline = {
+            "inventory": {
+                "display_name": "백이현",
+                "aliases": ["백이현"],
+                "evidence_episode_nos": [1],
+            },
+            "profile": {
+                "speech_style": {},
+                "personality_core": [],
+                "baseline_attitude": "",
+            },
+            "examples": {"examples": []},
+        }
+        shadow = {
+            "inventory": {
+                "display_name": "백이현",
+                "aliases": ["백이현", "이현", "공자"],
+                "narration_names": ["백이현"],
+                "social_call_names": ["공자님"],
+                "persona_names": ["검은 공자"],
+                "real_names": ["백이현"],
+                "evidence_episode_nos": [1, 2, 3, 4],
+                "relation_episode_count": 3,
+            },
+            "profile": {
+                "speech_style": {"tone": "단호", "formality": "반말"},
+                "personality_core": ["원칙적", "경계심"],
+                "baseline_attitude": "경계",
+            },
+            "examples": {
+                "examples": [
+                    {"episode_no": 1, "text": "물러서지 마."},
+                    {"episode_no": 2, "text": "내가 확인하지."},
+                    {"episode_no": 3, "text": "지금은 움직여야 해."},
+                ]
+            },
+            "summary_context_lines": ["[1화] 백이현이 결심한다."],
+            "relation_context_lines": ["백이현 -> 설총: 경계"],
+        }
+
+        report = module.compare_character_chat_context_richness(baseline, shadow)
+
+        self.assertGreater(report["candidate"]["richness_score"], report["baseline"]["richness_score"])
+        self.assertGreater(report["deltas"]["example_count"], 0)
+        self.assertGreater(report["deltas"]["identity_name_signal_count"], 0)
+        self.assertIn("speech_style_field_count", report["improved_metrics"])
 
     def test_dedupe_rp_dialogue_items_preserves_episode_no(self):
         module = load_module()
@@ -993,6 +1197,49 @@ class StoryAgentContextDeltaValidationTest(TestCase):
 
         self.assertEqual(quality["status"], "excluded_generic_label")
         self.assertFalse(quality["strict_chat_ready"])
+
+    def test_direct_voice_quality_accepts_strong_role_like_persona_label(self):
+        module = load_module()
+        target = {
+            "display_name": "관리자",
+            "aliases": ["관리자"],
+            "display_safety": {"status": "pass", "reason": "stable_persona_identity"},
+            "collection_rules": {
+                "use_dialogue": True,
+                "speaker_anchors": ["관리자"],
+            },
+        }
+
+        quality = module.build_direct_voice_evidence_quality(
+            target,
+            {
+                1: "\n".join(
+                    [
+                        '관리자가 말했다. "지금부터 기록을 다시 확인한다, 누구도 먼저 움직이지 말고 내가 부를 때까지 대기해."',
+                        '관리자가 낮게 답했다. "내 허락 없이 문을 열면 모두 위험해진다, 그러니 통제선 밖으로 물러서."',
+                        '관리자는 시선을 돌리며 말했다. "남은 권한은 내가 책임지고 정리하겠다, 너희는 생존자부터 확인해."',
+                    ]
+                ),
+                2: "\n".join(
+                    [
+                        '관리자가 물었다. "네가 본 장면을 순서대로 말해, 작은 단서라도 빠뜨리면 안 된다."',
+                        '관리자가 고개를 끄덕이며 말했다. "좋아, 이번에는 네 판단을 믿고 맡기겠다, 대신 보고는 바로 올려."',
+                        '관리자가 짧게 말했다. "문제는 아직 끝나지 않았고, 내가 직접 막는다, 모두 뒤를 맡아라."',
+                    ]
+                ),
+                3: "\n".join(
+                    [
+                        '관리자가 한숨을 삼키며 답했다. "여기서 물러서면 다음 피해자는 더 늘어난다, 그러니 내가 끝까지 남겠다."',
+                        '관리자가 손을 들며 말했다. "경보는 내가 끈다, 너는 사람들을 빼내고 출구를 확보해."',
+                        '관리자가 마지막으로 답했다. "책임은 내게 있으니 모두 뒤로 물러서라, 남은 판단은 내가 한다."',
+                    ]
+                ),
+            },
+        )
+
+        self.assertEqual(quality["status"], "strict_dialogue_ready")
+        self.assertTrue(quality["strict_chat_ready"])
+        self.assertEqual(quality["dialogue"]["episode_count"], 3)
 
     def test_dialogue_attribution_rejects_addressee_as_speaker(self):
         module = load_module()
@@ -1453,6 +1700,901 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual(inventory[0]["work_role"], "main_protagonist")
         self.assertTrue(inventory[0]["is_protagonist"])
 
+    def test_inventory_v3_marks_clear_dominant_top_below_default_threshold_as_protagonist(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 21):
+            characters = []
+            if episode_no <= 15:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:named:존" if episode_no <= 4 else "named:존",
+                        display_name="존",
+                        is_protagonist=episode_no <= 4,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            if episode_no <= 8:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:named:요한" if episode_no <= 2 else "named:요한",
+                        display_name="요한",
+                        is_protagonist=episode_no <= 2,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            rows.append(signal_row(episode_no, episode_no, characters))
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(inventory[0]["display_name"], "존")
+        self.assertLess(inventory[0]["protagonist_evidence"]["score"], 0.40)
+        self.assertGreaterEqual(inventory[0]["protagonist_evidence"]["score"], 0.35)
+        self.assertEqual(inventory[0]["work_role"], "main_protagonist")
+        self.assertTrue(inventory[0]["is_protagonist"])
+
+    def test_inventory_v3_marks_role_like_name_when_top_leads_work_and_focal_evidence(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 21):
+            characters = []
+            if episode_no <= 13:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:named:추종자" if episode_no <= 5 else "named:추종자",
+                        display_name="추종자",
+                        is_protagonist=episode_no <= 5,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            if episode_no <= 12:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:named:신미아" if episode_no <= 4 else "named:신미아",
+                        display_name="신미아",
+                        is_protagonist=episode_no <= 4,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            rows.append(signal_row(episode_no, episode_no, characters))
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(inventory[0]["display_name"], "추종자")
+        self.assertLess(inventory[0]["protagonist_evidence"]["score"], 0.40)
+        self.assertEqual(inventory[0]["work_role"], "main_protagonist")
+        self.assertTrue(inventory[0]["is_protagonist"])
+
+    def test_inventory_v3_keeps_close_top_candidates_under_review_below_default_threshold(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 21):
+            characters = []
+            if episode_no <= 12:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:named:하린" if episode_no <= 4 else "named:하린",
+                        display_name="하린",
+                        is_protagonist=episode_no <= 4,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            if episode_no <= 12:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:named:미아" if episode_no <= 4 else "named:미아",
+                        display_name="미아",
+                        is_protagonist=episode_no <= 4,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            rows.append(signal_row(episode_no, episode_no, characters))
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual([row for row in inventory if row["work_role"] == "main_protagonist"], [])
+        top_rows = [row for row in inventory if row["protagonist_evidence"]["rank"] <= 2]
+        self.assertEqual(len(top_rows), 2)
+        self.assertTrue(all("AMBIGUOUS_TOP_CANDIDATES" in row["review_reasons"] for row in top_rows))
+
+    def test_inventory_v3_work_level_resolution_selects_existing_candidate_only(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 11):
+            characters = [
+                signal_character(
+                    character_key="protagonist:named:득구" if episode_no <= 5 else "named:득구",
+                    display_name="득구",
+                    is_protagonist=episode_no <= 5,
+                    role_in_episode="lead",
+                    voice_mode="dialogue",
+                    scene_weight="high",
+                ),
+            ]
+            if episode_no in {3, 4}:
+                characters.append(
+                    signal_character(
+                        character_key="named:설총",
+                        display_name="설총",
+                        role_in_episode="counterpart",
+                        voice_mode="dialogue",
+                        scene_weight="medium",
+                    )
+                )
+            rows.append(signal_row(episode_no, episode_no, characters))
+
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        deukgu_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "득구")
+        resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": deukgu_key,
+            "confidence": "medium",
+            "reason_code": "single_clear",
+            "rationale": "작품 단위 연속성이 득구 쪽에 있다.",
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows, protagonist_resolution=resolution)
+        main_rows = [row for row in inventory if row["work_role"] == "main_protagonist"]
+
+        self.assertEqual([row["display_name"] for row in main_rows], ["득구"])
+        self.assertEqual(main_rows[0]["work_protagonist_resolution"]["decision"], "RESOLVED")
+        self.assertFalse(any(row["display_name"] == "설총" and row["is_protagonist"] for row in inventory))
+
+    def test_inventory_v3_work_level_resolution_preserves_other_chat_targets(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 8):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:추종자" if episode_no <= 5 else "named:추종자",
+                            display_name="추종자",
+                            is_protagonist=episode_no <= 5,
+                            is_work_protagonist=episode_no <= 5,
+                            is_episode_focal=episode_no <= 5,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="named:신미아",
+                            display_name="신미아",
+                            is_episode_focal=episode_no in {2, 4, 6},
+                            role_in_episode="lead" if episode_no in {2, 4, 6} else "counterpart",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                    ],
+                )
+            )
+
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        follower_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "추종자")
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "RESOLVED",
+                "work_protagonist_key": follower_key,
+                "confidence": "high",
+                "reason_code": "single_clear",
+                "rationale": "추종자가 작품 전체 목표와 서술 중심에서 우세하다.",
+                "rejected": [{"key": "character:신미아", "reason": "주요 인물이지만 작품 대표 주인공은 아니다."}],
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": True,
+                    "multiple_plausible_main_candidates": False,
+                },
+            },
+        )
+        by_name = {row["display_name"]: row for row in inventory}
+        rp_target_names = [
+            target["display_name"]
+            for target in module.build_inventory_rp_targets(
+                {row["canonical_character_key"]: row for row in inventory}
+            )
+        ]
+
+        self.assertEqual(by_name["추종자"]["work_role"], "main_protagonist")
+        self.assertTrue(by_name["추종자"]["public_chat_eligible"])
+        self.assertEqual(by_name["신미아"]["work_role"], "major_character")
+        self.assertFalse(by_name["신미아"]["is_protagonist"])
+        self.assertTrue(by_name["신미아"]["public_chat_eligible"])
+        self.assertIn("추종자", rp_target_names)
+        self.assertIn("신미아", rp_target_names)
+
+    def test_inventory_v3_work_level_resolution_accepts_co_main_protagonists(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 11):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:득구" if episode_no <= 5 else "named:득구",
+                            display_name="득구",
+                            is_protagonist=episode_no <= 5,
+                            is_work_protagonist=episode_no <= 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="protagonist:named:한설총" if episode_no > 5 else "named:한설총",
+                            display_name="한설총",
+                            is_protagonist=episode_no > 5,
+                            is_work_protagonist=episode_no > 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                    ],
+                )
+            )
+
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        deukgu_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "득구")
+        seolchong_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "한설총")
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "RESOLVED",
+                "work_protagonist_key": deukgu_key,
+                "work_protagonist_keys": [deukgu_key, seolchong_key],
+                "confidence": "medium",
+                "reason_code": "co_main_protagonists",
+                "rationale": "득구와 한설총이 작품 전체 행동/서술 중심을 나눠 갖는다.",
+                "rejected": [],
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": True,
+                    "multiple_plausible_main_candidates": True,
+                },
+            },
+        )
+
+        by_name = {row["display_name"]: row for row in inventory}
+        main_names = [row["display_name"] for row in inventory if row["work_role"] == "main_protagonist"]
+
+        self.assertEqual(main_names, ["득구", "한설총"])
+        self.assertTrue(by_name["득구"]["is_protagonist"])
+        self.assertTrue(by_name["한설총"]["is_protagonist"])
+        self.assertEqual(by_name["득구"]["work_protagonist_resolution"]["work_protagonist_keys"], [deukgu_key, seolchong_key])
+        self.assertEqual(by_name["한설총"]["work_protagonist_resolution"]["reason_code"], "co_main_protagonists")
+
+    def test_inventory_v3_work_level_resolution_expands_near_tie_single_selection_to_co_main(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 11):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:득구" if episode_no <= 5 else "named:득구",
+                            display_name="득구",
+                            is_protagonist=episode_no <= 5,
+                            is_work_protagonist=episode_no <= 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="protagonist:named:한설총" if episode_no > 5 else "named:한설총",
+                            display_name="한설총",
+                            is_protagonist=episode_no > 5,
+                            is_work_protagonist=episode_no > 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                    ],
+                )
+            )
+
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        deukgu_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "득구")
+        seolchong_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "한설총")
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "RESOLVED",
+                "work_protagonist_key": deukgu_key,
+                "work_protagonist_keys": [],
+                "confidence": "medium",
+                "reason_code": "single_clear",
+                "rationale": "모델은 득구를 골랐지만 지표상 한설총도 근접 동률이다.",
+                "rejected": [],
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": True,
+                    "multiple_plausible_main_candidates": False,
+                },
+            },
+        )
+
+        main_names = [row["display_name"] for row in inventory if row["work_role"] == "main_protagonist"]
+        by_name = {row["display_name"]: row for row in inventory}
+
+        self.assertEqual(main_names, ["득구", "한설총"])
+        self.assertEqual(by_name["득구"]["work_protagonist_resolution"]["work_protagonist_keys"], [deukgu_key, seolchong_key])
+        self.assertEqual(by_name["득구"]["work_protagonist_resolution"]["reason_code"], "co_main_protagonists")
+
+    def test_inventory_v3_work_level_resolution_does_not_expand_rejected_near_tie(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 11):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:득구" if episode_no <= 5 else "named:득구",
+                            display_name="득구",
+                            is_protagonist=episode_no <= 5,
+                            is_work_protagonist=episode_no <= 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="protagonist:named:한설총" if episode_no > 5 else "named:한설총",
+                            display_name="한설총",
+                            is_protagonist=episode_no > 5,
+                            is_work_protagonist=episode_no > 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                    ],
+                )
+            )
+
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        deukgu_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "득구")
+        seolchong_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "한설총")
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "RESOLVED",
+                "work_protagonist_key": deukgu_key,
+                "work_protagonist_keys": [],
+                "confidence": "medium",
+                "reason_code": "single_clear",
+                "rationale": "모델은 득구를 단일 주인공으로 보고 한설총은 명시 제외했다.",
+                "rejected": [{"key": seolchong_key, "reason": "중요 조력자지만 작품 대표 주인공은 아니다."}],
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": True,
+                    "multiple_plausible_main_candidates": False,
+                },
+            },
+        )
+
+        main_names = [row["display_name"] for row in inventory if row["work_role"] == "main_protagonist"]
+        by_name = {row["display_name"]: row for row in inventory}
+
+        self.assertEqual(main_names, ["득구"])
+        self.assertEqual(by_name["득구"]["work_protagonist_resolution"]["work_protagonist_keys"], [deukgu_key])
+        self.assertEqual(by_name["득구"]["work_protagonist_resolution"]["reason_code"], "single_clear")
+        self.assertFalse(by_name["한설총"]["is_protagonist"])
+
+    def test_inventory_v3_work_level_resolution_converts_near_tie_unresolved_to_co_main(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 11):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:득구" if episode_no <= 5 else "named:득구",
+                            display_name="득구",
+                            is_protagonist=episode_no <= 5,
+                            is_work_protagonist=episode_no <= 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="protagonist:named:한설총" if episode_no > 5 else "named:한설총",
+                            display_name="한설총",
+                            is_protagonist=episode_no > 5,
+                            is_work_protagonist=episode_no > 5,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        ),
+                    ],
+                )
+            )
+
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        deukgu_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "득구")
+        seolchong_key = next(row["canonical_character_key"] for row in base_inventory if row["display_name"] == "한설총")
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "UNRESOLVED",
+                "work_protagonist_key": None,
+                "work_protagonist_keys": [],
+                "confidence": "low",
+                "reason_code": "ambiguous_dual_lead",
+                "rationale": "득구와 한설총이 거의 동률이다.",
+                "rejected": [],
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": False,
+                    "multiple_plausible_main_candidates": True,
+                },
+            },
+        )
+
+        main_names = [row["display_name"] for row in inventory if row["work_role"] == "main_protagonist"]
+        by_name = {row["display_name"]: row for row in inventory}
+
+        self.assertEqual(main_names, ["득구", "한설총"])
+        self.assertEqual(by_name["득구"]["work_protagonist_resolution"]["work_protagonist_keys"], [deukgu_key, seolchong_key])
+        self.assertEqual(by_name["한설총"]["work_protagonist_resolution"]["confidence"], "medium")
+
+    def test_inventory_v3_work_level_resolution_unresolved_has_no_legacy_fallback(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 21):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:존" if episode_no <= 5 else "named:존",
+                            display_name="존",
+                            is_protagonist=episode_no <= 5,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        )
+                    ],
+                )
+            )
+
+        legacy_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        self.assertEqual(legacy_inventory[0]["work_role"], "main_protagonist")
+
+        unresolved_inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "UNRESOLVED",
+                "confidence": "low",
+                "reason_code": "insufficient_evidence",
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": False,
+                    "multiple_plausible_main_candidates": True,
+                },
+            },
+        )
+
+        self.assertEqual([row for row in unresolved_inventory if row["work_role"] == "main_protagonist"], [])
+        self.assertIn("WORK_PROTAGONIST_UNRESOLVED", unresolved_inventory[0]["review_reasons"])
+
+    def test_inventory_v3_work_level_resolution_rejects_blocked_role_title_label(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 5):
+            rows.append(
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:제일황자" if episode_no <= 2 else "named:제일황자",
+                            display_name="제 일 황자",
+                            aliases=["제 일 황자"],
+                            is_protagonist=episode_no <= 2,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        )
+                    ],
+                )
+            )
+
+        base_inventory = module.aggregate_character_inventory_v3_rows(rows)
+        blocked_key = base_inventory[0]["canonical_character_key"]
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "RESOLVED",
+                "work_protagonist_key": blocked_key,
+                "confidence": "high",
+                "reason_code": "single_clear",
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": True,
+                    "multiple_plausible_main_candidates": False,
+                },
+            },
+        )
+
+        self.assertEqual([row for row in inventory if row["work_role"] == "main_protagonist"], [])
+        self.assertEqual(inventory[0]["work_protagonist_resolution"]["reason_code"], "selected_candidate_not_eligible")
+
+    def test_build_work_protagonist_resolution_input_marks_selection_eligibility(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:named:데시",
+                        display_name="데시",
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    ),
+                    signal_character(
+                        character_key="named:이안의아이",
+                        display_name="이안의 아이",
+                        aliases=["이안의 아이"],
+                        role_in_episode="support",
+                        voice_mode="dialogue",
+                        scene_weight="medium",
+                    ),
+                ],
+            )
+        ]
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        resolver_input = module.build_work_protagonist_resolution_input(
+            inventory,
+            product_id=1191,
+            product_title="환생했더니, 이세계에서 강제징집?",
+            total_signal_episodes=1,
+        )
+        by_name = {candidate["display_name"]: candidate for candidate in resolver_input["candidates"]}
+
+        self.assertTrue(by_name["데시"]["selection_eligible"])
+        self.assertFalse(by_name["이안의 아이"]["selection_eligible"])
+        self.assertTrue(resolver_input["hard_rules"]["do_not_merge_characters"])
+
+    def test_build_work_protagonist_resolution_input_compacts_duplicate_display_candidates(self):
+        module = load_module()
+        rows = [
+            {
+                "canonical_character_key": "character:나디야:dup:keep",
+                "display_name": "나디야",
+                "aliases": ["나디야", "나디야는"],
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 10,
+                "first_seen_episode_no": 1,
+                "latest_seen_episode_no": 10,
+                "evidence_episode_nos": list(range(1, 11)),
+                "protagonist_evidence": {"rank": 1, "score": 0.313},
+                "work_protagonist_evidence": {"episode_count": 10},
+                "episode_focal_evidence": {"episode_count": 10},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 10},
+                "scene_weight_counts": {"high": 10},
+                "voice_mode_counts": {"dialogue": 8, "monologue": 0},
+                "relation_episode_count": 4,
+                "review_reasons": ["AMBIGUOUS_TOP_CANDIDATES", "duplicate_canonical_key"],
+            },
+            {
+                "canonical_character_key": "character:오리온",
+                "display_name": "오리온",
+                "aliases": ["오리온"],
+                "identity_status": "RESOLVED_NAMED",
+                "identity_conflict_reasons": [],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 23,
+                "first_seen_episode_no": 3,
+                "latest_seen_episode_no": 35,
+                "evidence_episode_nos": list(range(3, 26)),
+                "protagonist_evidence": {"rank": 2, "score": 0.29},
+                "work_protagonist_evidence": {"episode_count": 6},
+                "episode_focal_evidence": {"episode_count": 6},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 8},
+                "scene_weight_counts": {"high": 18},
+                "voice_mode_counts": {"dialogue": 18, "monologue": 0},
+                "relation_episode_count": 12,
+                "review_reasons": ["AMBIGUOUS_TOP_CANDIDATES"],
+            },
+            {
+                "canonical_character_key": "character:나디야:dup:polluted",
+                "display_name": "나디야",
+                "aliases": ["나디야", "오리온"],
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 5,
+                "first_seen_episode_no": 11,
+                "latest_seen_episode_no": 15,
+                "evidence_episode_nos": list(range(11, 16)),
+                "protagonist_evidence": {"rank": 4, "score": 0.224},
+                "work_protagonist_evidence": {"episode_count": 5},
+                "episode_focal_evidence": {"episode_count": 4},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 5},
+                "scene_weight_counts": {"high": 5},
+                "voice_mode_counts": {"dialogue": 4, "monologue": 0},
+                "relation_episode_count": 3,
+                "review_reasons": ["duplicate_canonical_key"],
+            },
+            {
+                "canonical_character_key": "character:나디야:dup:late",
+                "display_name": "나디야",
+                "aliases": ["나디야"],
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 10,
+                "first_seen_episode_no": 16,
+                "latest_seen_episode_no": 25,
+                "evidence_episode_nos": list(range(16, 26)),
+                "protagonist_evidence": {"rank": 6, "score": 0.18},
+                "work_protagonist_evidence": {"episode_count": 0},
+                "episode_focal_evidence": {"episode_count": 3},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 7},
+                "scene_weight_counts": {"high": 8},
+                "voice_mode_counts": {"dialogue": 7, "monologue": 0},
+                "relation_episode_count": 8,
+                "review_reasons": ["duplicate_canonical_key"],
+            },
+        ]
+
+        resolver_input = module.build_work_protagonist_resolution_input(
+            rows,
+            product_id=1159,
+            product_title="별이 뜨기 전에",
+            total_signal_episodes=35,
+        )
+        by_name = {candidate["display_name"]: candidate for candidate in resolver_input["candidates"]}
+
+        self.assertEqual([candidate["display_name"] for candidate in resolver_input["candidates"]].count("나디야"), 1)
+        self.assertIn("오리온", by_name)
+        self.assertEqual(by_name["나디야"]["canonical_character_key"], "character:나디야:dup:keep")
+        self.assertEqual(by_name["나디야"]["distinct_episode_count"], 20)
+        self.assertGreater(by_name["나디야"]["protagonist_score"], 0.313)
+        self.assertNotIn("오리온", by_name["나디야"]["aliases"])
+        self.assertEqual(by_name["나디야"]["duplicate_compaction"]["row_count"], 3)
+        self.assertEqual(by_name["나디야"]["duplicate_compaction"]["evidence_row_count"], 2)
+        self.assertEqual(
+            by_name["나디야"]["duplicate_compaction"]["ignored_cross_alias_keys"],
+            ["character:나디야:dup:polluted"],
+        )
+        self.assertEqual(by_name["나디야"]["duplicate_compaction"]["removed_cross_candidate_aliases"], ["오리온"])
+        self.assertTrue(by_name["나디야"]["selection_eligible"])
+
+    def test_build_work_protagonist_resolution_input_keeps_representative_cross_alias_evidence(self):
+        module = load_module()
+        rows = [
+            {
+                "canonical_character_key": "character:레이븐:dup:main",
+                "display_name": "레이븐",
+                "aliases": ["레이븐", "주인공"],
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 80,
+                "first_seen_episode_no": 1,
+                "latest_seen_episode_no": 80,
+                "evidence_episode_nos": list(range(1, 81)),
+                "protagonist_evidence": {"rank": 1, "score": 0.8},
+                "work_protagonist_evidence": {"episode_count": 75},
+                "episode_focal_evidence": {"episode_count": 75},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 70},
+                "scene_weight_counts": {"high": 75},
+                "voice_mode_counts": {"dialogue": 60, "monologue": 0},
+                "relation_episode_count": 40,
+                "review_reasons": ["duplicate_canonical_key"],
+            },
+            {
+                "canonical_character_key": "character:주인공",
+                "display_name": "주인공",
+                "aliases": ["주인공"],
+                "identity_status": "UNRESOLVED",
+                "identity_conflict_reasons": ["unresolved_generic_first_person"],
+                "display_safety": {"status": "fail", "reason": "generic_display_name"},
+                "display_name_type": "generic",
+                "entity_kind": "person",
+                "distinct_episode_count": 2,
+                "first_seen_episode_no": 1,
+                "latest_seen_episode_no": 2,
+                "evidence_episode_nos": [1, 2],
+                "protagonist_evidence": {"rank": 2, "score": 0.2},
+                "work_protagonist_evidence": {"episode_count": 2},
+                "episode_focal_evidence": {"episode_count": 2},
+                "first_person_evidence": {"episode_count": 2},
+                "episode_role_counts": {"lead": 2},
+                "scene_weight_counts": {"high": 2},
+                "voice_mode_counts": {"dialogue": 0, "monologue": 2},
+                "relation_episode_count": 0,
+                "review_reasons": [],
+            },
+            {
+                "canonical_character_key": "character:레이븐:dup:minor",
+                "display_name": "레이븐",
+                "aliases": ["레이븐"],
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 3,
+                "first_seen_episode_no": 81,
+                "latest_seen_episode_no": 83,
+                "evidence_episode_nos": [81, 82, 83],
+                "protagonist_evidence": {"rank": 3, "score": 0.05},
+                "work_protagonist_evidence": {"episode_count": 0},
+                "episode_focal_evidence": {"episode_count": 0},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 1},
+                "scene_weight_counts": {"high": 1},
+                "voice_mode_counts": {"dialogue": 2, "monologue": 0},
+                "relation_episode_count": 1,
+                "review_reasons": ["duplicate_canonical_key"],
+            },
+        ]
+
+        resolver_input = module.build_work_protagonist_resolution_input(
+            rows,
+            product_id=1103,
+            product_title="오염세계의 까마귀",
+            total_signal_episodes=94,
+        )
+        by_name = {candidate["display_name"]: candidate for candidate in resolver_input["candidates"]}
+
+        self.assertEqual(by_name["레이븐"]["distinct_episode_count"], 83)
+        self.assertGreaterEqual(by_name["레이븐"]["work_protagonist_hint_count"], 75)
+        self.assertNotIn("주인공", by_name["레이븐"]["aliases"])
+        self.assertEqual(by_name["레이븐"]["duplicate_compaction"]["evidence_row_count"], 2)
+        self.assertEqual(by_name["레이븐"]["duplicate_compaction"]["ignored_cross_alias_keys"], [])
+
+    def test_build_work_protagonist_resolution_input_sorts_after_duplicate_compaction(self):
+        module = load_module()
+        rows = [
+            {
+                "canonical_character_key": "character:남우진",
+                "display_name": "남우진",
+                "aliases": ["남우진"],
+                "identity_status": "RESOLVED_NAMED",
+                "identity_conflict_reasons": [],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 32,
+                "first_seen_episode_no": 1,
+                "latest_seen_episode_no": 32,
+                "evidence_episode_nos": list(range(1, 33)),
+                "protagonist_evidence": {"rank": 1, "score": 0.36},
+                "work_protagonist_evidence": {"episode_count": 11},
+                "episode_focal_evidence": {"episode_count": 11},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 18},
+                "scene_weight_counts": {"high": 18},
+                "voice_mode_counts": {"dialogue": 30, "monologue": 0},
+                "relation_episode_count": 12,
+                "review_reasons": ["AMBIGUOUS_TOP_CANDIDATES"],
+            },
+            {
+                "canonical_character_key": "character:송하늘:dup:first_person",
+                "display_name": "송하늘",
+                "aliases": ["송하늘", "하늘"],
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 16,
+                "first_seen_episode_no": 9,
+                "latest_seen_episode_no": 41,
+                "evidence_episode_nos": list(range(9, 25)),
+                "protagonist_evidence": {"rank": 2, "score": 0.33},
+                "work_protagonist_evidence": {"episode_count": 12},
+                "episode_focal_evidence": {"episode_count": 12},
+                "first_person_evidence": {"episode_count": 11},
+                "episode_role_counts": {"lead": 7},
+                "scene_weight_counts": {"high": 14},
+                "voice_mode_counts": {"dialogue": 16, "monologue": 0},
+                "relation_episode_count": 10,
+                "review_reasons": ["duplicate_canonical_key"],
+            },
+            {
+                "canonical_character_key": "character:송하늘:dup:named",
+                "display_name": "송하늘",
+                "aliases": ["송하늘", "하늘 씨"],
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+                "display_name_type": "named",
+                "entity_kind": "person",
+                "distinct_episode_count": 27,
+                "first_seen_episode_no": 1,
+                "latest_seen_episode_no": 47,
+                "evidence_episode_nos": list(range(1, 28)),
+                "protagonist_evidence": {"rank": 3, "score": 0.30},
+                "work_protagonist_evidence": {"episode_count": 9},
+                "episode_focal_evidence": {"episode_count": 9},
+                "first_person_evidence": {"episode_count": 0},
+                "episode_role_counts": {"lead": 11},
+                "scene_weight_counts": {"high": 22},
+                "voice_mode_counts": {"dialogue": 20, "monologue": 0},
+                "relation_episode_count": 12,
+                "review_reasons": ["duplicate_canonical_key"],
+            },
+        ]
+
+        resolver_input = module.build_work_protagonist_resolution_input(
+            rows,
+            product_id=1161,
+            product_title="사랑을 잊은 신데렐라에게 고백하는 법",
+            total_signal_episodes=47,
+        )
+
+        self.assertEqual(resolver_input["candidates"][0]["display_name"], "송하늘")
+        self.assertGreater(
+            resolver_input["candidates"][0]["protagonist_score"],
+            resolver_input["candidates"][1]["protagonist_score"],
+        )
+
     def test_inventory_v3_does_not_attach_generic_first_person_to_top_named_candidate(self):
         module = load_module()
         rows = [
@@ -1506,6 +2648,474 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertFalse(by_display_name["나"]["is_protagonist"])
         self.assertEqual(by_display_name["나"]["protagonist_confidence"], "low")
         self.assertEqual(by_display_name["백이현"]["source_character_keys"], ["named:백이현"])
+
+    def test_inventory_v3_generic_first_person_source_key_does_not_merge_different_named_speakers(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="남우진",
+                        aliases=["남우진"],
+                        is_protagonist=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="송하늘",
+                        aliases=["송하늘"],
+                        is_protagonist=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+            signal_row(
+                3,
+                3,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="하늘 씨",
+                        aliases=["하늘 씨", "하늘"],
+                        is_protagonist=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        by_name = {row["display_name"]: row for row in inventory}
+
+        self.assertIn("남우진", by_name)
+        self.assertIn("송하늘", by_name)
+        self.assertNotEqual(by_name["남우진"]["canonical_character_key"], by_name["송하늘"]["canonical_character_key"])
+        self.assertEqual(by_name["송하늘"]["distinct_episode_count"], 2)
+        self.assertIn("하늘 씨", by_name["송하늘"]["aliases"])
+
+    def test_inventory_v3_rejects_unverified_first_person_topic_as_public_identity(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="주제",
+                        aliases=["주제"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "주제")
+        self.assertEqual(inventory[0]["identity_status"], "UNRESOLVED")
+        self.assertIn("first_person_identity_unverified", inventory[0]["identity_conflict_reasons"])
+        self.assertEqual(
+            inventory[0]["display_safety"],
+            {"status": "review", "reason": "first_person_identity_unverified"},
+        )
+        self.assertFalse(inventory[0]["is_protagonist"])
+        self.assertFalse(inventory[0]["public_chat_eligible"])
+        self.assertFalse(inventory[0]["public_slot_eligible"])
+
+    def test_inventory_v3_keeps_first_person_identity_with_positive_name_signal(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="송하늘",
+                        aliases=["송하늘"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        is_first_person=True,
+                        social_call_names=["송하늘"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "송하늘")
+        self.assertEqual(inventory[0]["identity_status"], "RESOLVED_NAMED")
+        self.assertNotIn("first_person_identity_unverified", inventory[0]["identity_conflict_reasons"])
+        self.assertEqual(inventory[0]["display_safety"], {"status": "pass", "reason": "resolved_named_identity"})
+        self.assertTrue(inventory[0]["public_chat_eligible"])
+        self.assertTrue(inventory[0]["public_slot_eligible"])
+
+    def test_inventory_v3_merges_possessed_first_person_into_named_identity(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:named:그",
+                        display_name="그",
+                        aliases=["그", "데시"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="narration_only",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="주인공",
+                        aliases=["주인공"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="narration_only",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "named:데시",
+                                "target_label": "데시",
+                                "relation_tag": "빙의",
+                                "direction": "to_target",
+                            }
+                        ],
+                    ),
+                    signal_character(
+                        character_key="named:데시",
+                        display_name="데시",
+                        aliases=["데시"],
+                        narration_names=["데시"],
+                        role_in_episode="support",
+                        voice_mode="narration_only",
+                        scene_weight="low",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:first_person",
+                                "target_label": "주인공",
+                                "relation_tag": "빙의당함",
+                                "direction": "from_target",
+                            }
+                        ],
+                    ),
+                ],
+            ),
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        character = inventory[0]
+        self.assertEqual(character["display_name"], "데시")
+        self.assertEqual(character["work_role"], "main_protagonist")
+        self.assertEqual(character["work_protagonist_evidence"]["episode_count"], 2)
+        self.assertEqual(character["episode_focal_evidence"]["episode_count"], 2)
+        self.assertEqual(character["distinct_episode_count"], 2)
+        self.assertEqual(
+            set(character["source_character_keys"]),
+            {"protagonist:named:그", "protagonist:first_person", "named:데시"},
+        )
+        self.assertNotIn("unresolved_generic_first_person", character["identity_conflict_reasons"])
+        self.assertFalse(character["public_chat_eligible"])
+        self.assertFalse(character["public_slot_eligible"])
+
+    def test_inventory_v3_does_not_merge_one_way_possession_relation_without_alias(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="주인공",
+                        aliases=["주인공"],
+                        is_protagonist=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="narration_only",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "named:데시",
+                                "target_label": "데시",
+                                "relation_tag": "빙의",
+                                "direction": "to_target",
+                            }
+                        ],
+                    ),
+                    signal_character(
+                        character_key="named:데시",
+                        display_name="데시",
+                        aliases=["데시"],
+                        role_in_episode="support",
+                        voice_mode="narration_only",
+                        scene_weight="low",
+                    ),
+                ],
+            )
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        source_sets = [set(row["source_character_keys"]) for row in inventory]
+
+        self.assertIn({"protagonist:first_person"}, source_sets)
+        self.assertIn({"named:데시"}, source_sets)
+        self.assertNotIn({"protagonist:first_person", "named:데시"}, source_sets)
+
+    def test_inventory_v3_does_not_merge_possession_target_with_independent_voice(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="주인공",
+                        aliases=["주인공"],
+                        is_protagonist=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="monologue",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "named:데시",
+                                "target_label": "데시",
+                                "relation_tag": "빙의",
+                                "direction": "to_target",
+                            }
+                        ],
+                    ),
+                    signal_character(
+                        character_key="named:데시",
+                        display_name="데시",
+                        aliases=["데시"],
+                        role_in_episode="counterpart",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:first_person",
+                                "target_label": "주인공",
+                                "relation_tag": "빙의당함",
+                                "direction": "from_target",
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        source_sets = [set(row["source_character_keys"]) for row in inventory]
+
+        self.assertIn({"protagonist:first_person"}, source_sets)
+        self.assertIn({"named:데시"}, source_sets)
+        self.assertNotIn({"protagonist:first_person", "named:데시"}, source_sets)
+
+    def test_inventory_v3_does_not_merge_recall_memory_relation_as_identity(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:named:주인공",
+                        display_name="주인공",
+                        aliases=["주인공"],
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="narration_only",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "named:사촌누나",
+                                "target_label": "사촌 누나",
+                                "relation_tag": "회귀 전 기억",
+                                "direction": "to_target",
+                            }
+                        ],
+                    ),
+                    signal_character(
+                        character_key="named:사촌누나",
+                        display_name="사촌 누나",
+                        aliases=["사촌 누나"],
+                        role_in_episode="support",
+                        voice_mode="narration_only",
+                        scene_weight="medium",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:named:주인공",
+                                "target_label": "주인공",
+                                "relation_tag": "회귀 전 기억",
+                                "direction": "from_target",
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        source_sets = [set(row["source_character_keys"]) for row in inventory]
+
+        self.assertIn({"protagonist:named:주인공"}, source_sets)
+        self.assertIn({"named:사촌누나"}, source_sets)
+        self.assertNotIn({"protagonist:named:주인공", "named:사촌누나"}, source_sets)
+
+    def test_inventory_v3_does_not_merge_named_protagonist_into_possession_target_by_relation_only(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:named:추종자",
+                        display_name="추종자",
+                        aliases=["추종자"],
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "named:신미아",
+                                "target_label": "신미아",
+                                "relation_tag": "빙의 대상",
+                                "direction": "to_target",
+                            }
+                        ],
+                    ),
+                    signal_character(
+                        character_key="named:신미아",
+                        display_name="신미아",
+                        aliases=["신미아"],
+                        role_in_episode="support",
+                        voice_mode="narration_only",
+                        scene_weight="medium",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:named:추종자",
+                                "target_label": "추종자",
+                                "relation_tag": "빙의 대상",
+                                "direction": "from_target",
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        source_sets = [set(row["source_character_keys"]) for row in inventory]
+
+        self.assertIn({"protagonist:named:추종자"}, source_sets)
+        self.assertIn({"named:신미아"}, source_sets)
+        self.assertNotIn({"protagonist:named:추종자", "named:신미아"}, source_sets)
+
+    def test_inventory_v3_does_not_merge_blocked_role_source_into_named_identity(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="제 일 황자",
+                        aliases=["제 일 황자"],
+                        is_protagonist=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                        voice_mode="narration_only",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:named:아델리트",
+                                "target_label": "아델리트",
+                                "relation_tag": "빙의",
+                                "direction": "to_target",
+                            }
+                        ],
+                    ),
+                    signal_character(
+                        character_key="protagonist:named:아델리트",
+                        display_name="아델리트",
+                        aliases=["아델리트"],
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="narration_only",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:first_person",
+                                "target_label": "제 일 황자",
+                                "relation_tag": "빙의",
+                                "direction": "from_target",
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        source_sets = [set(row["source_character_keys"]) for row in inventory]
+
+        self.assertIn({"protagonist:first_person"}, source_sets)
+        self.assertIn({"protagonist:named:아델리트"}, source_sets)
+        self.assertNotIn({"protagonist:first_person", "protagonist:named:아델리트"}, source_sets)
 
     def test_inventory_v3_keeps_related_named_characters_split(self):
         module = load_module()
@@ -1668,6 +3278,37 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             {"protagonist:named:남기준", "protagonist:named:기준"},
         )
         self.assertEqual(main_rows[0]["episode_focal_evidence"]["episode_count"], 3)
+
+    def test_inventory_v3_cannot_link_parent_index_tracks_component_unions(self):
+        module = load_module()
+        parents = [0, 1, 2, 3]
+        cannot_link_parent_index = module._build_cannot_link_parent_index(
+            parents,
+            {(0, 2), (1, 3)},
+        )
+
+        self.assertTrue(module._would_merge_cannot_link_pair(parents, 0, 2, cannot_link_parent_index))
+        self.assertFalse(module._would_merge_cannot_link_pair(parents, 0, 1, cannot_link_parent_index))
+
+        module._union_observations_with_cannot_link_indexes(
+            parents,
+            0,
+            1,
+            [cannot_link_parent_index],
+        )
+
+        self.assertTrue(module._would_merge_cannot_link_pair(parents, 0, 2, cannot_link_parent_index))
+        self.assertTrue(module._would_merge_cannot_link_pair(parents, 1, 3, cannot_link_parent_index))
+        self.assertFalse(module._would_merge_cannot_link_pair(parents, 2, 3, cannot_link_parent_index))
+
+        module._union_observations_with_cannot_link_indexes(
+            parents,
+            2,
+            3,
+            [cannot_link_parent_index],
+        )
+
+        self.assertTrue(module._would_merge_cannot_link_pair(parents, 0, 2, cannot_link_parent_index))
 
     def test_inventory_v3_does_not_merge_name_variants_when_same_episode_cannot_linked(self):
         module = load_module()
@@ -1899,6 +3540,605 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual(main_rows[0]["persona_names"], ["조렌 테이머"])
         self.assertEqual(main_rows[0]["real_names"], ["방호영"])
         self.assertIn("호영", main_rows[0]["aliases"])
+
+    def test_inventory_v3_recurring_protagonist_alias_bridge_uses_persona_display(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="named:조렌테이머",
+                        display_name="조렌 테이머",
+                        aliases=["조렌 테이머", "조렌"],
+                        role_in_episode="counterpart",
+                        voice_mode="dialogue",
+                        scene_weight="medium",
+                    ),
+                    signal_character(
+                        character_key="protagonist:named:방호영",
+                        display_name="방호영",
+                        aliases=["방호영", "호영"],
+                        is_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="narration_only",
+                        scene_weight="high",
+                    ),
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        character_key="protagonist:named:호영",
+                        display_name="호영",
+                        aliases=["호영", "조렌 테이머", "수호자"],
+                        is_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+            signal_row(
+                3,
+                3,
+                [
+                    signal_character(
+                        character_key="protagonist:named:조렌테이머",
+                        display_name="조렌 테이머",
+                        aliases=["조렌 테이머", "변방백"],
+                        is_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                        relation_edges=[
+                            {
+                                "target_key": "named:호영",
+                                "target_label": "호영",
+                                "relation_tag": "동행",
+                            }
+                        ],
+                    ),
+                    signal_character(
+                        character_key="named:호영",
+                        display_name="호영",
+                        aliases=["호영"],
+                        role_in_episode="support",
+                        voice_mode="dialogue",
+                        scene_weight="medium",
+                    ),
+                ],
+            ),
+            signal_row(
+                13,
+                13,
+                [
+                    signal_character(
+                        character_key="protagonist:named:호영",
+                        display_name="호영",
+                        aliases=["호영", "조렌 테이머"],
+                        is_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        main_rows = [row for row in inventory if row["work_role"] == "main_protagonist"]
+        source_sets = [set(row["source_character_keys"]) for row in inventory]
+
+        self.assertEqual(len(main_rows), 1)
+        self.assertEqual(main_rows[0]["display_name"], "조렌 테이머")
+        self.assertEqual(main_rows[0]["display_name_source"], "alias_bridge")
+        self.assertTrue(main_rows[0]["public_chat_eligible"])
+        self.assertTrue(
+            any(
+                {
+                    "named:조렌테이머",
+                    "named:호영",
+                    "protagonist:named:방호영",
+                    "protagonist:named:조렌테이머",
+                    "protagonist:named:호영",
+                } <= source_set
+                for source_set in source_sets
+            )
+        )
+
+    def test_inventory_v3_relation_edge_keeps_honorific_alias_split_without_persona_display(self):
+        module = load_module()
+        rows = []
+        for episode_no in range(1, 7):
+            characters = []
+            if episode_no <= 4:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:named:남우진",
+                        display_name="남우진",
+                        aliases=["남우진", "우진"],
+                        is_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            characters.append(
+                signal_character(
+                    character_key="named:하늘",
+                    display_name="하늘",
+                    aliases=["하늘"],
+                    role_in_episode="counterpart",
+                    voice_mode="dialogue",
+                    scene_weight="medium",
+                    relation_edges=[
+                        {
+                            "target_key": "protagonist:first_person",
+                            "target_label": "하늘 씨",
+                            "relation_tag": "연인",
+                        }
+                    ]
+                    if episode_no >= 5
+                    else [],
+                )
+            )
+            if episode_no >= 5:
+                characters.append(
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="하늘 씨",
+                        aliases=["하늘 씨", "하늘"],
+                        is_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                )
+            rows.append(signal_row(episode_no, episode_no, characters))
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        main_rows = [row for row in inventory if row["work_role"] == "main_protagonist"]
+        haneul_rows = [
+            row
+            for row in inventory
+            if any(alias in {"하늘", "하늘 씨"} for alias in row["aliases"])
+        ]
+
+        self.assertEqual(len(main_rows), 1)
+        self.assertEqual(main_rows[0]["display_name"], "남우진")
+        self.assertGreaterEqual(len(haneul_rows), 2)
+
+    def test_inventory_v3_display_name_prefers_frequent_full_name_over_single_typo_variant(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="named:하늘",
+                        display_name="송하늘",
+                        aliases=["송하늘", "하늘"],
+                        role_in_episode="counterpart",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+        rows.extend(
+            [
+                signal_row(
+                    4,
+                    4,
+                    [
+                        signal_character(
+                            character_key="named:하늘",
+                            display_name="하늘",
+                            aliases=["하늘"],
+                            role_in_episode="counterpart",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        )
+                    ],
+                ),
+                signal_row(
+                    5,
+                    5,
+                    [
+                        signal_character(
+                            character_key="named:하늘",
+                            display_name="솔하늘",
+                            aliases=["솔하늘", "하늘"],
+                            role_in_episode="counterpart",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        )
+                    ],
+                ),
+            ]
+        )
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "송하늘")
+        self.assertIn("솔하늘", inventory[0]["aliases"])
+
+    def test_inventory_v3_display_name_keeps_single_full_name_without_competing_full_name(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="named:다이애나",
+                        display_name="다이애나",
+                        aliases=["다이애나"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 5)
+        ]
+        rows.append(
+            signal_row(
+                5,
+                5,
+                [
+                    signal_character(
+                        character_key="named:다이애나",
+                        display_name="다이애나 체페슈",
+                        aliases=["다이애나 체페슈", "다이애나"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+        )
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "다이애나 체페슈")
+        self.assertIn("다이애나 체페슈", inventory[0]["aliases"])
+
+    def test_inventory_v3_display_name_prefers_frequent_name_over_contextual_suffix_variant(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="named:파이크",
+                        display_name="파이크",
+                        aliases=["파이크"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 5)
+        ]
+        rows.append(
+            signal_row(
+                5,
+                5,
+                [
+                    signal_character(
+                        character_key="named:파이크",
+                        display_name="파이크 단장",
+                        aliases=["파이크 단장", "파이크"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+        )
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "파이크")
+        self.assertIn("파이크 단장", inventory[0]["aliases"])
+
+    def test_inventory_v3_display_name_prefers_frequent_name_over_single_syllable_typo_suffix(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="named:깁소필라",
+                        display_name="깁소필라",
+                        aliases=["깁소필라"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 5)
+        ]
+        rows.append(
+            signal_row(
+                5,
+                5,
+                [
+                    signal_character(
+                        character_key="named:깁소필라",
+                        display_name="깁소 필라니",
+                        aliases=["깁소 필라니", "깁소필라"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+        )
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "깁소필라")
+        self.assertIn("깁소 필라니", inventory[0]["aliases"])
+
+    def test_inventory_v3_display_name_prefers_full_name_over_contextual_call_variant(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="named:주연",
+                        display_name="나주연",
+                        aliases=["나주연", "주연"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+        ]
+        rows.extend(
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="named:주연",
+                        display_name="주연이",
+                        aliases=["주연이", "주연"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(2, 6)
+        )
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "나주연")
+        self.assertIn("주연이", inventory[0]["aliases"])
+
+    def test_inventory_v3_contextual_call_variant_does_not_force_cross_cluster_merge(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:named:남우진",
+                        display_name="남우진",
+                        aliases=["남우진", "우진"],
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        character_key="named:우진씨",
+                        display_name="우진 씨",
+                        aliases=["우진 씨", "우진"],
+                        role_in_episode="counterpart",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            ),
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 2)
+        display_names = {row["display_name"] for row in inventory}
+        self.assertIn("남우진", display_names)
+        self.assertIn("우진", display_names)
+        self.assertNotIn("우진 씨", display_names)
+
+    def test_inventory_v3_contextual_call_suffix_without_base_evidence_is_kept(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="named:다온이",
+                        display_name="다온이",
+                        aliases=["다온이"],
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "다온이")
+
+    def test_inventory_v3_parenthetical_generic_display_uses_inner_persona_name(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:named:나오레오",
+                        display_name="나(오레오)",
+                        aliases=["나(오레오)", "오레오", "나"],
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "오레오")
+        self.assertIn("나(오레오)", inventory[0]["aliases"])
+
+    def test_inventory_v3_rejects_generic_parenthetical_protagonist_display(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:named:서술자주인공",
+                        display_name="서술자(주인공)",
+                        aliases=["서술자(주인공)", "주인공"],
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="monologue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 5)
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        resolver_input = module.build_work_protagonist_resolution_input(
+            inventory,
+            product_id=1149,
+            product_title="멸망한 국가의 도련님은 진실을 알고 있다",
+            total_signal_episodes=4,
+        )
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_safety"], {"status": "fail", "reason": "role_or_relation_label"})
+        self.assertFalse(inventory[0]["public_chat_eligible"])
+        self.assertFalse(inventory[0]["public_slot_eligible"])
+        self.assertFalse(resolver_input["candidates"][0]["selection_eligible"])
+
+    def test_inventory_v3_suppresses_duplicate_public_display_rows(self):
+        module = load_module()
+        rows = [
+            {
+                "canonical_character_key": "character:송하늘:dup:keep",
+                "display_name": "송하늘",
+                "work_role": "main_protagonist",
+                "identity_status": "RESOLVED_NAMED",
+                "identity_conflict_reasons": [],
+                "distinct_episode_count": 8,
+                "voice_mode_counts": {"dialogue": 5},
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "review_reasons": [],
+            },
+            {
+                "canonical_character_key": "character:송하늘:dup:drop",
+                "display_name": "송하늘",
+                "work_role": "major_character",
+                "identity_status": "CONFLICT",
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "distinct_episode_count": 4,
+                "voice_mode_counts": {"dialogue": 3},
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "review_reasons": [],
+            },
+        ]
+
+        module._suppress_duplicate_public_display_rows(rows)
+
+        self.assertTrue(rows[0]["public_chat_eligible"])
+        self.assertTrue(rows[0]["public_slot_eligible"])
+        self.assertFalse(rows[1]["public_chat_eligible"])
+        self.assertFalse(rows[1]["public_slot_eligible"])
+        self.assertIn("DUPLICATE_PUBLIC_DISPLAY_NAME", rows[1]["review_reasons"])
+
+    def test_inventory_v3_suppresses_main_alias_slot_without_hiding_chat(self):
+        module = load_module()
+        rows = [
+            {
+                "canonical_character_key": "character:남우진",
+                "display_name": "남우진",
+                "aliases": ["남우진", "우진"],
+                "work_role": "main_protagonist",
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "review_reasons": [],
+            },
+            {
+                "canonical_character_key": "character:우진",
+                "display_name": "우진",
+                "aliases": ["우진", "우진 씨"],
+                "work_role": "major_character",
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "review_reasons": [],
+            },
+        ]
+
+        module._suppress_main_alias_public_slot_rows(rows)
+
+        self.assertTrue(rows[0]["public_slot_eligible"])
+        self.assertTrue(rows[1]["public_chat_eligible"])
+        self.assertFalse(rows[1]["public_slot_eligible"])
+        self.assertIn("MAIN_ALIAS_PUBLIC_SLOT_DUPLICATE", rows[1]["review_reasons"])
 
     def test_inventory_v3_social_role_call_does_not_replace_resolved_real_name_display(self):
         module = load_module()
@@ -2648,6 +4888,70 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             module.build_inventory_rp_targets({inventory[0]["canonical_character_key"]: inventory[0]}),
             [],
         )
+
+    def test_inventory_v3_public_chat_gate_accepts_strong_role_like_persona(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:named:관리자" if episode_no <= 4 else "named:관리자",
+                        display_name="관리자",
+                        aliases=["관리자"],
+                        entity_kind="stable_role",
+                        is_protagonist=episode_no <= 4,
+                        is_episode_focal=episode_no <= 6,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 7)
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_name"], "관리자")
+        self.assertEqual(inventory[0]["work_role"], "main_protagonist")
+        self.assertEqual(inventory[0]["display_safety"], {"status": "pass", "reason": "stable_persona_identity"})
+        self.assertTrue(inventory[0]["public_chat_eligible"])
+        self.assertTrue(inventory[0]["public_slot_eligible"])
+        self.assertEqual(
+            [target["display_name"] for target in module.build_inventory_rp_targets({inventory[0]["canonical_character_key"]: inventory[0]})],
+            ["관리자"],
+        )
+
+    def test_inventory_v3_public_chat_gate_rejects_weak_role_like_persona(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="named:관리자",
+                        display_name="관리자",
+                        aliases=["관리자"],
+                        entity_kind="stable_role",
+                        role_in_episode="support",
+                        voice_mode="dialogue" if episode_no == 1 else "narration_only",
+                        scene_weight="medium",
+                    )
+                ],
+            )
+            for episode_no in range(1, 3)
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["display_safety"], {"status": "fail", "reason": "generic_display_name"})
+        self.assertFalse(inventory[0]["public_chat_eligible"])
+        self.assertFalse(inventory[0]["public_slot_eligible"])
 
     def test_inventory_v3_source_hash_changes_when_public_gate_changes(self):
         module = load_module()
