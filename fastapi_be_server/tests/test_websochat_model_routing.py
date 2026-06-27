@@ -6,6 +6,7 @@ from app.exceptions import CustomResponseException
 from app.services.websochat import (
     websochat_game_memory,
     websochat_qa_executor,
+    websochat_rp_renderer,
     websochat_service,
 )
 from app.services.websochat.websochat_planner import _build_websochat_qa_plan
