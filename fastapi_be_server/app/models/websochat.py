@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Integer, String, Text, TIMESTAMP, text
+from sqlalchemy import BigInteger, Integer, String, Text, TIMESTAMP, text as sa_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.rdb import Base
@@ -18,12 +18,12 @@ class WebsochatSession(Base):
     deleted_yn: Mapped[str] = mapped_column(String(1), nullable=False, server_default="N", comment="삭제 여부")
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, comment="세션 만료 시각")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
-    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
     updated_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 갱신한 id")
     updated_date: Mapped[datetime] = mapped_column(
         TIMESTAMP,
         nullable=False,
-        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+        server_default=sa_text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
     )
 
 
@@ -40,7 +40,7 @@ class WebsochatMessage(Base):
     )
     content: Mapped[str] = mapped_column(Text, nullable=False, comment="메시지 본문")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
-    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
 
 
 class WebsochatUsageLog(Base):
@@ -59,7 +59,7 @@ class WebsochatUsageLog(Base):
     fallback_used: Mapped[str] = mapped_column(String(1), nullable=False, server_default="N", comment="fallback 사용 여부")
     charged_cash: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", comment="해당 턴 캐시 차감액")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
-    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
 
 
 class WebsochatContextProduct(Base):
@@ -100,12 +100,12 @@ class WebsochatContextProduct(Base):
         comment="마지막 실패 메시지",
     )
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
-    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
     updated_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 갱신한 id")
     updated_date: Mapped[datetime] = mapped_column(
         TIMESTAMP,
         nullable=False,
-        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+        server_default=sa_text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
     )
 
 
@@ -136,7 +136,7 @@ class WebsochatContextDoc(Base):
     version_no: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1", comment="에피소드 내 버전")
     is_active: Mapped[str] = mapped_column(String(1), nullable=False, server_default="Y", comment="활성 여부")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
-    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
 
 
 class WebsochatContextChunk(Base):
@@ -153,7 +153,7 @@ class WebsochatContextChunk(Base):
     char_end: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="종료 위치")
     text: Mapped[str] = mapped_column(Text, nullable=False, comment="청크 본문")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
-    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
 
 
 class WebsochatContextSummary(Base):
@@ -175,4 +175,4 @@ class WebsochatContextSummary(Base):
     is_active: Mapped[str] = mapped_column(String(1), nullable=False, server_default="Y", comment="활성 여부")
     summary_text: Mapped[str] = mapped_column(Text, nullable=False, comment="요약 본문")
     created_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="row를 생성한 id")
-    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_date: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
