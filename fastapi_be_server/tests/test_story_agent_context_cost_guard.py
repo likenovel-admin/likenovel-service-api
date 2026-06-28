@@ -913,6 +913,67 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         module.assert_story_agent_foundation_invariants(ready_cursor, product_id=687)
         self.assertIn("character_inventory_v3", ready_cursor.query)
 
+    def test_delta_exit_code_is_nonzero_when_apply_product_failed(self):
+        module = load_module()
+        results = module.build_empty_results()
+        results["products"] = [
+            {
+                "product_id": 687,
+                "context_status": "failed",
+                "ready_episode_count": 3,
+                "total_episode_count": 5,
+            }
+        ]
+
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
+        self.assertEqual(module.build_delta_exit_code(results, apply=False), 0)
+
+        results["products"][0]["context_status"] = "ready"
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
+
+    def test_failed_delta_status_repair_refreshes_when_foundation_complete(self):
+        module = load_module()
+        cur = object()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+        repaired_row = {
+            "product_id": 687,
+            "context_status": "ready",
+            "ready_episode_count": 2,
+            "total_episode_count": 2,
+        }
+
+        with patch.object(module, "fetch_product_context_status", return_value="failed"), \
+             patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "assert_story_agent_foundation_invariants") as assert_foundation, \
+             patch.object(module, "fetch_total_episode_count", return_value=2), \
+             patch.object(module, "refresh_product_context_status", return_value=repaired_row) as refresh:
+            repaired = module.repair_failed_delta_context_statuses(cur, rows)
+
+        assert_foundation.assert_called_once_with(cur, product_id=687)
+        refresh.assert_called_once_with(cur, product_id=687, total_episode_count=2)
+        self.assertEqual(repaired, [repaired_row])
+
+    def test_failed_delta_status_repair_skips_when_foundation_gap_remains(self):
+        module = load_module()
+        cur = object()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(module, "fetch_product_context_status", return_value="failed"), \
+             patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value={102}), \
+             patch.object(module, "refresh_product_context_status") as refresh:
+            repaired = module.repair_failed_delta_context_statuses(cur, rows)
+
+        refresh.assert_not_called()
+        self.assertEqual(repaired, [])
+
     async def test_build_character_inventory_v3_resolved_path_applies_work_resolution(self):
         module = load_module()
         rows = []
