@@ -29,6 +29,8 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("missing_open_episode_count", script)
         self.assertIn("missing_open_character_signal_count", script)
         self.assertIn("missing_foundation_episode_count", script)
+        self.assertIn("active_character_inventory_count", script)
+        self.assertIn("active_character_inventory_v3_count", script)
         self.assertNotIn("MAX(pe.episode_no)", script)
         self.assertNotIn("p.price_type = 'free'", script)
 
@@ -43,6 +45,10 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn('--max-delta-episodes "${MAX_DELTA_EPISODES}"', script)
         self.assertIn("backlog_priority_threshold=${BACKLOG_PRIORITY_THRESHOLD}", script)
         self.assertIn('missing_foundation_episode_count > 0', script)
+        self.assertIn("context_status = 'failed'", script)
+        self.assertIn("missing_foundation_episode_count = 0", script)
+        self.assertIn("active_character_inventory_count > 0", script)
+        self.assertIn("active_character_inventory_v3_count > 0", script)
         failed_priority = "WHEN candidates.context_status = 'failed' THEN 0"
         large_backlog_priority = "WHEN candidates.missing_foundation_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1"
         small_delta_priority = "WHEN candidates.missing_foundation_episode_count < ${BACKLOG_PRIORITY_THRESHOLD} THEN 2"

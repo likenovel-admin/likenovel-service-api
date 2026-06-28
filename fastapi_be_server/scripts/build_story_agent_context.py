@@ -9565,6 +9565,19 @@ def fetch_total_episode_count(cur, product_id: int) -> int:
     return int(row.get("total_episode_count") or 0)
 
 
+def fetch_product_context_status(cur, *, product_id: int) -> str:
+    cur.execute(
+        """
+        SELECT context_status
+          FROM tb_story_agent_context_product
+         WHERE product_id = %s
+        """,
+        (product_id,),
+    )
+    row = cur.fetchone() or {}
+    return str(row.get("context_status") or "").strip()
+
+
 def mark_product_context_failed(*, product_id: int, total_episode_count: int, error_message: str) -> int:
     conn = db_connect()
     try:
@@ -9612,6 +9625,55 @@ def mark_product_context_failed(*, product_id: int, total_episode_count: int, er
         return ready_episode_count
     finally:
         conn.close()
+
+
+def repair_failed_delta_context_statuses(cur, rows: Iterable[dict]) -> list[dict[str, object]]:
+    rows_by_product: dict[int, list[dict]] = {}
+    for row in rows:
+        rows_by_product.setdefault(int(row["product_id"]), []).append(row)
+
+    repaired_products: list[dict[str, object]] = []
+    for product_id, product_rows in sorted(rows_by_product.items()):
+        if fetch_product_context_status(cur, product_id=product_id) != "failed":
+            continue
+        if build_open_add_episode_id_set(cur, product_id=product_id, product_rows=product_rows):
+            continue
+        if build_signal_repair_episode_id_set(cur, product_id=product_id, product_rows=product_rows):
+            continue
+        try:
+            assert_story_agent_foundation_invariants(cur, product_id=product_id)
+        except ValueError as exc:
+            logger.warning(
+                "story_agent_delta_status_repair_skip product_id=%s reason=%s",
+                product_id,
+                str(exc)[:200],
+            )
+            continue
+
+        total_episode_count = fetch_total_episode_count(cur, product_id=product_id)
+        status_row = refresh_product_context_status(
+            cur,
+            product_id=product_id,
+            total_episode_count=total_episode_count,
+        )
+        logger.info(
+            "story_agent_delta_status_repair product_id=%s status=%s ready=%s total=%s",
+            product_id,
+            status_row.get("context_status"),
+            status_row.get("ready_episode_count"),
+            status_row.get("total_episode_count"),
+        )
+        repaired_products.append(status_row)
+    return repaired_products
+
+
+def build_delta_exit_code(results: dict[str, object], *, apply: bool) -> int:
+    if not apply:
+        return 0
+    for product in list(results.get("products") or []):
+        if str((product or {}).get("context_status") or "").strip() == "failed":
+            return 1
+    return 0
 
 
 def build_empty_results() -> dict[str, object]:
@@ -10437,12 +10499,17 @@ async def main() -> int:
     validate_delta_args(args)
     query, params = build_target_query(args=args, use_epub_fallback=args.use_epub_fallback)
     rows: list[dict] = []
+    delta_status_repaired_products: list[dict[str, object]] = []
     conn = db_connect()
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
             rows = list(cur.fetchall())
             if args.build_mode == "delta":
+                if args.apply:
+                    delta_status_repaired_products = repair_failed_delta_context_statuses(cur, rows)
+                    if delta_status_repaired_products:
+                        conn.commit()
                 rows = filter_delta_candidate_rows(
                     cur,
                     rows,
@@ -10457,9 +10524,14 @@ async def main() -> int:
 
     if args.build_mode == "delta":
         results = await build_context_rows_delta(rows=rows, args=args)
+        if delta_status_repaired_products:
+            results["products"] = [
+                *delta_status_repaired_products,
+                *list(results.get("products") or []),
+            ]
         print_summary(results=results, apply=args.apply)
         write_delta_verification_json(args.verification_json_path, results)
-        return 0
+        return build_delta_exit_code(results, apply=args.apply)
 
     results = await build_context_rows(rows=rows, args=args)
     print_summary(results=results, apply=args.apply)
