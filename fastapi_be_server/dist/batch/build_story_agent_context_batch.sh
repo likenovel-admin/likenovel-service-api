@@ -195,7 +195,21 @@ FROM (
     GREATEST(
       SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END),
       SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END)
-    ) AS missing_foundation_episode_count
+    ) AS missing_foundation_episode_count,
+    (
+      SELECT COUNT(*)
+      FROM tb_story_agent_context_summary ci
+      WHERE ci.product_id = p.product_id
+        AND ci.summary_type = 'character_inventory'
+        AND ci.is_active = 'Y'
+    ) AS active_character_inventory_count,
+    (
+      SELECT COUNT(*)
+      FROM tb_story_agent_context_summary civ3
+      WHERE civ3.product_id = p.product_id
+        AND civ3.summary_type = 'character_inventory_v3'
+        AND civ3.is_active = 'Y'
+    ) AS active_character_inventory_v3_count
   FROM tb_product p
   JOIN tb_product_episode pe
     ON pe.product_id = p.product_id
@@ -224,6 +238,12 @@ FROM (
     sacp.context_status
   HAVING
     missing_foundation_episode_count > 0
+    OR (
+      context_status = 'failed'
+      AND missing_foundation_episode_count = 0
+      AND active_character_inventory_count > 0
+      AND active_character_inventory_v3_count > 0
+    )
 ) candidates
 ORDER BY
   CASE
