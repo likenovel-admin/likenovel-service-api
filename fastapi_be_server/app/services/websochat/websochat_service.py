@@ -630,6 +630,22 @@ def _build_websochat_rp_character_resolution_clarify_reply(
     return "이 작품 공개 범위에서 바로 찾을 수 있는 인물을 못 찾았어요. 주인공이나 다른 인물 이름으로 다시 말해 주세요."
 
 
+def _build_websochat_rp_unavailable_reply(
+    *,
+    active_character_label: str | None,
+) -> str:
+    normalized_label = re.sub(r"\s+", " ", str(active_character_label or "").strip())
+    if normalized_label:
+        return (
+            f"지금은 {normalized_label}와 대화할 캐릭터 데이터가 아직 준비되지 않았어요. "
+            "캐릭터 말투와 설정을 확인할 수 있을 때 다시 시작할게요."
+        )
+    return (
+        "지금은 이 인물과 대화할 캐릭터 데이터가 아직 준비되지 않았어요. "
+        "캐릭터 말투와 설정을 확인할 수 있을 때 다시 시작할게요."
+    )
+
+
 def _build_websochat_rp_scope_ready_reply(
     *,
     read_scope_label: str | None,
@@ -3573,10 +3589,12 @@ def _build_websochat_character_relation_lines(relation_payloads: list[dict[str, 
     seen_keys: set[str] = set()
     for payload in relation_payloads:
         active_side = str(payload.get("_active_side") or "").strip()
+        source_name = str(payload.get("source_display_name") or payload.get("source_key") or "").strip()
+        target_name = str(payload.get("target_display_name") or payload.get("target_key") or "").strip()
         if active_side == "source":
-            other_name = str(payload.get("target_display_name") or payload.get("target_key") or "").strip()
+            other_name = target_name
         else:
-            other_name = str(payload.get("source_display_name") or payload.get("source_key") or "").strip()
+            other_name = source_name
         if not other_name:
             continue
         relation_tags = [
@@ -3586,7 +3604,8 @@ def _build_websochat_character_relation_lines(relation_payloads: list[dict[str, 
         ]
         intensity = str(payload.get("relation_intensity") or "").strip()
         distinct_episode_count = int(payload.get("distinct_episode_count") or 0)
-        line_parts = [other_name]
+        relation_label = f"{source_name} -> {target_name}" if source_name and target_name else other_name
+        line_parts = [relation_label]
         if relation_tags:
             line_parts.append(", ".join(relation_tags[:3]))
         if intensity:
@@ -3602,6 +3621,10 @@ def _build_websochat_character_relation_lines(relation_payloads: list[dict[str, 
         if len(lines) >= 6:
             break
     return lines
+
+
+def _extract_websochat_episode_row_text(row: dict[str, Any]) -> str:
+    return str(row.get("chunkText") or row.get("content") or "").strip()
 
 
 def _is_websochat_inventory_rp_eligible(
@@ -4634,12 +4657,18 @@ async def _load_websochat_rp_context(
 
     if rp_mode == "scene":
         scene_episode_no = int(normalized_memory.get("scene_episode_no") or 0) or None
-        if scene_episode_no:
+        latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
+        read_episode_to = int(normalized_memory.get("read_episode_to") or 0)
+        latest_public_episode_no = min(
+            read_episode_to if read_episode_to > 0 else latest_episode_no,
+            latest_episode_no,
+        )
+        if scene_episode_no and scene_episode_no <= latest_public_episode_no:
             summary_rows = await _get_websochat_summary_candidates(
                 product_id=product_id,
                 keywords=[],
                 query_text=f"{scene_episode_no}화",
-                latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+                latest_episode_no=latest_public_episode_no,
                 mode="exact",
                 episode_no=scene_episode_no,
                 db=db,
@@ -4649,13 +4678,13 @@ async def _load_websochat_rp_context(
                 product_id=product_id,
                 episode_from=scene_episode_no,
                 episode_to=scene_episode_no,
-                latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+                latest_episode_no=latest_public_episode_no,
                 db=db,
             )
             scene_source_text = "\n".join(
-                str(row.get("content") or "").strip()
+                _extract_websochat_episode_row_text(row)
                 for row in episode_rows[:1]
-                if str(row.get("content") or "").strip()
+                if _extract_websochat_episode_row_text(row)
             )[:WEBSOCHAT_PREFETCH_CONTEXT_CHARS]
             context["scene_episode_no"] = scene_episode_no
             context["scene_summary_text"] = scene_summary_text
@@ -5067,7 +5096,7 @@ async def _build_websochat_rp_exact_recall_context(
                 db=db,
             )
             for row in episode_rows:
-                chunk_text = str(row.get("chunkText") or "").strip()
+                chunk_text = _extract_websochat_episode_row_text(row)
                 if not chunk_text:
                     continue
                 score = sum(1 for keyword in keywords if keyword and keyword in chunk_text)
@@ -5227,6 +5256,22 @@ async def _generate_websochat_reply(
         active_route = normalized_forced_route or _resolve_websochat_response_route(
             normalized_memory=normalized_memory,
             rp_context=rp_context,
+        )
+    if active_route == "rp" and not rp_context:
+        active_character_label = _resolve_websochat_active_character_label(normalized_memory)
+        logger.info(
+            "websochat rp_context_unavailable product_id=%s session_id=%s active_character=%s",
+            product_row.get("productId"),
+            session_id,
+            str(normalized_memory.get("active_character") or "").strip() or None,
+        )
+        return (
+            _build_websochat_rp_unavailable_reply(active_character_label=active_character_label),
+            "system",
+            "rp:unavailable",
+            False,
+            "rp_unavailable",
+            None,
         )
     recent_messages = await _get_websochat_recent_messages(session_id=session_id, db=db)
     if active_route == "rp" and rp_context:
@@ -7139,7 +7184,7 @@ async def post_message(
             effective_qa_action_key=effective_qa_action_key,
             current_pending_qa_action_key=pending_qa_action_key,
         )
-        if route_mode not in {"qa:starter", "rp:starter"} and not _is_websochat_noncanonical_action(effective_qa_action_key):
+        if route_mode not in {"qa:starter", "rp:starter", "rp:unavailable"} and not _is_websochat_noncanonical_action(effective_qa_action_key):
             next_session_memory = _update_websochat_session_memory_after_reply(
                 next_session_memory,
                 user_prompt=req_body.content,
@@ -7177,6 +7222,8 @@ async def post_message(
             },
         )
 
+        if route_mode == "rp:unavailable":
+            should_charge_cash = False
         charged_cash = (
             _resolve_websochat_message_cash_cost(effective_qa_action_key)
             if should_charge_cash

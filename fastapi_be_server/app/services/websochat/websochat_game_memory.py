@@ -279,7 +279,9 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         active_mode = None
     if active_mode in WEBSOCHAT_ALLOWED_GAME_MODES and game_context.get("mode") != active_mode:
         active_mode = game_context.get("mode")
-    if active_mode == "rp" and (not active_character or not rp_mode):
+    if active_mode == "rp" and active_character and not rp_mode:
+        rp_mode = "free"
+    if active_mode == "rp" and not active_character:
         active_mode = None
     if active_character and pending_rp_character_selection:
         pending_rp_character_selection = False
