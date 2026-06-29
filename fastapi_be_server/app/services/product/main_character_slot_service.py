@@ -75,29 +75,78 @@ async def get_public_main_character_slots(adult_yn: str, db: AsyncSession):
     return {"data": [convert_main_character_slot_row(row) for row in rows]}
 
 
-async def get_product_character_roster(product_id: int, db: AsyncSession):
-    # 웹소챗 이상형월드컵과 동일한 캐릭터 로스터(LLM 미사용, scope_key/display_name)를 재사용한다.
-    from app.services.websochat.websochat_compare_runtime import (
-        get_websochat_game_candidate_profiles,
-    )
+# 메인 캐릭터 구좌는 채팅보다 엄격한 공개 게이트를 쓴다. v3 인벤토리 summary_type.
+SLOT_CHARACTER_INVENTORY_SUMMARY_TYPE = "character_inventory_v3"
 
-    candidates = await get_websochat_game_candidate_profiles(
-        product_id=product_id, db=db
-    )
-    characters = []
-    for item in candidates:
-        scope_key = str(item.get("scope_key") or "").strip()
-        display_name = str(item.get("display_name") or "").strip()
-        if not scope_key or not display_name:
+
+def _is_slot_eligible_payload(payload) -> bool:
+    """공개 메인 구좌 노출 게이트: display_safety pass + public_slot_eligible + 주인공.
+
+    채팅용 _is_websochat_inventory_rp_eligible(public_chat_eligible 중심)보다 엄격하다.
+    """
+    if not isinstance(payload, dict) or not payload:
+        return False
+    display_safety = payload.get("display_safety")
+    if not isinstance(display_safety, dict):
+        return False
+    if str(display_safety.get("status") or "").strip().lower() != "pass":
+        return False
+    if payload.get("public_slot_eligible") is not True:
+        return False
+    if str(payload.get("work_role") or "").strip().lower() != "main_protagonist":
+        return False
+    return True
+
+
+def _build_slot_character_roster(rows) -> list[dict]:
+    """character_inventory_v3 row에서 슬롯 적격 주인공만 추려 contract(scopeKey/displayName/aliases) 반환."""
+    from app.services.websochat.websochat_utils import _extract_websochat_json_object
+
+    seen_scope_keys: set[str] = set()
+    characters: list[dict] = []
+    for row in rows:
+        data = dict(row)
+        scope_key = str(data.get("scopeKey") or "").strip()
+        if not scope_key or scope_key in seen_scope_keys:
             continue
+        payload = _extract_websochat_json_object(str(data.get("summaryText") or "")) or {}
+        if not _is_slot_eligible_payload(payload):
+            continue
+        display_name = str(payload.get("display_name") or "").strip()
+        if not display_name:
+            continue
+        seen_scope_keys.add(scope_key)
+        aliases = [
+            str(alias).strip()
+            for alias in (payload.get("aliases") or [])
+            if str(alias).strip()
+        ]
         characters.append(
-            {
-                "scopeKey": scope_key,
-                "displayName": display_name,
-                "aliases": list(item.get("aliases") or []),
-            }
+            {"scopeKey": scope_key, "displayName": display_name, "aliases": aliases}
         )
-    return {"data": characters}
+    return characters
+
+
+async def get_product_character_roster(product_id: int, db: AsyncSession):
+    # 메인 캐릭터 구좌 전용 슬롯 로스터: character_inventory_v3의 공개 슬롯 게이트를 통과한 주인공만.
+    # v3 데이터가 없으면 빈 배열(월드컵 후보 fallback 없음 — 공개 메인 노출 안전 게이트).
+    result = await db.execute(
+        text(
+            """
+            SELECT scope_key AS scopeKey, summary_text AS summaryText
+            FROM tb_story_agent_context_summary
+            WHERE product_id = :product_id
+              AND summary_type = :summary_type
+              AND is_active = 'Y'
+            ORDER BY summary_id DESC
+            """
+        ),
+        {
+            "product_id": product_id,
+            "summary_type": SLOT_CHARACTER_INVENTORY_SUMMARY_TYPE,
+        },
+    )
+    return {"data": _build_slot_character_roster(result.mappings().all())}
 
 
 def _normalize_optional_datetime(value):
