@@ -437,6 +437,8 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(context["speech_style"].get("tone"))
         self.assertIn("냉정", context["personality_core"])
         self.assertIn("제일황자", "\n".join(context["character_relation_lines"]))
+        self.assertIn("아델리트 -> 제일황자", "\n".join(context["character_relation_lines"]))
+        self.assertIn("율리아나 -> 아델리트", "\n".join(context["character_relation_lines"]))
         self.assertEqual(context["anchor_episode_no"], 12)
 
         prompt = websochat_rp_renderer.build_websochat_rp_system_prompt(
@@ -446,6 +448,53 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("[관계 맥락]", prompt)
         self.assertIn("제일황자", prompt)
+
+    async def test_scene_rp_context_does_not_load_future_episode_over_read_scope(self):
+        db = _FakeRpContextDb()
+
+        with (
+            patch.object(
+                websochat_service,
+                "_build_websochat_rp_trajectory_context",
+                new_callable=AsyncMock,
+            ) as build_trajectory,
+            patch.object(
+                websochat_service,
+                "_get_websochat_summary_candidates",
+                new_callable=AsyncMock,
+            ) as get_summary_candidates,
+            patch.object(
+                websochat_service,
+                "_get_websochat_episode_contents",
+                new_callable=AsyncMock,
+            ) as get_episode_contents,
+        ):
+            build_trajectory.return_value = None
+            get_summary_candidates.return_value = [
+                {"summaryText": "5화의 미래 장면이 들어오면 안 된다."}
+            ]
+            get_episode_contents.return_value = [
+                {"episodeNo": 5, "content": "미래 회차 원문"}
+            ]
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 10},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:아델리트",
+                    "active_character_label": "아델리트",
+                    "rp_mode": "scene",
+                    "scene_episode_no": 5,
+                    "read_episode_to": 3,
+                },
+                db=db,
+            )
+
+        self.assertIsNotNone(context)
+        self.assertNotIn("scene_episode_no", context)
+        self.assertNotIn("scene_summary_text", context)
+        self.assertNotIn("scene_source_text", context)
+        get_summary_candidates.assert_not_awaited()
+        get_episode_contents.assert_not_awaited()
 
     async def test_unsafe_inventory_v3_does_not_seed_new_rp_context_without_profile(self):
         db = _FakeUnsafeInventorySeedDb()
@@ -629,6 +678,254 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertFalse(hasattr(websochat_service, "generate_websochat_rp_reply_with_claude"))
+
+    async def test_forced_rp_without_context_does_not_fallback_to_qa(self):
+        product_row = {"productId": 1, "title": "테스트", "latestEpisodeNo": 5}
+        evidence_bundle = {
+            "product_row": product_row,
+            "resolved_scope": {"read_episode_to": 1},
+            "context_text": "",
+            "summary_rows": [],
+            "chunk_rows": [],
+            "exact_episode_rows": [],
+            "tool_context_message": None,
+        }
+        qa_result = {
+            "reply": "QA로 새면 안 됩니다.",
+            "model_used": "gemini",
+            "route_mode": "qa",
+            "fallback_used": False,
+            "intent": "factual",
+            "referenced_episode_nos": [],
+        }
+
+        with (
+            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(
+                websochat_service,
+                "_load_websochat_rp_context",
+                new_callable=AsyncMock,
+            ) as load_rp_context,
+            patch.object(
+                websochat_service,
+                "_get_websochat_recent_messages",
+                new_callable=AsyncMock,
+            ) as get_recent_messages,
+            patch.object(
+                websochat_service,
+                "_resolve_websochat_intent",
+                new_callable=AsyncMock,
+            ) as resolve_intent,
+            patch.object(
+                websochat_service,
+                "_resolve_websochat_qa_corrections",
+                new_callable=AsyncMock,
+            ) as resolve_corrections,
+            patch.object(
+                websochat_service,
+                "assemble_websochat_scope_context",
+                new_callable=AsyncMock,
+            ) as assemble_context,
+            patch.object(
+                websochat_service,
+                "execute_websochat_qa",
+                new_callable=AsyncMock,
+            ) as execute_qa,
+        ):
+            load_rp_context.return_value = None
+            get_recent_messages.return_value = []
+            resolve_intent.return_value = ("factual", False, "general")
+            resolve_corrections.return_value = []
+            assemble_context.return_value = evidence_bundle
+            execute_qa.return_value = qa_result
+
+            reply, model_used, route_mode, fallback_used, intent, next_memory = await websochat_service._generate_websochat_reply(
+                session_id=123,
+                session_memory={
+                    "read_scope_state": "known",
+                    "read_episode_to": 1,
+                    "active_mode": "rp",
+                    "active_character": "named:test",
+                    "active_character_label": "테스트",
+                    "rp_mode": "free",
+                },
+                product_row=product_row,
+                user_prompt="안녕",
+                user_id=1,
+                db=AsyncMock(),
+                forced_route="rp",
+            )
+
+        self.assertIn("테스트", reply)
+        self.assertEqual(model_used, "system")
+        self.assertEqual(route_mode, "rp:unavailable")
+        self.assertFalse(fallback_used)
+        self.assertEqual(intent, "rp_unavailable")
+        self.assertIsNone(next_memory)
+        get_recent_messages.assert_not_awaited()
+        execute_qa.assert_not_awaited()
+
+    async def test_active_rp_session_without_context_does_not_fallback_to_qa(self):
+        product_row = {"productId": 1, "title": "테스트", "latestEpisodeNo": 5}
+        qa_result = {
+            "reply": "기존 RP 세션도 QA로 새면 안 됩니다.",
+            "model_used": "gemini",
+            "route_mode": "qa",
+            "fallback_used": False,
+            "intent": "factual",
+            "referenced_episode_nos": [],
+        }
+
+        with (
+            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(
+                websochat_service,
+                "_load_websochat_rp_context",
+                new_callable=AsyncMock,
+            ) as load_rp_context,
+            patch.object(
+                websochat_service,
+                "_get_websochat_recent_messages",
+                new_callable=AsyncMock,
+            ) as get_recent_messages,
+            patch.object(
+                websochat_service,
+                "execute_websochat_qa",
+                new_callable=AsyncMock,
+            ) as execute_qa,
+        ):
+            load_rp_context.return_value = None
+            get_recent_messages.return_value = []
+            execute_qa.return_value = qa_result
+
+            reply, model_used, route_mode, fallback_used, intent, next_memory = await websochat_service._generate_websochat_reply(
+                session_id=123,
+                session_memory={
+                    "read_scope_state": "known",
+                    "read_episode_to": 1,
+                    "active_mode": "rp",
+                    "active_character": "named:test",
+                    "active_character_label": "테스트",
+                    "rp_mode": "free",
+                },
+                product_row=product_row,
+                user_prompt="아직 있어?",
+                user_id=1,
+                db=AsyncMock(),
+            )
+
+        self.assertIn("테스트", reply)
+        self.assertEqual(model_used, "system")
+        self.assertEqual(route_mode, "rp:unavailable")
+        self.assertFalse(fallback_used)
+        self.assertEqual(intent, "rp_unavailable")
+        self.assertIsNone(next_memory)
+        get_recent_messages.assert_not_awaited()
+        execute_qa.assert_not_awaited()
+
+    async def test_active_rp_session_without_rp_mode_does_not_fallback_to_qa(self):
+        product_row = {"productId": 1, "title": "테스트", "latestEpisodeNo": 5}
+        qa_result = {
+            "reply": "rp_mode 누락 세션도 QA로 새면 안 됩니다.",
+            "model_used": "gemini",
+            "route_mode": "qa",
+            "fallback_used": False,
+            "intent": "factual",
+            "referenced_episode_nos": [],
+        }
+
+        with (
+            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(
+                websochat_service,
+                "_load_websochat_rp_context",
+                new_callable=AsyncMock,
+            ) as load_rp_context,
+            patch.object(
+                websochat_service,
+                "_get_websochat_recent_messages",
+                new_callable=AsyncMock,
+            ) as get_recent_messages,
+            patch.object(
+                websochat_service,
+                "execute_websochat_qa",
+                new_callable=AsyncMock,
+            ) as execute_qa,
+        ):
+            load_rp_context.return_value = None
+            get_recent_messages.return_value = []
+            execute_qa.return_value = qa_result
+
+            reply, model_used, route_mode, fallback_used, intent, next_memory = await websochat_service._generate_websochat_reply(
+                session_id=123,
+                session_memory={
+                    "read_scope_state": "known",
+                    "read_episode_to": 1,
+                    "active_mode": "rp",
+                    "active_character": "named:test",
+                    "active_character_label": "테스트",
+                },
+                product_row=product_row,
+                user_prompt="아직 있어?",
+                user_id=1,
+                db=AsyncMock(),
+            )
+
+        self.assertIn("테스트", reply)
+        self.assertEqual(model_used, "system")
+        self.assertEqual(route_mode, "rp:unavailable")
+        self.assertFalse(fallback_used)
+        self.assertEqual(intent, "rp_unavailable")
+        self.assertIsNone(next_memory)
+        get_recent_messages.assert_not_awaited()
+        execute_qa.assert_not_awaited()
+
+    async def test_exact_recall_uses_grouped_episode_content_field(self):
+        with (
+            patch.object(
+                websochat_service,
+                "_resolve_websochat_rp_recall_need",
+                new_callable=AsyncMock,
+            ) as resolve_recall_need,
+            patch.object(
+                websochat_service,
+                "_get_websochat_summary_candidates",
+                new_callable=AsyncMock,
+            ) as get_summary_candidates,
+            patch.object(
+                websochat_service,
+                "_get_websochat_episode_contents",
+                new_callable=AsyncMock,
+            ) as get_episode_contents,
+            patch.object(
+                websochat_service,
+                "_search_websochat_episode_contents",
+                new_callable=AsyncMock,
+            ) as search_episode_contents,
+        ):
+            resolve_recall_need.return_value = (True, "검")
+            get_summary_candidates.return_value = []
+            get_episode_contents.return_value = [
+                {"episodeNo": 2, "content": "테스트가 검을 들었다."}
+            ]
+            search_episode_contents.return_value = []
+
+            context = await websochat_service._build_websochat_rp_exact_recall_context(
+                product_row={"productId": 1, "title": "테스트", "latestEpisodeNo": 5},
+                user_prompt="그때 뭘 들었지?",
+                recent_messages=[],
+                rp_context={
+                    "display_name": "테스트",
+                    "anchor_episode_no": 2,
+                    "trajectory_history": [],
+                    "session_memory": {"read_episode_to": 3},
+                },
+                db=AsyncMock(),
+            )
+
+        self.assertIn("raw_recall_context", context)
+        self.assertIn("검을 들었다", context["raw_recall_context"])
+        search_episode_contents.assert_not_awaited()
 
     async def test_read_scope_guard_marks_session_after_first_unknown_prompt(self):
         reply, model_used, route_mode, _, intent, next_memory = await websochat_service._generate_websochat_reply(

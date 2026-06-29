@@ -19,7 +19,10 @@ def _resolve_websochat_response_route(
     active_mode = str(normalized_memory.get("active_mode") or "").strip().lower()
     if active_mode in WEBSOCHAT_ALLOWED_GAME_MODES:
         return "game"
-    if rp_context:
+    if rp_context or (
+        active_mode == "rp"
+        and str(normalized_memory.get("active_character") or "").strip()
+    ):
         return "rp"
     return "qa"
 
