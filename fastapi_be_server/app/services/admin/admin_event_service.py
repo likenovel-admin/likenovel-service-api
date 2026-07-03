@@ -36,6 +36,7 @@ BANNER_LIST_POSITION_MAP = {
     "main-top": ("main", "top"),
     "main-mid": ("main", "mid"),
     "main-bot": ("main", "bot"),
+    "companyNotice": ("companyNotice", None),
     "paid": ("paid", None),
     "review": ("review", None),
     "promotion": ("promotion", None),
@@ -49,7 +50,15 @@ BANNER_LIST_ORDER_BY_MAP = {
     "latest_updated": "COALESCE(updated_date, created_date) DESC, id DESC",
 }
 
-ALLOWED_BANNER_POSITIONS = ["main", "paid", "review", "promotion", "search", "viewer"]
+ALLOWED_BANNER_POSITIONS = [
+    "main",
+    "companyNotice",
+    "paid",
+    "review",
+    "promotion",
+    "search",
+    "viewer",
+]
 ALLOWED_MAIN_BANNER_DIVISIONS = ["top", "mid", "bot"]
 
 
@@ -959,8 +968,7 @@ async def reorder_banners(
     """
 
     # position 검증
-    allowed_positions = ["main", "paid", "review", "promotion", "search", "viewer"]
-    if req_body.position not in allowed_positions:
+    if req_body.position not in ALLOWED_BANNER_POSITIONS:
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.NOT_ALLOWED_POSITION.format(req_body.position),
