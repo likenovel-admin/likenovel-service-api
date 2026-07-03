@@ -1035,6 +1035,7 @@ ALLOWED_AI_READER_AGE_GROUPS = set(DEFAULT_AI_READER_AGE_GROUP_RATIOS)
 ALLOWED_AI_READER_GENDERS = {"M", "F", "X"}
 AI_READER_NICKNAME_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9]+$")
 FORBIDDEN_AI_READER_NICKNAME_TERMS = ("디씨", "주갤", "주갤러")
+MAX_AI_READER_AGENT_COUNT = 1000
 
 
 class AiReaderTimeBlock(AdminBase):
@@ -1092,7 +1093,7 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         examples=["ai-reader-"],
         description="AI 전용 계정 이메일 prefix",
     )
-    agent_count: int = Field(default=100, ge=1, le=100, description="투입할 AI 독자 수")
+    agent_count: int = Field(default=100, ge=1, le=MAX_AI_READER_AGENT_COUNT, description="투입할 AI 독자 수")
     schedule_date: Optional[str] = Field(
         default=None,
         examples=["2026-05-13"],
@@ -1223,7 +1224,7 @@ class PostAiReaderBootstrapReqBody(AdminBase):
 
 
 class PostAiReaderResumePausedReqBody(AdminBase):
-    agent_count: int = Field(default=100, ge=1, le=100, description="재가동할 paused AI 독자 수")
+    agent_count: int = Field(default=100, ge=1, le=MAX_AI_READER_AGENT_COUNT, description="재가동할 paused AI 독자 수")
     schedule_date: Optional[str] = Field(
         default=None,
         examples=["2026-05-14"],
@@ -1304,7 +1305,7 @@ class PostAiReaderRefreshSchedulesReqBody(PostAiReaderResumePausedReqBody):
     agent_count: int = Field(
         default=100,
         ge=1,
-        le=100,
+        le=MAX_AI_READER_AGENT_COUNT,
         description="새 스케줄을 생성할 active AI 독자 수",
     )
 
@@ -1313,7 +1314,7 @@ class PostAiReaderRestartReqBody(PostAiReaderResumePausedReqBody):
     agent_count: int = Field(
         default=100,
         ge=1,
-        le=100,
+        le=MAX_AI_READER_AGENT_COUNT,
         description="전체 AI 독자를 정리한 뒤 새로 active 전환할 AI 독자 수",
     )
 
