@@ -3610,6 +3610,33 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_immediate_schedule_batches_split_1000_agents_into_100_agent_batches(self):
+        from app.services.admin import admin_ai_reader_service
+
+        batches = admin_ai_reader_service._build_immediate_schedule_batches(
+            agent_count=1000,
+            schedule_date=date(2026, 5, 14),
+            start_immediately=True,
+            batch_size=100,
+            batch_interval_minutes=10,
+            now=datetime(2026, 5, 14, 15, 7, 21),
+        )
+
+        self.assertEqual(len(batches), 10)
+        self.assertEqual(sum(batch["agent_count"] for batch in batches), 1000)
+        self.assertEqual(
+            [batch["agent_count"] for batch in batches],
+            [100] * 10,
+        )
+        self.assertEqual(
+            batches[0]["active_start_at"],
+            datetime(2026, 5, 14, 15, 10),
+        )
+        self.assertEqual(
+            batches[-1]["active_start_at"],
+            datetime(2026, 5, 14, 16, 40),
+        )
+
     def test_immediate_schedule_batches_only_run_for_today(self):
         from app.services.admin import admin_ai_reader_service
 
@@ -5298,21 +5325,34 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["available_user_count"], 1)
 
-    def test_bootstrap_ai_reader_agents_caps_agent_count_at_200(self):
-        from app.schemas.admin import PostAiReaderBootstrapReqBody
-
-        req_body = PostAiReaderBootstrapReqBody(
-            email_prefix="prod-ai-reader-",
-            agent_count=200,
+    def test_ai_reader_agent_count_allows_up_to_1000(self):
+        from app.schemas.admin import (
+            PostAiReaderBootstrapReqBody,
+            PostAiReaderRefreshSchedulesReqBody,
+            PostAiReaderRestartReqBody,
+            PostAiReaderResumePausedReqBody,
         )
 
-        self.assertEqual(req_body.agent_count, 200)
+        request_cases = [
+            (PostAiReaderBootstrapReqBody, {"email_prefix": "prod-ai-reader-"}),
+            (PostAiReaderResumePausedReqBody, {}),
+            (PostAiReaderRefreshSchedulesReqBody, {}),
+            (PostAiReaderRestartReqBody, {}),
+        ]
 
-        with self.assertRaises(ValueError):
-            PostAiReaderBootstrapReqBody(
-                email_prefix="prod-ai-reader-",
-                agent_count=201,
-            )
+        for request_cls, extra_kwargs in request_cases:
+            with self.subTest(request_cls=request_cls.__name__):
+                req_body = request_cls(
+                    **extra_kwargs,
+                    agent_count=1000,
+                )
+                self.assertEqual(req_body.agent_count, 1000)
+
+                with self.assertRaises(ValueError):
+                    request_cls(
+                        **extra_kwargs,
+                        agent_count=1001,
+                    )
 
     async def test_bootstrap_ai_reader_agents_dry_run_applies_activity_preset(self):
         from app.schemas.admin import PostAiReaderBootstrapReqBody
