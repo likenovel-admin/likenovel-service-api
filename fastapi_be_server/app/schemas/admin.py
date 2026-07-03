@@ -632,7 +632,7 @@ class PostBannerReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
     position: str = Field(
         examples=["main"],
-        description="노출 위치, main (메인: 대배너(상단 캐러셀), 띠배너(중간), 고정배너(하단)) | paid (메인>유료: 대배너(상단 캐러셀)) | review (메인>작품리뷰: 대배너(상단 캐러셀)) | promotion (메인>프로모션: 고정배너(상단)) | search (검색/검색결과: 고정배너(상단) | viewer (뷰어: 띠배너))",
+        description="노출 위치, main (메인: 대배너(상단 캐러셀), 띠배너(중간), 고정배너(하단)) | companyNotice (메인: 미니캐러셀) | paid (메인>유료: 대배너(상단 캐러셀)) | review (메인>작품리뷰: 대배너(상단 캐러셀)) | promotion (메인>프로모션: 고정배너(상단)) | search (검색/검색결과: 고정배너(상단) | viewer (뷰어: 띠배너))",
     )
     division: Optional[str] = Field(
         default=None,
@@ -667,7 +667,7 @@ class ReorderBannersReqBody(AdminBase):
 
     position: str = Field(
         examples=["main"],
-        description="노출 위치, main | paid | review | promotion | search | viewer",
+        description="노출 위치, main | companyNotice | paid | review | promotion | search | viewer",
     )
     division: Optional[str] = Field(
         default=None,
