@@ -134,6 +134,56 @@ WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS = 220
 WEBSOCHAT_ACTIVE_CHARACTER_SINGLE_CANDIDATE_FALLBACK_MIN_RATIO = 0.5
 
 
+def _build_websochat_session_contract_payload(session_memory: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_websochat_session_memory(session_memory)
+    return {
+        "sessionKind": str(normalized.get("session_kind") or "websochat"),
+        "entrySource": normalized.get("entry_source"),
+        "lockedCharacterScopeKey": normalized.get("locked_character_scope_key"),
+        "allowedModes": list(normalized.get("allowed_modes") or []),
+    }
+
+
+def _is_websochat_character_chat_session(session_memory: dict[str, Any]) -> bool:
+    normalized = _normalize_websochat_session_memory(session_memory)
+    return str(normalized.get("session_kind") or "").strip().lower() == "character_chat"
+
+
+def _resolve_websochat_requested_mode_key(
+    *,
+    starter_mode_key: str | None,
+    qa_action_key: str | None,
+    game_mode: str | None,
+    session_memory: dict[str, Any],
+) -> str | None:
+    normalized_starter = str(starter_mode_key or "").strip().lower() or None
+    if str(qa_action_key or "").strip().lower():
+        return "qa"
+    if str(game_mode or "").strip().lower() in WEBSOCHAT_ALLOWED_GAME_MODES:
+        return "ideal_worldcup"
+    if normalized_starter:
+        return normalized_starter
+    if _is_websochat_character_chat_session(session_memory):
+        return "rp"
+    return None
+
+
+def _assert_websochat_session_allows_mode(
+    session_memory: dict[str, Any],
+    requested_mode_key: str | None,
+) -> None:
+    normalized_mode = str(requested_mode_key or "").strip().lower() or None
+    if not normalized_mode:
+        return
+    allowed_modes = set(_normalize_websochat_session_memory(session_memory).get("allowed_modes") or [])
+    if normalized_mode in allowed_modes:
+        return
+    raise CustomResponseException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        message="캐릭터챗 세션에서는 캐릭터와 대화만 사용할 수 있어요. 작품 질문은 새 웹소챗 대화에서 이용해 주세요.",
+    )
+
+
 async def _call_websochat_gemini_json(
     *,
     system_prompt: str,
@@ -183,6 +233,7 @@ def _build_websochat_billing_status_payload(
 WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE = "비공개된 작품과는 더이상 이야기하실 수 없습니다."
 WEBSOCHAT_CONTEXT_PENDING_MESSAGE = "이 작품은 아직 대화 준비 중입니다."
 WEBSOCHAT_CONTEXT_DISABLED_MESSAGE = "현재 웹소챗이 비활성화된 작품입니다."
+WEBSOCHAT_ACCESS_REQUIRED_MESSAGE = "구매/대여한 회차 또는 무료 공개 회차 범위 안에서만 웹소챗을 사용할 수 있습니다."
 WEBSOCHAT_PLACEHOLDER_TEMPLATE = (
     "[{title}] 기준으로 관련 회차와 원문 일부를 먼저 찾았습니다.\n"
     "{context_block}\n\n"
@@ -387,20 +438,170 @@ def _resolve_websochat_read_scope_state(
     return "unknown"
 
 
-def _apply_websochat_account_read_scope(
+def _resolve_websochat_requested_episode_to(value: int | None) -> int | None:
+    resolved = max(int(value or 0), 0)
+    return resolved or None
+
+
+async def _get_websochat_authorized_read_scope(
+    *,
+    product_id: int,
+    user_id: int | None,
+    requested_episode_to: int | None,
+    synced_latest_episode_no: int | None,
+    db: AsyncSession,
+) -> dict[str, Any]:
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                pe.episode_id AS episodeId,
+                pe.episode_no AS episodeNo,
+                COALESCE(pe.price_type, 'free') AS priceType,
+                CASE
+                    WHEN COALESCE(pe.price_type, 'free') = 'free' THEN 1
+                    WHEN :user_id IS NOT NULL AND EXISTS (
+                        SELECT 1
+                        FROM tb_user_productbook pb
+                        WHERE pb.user_id = :user_id
+                          AND pb.use_yn = 'Y'
+                          AND (
+                              pb.own_type = 'own'
+                              OR (
+                                  pb.own_type = 'rental'
+                                  AND (
+                                      pb.rental_expired_date IS NULL
+                                      OR pb.rental_expired_date > NOW()
+                                  )
+                              )
+                          )
+                          AND (
+                              pb.episode_id = pe.episode_id
+                              OR (
+                                  pb.episode_id IS NULL
+                                  AND pb.product_id = pe.product_id
+                              )
+                              OR (
+                                  pb.episode_id IS NULL
+                                  AND pb.product_id IS NULL
+                              )
+                          )
+                    ) THEN 1
+                    ELSE 0
+                END AS authorizedYn
+            FROM tb_product_episode pe
+            WHERE pe.product_id = :product_id
+              AND pe.use_yn = 'Y'
+              AND pe.open_yn = 'Y'
+            ORDER BY pe.episode_no ASC, pe.episode_id ASC
+            """
+        ),
+        {
+            "product_id": int(product_id),
+            "user_id": user_id,
+        },
+    )
+    rows = [dict(row) for row in result.mappings().all()]
+    expected_episode_no = 1
+    contiguous_episode_to = 0
+    seen_episode_nos: set[int] = set()
+
+    for row in rows:
+        episode_no = int(row.get("episodeNo") or 0)
+        if episode_no <= 0 or episode_no in seen_episode_nos:
+            continue
+        seen_episode_nos.add(episode_no)
+        if episode_no != expected_episode_no:
+            break
+        if int(row.get("authorizedYn") or 0) != 1:
+            break
+        contiguous_episode_to = episode_no
+        expected_episode_no = episode_no + 1
+
+    synced_episode_to = max(int(synced_latest_episode_no or 0), 0)
+    max_authorized_episode_to = (
+        min(contiguous_episode_to, synced_episode_to)
+        if synced_episode_to > 0
+        else 0
+    )
+    requested = _resolve_websochat_requested_episode_to(requested_episode_to)
+    authorized_read_episode_to = (
+        min(requested, max_authorized_episode_to)
+        if requested is not None and max_authorized_episode_to > 0
+        else None
+    )
+    return {
+        "requestedEpisodeTo": requested,
+        "authorizedReadEpisodeTo": authorized_read_episode_to,
+        "maxAuthorizedEpisodeTo": max_authorized_episode_to,
+        "contiguousAuthorizedEpisodeTo": contiguous_episode_to,
+        "syncedLatestEpisodeNo": synced_episode_to,
+    }
+
+
+async def _apply_websochat_account_read_scope(
     session_memory: dict[str, Any],
     account_read_episode_to: int | None,
+    *,
+    product_id: int,
+    user_id: int | None,
+    synced_latest_episode_no: int | None,
+    db: AsyncSession,
 ) -> dict[str, Any]:
     normalized = _normalize_websochat_session_memory(session_memory)
-    resolved_account_read_episode_to = max(int(account_read_episode_to or 0), 0) or None
-    if not resolved_account_read_episode_to:
+    requested_account_read_episode_to = _resolve_websochat_requested_episode_to(account_read_episode_to)
+    if not requested_account_read_episode_to:
         return normalized
     if str(normalized.get("read_scope_source") or "").strip().lower() == "prompt":
         return normalized
-    normalized["read_episode_to"] = resolved_account_read_episode_to
+    authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=product_id,
+        user_id=user_id,
+        requested_episode_to=requested_account_read_episode_to,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    authorized_read_episode_to = _resolve_websochat_requested_episode_to(
+        authorized_scope.get("authorizedReadEpisodeTo")
+    )
+    if not authorized_read_episode_to:
+        return normalized
+    normalized["read_episode_to"] = authorized_read_episode_to
     normalized["read_scope_state"] = "known"
     normalized["read_scope_source"] = "account"
     return normalized
+
+
+async def _clamp_websochat_session_read_scope_to_authorized(
+    *,
+    session_memory: dict[str, Any],
+    product_id: int,
+    user_id: int | None,
+    synced_latest_episode_no: int | None,
+    db: AsyncSession,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    normalized = _normalize_websochat_session_memory(session_memory)
+    requested_read_episode_to = _resolve_websochat_requested_episode_to(
+        normalized.get("read_episode_to")
+    )
+    authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=product_id,
+        user_id=user_id,
+        requested_episode_to=requested_read_episode_to,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    authorized_read_episode_to = _resolve_websochat_requested_episode_to(
+        authorized_scope.get("authorizedReadEpisodeTo")
+    )
+    if requested_read_episode_to and authorized_read_episode_to:
+        normalized["read_episode_to"] = authorized_read_episode_to
+        normalized["read_scope_state"] = "known"
+    elif requested_read_episode_to and not authorized_read_episode_to:
+        normalized["read_episode_to"] = None
+        normalized["read_scope_state"] = "unknown"
+        normalized["read_scope_source"] = "unknown"
+    return normalized, authorized_scope
 
 
 def _build_websochat_cta_cards(
@@ -966,6 +1167,7 @@ async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSessio
             p.story_agent_setting_text AS websochatSetting,
             {get_file_path_sub_query('p.thumbnail_file_id', 'coverImagePath')},
             p.status_code AS statusCode,
+            p.price_type AS priceType,
             COALESCE(sacp.context_status, 'pending') AS contextStatus,
             COALESCE(MAX(e.episode_no), 0) AS latestEpisodeNo,
             LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo
@@ -973,16 +1175,15 @@ async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSessio
         LEFT JOIN tb_story_agent_context_product sacp
           ON sacp.product_id = p.product_id
         LEFT JOIN tb_product_episode e
-          ON e.product_id = p.product_id
+            ON e.product_id = p.product_id
          AND e.use_yn = 'Y'
          AND e.open_yn = 'Y'
         WHERE p.product_id = :product_id
-          AND p.price_type = 'free'
           AND p.open_yn = 'Y'
           AND p.blind_yn = 'N'
           AND COALESCE(sacp.context_status, 'pending') = 'ready'
           {ratings_filter}
-        GROUP BY p.product_id, p.title, p.author_name, p.story_agent_setting_text, p.thumbnail_file_id, p.status_code, sacp.context_status, sacp.ready_episode_count
+        GROUP BY p.product_id, p.title, p.author_name, p.story_agent_setting_text, p.thumbnail_file_id, p.status_code, p.price_type, sacp.context_status, sacp.ready_episode_count
         HAVING COALESCE(MAX(e.episode_no), 0) > 0
         """
     )
@@ -1053,18 +1254,17 @@ async def _get_websochat_product_session_state(
 
     product = dict(row)
     can_send_message = (
-        product.get("priceType") == "free"
-        and product.get("openYn") == "Y"
+        product.get("openYn") == "Y"
         and product.get("blindYn") == "N"
         and product.get("contextStatus") == "ready"
         and int(product.get("latestEpisodeNo") or 0) > 0
+        and _resolve_websochat_synced_latest_episode_no(product) > 0
         and (adult_yn == "Y" or product.get("ratingsCode") == "all")
     )
     unavailable_message = None
     if not can_send_message:
         if (
-            product.get("priceType") != "free"
-            or product.get("openYn") != "Y"
+            product.get("openYn") != "Y"
             or product.get("blindYn") != "N"
             or int(product.get("latestEpisodeNo") or 0) <= 0
         ):
@@ -4023,6 +4223,150 @@ def _build_websochat_inventory_v3_resolution(
     }
 
 
+def _build_websochat_rp_lookup_scope_keys(
+    *,
+    normalized_memory: dict[str, Any],
+    resolved_active_character: str,
+    resolution: dict[str, Any],
+) -> list[str]:
+    resolved_scope_key = str(resolved_active_character or "").strip()
+    if not resolved_scope_key:
+        return []
+    inventory_payload = dict(resolution.get("inventoryPayload") or {})
+    identity_scope_keys = [
+        str(scope_key or "").strip()
+        for scope_key in list(inventory_payload.get("protagonist_identity_scope_keys") or [])
+        if str(scope_key or "").strip()
+    ]
+    if _is_websochat_character_chat_session(normalized_memory):
+        return _merge_websochat_ordered_texts([resolved_scope_key], identity_scope_keys)
+    alias_scope_keys = [
+        str(scope_key or "").strip()
+        for scope_key in list(resolution.get("aliasScopeKeys") or [])
+        if str(scope_key or "").strip()
+    ]
+    return _merge_websochat_ordered_texts(alias_scope_keys, [resolved_scope_key], identity_scope_keys)
+
+
+def _is_websochat_summary_payload_scope_compatible(
+    payload: dict[str, Any] | None,
+    *,
+    scope_key: str,
+) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    expected_scope_key = str(scope_key or "").strip()
+    if not expected_scope_key:
+        return False
+    payload_scope_key = str(payload.get("character_key") or "").strip()
+    if not payload_scope_key:
+        return True
+    return payload_scope_key == expected_scope_key
+
+
+def _is_websochat_character_chat_opening_payload_compatible(
+    payload: dict[str, Any] | None,
+    *,
+    scope_key: str,
+) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    expected_scope_key = str(scope_key or "").strip()
+    if not expected_scope_key:
+        return False
+    target_payload = payload.get("chat_target")
+    target_scope_key = ""
+    if isinstance(target_payload, dict):
+        target_scope_key = str(target_payload.get("scope_key") or "").strip()
+    payload_scope_key = (
+        str(payload.get("character_key") or "").strip()
+        or str(payload.get("scope_key") or "").strip()
+        or target_scope_key
+    )
+    if payload_scope_key and payload_scope_key != expected_scope_key:
+        return False
+    readiness = payload.get("readiness")
+    if isinstance(readiness, dict) and str(readiness.get("status") or "").strip() not in ("", "ready"):
+        return False
+    opening_message = payload.get("opening_message")
+    if not isinstance(opening_message, dict):
+        return False
+    narration = str(opening_message.get("narration") or "").strip()
+    dialogue = str(opening_message.get("dialogue") or "").strip()
+    opening_text = str(opening_message.get("opening_text") or "").strip()
+    user_objective = str(opening_message.get("user_objective") or "").strip()
+    if not narration or not dialogue or not opening_text or not user_objective:
+        return False
+    if len(narration) < 220 or len(dialogue) < 20 or len(opening_text) < 280:
+        return False
+    if dialogue.strip().lstrip('"“').startswith("거기"):
+        return False
+    if _has_websochat_character_chat_opening_agency_violation(f"{dialogue}\n{opening_text}"):
+        return False
+    return True
+
+
+def _has_websochat_character_chat_opening_agency_violation(text: str) -> bool:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return False
+    forbidden_fragments = [
+        "멍하니 서",
+        "멍하니 있",
+        "숨어서",
+        "숨어 있",
+        "눈치만 보",
+        "튀어나와",
+        "어슬렁",
+        "허가받지 않은",
+        "침입자",
+        "침입했",
+        "목적이 뭐",
+        "정체가 뭐",
+        "누구냐",
+        "왜 여기",
+        "대답해",
+        "네가 가리킨",
+        "네가 들고",
+        "네가 내민",
+        "네 손",
+        "네 발치",
+        "너를 향해",
+        "너에게",
+        "너를 쏘아보",
+        "너를 힐끗",
+        "너를 쳐다",
+    ]
+    return any(fragment in normalized for fragment in forbidden_fragments)
+
+
+def _is_websochat_character_chat_rp_context_ready(
+    *,
+    resolved_active_character: str,
+    profile: dict[str, Any] | None,
+    examples_payload: dict[str, Any] | None,
+    internal_prompt_payload: dict[str, Any] | None,
+    internal_prompt: str,
+    inventory_payload: dict[str, Any] | None,
+    opening_payload: dict[str, Any] | None,
+) -> bool:
+    resolved_scope_key = str(resolved_active_character or "").strip()
+    if not resolved_scope_key or not profile or examples_payload is None or not str(internal_prompt or "").strip():
+        return False
+    if not _is_websochat_character_chat_opening_payload_compatible(opening_payload, scope_key=resolved_scope_key):
+        return False
+    if not _has_websochat_inventory_public_gate(inventory_payload):
+        return False
+    if not _is_websochat_inventory_rp_eligible(inventory_payload):
+        return False
+    for payload in (profile, examples_payload, internal_prompt_payload):
+        if payload is None:
+            return False
+        if not _is_websochat_summary_payload_scope_compatible(payload, scope_key=resolved_scope_key):
+            return False
+    return True
+
+
 async def _build_websochat_rp_trajectory_context(
     *,
     product_id: int,
@@ -4523,17 +4867,16 @@ async def _load_websochat_rp_context(
     resolved_active_character = str(resolution.get("scopeKey") or "").strip()
     if not resolved_active_character:
         return None
+    is_character_chat_session = _is_websochat_character_chat_session(normalized_memory)
     protagonist_cluster_rows: list[dict[str, Any]] = []
-    alias_scope_keys = [
-        str(scope_key or "").strip()
-        for scope_key in list(resolution.get("aliasScopeKeys") or [])
-        if str(scope_key or "").strip()
-    ]
-    cluster_scope_keys: list[str] = _merge_websochat_ordered_texts(
-        alias_scope_keys,
-        [resolved_active_character],
+    cluster_scope_keys: list[str] = _build_websochat_rp_lookup_scope_keys(
+        normalized_memory=normalized_memory,
+        resolved_active_character=resolved_active_character,
+        resolution=resolution,
     )
-    if resolved_active_character.startswith("protagonist:"):
+    if not cluster_scope_keys:
+        return None
+    if not is_character_chat_session and resolved_active_character.startswith("protagonist:"):
         protagonist_rows = await _load_websochat_protagonist_inventory_rows(
             product_id=product_id,
             db=db,
@@ -4559,6 +4902,28 @@ async def _load_websochat_rp_context(
         scope_keys=cluster_scope_keys,
         db=db,
     )
+    internal_prompt_row = await _get_websochat_first_available_summary_row(
+        product_id=product_id,
+        summary_type="character_chat_internal_prompt",
+        scope_keys=cluster_scope_keys,
+        db=db,
+    )
+    opening_row = (
+        await _get_websochat_first_available_summary_row(
+            product_id=product_id,
+            summary_type="character_chat_opening_v1",
+            scope_keys=cluster_scope_keys,
+            db=db,
+        )
+        if is_character_chat_session
+        else None
+    )
+    inventory_v3_row = await _get_websochat_first_available_summary_row(
+        product_id=product_id,
+        summary_type="character_inventory_v3",
+        scope_keys=cluster_scope_keys,
+        db=db,
+    )
     inventory_row = await _get_websochat_first_available_summary_row(
         product_id=product_id,
         summary_type="character_inventory",
@@ -4567,7 +4932,12 @@ async def _load_websochat_rp_context(
     )
     profile = _extract_websochat_json_object(str((profile_row or {}).get("summaryText") or ""))
     examples_payload = _extract_websochat_json_object(str((examples_row or {}).get("summaryText") or ""))
-    inventory_payload = _extract_websochat_json_object(str((inventory_row or {}).get("summaryText") or ""))
+    internal_prompt_payload = _extract_websochat_json_object(str((internal_prompt_row or {}).get("summaryText") or ""))
+    internal_prompt = str((internal_prompt_payload or {}).get("internal_prompt") or "").strip()
+    opening_payload = _extract_websochat_json_object(str((opening_row or {}).get("summaryText") or ""))
+    inventory_payload = _extract_websochat_json_object(
+        str(((inventory_v3_row or inventory_row) or {}).get("summaryText") or "")
+    )
     canonical_inventory_payload = dict(resolution.get("inventoryPayload") or {})
     canonical_inventory_has_public_gate = _has_websochat_inventory_public_gate(canonical_inventory_payload)
     if canonical_inventory_has_public_gate and not _is_websochat_inventory_rp_eligible(canonical_inventory_payload):
@@ -4580,6 +4950,26 @@ async def _load_websochat_rp_context(
         merged_inventory_payload = _merge_websochat_protagonist_inventory_payload(protagonist_cluster_rows)
         if merged_inventory_payload:
             inventory_payload = merged_inventory_payload
+    if is_character_chat_session and not _is_websochat_character_chat_rp_context_ready(
+        resolved_active_character=resolved_active_character,
+        profile=profile,
+        examples_payload=examples_payload,
+        internal_prompt_payload=internal_prompt_payload,
+        internal_prompt=internal_prompt,
+        inventory_payload=inventory_payload,
+        opening_payload=opening_payload,
+    ):
+        logger.info(
+            "websochat character_chat_context_unavailable product_id=%s scope_key=%s profile=%s examples=%s internal_prompt=%s opening=%s inventory_gate=%s",
+            product_id,
+            resolved_active_character,
+            bool(profile),
+            examples_payload is not None,
+            bool(internal_prompt),
+            bool(opening_payload),
+            _has_websochat_inventory_public_gate(inventory_payload),
+        )
+        return None
     inventory_is_protagonist = bool((inventory_payload or {}).get("is_protagonist"))
     inventory_rp_eligible = _is_websochat_inventory_rp_eligible(inventory_payload)
     inventory_has_public_gate = _has_websochat_inventory_public_gate(inventory_payload)
@@ -4629,9 +5019,12 @@ async def _load_websochat_rp_context(
         "personality_core": profile.get("personality_core") or [],
         "baseline_attitude": str(profile.get("baseline_attitude") or "").strip(),
         "examples": list(examples_payload.get("examples") or []),
+        "internal_prompt": internal_prompt,
         "inventory": inventory_payload or {},
         "session_memory": normalized_memory,
     }
+    if is_character_chat_session and opening_payload:
+        context["character_chat_opening"] = opening_payload
 
     relation_payloads = await _load_websochat_character_relation_payloads(
         product_id=product_id,
@@ -5995,6 +6388,7 @@ async def search_products(
             p.author_name AS authorNickname,
             {get_file_path_sub_query('p.thumbnail_file_id', 'coverImagePath')},
             p.status_code AS statusCode,
+            p.price_type AS priceType,
             COALESCE(sacp.context_status, 'pending') AS contextStatus,
             COALESCE(MAX(e.episode_no), 0) AS latestEpisodeNo,
             LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo
@@ -6002,18 +6396,17 @@ async def search_products(
         LEFT JOIN tb_story_agent_context_product sacp
           ON sacp.product_id = p.product_id
         LEFT JOIN tb_product_episode e
-          ON e.product_id = p.product_id
+            ON e.product_id = p.product_id
          AND e.use_yn = 'Y'
          AND e.open_yn = 'Y'
-        WHERE p.price_type = 'free'
-          AND p.open_yn = 'Y'
+        WHERE p.open_yn = 'Y'
           AND p.blind_yn = 'N'
           {ratings_filter}
           AND (
             p.title LIKE :keyword
             OR p.author_name LIKE :keyword
           )
-        GROUP BY p.product_id, p.title, p.author_name, p.thumbnail_file_id, p.status_code, sacp.context_status, sacp.ready_episode_count
+        GROUP BY p.product_id, p.title, p.author_name, p.thumbnail_file_id, p.status_code, p.price_type, sacp.context_status, sacp.ready_episode_count
         HAVING COALESCE(MAX(e.episode_no), 0) > 0
         ORDER BY
           CASE WHEN COALESCE(sacp.context_status, 'pending') = 'ready' THEN 0 ELSE 1 END,
@@ -6080,6 +6473,7 @@ async def get_sessions(
     result = await db.execute(query, params)
     session_rows = [dict(row) for row in result.mappings().all()]
     product_state_cache: dict[int, dict[str, Any]] = {}
+    authorized_scope_cache: dict[tuple[int, int | None], dict[str, Any]] = {}
     read_scope_title_cache: dict[tuple[int, int], str | None] = {}
     items: list[dict[str, Any]] = []
 
@@ -6100,12 +6494,33 @@ async def get_sessions(
         )
         scope_state = _resolve_websochat_read_scope_state(session_memory)
         requested_read_episode_to = max(int(session_memory.get("read_episode_to") or 0), 0) or None
+        authorized_scope_key = (current_product_id, requested_read_episode_to)
+        if authorized_scope_key not in authorized_scope_cache:
+            authorized_scope_cache[authorized_scope_key] = await _get_websochat_authorized_read_scope(
+                product_id=current_product_id,
+                user_id=user_id,
+                requested_episode_to=requested_read_episode_to,
+                synced_latest_episode_no=_resolve_websochat_synced_latest_episode_no(product_state),
+                db=db,
+            )
+        authorized_scope = authorized_scope_cache[authorized_scope_key]
+        authorized_read_episode_to = _resolve_websochat_requested_episode_to(
+            authorized_scope.get("authorizedReadEpisodeTo")
+        )
+        display_scope_state = (
+            "unknown"
+            if scope_state == "known" and not authorized_read_episode_to
+            else scope_state
+        )
         read_episode_to = _resolve_websochat_display_read_episode_to(
-            scope_state=scope_state,
+            scope_state=display_scope_state,
             latest_episode_no=product_state.get("latestEpisodeNo"),
             synced_latest_episode_no=product_state.get("syncedLatestEpisodeNo"),
-            requested_read_episode_to=requested_read_episode_to,
+            requested_read_episode_to=authorized_read_episode_to,
         )
+        can_send_message = bool(product_state.get("canSendMessage")) and int(
+            authorized_scope.get("maxAuthorizedEpisodeTo") or 0
+        ) > 0
         read_episode_title = None
         if read_episode_to:
             cache_key = (current_product_id, read_episode_to)
@@ -6131,18 +6546,24 @@ async def get_sessions(
                 "productTitle": product_state.get("title"),
                 "productAuthorNickname": product_state.get("authorNickname"),
                 "coverImagePath": product_state.get("coverImagePath"),
-                "readScopeState": scope_state,
+                "productPriceType": product_state.get("priceType"),
+                "readScopeState": display_scope_state,
                 "readEpisodeNo": read_episode_to,
                 "readEpisodeTitle": read_episode_title,
                 "latestEpisodeNo": product_state.get("latestEpisodeNo") or 0,
                 "publishedLatestEpisodeNo": product_state.get("latestEpisodeNo") or 0,
                 "syncedLatestEpisodeNo": product_state.get("syncedLatestEpisodeNo") or 0,
                 "contextStatus": product_state.get("contextStatus"),
-                "canSendMessage": product_state.get("canSendMessage"),
-                "unavailableMessage": product_state.get("unavailableMessage"),
+                "canSendMessage": can_send_message,
+                "unavailableMessage": (
+                    product_state.get("unavailableMessage")
+                    if can_send_message
+                    else product_state.get("unavailableMessage") or WEBSOCHAT_ACCESS_REQUIRED_MESSAGE
+                ),
                 "pendingQaActionKey": pending_qa_action_key,
                 "rpStage": rp_session_state["rpStage"],
                 "rpActiveCharacterLabel": rp_session_state["rpActiveCharacterLabel"],
+                **_build_websochat_session_contract_payload(session_memory),
             }
         )
 
@@ -6200,11 +6621,29 @@ async def get_messages(
     requested_read_episode_to = max(int(session_memory.get("read_episode_to") or 0), 0) or None
     latest_episode_no = int(product_state.get("latestEpisodeNo") or 0)
     synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_state)
+    authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=int(session_row["product_id"]),
+        user_id=user_id,
+        requested_episode_to=requested_read_episode_to,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    authorized_read_episode_to = _resolve_websochat_requested_episode_to(
+        authorized_scope.get("authorizedReadEpisodeTo")
+    )
+    display_scope_state = (
+        "unknown"
+        if scope_state == "known" and not authorized_read_episode_to
+        else scope_state
+    )
+    can_send_message = bool(product_state.get("canSendMessage")) and int(
+        authorized_scope.get("maxAuthorizedEpisodeTo") or 0
+    ) > 0
     read_episode_to = _resolve_websochat_display_read_episode_to(
-        scope_state=scope_state,
+        scope_state=display_scope_state,
         latest_episode_no=latest_episode_no,
         synced_latest_episode_no=synced_latest_episode_no,
-        requested_read_episode_to=requested_read_episode_to,
+        requested_read_episode_to=authorized_read_episode_to,
     )
     read_episode_title = None
     if read_episode_to:
@@ -6214,7 +6653,7 @@ async def get_messages(
             db,
         )
     concierge_payload = None
-    if scope_state == "none":
+    if display_scope_state == "none":
         concierge_payload = await build_websochat_concierge_payload(
             product_row=product_state,
             user_id=user_id,
@@ -6223,7 +6662,7 @@ async def get_messages(
     episode_ref_ceiling = _resolve_websochat_episode_ref_ceiling(
         latest_episode_no,
         synced_latest_episode_no,
-        requested_read_episode_to,
+        authorized_read_episode_to,
     )
     messages = [
         (
@@ -6236,12 +6675,12 @@ async def get_messages(
     messages = _attach_websochat_concierge_to_last_assistant_message(messages, concierge_payload)
     starter = _build_websochat_starter(
         product_title=str(product_state.get("title") or session_row.get("title") or "").strip(),
-        scope_state=scope_state,
+        scope_state=display_scope_state,
         read_episode_to=read_episode_to,
         read_episode_title=read_episode_title,
         latest_episode_no=latest_episode_no,
         synced_latest_episode_no=synced_latest_episode_no,
-        can_send_message=bool(product_state.get("canSendMessage")),
+        can_send_message=can_send_message,
         concierge_payload=concierge_payload,
     )
     guide_message = None
@@ -6293,7 +6732,7 @@ async def get_messages(
         len(messages),
         bool(starter),
         bool(guide_message),
-        scope_state,
+        display_scope_state,
         read_episode_to,
         rp_session_state["rpStage"],
         rp_session_state["rpActiveCharacterLabel"],
@@ -6309,13 +6748,18 @@ async def get_messages(
                 "productTitle": product_state.get("title"),
                 "productAuthorNickname": product_state.get("authorNickname"),
                 "coverImagePath": product_state.get("coverImagePath"),
-                "readScopeState": scope_state,
+                "productPriceType": product_state.get("priceType"),
+                "readScopeState": display_scope_state,
                 "latestEpisodeNo": latest_episode_no,
                 "publishedLatestEpisodeNo": latest_episode_no,
                 "syncedLatestEpisodeNo": synced_latest_episode_no,
                 "contextStatus": product_state.get("contextStatus"),
-                "canSendMessage": bool(product_state.get("canSendMessage")),
-                "unavailableMessage": product_state.get("unavailableMessage"),
+                "canSendMessage": can_send_message,
+                "unavailableMessage": (
+                    product_state.get("unavailableMessage")
+                    if can_send_message
+                    else product_state.get("unavailableMessage") or WEBSOCHAT_ACCESS_REQUIRED_MESSAGE
+                ),
                 "pendingQaActionKey": pending_qa_action_key,
                 "createdDate": (
                     session_row["created_date"].strftime("%Y-%m-%d %H:%M:%S")
@@ -6331,6 +6775,7 @@ async def get_messages(
                 "readEpisodeTitle": read_episode_title,
                 "rpStage": rp_session_state["rpStage"],
                 "rpActiveCharacterLabel": rp_session_state["rpActiveCharacterLabel"],
+                **_build_websochat_session_contract_payload(session_memory),
             },
             "messages": messages,
             "starter": starter,
@@ -6391,19 +6836,39 @@ async def create_session(
             message=product_state.get("unavailableMessage") or ErrorMessages.NOT_FOUND_PRODUCT,
         )
     _assert_websochat_product_context_available(product_row)
+    synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_row)
+    authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=req_body.product_id,
+        user_id=user_id,
+        requested_episode_to=None,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    if int(authorized_scope.get("maxAuthorizedEpisodeTo") or 0) <= 0:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=WEBSOCHAT_ACCESS_REQUIRED_MESSAGE,
+        )
 
     title = (req_body.title or WEBSOCHAT_DEFAULT_TITLE).strip()[:120]
+    locked_character_scope_key = str(req_body.locked_character_scope_key or "").strip() or None
+    session_kind = (
+        "character_chat"
+        if locked_character_scope_key
+        else str(req_body.session_kind or "").strip().lower() or "websochat"
+    )
+    requested_active_character = locked_character_scope_key or req_body.active_character
     resolution = await _resolve_websochat_active_character_resolution(
         product_id=req_body.product_id,
-        active_character=req_body.active_character,
+        active_character=requested_active_character,
         db=db,
     )
     resolved_active_character = str(resolution.get("scopeKey") or "").strip() or None
-    if req_body.active_character and not resolved_active_character:
+    if requested_active_character and not resolved_active_character:
         logger.info(
             "websochat rp_resolution_clarify product_id=%s raw=%s resolution_source=%s protagonist_intent=%s candidate_count=%s",
             req_body.product_id,
-            req_body.active_character,
+            requested_active_character,
             str(resolution.get("resolutionSource") or "none"),
             bool(resolution.get("protagonistIntent")),
             int(resolution.get("candidateCount") or 0),
@@ -6412,11 +6877,23 @@ async def create_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             message="누구와 이야기하고 싶은지 이름으로 한 번만 더 말해줘. 주인공이면 이름이나 주인공이라고 적어도 돼요.",
         )
+    if session_kind == "character_chat":
+        if not resolved_active_character:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="캐릭터챗을 시작할 인물 정보가 필요합니다.",
+            )
+        if locked_character_scope_key and locked_character_scope_key != resolved_active_character:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="캐릭터챗 고정 인물과 선택 인물이 일치하지 않습니다.",
+            )
+        locked_character_scope_key = resolved_active_character
     session_memory = _merge_websochat_session_memory(
         base_memory={},
-        rp_mode=req_body.rp_mode,
+        rp_mode=req_body.rp_mode or ("free" if session_kind == "character_chat" else None),
         active_character=resolved_active_character,
-        active_character_label=req_body.active_character,
+        active_character_label=str(resolution.get("displayName") or "").strip() or requested_active_character,
         scene_episode_no=req_body.scene_episode_no,
         game_mode=req_body.game_mode,
         game_gender_scope=req_body.game_gender_scope,
@@ -6424,9 +6901,22 @@ async def create_session(
         game_match_mode=req_body.game_match_mode,
         game_read_episode_to=req_body.game_read_episode_to,
     )
-    session_memory = _apply_websochat_account_read_scope(
+    session_memory["session_kind"] = session_kind
+    session_memory["entry_source"] = req_body.entry_source
+    if session_kind == "character_chat":
+        session_memory["locked_character_scope_key"] = locked_character_scope_key
+        session_memory["allowed_modes"] = ["rp"]
+        session_memory["active_mode"] = "rp"
+        session_memory["pending_rp_character_selection"] = False
+    else:
+        session_memory["allowed_modes"] = ["qa", "rp", "ideal_worldcup"]
+    session_memory = await _apply_websochat_account_read_scope(
         session_memory,
         req_body.account_read_episode_to,
+        product_id=req_body.product_id,
+        user_id=user_id,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
     )
     session_memory_json = _serialize_websochat_session_memory(session_memory)
     query = text(
@@ -6467,6 +6957,7 @@ async def create_session(
             "productId": req_body.product_id,
             "title": title,
             "product": product_row,
+            **_build_websochat_session_contract_payload(session_memory),
         }
     }
 
@@ -6523,6 +7014,15 @@ async def patch_session_mode(
         bool(session_memory.get("pending_rp_character_selection")),
         req_body.mode_key,
     )
+    _assert_websochat_session_allows_mode(session_memory, req_body.mode_key)
+    if _is_websochat_character_chat_session(session_memory) and req_body.mode_key == "rp":
+        return {
+            "data": {
+                "sessionId": session_id,
+                "modeKey": "rp",
+                "pendingRpCharacterSelection": False,
+            }
+        }
 
     if (
         req_body.mode_key in {"qa", "rp"}
@@ -6599,22 +7099,62 @@ async def patch_session_read_scope(
     session_row = await _get_session_row(session_id, user_id, resolved_guest_key, db)
     session_memory = _normalize_websochat_session_memory(session_row.get("session_memory_json"))
     current_read_episode_to = max(int(session_memory.get("read_episode_to") or 0), 0)
-    latest_visible_episode_no = await _get_websochat_latest_visible_episode_no(
-        int(session_row["product_id"]),
+    product_state = await _get_websochat_product_session_state(
+        product_id=int(session_row["product_id"]),
+        adult_yn=await _resolve_effective_adult_yn(
+            kc_user_id=kc_user_id,
+            adult_yn="Y",
+            db=db,
+        ),
         db=db,
     )
-    requested_read_episode_to = min(
-        max(int(req_body.read_episode_to or 0), 0),
-        max(int(latest_visible_episode_no or 0), 0),
-    )
-    if requested_read_episode_to <= 0:
+    if not product_state.get("canSendMessage"):
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            message=ErrorMessages.NOT_FOUND_EPISODE,
+            message=product_state.get("unavailableMessage") or WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE,
+        )
+    synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_state)
+    current_authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=int(session_row["product_id"]),
+        user_id=user_id,
+        requested_episode_to=current_read_episode_to,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    requested_authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=int(session_row["product_id"]),
+        user_id=user_id,
+        requested_episode_to=req_body.read_episode_to,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    requested_read_episode_to = _resolve_websochat_requested_episode_to(
+        requested_authorized_scope.get("authorizedReadEpisodeTo")
+    )
+    if not requested_read_episode_to:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=(
+                WEBSOCHAT_ACCESS_REQUIRED_MESSAGE
+                if int(requested_authorized_scope.get("maxAuthorizedEpisodeTo") or 0) <= 0
+                else ErrorMessages.NOT_FOUND_EPISODE
+            ),
         )
 
-    resolved_read_episode_to = max(current_read_episode_to, requested_read_episode_to)
-    if resolved_read_episode_to > current_read_episode_to:
+    current_authorized_read_episode_to = _resolve_websochat_requested_episode_to(
+        current_authorized_scope.get("authorizedReadEpisodeTo")
+    )
+    if (
+        str(session_memory.get("read_scope_source") or "").strip().lower() == "prompt"
+        and current_authorized_read_episode_to
+    ):
+        resolved_read_episode_to = int(current_authorized_read_episode_to or 0)
+    else:
+        resolved_read_episode_to = max(
+            int(current_authorized_read_episode_to or 0),
+            int(requested_read_episode_to or 0),
+        )
+    if resolved_read_episode_to != current_read_episode_to:
         session_memory["read_episode_to"] = resolved_read_episode_to
         session_memory["read_scope_state"] = "known"
         session_memory["read_scope_source"] = "viewer"
@@ -6703,6 +7243,22 @@ async def post_message(
     current_session_memory = _normalize_websochat_session_memory(session_row.get("session_memory_json"))
     starter_mode_key = str(req_body.starter_mode_key or "").strip().lower() or None
     qa_action_key = str(req_body.qa_action_key or "").strip().lower() or None
+    is_character_chat_session = _is_websochat_character_chat_session(current_session_memory)
+    requested_mode_key = _resolve_websochat_requested_mode_key(
+        starter_mode_key=starter_mode_key,
+        qa_action_key=qa_action_key,
+        game_mode=req_body.game_mode,
+        session_memory=current_session_memory,
+    )
+    _assert_websochat_session_allows_mode(current_session_memory, requested_mode_key)
+    locked_character_scope_key = str(current_session_memory.get("locked_character_scope_key") or "").strip() or None
+    if is_character_chat_session and not locked_character_scope_key:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="캐릭터챗 세션의 고정 인물 정보가 없습니다. 다시 시작해 주세요.",
+        )
+    request_active_character = locked_character_scope_key if is_character_chat_session else req_body.active_character
+    request_rp_mode = req_body.rp_mode or ("free" if is_character_chat_session else None)
     if starter_mode_key == "qa":
         current_session_memory = _clear_websochat_rp_context(_clear_websochat_game_context(current_session_memory))
     elif starter_mode_key == "rp":
@@ -6712,74 +7268,6 @@ async def post_message(
     explicit_game_mode = req_body.game_mode
     if starter_mode_key == "ideal_worldcup" and not explicit_game_mode:
         explicit_game_mode = "ideal_worldcup"
-    resolution = await _resolve_websochat_active_character_resolution(
-        product_id=int(session_row["product_id"]),
-        active_character=req_body.active_character,
-        db=db,
-    )
-    resolved_active_character = str(resolution.get("scopeKey") or "").strip() or None
-    resolved_active_character_label = (
-        str(resolution.get("displayName") or "").strip()
-        or str(req_body.active_character or "").strip()
-        or None
-    )
-    needs_character_resolution_clarify = bool(req_body.active_character and not resolved_active_character)
-    character_resolution_clarify_reply = None
-    if needs_character_resolution_clarify:
-        logger.info(
-            "websochat rp_resolution_clarify product_id=%s raw=%s resolution_source=%s protagonist_intent=%s candidate_count=%s",
-            int(session_row["product_id"]),
-            req_body.active_character,
-            str(resolution.get("resolutionSource") or "none"),
-            bool(resolution.get("protagonistIntent")),
-            int(resolution.get("candidateCount") or 0),
-        )
-        character_resolution_clarify_reply = _build_websochat_rp_character_resolution_clarify_reply(
-            active_character_label=req_body.active_character,
-            resolution_source=str(resolution.get("resolutionSource") or "none"),
-            protagonist_intent=bool(resolution.get("protagonistIntent")),
-            candidate_names=[
-                str(candidate_name).strip()
-                for candidate_name in list(resolution.get("candidateNames") or [])
-                if str(candidate_name).strip()
-            ],
-        )
-    if needs_character_resolution_clarify:
-        next_session_memory = _clear_websochat_rp_context(_clear_websochat_game_context(current_session_memory))
-        next_session_memory["pending_rp_character_selection"] = True
-        next_session_memory["pending_mode_entry_guide"] = None
-    else:
-        next_session_memory = _merge_websochat_session_memory(
-            base_memory=current_session_memory,
-            rp_mode=req_body.rp_mode,
-            active_character=resolved_active_character,
-            active_character_label=resolved_active_character_label,
-            scene_episode_no=req_body.scene_episode_no,
-            game_mode=explicit_game_mode,
-            game_gender_scope=req_body.game_gender_scope,
-            game_category=req_body.game_category,
-            game_match_mode=req_body.game_match_mode,
-            game_read_episode_to=req_body.game_read_episode_to,
-        )
-    next_session_memory = _apply_websochat_account_read_scope(
-        next_session_memory,
-        req_body.account_read_episode_to,
-    )
-    logger.info(
-        "websochat_debug post_message:memory session_id=%s current_rp_stage=%s next_rp_stage=%s pending_rp=%s resolved_active_character=%s active_character_label=%s",
-        session_id,
-        _resolve_websochat_rp_stage(current_session_memory),
-        _resolve_websochat_rp_stage(next_session_memory),
-        bool(next_session_memory.get("pending_rp_character_selection")),
-        resolved_active_character,
-        _resolve_websochat_active_character_label(next_session_memory),
-    )
-    if starter_mode_key not in {"qa", "rp"}:
-        next_session_memory = apply_websochat_implicit_game_inputs(
-            session_memory=next_session_memory,
-            user_prompt=req_body.content,
-            game_read_episode_to=req_body.game_read_episode_to,
-        )
     effective_adult_yn = await _resolve_effective_adult_yn(
         kc_user_id=kc_user_id,
         adult_yn="Y",
@@ -6803,6 +7291,90 @@ async def post_message(
     _assert_websochat_product_context_available(product_row)
     synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_row)
     latest_episode_no = max(int(product_row.get("latestEpisodeNo") or 0), 0)
+    authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=int(session_row["product_id"]),
+        user_id=user_id,
+        requested_episode_to=None,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    if int(authorized_scope.get("maxAuthorizedEpisodeTo") or 0) <= 0:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=WEBSOCHAT_ACCESS_REQUIRED_MESSAGE,
+        )
+    resolution = await _resolve_websochat_active_character_resolution(
+        product_id=int(session_row["product_id"]),
+        active_character=request_active_character,
+        db=db,
+    )
+    resolved_active_character = str(resolution.get("scopeKey") or "").strip() or None
+    resolved_active_character_label = (
+        str(resolution.get("displayName") or "").strip()
+        or str(request_active_character or "").strip()
+        or None
+    )
+    needs_character_resolution_clarify = bool(request_active_character and not resolved_active_character)
+    character_resolution_clarify_reply = None
+    if needs_character_resolution_clarify:
+        logger.info(
+            "websochat rp_resolution_clarify product_id=%s raw=%s resolution_source=%s protagonist_intent=%s candidate_count=%s",
+            int(session_row["product_id"]),
+            request_active_character,
+            str(resolution.get("resolutionSource") or "none"),
+            bool(resolution.get("protagonistIntent")),
+            int(resolution.get("candidateCount") or 0),
+        )
+        character_resolution_clarify_reply = _build_websochat_rp_character_resolution_clarify_reply(
+            active_character_label=request_active_character,
+            resolution_source=str(resolution.get("resolutionSource") or "none"),
+            protagonist_intent=bool(resolution.get("protagonistIntent")),
+            candidate_names=[
+                str(candidate_name).strip()
+                for candidate_name in list(resolution.get("candidateNames") or [])
+                if str(candidate_name).strip()
+            ],
+        )
+    if needs_character_resolution_clarify:
+        next_session_memory = _clear_websochat_rp_context(_clear_websochat_game_context(current_session_memory))
+        next_session_memory["pending_rp_character_selection"] = True
+        next_session_memory["pending_mode_entry_guide"] = None
+    else:
+        next_session_memory = _merge_websochat_session_memory(
+            base_memory=current_session_memory,
+            rp_mode=request_rp_mode,
+            active_character=resolved_active_character,
+            active_character_label=resolved_active_character_label,
+            scene_episode_no=req_body.scene_episode_no,
+            game_mode=explicit_game_mode,
+            game_gender_scope=req_body.game_gender_scope,
+            game_category=req_body.game_category,
+            game_match_mode=req_body.game_match_mode,
+            game_read_episode_to=req_body.game_read_episode_to,
+        )
+    logger.info(
+        "websochat_debug post_message:memory session_id=%s current_rp_stage=%s next_rp_stage=%s pending_rp=%s resolved_active_character=%s active_character_label=%s",
+        session_id,
+        _resolve_websochat_rp_stage(current_session_memory),
+        _resolve_websochat_rp_stage(next_session_memory),
+        bool(next_session_memory.get("pending_rp_character_selection")),
+        resolved_active_character,
+        _resolve_websochat_active_character_label(next_session_memory),
+    )
+    if starter_mode_key not in {"qa", "rp"} and not is_character_chat_session:
+        next_session_memory = apply_websochat_implicit_game_inputs(
+            session_memory=next_session_memory,
+            user_prompt=req_body.content,
+            game_read_episode_to=req_body.game_read_episode_to,
+        )
+    next_session_memory = await _apply_websochat_account_read_scope(
+        next_session_memory,
+        req_body.account_read_episode_to,
+        product_id=int(session_row["product_id"]),
+        user_id=user_id,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
     requested_next_episode_write = _is_websochat_noncanonical_action(
         req_body.qa_action_key
     ) or _is_websochat_next_episode_write_query(req_body.content)
@@ -6829,6 +7401,13 @@ async def post_message(
         next_session_memory["read_episode_to"] = None
         next_session_memory["read_scope_state"] = "none"
         next_session_memory["read_scope_source"] = "prompt"
+    next_session_memory, authorized_scope = await _clamp_websochat_session_read_scope_to_authorized(
+        session_memory=next_session_memory,
+        product_id=int(session_row["product_id"]),
+        user_id=user_id,
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
 
     display_read_episode_to = _resolve_websochat_display_read_episode_to(
         scope_state=_resolve_websochat_read_scope_state(next_session_memory),
@@ -6914,7 +7493,7 @@ async def post_message(
             )
 
         if character_resolution_clarify_reply:
-            user_content = str(req_body.content or req_body.active_character or "").strip()
+            user_content = str(req_body.content or request_active_character or "").strip()
             insert_query = text(
                 """
                 INSERT INTO tb_story_agent_message (
@@ -6991,7 +7570,7 @@ async def post_message(
             logger.info(
                 "websochat rp_resolution_clarify_completed session_id=%s raw=%s resolution_source=%s",
                 session_id,
-                req_body.active_character,
+                request_active_character,
                 str(resolution.get("resolutionSource") or "none"),
             )
             return {
@@ -7158,6 +7737,8 @@ async def post_message(
             forced_route = None
             if starter_mode_key == "rp" and resolved_active_character:
                 forced_route = "rp"
+            elif is_character_chat_session and resolved_active_character:
+                forced_route = "rp"
             elif starter_mode_key == "ideal_worldcup":
                 forced_route = "game"
             assistant_reply, model_used, route_mode, fallback_used, intent, route_session_memory = await _generate_websochat_reply(
@@ -7190,6 +7771,13 @@ async def post_message(
                 user_prompt=req_body.content,
                 assistant_reply=assistant_reply,
             )
+        next_session_memory, _ = await _clamp_websochat_session_read_scope_to_authorized(
+            session_memory=next_session_memory,
+            product_id=int(session_row["product_id"]),
+            user_id=user_id,
+            synced_latest_episode_no=synced_latest_episode_no,
+            db=db,
+        )
 
         insert_query = text(
             """

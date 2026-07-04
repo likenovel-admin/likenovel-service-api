@@ -25,6 +25,14 @@ product comment 도메인 개별 서비스 함수 모음
 """
 
 
+def _author_profile_image_path_sub_query() -> str:
+    return get_file_path_sub_query(
+        f"coalesce(y.profile_image_id, y_fallback.profile_image_id, {settings.R2_PROFILE_DEFAULT_IMAGE})",
+        "author_profile_image_path",
+        "user",
+    )
+
+
 async def get_products_product_id_comments(
     product_id: str,
     page: str,
@@ -110,10 +118,18 @@ async def get_products_product_id_comments(
                                          tmp_get_products_product_id_comments_2 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
@@ -164,10 +180,18 @@ async def get_products_product_id_comments(
                                          tmp_get_products_product_id_comments_2 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
@@ -238,10 +262,18 @@ async def get_products_product_id_comments(
                                          tmp_get_products_product_id_comments_2 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
@@ -290,10 +322,18 @@ async def get_products_product_id_comments(
                                          tmp_get_products_product_id_comments_2 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
@@ -409,10 +449,18 @@ async def get_products_product_id_comments(
                                          with tmp_get_products_product_id_comments_3 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
@@ -451,10 +499,18 @@ async def get_products_product_id_comments(
                                          with tmp_get_products_product_id_comments_3 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
@@ -512,10 +568,18 @@ async def get_products_product_id_comments(
                                          with tmp_get_products_product_id_comments_3 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
@@ -553,10 +617,18 @@ async def get_products_product_id_comments(
                                          with tmp_get_products_product_id_comments_3 as (
                                              select z.product_id
                                                   , z.author_name as author_nickname
-                                                  , {get_file_path_sub_query("y.profile_image_id", "author_profile_image_path", "user")}
+                                                  , {_author_profile_image_path_sub_query()}
                                                from tb_product z
-                                              inner join tb_user_profile y on z.author_id = y.user_id
+                                               left join tb_user_profile y on z.author_id = y.user_id
                                                 and z.author_name = y.nickname
+                                               left join tb_user_profile y_fallback on z.author_id = y_fallback.user_id
+                                                and y_fallback.profile_id = (
+                                                    select yp.profile_id
+                                                      from tb_user_profile yp
+                                                     where yp.user_id = z.author_id
+                                                     order by yp.default_yn desc, yp.profile_id asc
+                                                     limit 1
+                                                )
                                               where product_id = :product_id
                                          )
                                          select a.comment_id
