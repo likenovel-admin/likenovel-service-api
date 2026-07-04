@@ -19,6 +19,10 @@ class WebsochatSessionItem(BaseModel):
     sessionId: int
     productId: int
     title: str
+    sessionKind: str | None = None
+    entrySource: str | None = None
+    lockedCharacterScopeKey: str | None = None
+    allowedModes: list[str] | None = None
     updatedDate: str
     createdDate: str
     productTitle: str | None = None
@@ -83,6 +87,9 @@ class PostWebsochatSessionReqBody(BaseModel):
     product_id: int = Field(..., gt=0)
     guest_key: Optional[str] = Field(default=None, max_length=64)
     title: Optional[str] = Field(default=None, max_length=120)
+    session_kind: Optional[str] = Field(default=None, max_length=30)
+    entry_source: Optional[str] = Field(default=None, max_length=50)
+    locked_character_scope_key: Optional[str] = Field(default=None, max_length=80)
     rp_mode: Optional[str] = Field(default=None, max_length=10)
     active_character: Optional[str] = Field(default=None, max_length=80)
     scene_episode_no: Optional[int] = Field(default=None, gt=0)
@@ -96,6 +103,44 @@ class PostWebsochatSessionReqBody(BaseModel):
     @field_validator("title")
     @classmethod
     def normalize_title(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("session_kind")
+    @classmethod
+    def normalize_session_kind(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in {"websochat", "character_chat"}:
+            raise ValueError("session_kind는 websochat 또는 character_chat만 허용됩니다.")
+        return normalized
+
+    @field_validator("entry_source")
+    @classmethod
+    def normalize_entry_source(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in {
+            "home_character_slot",
+            "websochat_rp_mode",
+            "product_detail_websochat",
+            "viewer_websochat",
+            "character_chat_handoff",
+        }:
+            raise ValueError("entry_source가 허용 목록에 없습니다.")
+        return normalized
+
+    @field_validator("locked_character_scope_key")
+    @classmethod
+    def normalize_locked_character_scope_key(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         normalized = value.strip()

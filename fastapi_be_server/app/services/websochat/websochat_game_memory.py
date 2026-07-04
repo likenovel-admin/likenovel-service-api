@@ -7,6 +7,16 @@ from typing import Any
 
 WEBSOCHAT_ALLOWED_RP_MODES = {"free", "scene"}
 WEBSOCHAT_ALLOWED_GAME_MODES = {"ideal_worldcup", "vs_game"}
+WEBSOCHAT_ALLOWED_MODE_KEYS = {"qa", "rp", "ideal_worldcup"}
+WEBSOCHAT_DEFAULT_ALLOWED_MODE_KEYS = ["qa", "rp", "ideal_worldcup"]
+WEBSOCHAT_ALLOWED_SESSION_KINDS = {"websochat", "character_chat"}
+WEBSOCHAT_ALLOWED_SESSION_ENTRY_SOURCES = {
+    "home_character_slot",
+    "websochat_rp_mode",
+    "product_detail_websochat",
+    "viewer_websochat",
+    "character_chat_handoff",
+}
 WEBSOCHAT_ALLOWED_GAME_GENDER_SCOPES = {"male", "female", "mixed"}
 WEBSOCHAT_ALLOWED_GAME_CATEGORIES = {
     "romance",
@@ -22,7 +32,7 @@ WEBSOCHAT_ALLOWED_GAME_CATEGORIES = {
 WEBSOCHAT_PENDING_GAME_CATEGORY = "__pending__"
 WEBSOCHAT_ALLOWED_VS_GAME_MATCH_MODES = {"direct_match", "criteria_match"}
 WEBSOCHAT_ALLOWED_READ_SCOPE_STATES = {"unknown", "none", "known"}
-WEBSOCHAT_ALLOWED_READ_SCOPE_SOURCES = {"unknown", "account", "prompt"}
+WEBSOCHAT_ALLOWED_READ_SCOPE_SOURCES = {"unknown", "account", "viewer", "prompt"}
 WEBSOCHAT_ALLOWED_RP_STAGES = {"idle", "awaiting_character", "chatting"}
 WEBSOCHAT_ALLOWED_PENDING_MODE_ENTRY_GUIDES = {"qa_ready", "rp_select"}
 WEBSOCHAT_ALLOWED_PENDING_QA_ACTION_KEYS = {"predict", "next_episode_write"}
@@ -42,6 +52,16 @@ def _normalize_websochat_string_list(raw_value: Any, *, limit: int = 20) -> list
         items.append(normalized)
         if len(items) >= limit:
             break
+    return items
+
+
+def _normalize_websochat_mode_key_list(raw_value: Any) -> list[str]:
+    items: list[str] = []
+    for item in raw_value or []:
+        normalized = str(item or "").strip().lower()
+        if normalized not in WEBSOCHAT_ALLOWED_MODE_KEYS or normalized in items:
+            continue
+        items.append(normalized)
     return items
 
 
@@ -226,6 +246,19 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
     elif isinstance(raw_value, dict):
         parsed = raw_value
 
+    session_kind = str(parsed.get("session_kind") or "").strip().lower() or "websochat"
+    if session_kind not in WEBSOCHAT_ALLOWED_SESSION_KINDS:
+        session_kind = "websochat"
+    entry_source = str(parsed.get("entry_source") or "").strip().lower() or None
+    if entry_source not in WEBSOCHAT_ALLOWED_SESSION_ENTRY_SOURCES:
+        entry_source = None
+    locked_character_scope_key = str(parsed.get("locked_character_scope_key") or "").strip() or None
+    allowed_modes = _normalize_websochat_mode_key_list(parsed.get("allowed_modes"))
+    if not allowed_modes:
+        allowed_modes = list(WEBSOCHAT_DEFAULT_ALLOWED_MODE_KEYS)
+    if session_kind == "character_chat":
+        allowed_modes = ["rp"]
+
     try:
         read_episode_to = max(int(parsed.get("read_episode_to") or 0), 0) or None
     except Exception:
@@ -235,6 +268,13 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
     if read_scope_state not in WEBSOCHAT_ALLOWED_READ_SCOPE_STATES:
         read_scope_state = "known" if read_episode_to else "unknown"
     read_scope_source = str(parsed.get("read_scope_source") or "").strip().lower() or None
+    read_scope_source = {
+        "server_authorized_prompt": "prompt",
+        "server_authorized_account": "account",
+        "server_authorized_viewer": "viewer",
+        "server_authorized_none": "unknown",
+        "server_authorized_unknown": "unknown",
+    }.get(read_scope_source, read_scope_source)
     if read_scope_source not in WEBSOCHAT_ALLOWED_READ_SCOPE_SOURCES:
         read_scope_source = "unknown"
 
@@ -274,6 +314,21 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         game_match_mode=str(raw_game_context.get("match_mode") or "").strip().lower() or None,
     )
     games = _normalize_websochat_games_memory(parsed.get("games"))
+    if session_kind == "character_chat" and locked_character_scope_key:
+        if active_character != locked_character_scope_key:
+            active_character = locked_character_scope_key
+            active_character_label = None
+        if not rp_mode:
+            rp_mode = "free"
+        pending_rp_character_selection = False
+        pending_qa_action_key = None
+        pending_mode_entry_guide = None
+        game_context = _build_websochat_game_context(
+            game_mode=None,
+            game_gender_scope=None,
+            game_category=None,
+            game_match_mode=None,
+        )
     active_mode = str(parsed.get("active_mode") or "").strip().lower() or None
     if active_mode not in ({"rp"} | WEBSOCHAT_ALLOWED_GAME_MODES):
         active_mode = None
@@ -281,6 +336,8 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         active_mode = game_context.get("mode")
     if active_mode == "rp" and active_character and not rp_mode:
         rp_mode = "free"
+    if session_kind == "character_chat" and locked_character_scope_key and active_character:
+        active_mode = "rp"
     if active_mode == "rp" and not active_character:
         active_mode = None
     if active_character and pending_rp_character_selection:
@@ -288,6 +345,10 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
     if not active_character:
         active_character_label = None
     return {
+        "session_kind": session_kind,
+        "entry_source": entry_source,
+        "locked_character_scope_key": locked_character_scope_key,
+        "allowed_modes": allowed_modes,
         "active_mode": active_mode,
         "read_episode_to": read_episode_to,
         "read_scope_prompted": read_scope_prompted,
@@ -411,7 +472,7 @@ def _merge_websochat_session_memory(
         next_memory["active_mode"] = "rp"
         next_memory["pending_rp_character_selection"] = False
 
-    return next_memory
+    return _normalize_websochat_session_memory(next_memory)
 def _resolve_websochat_active_character_label(session_memory: dict[str, Any]) -> str | None:
     normalized = _normalize_websochat_session_memory(session_memory)
     explicit_label = str(normalized.get("active_character_label") or "").strip()
@@ -490,6 +551,12 @@ def _merge_websochat_qa_corrections(
 
 def _serialize_websochat_session_memory(session_memory: dict[str, Any]) -> str | None:
     normalized = _normalize_websochat_session_memory(session_memory)
+    has_session_contract = bool(
+        normalized.get("session_kind") != "websochat"
+        or normalized.get("entry_source")
+        or normalized.get("locked_character_scope_key")
+        or normalized.get("allowed_modes") != WEBSOCHAT_DEFAULT_ALLOWED_MODE_KEYS
+    )
     has_rp_state = bool(normalized.get("active_character") and normalized.get("rp_mode"))
     has_pending_rp_state = bool(normalized.get("pending_rp_character_selection"))
     has_game_state = bool(normalized.get("game_context", {}).get("mode"))
@@ -499,6 +566,6 @@ def _serialize_websochat_session_memory(session_memory: dict[str, Any]) -> str |
     has_pending_qa_action = bool(normalized.get("pending_qa_action_key"))
     has_qa_memory = bool(normalized.get("qa_recent_notes"))
     has_qa_corrections = bool(normalized.get("qa_corrections"))
-    if not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_scope_prompted and not has_non_read_scope_state and not has_pending_qa_action and not has_qa_memory and not has_qa_corrections:
+    if not has_session_contract and not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_scope_prompted and not has_non_read_scope_state and not has_pending_qa_action and not has_qa_memory and not has_qa_corrections:
         return None
     return json.dumps(normalized, ensure_ascii=False)

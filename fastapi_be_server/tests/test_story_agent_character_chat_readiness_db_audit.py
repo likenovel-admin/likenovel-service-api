@@ -1,0 +1,185 @@
+import importlib.util
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
+MODULE_PATH = SCRIPT_DIR / "audit_character_chat_asset_readiness_db.py"
+
+
+def load_module():
+    module_name = "audit_character_chat_asset_readiness_db_under_test"
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(module_name, MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
+    def test_build_product_query_defaults_to_open_ongoing_public_scope(self):
+        module = load_module()
+
+        query, params = module.build_product_query(product_ids=[100, 200], limit=10, open_only=True)
+
+        self.assertIn("p.price_type IN ('free', 'paid')", query)
+        self.assertIn("p.status_code = 'ongoing'", query)
+        self.assertIn("p.open_yn = 'Y'", query)
+        self.assertIn("p.product_id IN (%s, %s)", query)
+        self.assertIn("LIMIT %s", query)
+        self.assertEqual(params, [100, 200, 10])
+
+    def test_build_product_query_can_include_closed_scope_for_shadow_cases(self):
+        module = load_module()
+
+        query, params = module.build_product_query(product_ids=[], limit=0, open_only=False)
+
+        self.assertNotIn("p.price_type IN", query)
+        self.assertNotIn("p.status_code = 'ongoing'", query)
+        self.assertNotIn("LIMIT %s", query)
+        self.assertEqual(params, [])
+
+    def test_summarize_verifications_counts_ready_hold_and_reasons(self):
+        module = load_module()
+        rows = [
+            {
+                "product_id": 1,
+                "context_status": "ready",
+                "character_chat_asset_readiness": {
+                    "character_chat_status": "ready",
+                    "public_candidate_count": 2,
+                    "ready_public_candidate_count": 1,
+                    "public_slot_ready_count": 1,
+                    "block_reason_counts": {},
+                },
+            },
+            {
+                "product_id": 2,
+                "context_status": "ready",
+                "character_chat_asset_readiness": {
+                    "character_chat_status": "hold",
+                    "public_candidate_count": 1,
+                    "ready_public_candidate_count": 0,
+                    "public_slot_ready_count": 0,
+                    "block_reason_counts": {
+                        "missing_character_chat_opening": 1,
+                        "missing_usable_scene": 1,
+                    },
+                },
+            },
+            {
+                "product_id": 3,
+                "context_status": "",
+                "character_chat_asset_readiness": {
+                    "character_chat_status": "none_eligible",
+                    "public_candidate_count": 0,
+                },
+            },
+        ]
+
+        summary = module.summarize_verifications(rows)
+
+        self.assertEqual(summary["productCount"], 3)
+        self.assertEqual(summary["contextStatusCounts"], {"missing": 1, "ready": 2})
+        self.assertEqual(
+            summary["characterChatStatusCounts"],
+            {"hold": 1, "none_eligible": 1, "ready": 1},
+        )
+        self.assertEqual(
+            summary["blockReasonCounts"],
+            {"missing_character_chat_opening": 1, "missing_usable_scene": 1},
+        )
+        self.assertEqual(
+            summary["actionPlanCounts"],
+            {
+                "generate_character_chat_opening": 1,
+                "generate_episode_scene_extraction": 1,
+                "ready": 1,
+                "build_story_context_foundation": 1,
+            },
+        )
+        self.assertEqual(rows[0]["assetActionPlan"], ["ready"])
+        self.assertEqual(
+            rows[1]["assetActionPlan"],
+            ["generate_episode_scene_extraction", "generate_character_chat_opening"],
+        )
+        self.assertEqual(rows[2]["assetActionPlan"], ["build_story_context_foundation"])
+        self.assertEqual(
+            summary["candidateProductIdsByAction"],
+            {
+                "build_story_context_foundation": [3],
+                "generate_character_chat_opening": [2],
+                "generate_episode_scene_extraction": [2],
+                "ready": [1],
+            },
+        )
+        self.assertEqual(summary["publicCandidateTotal"], 3)
+        self.assertEqual(summary["readyPublicCandidateTotal"], 1)
+        self.assertEqual(summary["publicSlotReadyTotal"], 1)
+        self.assertEqual(summary["readyProductIds"], [1])
+        self.assertEqual(summary["holdProductIdsSample"], [2])
+
+    def test_load_env_file_reads_key_values_without_printing_or_sourcing(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "BATCH_DB_HOST='127.0.0.1'",
+                        "BAD-NAME=skip",
+                        "not a shell command",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            old_value = os.environ.pop("BATCH_DB_HOST", None)
+            try:
+                loaded = module.load_env_file(env_path)
+                value = os.environ.get("BATCH_DB_HOST")
+            finally:
+                os.environ.pop("BATCH_DB_HOST", None)
+                if old_value is not None:
+                    os.environ["BATCH_DB_HOST"] = old_value
+
+        self.assertEqual(loaded, ["BATCH_DB_HOST"])
+        self.assertEqual(value, "127.0.0.1")
+        self.assertNotIn("BAD-NAME", os.environ)
+
+    def test_build_asset_action_plan_prioritizes_v3_rp_rebuild_over_opening(self):
+        module = load_module()
+
+        actions = module.build_asset_action_plan(
+            {
+                "product_id": 2004,
+                "context_status": "ready",
+                "character_chat_asset_readiness": {
+                    "character_chat_status": "hold",
+                    "block_reason_counts": {
+                        "legacy_profile_scope_key_mismatch": 2,
+                        "legacy_examples_scope_key_mismatch": 2,
+                        "missing_internal_prompt": 2,
+                        "missing_character_chat_opening": 2,
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(
+            actions,
+            [
+                "rebuild_rp_assets_with_v3_scope",
+                "generate_character_chat_internal_prompt",
+                "generate_character_chat_opening",
+            ],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

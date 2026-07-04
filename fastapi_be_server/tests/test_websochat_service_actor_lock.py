@@ -19,6 +19,23 @@ class _FakeDb:
     async def execute(self, *args, **kwargs):
         self.next_lastrowid += 1
         self.executions.append((args, kwargs))
+        statement = str(args[0]) if args else ""
+        if "FROM tb_product_episode pe" in statement and "authorizedYn" in statement:
+            class _Mappings:
+                def all(self):
+                    return [
+                        {"episodeNo": 1, "authorizedYn": 1},
+                        {"episodeNo": 2, "authorizedYn": 1},
+                        {"episodeNo": 3, "authorizedYn": 1},
+                        {"episodeNo": 4, "authorizedYn": 1},
+                        {"episodeNo": 5, "authorizedYn": 1},
+                    ]
+
+            class _MappingResult:
+                def mappings(self):
+                    return _Mappings()
+
+            return _MappingResult()
 
         class _Result:
             lastrowid = self.next_lastrowid
