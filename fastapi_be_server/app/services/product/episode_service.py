@@ -900,6 +900,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
 
                     is_private = episode_open_yn == "N"
                     episode_no = int(db_rst[0].get("episode_no") or 0)
+                    episode_price_type = db_rst[0].get("price_type") or "free"
                     product_price_type = db_rst[0].get("product_price_type")
                     websochat_context_status = db_rst[0].get("websochat_context_status")
                     websochat_published_latest_episode_no = int(
@@ -909,10 +910,10 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                         db_rst[0].get("websochat_synced_latest_episode_no") or 0
                     )
                     websochat_eligible = (
-                        product_price_type == "free"
-                        and websochat_context_status == "ready"
+                        websochat_context_status == "ready"
                         and episode_no > 0
                         and websochat_synced_latest_episode_no >= episode_no
+                        and (episode_price_type == "free" or bool(episode_own_type))
                     )
 
                     res_data = {
@@ -1164,7 +1165,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
 
             if db_rst:
                 episode_no = int(db_rst[0].get("episode_no") or 0)
-                episode_price_type = db_rst[0].get("price_type")
+                episode_price_type = db_rst[0].get("price_type") or "free"
                 if episode_price_type == "paid" or episode_no > 5:
                     raise CustomResponseException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1180,7 +1181,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                     db_rst[0].get("websochat_synced_latest_episode_no") or 0
                 )
                 websochat_eligible = (
-                    product_price_type == "free"
+                    episode_price_type == "free"
                     and websochat_context_status == "ready"
                     and episode_no > 0
                     and episode_no <= 5

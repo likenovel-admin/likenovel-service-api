@@ -32,9 +32,11 @@ class _FakeResult:
 
 
 class _FakeRpContextDb:
-    def __init__(self, *, canonical_profile_ready=True):
+    def __init__(self, *, canonical_profile_ready=True, internal_prompt_ready=True, opening_ready=True):
         self.exact_summary_requests = []
         self.canonical_profile_ready = canonical_profile_ready
+        self.internal_prompt_ready = internal_prompt_ready
+        self.opening_ready = opening_ready
 
     async def execute(self, statement, params=None):
         query = str(statement)
@@ -52,6 +54,9 @@ class _FakeRpContextDb:
                                 "aliases": ["아델리트"],
                                 "is_protagonist": True,
                                 "distinct_episode_count": 4,
+                                "public_chat_eligible": True,
+                                "public_slot_eligible": True,
+                                "display_safety": {"status": "pass"},
                             },
                             ensure_ascii=False,
                         ),
@@ -99,6 +104,55 @@ class _FakeRpContextDb:
                                         "confidence": 0.9,
                                     }
                                 ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "episodeFrom": None,
+                        "episodeTo": None,
+                    }
+                ]
+            )
+        if summary_type == "character_chat_internal_prompt" and scope_key == profile_scope_key and self.internal_prompt_ready:
+            return _FakeResult(
+                [
+                    {
+                        "summaryId": 12,
+                        "summaryText": json.dumps(
+                            {
+                                "internal_prompt": "[핵심 정체성] 아델리트는 경계심을 숨기지 않는 주인공이다.\n[짧은 입력 처리] 사용자가 짧게 답해도 장면을 한 걸음 전진시킨다."
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "episodeFrom": None,
+                        "episodeTo": None,
+                    }
+                ]
+            )
+        if summary_type == "character_chat_opening_v1" and scope_key == profile_scope_key and self.opening_ready:
+            return _FakeResult(
+                [
+                    {
+                        "summaryId": 13,
+                        "summaryText": json.dumps(
+                            {
+                                "readiness": {"status": "ready", "confidence": 0.9},
+                                "chat_target": {"scope_key": "character:아델리트", "display_name": "아델리트"},
+                                "opening_scene": {"situation": "아델리트가 문틈의 빛을 확인한다."},
+                                "opening_message": {
+                                    "narration": "문틈 아래로 새어 나온 빛이 바닥의 흠집을 길게 비춘다. 아델리트는 문고리에서 손을 떼지 않은 채 복도 끝에서 멎은 발소리를 가늠한다. 습기 밴 벽지 사이로 낮은 마찰음이 퍼지고, 손잡이 근처의 금속 가루가 등불 가장자리에서 희미하게 반짝인다. 아델리트는 먼저 등불의 심지를 낮추고 바닥의 긁힌 자국을 눈으로 따라간다. 지금 문을 열면 안쪽의 누군가가 움직이고, 그림자를 확인하면 발소리의 주인을 놓칠 수 있다. 잠긴 공기 속에서 선택을 미룰 여유가 없다.",
+                                    "dialogue": "\"발소리가 멎었어. 지금 문을 열지, 저쪽 그림자부터 확인할지 골라.\"",
+                                    "opening_text": "문틈 아래로 새어 나온 빛이 바닥의 흠집을 길게 비춘다. 아델리트는 문고리에서 손을 떼지 않은 채 복도 끝에서 멎은 발소리를 가늠한다. 습기 밴 벽지 사이로 낮은 마찰음이 퍼지고, 손잡이 근처의 금속 가루가 등불 가장자리에서 희미하게 반짝인다. 아델리트는 먼저 등불의 심지를 낮추고 바닥의 긁힌 자국을 눈으로 따라간다. 지금 문을 열면 안쪽의 누군가가 움직이고, 그림자를 확인하면 발소리의 주인을 놓칠 수 있다. 잠긴 공기 속에서 선택을 미룰 여유가 없다.\n\n\"발소리가 멎었어. 지금 문을 열지, 저쪽 그림자부터 확인할지 골라.\"",
+                                    "user_objective": "문을 열지 그림자를 확인할지 선택한다.",
+                                },
+                                "user_role": {"role_type": "임시 동행자"},
+                                "character_drive": {"immediate_objective": "문 앞의 위험을 넘긴다."},
+                                "agency_contract": {
+                                    "character_moves_first": True,
+                                    "non_user_dependent_action": "아델리트가 먼저 문고리를 확인한다.",
+                                },
+                                "progression_engine": {
+                                    "scene_exit_condition": "문틈 단서를 확인하고 다음 행동으로 넘어간다.",
+                                },
                             },
                             ensure_ascii=False,
                         ),
@@ -323,6 +377,26 @@ class _FakeUnsafeInventoryV3WithLegacyRpDb:
 
 
 class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_character_chat_lookup_scope_includes_protagonist_identity_group(self):
+        scope_keys = websochat_service._build_websochat_rp_lookup_scope_keys(
+            normalized_memory={"session_kind": "character_chat"},
+            resolved_active_character="character:갤러해드지그문트",
+            resolution={
+                "aliasScopeKeys": ["protagonist:named:갤러해드지그문트"],
+                "inventoryPayload": {
+                    "protagonist_identity_scope_keys": [
+                        "character:갤러해드지그문트",
+                        "character:니드호그",
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(
+            scope_keys,
+            ["character:갤러해드지그문트", "character:니드호그"],
+        )
+
     async def test_inventory_rp_eligibility_respects_public_chat_gate_without_breaking_legacy_payload(self):
         self.assertFalse(
             websochat_service._is_websochat_inventory_rp_eligible(
@@ -373,8 +447,85 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context["active_character"], "character:아델리트")
         self.assertEqual(context["display_name"], "아델리트")
         self.assertEqual(context["examples"][0]["text"], "나는 아직 여기서 끝낼 생각 없어.")
+        self.assertIn("[핵심 정체성]", context["internal_prompt"])
         self.assertIn(("character_rp_profile", "character:아델리트"), db.exact_summary_requests)
         self.assertEqual(db.exact_summary_requests[0], ("character_rp_profile", "character:아델리트"))
+
+    async def test_character_chat_context_requires_internal_prompt(self):
+        db = _FakeRpContextDb(internal_prompt_ready=False)
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 5},
+                session_memory={
+                    "session_kind": "character_chat",
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:아델리트",
+                    "locked_character_scope_key": "protagonist:named:아델리트",
+                    "allowed_modes": ["rp"],
+                    "rp_mode": "free",
+                },
+                db=db,
+            )
+
+        self.assertIsNone(context)
+        self.assertIn(("character_chat_internal_prompt", "character:아델리트"), db.exact_summary_requests)
+
+    async def test_character_chat_context_requires_opening_asset(self):
+        db = _FakeRpContextDb(opening_ready=False)
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 5},
+                session_memory={
+                    "session_kind": "character_chat",
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:아델리트",
+                    "locked_character_scope_key": "protagonist:named:아델리트",
+                    "allowed_modes": ["rp"],
+                    "rp_mode": "free",
+                },
+                db=db,
+            )
+
+        self.assertIsNone(context)
+        self.assertIn(("character_chat_opening_v1", "character:아델리트"), db.exact_summary_requests)
+
+    async def test_character_chat_context_loads_opening_asset(self):
+        db = _FakeRpContextDb()
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 5},
+                session_memory={
+                    "session_kind": "character_chat",
+                    "active_mode": "rp",
+                    "active_character": "protagonist:named:아델리트",
+                    "locked_character_scope_key": "protagonist:named:아델리트",
+                    "allowed_modes": ["rp"],
+                    "rp_mode": "free",
+                },
+                db=db,
+            )
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["character_chat_opening"]["chat_target"]["scope_key"], "character:아델리트")
+        self.assertIn(("character_chat_opening_v1", "character:아델리트"), db.exact_summary_requests)
 
     async def test_legacy_rp_scope_keeps_legacy_profile_when_canonical_profile_is_missing(self):
         db = _FakeRpContextDb(canonical_profile_ready=False)

@@ -51,6 +51,7 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 EPISODE_SUMMARY_MODEL = os.getenv("STORY_AGENT_SUMMARY_MODEL", "deepseek/deepseek-v3.2").strip()
 RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma-4-31b-it").strip()
 RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
+RP_OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("STORY_AGENT_RP_OPENROUTER_TIMEOUT_SECONDS", "90"))
 RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "3"))
 RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "12"))
 RP_DIALOGUE_FALLBACK_MAX_EPISODES = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_MAX_EPISODES", "18"))
@@ -66,6 +67,13 @@ if RP_REASONING_MODEL.startswith("anthropic."):
 RP_REASONING_EFFORT = (os.getenv("STORY_AGENT_RP_REASONING_EFFORT", "medium").strip() or "medium")
 RP_REASONING_THINKING_DISPLAY = (os.getenv("STORY_AGENT_RP_REASONING_THINKING_DISPLAY", "omitted").strip() or "omitted")
 EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS", "2600"))
+EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL = (
+    os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL", "").strip()
+    or RP_OPENROUTER_MODEL
+)
+EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS = float(
+    os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS", "60")
+)
 EPISODE_SUMMARY_TIMEOUT_SECONDS = 120.0
 EPISODE_SUMMARY_TEMPERATURE = float(os.getenv("STORY_AGENT_SUMMARY_TEMPERATURE", "0.0"))
 EPISODE_SUMMARY_MAX_OUTPUT_TOKENS = 1400
@@ -95,7 +103,20 @@ WORK_PROTAGONIST_CO_MAIN_HINT_RATIO = 0.80
 RELATION_INVENTORY_FORMAT_VERSION = "relation_inventory_v1"
 CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v3"
 CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
+CHARACTER_CHAT_INTERNAL_PROMPT_FORMAT_VERSION = "character_chat_internal_prompt_v1"
+CHARACTER_CHAT_OPENING_FORMAT_VERSION = "character_chat_opening_v1"
+EPISODE_SCENE_EXTRACTION_FORMAT_VERSION = "episode_scene_extraction_v1"
+EPISODE_SCENE_EXTRACTION_MAX_INPUT_CHARS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_INPUT_CHARS", "18000"))
+EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS", "6000"))
+EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL = (
+    os.getenv("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL", "").strip()
+    or RP_OPENROUTER_MODEL
+)
+EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS = float(
+    os.getenv("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS", "60")
+)
 EPISODE_CHARACTER_SIGNALS_TOOL_NAME = "submit_episode_character_signals"
+EPISODE_SCENE_EXTRACTION_TOOL_NAME = "submit_episode_scene_extraction"
 DIALOGUE_QUOTE_RE = re.compile(r'["“](.*?)["”]', re.S)
 FIRST_PERSON_MONOLOGUE_RE = re.compile(
     r"(?<![가-힣A-Za-z0-9])(?:나는|내가|난(?=[^가-힣A-Za-z0-9]|$)|나를|내게|내겐|내 마음|내 생각|내 판단)"
@@ -312,6 +333,234 @@ RP_PROFILE_SYNTHESIS_PROMPT = """너는 웹소설 캐릭터 RP 프로필 합성�
 11. 가능하면 반응축마다 대표 대사 1개씩 먼저 고르고, 축이 부족할 때만 같은 축의 대사를 추가하라.
 """
 
+CHARACTER_CHAT_INTERNAL_PROMPT_SYSTEM = """너는 웹소설 원고 기반 캐릭터챗 내부 프롬프트 설계자다.
+반드시 JSON만 반환하라. 원문/요약/관계/대사 근거에 없는 설정을 만들지 마라.
+
+목표:
+- 아래 입력만으로 매 턴 캐릭터 답변을 밀어주는 '1:1 캐릭터챗 내부 프롬프트'를 작성한다.
+- 출력 형식 가드가 아니라, 캐릭터의 정체성/말투/상황 반응/관계 리듬을 유지하는 본체 프롬프트여야 한다.
+- 작품 Q&A가 아니라 사용자가 캐릭터와 같은 장면에 이미 엮인 듯한 역할극을 전제로 한다.
+- 런타임의 하드 렌더링 가드가 이 내부 프롬프트보다 우선한다. 내부 프롬프트도 그 가드를 거스르지 않게 작성한다.
+
+출력 스키마:
+{"internal_prompt":"1600~3200자 한국어 내부 프롬프트"}
+
+internal_prompt 필수 구성:
+1. [핵심 정체성]: 이름/별칭/작품 속 역할. 회빙환/빙의/가명/호칭이 있으면 등장인물이 실제로 부르는 이름을 우선하되, 근거가 있는 별칭만 쓴다.
+2. [캐릭터성/말투]: 성격, 판단 기준, 말투, 호칭, 문장 리듬. 실제 대사 근거와 모순되면 안 된다.
+3. [관계와 거리감]: 사용자를 이미 장면에 엮인 비네임드 조력자/동행자/관계자로 대하는 기본 거리감, 경계/호감/협력 변화 조건. 사용자의 정체를 캐묻는 미스터리로 만들지 않는다.
+4. [첫인사 오프닝]: 사용자가 아직 말하기 전 캐릭터가 먼저 말을 거는 장면을 어떻게 열지 쓴다. 장소의 공기/소리/빛, 캐릭터의 자세/시선/거리, 사용자를 붙잡는 즉각적 긴장, 첫 대사의 상황 질문/협력 요청/선택 여지 hook을 포함한다.
+5. [시작/현재 장면 운용]: 읽은 범위 기준 앵커를 받아 그 시점에서 확인 가능한 장소, 긴장, 행동만 사용한다. 시작 장면을 매 턴 리셋하지 않는다.
+6. [원작 기반 새 사건 운용]: 원작 세계관, 설정, 인물성, 읽은 범위의 갈등은 최대한 유지하되 원작 사건을 그대로 재연하지 않는다. 원작 플롯은 앵커로만 쓰고, 답변의 중심은 원작에서 파생된 새 사이드 사건/새 변수/새 단서여야 한다. 새 사건의 비중을 원작 요약보다 높게 두되, 새 사건은 기존 세계관과 캐릭터 동기에서 자연스럽게 생긴 작은 위기, 요청, 방해, 단서, 관계 압력이어야 한다. 원작 결말/배후/미래 사건을 새로 확정하지 않는다.
+7. [짧은 입력 처리]: 사용자가 '응', '그래', '뭐야?'처럼 짧게 말해도 캐릭터가 지문+대사로 반응하고 작은 사건/질문/행동 하나, 또는 새 변수/관계 반응/장면 변화 하나로 장면을 전진시킨다.
+8. [금지]: 사용자 행동/감정/대사를 대신 확정하지 않는다. 사용자의 표정/떨림/긴장/신체 반응/숨소리/소지품/서 있는 자세도 단정하지 않는다. 얼굴/발끝/몸을 훑는 지문도 쓰지 않는다. 지문에서는 2인칭 대명사 전체를 쓰지 않는다. 사용자의 정체를 추궁하거나 '너 누구냐', '왜 여기 있지', '수상한 놈', '침입자냐'로 시작하지 않는다. 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 않는다. AI/시스템/프롬프트/규칙을 언급하지 않는다. 공개 읽은 범위 밖 스포일러를 만들지 않는다. 원문 대사를 그대로 복붙하지 않는다.
+9. [응답 감각]: 첫인사는 5~8문장 지문 + 2~3문장 대사로 장면을 충분히 연다. 이후 답변은 지문 2~4문장 뒤 캐릭터 대사 1~3문장을 기본으로 하되, 매 턴 물리적 행동/새 변수/관계 반응/장면 변화/hook 하나를 둔다.
+
+규칙:
+- 정보가 부족하면 모른다고 해설하지 말고, 확인 가능한 현재 장면의 반응으로 좁혀라.
+- 단순 목록보다 실제 런타임에서 바로 먹히는 지시문 문체로 작성하라.
+- 예시는 말투 기준으로만 짧게 포함하고, 원문 대사를 길게 인용하지 마라.
+- 첫인사는 일반 인사말이 아니라 독자가 스크롤을 멈출 만큼 구체적인 장면 진입이어야 한다.
+- 사용자는 원작 기존 네임드가 아니라 이미 장면에 엮인 비네임드 조력자/동행자/관계자다. 기본 역할은 낮은 신뢰의 협력자, 임시 동행자, 현장 보조자, 목격자, 같이 휘말린 사람 중 장면에 맞게 약하게만 둔다.
+- 캐릭터가 경계심이 강해도 의심은 말투 한 줄 이하로만 두고, 정체 미스터리/심문 루프를 사건 엔진으로 쓰지 마라. 첫인사는 현재 사건의 목적, 위기, 행동 hook으로 열어라.
+- 치료 보조, 기록 담당, 임시 동행자, 현장 보조자처럼 장면을 돕는 약한 역할 라벨은 가능하지만 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 마라.
+- 원작은 대본이 아니라 제약 조건이다. 원작 장면을 요약하거나 반복하지 말고, 읽은 범위의 갈등/관계/장소/물건에서 파생된 새 곁가지 사건으로 시작하라.
+- 캐릭터는 장면 목적과 stake를 제공하되, 사용자를 심부름시키는 명령문보다 장면 압력, 협력 요청, 자연스러운 1~2개 행동 방향으로 유도하라.
+- 사건 진행만 밀지 말고, 사용자의 말에 대한 캐릭터의 관계 반응을 최소 하나 포함하게 하라.
+- 압박감은 캐릭터의 자세, 주변 사물, 출입구, 거리 조절, 질문으로 만들고 사용자의 내면/신체 상태/구체 위치/소지품을 쓰지 마라.
+- 지문에서는 2인칭 대명사 전체를 쓰지 마라. '너/네/당신/상대/보조자'를 지문 주어·목적어·방향어로 쓰지 말고, '곁에 선 이', '옆의 사람', '너를 향해', '너에게' 같은 우회 표현도 쓰지 마라. 사용자를 향한 말은 캐릭터 대사 안에만 넣어라.
+- 지문에서 시선, 턱짓, 속삭임, 대답, 명령의 대상이 사용자인 표현도 금지다. '보조자를 돌아보며', '보조자 쪽으로'처럼 사용자 대체어를 쓰는 방식도 금지다.
+- '저 약재', '밖 소리', '저쪽 통로' 같은 사용자 입력은 사용자가 손짓하거나 움직였다는 뜻이 아니다. 지문에서 '네가 가리킨', '네가 들고 있는', '네가 내민', '네 손', '네 발치', '너를 향해', '너를 돌아보며'처럼 입력 밖 행동을 만들지 마라.
+- 사용자가 입력하지 않은 행동, 소지품, 자세, 이동, 과거 경력, 원작 관계를 만들지 마라. '기록판을 들고 있다', '약재를 가리켰다', '레지던트 때처럼', '통로로 밀었다', '손을 잡았다'는 금지다.
+- 협력 요청은 대사 속 선택형으로만 하라. 캐릭터가 사용자의 몸을 밀거나 이동시키거나 환부를 닦게 하거나 증거를 쥐여 주었다고 지문에서 확정하지 마라.
+- '곁에 선 너', '멍하니 서서', '네가 멈춰 선', '네가 가리킨', '네 발치'처럼 사용자의 자세, 위치, 손짓, 시선을 새로 만드는 표현도 금지하라.
+- '상대의 어깨/눈/손/발치/몸', '상대의 귓가', '짐승의 털 속에 숨으라'처럼 사용자의 신체, 시선, 위치, 접촉 상태를 우회해서 확정하지 마라. 캐릭터가 사용자를 잡아채거나 끌어당기거나 짓누르거나 몸을 낮추게 만드는 물리 조작도 금지하라.
+- '너를 쏘아보았다', '너를 힐끗 보았다', '너를 쳐다보지도 않았다', '문 앞을 지키고 서서', '뒤에 숨어서'처럼 사용자를 특정 위치/자세로 배치하거나 캐릭터 시선의 대상으로 고정하는 표현도 금지하라. 관계 반응은 대사, 말투, 판단, 주변 사물에 대한 반응으로 드러내게 하라.
+- 출력 전 자체검수 기준을 내부 프롬프트에 포함하라. 지문 안의 '너/네/당신/상대/보조자/곁에 선 이/옆의 사람/너에게', 사용자 얼굴/눈/어깨/손/발끝/몸/위아래 훑기, 숨소리/떨림/긴장, 서 있음/움직임 단정, '네가 가리킨/멈춰 선/들고 있는/내민', '너를 향해/돌아보며/쏘아보/힐끗 보/쳐다보', '문 앞을 지키고 서서/뒤에 숨어서', '밀어 넣/떠밀/잡아채/끌어당겨/짓눌러/몸을 낮추게'가 나오면 캐릭터의 시선이 출입구/복도/주변 사물로 향하거나 캐릭터 자신만 움직이는 묘사로 고치게 하라.
+"""
+
+EPISODE_SCENE_EXTRACTION_SYSTEM = """너는 웹소설 원문을 캐릭터챗용 장면 단위로 나누는 전처리기다.
+반드시 JSON만 반환하라. 첫인사, RP 대사, 새 사건, 감상평을 만들지 마라.
+
+목표:
+- 회차 원문을 캐릭터가 움직일 수 있는 장면 4~6개로 나눈다.
+- 각 장면은 원문에 실제로 있는 시작 앵커(boundary_anchor_start)를 가져야 한다.
+- boundary_anchor_start는 원문에서 그대로 찾을 수 있는 8~80자 문자열이어야 한다.
+- 인물 scope_key는 입력의 canonical_character_packet에 있는 값만 사용한다. 모르면 scope_key를 null로 둔다.
+- 원문에 없는 인물, 장소, 목적, 감정을 만들지 않는다.
+- 캐릭터챗 첫인사나 프롬프트를 쓰지 말고 장면 재료만 추출한다.
+- 전체 JSON은 간결하게 쓴다. 장면당 participants 최대 3명, action_ownership 최대 2개, scene_gist 최대 60자.
+- 캐릭터챗 재료이므로 주인공/대상 캐릭터가 현장에 등장해 직접 판단, 행동, 대화, 관계 반응을 하는 장면을 최우선으로 고른다.
+
+출력 스키마:
+{
+  "schema_version": "episode_scene_extraction_v1",
+  "status": "ok|partial|failed",
+  "scenes": [
+    {
+      "scene_index": 1,
+      "boundary_anchor_start": "원문 그대로 시작 앵커",
+      "scene_kind": "dialogue|action|conflict|exposition|transition|mixed",
+      "scene_gist": "장면에서 실제로 벌어진 일 1문장",
+      "current_action": "캐릭터가 이 장면에서 이미 하고 있는 행동",
+      "immediate_pressure": "지금 장면을 밀어붙이는 위기/목표/갈등",
+      "character_initiative_reason": "캐릭터가 유저에게 먼저 말을 걸 수밖에 없는 이유",
+      "user_entry_role": "유저가 이 장면에 들어올 때 가장 자연스러운 약한 역할",
+      "user_hook": "캐릭터가 유저에게 던질 수 있는 선택/협력 hook",
+      "user_can_do": ["유저가 할 수 있는 약한 행동 선택지"],
+      "opening_grounding": {
+        "place_anchor": "첫인사 지문에 써도 되는 원문 기반 장소/공간",
+        "sensory_anchors": ["원문 근거가 있는 소리/빛/냄새/온도/군중감"],
+        "prop_anchors": ["원문 근거가 있는 물건/무기/문서/장치"],
+        "spatial_constraints": ["문 앞|복도 끝|마차 안처럼 원문 근거가 있는 공간 제약"],
+        "character_visible_motion": "캐릭터가 원문에서 실제로 보이는 자세/움직임",
+        "forbidden_opening_inventions": ["원문에 없으면 첫인사에 만들지 말아야 할 장식"]
+      },
+      "scene_identity_boundary": {
+        "allowed_address_names": ["현재 장면에서 유저가 써도 자연스러운 이름/호칭"],
+        "must_not_address_as": ["현재 장면에서 먼저 쓰면 스포/오인인 이름/정체"],
+        "surface_role_for_user": "유저가 약하게 인식해도 되는 사회적 표면 역할",
+        "identity_spoiler_risk": "low|medium|high"
+      },
+      "pressure_clock": "3~5턴 안에 악화되거나 변하는 압박",
+      "conversation_fuel_tags": ["협상|수사|훈련|생존|방송|작전|관계압력 등 최대 3개"],
+      "beat_ladder": ["초기 긴장 -> 선택 -> 작은 결과처럼 장면을 전진시키는 단계"],
+      "turn_continuation_contract": {
+        "state_variables": ["장면 안에서 20턴 동안 변할 수 있는 상태"],
+        "user_response_branches": {
+          "accepts_hook": "유저가 협력하면 생기는 작은 변화",
+          "asks_question": "되물음에 답한 뒤 장면을 전진시키는 방식",
+          "refuses_or_delays": "거절/주저에도 막히지 않는 대안",
+          "short_or_ambiguous": "응/그래/뭐야 같은 짧은 입력 처리",
+          "hostile_or_suspicious": "심문 루프 없이 넘기는 방식"
+        },
+        "stall_breaker": "2턴 이상 제자리일 때 투입할 작은 방해/단서/관계 반응",
+        "scene_exit_condition": "이 장면을 끝내고 다음 장면으로 넘길 조건",
+        "canon_safe_new_event_types": ["작은 방해|새 단서|관계 압력|주변 소음|시간 압박"]
+      },
+      "knowledge_boundary": {
+        "can_hint": ["암시 가능하지만 단정하면 안 되는 정보"],
+        "must_not_reveal": ["이 장면/읽은 범위에서 직접 말하면 안 되는 정보"]
+      },
+      "progression_seed": "다음 3~5턴 안에 장면을 전진시킬 작은 변화",
+      "participants": [
+        {"mention_label": "원문 표시명", "scope_key": "canonical scope_key 또는 null", "evidence": "원문 근거 짧게"}
+      ],
+      "action_ownership": [
+        {"actor_scope_key": "canonical scope_key 또는 null", "action": "그 인물이 한 행동/결정"}
+      ]
+    }
+  ]
+}
+
+규칙:
+1. 장면은 시간/장소/행동 목적/대화 상대가 바뀌는 지점에서만 나눈다.
+2. boundary_anchor_start는 요약문이 아니라 원문 일부여야 한다. 줄번호 표기는 넣지 마라.
+3. canonical scope_key가 확실하지 않으면 절대 새 scope_key를 만들지 마라.
+4. scene_gist는 장면 목적과 압력만 쓰고, 원작 이후 전개나 결말을 추측하지 마라.
+5. 원문 전체를 빠짐없이 요약하려 하지 말고 캐릭터챗에서 재사용 가능한 핵심 장면을 고른다.
+6. evidence에는 L0001 같은 라인 prefix를 넣지 말고 원문 표현만 짧게 넣어라.
+7. 중요하지 않은 단역/동물/장소/직책은 participants에 넣지 마라.
+8. 먼저 주인공/대상 캐릭터가 실제로 현장에 등장하는 장면을 최소 4개까지 찾는다. 원문에 그런 장면이 4개 미만일 때만 더 적게 낸다.
+9. 가능하면 모든 scene의 participants에 주인공/대상 캐릭터의 canonical scope_key를 포함하라. 단, 원문상 그 인물이 실제로 등장하거나 행동/판단의 중심일 때만 포함한다.
+10. 주인공/대상 캐릭터가 현장에 없는 배경, 적대자 회의, 설명 장면은 위 8번을 채운 뒤에도 회차 전개 이해에 꼭 필요할 때만 최대 1개 고른다.
+11. current_action은 원문 장면에서 캐릭터가 실제로 하는 행동/판단만 쓴다. 성격 설명이나 장르 설명을 쓰지 마라.
+12. immediate_pressure는 첫인사에서 바로 걸 수 있는 압력이어야 한다. "자기소개", "상황 설명"처럼 정지된 문구는 쓰지 마라.
+13. character_initiative_reason은 캐릭터가 먼저 말을 걸 이유다. 사용자의 정체를 캐묻는 미스터리로 만들지 말고 현재 사건/압력/협력 필요에서 뽑아라.
+14. user_entry_role은 원작 네임드가 아니라 장면에 약하게 엮일 수 있는 비네임드 역할만 쓴다. 예: 임시 동행자, 현장 보조자, 의뢰인, 기록 담당, 파티원, 목격자.
+15. user_hook과 user_can_do는 사용자의 행동/감정/소지품을 확정하지 말고 캐릭터가 대사로 제안할 수 있는 선택/협력 요청만 쓴다.
+16. opening_grounding은 첫인사 지문에서 안전하게 쓸 수 있는 원문 물성만 넣는다. 원문에 없는 비, 달빛, 피 냄새, 골목, 접촉, 자세를 만들지 마라.
+17. scene_identity_boundary는 현재 장면에서 공개 가능한 이름/호칭과 먼저 꺼내면 안 되는 정체를 분리한다. 동일인 bridge가 있어도 공개 가능성은 별도다.
+18. pressure_clock과 beat_ladder는 20턴 이상 대화가 제자리 반복되지 않도록 장면이 어떻게 조금씩 악화/전진하는지 쓴다.
+19. turn_continuation_contract는 유저가 협력/질문/거절/짧은 답/도발을 해도 심문 루프 없이 장면을 전진시키는 정책만 쓴다.
+20. conversation_fuel_tags는 장면을 오래 끌 수 있는 루프만 최대 3개 고른다. 태그를 많이 붙이지 마라.
+21. knowledge_boundary는 읽은 범위에서 암시 가능한 것과 직접 말하면 안 되는 것을 분리한다. 원작 미래 사건을 새로 확정하지 마라.
+22. progression_seed는 원작 장면 복붙이 아니라 3~5턴 안에 새 곁가지 사건, 관계 반응, 위치 변화, 단서, 방해로 장면을 전진시킬 씨앗만 쓴다.
+"""
+
+CHARACTER_CHAT_OPENING_SYSTEM = """너는 웹소설 원작 기반 캐릭터챗의 첫 진입 자산 생성기다.
+반드시 JSON object 하나만 반환하라. 코드블록, 설명, 머리말 금지.
+
+목표:
+- 입력된 캐릭터 인벤토리, RP 프로필, 대표 대사, 내부 프롬프트, 장면 프레임만 사용한다.
+- 캐릭터가 먼저 말을 걸 수 있는 몰입형 opening asset을 만든다.
+- 원작 세계관과 읽은 범위의 사실은 유지하되, 원작 사건 복붙이 아니라 장면에서 자연스럽게 파생되는 작은 새 사건/압박/hook을 중심에 둔다.
+- 유저는 원작 네임드가 아니라 장면에 약하게 엮인 비네임드 조력자/동행자/목격자다.
+- 유저 정체 추궁, 심문 루프, "무엇을 도와줄까"식 일반 인사는 금지다.
+- 사용자의 행동, 감정, 자세, 소지품, 신체 반응을 지문에서 확정하지 않는다.
+
+출력 스키마:
+{
+  "readiness": {"status": "ready|needs_review|not_ready", "confidence": 0.0, "block_reasons": []},
+  "chat_target": {"scope_key": "입력 scope_key", "display_name": "캐릭터명", "aliases": []},
+  "opening_scene": {
+    "situation": "첫 진입 장면",
+    "immediate_conflict": "즉시 압박",
+    "props_or_anchors": [],
+    "nearby_characters": []
+  },
+  "opening_message": {
+    "narration": "첫 화면에 그대로 쓸 300~500자 서술형 지문. 캐릭터/환경/사물/사건만 묘사",
+    "dialogue": "캐릭터가 직접 말하는 1~3문장의 첫 대사",
+    "opening_text": "서술형 지문 문단 + 빈 줄 + 큰따옴표 대사로 합친 첫 assistant 응답 초안",
+    "user_objective": "유저가 첫 답변에서 무엇을 하면 되는지"
+  },
+  "user_role": {
+    "role_type": "임시 조력자|동행자|목격자|의뢰인|동료|불명",
+    "relationship_to_character": "약한 관계",
+    "scene_entry_reason": "유저가 지금 장면에 있는 이유",
+    "first_turn_affordance": "첫 답변에서 할 수 있는 약한 선택"
+  },
+  "character_drive": {
+    "immediate_objective": "캐릭터의 지금 목표",
+    "pressure": "압박/위험/제약",
+    "longer_desire": "초반 큰 욕망"
+  },
+  "agency_contract": {
+    "character_moves_first": true,
+    "non_user_dependent_action": "유저가 침묵해도 캐릭터가 다음에 할 행동",
+    "decision_character_must_make": "캐릭터가 곧 선택할 결정",
+    "user_influence_boundary": "유저가 영향을 줄 수 있지만 대신 주도하지 않는 범위"
+  },
+  "progression_engine": {
+    "short_term_goal": "첫 5~10턴 목표",
+    "mid_term_escalation": "10~30턴 사이 새 압박",
+    "scene_exit_condition": "다음 국면으로 넘어가는 조건"
+  },
+  "user_affordance_contract": {
+    "primary_affordances": [],
+    "forbidden_agency_load": [],
+    "safe_response_examples": []
+  },
+  "canon_safe_expansion": {
+    "safe_new_event_pattern": "읽은 범위에서 파생 가능한 새 사건 패턴",
+    "allowed_inventions": [],
+    "forbidden_inventions": [],
+    "must_preserve_facts": []
+  },
+  "progression": {
+    "opening_greeting_intent": "첫 인사가 달성할 목적",
+    "next_beats": [{"beat": "다음 전개", "trigger": "유저 반응 조건", "avoid_repeating": "반복 금지"}],
+    "anti_loop_rules": []
+  }
+}
+
+규칙:
+1. readiness.status는 장면 프레임, 캐릭터 목표, 유저 역할, 다음 전개가 모두 있을 때만 ready다.
+2. chat_target.scope_key는 입력 scope_key와 정확히 같아야 한다.
+3. opening_message는 실제 첫 assistant 응답 초안이다. 일반 캐릭터챗 위저드의 첫시작처럼 intro(서술형 지문) + first_line(첫대사) 구조로 만든다. 대사만 있거나 지문만 있으면 ready가 아니다.
+4. 유저를 특정 원작 인물, 연인, 가족, 포로, 환자, 짐승, 주인공으로 확정하지 마라.
+5. 캐릭터가 장면 목적과 stake를 제공하고, 대화가 20~30턴 반복되지 않게 progression_engine을 채워라.
+6. opening_message.narration은 300~500자 분량의 서술형 지문이다. 사건 한복판에서 시작하고, 빛/소리/온도/냄새 중 1~2개 감각 디테일, 캐릭터의 3인칭 행동, 즉시 압박, 관계 훅을 넣어라.
+7. opening_message.narration은 캐릭터/환경/사물/사건만 묘사한다. 지문에서 사용자의 행동, 감정, 자세, 소지품, 신체 반응, 위치를 확정하지 마라.
+8. opening_message.dialogue는 chat_target 캐릭터가 직접 말하는 1~3문장 대사여야 한다. 대사 안에는 유저가 지금 할 수 있는 구체 행동/선택/협력 요청을 넣어라.
+   단, 대사에서도 사용자가 이미 멍하니 서 있다/숨어 있다/어슬렁거린다/침입했다/허가받지 않았다/목적을 숨긴다/대답해야 한다고 단정하지 마라.
+   협력 요청은 "저 박스 근처로 누가 다가오면 알려", "왼쪽 문양과 오른쪽 발소리 중 하나를 확인해"처럼 외부 사물과 선택지를 향해야 한다.
+   첫 대사는 "거기,"로 시작하지 마라. 사용자를 부르는 대신 곧바로 외부 사건/사물/선택지를 제시하라.
+   좋은 형식: "저 박스 근처로 누가 다가오면 바로 알려. 나는 이 상태창부터 확인할게." / "왼쪽 문양과 오른쪽 발소리 중 하나를 먼저 봐. 둘 다 놓치면 늦어."
+9. opening_message.opening_text는 첫 화면에 그대로 띄울 순수 본문이다. 반드시 `narration` 문단, 빈 줄, 큰따옴표 대사 순서로 작성하라. 단답 대사, 안내문, 자기소개, "무엇을 도와줄까"식 일반 인사는 금지다.
+"""
+
 RP_CHARACTER_PLAN_PROMPT = """너는 웹소설 episode_summary를 보고 RP용 중심인물 계획을 세우는 추론기다.
 반드시 JSON만 반환하라. 작품 속 실제 인물만 골라라.
 
@@ -372,6 +621,9 @@ EPISODE_CHARACTER_SIGNALS_PROMPT = """너는 웹소설 회차 요약에서 캐�
 8. display_name에는 "주인공", "선배", "아저씨", "아이" 같은 generic 호칭보다 실제 이름/반복 별칭을 우선한다.
    1인칭 화자의 실제 이름/반복 별칭이 없으면 display_name="나"로 두고, 연구 주제/대화 주제/사건명/상태어를 이름처럼 쓰지 마라.
 9. narration_names에는 서술자가 그 인물을 지칭하는 이름을 넣고, social_call_names에는 다른 인물이 그 인물을 부르는 호칭을 넣는다.
+   - social_call_names는 identity merge 근거가 아니라 말투/거리감 근거다. display_name을 바꾸기 위해 쓰지 마라.
+   - 한국 웹소설 호칭/거리감 신호(예: 전하, 폐하, 도련님, 아가씨, 공자, 대장, 팀장, 대표님, 선생님, 교수, 헌터, 선배, 후배, 형님, 사부, 사형, 장로, 낭자)는 실제 대사/요약에 드러나면 social_call_names에 넣는다.
+   - "형", "누나", "아저씨", "주인공", "아이"처럼 일반 관계어는 반복되어 한 인물을 안정적으로 가리키는 경우에만 social_call_names에 넣고, display_name으로 승격하지 마라.
 10. 회빙환/빙의/게임/가명처럼 사회적으로 통용되는 현재 정체성 이름은 persona_names에 넣고, 현실/전생/본명은 real_names에 넣는다.
 11. action과 affect는 짧은 한국어 태그 0~4개만 넣는다. 없으면 비워도 된다.
 12. REL은 실제로 드러난 관계만 넣는다. 애매하면 생략한다.
@@ -1070,6 +1322,24 @@ def require_paid_rp_openrouter_model() -> str:
     return model
 
 
+def require_paid_character_signals_openrouter_model() -> str:
+    model = str(EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL is empty")
+    if model.lower().endswith(":free"):
+        raise RuntimeError("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL must not use :free")
+    return model
+
+
+def require_paid_episode_scene_extraction_openrouter_model() -> str:
+    model = str(EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL is empty")
+    if model.lower().endswith(":free"):
+        raise RuntimeError("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL must not use :free")
+    return model
+
+
 def build_rp_openrouter_payload(
     *,
     system_prompt: str,
@@ -1097,6 +1367,40 @@ def build_rp_openrouter_payload(
     return payload
 
 
+def build_character_signals_openrouter_payload(*, user_prompt: str) -> dict[str, object]:
+    return {
+        "model": require_paid_character_signals_openrouter_model(),
+        "temperature": 0.0,
+        "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
+        "response_format": {"type": "json_object"},
+        "reasoning": {"effort": "none", "exclude": True},
+        "messages": [
+            {
+                "role": "system",
+                "content": f"{EPISODE_CHARACTER_SIGNALS_PROMPT}\n\n반드시 유효한 JSON object만 반환하라.",
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+
+def build_episode_scene_extraction_openrouter_payload(*, user_prompt: str) -> dict[str, object]:
+    return {
+        "model": require_paid_episode_scene_extraction_openrouter_model(),
+        "temperature": 0.0,
+        "max_tokens": EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS,
+        "response_format": {"type": "json_object"},
+        "reasoning": {"effort": "none", "exclude": True},
+        "messages": [
+            {
+                "role": "system",
+                "content": f"{EPISODE_SCENE_EXTRACTION_SYSTEM}\n\n반드시 유효한 JSON object만 반환하라.",
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+
 async def request_rp_openrouter_json_payload(
     client: AsyncClient,
     *,
@@ -1105,18 +1409,42 @@ async def request_rp_openrouter_json_payload(
     max_tokens: int,
     title: str,
 ) -> dict | None:
-    response = await client.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "X-Title": title,
-        },
-        json=build_rp_openrouter_payload(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_tokens=max_tokens,
+    response = await asyncio.wait_for(
+        client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": title,
+            },
+            json=build_rp_openrouter_payload(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+            ),
         ),
+        timeout=RP_OPENROUTER_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return extract_json_object(extract_openrouter_message_text(response.json()))
+
+
+async def request_episode_scene_extraction_openrouter_json_payload(
+    client: AsyncClient,
+    *,
+    user_prompt: str,
+) -> dict | None:
+    response = await asyncio.wait_for(
+        client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "LikeNovel Story Agent Episode Scene Extraction Batch",
+            },
+            json=build_episode_scene_extraction_openrouter_payload(user_prompt=user_prompt),
+        ),
+        timeout=EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return extract_json_object(extract_openrouter_message_text(response.json()))
@@ -1403,6 +1731,75 @@ async def request_episode_summary_text(
     return extract_openrouter_message_text(response.json())
 
 
+def is_openrouter_payment_required_error(exc: BaseException) -> bool:
+    return isinstance(exc, HTTPStatusError) and getattr(exc.response, "status_code", None) == 402
+
+
+def is_anthropic_billing_error(exc: BaseException) -> bool:
+    if not isinstance(exc, HTTPStatusError):
+        return False
+    status_code = int(getattr(exc.response, "status_code", 0) or 0)
+    if status_code not in {400, 402, 429}:
+        return False
+    body = str(getattr(exc.response, "text", "") or "").lower()
+    return "credit balance" in body or "billing" in body or "purchase credits" in body
+
+
+async def assert_storyctx_openrouter_apply_ready(client: AsyncClient | None) -> None:
+    if client is None or not OPENROUTER_API_KEY or not (EPISODE_SUMMARY_MODEL or RP_OPENROUTER_MODEL):
+        return
+    model = EPISODE_SUMMARY_MODEL or RP_OPENROUTER_MODEL
+    try:
+        response = await client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "LikeNovel Story Agent OpenRouter Preflight",
+            },
+            json={
+                "model": model,
+                "temperature": 0.0,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+        response.raise_for_status()
+    except HTTPStatusError as exc:
+        if is_openrouter_payment_required_error(exc):
+            raise RuntimeError("OpenRouter preflight failed: 402 Payment Required") from exc
+        raise
+
+
+async def assert_storyctx_anthropic_apply_ready(client: AsyncClient | None) -> None:
+    if client is None or not settings.ANTHROPIC_API_KEY or not RP_REASONING_MODEL:
+        return
+    try:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": settings.ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": RP_REASONING_MODEL,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+        response.raise_for_status()
+    except HTTPStatusError as exc:
+        if is_anthropic_billing_error(exc):
+            raise RuntimeError("Anthropic preflight failed: billing or credit unavailable") from exc
+        raise
+
+
+async def assert_storyctx_apply_providers_ready(client: AsyncClient | None) -> None:
+    await assert_storyctx_openrouter_apply_ready(client)
+    await assert_storyctx_anthropic_apply_ready(client)
+
+
 async def generate_episode_summary_text(
     *,
     client: AsyncClient | None,
@@ -1509,19 +1906,29 @@ def build_compound_summary_source_hash(format_version: str, components: list[str
 
 
 def build_rp_reasoning_signature() -> str:
-    if not RP_REASONING_MODEL:
+    if RP_REASONING_MODEL:
+        return "|".join(
+            [
+                "anthropic",
+                RP_REASONING_MODEL,
+                RP_REASONING_EFFORT,
+                RP_REASONING_THINKING_DISPLAY,
+            ]
+        )
+    if DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
         return "|".join(
             [
                 "deepseek",
                 RP_DEEPSEEK_FALLBACK_MODEL,
             ]
         )
+    if not OPENROUTER_API_KEY or not EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
+        return "none"
     return "|".join(
         [
-            "anthropic",
-            RP_REASONING_MODEL,
-            RP_REASONING_EFFORT,
-            RP_REASONING_THINKING_DISPLAY,
+            "openrouter",
+            require_paid_character_signals_openrouter_model(),
+            "reasoning:none",
         ]
     )
 
@@ -1542,17 +1949,37 @@ def _log_value(value: object) -> str:
     return text if text else "none"
 
 
+def is_episode_character_signals_provider_available() -> bool:
+    return bool(
+        (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
+        or (DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL)
+        or (OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL)
+    )
+
+
 def build_storyctx_provider_summary_line() -> str:
     episode_summary_provider = "openrouter" if OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL else "local_fallback"
     rp_openrouter_provider = "openrouter" if OPENROUTER_API_KEY and RP_OPENROUTER_MODEL else "disabled"
     if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
         signal_provider = "anthropic"
         signal_model = RP_REASONING_MODEL
-        signal_fallback_provider = "deepseek" if DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL else "none"
-        signal_fallback_model = RP_DEEPSEEK_FALLBACK_MODEL if signal_fallback_provider == "deepseek" else "none"
+        if DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
+            signal_fallback_provider = "deepseek"
+            signal_fallback_model = RP_DEEPSEEK_FALLBACK_MODEL
+        elif OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
+            signal_fallback_provider = "openrouter"
+            signal_fallback_model = EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL
+        else:
+            signal_fallback_provider = "none"
+            signal_fallback_model = "none"
     elif DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
         signal_provider = "deepseek"
         signal_model = RP_DEEPSEEK_FALLBACK_MODEL
+        signal_fallback_provider = "openrouter" if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL else "none"
+        signal_fallback_model = EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL if signal_fallback_provider == "openrouter" else "none"
+    elif OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
+        signal_provider = "openrouter"
+        signal_model = EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL
         signal_fallback_provider = "none"
         signal_fallback_model = "none"
     else:
@@ -2389,6 +2816,12 @@ def has_enough_rp_example_texts(example_texts: list[str]) -> bool:
     return len([text for text in example_texts if str(text or "").strip()]) >= RP_PROFILE_MIN_EXAMPLE_TEXTS
 
 
+def _append_unique_text(values: list[str], value: str, *, limit: int = 8) -> None:
+    text = str(value or "").strip()
+    if text and text not in values and len(values) < limit:
+        values.append(text)
+
+
 def extract_json_object(raw_text: str) -> dict | None:
     raw = str(raw_text or "").strip()
     if not raw:
@@ -2946,6 +3379,238 @@ def build_rp_profile_synthesis_user_prompt(
     )
 
 
+def _string_list(value: object, *, limit: int = 8) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    result: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text[:80])
+        if len(result) >= limit:
+            break
+    return result
+
+
+HONORIFIC_ADDRESS_SUFFIXES = (
+    "님",
+    "전하",
+    "폐하",
+    "공자",
+    "공작",
+    "궁주",
+    "소궁주",
+    "도련님",
+    "아가씨",
+    "사부",
+    "사형",
+    "장로",
+    "노야",
+    "교주",
+    "각주",
+    "선생님",
+    "교수",
+    "대장",
+    "팀장",
+    "대표님",
+    "선배",
+    "후배",
+    "형님",
+    "낭자",
+    "헌터",
+    "씨",
+)
+
+
+def _is_honorific_address_term(term: str) -> bool:
+    text = str(term or "").strip()
+    return bool(text) and text.endswith(HONORIFIC_ADDRESS_SUFFIXES)
+
+
+def build_addressing_contract_v1(
+    *,
+    address_terms: list[str],
+    forbidden_address_terms: list[str] | None = None,
+    speech_register: str = "unknown",
+) -> dict[str, object]:
+    forbidden_terms: list[str] = []
+    for value in forbidden_address_terms or []:
+        _append_unique_text(forbidden_terms, str(value or ""), limit=8)
+
+    allowed_terms: list[str] = []
+    forbidden_set = set(forbidden_terms)
+    for value in address_terms:
+        text = str(value or "").strip()
+        if text and text not in forbidden_set:
+            _append_unique_text(allowed_terms, text, limit=8)
+
+    has_honorific_surface = any(_is_honorific_address_term(term) for term in allowed_terms)
+    if has_honorific_surface:
+        distance_axis = "user_lower_or_formal_distance"
+    else:
+        distance_axis = "unknown"
+
+    if allowed_terms and (has_honorific_surface or forbidden_terms):
+        confidence = "high"
+    elif allowed_terms:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "schema_version": "addressing_contract_v1",
+        "user_to_character_allowed_calls": allowed_terms[:6],
+        "user_to_character_forbidden_calls": forbidden_terms[:6],
+        "character_to_user_default_call": "호칭 생략",
+        "character_to_user_register": str(speech_register or "unknown"),
+        "distance_axis": distance_axis,
+        "switch_triggers": [
+            "공개 호칭 근거가 있으면 공개 호칭을 우선한다",
+            "금지 정체명은 reveal_boundary 전까지 먼저 쓰지 않는다",
+        ],
+        "evidence_terms": allowed_terms[:6],
+        "confidence": confidence,
+    }
+
+
+def build_profile_voice_contract_v1(profile_payload: dict[str, object] | None) -> dict[str, object]:
+    profile = dict(profile_payload or {})
+    raw_speech_style = profile.get("speech_style") or {}
+    speech_style = dict(raw_speech_style) if isinstance(raw_speech_style, dict) else {}
+    formality = str(speech_style.get("formality") or "").strip()
+    sentence_length = str(speech_style.get("sentence_length") or "").strip()
+    address = str(speech_style.get("address") or "").strip()
+    if "존대" in formality or "높임" in formality:
+        speech_register = "formal_polite"
+    elif "반말" in formality:
+        speech_register = "casual"
+    elif formality:
+        speech_register = "mixed"
+    else:
+        speech_register = "unknown"
+
+    if "짧" in sentence_length:
+        default_sentence_length = "short"
+    elif "장문" in sentence_length or "길" in sentence_length:
+        default_sentence_length = "long"
+    elif sentence_length:
+        default_sentence_length = "medium"
+    else:
+        default_sentence_length = "unknown"
+
+    address_terms = _string_list(address, limit=6)
+    return {
+        "schema_version": "voice_contract_v1",
+        "stage": "rp_profile",
+        "speech_register": speech_register,
+        "default_sentence_length": default_sentence_length,
+        "tone_keywords": _string_list(speech_style.get("tone"), limit=6),
+        "habit_phrases": _string_list(speech_style.get("habit"), limit=6),
+        "address_terms": address_terms,
+        "addressing_contract_v1": build_addressing_contract_v1(
+            address_terms=address_terms,
+            speech_register=speech_register,
+        ),
+        "baseline_attitude": str(profile.get("baseline_attitude") or "").strip(),
+        "forbidden_speech_patterns": [
+            "무엇을 도와드릴까요",
+            "안녕하세요",
+            "제가 도와드릴게요",
+            "작품에 대해 설명하자면",
+        ],
+    }
+
+
+def build_character_chat_internal_prompt_user_prompt(
+    *,
+    target: dict[str, object],
+    profile_payload: dict[str, object],
+    example_payload: dict[str, object],
+    dialogue_items: list[dict[str, object]],
+    summary_context_lines: list[str],
+    inventory_item: dict[str, object] | None = None,
+    relation_context_lines: list[str] | None = None,
+    scene_context_lines: list[str] | None = None,
+) -> str:
+    dialogue_lines: list[str] = []
+    for item in dialogue_items[:40]:
+        text_value = normalize_rp_text(str(item.get("text") or ""), limit=220)
+        if not text_value:
+            continue
+        episode_no = int(item.get("episode_no") or 0)
+        kind = str(item.get("kind") or "dialogue").strip()
+        context = str(item.get("context") or "").strip()[:20]
+        dialogue_lines.append(f"- {episode_no}화 | {kind} | {context} | {text_value}")
+
+    example_lines = [
+        f"- {int(item.get('episode_no') or 0)}화 | {normalize_rp_text(str(item.get('text') or ''), limit=220)}"
+        for item in list(example_payload.get("examples") or [])[:5]
+        if str(item.get("text") or "").strip()
+    ]
+
+    compact_inventory = {
+        key: inventory_item.get(key)
+        for key in [
+            "display_name",
+            "aliases",
+            "is_protagonist",
+            "is_first_person",
+            "work_role",
+            "identity_surface",
+            "reveal_boundary",
+            "read_range_state_snapshot",
+            "interaction_affordance_v1",
+            "adjacent_event_seed_v1",
+            "pov_and_protagonist_centrality_v1",
+            "voice_contract_v1",
+            "chat_readiness_v1",
+            "dominant_action_tags",
+            "dominant_affect_tags",
+            "relation_presence",
+            "action_presence",
+            "first_seen_episode_no",
+            "distinct_episode_count",
+        ]
+        if inventory_item and inventory_item.get(key) not in (None, "", [])
+    }
+    profile_voice_contract = build_profile_voice_contract_v1(profile_payload)
+
+    return (
+        "[대상 캐릭터]\n"
+        + json.dumps(
+            {
+                "display_name": str(target.get("display_name") or "").strip(),
+                "aliases": [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()],
+                "is_protagonist": bool(target.get("is_protagonist")),
+                "is_first_person": bool(target.get("is_first_person")),
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n[인벤토리 근거]\n"
+        + json.dumps(compact_inventory, ensure_ascii=False)
+        + "\n\n[RP 프로필]\n"
+        + json.dumps(profile_payload, ensure_ascii=False)
+        + "\n\n[보이스 계약]\n"
+        + json.dumps(
+            {
+                "profile_voice_contract": profile_voice_contract,
+                "inventory_voice_contract": compact_inventory.get("voice_contract_v1") if compact_inventory else None,
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n[대표 대사]\n"
+        + ("\n".join(example_lines) if example_lines else "없음")
+        + "\n\n[대사 후보]\n"
+        + ("\n".join(dialogue_lines) if dialogue_lines else "없음")
+        + "\n\n[회차 요약 근거]\n"
+        + ("\n".join(f"- {line}" for line in summary_context_lines[:8]) if summary_context_lines else "없음")
+        + "\n\n[관계 근거]\n"
+        + ("\n".join(str(line).strip() for line in (relation_context_lines or [])[:8] if str(line).strip()) or "없음")
+        + "\n\n[장면 프레임 근거]\n"
+        + ("\n".join(str(line).strip() for line in (scene_context_lines or [])[:8] if str(line).strip()) or "없음")
+        + "\n\n위 근거만 사용해 character_chat 내부 프롬프트를 작성하라."
+    )
+
+
 def split_text_lines(normalized_text: str) -> list[str]:
     return [re.sub(r"[ \t]+", " ", line).strip() for line in str(normalized_text or "").splitlines() if line.strip()]
 
@@ -2953,6 +3618,565 @@ def split_text_lines(normalized_text: str) -> list[str]:
 def normalize_rp_text(value: str, *, limit: int = 300) -> str:
     cleaned = re.sub(r"\s+", " ", str(value or "").replace("\u3000", " ")).strip()
     return cleaned[:limit]
+
+
+def _normalize_episode_scene_text_list(value, *, limit: int = 90, max_items: int = 4) -> list[str]:
+    if value in (None, ""):
+        return []
+    raw_items = value if isinstance(value, list) else [value]
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if isinstance(item, dict):
+            parts = [
+                str(item.get(key) or "").strip()
+                for key in ("choice", "trigger", "advance", "action", "item", "text")
+                if str(item.get(key) or "").strip()
+            ]
+            text_value = " -> ".join(parts)
+        else:
+            text_value = str(item or "").strip()
+        normalized = normalize_rp_text(text_value, limit=limit)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(normalized)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _normalize_episode_scene_knowledge_boundary(value) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {"can_hint": [], "must_not_reveal": []}
+    return {
+        "can_hint": _normalize_episode_scene_text_list(value.get("can_hint"), limit=100, max_items=3),
+        "must_not_reveal": _normalize_episode_scene_text_list(
+            value.get("must_not_reveal"),
+            limit=100,
+            max_items=3,
+        ),
+    }
+
+
+def _normalize_episode_scene_opening_grounding(value) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {
+            "place_anchor": "",
+            "sensory_anchors": [],
+            "prop_anchors": [],
+            "spatial_constraints": [],
+            "character_visible_motion": "",
+            "forbidden_opening_inventions": [],
+        }
+    return {
+        "place_anchor": normalize_rp_text(str(value.get("place_anchor") or ""), limit=80),
+        "sensory_anchors": _normalize_episode_scene_text_list(value.get("sensory_anchors"), limit=50, max_items=3),
+        "prop_anchors": _normalize_episode_scene_text_list(value.get("prop_anchors"), limit=50, max_items=3),
+        "spatial_constraints": _normalize_episode_scene_text_list(
+            value.get("spatial_constraints"),
+            limit=60,
+            max_items=3,
+        ),
+        "character_visible_motion": normalize_rp_text(
+            str(value.get("character_visible_motion") or ""),
+            limit=100,
+        ),
+        "forbidden_opening_inventions": _normalize_episode_scene_text_list(
+            value.get("forbidden_opening_inventions"),
+            limit=50,
+            max_items=3,
+        ),
+    }
+
+
+def _normalize_episode_scene_identity_boundary(value) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {
+            "allowed_address_names": [],
+            "must_not_address_as": [],
+            "surface_role_for_user": "",
+            "identity_spoiler_risk": "unknown",
+        }
+    risk = str(value.get("identity_spoiler_risk") or "unknown").strip().lower()
+    if risk not in {"low", "medium", "high", "unknown"}:
+        risk = "unknown"
+    return {
+        "allowed_address_names": _normalize_episode_scene_text_list(
+            value.get("allowed_address_names"),
+            limit=40,
+            max_items=4,
+        ),
+        "must_not_address_as": _normalize_episode_scene_text_list(
+            value.get("must_not_address_as"),
+            limit=50,
+            max_items=4,
+        ),
+        "surface_role_for_user": normalize_rp_text(str(value.get("surface_role_for_user") or ""), limit=80),
+        "identity_spoiler_risk": risk,
+    }
+
+
+def _normalize_episode_scene_response_branches(value) -> dict[str, str]:
+    if not isinstance(value, dict):
+        value = {}
+    branch_keys = (
+        "accepts_hook",
+        "asks_question",
+        "refuses_or_delays",
+        "short_or_ambiguous",
+        "hostile_or_suspicious",
+    )
+    return {
+        key: normalize_rp_text(str(value.get(key) or ""), limit=100)
+        for key in branch_keys
+    }
+
+
+def _normalize_episode_scene_turn_contract(value) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {
+            "state_variables": [],
+            "user_response_branches": _normalize_episode_scene_response_branches({}),
+            "stall_breaker": "",
+            "scene_exit_condition": "",
+            "canon_safe_new_event_types": [],
+        }
+    return {
+        "state_variables": _normalize_episode_scene_text_list(value.get("state_variables"), limit=70, max_items=4),
+        "user_response_branches": _normalize_episode_scene_response_branches(
+            value.get("user_response_branches")
+        ),
+        "stall_breaker": normalize_rp_text(str(value.get("stall_breaker") or ""), limit=100),
+        "scene_exit_condition": normalize_rp_text(str(value.get("scene_exit_condition") or ""), limit=100),
+        "canon_safe_new_event_types": _normalize_episode_scene_text_list(
+            value.get("canon_safe_new_event_types"),
+            limit=50,
+            max_items=4,
+        ),
+    }
+
+
+def _is_usable_episode_scene_payload(payload: object) -> bool:
+    return (
+        isinstance(payload, dict)
+        and str(payload.get("status") or "").strip().lower() != "failed"
+        and int(payload.get("scene_count") or 0) > 0
+        and isinstance(payload.get("scenes"), list)
+    )
+
+
+EPISODE_SCENE_KIND_VALUES = {"dialogue", "action", "conflict", "exposition", "transition", "mixed"}
+EPISODE_SCENE_STATUS_VALUES = {"ok", "partial", "failed"}
+
+
+def build_line_indexed_episode_text(normalized_text: str) -> tuple[str, list[dict[str, object]]]:
+    """원문 line/char offset을 모델 입력에 노출한다. 판정은 이 map으로만 한다."""
+    rows: list[dict[str, object]] = []
+    offset = 0
+    for line_no, raw_line in enumerate(str(normalized_text or "").splitlines(keepends=True), start=1):
+        line_text = raw_line.rstrip("\r\n")
+        line_start = offset
+        line_end = line_start + len(line_text)
+        offset += len(raw_line)
+        compact_line = re.sub(r"[ \t]+", " ", line_text).strip()
+        if not compact_line:
+            continue
+        rows.append(
+            {
+                "line_no": line_no,
+                "char_start": line_start,
+                "char_end": line_end,
+                "text": compact_line,
+            }
+        )
+    indexed_text = "\n".join(
+        f"L{int(row['line_no']):04d}|{int(row['char_start'])}-{int(row['char_end'])}| {row['text']}"
+        for row in rows
+    )
+    return indexed_text, rows
+
+
+def _collapse_episode_scene_anchor_text(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def _build_episode_scene_collapsed_index(value: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    positions: list[int] = []
+    for index, char in enumerate(str(value or "")):
+        if char.isspace():
+            continue
+        chars.append(char)
+        positions.append(index)
+    return "".join(chars), positions
+
+
+def resolve_episode_scene_anchor(
+    normalized_text: str,
+    anchor_text: str,
+    *,
+    start_after: int = 0,
+) -> dict[str, object] | None:
+    source_text = str(normalized_text or "")
+    anchor = str(anchor_text or "").strip()
+    if not source_text or not anchor:
+        return None
+
+    exact_start = source_text.find(anchor, max(0, start_after))
+    if exact_start >= 0:
+        exact_end = exact_start + len(anchor)
+        return {
+            "char_start": exact_start,
+            "char_end": exact_end,
+            "matched_text": source_text[exact_start:exact_end],
+            "match_type": "exact",
+        }
+
+    collapsed_anchor = _collapse_episode_scene_anchor_text(anchor)
+    if len(collapsed_anchor) < 4:
+        return None
+    collapsed_source, positions = _build_episode_scene_collapsed_index(source_text)
+    collapsed_start = 0
+    while collapsed_start < len(positions) and positions[collapsed_start] < start_after:
+        collapsed_start += 1
+    collapsed_found = collapsed_source.find(collapsed_anchor, collapsed_start)
+    if collapsed_found < 0:
+        return None
+    char_start = positions[collapsed_found]
+    char_end = positions[collapsed_found + len(collapsed_anchor) - 1] + 1
+    return {
+        "char_start": char_start,
+        "char_end": char_end,
+        "matched_text": source_text[char_start:char_end],
+        "match_type": "whitespace_normalized",
+    }
+
+
+def _episode_scene_line_no_for_offset(line_rows: list[dict[str, object]], offset: int) -> int:
+    if not line_rows:
+        return 0
+    safe_offset = max(0, int(offset))
+    previous_line_no = int(line_rows[0].get("line_no") or 0)
+    for row in line_rows:
+        line_no = int(row.get("line_no") or 0)
+        line_start = int(row.get("char_start") or 0)
+        line_end = int(row.get("char_end") or line_start)
+        if safe_offset < line_start:
+            return previous_line_no
+        if line_start <= safe_offset <= max(line_start, line_end):
+            return line_no
+        previous_line_no = line_no
+    return int(line_rows[-1].get("line_no") or 0)
+
+
+def _build_episode_scene_canonical_map(canonical_character_packet: object | None) -> dict[str, dict[str, object]]:
+    if isinstance(canonical_character_packet, dict):
+        raw_items = canonical_character_packet.get("characters") or canonical_character_packet.get("items") or []
+    elif isinstance(canonical_character_packet, list):
+        raw_items = canonical_character_packet
+    else:
+        raw_items = []
+
+    canonical_by_scope: dict[str, dict[str, object]] = {}
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        scope_key = str(
+            raw_item.get("scope_key")
+            or raw_item.get("scopeKey")
+            or raw_item.get("canonical_character_key")
+            or raw_item.get("character_key")
+            or ""
+        ).strip()
+        if not scope_key:
+            continue
+        display_name = str(raw_item.get("display_name") or raw_item.get("displayName") or "").strip()
+        aliases = [str(alias).strip() for alias in (raw_item.get("aliases") or []) if str(alias).strip()]
+        canonical_by_scope[scope_key] = {"scope_key": scope_key, "display_name": display_name, "aliases": aliases}
+    return canonical_by_scope
+
+
+def _normalize_episode_scene_participants(
+    raw_participants: object,
+    canonical_by_scope: dict[str, dict[str, object]],
+    validation_issues: list[str],
+    scene_index: int,
+) -> list[dict[str, object]]:
+    participants: list[dict[str, object]] = []
+    if not isinstance(raw_participants, list):
+        return participants
+    for participant_index, raw_participant in enumerate(raw_participants[:12], start=1):
+        if not isinstance(raw_participant, dict):
+            continue
+        mention_label = normalize_rp_text(
+            str(
+                raw_participant.get("mention_label")
+                or raw_participant.get("display_name")
+                or raw_participant.get("name")
+                or ""
+            ),
+            limit=40,
+        )
+        scope_key = str(raw_participant.get("scope_key") or raw_participant.get("scopeKey") or "").strip()
+        if scope_key and scope_key not in canonical_by_scope:
+            validation_issues.append(f"scene_{scene_index}_participant_{participant_index}_unknown_scope:{scope_key}")
+            scope_key = ""
+        evidence = normalize_rp_text(str(raw_participant.get("evidence") or ""), limit=120)
+        if not mention_label and not scope_key:
+            continue
+        normalized_item: dict[str, object] = {
+            "mention_label": mention_label or canonical_by_scope.get(scope_key, {}).get("display_name") or "",
+            "scope_key": scope_key or None,
+        }
+        if scope_key:
+            normalized_item["display_name"] = str(canonical_by_scope[scope_key].get("display_name") or "")
+        if evidence:
+            normalized_item["evidence"] = evidence
+        participants.append(normalized_item)
+    return participants
+
+
+def _normalize_episode_scene_action_ownership(
+    raw_actions: object,
+    canonical_by_scope: dict[str, dict[str, object]],
+    validation_issues: list[str],
+    scene_index: int,
+) -> list[dict[str, object]]:
+    actions: list[dict[str, object]] = []
+    if not isinstance(raw_actions, list):
+        return actions
+    for action_index, raw_action in enumerate(raw_actions[:12], start=1):
+        if not isinstance(raw_action, dict):
+            continue
+        action = normalize_rp_text(str(raw_action.get("action") or ""), limit=100)
+        if not action:
+            continue
+        actor_scope_key = str(raw_action.get("actor_scope_key") or raw_action.get("scope_key") or "").strip()
+        if actor_scope_key and actor_scope_key not in canonical_by_scope:
+            validation_issues.append(f"scene_{scene_index}_action_{action_index}_unknown_scope:{actor_scope_key}")
+            actor_scope_key = ""
+        actions.append({"actor_scope_key": actor_scope_key or None, "action": action})
+    return actions
+
+
+def normalize_episode_scene_extraction_payload(
+    payload: dict | None,
+    *,
+    normalized_text: str,
+    canonical_character_packet: object | None = None,
+    episode_no: int = 0,
+) -> dict[str, object]:
+    source_text = str(normalized_text or "")[:EPISODE_SCENE_EXTRACTION_MAX_INPUT_CHARS]
+    _, line_rows = build_line_indexed_episode_text(source_text)
+    canonical_by_scope = _build_episode_scene_canonical_map(canonical_character_packet)
+    validation_issues: list[str] = []
+    if not isinstance(payload, dict):
+        return {
+            "schema_version": EPISODE_SCENE_EXTRACTION_FORMAT_VERSION,
+            "episode_no": int(episode_no or 0),
+            "status": "failed",
+            "scene_count": 0,
+            "dropped_scene_count": 0,
+            "validation_issues": ["payload_not_object"],
+            "scenes": [],
+        }
+
+    raw_scenes = payload.get("scenes") or []
+    if not isinstance(raw_scenes, list):
+        raw_scenes = []
+        validation_issues.append("scenes_not_list")
+
+    resolved_scenes: list[dict[str, object]] = []
+    search_cursor = 0
+    dropped_scene_count = 0
+    for raw_index, raw_scene in enumerate(raw_scenes[:12], start=1):
+        if not isinstance(raw_scene, dict):
+            dropped_scene_count += 1
+            validation_issues.append(f"scene_{raw_index}_not_object")
+            continue
+        anchor = str(
+            raw_scene.get("boundary_anchor_start")
+            or raw_scene.get("start_anchor")
+            or raw_scene.get("anchor")
+            or ""
+        ).strip()
+        match = resolve_episode_scene_anchor(source_text, anchor, start_after=search_cursor)
+        if match is None:
+            match = resolve_episode_scene_anchor(source_text, anchor, start_after=0)
+        if match is None:
+            dropped_scene_count += 1
+            validation_issues.append(f"scene_{raw_index}_anchor_not_found")
+            continue
+        search_cursor = max(search_cursor, int(match["char_end"]))
+        scene_kind = str(raw_scene.get("scene_kind") or "mixed").strip().lower()
+        if scene_kind not in EPISODE_SCENE_KIND_VALUES:
+            validation_issues.append(f"scene_{raw_index}_unknown_kind:{scene_kind}")
+            scene_kind = "mixed"
+        resolved_scenes.append(
+            {
+                "raw_index": raw_index,
+                "boundary_anchor_start": anchor,
+                "scene_kind": scene_kind,
+                "scene_gist": normalize_rp_text(str(raw_scene.get("scene_gist") or ""), limit=160),
+                "current_action": normalize_rp_text(str(raw_scene.get("current_action") or ""), limit=120),
+                "immediate_pressure": normalize_rp_text(str(raw_scene.get("immediate_pressure") or ""), limit=120),
+                "character_initiative_reason": normalize_rp_text(
+                    str(raw_scene.get("character_initiative_reason") or ""),
+                    limit=140,
+                ),
+                "user_entry_role": normalize_rp_text(str(raw_scene.get("user_entry_role") or ""), limit=80),
+                "user_hook": normalize_rp_text(str(raw_scene.get("user_hook") or ""), limit=140),
+                "user_can_do": _normalize_episode_scene_text_list(
+                    raw_scene.get("user_can_do"),
+                    limit=90,
+                    max_items=4,
+                ),
+                "opening_grounding": _normalize_episode_scene_opening_grounding(
+                    raw_scene.get("opening_grounding")
+                ),
+                "scene_identity_boundary": _normalize_episode_scene_identity_boundary(
+                    raw_scene.get("scene_identity_boundary")
+                ),
+                "pressure_clock": normalize_rp_text(str(raw_scene.get("pressure_clock") or ""), limit=140),
+                "conversation_fuel_tags": _normalize_episode_scene_text_list(
+                    raw_scene.get("conversation_fuel_tags"),
+                    limit=40,
+                    max_items=3,
+                ),
+                "beat_ladder": _normalize_episode_scene_text_list(
+                    raw_scene.get("beat_ladder"),
+                    limit=140,
+                    max_items=4,
+                ),
+                "turn_continuation_contract": _normalize_episode_scene_turn_contract(
+                    raw_scene.get("turn_continuation_contract")
+                ),
+                "knowledge_boundary": _normalize_episode_scene_knowledge_boundary(
+                    raw_scene.get("knowledge_boundary")
+                ),
+                "progression_seed": normalize_rp_text(str(raw_scene.get("progression_seed") or ""), limit=140),
+                "participants": _normalize_episode_scene_participants(
+                    raw_scene.get("participants"),
+                    canonical_by_scope,
+                    validation_issues,
+                    raw_index,
+                ),
+                "action_ownership": _normalize_episode_scene_action_ownership(
+                    raw_scene.get("action_ownership"),
+                    canonical_by_scope,
+                    validation_issues,
+                    raw_index,
+                ),
+                "char_start": int(match["char_start"]),
+                "anchor_end": int(match["char_end"]),
+                "anchor_match": {
+                    "type": str(match.get("match_type") or ""),
+                    "text": normalize_rp_text(str(match.get("matched_text") or ""), limit=120),
+                },
+            }
+        )
+
+    resolved_scenes.sort(key=lambda item: (int(item["char_start"]), int(item["raw_index"])))
+    deduped_scenes: list[dict[str, object]] = []
+    seen_starts: set[int] = set()
+    for scene in resolved_scenes:
+        char_start = int(scene["char_start"])
+        if char_start in seen_starts:
+            dropped_scene_count += 1
+            validation_issues.append(f"scene_{int(scene['raw_index'])}_duplicate_anchor")
+            continue
+        seen_starts.add(char_start)
+        deduped_scenes.append(scene)
+
+    normalized_scenes: list[dict[str, object]] = []
+    for index, scene in enumerate(deduped_scenes, start=1):
+        char_start = int(scene["char_start"])
+        next_start = (
+            int(deduped_scenes[index]["char_start"])
+            if index < len(deduped_scenes)
+            else len(source_text)
+        )
+        char_end = max(int(scene["anchor_end"]), next_start)
+        normalized_scenes.append(
+            {
+                "scene_index": index,
+                "boundary_anchor_start": scene["boundary_anchor_start"],
+                "scene_kind": scene["scene_kind"],
+                "scene_gist": scene["scene_gist"],
+                "current_action": scene["current_action"],
+                "immediate_pressure": scene["immediate_pressure"],
+                "character_initiative_reason": scene["character_initiative_reason"],
+                "user_entry_role": scene["user_entry_role"],
+                "user_hook": scene["user_hook"],
+                "user_can_do": scene["user_can_do"],
+                "opening_grounding": scene["opening_grounding"],
+                "scene_identity_boundary": scene["scene_identity_boundary"],
+                "pressure_clock": scene["pressure_clock"],
+                "conversation_fuel_tags": scene["conversation_fuel_tags"],
+                "beat_ladder": scene["beat_ladder"],
+                "turn_continuation_contract": scene["turn_continuation_contract"],
+                "knowledge_boundary": scene["knowledge_boundary"],
+                "progression_seed": scene["progression_seed"],
+                "participants": scene["participants"],
+                "action_ownership": scene["action_ownership"],
+                "start_line": _episode_scene_line_no_for_offset(line_rows, char_start),
+                "end_line": _episode_scene_line_no_for_offset(line_rows, max(char_start, char_end - 1)),
+                "char_start": char_start,
+                "char_end": char_end,
+                "anchor_match": scene["anchor_match"],
+            }
+        )
+
+    raw_status = str(payload.get("status") or "ok").strip().lower()
+    if raw_status not in EPISODE_SCENE_STATUS_VALUES:
+        validation_issues.append(f"unknown_status:{raw_status}")
+        raw_status = "partial"
+    if not normalized_scenes:
+        status = "failed"
+    elif dropped_scene_count or validation_issues or raw_status != "ok":
+        status = "partial"
+    else:
+        status = "ok"
+
+    return {
+        "schema_version": EPISODE_SCENE_EXTRACTION_FORMAT_VERSION,
+        "episode_no": int(episode_no or 0),
+        "status": status,
+        "scene_count": len(normalized_scenes),
+        "dropped_scene_count": dropped_scene_count,
+        "validation_issues": validation_issues[:40],
+        "scenes": normalized_scenes,
+    }
+
+
+def build_episode_scene_extraction_user_prompt(
+    *,
+    product_title: str,
+    episode_no: int,
+    episode_title: str,
+    normalized_text: str,
+    canonical_character_packet: object | None = None,
+) -> str:
+    source_text = str(normalized_text or "")[:EPISODE_SCENE_EXTRACTION_MAX_INPUT_CHARS]
+    indexed_text, _ = build_line_indexed_episode_text(source_text)
+    return (
+        "[작품]\n"
+        + json.dumps(
+            {
+                "product_title": str(product_title or "").strip(),
+                "episode_no": int(episode_no or 0),
+                "episode_title": str(episode_title or "").strip(),
+                "schema_version": EPISODE_SCENE_EXTRACTION_FORMAT_VERSION,
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n[canonical_character_packet]\n"
+        + json.dumps(canonical_character_packet or {"characters": []}, ensure_ascii=False)
+        + "\n\n[회차 원문: 라인/문자 오프셋 포함]\n"
+        + (indexed_text or "원문 없음")
+        + "\n\n위 원문에서 캐릭터챗 재료로 쓸 장면만 추출하라. boundary_anchor_start는 반드시 원문 일부를 그대로 사용하라."
+    )
 
 
 def build_rp_context(line: str, prev_line: str = "") -> str:
@@ -3725,10 +4949,47 @@ async def request_episode_character_signals_payload(
             exc,
         )
 
+    if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
+        for attempt in range(2):
+            try:
+                response = await asyncio.wait_for(
+                    client.post(
+                        f"{OPENROUTER_BASE_URL}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                            "Content-Type": "application/json",
+                            "X-Title": "LikeNovel Story Agent Episode Character Signals OpenRouter",
+                        },
+                        json=build_character_signals_openrouter_payload(
+                            user_prompt=(
+                                build_episode_character_signals_user_prompt(row, summary_text)
+                                + "\n\nJSON object must satisfy the episode_character_signals schema exactly."
+                            ),
+                        ),
+                    ),
+                    timeout=EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                openrouter_payload = extract_json_object(extract_openrouter_message_text(response.json()))
+                if openrouter_payload:
+                    logger.info(
+                        "[storyctx] episode_character_signals provider=openrouter model=%s episode_no=%s",
+                        EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+                        episode_no,
+                    )
+                    return openrouter_payload
+            except (asyncio.TimeoutError, HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "[storyctx] episode_character_signals openrouter fallback failed episode_no=%s attempt=%s: %s",
+                    episode_no,
+                    attempt + 1,
+                    exc,
+                )
+
     diagnostics = build_episode_character_signals_parse_diagnostics(raw_text)
     raise EpisodeCharacterSignalsParseError(
         episode_no=episode_no,
-        model=RP_REASONING_MODEL or RP_DEEPSEEK_FALLBACK_MODEL,
+        model=RP_REASONING_MODEL or RP_DEEPSEEK_FALLBACK_MODEL or EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
         request_id=request_id,
         json_parse_ok=bool(diagnostics["json_parse_ok"]),
         line_parse_ok=bool(diagnostics["line_parse_ok"]),
@@ -3765,6 +5026,320 @@ async def request_rp_profile_payload(
     )
 
 
+def normalize_character_chat_internal_prompt_payload(payload: dict | None) -> dict[str, str] | None:
+    if not isinstance(payload, dict):
+        return None
+    internal_prompt = str(payload.get("internal_prompt") or "").strip()
+    if not internal_prompt:
+        return None
+    return {"internal_prompt": internal_prompt[:4000]}
+
+
+async def request_character_chat_internal_prompt_payload(
+    client: AsyncClient,
+    *,
+    target: dict[str, object],
+    profile_payload: dict[str, object],
+    example_payload: dict[str, object],
+    dialogue_items: list[dict[str, object]],
+    summary_context_lines: list[str],
+    inventory_item: dict[str, object] | None = None,
+    relation_context_lines: list[str] | None = None,
+    scene_context_lines: list[str] | None = None,
+) -> dict[str, str] | None:
+    payload = await request_rp_openrouter_json_payload(
+        client,
+        system_prompt=CHARACTER_CHAT_INTERNAL_PROMPT_SYSTEM,
+        user_prompt=build_character_chat_internal_prompt_user_prompt(
+            target=target,
+            profile_payload=profile_payload,
+            example_payload=example_payload,
+            dialogue_items=dialogue_items,
+            summary_context_lines=summary_context_lines,
+            inventory_item=inventory_item,
+            relation_context_lines=relation_context_lines,
+            scene_context_lines=scene_context_lines,
+        ),
+        max_tokens=3200,
+        title="LikeNovel Story Agent Character Chat Internal Prompt Batch",
+    )
+    return normalize_character_chat_internal_prompt_payload(payload)
+
+
+def build_character_chat_opening_user_prompt(
+    *,
+    scope_key: str,
+    target: dict[str, object],
+    profile_payload: dict[str, object],
+    example_payload: dict[str, object],
+    internal_prompt_payload: dict[str, object],
+    summary_context_lines: list[str],
+    inventory_item: dict[str, object] | None = None,
+    relation_context_lines: list[str] | None = None,
+    scene_context_lines: list[str] | None = None,
+) -> str:
+    compact_inventory = {
+        key: inventory_item.get(key)
+        for key in [
+            "display_name",
+            "aliases",
+            "is_protagonist",
+            "is_first_person",
+            "work_role",
+            "identity_surface",
+            "reveal_boundary",
+            "read_range_state_snapshot",
+            "interaction_affordance_v1",
+            "adjacent_event_seed_v1",
+            "chat_readiness_v1",
+            "public_chat_eligible",
+            "public_slot_eligible",
+        ]
+        if inventory_item and inventory_item.get(key) not in (None, "", [])
+    }
+    return (
+        "[필수 scope_key]\n"
+        + scope_key
+        + "\n\n[대상 캐릭터]\n"
+        + json.dumps(
+            {
+                "display_name": str(target.get("display_name") or "").strip(),
+                "aliases": [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()],
+                "is_protagonist": bool(target.get("is_protagonist")),
+                "is_first_person": bool(target.get("is_first_person")),
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n[인벤토리]\n"
+        + json.dumps(compact_inventory, ensure_ascii=False)
+        + "\n\n[RP 프로필]\n"
+        + json.dumps(profile_payload, ensure_ascii=False)
+        + "\n\n[대표 대사]\n"
+        + json.dumps(example_payload, ensure_ascii=False)
+        + "\n\n[내부 프롬프트]\n"
+        + json.dumps(internal_prompt_payload, ensure_ascii=False)
+        + "\n\n[회차 요약 근거]\n"
+        + ("\n".join(f"- {line}" for line in summary_context_lines[:8]) if summary_context_lines else "없음")
+        + "\n\n[관계 근거]\n"
+        + ("\n".join(str(line).strip() for line in (relation_context_lines or [])[:8] if str(line).strip()) or "없음")
+        + "\n\n[장면 프레임 근거]\n"
+        + ("\n".join(str(line).strip() for line in (scene_context_lines or [])[:8] if str(line).strip()) or "없음")
+        + "\n\n위 근거만 사용해 character_chat_opening_v1 JSON을 작성하라."
+    )
+
+
+def normalize_character_chat_opening_payload(
+    payload: dict | None,
+    *,
+    scope_key: str,
+    display_name: str,
+) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    readiness = dict(payload.get("readiness") or {})
+    if str(readiness.get("status") or "").strip() != "ready":
+        return None
+    chat_target = dict(payload.get("chat_target") or {})
+    payload_scope_key = str(chat_target.get("scope_key") or "").strip()
+    if payload_scope_key and payload_scope_key != scope_key:
+        return None
+    chat_target["scope_key"] = scope_key
+    chat_target["display_name"] = str(chat_target.get("display_name") or "").strip() or display_name
+    if not chat_target["display_name"]:
+        return None
+    required_dict_fields = [
+        "opening_message",
+        "opening_scene",
+        "user_role",
+        "character_drive",
+        "agency_contract",
+        "progression_engine",
+    ]
+    if any(not isinstance(payload.get(field_name), dict) or not payload.get(field_name) for field_name in required_dict_fields):
+        return None
+    opening_message = normalize_character_chat_opening_message(payload.get("opening_message"))
+    if opening_message is None:
+        return None
+    normalized = dict(payload)
+    normalized["schema_version"] = CHARACTER_CHAT_OPENING_FORMAT_VERSION
+    normalized["readiness"] = readiness
+    normalized["chat_target"] = chat_target
+    normalized["opening_message"] = opening_message
+    return normalized
+
+
+def normalize_character_chat_opening_message(value: object) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    narration = normalize_rp_text(str(value.get("narration") or ""), limit=900)
+    dialogue = normalize_rp_text(str(value.get("dialogue") or ""), limit=600)
+    if dialogue and not any(mark in dialogue for mark in ('"', "“", "”")):
+        dialogue = f'"{dialogue.strip(chr(34)).strip("“”")}"'
+    opening_text = normalize_character_chat_opening_block(str(value.get("opening_text") or ""), limit=1800)
+    user_objective = normalize_rp_text(str(value.get("user_objective") or ""), limit=220)
+    if not opening_text and narration and dialogue:
+        opening_text = f"{narration}\n\n{dialogue}"
+    elif opening_text and "\n" not in opening_text and narration and dialogue:
+        opening_text = f"{narration}\n\n{dialogue}"
+    if not narration or not dialogue or not opening_text or not user_objective:
+        return None
+    if len(narration) < 220 or len(dialogue) < 20 or len(opening_text) < 280:
+        return None
+    if dialogue not in opening_text and dialogue.strip('"“”') not in opening_text:
+        return None
+    if dialogue.strip().lstrip('"“').startswith("거기"):
+        return None
+    if has_character_chat_opening_agency_violation(f"{dialogue}\n{opening_text}"):
+        return None
+    return {
+        "narration": narration,
+        "dialogue": dialogue,
+        "opening_text": opening_text,
+        "user_objective": user_objective,
+    }
+
+
+def has_character_chat_opening_agency_violation(text: str) -> bool:
+    normalized = normalize_rp_text(str(text or ""), limit=2200)
+    if not normalized:
+        return False
+    forbidden_fragments = [
+        "멍하니 서",
+        "멍하니 있",
+        "숨어서",
+        "숨어 있",
+        "눈치만 보",
+        "튀어나와",
+        "어슬렁",
+        "허가받지 않은",
+        "침입자",
+        "침입했",
+        "목적이 뭐",
+        "정체가 뭐",
+        "누구냐",
+        "왜 여기",
+        "대답해",
+        "네가 가리킨",
+        "네가 들고",
+        "네가 내민",
+        "네 손",
+        "네 발치",
+        "너를 향해",
+        "너에게",
+        "너를 쏘아보",
+        "너를 힐끗",
+        "너를 쳐다",
+    ]
+    return any(fragment in normalized for fragment in forbidden_fragments)
+
+
+def normalize_character_chat_opening_block(value: str, *, limit: int) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u3000", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    lines: list[str] = []
+    blank_seen = False
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if lines and not blank_seen:
+                lines.append("")
+            blank_seen = True
+            continue
+        lines.append(line)
+        blank_seen = False
+    normalized = "\n".join(lines).strip()
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    if len(normalized) > limit:
+        normalized = normalized[:limit].rstrip()
+    return normalized
+
+
+async def request_character_chat_opening_payload(
+    client: AsyncClient,
+    *,
+    scope_key: str,
+    target: dict[str, object],
+    profile_payload: dict[str, object],
+    example_payload: dict[str, object],
+    internal_prompt_payload: dict[str, object],
+    summary_context_lines: list[str],
+    inventory_item: dict[str, object] | None = None,
+    relation_context_lines: list[str] | None = None,
+    scene_context_lines: list[str] | None = None,
+) -> dict[str, object] | None:
+    display_name = str(target.get("display_name") or "").strip()
+    payload = await request_rp_openrouter_json_payload(
+        client,
+        system_prompt=CHARACTER_CHAT_OPENING_SYSTEM,
+        user_prompt=build_character_chat_opening_user_prompt(
+            scope_key=scope_key,
+            target=target,
+            profile_payload=profile_payload,
+            example_payload=example_payload,
+            internal_prompt_payload=internal_prompt_payload,
+            summary_context_lines=summary_context_lines,
+            inventory_item=inventory_item,
+            relation_context_lines=relation_context_lines,
+            scene_context_lines=scene_context_lines,
+        ),
+        max_tokens=3000,
+        title="LikeNovel Story Agent Character Chat Opening Batch",
+    )
+    return normalize_character_chat_opening_payload(
+        payload,
+        scope_key=scope_key,
+        display_name=display_name,
+    )
+
+
+async def request_episode_scene_extraction_payload(
+    client: AsyncClient,
+    *,
+    product_title: str,
+    episode_no: int,
+    episode_title: str,
+    normalized_text: str,
+    canonical_character_packet: object | None = None,
+) -> dict[str, object]:
+    user_prompt = build_episode_scene_extraction_user_prompt(
+        product_title=product_title,
+        episode_no=episode_no,
+        episode_title=episode_title,
+        normalized_text=normalized_text,
+        canonical_character_packet=canonical_character_packet,
+    )
+    normalized_payload: dict[str, object] = {}
+    for attempt in range(2):
+        retry_suffix = (
+            "\n\n이전 응답은 완전한 JSON object가 아니었다. "
+            "이번에는 반드시 닫힌 JSON object 하나만 끝까지 반환하라."
+            if attempt
+            else ""
+        )
+        try:
+            payload = await request_episode_scene_extraction_openrouter_json_payload(
+                client,
+                user_prompt=user_prompt + retry_suffix,
+            )
+        except (asyncio.TimeoutError, HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "[storyctx] episode_scene_extraction openrouter failed episode_no=%s attempt=%s: %s",
+                episode_no,
+                attempt + 1,
+                exc,
+            )
+            continue
+        normalized_payload = normalize_episode_scene_extraction_payload(
+            payload,
+            normalized_text=normalized_text,
+            canonical_character_packet=canonical_character_packet,
+            episode_no=episode_no,
+        )
+        if _is_usable_episode_scene_payload(normalized_payload):
+            return normalized_payload
+    return normalized_payload
+
+
 def build_rp_inventory_signature_parts(inventory_item: dict[str, object] | None) -> list[str]:
     if not inventory_item:
         return []
@@ -3775,6 +5350,30 @@ def build_rp_inventory_signature_parts(inventory_item: dict[str, object] | None)
         f"inv:voice:{int(inventory_item.get('voice_evidence_count') or 0)}",
         f"inv:action:{str(inventory_item.get('action_presence') or '')}",
         f"inv:relation:{str(inventory_item.get('relation_presence') or '')}",
+    ]
+
+
+def build_character_chat_inventory_signature_parts(inventory_item: dict[str, object] | None) -> list[str]:
+    if not inventory_item:
+        return []
+    return [
+        *build_rp_inventory_signature_parts(inventory_item),
+        "inv:identity_surface:"
+        + json.dumps(dict(inventory_item.get("identity_surface") or {}), ensure_ascii=False, sort_keys=True),
+        "inv:reveal_boundary:"
+        + json.dumps(dict(inventory_item.get("reveal_boundary") or {}), ensure_ascii=False, sort_keys=True),
+        "inv:read_range_state:"
+        + json.dumps(dict(inventory_item.get("read_range_state_snapshot") or {}), ensure_ascii=False, sort_keys=True),
+        "inv:interaction_affordance:"
+        + json.dumps(dict(inventory_item.get("interaction_affordance_v1") or {}), ensure_ascii=False, sort_keys=True),
+        "inv:adjacent_event_seed:"
+        + json.dumps(dict(inventory_item.get("adjacent_event_seed_v1") or {}), ensure_ascii=False, sort_keys=True),
+        "inv:pov_centrality:"
+        + json.dumps(dict(inventory_item.get("pov_and_protagonist_centrality_v1") or {}), ensure_ascii=False, sort_keys=True),
+        "inv:voice_contract:"
+        + json.dumps(dict(inventory_item.get("voice_contract_v1") or {}), ensure_ascii=False, sort_keys=True),
+        "inv:chat_readiness:"
+        + json.dumps(dict(inventory_item.get("chat_readiness_v1") or {}), ensure_ascii=False, sort_keys=True),
     ]
 
 
@@ -3816,6 +5415,60 @@ def build_rp_examples_source_hash(
             *(f"summary:{line}" for line in summary_context_lines[:8]),
             *(f"relation:{line}" for line in relation_context_lines[:6]),
             *(str(item.get("text") or "") for item in list(example_payload.get("examples") or [])),
+        ],
+    )
+
+
+def build_character_chat_internal_prompt_source_hash(
+    *,
+    character_key: str,
+    inventory_item: dict[str, object] | None,
+    profile_payload: dict[str, object],
+    example_payload: dict[str, object],
+    dialogue_items: list[dict[str, object]],
+    summary_context_lines: list[str],
+    relation_context_lines: list[str],
+    scene_context_lines: list[str] | None = None,
+) -> str:
+    return build_compound_summary_source_hash(
+        CHARACTER_CHAT_INTERNAL_PROMPT_FORMAT_VERSION,
+        [
+            character_key,
+            build_rp_profile_model_signature(),
+            *build_character_chat_inventory_signature_parts(inventory_item),
+            json.dumps(profile_payload, ensure_ascii=False, sort_keys=True),
+            *(str(item.get("text") or "") for item in list(example_payload.get("examples") or [])),
+            *(f"summary:{line}" for line in summary_context_lines[:8]),
+            *(f"relation:{line}" for line in relation_context_lines[:8]),
+            *(f"scene:{line}" for line in list(scene_context_lines or [])[:8]),
+            *(f"{int(item.get('episode_no') or 0)}:{str(item.get('text') or '')}" for item in dialogue_items[:40]),
+        ],
+    )
+
+
+def build_character_chat_opening_source_hash(
+    *,
+    character_key: str,
+    inventory_item: dict[str, object] | None,
+    profile_row: dict[str, object],
+    examples_row: dict[str, object],
+    internal_prompt_row: dict[str, object],
+    summary_context_lines: list[str],
+    relation_context_lines: list[str],
+    scene_context_lines: list[str] | None = None,
+) -> str:
+    return build_compound_summary_source_hash(
+        CHARACTER_CHAT_OPENING_FORMAT_VERSION,
+        [
+            character_key,
+            build_rp_profile_model_signature(),
+            *build_character_chat_inventory_signature_parts(inventory_item),
+            f"profile:{str(profile_row.get('source_hash') or '')}",
+            f"examples:{str(examples_row.get('source_hash') or '')}",
+            f"internal:{str(internal_prompt_row.get('source_hash') or '')}",
+            *(f"summary:{line}" for line in summary_context_lines[:8]),
+            *(f"relation:{line}" for line in relation_context_lines[:8]),
+            *(f"scene:{line}" for line in list(scene_context_lines or [])[:8]),
         ],
     )
 
@@ -4002,8 +5655,11 @@ def compute_rp_affected_scope_keys(
     new_touched_signal_rows: list[dict],
     old_profile_map: dict[str, dict[str, object]],
     old_examples_map: dict[str, dict[str, object]],
+    old_internal_prompt_map: dict[str, dict[str, object]] | None = None,
     cleanup_scope_keys: set[str] | None = None,
 ) -> set[str]:
+    internal_prompt_gate_enabled = old_internal_prompt_map is not None
+    old_internal_prompt_map = old_internal_prompt_map or {}
     touched_character_keys = extract_character_keys_from_signal_rows(old_touched_signal_rows) | extract_character_keys_from_signal_rows(new_touched_signal_rows)
     touched_relation_keys = extract_relation_keys_from_signal_rows(old_touched_signal_rows) | extract_relation_keys_from_signal_rows(new_touched_signal_rows)
     changed_relation_keys = {
@@ -4033,7 +5689,7 @@ def compute_rp_affected_scope_keys(
                 resolved_scope_keys.update(mapped_scope_keys)
             else:
                 resolved_scope_keys.add(source_key)
-            if source_key in old_profile_map or source_key in old_examples_map:
+            if source_key in old_profile_map or source_key in old_examples_map or source_key in old_internal_prompt_map:
                 resolved_scope_keys.add(source_key)
         return resolved_scope_keys
 
@@ -4047,6 +5703,7 @@ def compute_rp_affected_scope_keys(
             or new_inventory_item
             or scope_key in old_profile_map
             or scope_key in old_examples_map
+            or scope_key in old_internal_prompt_map
         )
         if not known_scope:
             continue
@@ -4055,7 +5712,16 @@ def compute_rp_affected_scope_keys(
             or scope_key in resolved_relation_scope_keys
             or (new_inventory_item and scope_key not in old_profile_map)
             or (new_inventory_item and scope_key not in old_examples_map)
-            or (not old_inventory_item and not new_inventory_item and (scope_key in old_profile_map or scope_key in old_examples_map))
+            or (internal_prompt_gate_enabled and new_inventory_item and scope_key not in old_internal_prompt_map)
+            or (
+                not old_inventory_item
+                and not new_inventory_item
+                and (
+                    scope_key in old_profile_map
+                    or scope_key in old_examples_map
+                    or scope_key in old_internal_prompt_map
+                )
+            )
         ):
             candidate_scope_keys.add(scope_key)
     return {scope_key for scope_key in candidate_scope_keys if str(scope_key or "").strip()}
@@ -4236,6 +5902,10 @@ async def build_rp_summaries(
         logger.info("story_agent_rp_keep_old product_id=%s reason=%s", product_id, "plan_targets_missing")
         return {key: (value[0], value[1]) for key, value in counts.items()}
 
+    scene_context_lines_by_scope = load_character_chat_scene_context_lines_by_scope(
+        conn,
+        product_id=product_id,
+    )
     valid_scope_keys: set[str] = set()
     for target in targets:
         character_key = str(target.get("character_key") or "").strip()
@@ -4300,6 +5970,7 @@ async def build_rp_summaries(
             character_key=character_key,
             relation_map=relation_map or {},
         )
+        scene_context_lines = scene_context_lines_by_scope.get(character_key, [])
 
         if not dialogue_items:
             logger.info(
@@ -4365,6 +6036,34 @@ async def build_rp_summaries(
                     "confidence": 0.9 if matched_item else 0.7,
                 }
             )
+        internal_prompt_payload: dict[str, str] | None = None
+        try:
+            internal_prompt_payload = await request_character_chat_internal_prompt_payload(
+                summary_client,
+                target=target,
+                profile_payload=profile_payload,
+                example_payload=example_payload,
+                dialogue_items=dialogue_items,
+                summary_context_lines=summary_context_lines,
+                inventory_item=inventory_item,
+                relation_context_lines=relation_context_lines,
+                scene_context_lines=scene_context_lines,
+            )
+        except Exception as exc:
+            logger.warning(
+                "story_agent_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
+                product_id,
+                character_key,
+                str(exc)[:200],
+            )
+            if verbose:
+                print(f"[character-chat-prompt-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
+        if internal_prompt_payload:
+            internal_prompt_payload = {
+                "character_key": character_key,
+                "display_name": str(profile_payload.get("display_name") or "").strip(),
+                **internal_prompt_payload,
+            }
 
         profile_source_hash = build_rp_profile_source_hash(
             character_key=character_key,
@@ -4380,6 +6079,18 @@ async def build_rp_summaries(
             summary_context_lines=summary_context_lines,
             relation_context_lines=relation_context_lines,
         )
+        internal_prompt_source_hash = ""
+        if internal_prompt_payload:
+            internal_prompt_source_hash = build_character_chat_internal_prompt_source_hash(
+                character_key=character_key,
+                inventory_item=inventory_item,
+                profile_payload=profile_payload,
+                example_payload=example_payload,
+                dialogue_items=dialogue_items,
+                summary_context_lines=summary_context_lines,
+                relation_context_lines=relation_context_lines,
+                scene_context_lines=scene_context_lines,
+            )
         with work_cursor(conn) as cur:
             _, profile_inserted = upsert_summary(
                 cur,
@@ -4399,6 +6110,16 @@ async def build_rp_summaries(
                 source_doc_count=len(example_payload["examples"]),
                 summary_text=json.dumps(example_payload, ensure_ascii=False),
             )
+            if internal_prompt_payload:
+                upsert_summary(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_chat_internal_prompt",
+                    scope_key=character_key,
+                    source_hash=internal_prompt_source_hash,
+                    source_doc_count=len(dialogue_items),
+                    summary_text=json.dumps(internal_prompt_payload, ensure_ascii=False),
+                )
         conn.commit()
         counts["profile"][0 if profile_inserted else 1] += 1
         counts["examples"][0 if examples_inserted else 1] += 1
@@ -4408,6 +6129,7 @@ async def build_rp_summaries(
         with work_cursor(conn) as cur:
             deactivate_missing_active_scopes(cur, product_id, "character_rp_profile", valid_scope_keys)
             deactivate_missing_active_scopes(cur, product_id, "character_rp_examples", valid_scope_keys)
+            deactivate_missing_active_scopes(cur, product_id, "character_chat_internal_prompt", valid_scope_keys)
         conn.commit()
     return {key: (value[0], value[1]) for key, value in counts.items()}
 
@@ -4444,6 +6166,10 @@ async def build_rp_summaries_delta(
     ):
         return counts
 
+    scene_context_lines_by_scope = load_character_chat_scene_context_lines_by_scope(
+        conn,
+        product_id=product_id,
+    )
     source_scope_key_map = build_inventory_source_scope_key_map(inventory_map or {})
     processed_scope_keys: set[str] = set()
     for scope_key in sorted(affected_scope_keys):
@@ -4467,6 +6193,12 @@ async def build_rp_summaries_delta(
                     summary_type="character_rp_examples",
                     scope_key=scope_key,
                 )
+                deactivate_active_scope(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_chat_internal_prompt",
+                    scope_key=scope_key,
+                )
             continue
 
         if not is_batch_rp_candidate(inventory_item):
@@ -4481,6 +6213,12 @@ async def build_rp_summaries_delta(
                     cur,
                     product_id=product_id,
                     summary_type="character_rp_examples",
+                    scope_key=scope_key,
+                )
+                deactivate_active_scope(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_chat_internal_prompt",
                     scope_key=scope_key,
                 )
             continue
@@ -4549,6 +6287,7 @@ async def build_rp_summaries_delta(
             character_key=scope_key,
             relation_map=relation_map,
         )
+        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
         try:
             payload = await request_rp_profile_payload(
                 summary_client,
@@ -4600,6 +6339,34 @@ async def build_rp_summaries_delta(
                     "confidence": 0.9 if matched_item else 0.7,
                 }
             )
+        internal_prompt_payload: dict[str, str] | None = None
+        try:
+            internal_prompt_payload = await request_character_chat_internal_prompt_payload(
+                summary_client,
+                target=target,
+                profile_payload=profile_payload,
+                example_payload=example_payload,
+                dialogue_items=dialogue_items,
+                summary_context_lines=summary_context_lines,
+                inventory_item=inventory_item,
+                relation_context_lines=relation_context_lines,
+                scene_context_lines=scene_context_lines,
+            )
+        except Exception as exc:
+            logger.warning(
+                "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
+                product_id,
+                scope_key,
+                str(exc)[:200],
+            )
+            if verbose:
+                print(f"[character-chat-delta-prompt-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
+        if internal_prompt_payload:
+            internal_prompt_payload = {
+                "character_key": scope_key,
+                "display_name": str(profile_payload.get("display_name") or "").strip(),
+                **internal_prompt_payload,
+            }
 
         profile_source_hash = build_rp_profile_source_hash(
             character_key=scope_key,
@@ -4615,6 +6382,18 @@ async def build_rp_summaries_delta(
             summary_context_lines=summary_context_lines,
             relation_context_lines=relation_context_lines,
         )
+        internal_prompt_source_hash = ""
+        if internal_prompt_payload:
+            internal_prompt_source_hash = build_character_chat_internal_prompt_source_hash(
+                character_key=scope_key,
+                inventory_item=inventory_item,
+                profile_payload=profile_payload,
+                example_payload=example_payload,
+                dialogue_items=dialogue_items,
+                summary_context_lines=summary_context_lines,
+                relation_context_lines=relation_context_lines,
+                scene_context_lines=scene_context_lines,
+            )
 
         with work_cursor(conn) as cur:
             _, profile_inserted = upsert_summary(
@@ -4635,10 +6414,189 @@ async def build_rp_summaries_delta(
                 source_doc_count=len(example_payload["examples"]),
                 summary_text=json.dumps(example_payload, ensure_ascii=False),
             )
+            if internal_prompt_payload:
+                upsert_summary(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_chat_internal_prompt",
+                    scope_key=scope_key,
+                    source_hash=internal_prompt_source_hash,
+                    source_doc_count=len(dialogue_items),
+                    summary_text=json.dumps(internal_prompt_payload, ensure_ascii=False),
+                )
         counts["profile"][0 if profile_inserted else 1] += 1
         counts["examples"][0 if examples_inserted else 1] += 1
 
     return counts
+
+
+async def build_character_chat_opening_summaries(
+    conn,
+    *,
+    product_id: int,
+    episode_rows: list[dict[str, object]],
+    summary_client: AsyncClient | None,
+    inventory_map: dict[str, dict[str, object]],
+    relation_map: dict[str, list[dict[str, object]]],
+    affected_scope_keys: set[str] | None = None,
+    cleanup_missing_scopes: bool = True,
+    verbose: bool = False,
+) -> tuple[int, int]:
+    if summary_client is None or not OPENROUTER_API_KEY or not EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL:
+        return 0, 0
+
+    with work_cursor(conn) as cur:
+        profile_rows_by_scope = fetch_active_summary_state_map(
+            cur=cur,
+            product_id=product_id,
+            summary_type="character_rp_profile",
+        )
+        example_rows_by_scope = fetch_active_summary_state_map(
+            cur=cur,
+            product_id=product_id,
+            summary_type="character_rp_examples",
+        )
+        internal_prompt_rows_by_scope = fetch_active_summary_state_map(
+            cur=cur,
+            product_id=product_id,
+            summary_type="character_chat_internal_prompt",
+        )
+
+    scene_context_lines_by_scope = load_character_chat_scene_context_lines_by_scope(
+        conn,
+        product_id=product_id,
+    )
+    source_scope_key_map = build_inventory_source_scope_key_map(inventory_map or {})
+    normalized_affected_scope_keys: set[str] | None = None
+    if affected_scope_keys is not None:
+        normalized_affected_scope_keys = {
+            source_scope_key_map.get(str(scope_key or "").strip(), str(scope_key or "").strip())
+            for scope_key in affected_scope_keys
+            if str(scope_key or "").strip()
+        }
+
+    inserted_count = 0
+    reused_count = 0
+    valid_scope_keys: set[str] = set()
+    for scope_key, inventory_item in sorted((inventory_map or {}).items()):
+        scope_key = str(scope_key or "").strip()
+        if not scope_key:
+            continue
+        if normalized_affected_scope_keys is not None and scope_key not in normalized_affected_scope_keys:
+            continue
+        inventory_item = dict(inventory_item or {})
+        if not is_batch_rp_candidate(inventory_item):
+            continue
+        target = dict(build_inventory_rp_target(scope_key=scope_key, inventory_item=inventory_item) or {})
+        if not target:
+            continue
+        target = attach_competing_speaker_anchors(
+            target,
+            current_scope_key=scope_key,
+            inventory_map=inventory_map,
+        )
+        if get_rp_target_skip_reason(target):
+            continue
+        profile_row = dict(profile_rows_by_scope.get(scope_key) or {})
+        example_row = dict(example_rows_by_scope.get(scope_key) or {})
+        internal_prompt_row = dict(internal_prompt_rows_by_scope.get(scope_key) or {})
+        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
+        if not profile_row or not example_row or not internal_prompt_row or not scene_context_lines:
+            continue
+
+        profile_payload = dict(profile_row.get("payload") or {})
+        example_payload = dict(example_row.get("payload") or {})
+        internal_prompt_payload = dict(internal_prompt_row.get("payload") or {})
+        if not profile_payload or not example_payload or not internal_prompt_payload:
+            continue
+
+        summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
+        relation_context_lines = build_rp_relation_context_lines(
+            character_key=scope_key,
+            relation_map=relation_map,
+        )
+        source_hash = build_character_chat_opening_source_hash(
+            character_key=scope_key,
+            inventory_item=inventory_item,
+            profile_row=profile_row,
+            examples_row=example_row,
+            internal_prompt_row=internal_prompt_row,
+            summary_context_lines=summary_context_lines,
+            relation_context_lines=relation_context_lines,
+            scene_context_lines=scene_context_lines,
+        )
+        reused_existing = False
+        with work_cursor(conn) as cur:
+            existing = fetch_existing_summary(
+                cur=cur,
+                product_id=product_id,
+                summary_type="character_chat_opening_v1",
+                scope_key=scope_key,
+                source_hash=source_hash,
+            )
+            if existing and _is_character_chat_opening_row_ready(existing, scope_key=scope_key):
+                activate_existing_summary(
+                    cur,
+                    int(existing["summary_id"]),
+                    product_id,
+                    "character_chat_opening_v1",
+                    scope_key,
+                )
+                reused_existing = True
+        if reused_existing:
+            conn.commit()
+            valid_scope_keys.add(scope_key)
+            reused_count += 1
+            continue
+
+        try:
+            opening_payload = await request_character_chat_opening_payload(
+                summary_client,
+                scope_key=scope_key,
+                target=target,
+                profile_payload=profile_payload,
+                example_payload=example_payload,
+                internal_prompt_payload=internal_prompt_payload,
+                summary_context_lines=summary_context_lines,
+                inventory_item=inventory_item,
+                relation_context_lines=relation_context_lines,
+                scene_context_lines=scene_context_lines,
+            )
+        except Exception as exc:
+            logger.warning(
+                "story_agent_character_chat_opening_keep_old product_id=%s scope_key=%s error=%s",
+                product_id,
+                scope_key,
+                str(exc)[:200],
+            )
+            if verbose:
+                print(f"[character-chat-opening-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
+            continue
+        if not opening_payload:
+            continue
+
+        valid_scope_keys.add(scope_key)
+        with work_cursor(conn) as cur:
+            _, inserted = upsert_summary(
+                cur,
+                product_id=product_id,
+                summary_type="character_chat_opening_v1",
+                scope_key=scope_key,
+                source_hash=source_hash,
+                source_doc_count=len(scene_context_lines),
+                summary_text=json.dumps(opening_payload, ensure_ascii=False),
+            )
+        conn.commit()
+        if inserted:
+            inserted_count += 1
+        else:
+            reused_count += 1
+
+    if cleanup_missing_scopes and (inserted_count + reused_count) > 0:
+        with work_cursor(conn) as cur:
+            deactivate_missing_active_scopes(cur, product_id, "character_chat_opening_v1", valid_scope_keys)
+        conn.commit()
+    return inserted_count, reused_count
 
 
 async def build_episode_character_signals_summaries(
@@ -4652,6 +6610,7 @@ async def build_episode_character_signals_summaries(
 ) -> tuple[int, int]:
     if summary_client is None:
         return 0, 0
+    provider_available = is_episode_character_signals_provider_available()
 
     inserted_count = 0
     reused_count = 0
@@ -4695,8 +6654,20 @@ async def build_episode_character_signals_summaries(
             conn.commit()
             reused_count += 1
             continue
+        if not provider_available:
+            if verbose:
+                print(
+                    f"[character-signals-keep-old] product_id={product_id} "
+                    f"episode_no={episode_no} reason=provider_unavailable"
+                )
+            continue
 
         try:
+            if verbose:
+                print(
+                    f"[character-signals-start] product_id={product_id} episode_no={episode_no} "
+                    f"signature={build_rp_reasoning_signature()}"
+                )
             payload = await request_episode_character_signals_payload(
                 summary_client,
                 row={
@@ -4757,6 +6728,197 @@ async def build_episode_character_signals_summaries(
     return inserted_count, reused_count
 
 
+def build_episode_scene_canonical_character_packet(
+    inventory_map: dict[str, dict[str, object]],
+    *,
+    limit: int = 24,
+) -> dict[str, list[dict[str, object]]]:
+    rows: list[dict[str, object]] = []
+    for scope_key, item in (inventory_map or {}).items():
+        scope_key = str(scope_key or item.get("canonical_character_key") or "").strip()
+        display_name = str(item.get("display_name") or "").strip()
+        if not scope_key or not display_name:
+            continue
+        if str(item.get("entity_kind") or "person").strip().lower() != "person":
+            continue
+        aliases = [
+            str(alias).strip()
+            for alias in list(item.get("aliases") or [])
+            if str(alias).strip()
+        ][:8]
+        rows.append(
+            {
+                "scope_key": scope_key,
+                "display_name": display_name,
+                "aliases": aliases,
+                "work_role": str(item.get("work_role") or "").strip(),
+                "is_protagonist": bool(item.get("is_protagonist"))
+                or str(item.get("work_role") or "").strip() == "main_protagonist",
+                "first_seen_episode_no": int(item.get("first_seen_episode_no") or 0),
+                "distinct_episode_count": int(item.get("distinct_episode_count") or 0),
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            0 if bool(item.get("is_protagonist")) else 1,
+            int(item.get("first_seen_episode_no") or 999999),
+            -int(item.get("distinct_episode_count") or 0),
+            str(item.get("display_name") or ""),
+        )
+    )
+    return {"characters": rows[:limit]}
+
+
+def build_episode_scene_extraction_source_hash(
+    row: dict[str, object],
+    canonical_character_packet: object | None,
+) -> str:
+    return build_compound_summary_source_hash(
+        EPISODE_SCENE_EXTRACTION_FORMAT_VERSION,
+        [
+            f"{int(row.get('summary_id') or 0)}:{str(row.get('source_hash') or '').strip()}",
+            json.dumps(canonical_character_packet or {"characters": []}, ensure_ascii=False, sort_keys=True),
+        ],
+    )
+
+
+async def build_episode_scene_extraction_summaries(
+    conn,
+    *,
+    product_id: int,
+    product_title: str,
+    episode_rows: list[dict[str, object]],
+    episode_texts_by_no: dict[int, str],
+    summary_client: AsyncClient | None,
+    canonical_character_packet: object | None,
+    cleanup_missing_scopes: bool = True,
+    verbose: bool = False,
+) -> tuple[int, int]:
+    if summary_client is None or not OPENROUTER_API_KEY or not RP_OPENROUTER_MODEL:
+        return 0, 0
+    packet_characters = (
+        list(canonical_character_packet.get("characters") or [])
+        if isinstance(canonical_character_packet, dict)
+        else []
+    )
+    if not packet_characters:
+        return 0, 0
+
+    inserted_count = 0
+    reused_count = 0
+    valid_scope_keys: set[str] = set()
+    for row in episode_rows:
+        summary_id = int(row.get("summary_id") or 0)
+        episode_no = int(row.get("episode_from") or row.get("episode_no") or 0)
+        normalized_text = str(episode_texts_by_no.get(episode_no) or "").strip()
+        scope_key = str(row.get("scope_key") or "").strip()
+        if not summary_id or episode_no <= 0 or not normalized_text or not scope_key:
+            continue
+        valid_scope_keys.add(scope_key)
+        source_hash = build_episode_scene_extraction_source_hash(row, canonical_character_packet)
+        existing_summary_id = 0
+        replace_existing_summary_id = 0
+        with work_cursor(conn) as cur:
+            existing = fetch_existing_summary(
+                cur=cur,
+                product_id=product_id,
+                summary_type="episode_scene_extraction",
+                scope_key=scope_key,
+                source_hash=source_hash,
+            )
+            if existing:
+                existing_payload = extract_json_object(str(existing.get("summary_text") or "")) or {}
+                if _is_usable_episode_scene_payload(existing_payload):
+                    existing_summary_id = int(existing["summary_id"])
+                    activate_existing_summary(
+                        cur,
+                        existing_summary_id,
+                        product_id,
+                        "episode_scene_extraction",
+                        scope_key,
+                    )
+                else:
+                    replace_existing_summary_id = int(existing["summary_id"])
+        if existing_summary_id:
+            conn.commit()
+            reused_count += 1
+            continue
+
+        try:
+            if verbose:
+                print(
+                    f"[episode-scene-start] product_id={product_id} episode_no={episode_no} "
+                    f"model={EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL}"
+                )
+            payload = await request_episode_scene_extraction_payload(
+                summary_client,
+                product_title=product_title,
+                episode_no=episode_no,
+                episode_title=parse_summary_text(str(row.get("summary_text") or "")).get("header") or "",
+                normalized_text=normalized_text,
+                canonical_character_packet=canonical_character_packet,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"[episode-scene-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
+            with work_cursor(conn) as cur:
+                deactivate_active_scope(
+                    cur,
+                    product_id=product_id,
+                    summary_type="episode_scene_extraction",
+                    scope_key=scope_key,
+                )
+            conn.commit()
+            continue
+
+        if not _is_usable_episode_scene_payload(payload):
+            if verbose:
+                issues = payload.get("validation_issues") if isinstance(payload, dict) else ["payload_not_object"]
+                print(
+                    f"[episode-scene-keep-old] product_id={product_id} episode_no={episode_no} "
+                    f"reason=invalid_scene_payload issues={json.dumps(issues, ensure_ascii=False)[:180]}"
+                )
+            continue
+
+        with work_cursor(conn) as cur:
+            if replace_existing_summary_id:
+                update_existing_summary_payload(
+                    cur,
+                    summary_id=replace_existing_summary_id,
+                    product_id=product_id,
+                    summary_type="episode_scene_extraction",
+                    scope_key=scope_key,
+                    source_doc_count=1,
+                    summary_text=json.dumps(payload, ensure_ascii=False),
+                    episode_from=episode_no,
+                    episode_to=episode_no,
+                )
+                inserted = True
+            else:
+                _, inserted = upsert_summary(
+                    cur,
+                    product_id=product_id,
+                    summary_type="episode_scene_extraction",
+                    scope_key=scope_key,
+                    source_hash=source_hash,
+                    source_doc_count=1,
+                    summary_text=json.dumps(payload, ensure_ascii=False),
+                    episode_from=episode_no,
+                    episode_to=episode_no,
+                )
+        conn.commit()
+        if inserted:
+            inserted_count += 1
+        else:
+            reused_count += 1
+
+    if cleanup_missing_scopes:
+        with work_cursor(conn) as cur:
+            deactivate_missing_active_scopes(cur, product_id, "episode_scene_extraction", valid_scope_keys)
+        conn.commit()
+    return inserted_count, reused_count
+
+
 def upsert_summary(
     cur,
     *,
@@ -4768,17 +6930,19 @@ def upsert_summary(
     summary_text: str,
     episode_from: int | None = None,
     episode_to: int | None = None,
+    reuse_existing: bool = True,
 ) -> tuple[int, bool]:
-    existing = fetch_existing_summary(
-        cur=cur,
-        product_id=product_id,
-        summary_type=summary_type,
-        scope_key=scope_key,
-        source_hash=source_hash,
-    )
-    if existing:
-        activate_existing_summary(cur, int(existing["summary_id"]), product_id, summary_type, scope_key)
-        return int(existing["summary_id"]), False
+    if reuse_existing:
+        existing = fetch_existing_summary(
+            cur=cur,
+            product_id=product_id,
+            summary_type=summary_type,
+            scope_key=scope_key,
+            source_hash=source_hash,
+        )
+        if existing:
+            activate_existing_summary(cur, int(existing["summary_id"]), product_id, summary_type, scope_key)
+            return int(existing["summary_id"]), False
 
     version_no = fetch_next_summary_version_no(cur, product_id, summary_type, scope_key)
     cur.execute(
@@ -5393,7 +7557,19 @@ def _display_label_has_generic_parenthetical_block(normalized: str) -> bool:
     return prefix_generic and inner_generic
 
 
+def _display_label_has_leading_particle_honorific_phrase(label: str) -> bool:
+    match = re.fullmatch(
+        r"(?:은|는|이|가|을|를|도|만)\s+(?P<title>[가-힣A-Za-z0-9 ]{1,12})",
+        str(label or "").strip(),
+    )
+    if not match:
+        return False
+    return _is_honorific_address_term(match.group("title"))
+
+
 def _display_label_has_hard_public_block(label: str) -> bool:
+    if _display_label_has_leading_particle_honorific_phrase(label):
+        return True
     normalized = normalize_signal_entity_label(label)
     if not normalized or normalized in NON_PERSONA_GENERIC_LABELS:
         return True
@@ -6647,6 +8823,8 @@ def _classify_character_inventory_v3_rows(
     else:
         _apply_work_protagonist_resolution(rows, protagonist_resolution)
 
+    _apply_protagonist_identity_groups(rows)
+
     for row in rows:
         is_protagonist = str(row.get("work_role") or "") == "main_protagonist"
         voice_counts = dict(row.get("voice_mode_counts") or {})
@@ -6678,6 +8856,14 @@ def _classify_character_inventory_v3_rows(
         row["display_safety"] = display_safety
         row["public_chat_eligible"] = is_public_chat_inventory_candidate(row)
         row["public_slot_eligible"] = is_public_slot_inventory_candidate(row)
+        row["identity_surface"] = build_inventory_identity_surface(row)
+        row["reveal_boundary"] = build_inventory_reveal_boundary(row)
+        row["read_range_state_snapshot"] = build_inventory_read_range_state_snapshot(row)
+        row["interaction_affordance_v1"] = build_inventory_interaction_affordance_v1(row)
+        row["adjacent_event_seed_v1"] = build_inventory_adjacent_event_seed_v1(row)
+        row["pov_and_protagonist_centrality_v1"] = build_inventory_pov_and_protagonist_centrality_v1(row)
+        row["voice_contract_v1"] = build_inventory_voice_contract_v1(row)
+        row["chat_readiness_v1"] = build_inventory_chat_readiness_v1(row)
 
 
 def build_inventory_display_safety(row: dict[str, object]) -> dict[str, object]:
@@ -6735,6 +8921,442 @@ def is_public_slot_inventory_candidate(row: dict[str, object]) -> bool:
     voice_counts = dict(row.get("voice_mode_counts") or {})
     speaking_episode_count = int(voice_counts.get("dialogue") or 0) + int(voice_counts.get("monologue") or 0)
     return speaking_episode_count >= 2 or int(row.get("relation_episode_count") or 0) >= 2
+
+
+def build_inventory_identity_surface(row: dict[str, object]) -> dict[str, object]:
+    display_name = str(row.get("display_name") or "").strip()
+    display_safety = dict(row.get("display_safety") or build_inventory_display_safety(row))
+    addressable_names: list[str] = []
+    social_call_names = list(row.get("social_call_names") or [])
+    persona_names = list(row.get("persona_names") or [])
+    address_name_candidates = [display_name, *social_call_names, *persona_names]
+    if not social_call_names and not persona_names:
+        address_name_candidates.extend(list(row.get("narration_names") or []))
+    for value in address_name_candidates:
+        if _identity_claim_label_is_blocked(str(value or "")):
+            continue
+        _append_unique_text(addressable_names, str(value or ""), limit=6)
+
+    private_identity_names: list[str] = []
+    for value in list(row.get("real_names") or []):
+        normalized_value = normalize_signal_entity_label(str(value or ""))
+        if not normalized_value:
+            continue
+        if any(normalize_signal_entity_label(name) == normalized_value for name in addressable_names):
+            continue
+        if _identity_claim_label_is_blocked(str(value or "")):
+            continue
+        _append_unique_text(private_identity_names, str(value or ""), limit=6)
+
+    reveal_state = "public"
+    if private_identity_names:
+        reveal_state = "known_to_self"
+    if str(display_safety.get("status") or "") != "pass":
+        reveal_state = "ambiguous"
+    elif str(row.get("identity_status") or "") in {"UNRESOLVED", "CONFLICT"}:
+        reveal_state = "ambiguous"
+
+    confidence = "high" if str(row.get("identity_confidence") or "") == "high" and reveal_state == "public" else "medium"
+    if reveal_state == "ambiguous":
+        confidence = "low"
+
+    return {
+        "chat_display_name": display_name,
+        "addressable_names": addressable_names[:6],
+        "public_role_titles": [
+            name
+            for name in list(row.get("social_call_names") or [])[:4]
+            if name in addressable_names and name != display_name
+        ],
+        "private_identity_names": private_identity_names[:6],
+        "forbidden_until_revealed": private_identity_names[:6],
+        "reveal_state": reveal_state,
+        "reveal_audience": "general_public" if reveal_state == "public" else "self_only" if reveal_state == "known_to_self" else "unknown",
+        "confidence": confidence,
+        "evidence_episode_nos": list(row.get("evidence_episode_nos") or [])[:8],
+    }
+
+
+def build_inventory_reveal_boundary(row: dict[str, object]) -> dict[str, object]:
+    identity_surface = dict(row.get("identity_surface") or build_inventory_identity_surface(row))
+    return {
+        "allowed_address_names": list(identity_surface.get("addressable_names") or [])[:6],
+        "must_not_address_as": list(identity_surface.get("forbidden_until_revealed") or [])[:6],
+        "reveal_state": str(identity_surface.get("reveal_state") or "ambiguous"),
+        "identity_spoiler_risk": "high"
+        if list(identity_surface.get("forbidden_until_revealed") or [])
+        else "medium"
+        if str(identity_surface.get("reveal_state") or "") == "ambiguous"
+        else "low",
+    }
+
+
+def build_inventory_read_range_state_snapshot(row: dict[str, object]) -> dict[str, object]:
+    identity_surface = dict(row.get("identity_surface") or build_inventory_identity_surface(row))
+    reveal_boundary = dict(row.get("reveal_boundary") or build_inventory_reveal_boundary(row))
+    voice_counts = dict(row.get("voice_mode_counts") or {})
+    scene_counts = dict(row.get("scene_weight_counts") or {})
+    role_counts = dict(row.get("episode_role_counts") or {})
+    evidence_episode_nos = [
+        int(value)
+        for value in list(row.get("evidence_episode_nos") or [])
+        if int(value or 0) > 0
+    ]
+    public_role_titles = list(identity_surface.get("public_role_titles") or [])
+    private_identity_names = list(identity_surface.get("private_identity_names") or [])
+    social_call_names = list(row.get("social_call_names") or [])
+    persona_names = list(row.get("persona_names") or [])
+    identity_variant = "normal"
+    if private_identity_names and (social_call_names or persona_names):
+        identity_variant = "alternate_public_identity"
+    elif private_identity_names:
+        identity_variant = "hidden_true_name"
+    elif str(row.get("entity_kind") or "").strip().lower() == "stable_role":
+        identity_variant = "role_identity"
+
+    return {
+        "schema_version": "read_range_state_snapshot_v1",
+        "stage": "inventory_signal",
+        "as_of_episode_no": int(row.get("latest_seen_episode_no") or 0),
+        "valid_episode_range": {
+            "from": int(row.get("first_seen_episode_no") or 0),
+            "to": int(row.get("latest_seen_episode_no") or 0),
+        },
+        "current_identity": {
+            "display_name": str(identity_surface.get("chat_display_name") or row.get("display_name") or ""),
+            "social_name": str((social_call_names or persona_names or [None])[0] or "") or None,
+            "private_true_name": str((private_identity_names or [None])[0] or "") or None,
+            "title_or_role_name": str((public_role_titles or [None])[0] or "") or None,
+            "identity_variant": identity_variant,
+            "reveal_state": str(reveal_boundary.get("reveal_state") or "ambiguous"),
+        },
+        "current_status": {
+            "work_role": str(row.get("work_role") or ""),
+            "entity_kind": str(row.get("entity_kind") or ""),
+            "role_confidence": str(row.get("role_confidence") or ""),
+            "dominant_action_tags": list(row.get("dominant_action_tags") or [])[:5],
+            "dominant_affect_tags": list(row.get("dominant_affect_tags") or [])[:5],
+        },
+        "evidence_counts": {
+            "distinct_episode_count": int(row.get("distinct_episode_count") or 0),
+            "lead_episode_count": int(role_counts.get("lead") or 0),
+            "high_scene_episode_count": int(scene_counts.get("high") or 0),
+            "dialogue_episode_count": int(voice_counts.get("dialogue") or 0),
+            "monologue_episode_count": int(voice_counts.get("monologue") or 0),
+            "relation_episode_count": int(row.get("relation_episode_count") or 0),
+        },
+        "evidence_episode_nos": evidence_episode_nos[:8],
+        "forbidden_identity_terms": list(reveal_boundary.get("must_not_address_as") or [])[:6],
+    }
+
+
+def _inventory_action_tags(row: dict[str, object]) -> list[str]:
+    return [str(value).strip() for value in list(row.get("dominant_action_tags") or []) if str(value).strip()]
+
+
+def _inventory_has_action_tag_family(row: dict[str, object], keywords: set[str]) -> bool:
+    return any(keyword in tag for tag in _inventory_action_tags(row) for keyword in keywords)
+
+
+def _inventory_action_tag_family_count(row: dict[str, object], keywords: set[str]) -> int:
+    return sum(
+        1
+        for tag in _inventory_action_tags(row)
+        if any(keyword in tag for keyword in keywords)
+    )
+
+
+def _inventory_primary_interaction_role(row: dict[str, object]) -> tuple[str, str]:
+    relation_count = int(row.get("relation_episode_count") or 0)
+    investigation_count = _inventory_action_tag_family_count(row, {"조사", "수사", "추적", "탐색", "단서", "정보", "열람", "잠입", "추리", "진단", "치료", "정체"})
+    combat_count = _inventory_action_tag_family_count(row, {"전투", "훈련", "수련", "생존", "방어", "공격", "제압", "처형", "검기", "테이밍", "소환", "각성"})
+    if investigation_count > 0 and investigation_count >= combat_count:
+        return "scene_clue_holder", "장면에 단서를 들고 엮인 임시 조력자"
+    if combat_count > 0:
+        return "field_support", "현장 보조자"
+    if relation_count >= 2:
+        return "temporary_ally", "낮은 신뢰의 임시 동행자"
+    return "temporary_helper_at_scene", "장면에 약하게 엮인 임시 조력자"
+
+
+def build_inventory_interaction_affordance_v1(row: dict[str, object]) -> dict[str, object]:
+    role_key, role_label = _inventory_primary_interaction_role(row)
+    reveal_boundary = dict(row.get("reveal_boundary") or build_inventory_reveal_boundary(row))
+    return {
+        "schema_version": "interaction_affordance_v1",
+        "stage": "inventory_signal",
+        "preferred_user_role_key": role_key,
+        "user_role_options": [
+            {
+                "role_key": role_key,
+                "role_label_ko": role_label,
+                "entry_reason": "읽은 범위 안의 현재 사건에 약하게 엮여 있고, 주인공의 다음 판단에 작은 도움을 줄 수 있다.",
+                "why_protagonist_does_not_immediately_remove_user": "유저가 장면 압력, 단서, 선택지 중 하나와 연결되어 있어 즉시 배제하기보다 짧게 활용하는 편이 자연스럽다.",
+                "default_trust": "situational",
+                "suspicion_ceiling": "light",
+                "user_task": "주인공의 현재 행동을 보조할 단서 확인, 선택지 제시, 짧은 응답 중 하나를 맡는다.",
+                "user_success_condition": "주인공이 다음 행동을 정할 만큼 장면 정보나 압력이 한 단계 전진한다.",
+                "user_failure_risk": "응답이 짧거나 거절해도 심문 루프 대신 작은 방해, 단서, 시간 압박으로 장면을 전진시킨다.",
+                "address_rule_from_pc_to_user": "원작 네임드나 후반 관계로 확정하지 말고 장면 속 약한 관계로만 대한다.",
+                "user_must_not_know": list(reveal_boundary.get("must_not_address_as") or [])[:6],
+            }
+        ],
+        "prohibited_user_roles": [
+            "원작 기존 네임드",
+            "작가",
+            "독자",
+            "시스템",
+            "미래를 다 아는 존재",
+            "주인공의 확정된 연인/가족/절친",
+        ],
+    }
+
+
+def build_inventory_adjacent_event_seed_v1(row: dict[str, object]) -> dict[str, object]:
+    action_tags = _inventory_action_tags(row)
+    affect_tags = [str(value).strip() for value in list(row.get("dominant_affect_tags") or []) if str(value).strip()]
+    investigation_count = _inventory_action_tag_family_count(row, {"조사", "수사", "추적", "탐색", "단서", "정보", "열람", "잠입", "추리", "진단", "치료", "정체"})
+    combat_count = _inventory_action_tag_family_count(row, {"전투", "방어", "공격", "생존", "제압", "처형", "검기"})
+    trial_count = _inventory_action_tag_family_count(row, {"훈련", "수련", "테이밍", "소환", "각성", "시험", "오디션", "공연"})
+    if investigation_count > 0 and investigation_count >= combat_count and investigation_count >= trial_count:
+        conflict_vector = "hidden_clue"
+    elif combat_count > 0 and combat_count >= trial_count:
+        conflict_vector = "minor_attack"
+    elif trial_count > 0:
+        conflict_vector = "test_or_trial"
+    else:
+        conflict_vector = "unexpected_visitor"
+    role_key, role_label = _inventory_primary_interaction_role(row)
+    return {
+        "schema_version": "adjacent_event_seed_v1",
+        "stage": "inventory_signal",
+        "anchor_episode_range": {
+            "from": int(row.get("first_seen_episode_no") or 0),
+            "to": int(row.get("latest_seen_episode_no") or 0),
+        },
+        "grounded_situation": "읽은 범위 안에서 확인된 주인공의 행동/관계/압력만 앵커로 쓴다.",
+        "new_incident_is_adjacent_not_canon": True,
+        "conflict_vector": conflict_vector,
+        "allowed_intensity": "action" if conflict_vector in {"minor_attack", "test_or_trial"} else "investigation" if conflict_vector == "hidden_clue" else "emotional" if affect_tags else "banter",
+        "user_entry_point": role_label,
+        "protagonist_first_move": "주인공이 현재 압력이나 단서를 먼저 짚고, 유저에게 짧은 선택 또는 협력 hook을 건다.",
+        "canon_noninterference_rule": "원작 핵심 사건/결말/폭로를 재현하거나 바꾸지 말고, 같은 세계관에서 생긴 작은 곁가지 사건만 진행한다.",
+        "forbidden_canon_outcomes": ["원작 결말 확정", "후반 정체 폭로", "주요 관계 급진전", "원작 대사 복붙"],
+        "source_tags": action_tags[:5],
+    }
+
+
+def build_inventory_pov_and_protagonist_centrality_v1(row: dict[str, object]) -> dict[str, object]:
+    work_role = str(row.get("work_role") or "").strip()
+    first_seen_episode_no = int(row.get("first_seen_episode_no") or 0)
+    latest_seen_episode_no = int(row.get("latest_seen_episode_no") or 0)
+    focal_count = int(dict(row.get("episode_focal_evidence") or {}).get("episode_count") or 0)
+    work_protagonist_count = int(dict(row.get("work_protagonist_evidence") or {}).get("episode_count") or 0)
+    first_person_count = int(dict(row.get("first_person_evidence") or {}).get("episode_count") or 0)
+
+    if work_role == "main_protagonist":
+        if first_seen_episode_no <= 0:
+            protagonist_presence = "unknown"
+        elif first_seen_episode_no <= 1:
+            protagonist_presence = "active_from_start"
+        elif first_seen_episode_no <= 3:
+            protagonist_presence = "late_entry_after_prologue"
+        else:
+            protagonist_presence = "late_entry"
+    elif work_role == "major_character":
+        protagonist_presence = "major_non_protagonist"
+    else:
+        protagonist_presence = "not_protagonist"
+
+    hold_before_episode_no = (
+        first_seen_episode_no
+        if work_role == "main_protagonist" and first_seen_episode_no > 1
+        else None
+    )
+    expose_policy = "allow"
+    if work_role != "main_protagonist":
+        expose_policy = "reject_for_main_protagonist_chat"
+    elif hold_before_episode_no:
+        expose_policy = "hold_until_presence_episode"
+
+    return {
+        "schema_version": "pov_and_protagonist_centrality_v1",
+        "stage": "inventory_signal",
+        "protagonist_presence": protagonist_presence,
+        "first_seen_episode_no": first_seen_episode_no,
+        "latest_seen_episode_no": latest_seen_episode_no,
+        "hold_before_episode_no": hold_before_episode_no,
+        "expose_policy": expose_policy,
+        "active_pov_owner_character_key": str(row.get("canonical_character_key") or "") if first_person_count > 0 else None,
+        "true_main_protagonist_character_key": str(row.get("canonical_character_key") or "") if work_role == "main_protagonist" else None,
+        "evidence_counts": {
+            "episode_focal_count": focal_count,
+            "work_protagonist_hint_count": work_protagonist_count,
+            "first_person_count": first_person_count,
+            "distinct_episode_count": int(row.get("distinct_episode_count") or 0),
+        },
+    }
+
+
+def build_inventory_voice_contract_v1(row: dict[str, object]) -> dict[str, object]:
+    voice_counts = dict(row.get("voice_mode_counts") or {})
+    identity_surface = dict(row.get("identity_surface") or build_inventory_identity_surface(row))
+    reveal_boundary = dict(row.get("reveal_boundary") or build_inventory_reveal_boundary(row))
+    address_terms: list[str] = []
+    for value in [
+        *list(identity_surface.get("addressable_names") or []),
+        *list(identity_surface.get("public_role_titles") or []),
+        *list(row.get("social_call_names") or []),
+        *list(row.get("persona_names") or []),
+    ]:
+        _append_unique_text(address_terms, str(value or ""), limit=8)
+
+    speaking_episode_count = int(voice_counts.get("dialogue") or 0) + int(voice_counts.get("monologue") or 0)
+    speech_register = "unknown_inventory_signal"
+    if address_terms and any(_is_honorific_address_term(term) for term in address_terms):
+        speech_register = "honorific_surface_present"
+    elif speaking_episode_count >= 2:
+        speech_register = "dialogue_evidence_present"
+
+    forbidden_address_terms: list[str] = []
+    for value in [
+        *list(reveal_boundary.get("must_not_address_as") or []),
+        *list(identity_surface.get("private_identity_names") or []),
+        *list(identity_surface.get("forbidden_until_revealed") or []),
+    ]:
+        _append_unique_text(forbidden_address_terms, str(value or ""), limit=8)
+
+    return {
+        "schema_version": "voice_contract_v1",
+        "stage": "inventory_signal",
+        "speech_register": speech_register,
+        "address_terms": address_terms[:8],
+        "addressing_contract_v1": build_addressing_contract_v1(
+            address_terms=address_terms,
+            forbidden_address_terms=forbidden_address_terms,
+            speech_register=speech_register,
+        ),
+        "evidence_counts": {
+            "dialogue_episode_count": int(voice_counts.get("dialogue") or 0),
+            "monologue_episode_count": int(voice_counts.get("monologue") or 0),
+            "speaking_episode_count": speaking_episode_count,
+        },
+        "must_preserve": [
+            "한국어 존반말/호칭 거리감",
+            "원문 대사 근거가 있는 말투",
+            "관계에 따른 호칭 변화",
+        ],
+        "forbidden_speech_patterns": [
+            "무엇을 도와드릴까요",
+            "안녕하세요",
+            "제가 도와드릴게요",
+            "작품에 대해 설명하자면",
+        ],
+    }
+
+
+def build_inventory_chat_readiness_v1(row: dict[str, object]) -> dict[str, object]:
+    voice_counts = dict(row.get("voice_mode_counts") or {})
+    scene_counts = dict(row.get("scene_weight_counts") or {})
+    role_counts = dict(row.get("episode_role_counts") or {})
+    display_safety = dict(row.get("display_safety") or build_inventory_display_safety(row))
+    identity_surface = dict(row.get("identity_surface") or build_inventory_identity_surface(row))
+    reveal_boundary = dict(row.get("reveal_boundary") or build_inventory_reveal_boundary(row))
+    read_range_state = dict(row.get("read_range_state_snapshot") or build_inventory_read_range_state_snapshot(row))
+    interaction_affordance = dict(row.get("interaction_affordance_v1") or build_inventory_interaction_affordance_v1(row))
+    adjacent_event_seed = dict(row.get("adjacent_event_seed_v1") or build_inventory_adjacent_event_seed_v1(row))
+    pov_centrality = dict(row.get("pov_and_protagonist_centrality_v1") or build_inventory_pov_and_protagonist_centrality_v1(row))
+    voice_contract = dict(row.get("voice_contract_v1") or build_inventory_voice_contract_v1(row))
+
+    speaking_episode_count = int(voice_counts.get("dialogue") or 0) + int(voice_counts.get("monologue") or 0)
+    distinct_episode_count = int(row.get("distinct_episode_count") or 0)
+    scope_key = str(row.get("canonical_character_key") or "").strip()
+    work_role = str(row.get("work_role") or "").strip()
+    reveal_state = str(reveal_boundary.get("reveal_state") or "").strip()
+
+    required_passes = {
+        "has_valid_scope_key": bool(scope_key),
+        "has_character_work_match": work_role in {"main_protagonist", "major_character"},
+        "has_public_display_safety": str(display_safety.get("status") or "") == "pass",
+        "has_voice_evidence": speaking_episode_count >= 1,
+        "has_strict_voice_evidence": speaking_episode_count >= 2,
+        "has_read_range_state": distinct_episode_count >= 2,
+        "has_identity_surface": bool(identity_surface.get("chat_display_name")) and bool(list(identity_surface.get("addressable_names") or [])),
+        "has_reveal_boundary": reveal_state in {"public", "known_to_self"},
+        "has_read_range_state_snapshot": bool(read_range_state.get("as_of_episode_no")),
+        "has_interaction_affordance": bool(interaction_affordance.get("preferred_user_role_key")),
+        "has_adjacent_event_seed": bool(adjacent_event_seed.get("new_incident_is_adjacent_not_canon")),
+        "has_pov_centrality": str(pov_centrality.get("protagonist_presence") or "") not in {"", "unknown", "not_protagonist"},
+        "has_voice_contract": bool(voice_contract.get("speech_register")) and speaking_episode_count >= 1,
+    }
+
+    block_reasons: list[str] = []
+    if not required_passes["has_valid_scope_key"]:
+        block_reasons.append("scope_key_invalid")
+    if not required_passes["has_character_work_match"]:
+        block_reasons.append("not_major_character")
+    if not required_passes["has_public_display_safety"]:
+        block_reasons.append("display_safety_not_pass")
+    if not required_passes["has_voice_evidence"]:
+        block_reasons.append("insufficient_voice_evidence")
+    if not required_passes["has_read_range_state"]:
+        block_reasons.append("read_range_too_thin")
+    if not required_passes["has_identity_surface"]:
+        block_reasons.append("identity_surface_missing")
+    if not required_passes["has_reveal_boundary"]:
+        block_reasons.append("identity_unstable_without_boundary")
+    if not required_passes["has_interaction_affordance"]:
+        block_reasons.append("no_safe_user_role")
+    if not required_passes["has_adjacent_event_seed"]:
+        block_reasons.append("no_adjacent_event_seed")
+    if not required_passes["has_pov_centrality"]:
+        block_reasons.append("pov_owner_unclear")
+    if not required_passes["has_voice_contract"]:
+        block_reasons.append("voice_contract_missing")
+    if not bool(row.get("public_chat_eligible")) and not block_reasons:
+        block_reasons.append("public_chat_gate_failed")
+
+    hard_reject_reasons = {
+        "scope_key_invalid",
+        "display_safety_not_pass",
+        "identity_surface_missing",
+        "identity_unstable_without_boundary",
+        "not_major_character",
+    }
+    exposure_decision = (
+        "eligible"
+        if bool(row.get("public_chat_eligible"))
+        else "reject"
+        if any(reason in hard_reject_reasons for reason in block_reasons)
+        else "hold"
+    )
+
+    confidence = 0.0
+    if exposure_decision == "eligible":
+        confidence = 0.9 if bool(row.get("public_slot_eligible")) else 0.75
+    elif exposure_decision == "hold":
+        confidence = 0.45
+
+    return {
+        "schema_version": "chat_readiness_v1",
+        "stage": "inventory_signal",
+        "exposure_decision": exposure_decision,
+        "public_slot_allowed": bool(row.get("public_slot_eligible")),
+        "character_chat_allowed": bool(row.get("public_chat_eligible")),
+        "confidence": confidence,
+        "block_reasons": block_reasons,
+        "evidence_counts": {
+            "direct_dialogue_episodes": int(voice_counts.get("dialogue") or 0),
+            "monologue_episodes": int(voice_counts.get("monologue") or 0),
+            "speaking_episode_count": speaking_episode_count,
+            "lead_episode_count": int(role_counts.get("lead") or 0),
+            "high_scene_episode_count": int(scene_counts.get("high") or 0),
+            "scene_anchor_episode_count": distinct_episode_count,
+            "identity_surface_evidence_count": len(list(row.get("evidence_episode_nos") or [])),
+            "relationship_evidence_count": int(row.get("relation_episode_count") or 0),
+        },
+        "required_passes": required_passes,
+    }
 
 
 def _work_protagonist_resolution_candidate_is_selectable(row: dict[str, object]) -> bool:
@@ -7397,6 +10019,121 @@ def _apply_work_protagonist_resolution(
     return resolution
 
 
+def _row_episode_count(row: dict[str, object], field_name: str) -> int:
+    return int(dict(row.get(field_name) or {}).get("episode_count") or 0)
+
+
+def _is_previous_protagonist_identity_candidate(
+    row: dict[str, object],
+    *,
+    main_row: dict[str, object],
+) -> bool:
+    if row is main_row:
+        return False
+    if str(row.get("work_role") or "") == "main_protagonist":
+        return False
+    if str(row.get("entity_kind") or "person").strip().lower() not in {"person", "stable_role"}:
+        return False
+    if _inventory_identity_blocking_conflict_reasons(row):
+        return False
+    if str(build_inventory_display_safety(row).get("status") or "") != "pass":
+        return False
+
+    first_person_count = _row_episode_count(row, "first_person_evidence")
+    work_protagonist_count = _row_episode_count(row, "work_protagonist_evidence")
+    focal_count = _row_episode_count(row, "episode_focal_evidence")
+    if first_person_count <= 0 or work_protagonist_count <= 0 or focal_count <= 0:
+        return False
+
+    source_keys = [str(key or "").strip() for key in list(row.get("source_character_keys") or [])]
+    if not any(_is_generic_protagonist_source_key(source_key) for source_key in source_keys):
+        return False
+
+    candidate_first = int(row.get("first_seen_episode_no") or 0)
+    candidate_latest = int(row.get("latest_seen_episode_no") or 0)
+    main_first = int(main_row.get("first_seen_episode_no") or 0)
+    if candidate_first <= 0 or candidate_latest <= 0 or main_first <= 0:
+        return False
+    if candidate_first > main_first:
+        return False
+    if candidate_latest > main_first + 1:
+        return False
+    return True
+
+
+def _identity_group_member_item(
+    row: dict[str, object],
+    *,
+    role: str,
+    link_type: str,
+) -> dict[str, object]:
+    return {
+        "scope_key": str(row.get("canonical_character_key") or ""),
+        "display_name": str(row.get("display_name") or ""),
+        "role": role,
+        "link_type": link_type,
+        "evidence_episode_nos": list(row.get("evidence_episode_nos") or [])[:12],
+    }
+
+
+def _apply_protagonist_identity_groups(rows: list[dict[str, object]]) -> None:
+    main_rows = [row for row in rows if str(row.get("work_role") or "") == "main_protagonist"]
+    if len(main_rows) != 1:
+        return
+    main_row = main_rows[0]
+    main_key = str(main_row.get("canonical_character_key") or "")
+    if not main_key:
+        return
+
+    linked_rows = [
+        row
+        for row in rows
+        if _is_previous_protagonist_identity_candidate(row, main_row=main_row)
+    ]
+    if not linked_rows:
+        return
+    linked_rows = sorted(
+        linked_rows,
+        key=lambda row: (
+            -_row_episode_count(row, "first_person_evidence"),
+            -_row_episode_count(row, "work_protagonist_evidence"),
+            int(row.get("first_seen_episode_no") or 0),
+            str(row.get("display_name") or ""),
+        ),
+    )[:3]
+
+    identity_scope_keys = [main_key] + [
+        str(row.get("canonical_character_key") or "")
+        for row in linked_rows
+        if str(row.get("canonical_character_key") or "")
+    ]
+    members = [
+        _identity_group_member_item(
+            main_row,
+            role="current_protagonist",
+            link_type="primary",
+        ),
+        *[
+            _identity_group_member_item(
+                row,
+                role="previous_protagonist_identity",
+                link_type="first_person_reincarnation_identity",
+            )
+            for row in linked_rows
+        ],
+    ]
+    for row in [main_row, *linked_rows]:
+        row["identity_group_key"] = main_key
+        row["protagonist_identity_scope_keys"] = identity_scope_keys
+        row["identity_group_members"] = members
+        row["is_protagonist_identity_member"] = True
+    main_row["identity_group_role"] = "current_protagonist"
+    for row in linked_rows:
+        row["identity_group_role"] = "previous_protagonist_identity"
+        row["identity_linked_to_scope_key"] = main_key
+        row["identity_link_type"] = "first_person_reincarnation_identity"
+
+
 async def build_work_protagonist_resolution_for_inventory_v3(
     *,
     product_id: int,
@@ -7692,39 +10429,68 @@ def aggregate_character_inventory_v3_rows(
     )
 
 
+def build_character_inventory_v3_hash_payload(item: dict[str, object]) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "display_name": str(item.get("display_name") or ""),
+        "display_name_source": str(item.get("display_name_source") or ""),
+        "aliases": list(item.get("aliases") or []),
+        "narration_names": list(item.get("narration_names") or []),
+        "social_call_names": list(item.get("social_call_names") or []),
+        "persona_names": list(item.get("persona_names") or []),
+        "real_names": list(item.get("real_names") or []),
+        "source_character_keys": list(item.get("source_character_keys") or []),
+        "source_observation_refs": list(item.get("source_observation_refs") or []),
+        "identity_status": str(item.get("identity_status") or ""),
+        "identity_conflict_reasons": list(item.get("identity_conflict_reasons") or []),
+        "entity_kind": str(item.get("entity_kind") or ""),
+        "work_role": str(item.get("work_role") or ""),
+        "role_confidence": str(item.get("role_confidence") or ""),
+        "classification_status": str(item.get("classification_status") or ""),
+        "review_reasons": list(item.get("review_reasons") or []),
+        "is_protagonist": bool(item.get("is_protagonist")),
+        "protagonist_confidence": str(item.get("protagonist_confidence") or ""),
+        "protagonist_evidence": dict(item.get("protagonist_evidence") or {}),
+        "work_protagonist_resolution": dict(item.get("work_protagonist_resolution") or {}),
+        "rp_signal_quality": dict(item.get("rp_signal_quality") or {}),
+        "display_safety": dict(item.get("display_safety") or {}),
+        "public_chat_eligible": item.get("public_chat_eligible"),
+        "public_slot_eligible": item.get("public_slot_eligible"),
+        "identity_surface": dict(item.get("identity_surface") or {}),
+        "reveal_boundary": dict(item.get("reveal_boundary") or {}),
+        "read_range_state_snapshot": dict(item.get("read_range_state_snapshot") or {}),
+        "interaction_affordance_v1": dict(item.get("interaction_affordance_v1") or {}),
+        "adjacent_event_seed_v1": dict(item.get("adjacent_event_seed_v1") or {}),
+        "pov_and_protagonist_centrality_v1": dict(item.get("pov_and_protagonist_centrality_v1") or {}),
+        "voice_contract_v1": dict(item.get("voice_contract_v1") or {}),
+        "chat_readiness_v1": dict(item.get("chat_readiness_v1") or {}),
+        "evidence_episode_nos": list(item.get("evidence_episode_nos") or []),
+    }
+    optional_identity_fields = {
+        "identity_group_key": str(item.get("identity_group_key") or ""),
+        "identity_group_role": str(item.get("identity_group_role") or ""),
+        "identity_linked_to_scope_key": str(item.get("identity_linked_to_scope_key") or ""),
+        "identity_link_type": str(item.get("identity_link_type") or ""),
+        "protagonist_identity_scope_keys": list(item.get("protagonist_identity_scope_keys") or []),
+        "identity_group_members": list(item.get("identity_group_members") or []),
+        "is_protagonist_identity_member": bool(item.get("is_protagonist_identity_member")),
+    }
+    payload.update(
+        {
+            key: value
+            for key, value in optional_identity_fields.items()
+            if value not in ("", [], False)
+        }
+    )
+    return payload
+
+
 def build_character_inventory_v3_source_hash(item: dict[str, object]) -> str:
     return build_compound_summary_source_hash(
         CHARACTER_INVENTORY_V3_FORMAT_VERSION,
         [
             str(item.get("canonical_character_key") or ""),
             json.dumps(
-                {
-                    "display_name": str(item.get("display_name") or ""),
-                    "display_name_source": str(item.get("display_name_source") or ""),
-                    "aliases": list(item.get("aliases") or []),
-                    "narration_names": list(item.get("narration_names") or []),
-                    "social_call_names": list(item.get("social_call_names") or []),
-                    "persona_names": list(item.get("persona_names") or []),
-                    "real_names": list(item.get("real_names") or []),
-                    "source_character_keys": list(item.get("source_character_keys") or []),
-                    "source_observation_refs": list(item.get("source_observation_refs") or []),
-                    "identity_status": str(item.get("identity_status") or ""),
-                    "identity_conflict_reasons": list(item.get("identity_conflict_reasons") or []),
-                    "entity_kind": str(item.get("entity_kind") or ""),
-                    "work_role": str(item.get("work_role") or ""),
-                    "role_confidence": str(item.get("role_confidence") or ""),
-                    "classification_status": str(item.get("classification_status") or ""),
-                    "review_reasons": list(item.get("review_reasons") or []),
-                    "is_protagonist": bool(item.get("is_protagonist")),
-                    "protagonist_confidence": str(item.get("protagonist_confidence") or ""),
-                    "protagonist_evidence": dict(item.get("protagonist_evidence") or {}),
-                    "work_protagonist_resolution": dict(item.get("work_protagonist_resolution") or {}),
-                    "rp_signal_quality": dict(item.get("rp_signal_quality") or {}),
-                    "display_safety": dict(item.get("display_safety") or {}),
-                    "public_chat_eligible": item.get("public_chat_eligible"),
-                    "public_slot_eligible": item.get("public_slot_eligible"),
-                    "evidence_episode_nos": list(item.get("evidence_episode_nos") or []),
-                },
+                build_character_inventory_v3_hash_payload(item),
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -8987,6 +11753,430 @@ def build_rp_relation_context_lines(
     return lines
 
 
+def build_character_chat_scene_context_lines_by_scope(
+    scene_rows: list[dict[str, object]],
+    *,
+    limit_per_scope: int = 8,
+) -> dict[str, list[str]]:
+    lines_by_scope: dict[str, list[str]] = {}
+    for row in scene_rows:
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        if not isinstance(payload, dict):
+            continue
+        episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
+        for scene in list(payload.get("scenes") or []):
+            if not isinstance(scene, dict):
+                continue
+            scope_keys = {
+                str(item.get("scope_key") or "").strip()
+                for item in list(scene.get("participants") or [])
+                if isinstance(item, dict) and str(item.get("scope_key") or "").strip()
+            }
+            participant_names_by_scope: dict[str, set[str]] = {}
+            for item in list(scene.get("participants") or []):
+                if not isinstance(item, dict):
+                    continue
+                participant_scope_key = str(item.get("scope_key") or "").strip()
+                if not participant_scope_key:
+                    continue
+                names = participant_names_by_scope.setdefault(participant_scope_key, set())
+                for key in ("mention_label", "display_name"):
+                    name_value = normalize_rp_text(str(item.get(key) or ""), limit=40)
+                    if name_value:
+                        names.add(name_value)
+            scope_keys.update(
+                str(item.get("actor_scope_key") or "").strip()
+                for item in list(scene.get("action_ownership") or [])
+                if isinstance(item, dict) and str(item.get("actor_scope_key") or "").strip()
+            )
+            if not scope_keys:
+                continue
+
+            parts = []
+            scene_gist = normalize_rp_text(str(scene.get("scene_gist") or ""), limit=90)
+            current_action = normalize_rp_text(str(scene.get("current_action") or ""), limit=80)
+            immediate_pressure = normalize_rp_text(str(scene.get("immediate_pressure") or ""), limit=80)
+            character_initiative_reason = normalize_rp_text(
+                str(scene.get("character_initiative_reason") or ""),
+                limit=80,
+            )
+            user_entry_role = normalize_rp_text(str(scene.get("user_entry_role") or ""), limit=50)
+            user_hook = normalize_rp_text(str(scene.get("user_hook") or ""), limit=80)
+            user_can_do = _normalize_episode_scene_text_list(scene.get("user_can_do"), limit=60, max_items=2)
+            opening_grounding = _normalize_episode_scene_opening_grounding(scene.get("opening_grounding"))
+            scene_identity_boundary = _normalize_episode_scene_identity_boundary(
+                scene.get("scene_identity_boundary")
+            )
+            pressure_clock = normalize_rp_text(str(scene.get("pressure_clock") or ""), limit=80)
+            conversation_fuel_tags = _normalize_episode_scene_text_list(
+                scene.get("conversation_fuel_tags"),
+                limit=30,
+                max_items=3,
+            )
+            beat_ladder = _normalize_episode_scene_text_list(scene.get("beat_ladder"), limit=70, max_items=2)
+            turn_continuation_contract = _normalize_episode_scene_turn_contract(
+                scene.get("turn_continuation_contract")
+            )
+            knowledge_boundary = _normalize_episode_scene_knowledge_boundary(scene.get("knowledge_boundary"))
+            progression_seed = normalize_rp_text(str(scene.get("progression_seed") or ""), limit=80)
+            if scene_gist:
+                parts.append(f"장면={scene_gist}")
+            if current_action:
+                parts.append(f"행동={current_action}")
+            if immediate_pressure:
+                parts.append(f"압력={immediate_pressure}")
+            if character_initiative_reason:
+                parts.append(f"선제이유={character_initiative_reason}")
+            if user_entry_role:
+                parts.append(f"유저역할={user_entry_role}")
+            if user_hook:
+                parts.append(f"hook={user_hook}")
+            if user_can_do:
+                parts.append(f"선택={'; '.join(user_can_do)}")
+            place_anchor = str(opening_grounding.get("place_anchor") or "")
+            sensory_anchors = list(opening_grounding.get("sensory_anchors") or [])
+            prop_anchors = list(opening_grounding.get("prop_anchors") or [])
+            spatial_constraints = list(opening_grounding.get("spatial_constraints") or [])
+            character_visible_motion = str(opening_grounding.get("character_visible_motion") or "")
+            forbidden_opening_inventions = list(opening_grounding.get("forbidden_opening_inventions") or [])
+            if place_anchor:
+                parts.append(f"장소={place_anchor}")
+            if sensory_anchors:
+                parts.append(f"감각={'; '.join(sensory_anchors[:2])}")
+            if prop_anchors:
+                parts.append(f"소품={'; '.join(prop_anchors[:2])}")
+            if spatial_constraints:
+                parts.append(f"공간={'; '.join(spatial_constraints[:2])}")
+            if character_visible_motion:
+                parts.append(f"가시행동={character_visible_motion}")
+            if forbidden_opening_inventions:
+                parts.append(f"금지장식={'; '.join(forbidden_opening_inventions[:2])}")
+            allowed_address_names = list(scene_identity_boundary.get("allowed_address_names") or [])
+            must_not_address_as = list(scene_identity_boundary.get("must_not_address_as") or [])
+            surface_role_for_user = str(scene_identity_boundary.get("surface_role_for_user") or "")
+            identity_spoiler_risk = str(scene_identity_boundary.get("identity_spoiler_risk") or "")
+            if pressure_clock:
+                parts.append(f"시계={pressure_clock}")
+            if conversation_fuel_tags:
+                parts.append(f"연료={', '.join(conversation_fuel_tags)}")
+            if beat_ladder:
+                parts.append(f"beat={'; '.join(beat_ladder)}")
+            state_variables = list(turn_continuation_contract.get("state_variables") or [])
+            response_branches = dict(turn_continuation_contract.get("user_response_branches") or {})
+            stall_breaker = str(turn_continuation_contract.get("stall_breaker") or "")
+            scene_exit_condition = str(turn_continuation_contract.get("scene_exit_condition") or "")
+            canon_safe_new_event_types = list(turn_continuation_contract.get("canon_safe_new_event_types") or [])
+            if state_variables:
+                parts.append(f"상태변수={'; '.join(state_variables[:2])}")
+            branch_parts = [
+                str(response_branches.get(key) or "")
+                for key in ("short_or_ambiguous", "refuses_or_delays", "asks_question")
+                if str(response_branches.get(key) or "")
+            ][:2]
+            if branch_parts:
+                parts.append(f"분기={'; '.join(branch_parts)}")
+            if stall_breaker:
+                parts.append(f"정체해소={stall_breaker}")
+            if scene_exit_condition:
+                parts.append(f"퇴장조건={scene_exit_condition}")
+            if canon_safe_new_event_types:
+                parts.append(f"새사건유형={'; '.join(canon_safe_new_event_types[:2])}")
+            must_not_reveal = list(knowledge_boundary.get("must_not_reveal") or [])
+            can_hint = list(knowledge_boundary.get("can_hint") or [])
+            if can_hint:
+                parts.append(f"암시={'; '.join(can_hint[:2])}")
+            if must_not_reveal:
+                parts.append(f"금지공개={'; '.join(must_not_reveal[:2])}")
+            if progression_seed:
+                parts.append(f"진행={progression_seed}")
+            if not parts:
+                continue
+            prefix = f"- {episode_no}화"
+            scene_index = int(scene.get("scene_index") or 0)
+            if scene_index > 0:
+                prefix += f" 장면{scene_index}"
+            for scope_key in sorted(scope_keys):
+                scoped_parts = list(parts)
+                participant_names = participant_names_by_scope.get(scope_key) or set()
+                scoped_allowed_address_names = [
+                    name
+                    for name in allowed_address_names
+                    if not participant_names or name in participant_names
+                ]
+                if scoped_allowed_address_names:
+                    scoped_parts.append(f"허용호칭={'; '.join(scoped_allowed_address_names[:2])}")
+                if must_not_address_as:
+                    scoped_parts.append(f"금지호칭={'; '.join(must_not_address_as[:2])}")
+                if surface_role_for_user:
+                    scoped_parts.append(f"표면역할={surface_role_for_user}")
+                if identity_spoiler_risk and identity_spoiler_risk != "unknown":
+                    scoped_parts.append(f"정체위험={identity_spoiler_risk}")
+                line = f"{prefix}: " + " | ".join(scoped_parts)
+                lines = lines_by_scope.setdefault(scope_key, [])
+                if len(lines) < limit_per_scope and line not in lines:
+                    lines.append(line)
+    return lines_by_scope
+
+
+def load_character_chat_scene_context_lines_by_scope(conn, *, product_id: int) -> dict[str, list[str]]:
+    if not hasattr(conn, "ping"):
+        return {}
+    with work_cursor(conn) as cur:
+        return build_character_chat_scene_context_lines_by_scope(
+            fetch_active_summary_rows(
+                cur=cur,
+                product_id=product_id,
+                summary_type="episode_scene_extraction",
+            )
+        )
+
+
+CHARACTER_CHAT_ASSET_READINESS_SUMMARY_TYPES = (
+    "episode_summary",
+    "episode_character_signals",
+    "character_inventory_v3",
+    "episode_scene_extraction",
+    "character_rp_profile",
+    "character_rp_examples",
+    "character_chat_internal_prompt",
+    "character_chat_opening_v1",
+)
+
+
+def _summary_rows_by_scope(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    scoped: dict[str, dict[str, object]] = {}
+    for row in rows:
+        scope_key = str(row.get("scope_key") or "").strip()
+        if scope_key and scope_key not in scoped:
+            scoped[scope_key] = row
+    return scoped
+
+
+def _summary_row_payload(row: dict[str, object]) -> dict[str, object]:
+    payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _inventory_row_scope_key(row: dict[str, object], payload: dict[str, object]) -> str:
+    return (
+        str(row.get("scope_key") or "").strip()
+        or str(payload.get("canonical_character_key") or "").strip()
+        or str(payload.get("character_key") or "").strip()
+    )
+
+
+def _is_character_chat_public_candidate(payload: dict[str, object]) -> bool:
+    readiness = dict(payload.get("chat_readiness_v1") or {})
+    if str(readiness.get("exposure_decision") or "").strip() == "eligible":
+        return True
+    return bool(payload.get("public_chat_eligible")) or bool(readiness.get("character_chat_allowed"))
+
+
+def _increment_reason(counter: dict[str, int], reason: str) -> None:
+    counter[reason] = int(counter.get(reason) or 0) + 1
+
+
+def _has_summary_row_for_inventory_alias(
+    *,
+    scope_key: str,
+    inventory_payload: dict[str, object],
+    rows_by_scope: dict[str, dict[str, object]],
+) -> bool:
+    alias_keys = build_inventory_scope_alias_keys(scope_key, inventory_payload) - {scope_key}
+    return any(alias_key in rows_by_scope for alias_key in alias_keys)
+
+
+def _is_character_chat_opening_row_ready(row: dict[str, object] | None, *, scope_key: str) -> bool:
+    if not row:
+        return False
+    payload = _summary_row_payload(row)
+    readiness = dict(payload.get("readiness") or {})
+    if str(readiness.get("status") or "").strip() != "ready":
+        return False
+    chat_target = dict(payload.get("chat_target") or {})
+    payload_scope_key = str(chat_target.get("scope_key") or "").strip()
+    return normalize_character_chat_opening_payload(
+        payload,
+        scope_key=scope_key,
+        display_name=str(chat_target.get("display_name") or ""),
+    ) is not None and payload_scope_key == scope_key
+
+
+def build_character_chat_asset_readiness_verification(
+    *,
+    product_id: int,
+    summary_rows_by_type: dict[str, list[dict[str, object]]],
+    story_context_status: str = "",
+    total_episode_count: int = 0,
+) -> dict[str, object]:
+    """Verify that story-agent summaries are sufficient for character-chat exposure.
+
+    Story context readiness only proves episode summaries exist. Character chat needs
+    an exact-key inventory/profile/examples/internal-prompt/scene chain.
+    """
+    rows_by_type = {
+        summary_type: list(summary_rows_by_type.get(summary_type) or [])
+        for summary_type in CHARACTER_CHAT_ASSET_READINESS_SUMMARY_TYPES
+    }
+    profile_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_profile"])
+    example_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_examples"])
+    internal_prompt_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_chat_internal_prompt"])
+    opening_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_chat_opening_v1"])
+    scene_scope_keys = set(build_character_chat_scene_context_lines_by_scope(rows_by_type["episode_scene_extraction"]).keys())
+
+    public_candidates: list[dict[str, object]] = []
+    block_reason_counts: dict[str, int] = {}
+    missing_profile_scope_keys: list[str] = []
+    missing_examples_scope_keys: list[str] = []
+    missing_internal_prompt_scope_keys: list[str] = []
+    missing_opening_scope_keys: list[str] = []
+    invalid_opening_scope_keys: list[str] = []
+    missing_usable_scene_scope_keys: list[str] = []
+    legacy_profile_scope_key_mismatch_scope_keys: list[str] = []
+    legacy_examples_scope_key_mismatch_scope_keys: list[str] = []
+    ready_scope_keys: list[str] = []
+    public_slot_ready_scope_keys: list[str] = []
+    malformed_inventory_scope_keys: list[str] = []
+
+    for row in rows_by_type["character_inventory_v3"]:
+        payload = _summary_row_payload(row)
+        scope_key = _inventory_row_scope_key(row, payload)
+        if not scope_key:
+            malformed_inventory_scope_keys.append(str(row.get("summary_id") or "unknown"))
+            _increment_reason(block_reason_counts, "inventory_scope_key_missing")
+            continue
+        if not _is_character_chat_public_candidate(payload):
+            continue
+
+        missing_reasons: list[str] = []
+        if scope_key not in profile_rows_by_scope:
+            missing_profile_scope_keys.append(scope_key)
+            if _has_summary_row_for_inventory_alias(
+                scope_key=scope_key,
+                inventory_payload=payload,
+                rows_by_scope=profile_rows_by_scope,
+            ):
+                legacy_profile_scope_key_mismatch_scope_keys.append(scope_key)
+                missing_reasons.append("legacy_profile_scope_key_mismatch")
+            else:
+                missing_reasons.append("missing_profile")
+        if scope_key not in example_rows_by_scope:
+            missing_examples_scope_keys.append(scope_key)
+            if _has_summary_row_for_inventory_alias(
+                scope_key=scope_key,
+                inventory_payload=payload,
+                rows_by_scope=example_rows_by_scope,
+            ):
+                legacy_examples_scope_key_mismatch_scope_keys.append(scope_key)
+                missing_reasons.append("legacy_examples_scope_key_mismatch")
+            else:
+                missing_reasons.append("missing_examples")
+        if scope_key not in internal_prompt_rows_by_scope:
+            missing_internal_prompt_scope_keys.append(scope_key)
+            missing_reasons.append("missing_internal_prompt")
+        opening_row = opening_rows_by_scope.get(scope_key)
+        if not opening_row:
+            missing_opening_scope_keys.append(scope_key)
+            missing_reasons.append("missing_character_chat_opening")
+        elif not _is_character_chat_opening_row_ready(opening_row, scope_key=scope_key):
+            invalid_opening_scope_keys.append(scope_key)
+            missing_reasons.append("invalid_character_chat_opening")
+        if scope_key not in scene_scope_keys:
+            missing_usable_scene_scope_keys.append(scope_key)
+            missing_reasons.append("missing_usable_scene")
+        for reason in missing_reasons:
+            _increment_reason(block_reason_counts, reason)
+
+        if not missing_reasons:
+            ready_scope_keys.append(scope_key)
+            readiness = dict(payload.get("chat_readiness_v1") or {})
+            if bool(payload.get("public_slot_eligible")) or bool(readiness.get("public_slot_allowed")):
+                public_slot_ready_scope_keys.append(scope_key)
+
+        public_candidates.append(
+            {
+                "scope_key": scope_key,
+                "display_name": str(payload.get("display_name") or "").strip(),
+                "public_slot_eligible": bool(payload.get("public_slot_eligible")),
+                "ready": not missing_reasons,
+                "missing_reasons": missing_reasons,
+            }
+        )
+
+    if malformed_inventory_scope_keys:
+        character_chat_status = "failed"
+    elif not public_candidates:
+        character_chat_status = "none_eligible"
+    elif ready_scope_keys:
+        character_chat_status = "ready"
+    else:
+        character_chat_status = "hold"
+
+    return {
+        "schema_version": "character_chat_asset_readiness_v1",
+        "product_id": product_id,
+        "story_context_status": story_context_status,
+        "character_chat_status": character_chat_status,
+        "total_episode_count": int(total_episode_count or 0),
+        "summary_counts": {
+            summary_type: len(rows)
+            for summary_type, rows in rows_by_type.items()
+        },
+        "public_candidate_count": len(public_candidates),
+        "ready_public_candidate_count": len(ready_scope_keys),
+        "public_slot_ready_count": len(public_slot_ready_scope_keys),
+        "ready_scope_keys": sorted(ready_scope_keys),
+        "public_slot_ready_scope_keys": sorted(public_slot_ready_scope_keys),
+        "missing_profile_scope_keys": sorted(set(missing_profile_scope_keys)),
+        "missing_examples_scope_keys": sorted(set(missing_examples_scope_keys)),
+        "missing_internal_prompt_scope_keys": sorted(set(missing_internal_prompt_scope_keys)),
+        "missing_opening_scope_keys": sorted(set(missing_opening_scope_keys)),
+        "invalid_opening_scope_keys": sorted(set(invalid_opening_scope_keys)),
+        "missing_usable_scene_scope_keys": sorted(set(missing_usable_scene_scope_keys)),
+        "legacy_profile_scope_key_mismatch_scope_keys": sorted(set(legacy_profile_scope_key_mismatch_scope_keys)),
+        "legacy_examples_scope_key_mismatch_scope_keys": sorted(set(legacy_examples_scope_key_mismatch_scope_keys)),
+        "malformed_inventory_scope_keys": sorted(set(malformed_inventory_scope_keys)),
+        "block_reason_counts": dict(sorted(block_reason_counts.items())),
+        "public_candidates": public_candidates[:20],
+    }
+
+
+def fetch_character_chat_asset_readiness_verification(
+    cur,
+    *,
+    product_id: int,
+    story_context_status: str = "",
+    total_episode_count: int = 0,
+) -> dict[str, object]:
+    return build_character_chat_asset_readiness_verification(
+        product_id=product_id,
+        story_context_status=story_context_status,
+        total_episode_count=total_episode_count,
+        summary_rows_by_type={
+            summary_type: fetch_active_summary_rows(
+                cur=cur,
+                product_id=product_id,
+                summary_type=summary_type,
+            )
+            for summary_type in CHARACTER_CHAT_ASSET_READINESS_SUMMARY_TYPES
+        },
+    )
+
+
+def attach_character_chat_asset_readiness_to_status_row(cur, status_row: dict[str, object]) -> dict[str, object]:
+    enriched = dict(status_row)
+    product_id = int(enriched.get("product_id") or 0)
+    if product_id <= 0:
+        return enriched
+    enriched["character_chat_asset_readiness"] = fetch_character_chat_asset_readiness_verification(
+        cur,
+        product_id=product_id,
+        story_context_status=str(enriched.get("context_status") or ""),
+        total_episode_count=int(enriched.get("total_episode_count") or 0),
+    )
+    return enriched
+
+
 def build_compound_summaries(cur, product_id: int, product_title: str) -> dict[str, tuple[int, int]]:
     counts = {
         "range": [0, 0],
@@ -9239,12 +12429,13 @@ def fetch_next_version_no(cur, episode_id: int) -> int:
 def fetch_existing_summary(cur, product_id: int, summary_type: str, scope_key: str, source_hash: str) -> dict | None:
     cur.execute(
         """
-        SELECT summary_id, version_no, is_active
+        SELECT summary_id, version_no, is_active, summary_text
           FROM tb_story_agent_context_summary
          WHERE product_id = %s
            AND summary_type = %s
            AND scope_key = %s
            AND source_hash = %s
+         ORDER BY is_active DESC, summary_id DESC
          LIMIT 1
         """,
         (product_id, summary_type, scope_key, source_hash),
@@ -9287,6 +12478,44 @@ def activate_existing_summary(cur, summary_id: int, product_id: int, summary_typ
          WHERE summary_id = %s
         """,
         (summary_id,),
+    )
+
+
+def update_existing_summary_payload(
+    cur,
+    *,
+    summary_id: int,
+    product_id: int,
+    summary_type: str,
+    scope_key: str,
+    source_doc_count: int,
+    summary_text: str,
+    episode_from: int | None = None,
+    episode_to: int | None = None,
+) -> None:
+    cur.execute(
+        """
+        UPDATE tb_story_agent_context_summary
+           SET is_active = 'N'
+         WHERE product_id = %s
+           AND summary_type = %s
+           AND scope_key = %s
+           AND is_active = 'Y'
+           AND summary_id <> %s
+        """,
+        (product_id, summary_type, scope_key, summary_id),
+    )
+    cur.execute(
+        """
+        UPDATE tb_story_agent_context_summary
+           SET source_doc_count = %s,
+               episode_from = %s,
+               episode_to = %s,
+               summary_text = %s,
+               is_active = 'Y'
+         WHERE summary_id = %s
+        """,
+        (source_doc_count, episode_from, episode_to, summary_text, summary_id),
     )
 
 
@@ -9693,6 +12922,8 @@ def build_empty_results() -> dict[str, object]:
         "reused_character_snapshots": 0,
         "inserted_episode_character_signals": 0,
         "reused_episode_character_signals": 0,
+        "inserted_episode_scene_extractions": 0,
+        "reused_episode_scene_extractions": 0,
         "inserted_character_inventories": 0,
         "reused_character_inventories": 0,
         "inserted_character_inventory_v3": 0,
@@ -9703,6 +12934,8 @@ def build_empty_results() -> dict[str, object]:
         "reused_character_rp_profiles": 0,
         "inserted_character_rp_examples": 0,
         "reused_character_rp_examples": 0,
+        "inserted_character_chat_openings": 0,
+        "reused_character_chat_openings": 0,
         "skipped_rows": 0,
         "products": [],
         "delta_verifications": [],
@@ -9727,6 +12960,8 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
 
     work_conn = db_connect()
     try:
+        if args.apply:
+            await assert_storyctx_apply_providers_ready(summary_client)
         for product_id, product_rows in rows_by_product.items():
             product_failed = False
             failed_ready_episode_count = 0
@@ -9944,6 +13179,19 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                         results["inserted_relation_inventories"] += relation_counts[0]
                         results["reused_relation_inventories"] += relation_counts[1]
 
+                        scene_counts = await build_episode_scene_extraction_summaries(
+                            conn=work_conn,
+                            product_id=product_id,
+                            product_title=str(product_rows[0].get("title") or ""),
+                            episode_rows=episode_summary_rows,
+                            episode_texts_by_no=episode_texts_by_no,
+                            summary_client=summary_client,
+                            canonical_character_packet=build_episode_scene_canonical_character_packet(inventory_v3_map),
+                            verbose=args.verbose,
+                        )
+                        results["inserted_episode_scene_extractions"] += scene_counts[0]
+                        results["reused_episode_scene_extractions"] += scene_counts[1]
+
                         rp_counts = await build_rp_summaries(
                             conn=work_conn,
                             product_id=product_id,
@@ -9958,12 +13206,27 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                         results["reused_character_rp_profiles"] += rp_counts["profile"][1]
                         results["inserted_character_rp_examples"] += rp_counts["examples"][0]
                         results["reused_character_rp_examples"] += rp_counts["examples"][1]
+                        opening_counts = await build_character_chat_opening_summaries(
+                            conn=work_conn,
+                            product_id=product_id,
+                            episode_rows=episode_summary_rows,
+                            summary_client=summary_client,
+                            inventory_map=inventory_v3_map,
+                            relation_map=relation_map,
+                            verbose=args.verbose,
+                        )
+                        results["inserted_character_chat_openings"] += opening_counts[0]
+                        results["reused_character_chat_openings"] += opening_counts[1]
 
                         with work_cursor(work_conn) as cur:
                             status_row = refresh_product_context_status(
                                 cur=cur,
                                 product_id=product_id,
                                 total_episode_count=total_episode_count,
+                            )
+                            status_row = attach_character_chat_asset_readiness_to_status_row(
+                                cur,
+                                status_row,
                             )
                         work_conn.commit()
                         results["products"].append(status_row)
@@ -10030,6 +13293,8 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
 
     work_conn = db_connect()
     try:
+        if args.apply:
+            await assert_storyctx_apply_providers_ready(summary_client)
         for product_id, product_rows in rows_by_product.items():
             product_failed = False
             failed_ready_episode_count = 0
@@ -10070,6 +13335,11 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             cur=cur,
                             product_id=product_id,
                             summary_type="character_rp_examples",
+                        )
+                        old_internal_prompt_map = fetch_active_summary_state_map(
+                            cur=cur,
+                            product_id=product_id,
+                            summary_type="character_chat_internal_prompt",
                         )
                         old_touched_signal_rows = fetch_active_summary_rows_for_episode_nos(
                             cur,
@@ -10240,6 +13510,29 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 cur,
                                 product_id=product_id,
                             )
+                        scene_counts = await build_episode_scene_extraction_summaries(
+                            conn=work_conn,
+                            product_id=product_id,
+                            product_title=str(product_rows[0].get("title") or ""),
+                            episode_rows=touched_episode_summary_rows,
+                            episode_texts_by_no=episode_texts_by_no,
+                            summary_client=summary_client,
+                            canonical_character_packet=build_episode_scene_canonical_character_packet(new_inventory_v3_map),
+                            cleanup_missing_scopes=False,
+                            verbose=args.verbose,
+                        )
+                        results["inserted_episode_scene_extractions"] += scene_counts[0]
+                        results["reused_episode_scene_extractions"] += scene_counts[1]
+                        with work_cursor(work_conn) as cur:
+                            touched_scene_rows = fetch_active_summary_rows_for_episode_nos(
+                                cur,
+                                product_id=product_id,
+                                summary_type="episode_scene_extraction",
+                                episode_nos=touched_episode_nos,
+                            )
+                        scene_affected_scope_keys = set(
+                            build_character_chat_scene_context_lines_by_scope(touched_scene_rows).keys()
+                        )
                         rp_affected_scope_keys = compute_rp_affected_scope_keys(
                             old_inventory_map=old_inventory_v3_map,
                             new_inventory_map=new_inventory_v3_map,
@@ -10249,9 +13542,12 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             new_touched_signal_rows=new_touched_signal_rows,
                             old_profile_map=old_profile_map,
                             old_examples_map=old_examples_map,
+                            old_internal_prompt_map=old_internal_prompt_map,
                             cleanup_scope_keys=set(character_cleanup.get("touched_scope_keys") or []),
                         )
+                        rp_affected_scope_keys.update(scene_affected_scope_keys)
                         rp_counts = build_empty_delta_rp_counts()
+                        opening_counts = (0, 0)
                         if should_refresh_delta_rp(args):
                             rp_counts = await build_rp_summaries_delta(
                                 conn=work_conn,
@@ -10264,11 +13560,24 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 relation_map=new_relation_scope_map,
                                 verbose=args.verbose,
                             )
+                            opening_counts = await build_character_chat_opening_summaries(
+                                conn=work_conn,
+                                product_id=product_id,
+                                episode_rows=all_episode_summary_rows,
+                                summary_client=summary_client,
+                                inventory_map=new_inventory_v3_map,
+                                relation_map=new_relation_scope_map,
+                                affected_scope_keys=rp_affected_scope_keys,
+                                cleanup_missing_scopes=False,
+                                verbose=args.verbose,
+                            )
                         elif args.verbose and rp_affected_scope_keys:
                             print(
                                 f"[delta-rp-skip] product_id={product_id} "
                                 f"affected_scope_keys={len(rp_affected_scope_keys)}"
                             )
+                        results["inserted_character_chat_openings"] += opening_counts[0]
+                        results["reused_character_chat_openings"] += opening_counts[1]
                         with work_cursor(work_conn) as cur:
                             new_profile_map = fetch_active_summary_state_map(
                                 cur=cur,
@@ -10309,6 +13618,10 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 cur=cur,
                                 product_id=product_id,
                                 total_episode_count=total_episode_count,
+                            )
+                            status_row = attach_character_chat_asset_readiness_to_status_row(
+                                cur,
+                                status_row,
                             )
                         work_conn.commit()
                         results["inserted_range_summaries"] += compound_counts["range"][0]
@@ -10385,11 +13698,13 @@ def print_summary(results: dict[str, object], apply: bool) -> None:
         f"inserted_product_summaries={results['inserted_product_summaries']} reused_product_summaries={results['reused_product_summaries']} "
         f"inserted_character_snapshots={results['inserted_character_snapshots']} reused_character_snapshots={results['reused_character_snapshots']} "
         f"inserted_episode_character_signals={results['inserted_episode_character_signals']} reused_episode_character_signals={results['reused_episode_character_signals']} "
+        f"inserted_episode_scene_extractions={results['inserted_episode_scene_extractions']} reused_episode_scene_extractions={results['reused_episode_scene_extractions']} "
         f"inserted_character_inventories={results['inserted_character_inventories']} reused_character_inventories={results['reused_character_inventories']} "
         f"inserted_character_inventory_v3={results['inserted_character_inventory_v3']} reused_character_inventory_v3={results['reused_character_inventory_v3']} "
         f"inserted_relation_inventories={results['inserted_relation_inventories']} reused_relation_inventories={results['reused_relation_inventories']} "
         f"inserted_character_rp_profiles={results['inserted_character_rp_profiles']} reused_character_rp_profiles={results['reused_character_rp_profiles']} "
         f"inserted_character_rp_examples={results['inserted_character_rp_examples']} reused_character_rp_examples={results['reused_character_rp_examples']} "
+        f"inserted_character_chat_openings={results['inserted_character_chat_openings']} reused_character_chat_openings={results['reused_character_chat_openings']} "
         f"skipped_rows={results['skipped_rows']}"
     )
     for product in list(results.get("products") or [])[:20]:

@@ -632,7 +632,7 @@ class PostBannerReqBody(AdminBase):
     # 관리자 로그인 시 클라이언트에서 보내는 request body
     position: str = Field(
         examples=["main"],
-        description="노출 위치, main (메인: 대배너(상단 캐러셀), 띠배너(중간), 고정배너(하단)) | paid (메인>유료: 대배너(상단 캐러셀)) | review (메인>작품리뷰: 대배너(상단 캐러셀)) | promotion (메인>프로모션: 고정배너(상단)) | search (검색/검색결과: 고정배너(상단) | viewer (뷰어: 띠배너))",
+        description="노출 위치, main (메인: 대배너(상단 캐러셀), 띠배너(중간), 고정배너(하단)) | companyNotice (메인: 미니캐러셀) | paid (메인>유료: 대배너(상단 캐러셀)) | review (메인>작품리뷰: 대배너(상단 캐러셀)) | promotion (메인>프로모션: 고정배너(상단)) | search (검색/검색결과: 고정배너(상단) | viewer (뷰어: 띠배너))",
     )
     division: Optional[str] = Field(
         default=None,
@@ -667,7 +667,7 @@ class ReorderBannersReqBody(AdminBase):
 
     position: str = Field(
         examples=["main"],
-        description="노출 위치, main | paid | review | promotion | search | viewer",
+        description="노출 위치, main | companyNotice | paid | review | promotion | search | viewer",
     )
     division: Optional[str] = Field(
         default=None,
@@ -1045,6 +1045,7 @@ DEFAULT_AI_READER_PRODUCT_STATUS_WEIGHTS = {
     "end": 10,
     "stop": 0,
 }
+MAX_AI_READER_AGENT_COUNT = 1000
 ALLOWED_AI_READER_AGE_GROUPS = set(DEFAULT_AI_READER_AGE_GROUP_RATIOS)
 ALLOWED_AI_READER_GENDERS = {"M", "F", "X"}
 ALLOWED_AI_READER_PRODUCT_TYPE_WEIGHT_KEYS = set(DEFAULT_AI_READER_PRODUCT_TYPE_WEIGHTS)
@@ -1176,7 +1177,7 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         examples=["ai-reader-"],
         description="AI 전용 계정 이메일 prefix",
     )
-    agent_count: int = Field(default=100, ge=1, le=200, description="투입할 AI 독자 수")
+    agent_count: int = Field(default=100, ge=1, le=MAX_AI_READER_AGENT_COUNT, description="투입할 AI 독자 수")
     schedule_date: Optional[str] = Field(
         default=None,
         examples=["2026-05-13"],
@@ -1337,7 +1338,7 @@ class PostAiReaderBootstrapReqBody(AdminBase):
 
 
 class PostAiReaderResumePausedReqBody(AdminBase):
-    agent_count: int = Field(default=100, ge=1, le=200, description="재가동할 paused AI 독자 수")
+    agent_count: int = Field(default=100, ge=1, le=MAX_AI_READER_AGENT_COUNT, description="재가동할 paused AI 독자 수")
     schedule_date: Optional[str] = Field(
         default=None,
         examples=["2026-05-14"],
@@ -1448,7 +1449,7 @@ class PostAiReaderRefreshSchedulesReqBody(PostAiReaderResumePausedReqBody):
     agent_count: int = Field(
         default=100,
         ge=1,
-        le=200,
+        le=MAX_AI_READER_AGENT_COUNT,
         description="새 스케줄을 생성할 active AI 독자 수",
     )
 
@@ -1457,7 +1458,7 @@ class PostAiReaderRestartReqBody(PostAiReaderResumePausedReqBody):
     agent_count: int = Field(
         default=100,
         ge=1,
-        le=200,
+        le=MAX_AI_READER_AGENT_COUNT,
         description="전체 AI 독자를 정리한 뒤 새로 active 전환할 AI 독자 수",
     )
 
