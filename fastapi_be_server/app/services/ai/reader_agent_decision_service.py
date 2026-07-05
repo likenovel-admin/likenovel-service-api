@@ -99,14 +99,16 @@ def build_reader_decision_prompt(input_snapshot: dict[str, Any]) -> tuple[str, s
 - engagement_context.bayesian_action_model은 현재 N화를 보기 전 N+1화 계속보기/선호작/추천/평가의 사전확률(prior)과 서버 posterior_hint를 담는다.
 - 현재 N화를 읽었다고 가정한 작품 훅, 전개감, 취향 적합성을 조건부확률 evidence로 보고 bayesian_update.posterior 사후확률을 갱신한다.
 - "루즈하면 멈출 수 있음"은 loose_stop_evidence_weight=0.1의 약한 부정 evidence일 뿐, 직접 중단 명령이 아니다.
-- action_affordances.*.suggested=true는 서버가 posterior_hint >= posterior_threshold라고 본 상태다. 거절할 명확한 이유가 없으면 해당 행동을 하는 쪽으로 판단한다.
-- action_affordances.*.suggested=false는 금지가 아니다. 작품의 훅, 취향, 읽은 회차, 독자 성향상 자연스러우면 직접 행동해도 된다.
+- action_affordances.*.suggested=true는 서버가 posterior_hint >= posterior_threshold라고 본 약한 행동 힌트다. 명령이 아니라 확신을 높이는 보조값이며, 작품 훅과 독자 취향이 함께 맞을 때 행동한다.
+- public action(선호작/추천/평가)의 기본값은 none이다. 명확한 긍정 근거가 없으면 none을 선택하고, 강한 감상이나 계속 볼 의사가 분명할 때만 행동한다.
+- action_affordances.*.suggested=false는 보통 none을 선택하라는 신호다. 다만 작품의 훅, 취향, 읽은 회차, 독자 성향상 매우 자연스러운 강한 예외라면 직접 행동해도 된다.
 - engagement_score_hint가 threshold 이상인데 "임계치 미달"이라고 이유를 쓰면 안 된다.
 - read_episode_count가 action_affordances.evaluate.min_read_episode_count 이상이면 "3회차 미만"이라고 판단하면 안 된다.
 - 모든 행동은 과장하지 말고 독자 한 명의 자연스러운 반응으로 결정한다.
 - 강하게 마음에 든 독자는 첫 회차나 초반부에도 선호작/추천을 할 수 있다. 평가는 보통 3회차 이상 읽은 뒤 판단한다.
 - 추천은 선호작보다 가벼운 긍정 신호다. 몇 화를 읽고 계속 볼 마음이 들면 추천을 누를 수 있다.
-- 다음 회차를 볼지 판단한다. 강하게 마음에 들면 한 번의 판단에서 next_episode_count를 2까지 줄 수 있다.
+- 다음 회차를 볼지 판단한다. next_episode_count=1은 일반적인 계속 읽기이고, next_episode_count=2는 드문 binge 신호다. 강한 훅, 높은 취향 적합성, 독자의 burst 성향이 모두 맞을 때만 2를 사용한다. 일반적인 긍정은 1을 선택한다.
+- 애매하거나 관망 중인 경우는 drop_product=true로 단정하지 말고, 특히 초반 1~3화에서는 치명적인 취향 불일치가 아니면 한 화 더 본다.
 - 다음 회차를 보지 않으면 next_episode_count는 0이어야 한다.
 - drop_product가 true면 continue_reading은 false여야 한다.
 prompt_version={READER_DECISION_PROMPT_VERSION}
