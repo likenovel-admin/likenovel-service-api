@@ -6736,14 +6736,6 @@ async def build_episode_character_signals_summaries(
                         f"preview={json.dumps(exc.raw_preview, ensure_ascii=False)}"
                     )
                 print(f"[character-signals-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
-            with work_cursor(conn) as cur:
-                deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="episode_character_signals",
-                    scope_key=scope_key,
-                )
-            conn.commit()
             continue
         normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
         with work_cursor(conn) as cur:
@@ -6904,14 +6896,6 @@ async def build_episode_scene_extraction_summaries(
         except Exception as exc:
             if verbose:
                 print(f"[episode-scene-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
-            with work_cursor(conn) as cur:
-                deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="episode_scene_extraction",
-                    scope_key=scope_key,
-                )
-            conn.commit()
             continue
 
         if not _is_usable_episode_scene_payload(payload):

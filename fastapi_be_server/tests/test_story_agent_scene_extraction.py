@@ -783,6 +783,49 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         upsert_summary.assert_not_called()
         self.assertEqual(conn.commit_count, 0)
 
+    def test_scene_extraction_exception_keeps_old_scope(self):
+        module = load_module()
+        conn = FakeConnection()
+        request_mock = AsyncMock(side_effect=module.RequestError("upstream timeout"))
+
+        async def run():
+            with patch.object(module, "work_cursor", fake_work_cursor), \
+                 patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+                 patch.object(module, "fetch_existing_summary", return_value=None), \
+                 patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
+                 patch.object(module, "deactivate_active_scope") as deactivate_scope, \
+                 patch.object(module, "upsert_summary") as upsert_summary:
+                inserted, reused = await module.build_episode_scene_extraction_summaries(
+                    conn,
+                    product_id=687,
+                    product_title="테스트 작품",
+                    episode_rows=[
+                        {
+                            "summary_id": 11,
+                            "scope_key": "episode:1",
+                            "episode_from": 1,
+                            "source_hash": "summary-hash",
+                            "summary_text": "[1화] 시작",
+                        }
+                    ],
+                    episode_texts_by_no={1: "아델리트는 문을 열었다."},
+                    summary_client=object(),
+                    canonical_character_packet={
+                        "characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]
+                    },
+                    cleanup_missing_scopes=False,
+                    verbose=True,
+                )
+            return inserted, reused, deactivate_scope, upsert_summary
+
+        inserted, reused, deactivate_scope, upsert_summary = asyncio.run(run())
+
+        self.assertEqual((inserted, reused), (0, 0))
+        request_mock.assert_awaited_once()
+        deactivate_scope.assert_not_called()
+        upsert_summary.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
+
     def test_scene_extraction_does_not_reuse_existing_failed_payload(self):
         module = load_module()
         conn = FakeConnection()

@@ -447,7 +447,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         activate_existing.assert_called_once_with(ANY, 123, 687, "episode_character_signals", "episode:1001")
         self.assertEqual(conn.commit_count, 1)
 
-    async def test_episode_character_signal_failure_deactivates_stale_scope(self):
+    async def test_episode_character_signal_failure_keeps_old_scope(self):
         module = load_module()
         conn = FakeConnection()
         row = {
@@ -477,13 +477,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(inserted, 0)
         self.assertEqual(reused, 0)
         request_mock.assert_awaited_once()
-        deactivate_scope.assert_called_once_with(
-            ANY,
-            product_id=687,
-            summary_type="episode_character_signals",
-            scope_key="episode:1001",
-        )
-        self.assertEqual(conn.commit_count, 1)
+        deactivate_scope.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
 
     async def test_episode_character_signals_keep_old_when_provider_unavailable(self):
         module = load_module()
