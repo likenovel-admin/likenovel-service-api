@@ -106,6 +106,12 @@ CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
 CHARACTER_CHAT_INTERNAL_PROMPT_FORMAT_VERSION = "character_chat_internal_prompt_v1"
 CHARACTER_CHAT_OPENING_FORMAT_VERSION = "character_chat_opening_v1"
 CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION = "runtime_formula_seed_v1"
+CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED = "scene_backed"
+CHARACTER_CHAT_OPENING_STRATEGY_FORMULA_BACKED = "formula_backed"
+CHARACTER_CHAT_OPENING_STRATEGIES = {
+    CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED,
+    CHARACTER_CHAT_OPENING_STRATEGY_FORMULA_BACKED,
+}
 CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS = (
     "formula_type",
     "p_to_user_request",
@@ -516,6 +522,7 @@ CHARACTER_CHAT_OPENING_SYSTEM = """너는 웹소설 원작 기반 캐릭터챗�
 출력 스키마:
 {
   "readiness": {"status": "ready|needs_review|not_ready", "confidence": 0.0, "block_reasons": []},
+  "opening_strategy": "scene_backed|formula_backed",
   "chat_target": {"scope_key": "입력 scope_key", "display_name": "캐릭터명", "aliases": []},
   "opening_scene": {
     "situation": "첫 진입 장면",
@@ -579,7 +586,7 @@ CHARACTER_CHAT_OPENING_SYSTEM = """너는 웹소설 원작 기반 캐릭터챗�
 }
 
 규칙:
-1. readiness.status는 장면 프레임, 캐릭터 목표, 유저 역할, 다음 전개가 모두 있을 때만 ready다.
+1. readiness.status는 장면 프레임 또는 formula-backed 진입 프레임, 캐릭터 목표, 유저 역할, 다음 전개가 모두 있을 때만 ready다.
 2. chat_target.scope_key는 입력 scope_key와 정확히 같아야 한다.
 3. opening_message는 실제 첫 assistant 응답 초안이다. 일반 캐릭터챗 위저드의 첫시작처럼 intro(서술형 지문) + first_line(첫대사) 구조로 만든다. 대사만 있거나 지문만 있으면 ready가 아니다.
 4. 유저를 특정 원작 인물, 연인, 가족, 포로, 환자, 짐승, 주인공으로 확정하지 마라.
@@ -593,7 +600,22 @@ CHARACTER_CHAT_OPENING_SYSTEM = """너는 웹소설 원작 기반 캐릭터챗�
    협력 요청은 "저 박스 근처로 누가 다가오면 알려", "왼쪽 문양과 오른쪽 발소리 중 하나를 확인해"처럼 외부 사물과 선택지를 향해야 한다.
    첫 대사는 "거기,"로 시작하지 마라. 사용자를 부르는 대신 곧바로 외부 사건/사물/선택지를 제시하라.
    좋은 형식: "저 박스 근처로 누가 다가오면 바로 알려. 나는 이 상태창부터 확인할게." / "왼쪽 문양과 오른쪽 발소리 중 하나를 먼저 봐. 둘 다 놓치면 늦어."
-11. opening_message.opening_text는 첫 화면에 그대로 띄울 순수 본문이다. 반드시 `narration` 문단, 빈 줄, 큰따옴표 대사 순서로 작성하라. 단답 대사, 안내문, 자기소개, "무엇을 도와줄까"식 일반 인사는 금지다.
+11. opening_message.opening_text는 첫 화면에 그대로 띄울 순수 본문이다. 반드시 `narration` 문단, 빈 줄, 큰따옴표 대사 순서로 작성하라. narration은 최소 220자, opening_text는 최소 280자, dialogue는 최소 20자로 작성하라. 단답 대사, 안내문, 자기소개, "무엇을 도와줄까"식 일반 인사는 금지다.
+12. opening_strategy는 장면 프레임 근거가 있으면 scene_backed, 장면 프레임 근거가 없고 회차 요약/관계/공식 seed로 여는 새 micro-incident면 formula_backed다. formula_backed는 원작 장면 복제가 아니라 읽은 범위에서 파생 가능한 새 사건이어야 한다.
+"""
+
+CHARACTER_CHAT_FORMULA_BACKED_OPENING_SEED = """[formula-backed opening seed]
+- scene extraction이 없을 때만 사용한다. 원작 장면 복제가 아니라 읽은 범위의 설정/관계/압박을 보존한 새 micro-incident를 시작한다.
+- formula_type 후보는 장르가 아니라 첫 5~30턴을 움직이는 행동 공식이다.
+- 우선 공식:
+  1) FORMULA_PUBLIC_TEST_FLIP / UT_MONITOR_REACTION / MP_SAME_RELATION_NEW_TEST
+  2) FORMULA_RESOURCE_BOOTSTRAP / UT_INSPECT_CLUE / MP_SAME_ASSET_NEW_CLUE
+  3) FORMULA_COMBAT_PATTERN_BREAK / UT_CALL_TIMING / MP_SAME_PRESSURE_NEW_ROUTE
+  4) FORMULA_ALLY_TRUST_CONVERSION / UT_MONITOR_REACTION 또는 UT_CRAFT_RESPONSE / MP_SAME_RELATION_NEW_TEST
+  5) FORMULA_CASE_TO_NETWORK / UT_INSPECT_CLUE 또는 UT_SEARCH_RECORDS / MP_SAME_CASE_NEW_SCOPE
+- 유저 과업은 1~3턴 안에 끝나는 관찰, 단서 확인, 타이밍 콜, 답변 초안, 옵션 계산, 증거 준비 중 하나여야 한다.
+- 유저를 침입자/범인/심문 대상으로 몰지 말고, 캐릭터가 먼저 움직이며 유저는 작은 관찰/선택으로 보조한다.
+- 새 proper noun, 새 조직명, 새 고유 장소명, 새 네임드 인물은 만들지 않는다. 필요한 사물/방해는 쪽지, 발소리, 기록, 문서, 반응, 일정 지연처럼 generic anchor만 쓴다.
 """
 
 RP_CHARACTER_PLAN_PROMPT = """너는 웹소설 episode_summary를 보고 RP용 중심인물 계획을 세우는 추론기다.
@@ -5447,9 +5469,17 @@ def build_character_chat_opening_user_prompt(
         ]
         if inventory_item and inventory_item.get(key) not in (None, "", [])
     }
+    has_scene_context = any(str(line).strip() for line in (scene_context_lines or []))
+    opening_strategy = (
+        CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED
+        if has_scene_context
+        else CHARACTER_CHAT_OPENING_STRATEGY_FORMULA_BACKED
+    )
     return (
         "[필수 scope_key]\n"
         + scope_key
+        + "\n\n[오프닝 전략]\n"
+        + opening_strategy
         + "\n\n[대상 캐릭터]\n"
         + json.dumps(
             {
@@ -5474,6 +5504,11 @@ def build_character_chat_opening_user_prompt(
         + ("\n".join(str(line).strip() for line in (relation_context_lines or [])[:8] if str(line).strip()) or "없음")
         + "\n\n[장면 프레임 근거]\n"
         + ("\n".join(str(line).strip() for line in (scene_context_lines or [])[:8] if str(line).strip()) or "없음")
+        + (
+            "\n\n[formula-backed 공식 seed]\n" + CHARACTER_CHAT_FORMULA_BACKED_OPENING_SEED
+            if not has_scene_context
+            else ""
+        )
         + "\n\n위 근거만 사용해 character_chat_opening_v1 JSON을 작성하라."
     )
 
@@ -5483,6 +5518,7 @@ def normalize_character_chat_opening_payload(
     *,
     scope_key: str,
     display_name: str,
+    default_opening_strategy: str = CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED,
 ) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
@@ -5516,13 +5552,26 @@ def normalize_character_chat_opening_payload(
     )
     if runtime_formula_seed is None:
         return None
+    opening_strategy = normalize_character_chat_opening_strategy(
+        payload.get("opening_strategy")
+        or payload.get("generation_strategy")
+        or default_opening_strategy
+    )
     normalized = dict(payload)
     normalized["schema_version"] = CHARACTER_CHAT_OPENING_FORMAT_VERSION
+    normalized["opening_strategy"] = opening_strategy
     normalized["readiness"] = readiness
     normalized["chat_target"] = chat_target
     normalized["opening_message"] = opening_message
     normalized["runtime_formula_seed"] = runtime_formula_seed
     return normalized
+
+
+def normalize_character_chat_opening_strategy(value: object) -> str:
+    strategy = str(value or "").strip().lower()
+    if strategy in CHARACTER_CHAT_OPENING_STRATEGIES:
+        return strategy
+    return CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED
 
 
 def normalize_character_chat_runtime_formula_seed(value: object) -> dict[str, str] | None:
@@ -5644,6 +5693,11 @@ async def request_character_chat_opening_payload(
     scene_context_lines: list[str] | None = None,
 ) -> dict[str, object] | None:
     display_name = str(target.get("display_name") or "").strip()
+    default_opening_strategy = (
+        CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED
+        if any(str(line).strip() for line in (scene_context_lines or []))
+        else CHARACTER_CHAT_OPENING_STRATEGY_FORMULA_BACKED
+    )
     payload = await request_character_chat_asset_openrouter_json_payload(
         client,
         system_prompt=CHARACTER_CHAT_OPENING_SYSTEM,
@@ -5665,6 +5719,7 @@ async def request_character_chat_opening_payload(
         payload,
         scope_key=scope_key,
         display_name=display_name,
+        default_opening_strategy=default_opening_strategy,
     )
 
 
@@ -5832,12 +5887,14 @@ def build_character_chat_opening_source_hash(
     summary_context_lines: list[str],
     relation_context_lines: list[str],
     scene_context_lines: list[str] | None = None,
+    opening_strategy: str = CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED,
 ) -> str:
     return build_compound_summary_source_hash(
         CHARACTER_CHAT_OPENING_FORMAT_VERSION,
         [
             CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION,
             character_key,
+            f"strategy:{normalize_character_chat_opening_strategy(opening_strategy)}",
             build_rp_profile_model_signature(),
             *build_character_chat_inventory_signature_parts(inventory_item),
             f"profile:{str(profile_row.get('source_hash') or '')}",
@@ -6999,6 +7056,11 @@ async def build_character_chat_opening_summaries(
             product_id=product_id,
             summary_type="character_chat_internal_prompt",
         )
+        opening_rows_by_scope = fetch_active_summary_state_map(
+            cur=cur,
+            product_id=product_id,
+            summary_type="character_chat_opening_v1",
+        )
 
     scene_context_lines_by_scope = load_character_chat_scene_context_lines_by_scope(
         conn,
@@ -7015,7 +7077,12 @@ async def build_character_chat_opening_summaries(
 
     inserted_count = 0
     reused_count = 0
-    valid_scope_keys: set[str] = set()
+    valid_scope_keys: set[str] = {
+        str(scope_key or "").strip()
+        for scope_key, row in opening_rows_by_scope.items()
+        if str(scope_key or "").strip()
+        and _is_character_chat_opening_row_ready(row, scope_key=str(scope_key or "").strip())
+    }
     phase_deadline = asyncio.get_running_loop().time() + CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS
     phase_timed_out = False
     for scope_key, inventory_item in sorted((inventory_map or {}).items()):
@@ -7041,8 +7108,13 @@ async def build_character_chat_opening_summaries(
         example_row = dict(example_rows_by_scope.get(scope_key) or {})
         internal_prompt_row = dict(internal_prompt_rows_by_scope.get(scope_key) or {})
         scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
-        if not profile_row or not example_row or not internal_prompt_row or not scene_context_lines:
+        if not profile_row or not example_row or not internal_prompt_row:
             continue
+        opening_strategy = (
+            CHARACTER_CHAT_OPENING_STRATEGY_SCENE_BACKED
+            if scene_context_lines
+            else CHARACTER_CHAT_OPENING_STRATEGY_FORMULA_BACKED
+        )
 
         profile_payload = dict(profile_row.get("payload") or {})
         example_payload = dict(example_row.get("payload") or {})
@@ -7057,6 +7129,7 @@ async def build_character_chat_opening_summaries(
         )
         source_hash = build_character_chat_opening_source_hash(
             character_key=scope_key,
+            opening_strategy=opening_strategy,
             inventory_item=inventory_item,
             profile_row=profile_row,
             examples_row=example_row,
@@ -7143,7 +7216,7 @@ async def build_character_chat_opening_summaries(
                 summary_type="character_chat_opening_v1",
                 scope_key=scope_key,
                 source_hash=source_hash,
-                source_doc_count=len(scene_context_lines),
+                source_doc_count=len(scene_context_lines) if scene_context_lines else 1,
                 summary_text=json.dumps(opening_payload, ensure_ascii=False),
             )
         conn.commit()
@@ -12571,6 +12644,15 @@ def _is_character_chat_opening_row_ready(row: dict[str, object] | None, *, scope
     ) is not None and payload_scope_key == scope_key
 
 
+def _character_chat_opening_row_strategy(row: dict[str, object] | None) -> str:
+    if not row:
+        return ""
+    payload = _summary_row_payload(row)
+    return normalize_character_chat_opening_strategy(
+        payload.get("opening_strategy") or payload.get("generation_strategy")
+    )
+
+
 def build_character_chat_asset_readiness_verification(
     *,
     product_id: int,
@@ -12595,6 +12677,7 @@ def build_character_chat_asset_readiness_verification(
 
     public_candidates: list[dict[str, object]] = []
     block_reason_counts: dict[str, int] = {}
+    warning_reason_counts: dict[str, int] = {}
     missing_profile_scope_keys: list[str] = []
     missing_examples_scope_keys: list[str] = []
     missing_internal_prompt_scope_keys: list[str] = []
@@ -12644,15 +12727,23 @@ def build_character_chat_asset_readiness_verification(
             missing_internal_prompt_scope_keys.append(scope_key)
             missing_reasons.append("missing_internal_prompt")
         opening_row = opening_rows_by_scope.get(scope_key)
+        opening_ready = False
+        opening_strategy = ""
         if not opening_row:
             missing_opening_scope_keys.append(scope_key)
             missing_reasons.append("missing_character_chat_opening")
         elif not _is_character_chat_opening_row_ready(opening_row, scope_key=scope_key):
             invalid_opening_scope_keys.append(scope_key)
             missing_reasons.append("invalid_character_chat_opening")
+        else:
+            opening_ready = True
+            opening_strategy = _character_chat_opening_row_strategy(opening_row)
         if scope_key not in scene_scope_keys:
             missing_usable_scene_scope_keys.append(scope_key)
-            missing_reasons.append("missing_usable_scene")
+            if opening_ready and opening_strategy == CHARACTER_CHAT_OPENING_STRATEGY_FORMULA_BACKED:
+                _increment_reason(warning_reason_counts, "scene_enrichment_missing")
+            else:
+                missing_reasons.append("missing_usable_scene")
         for reason in missing_reasons:
             _increment_reason(block_reason_counts, reason)
 
@@ -12669,6 +12760,15 @@ def build_character_chat_asset_readiness_verification(
                 "public_slot_eligible": bool(payload.get("public_slot_eligible")),
                 "ready": not missing_reasons,
                 "missing_reasons": missing_reasons,
+                "warning_reasons": (
+                    ["scene_enrichment_missing"]
+                    if (
+                        scope_key not in scene_scope_keys
+                        and opening_ready
+                        and opening_strategy == CHARACTER_CHAT_OPENING_STRATEGY_FORMULA_BACKED
+                    )
+                    else []
+                ),
             }
         )
 
@@ -12706,6 +12806,7 @@ def build_character_chat_asset_readiness_verification(
         "legacy_examples_scope_key_mismatch_scope_keys": sorted(set(legacy_examples_scope_key_mismatch_scope_keys)),
         "malformed_inventory_scope_keys": sorted(set(malformed_inventory_scope_keys)),
         "block_reason_counts": dict(sorted(block_reason_counts.items())),
+        "warning_reason_counts": dict(sorted(warning_reason_counts.items())),
         "public_candidates": public_candidates[:20],
     }
 

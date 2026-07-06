@@ -1420,6 +1420,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(payload["readiness"]["status"], "ready")
+        self.assertEqual(payload["opening_strategy"], "formula_backed")
         request_json = client.calls[0]["json"]
         self.assertEqual(request_json["model"], "deepseek/deepseek-v4-pro")
         self.assertNotIn("provider", request_json)
@@ -2219,6 +2220,262 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         saved_payload = json.loads(upserted[0]["summary_text"])
         self.assertEqual(saved_payload["chat_target"]["scope_key"], scope_key)
         deactivate_missing.assert_called_once()
+
+    def test_character_chat_opening_prompt_adds_formula_seed_without_scene(self):
+        module = load_module()
+
+        prompt = module.build_character_chat_opening_user_prompt(
+            scope_key="character:백이현",
+            target={"display_name": "백이현", "aliases": ["백이현"], "is_protagonist": True},
+            profile_payload={"display_name": "백이현", "speech_style": {"tone": "단호"}},
+            example_payload={"examples": [{"episode_no": 1, "text": "움직여."}]},
+            internal_prompt_payload={"internal_prompt": "백이현은 먼저 움직인다."},
+            summary_context_lines=["[1화] 백이현이 봉인 문서를 확인한다."],
+            scene_context_lines=[],
+        )
+
+        self.assertIn("[오프닝 전략]\nformula_backed", prompt)
+        self.assertIn("[formula-backed 공식 seed]", prompt)
+        self.assertIn("FORMULA_PUBLIC_TEST_FLIP", prompt)
+        self.assertIn("새 proper noun", prompt)
+        self.assertIn("narration은 최소 220자", module.CHARACTER_CHAT_OPENING_SYSTEM)
+
+    async def test_character_chat_opening_build_allows_formula_backed_without_scene(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:백이현"
+        profile_payload = {
+            "character_key": scope_key,
+            "display_name": "백이현",
+            "aliases": ["백이현"],
+            "speech_style": {"tone": "단호"},
+        }
+        example_payload = {
+            "character_key": scope_key,
+            "examples": [{"episode_no": 1, "text": "나는 여기서 물러서지 않을 거야."}],
+        }
+        internal_prompt_payload = {"internal_prompt": "[핵심 정체성] 백이현은 먼저 단서를 확인한다."}
+        opening_payload = {
+            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
+            "opening_strategy": "formula_backed",
+            "chat_target": {"scope_key": scope_key, "display_name": "백이현"},
+            "opening_scene": {"situation": "봉인 문서가 놓인 방 앞에서 새 흔적이 발견된다."},
+            "opening_message": {
+                "narration": "낮은 등잔불이 문틀 아래의 젖은 자국을 비추고, 백이현은 아직 문을 열지 않은 채 손끝으로 봉인 끈의 끊어진 방향을 가늠한다. 복도 너머의 발소리는 한 번 가까워졌다가 멎고, 방 안쪽에서는 종이가 긁히는 듯한 마른 소리가 아주 짧게 새어 나온다. 그는 먼저 문고리를 잡지 않고, 끊어진 끈과 바닥의 물자국 사이에 시선을 고정한다. 지금 잘못 열면 안쪽 기록이 망가지고, 너무 늦으면 발소리의 주인을 놓칠 수 있다. 백이현은 어깨를 낮추고 다음 움직임을 고른다.",
+                "dialogue": "\"문 아래 물자국과 끊어진 봉인 끈 중 하나를 먼저 봐. 나는 문이 안쪽에서 열린 건지 확인할게.\"",
+                "opening_text": "낮은 등잔불이 문틀 아래의 젖은 자국을 비추고, 백이현은 아직 문을 열지 않은 채 손끝으로 봉인 끈의 끊어진 방향을 가늠한다. 복도 너머의 발소리는 한 번 가까워졌다가 멎고, 방 안쪽에서는 종이가 긁히는 듯한 마른 소리가 아주 짧게 새어 나온다. 그는 먼저 문고리를 잡지 않고, 끊어진 끈과 바닥의 물자국 사이에 시선을 고정한다. 지금 잘못 열면 안쪽 기록이 망가지고, 너무 늦으면 발소리의 주인을 놓칠 수 있다. 백이현은 어깨를 낮추고 다음 움직임을 고른다.\n\n\"문 아래 물자국과 끊어진 봉인 끈 중 하나를 먼저 봐. 나는 문이 안쪽에서 열린 건지 확인할게.\"",
+                "user_objective": "문 아래 물자국 또는 끊어진 봉인 끈 중 하나를 확인한다.",
+            },
+            "user_role": {"role_type": "현장 보조자"},
+            "character_drive": {"immediate_objective": "봉인 훼손의 방향을 확인한다."},
+            "agency_contract": {"character_moves_first": True},
+            "progression_engine": {"short_term_goal": "문이 열린 방향과 남은 단서를 확인한다."},
+            "runtime_formula_seed": {
+                "formula_type": "FORMULA_CASE_TO_NETWORK",
+                "p_to_user_request": "문 아래 물자국과 봉인 끈 중 하나를 먼저 확인하게 한다.",
+                "user_task_type": "UT_INSPECT_CLUE",
+                "user_task_success_condition": "유저가 물자국 또는 봉인 끈 중 하나를 확인한다.",
+                "protagonist_state_delta": "백이현이 문을 여는 순서와 추적 방향을 고른다.",
+                "open_loop": "문 안쪽 기록을 건드린 사람이 가까이에 있다.",
+                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+            },
+        }
+        state_maps = {
+            "character_rp_profile": {
+                scope_key: {"scope_key": scope_key, "source_hash": "profile-hash", "payload": profile_payload}
+            },
+            "character_rp_examples": {
+                scope_key: {"scope_key": scope_key, "source_hash": "examples-hash", "payload": example_payload}
+            },
+            "character_chat_internal_prompt": {
+                scope_key: {"scope_key": scope_key, "source_hash": "internal-hash", "payload": internal_prompt_payload}
+            },
+            "character_chat_opening_v1": {},
+        }
+        request_mock = AsyncMock(return_value=opening_payload)
+        upserted = []
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return 78, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(module, "request_character_chat_opening_payload", request_mock), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert), \
+             patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
+            counts = await module.build_character_chat_opening_summaries(
+                conn=conn,
+                product_id=687,
+                episode_rows=[],
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "source_character_keys": ["protagonist:named:백이현"],
+                        "display_name": "백이현",
+                        "aliases": ["백이현"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 3,
+                        "voice_evidence_count": 6,
+                        "public_chat_eligible": True,
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts, (1, 0))
+        request_mock.assert_awaited_once()
+        self.assertEqual(request_mock.await_args.kwargs["scene_context_lines"], [])
+        self.assertEqual(len(upserted), 1)
+        self.assertEqual(upserted[0]["source_doc_count"], 1)
+        saved_payload = json.loads(upserted[0]["summary_text"])
+        self.assertEqual(saved_payload["opening_strategy"], "formula_backed")
+        self.assertEqual(saved_payload["chat_target"]["scope_key"], scope_key)
+        deactivate_missing.assert_called_once()
+
+    def test_character_chat_readiness_allows_formula_backed_opening_without_scene(self):
+        module = load_module()
+        scope_key = "character:백이현"
+        narration = (
+            "낮은 등잔불이 문틀 아래의 젖은 자국을 비추고, 백이현은 아직 문을 열지 않은 채 손끝으로 봉인 끈의 끊어진 방향을 가늠한다. "
+            "복도 너머의 발소리는 한 번 가까워졌다가 멎고, 방 안쪽에서는 종이가 긁히는 듯한 마른 소리가 아주 짧게 새어 나온다. "
+            "그는 먼저 문고리를 잡지 않고, 끊어진 끈과 바닥의 물자국 사이에 시선을 고정한다. 지금 잘못 열면 안쪽 기록이 망가지고, "
+            "너무 늦으면 발소리의 주인을 놓칠 수 있다. 백이현은 어깨를 낮추고 다음 움직임을 고른다."
+        )
+        dialogue = '"문 아래 물자국과 끊어진 봉인 끈 중 하나를 먼저 봐. 나는 문이 안쪽에서 열린 건지 확인할게."'
+        opening_payload = {
+            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
+            "opening_strategy": "formula_backed",
+            "chat_target": {"scope_key": scope_key, "display_name": "백이현"},
+            "opening_scene": {"situation": "봉인 문서 앞에서 새 흔적이 발견된다."},
+            "opening_message": {
+                "narration": narration,
+                "dialogue": dialogue,
+                "opening_text": f"{narration}\n\n{dialogue}",
+                "user_objective": "문 아래 물자국 또는 끊어진 봉인 끈 중 하나를 확인한다.",
+            },
+            "user_role": {"role_type": "현장 보조자"},
+            "character_drive": {"immediate_objective": "봉인 훼손의 방향을 확인한다."},
+            "agency_contract": {"character_moves_first": True},
+            "progression_engine": {"short_term_goal": "문이 열린 방향과 남은 단서를 확인한다."},
+            "runtime_formula_seed": {
+                "formula_type": "FORMULA_CASE_TO_NETWORK",
+                "p_to_user_request": "문 아래 물자국과 봉인 끈 중 하나를 먼저 확인하게 한다.",
+                "user_task_type": "UT_INSPECT_CLUE",
+                "user_task_success_condition": "유저가 물자국 또는 봉인 끈 중 하나를 확인한다.",
+                "protagonist_state_delta": "백이현이 문을 여는 순서와 추적 방향을 고른다.",
+                "open_loop": "문 안쪽 기록을 건드린 사람이 가까이에 있다.",
+                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+            },
+        }
+
+        readiness = module.build_character_chat_asset_readiness_verification(
+            product_id=687,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    {
+                        "scope_key": scope_key,
+                        "summary_text": json.dumps(
+                            {
+                                "canonical_character_key": scope_key,
+                                "display_name": "백이현",
+                                "public_chat_eligible": True,
+                                "public_slot_eligible": True,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+                "character_rp_profile": [{"scope_key": scope_key, "summary_text": "{}"}],
+                "character_rp_examples": [{"scope_key": scope_key, "summary_text": "{}"}],
+                "character_chat_internal_prompt": [{"scope_key": scope_key, "summary_text": "{}"}],
+                "character_chat_opening_v1": [
+                    {"scope_key": scope_key, "summary_text": json.dumps(opening_payload, ensure_ascii=False)}
+                ],
+            },
+        )
+
+        self.assertEqual(readiness["character_chat_status"], "ready")
+        self.assertEqual(readiness["ready_public_candidate_count"], 1)
+        self.assertEqual(readiness["missing_usable_scene_scope_keys"], [scope_key])
+        self.assertNotIn("missing_usable_scene", readiness["block_reason_counts"])
+        self.assertEqual(readiness["warning_reason_counts"], {"scene_enrichment_missing": 1})
+        self.assertEqual(readiness["public_candidates"][0]["warning_reasons"], ["scene_enrichment_missing"])
+
+    def test_character_chat_readiness_still_blocks_scene_backed_opening_without_scene(self):
+        module = load_module()
+        scope_key = "character:백이현"
+        narration = (
+            "봉인된 문서가 놓인 탁자 위로 낮은 등잔불이 흔들리고, 백이현은 손끝에 묻은 먹물을 닦지 않은 채 서류의 끊어진 끈을 내려다본다. "
+            "창밖에서는 발소리가 한 번 가까워졌다가 멎고, 젖은 종이 냄새와 식은 쇠 냄새가 좁은 방 안에 가라앉는다. "
+            "백이현은 먼저 문서 가장자리의 찢어진 방향을 확인하고, 봉인이 깨진 시점을 가늠하듯 숨을 낮춘다. 지금 봉인을 다시 묶으면 "
+            "안쪽 기록이 사라질 수 있고, 문밖의 기척을 놓치면 누가 이 일을 벌였는지 알 수 없게 된다."
+        )
+        dialogue = '"문서의 끈이 끊어진 방향과 문밖 발소리 중 하나를 먼저 확인해야 해. 어느 쪽이 더 급하다고 보지?"'
+        opening_payload = {
+            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
+            "opening_strategy": "scene_backed",
+            "chat_target": {"scope_key": scope_key, "display_name": "백이현"},
+            "opening_scene": {"situation": "봉인 문서 앞"},
+            "opening_message": {
+                "narration": narration,
+                "dialogue": dialogue,
+                "opening_text": f"{narration}\n\n{dialogue}",
+                "user_objective": "문서의 끈 방향을 볼지 문밖 발소리를 확인할지 선택한다.",
+            },
+            "user_role": {"role_type": "임시 조력자"},
+            "character_drive": {"immediate_objective": "봉인된 문서가 훼손된 이유를 확인한다."},
+            "agency_contract": {"character_moves_first": True},
+            "progression_engine": {"short_term_goal": "문서 훼손 단서를 확인한다."},
+            "runtime_formula_seed": {
+                "formula_type": "FORMULA_CASE_TO_NETWORK",
+                "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
+                "user_task_type": "UT_INSPECT_CLUE",
+                "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
+                "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
+                "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
+                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+            },
+        }
+
+        readiness = module.build_character_chat_asset_readiness_verification(
+            product_id=687,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    {
+                        "scope_key": scope_key,
+                        "summary_text": json.dumps(
+                            {
+                                "canonical_character_key": scope_key,
+                                "display_name": "백이현",
+                                "public_chat_eligible": True,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+                "character_rp_profile": [{"scope_key": scope_key, "summary_text": "{}"}],
+                "character_rp_examples": [{"scope_key": scope_key, "summary_text": "{}"}],
+                "character_chat_internal_prompt": [{"scope_key": scope_key, "summary_text": "{}"}],
+                "character_chat_opening_v1": [
+                    {"scope_key": scope_key, "summary_text": json.dumps(opening_payload, ensure_ascii=False)}
+                ],
+            },
+        )
+
+        self.assertEqual(readiness["character_chat_status"], "hold")
+        self.assertEqual(readiness["ready_public_candidate_count"], 0)
+        self.assertEqual(readiness["missing_usable_scene_scope_keys"], [scope_key])
+        self.assertEqual(readiness["block_reason_counts"], {"missing_usable_scene": 1})
+        self.assertEqual(readiness["warning_reason_counts"], {})
 
     async def test_character_chat_opening_phase_timeout_stops_without_cleanup(self):
         module = load_module()
