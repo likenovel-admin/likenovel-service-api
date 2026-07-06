@@ -186,6 +186,16 @@ class FakeStatusErrorAsyncClient:
 
 
 class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
+    def test_character_chat_extraction_defaults_use_verified_models(self):
+        module = load_module()
+
+        self.assertEqual(module.EPISODE_SUMMARY_MODEL, "deepseek/deepseek-v3.2")
+        self.assertEqual(module.EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL, "deepseek/deepseek-v3.2")
+        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL, "deepseek/deepseek-v4-pro")
+        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS, 10000)
+        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS, 120.0)
+        self.assertEqual(module.RP_OPENROUTER_MODEL, "google/gemma-4-31b-it")
+
     async def test_apply_preflights_openrouter_payment_before_product_lock(self):
         module = load_module()
         client = FakeStatusErrorAsyncClient(402)
