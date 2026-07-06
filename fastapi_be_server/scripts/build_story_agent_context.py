@@ -1521,6 +1521,7 @@ async def request_character_chat_asset_openrouter_json_payload(
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
             ),
+            timeout=CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS,
         ),
         timeout=CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS,
     )
@@ -6848,7 +6849,7 @@ async def build_character_chat_opening_summaries(
     cleanup_missing_scopes: bool = True,
     verbose: bool = False,
 ) -> tuple[int, int]:
-    if summary_client is None or not OPENROUTER_API_KEY or not EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL:
+    if summary_client is None or not OPENROUTER_API_KEY or not CHARACTER_CHAT_ASSET_OPENROUTER_MODEL:
         return 0, 0
 
     with work_cursor(conn) as cur:
@@ -6884,6 +6885,8 @@ async def build_character_chat_opening_summaries(
     inserted_count = 0
     reused_count = 0
     valid_scope_keys: set[str] = set()
+    phase_deadline = asyncio.get_running_loop().time() + CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS
+    phase_timed_out = False
     for scope_key, inventory_item in sorted((inventory_map or {}).items()):
         scope_key = str(scope_key or "").strip()
         if not scope_key:
@@ -6955,19 +6958,39 @@ async def build_character_chat_opening_summaries(
             reused_count += 1
             continue
 
+        remaining_seconds = phase_deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            phase_timed_out = True
+            if verbose:
+                print(f"[character-chat-opening-stop] product_id={product_id} reason=phase_timeout")
+            break
         try:
-            opening_payload = await request_character_chat_opening_payload(
-                summary_client,
-                scope_key=scope_key,
-                target=target,
-                profile_payload=profile_payload,
-                example_payload=example_payload,
-                internal_prompt_payload=internal_prompt_payload,
-                summary_context_lines=summary_context_lines,
-                inventory_item=inventory_item,
-                relation_context_lines=relation_context_lines,
-                scene_context_lines=scene_context_lines,
+            opening_payload = await asyncio.wait_for(
+                request_character_chat_opening_payload(
+                    summary_client,
+                    scope_key=scope_key,
+                    target=target,
+                    profile_payload=profile_payload,
+                    example_payload=example_payload,
+                    internal_prompt_payload=internal_prompt_payload,
+                    summary_context_lines=summary_context_lines,
+                    inventory_item=inventory_item,
+                    relation_context_lines=relation_context_lines,
+                    scene_context_lines=scene_context_lines,
+                ),
+                timeout=remaining_seconds,
             )
+        except asyncio.TimeoutError as exc:
+            phase_timed_out = True
+            logger.warning(
+                "story_agent_character_chat_opening_phase_timeout product_id=%s scope_key=%s error=%s",
+                product_id,
+                scope_key,
+                str(exc)[:200],
+            )
+            if verbose:
+                print(f"[character-chat-opening-stop] product_id={product_id} character={scope_key} reason=phase_timeout")
+            break
         except Exception as exc:
             logger.warning(
                 "story_agent_character_chat_opening_keep_old product_id=%s scope_key=%s error=%s",
@@ -6998,7 +7021,7 @@ async def build_character_chat_opening_summaries(
         else:
             reused_count += 1
 
-    if cleanup_missing_scopes and (inserted_count + reused_count) > 0:
+    if cleanup_missing_scopes and not phase_timed_out and (inserted_count + reused_count) > 0:
         with work_cursor(conn) as cur:
             deactivate_missing_active_scopes(cur, product_id, "character_chat_opening_v1", valid_scope_keys)
         conn.commit()

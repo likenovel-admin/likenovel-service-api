@@ -1263,7 +1263,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"), \
              patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
-             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY", ""):
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY", ""), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS", 7.5):
             payload = await module.request_character_chat_opening_payload(
                 client,
                 scope_key="character:루벤세이린",
@@ -1279,6 +1280,26 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(request_json["model"], "deepseek/deepseek-v4-pro")
         self.assertNotIn("provider", request_json)
         self.assertEqual(request_json["response_format"], {"type": "json_object"})
+        self.assertEqual(client.calls[0]["timeout"], 7.5)
+
+    async def test_character_chat_asset_openrouter_timeout_does_not_hang(self):
+        module = load_module()
+        client = FakeHangingOpenRouterClient()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS", 0.01):
+            with self.assertRaises(asyncio.TimeoutError):
+                await module.request_character_chat_asset_openrouter_json_payload(
+                    client,
+                    system_prompt="system",
+                    user_prompt="user",
+                    max_tokens=128,
+                    title="LikeNovel Story Agent Character Chat Opening Batch",
+                )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["timeout"], 0.01)
 
     async def test_rp_openrouter_rejects_free_model_variant_before_network_call(self):
         module = load_module()
@@ -1841,6 +1862,86 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         saved_payload = json.loads(upserted[0]["summary_text"])
         self.assertEqual(saved_payload["chat_target"]["scope_key"], scope_key)
         deactivate_missing.assert_called_once()
+
+    async def test_character_chat_opening_phase_timeout_stops_without_cleanup(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_keys = ["character:백이현", "character:강서윤"]
+        state_maps = {
+            "character_rp_profile": {
+                scope_key: {
+                    "scope_key": scope_key,
+                    "source_hash": f"profile-{scope_key}",
+                    "payload": {"display_name": scope_key.rsplit(":", 1)[-1], "speech_style": {"tone": "단호"}},
+                }
+                for scope_key in scope_keys
+            },
+            "character_rp_examples": {
+                scope_key: {
+                    "scope_key": scope_key,
+                    "source_hash": f"examples-{scope_key}",
+                    "payload": {"examples": [{"episode_no": 1, "text": "움직여."}]},
+                }
+                for scope_key in scope_keys
+            },
+            "character_chat_internal_prompt": {
+                scope_key: {
+                    "scope_key": scope_key,
+                    "source_hash": f"internal-{scope_key}",
+                    "payload": {"internal_prompt": "캐릭터가 먼저 장면을 전진시킨다."},
+                }
+                for scope_key in scope_keys
+            },
+        }
+
+        async def hang_request(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        request_mock = AsyncMock(side_effect=hang_request)
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", ""), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS", 0.01), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(module, "request_character_chat_opening_payload", request_mock), \
+             patch.object(
+                 module,
+                 "load_character_chat_scene_context_lines_by_scope",
+                 return_value={scope_key: ["- 1화 장면1: 압력=문앞 발소리 | hook=방향 확인"] for scope_key in scope_keys},
+             ), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary") as upsert_mock, \
+             patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
+            counts = await module.build_character_chat_opening_summaries(
+                conn=conn,
+                product_id=687,
+                episode_rows=[],
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "display_name": scope_key.rsplit(":", 1)[-1],
+                        "aliases": [scope_key.rsplit(":", 1)[-1]],
+                        "entity_kind": "person",
+                        "distinct_episode_count": 3,
+                        "voice_evidence_count": 5,
+                        "public_chat_eligible": True,
+                    }
+                    for scope_key in scope_keys
+                },
+                relation_map={},
+                verbose=True,
+            )
+
+        self.assertEqual(counts, (0, 0))
+        self.assertEqual(request_mock.await_count, 1)
+        upsert_mock.assert_not_called()
+        deactivate_missing.assert_not_called()
 
     def test_opening_payload_normalization_rejects_scope_mismatch(self):
         module = load_module()
