@@ -1209,6 +1209,15 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "character_drive": {"immediate_objective": "문서의 흔적을 확인한다."},
             "agency_contract": {"character_moves_first": True},
             "progression_engine": {"short_term_goal": "봉인 문서를 확인한다."},
+            "runtime_formula_seed": {
+                "formula_type": "FORMULA_CASE_TO_NETWORK",
+                "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
+                "user_task_type": "UT_INSPECT_CLUE",
+                "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
+                "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
+                "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
+                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+            },
         }
         state_maps = {
             "character_rp_profile": {
@@ -1301,7 +1310,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         self.assertIsNone(normalized)
 
-    async def test_character_chat_opening_reuses_existing_summary_before_llm_call(self):
+    async def test_character_chat_opening_regenerates_legacy_summary_without_runtime_formula_seed(self):
         module = load_module()
         conn = FakeConnection()
         scope_key = "character:백이현"
@@ -1346,9 +1355,24 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "agency_contract": {"character_moves_first": True},
             "progression_engine": {"short_term_goal": "문서 훼손 단서를 확인한다."},
         }
+        regenerated_opening_payload = dict(existing_opening_payload)
+        regenerated_opening_payload["runtime_formula_seed"] = {
+            "formula_type": "FORMULA_CASE_TO_NETWORK",
+            "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
+            "user_task_type": "UT_INSPECT_CLUE",
+            "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
+            "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
+            "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
+            "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+        }
+        upserted = []
 
         def fake_fetch_state_map(*, summary_type, **_kwargs):
             return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return 92, True
 
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
@@ -1359,10 +1383,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                  return_value={"summary_id": 91, "summary_text": json.dumps(existing_opening_payload, ensure_ascii=False)},
              ), \
              patch.object(module, "activate_existing_summary") as activate_existing, \
-             patch.object(module, "request_character_chat_opening_payload", AsyncMock()) as request_mock, \
+             patch.object(module, "request_character_chat_opening_payload", AsyncMock(return_value=regenerated_opening_payload)) as request_mock, \
              patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["- 1화 장면1: 압력=문서 봉인"]}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "upsert_summary") as upsert_mock, \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert) as upsert_mock, \
              patch.object(module, "deactivate_missing_active_scopes"):
             counts = await module.build_character_chat_opening_summaries(
                 conn=conn,
@@ -1382,10 +1406,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 relation_map={},
             )
 
-        self.assertEqual(counts, (0, 1))
-        request_mock.assert_not_called()
-        upsert_mock.assert_not_called()
-        activate_existing.assert_called_once()
+        self.assertEqual(counts, (1, 0))
+        request_mock.assert_awaited_once()
+        upsert_mock.assert_called_once()
+        activate_existing.assert_not_called()
+        self.assertEqual(json.loads(upserted[0]["summary_text"])["runtime_formula_seed"]["user_task_type"], "UT_INSPECT_CLUE")
 
     async def test_rp_build_preserves_keep_old_scope_when_another_v3_target_succeeds(self):
         module = load_module()

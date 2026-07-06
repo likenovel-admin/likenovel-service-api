@@ -153,6 +153,15 @@ class _FakeRpContextDb:
                                 "progression_engine": {
                                     "scene_exit_condition": "문틈 단서를 확인하고 다음 행동으로 넘어간다.",
                                 },
+                                "runtime_formula_seed": {
+                                    "formula_type": "FORMULA_PUBLIC_TEST_FLIP",
+                                    "p_to_user_request": "문을 열지 그림자를 확인할지 고르게 한다.",
+                                    "user_task_type": "UT_INSPECT_CLUE",
+                                    "user_task_success_condition": "유저가 문 또는 그림자 중 하나를 선택한다.",
+                                    "protagonist_state_delta": "아델리트가 선택된 단서를 기준으로 문 앞 대응을 바꾼다.",
+                                    "open_loop": "문 안쪽의 움직임이 다음 압박으로 남는다.",
+                                    "mutation_policy": "MP_SAME_PRESSURE_NEW_ROUTE",
+                                },
                             },
                             ensure_ascii=False,
                         ),

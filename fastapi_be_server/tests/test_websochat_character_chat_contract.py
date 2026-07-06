@@ -180,6 +180,15 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
                     "canon_safe_expansion": {
                         "safe_new_event_pattern": "복도에서 파생된 작은 방해",
                     },
+                    "runtime_formula_seed": {
+                        "formula_type": "FORMULA_COMBAT_PATTERN_BREAK",
+                        "p_to_user_request": "문틈 아래 흔적과 발소리 중 먼저 확인할 대상을 고르게 한다.",
+                        "user_task_type": "UT_INSPECT_CLUE",
+                        "user_task_success_condition": "유저가 흔적 또는 발소리 중 하나를 선택한다.",
+                        "protagonist_state_delta": "데시가 선택된 단서를 기준으로 다음 방 진입 방식을 바꾼다.",
+                        "open_loop": "문 안쪽의 금속음이 다음 압박으로 남는다.",
+                        "mutation_policy": "MP_SAME_HAZARD_NEW_LOCATION",
+                    },
                 },
                 "session_memory": {
                     "session_kind": "character_chat",
@@ -202,6 +211,11 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
         self.assertIn("character_moves_first", prompt)
         self.assertIn("scene_exit_condition", prompt)
         self.assertIn("canon_safe_expansion", prompt)
+        self.assertIn("[캐릭터챗 런타임 전개 공식]", prompt)
+        self.assertIn("FORMULA_COMBAT_PATTERN_BREAK", prompt)
+        self.assertIn("UT_INSPECT_CLUE", prompt)
+        self.assertIn("protagonist_state_delta", prompt)
+        self.assertIn("mutation_policy", prompt)
         self.assertIn("캐릭터 운용 원칙", prompt)
         self.assertIn("[대화 운영 상태]", prompt)
         self.assertIn('"schema_version": "runtime_turn_state_v1"', prompt)
@@ -320,6 +334,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
         )
 
         self.assertNotIn("[캐릭터챗 응답 계약]", prompt)
+        self.assertNotIn("[캐릭터챗 런타임 전개 공식]", prompt)
         self.assertNotIn("[대화 운영 상태]", prompt)
         self.assertIn("지문은 필요할 때만 0~1문장", prompt)
 
@@ -458,6 +473,42 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
 
         self.assertFalse(ready)
 
+    def test_character_chat_context_rejects_opening_without_runtime_formula_seed(self):
+        ready = _is_websochat_character_chat_rp_context_ready(
+            resolved_active_character="character:신미아:dup:be14d6b7",
+            profile={
+                "character_key": "character:신미아:dup:be14d6b7",
+                "display_name": "신미아",
+            },
+            examples_payload={
+                "character_key": "character:신미아:dup:be14d6b7",
+                "examples": [{"text": "가자."}],
+            },
+            internal_prompt_payload={
+                "character_key": "character:신미아:dup:be14d6b7",
+                "internal_prompt": "[핵심 정체성] 신미아",
+            },
+            internal_prompt="[핵심 정체성] 신미아",
+            inventory_payload={
+                "display_name": "신미아",
+                "public_chat_eligible": True,
+                "display_safety": {"status": "pass"},
+            },
+            opening_payload={
+                "chat_target": {"scope_key": "character:신미아:dup:be14d6b7"},
+                "readiness": {"status": "ready"},
+                "opening_scene": {"situation": "신미아가 먼저 움직인다."},
+                "opening_message": {
+                    "narration": "어두운 통로의 기척이 한순간 끊기고, 신미아는 손끝에 걸린 작은 표식을 확인한다. 닫힌 문 안쪽에서 낮은 마찰음이 이어지고, 천장 틈으로 떨어진 먼지가 등불 가장자리에서 희미하게 흩어진다. 신미아는 먼저 벽에 남은 표식의 방향만 천천히 맞춘다. 표식은 안쪽이 아니라 옆 통로의 낮은 배수구 쪽으로 이어져 있고, 그 아래에서 누군가 금속을 긁는 듯한 소리가 끊긴다. 지금 문을 열면 소리의 주인을 놓치고, 배수구를 확인하면 안쪽의 움직임이 먼저 반응할 수 있다.",
+                    "dialogue": "\"지금 열면 안 돼. 저 표식이 어느 쪽으로 이어지는지 먼저 확인해야 해.\"",
+                    "opening_text": "어두운 통로의 기척이 한순간 끊기고, 신미아는 손끝에 걸린 작은 표식을 확인한다. 닫힌 문 안쪽에서 낮은 마찰음이 이어지고, 천장 틈으로 떨어진 먼지가 등불 가장자리에서 희미하게 흩어진다. 신미아는 먼저 벽에 남은 표식의 방향만 천천히 맞춘다. 표식은 안쪽이 아니라 옆 통로의 낮은 배수구 쪽으로 이어져 있고, 그 아래에서 누군가 금속을 긁는 듯한 소리가 끊긴다. 지금 문을 열면 소리의 주인을 놓치고, 배수구를 확인하면 안쪽의 움직임이 먼저 반응할 수 있다.\n\n\"지금 열면 안 돼. 저 표식이 어느 쪽으로 이어지는지 먼저 확인해야 해.\"",
+                    "user_objective": "표식의 방향을 확인할지 문 안쪽 소리를 먼저 들을지 선택한다.",
+                },
+            },
+        )
+
+        self.assertFalse(ready)
+
     def test_character_chat_context_accepts_exact_identity_bundle(self):
         ready = _is_websochat_character_chat_rp_context_ready(
             resolved_active_character="character:신미아:dup:be14d6b7",
@@ -488,6 +539,15 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
                     "dialogue": "\"지금 열면 안 돼. 저 표식이 어느 쪽으로 이어지는지 먼저 확인해야 해.\"",
                     "opening_text": "어두운 통로의 기척이 한순간 끊기고, 신미아는 손끝에 걸린 작은 표식을 확인한다. 닫힌 문 안쪽에서 낮은 마찰음이 이어지고, 천장 틈으로 떨어진 먼지가 등불 가장자리에서 희미하게 흩어진다. 신미아는 먼저 문턱 앞에 무릎을 낮추지 않고, 벽에 남은 표식의 방향만 천천히 맞춘다. 표식은 안쪽이 아니라 옆 통로의 낮은 배수구 쪽으로 이어져 있고, 그 아래에서 누군가 금속을 긁는 듯한 소리가 끊긴다. 지금 문을 열면 소리의 주인을 놓치고, 배수구를 확인하면 안쪽의 움직임이 먼저 반응할 수 있다.\n\n\"지금 열면 안 돼. 저 표식이 어느 쪽으로 이어지는지 먼저 확인해야 해.\"",
                     "user_objective": "표식의 방향을 확인할지 문 안쪽 소리를 먼저 들을지 선택한다.",
+                },
+                "runtime_formula_seed": {
+                    "formula_type": "FORMULA_CASE_TO_NETWORK",
+                    "p_to_user_request": "표식 방향과 문 안쪽 소리 중 먼저 확인할 대상을 고르게 한다.",
+                    "user_task_type": "UT_INSPECT_CLUE",
+                    "user_task_success_condition": "유저가 표식 또는 소리 중 하나를 선택한다.",
+                    "protagonist_state_delta": "신미아가 선택된 단서를 기준으로 이동 경로를 바꾼다.",
+                    "open_loop": "배수구 아래 금속음이 다음 압박으로 남는다.",
+                    "mutation_policy": "MP_SAME_CASE_NEW_SCOPE",
                 },
             },
         )

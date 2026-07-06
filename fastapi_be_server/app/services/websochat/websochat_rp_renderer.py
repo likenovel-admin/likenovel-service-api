@@ -41,6 +41,7 @@ def _compact_character_chat_opening_asset(payload: dict[str, Any]) -> dict[str, 
         "character_drive",
         "agency_contract",
         "progression_engine",
+        "runtime_formula_seed",
         "user_affordance_contract",
         "canon_safe_expansion",
         "progression",
@@ -302,6 +303,11 @@ def build_websochat_rp_system_prompt(
     character_chat_opening = _compact_character_chat_opening_asset(
         rp_context.get("character_chat_opening") or {}
     )
+    runtime_formula_seed = (
+        character_chat_opening.get("runtime_formula_seed")
+        if isinstance(character_chat_opening.get("runtime_formula_seed"), dict)
+        else {}
+    )
     scene_lines: list[str] = []
     if str(rp_context.get("rp_mode") or "") == "scene":
         scene_summary = str(rp_context.get("scene_summary_text") or "").strip()
@@ -346,6 +352,19 @@ def build_websochat_rp_system_prompt(
                 "- 자산에 없는 원작 미래 사건이나 사용자의 신체/행동/소지품은 새로 만들지 마라.",
             ],
         )
+    if is_character_chat_session and runtime_formula_seed:
+        _append_prompt_block(
+            blocks,
+            "캐릭터챗 런타임 전개 공식",
+            [
+                json.dumps(runtime_formula_seed, ensure_ascii=False, sort_keys=True),
+                "- 이 블록은 장면을 앞으로 미는 엔진이다. 작품 설정 설명이나 연구용 분류로 노출하지 마라.",
+                "- p_to_user_request와 user_task_success_condition을 사용해 유저에게 1~3턴 안에 답할 수 있는 구체 작업을 제시하라.",
+                "- 사용자가 응답하면 protagonist_state_delta로 캐릭터의 다음 행동/판단을 전환하고, open_loop로 다음 3~5턴의 새 변수나 압박을 남겨라.",
+                "- 원작 장면을 그대로 재연하지 말고 mutation_policy에 맞는 같은 세계의 곁가지 사건으로 변형하라.",
+                "- 유저가 짧게 답하거나 망설여도 같은 질문을 반복하지 말고 단서, 반응, 시간 압박, 작은 방해 중 하나를 더해 진행하라.",
+            ],
+        )
     _append_prompt_block(
         blocks,
         "역할 고정",
@@ -377,6 +396,7 @@ def build_websochat_rp_system_prompt(
             [
                 json.dumps(runtime_turn_state, ensure_ascii=False, sort_keys=True),
                 "- next_required_move를 이번 응답에 반드시 하나 반영하라.",
+                "- 캐릭터챗 런타임 전개 공식이 있으면 next_required_move는 그 공식의 user task, protagonist state delta, open loop 중 하나를 전진시키는 방식으로 반영하라.",
                 "- stall_count가 2 이상이면 같은 질문을 반복하지 말고 상태 변화, 작은 방해, 새 단서, 관계 반응 중 하나로 장면을 움직여라.",
                 "- asks_lore는 작품 해설로 길게 답하지 말고 캐릭터가 알 법한 말만 짧게 답한 뒤 현재 장면 압력으로 복귀하라.",
             ],

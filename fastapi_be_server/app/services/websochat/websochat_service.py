@@ -4280,6 +4280,28 @@ def _is_websochat_summary_payload_scope_compatible(
     return payload_scope_key == expected_scope_key
 
 
+_WEBSOCHAT_CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS = (
+    "formula_type",
+    "p_to_user_request",
+    "user_task_type",
+    "user_task_success_condition",
+    "protagonist_state_delta",
+    "open_loop",
+    "mutation_policy",
+)
+
+
+def _is_websochat_character_chat_runtime_formula_seed_compatible(
+    value: Any,
+) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    return all(
+        bool(str(value.get(field_name) or "").strip())
+        for field_name in _WEBSOCHAT_CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS
+    )
+
+
 def _is_websochat_character_chat_opening_payload_compatible(
     payload: dict[str, Any] | None,
     *,
@@ -4303,6 +4325,10 @@ def _is_websochat_character_chat_opening_payload_compatible(
         return False
     readiness = payload.get("readiness")
     if isinstance(readiness, dict) and str(readiness.get("status") or "").strip() not in ("", "ready"):
+        return False
+    if not _is_websochat_character_chat_runtime_formula_seed_compatible(
+        payload.get("runtime_formula_seed")
+    ):
         return False
     opening_message = payload.get("opening_message")
     if not isinstance(opening_message, dict):
