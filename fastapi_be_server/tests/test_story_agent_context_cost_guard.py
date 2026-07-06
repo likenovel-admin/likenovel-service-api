@@ -1802,6 +1802,125 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["deactivated_examples_count"], 0)
         deactivate_scope.assert_not_called()
 
+    async def test_delta_rp_build_migrates_legacy_source_assets_to_canonical_scope(self):
+        module = load_module()
+        conn = FakeConnection()
+        episode_texts_by_no = {
+            8: "\n".join(
+                [
+                    '원유성이 짧게 말했다. "진짜 개쩔었어, 방금."',
+                    '원유성이 웃으며 말했다. "형님! 형님이 앞으로 제 롤모델입니다!"',
+                    '원유성이 고개를 끄덕였다. "채민아, 너 오늘 정말 멋졌어. 칭찬받을 만해."',
+                ]
+            )
+        }
+        weak_profile_payload = {
+            "speech_style": {"tone": ["다정한"]},
+            "personality_core": ["배려심"],
+            "baseline_attitude": "무난",
+            "example_dialogues": ["진짜 개쩔었어, 방금."],
+        }
+        legacy_profile_payload = {
+            "character_key": "protagonist:first_person",
+            "display_name": "원유성",
+            "aliases": ["원유성", "주인공"],
+            "speech_style": {"tone": ["차분한"], "formality": "상황따라"},
+            "personality_core": ["상처를 안고 있음", "친구에게 솔직함"],
+            "baseline_attitude": "친근",
+        }
+        legacy_example_payload = {
+            "character_key": "protagonist:first_person",
+            "examples": [
+                {"episode_no": 5, "source_kind": "dialogue", "text": "우리 친구 아니었냐?", "confidence": 0.9},
+                {"episode_no": 8, "source_kind": "dialogue", "text": "진짜 개쩔었어, 방금.", "confidence": 0.9},
+                {"episode_no": 8, "source_kind": "dialogue", "text": "형님! 형님이 앞으로 제 롤모델입니다!", "confidence": 0.9},
+            ],
+        }
+        rule_items = [
+            {"episode_no": 8, "kind": "dialogue", "text": "진짜 개쩔었어, 방금.", "example_score": 8},
+            {"episode_no": 8, "kind": "dialogue", "text": "형님! 형님이 앞으로 제 롤모델입니다!", "example_score": 8},
+            {"episode_no": 8, "kind": "dialogue", "text": "채민아, 너 오늘 정말 멋졌어.", "example_score": 8},
+        ]
+        internal_prompt_mock = AsyncMock(return_value={"internal_prompt": "원유성은 장면 안에서 먼저 행동한다."})
+        upserted = []
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            if summary_type == "character_rp_profile":
+                return {
+                    "protagonist:first_person": {
+                        "scope_key": "protagonist:first_person",
+                        "source_hash": "legacy-profile",
+                        "payload": legacy_profile_payload,
+                    }
+                }
+            if summary_type == "character_rp_examples":
+                return {
+                    "protagonist:first_person": {
+                        "scope_key": "protagonist:first_person",
+                        "source_hash": "legacy-examples",
+                        "payload": legacy_example_payload,
+                    }
+                }
+            return {}
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return len(upserted), True
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": True}), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=rule_items), \
+             patch.object(module, "select_rp_example_texts", return_value=["진짜 개쩔었어, 방금."]), \
+             patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=weak_profile_payload)), \
+             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={"character:원유성": ["[8화] 압력=무대 직후 | hook=평가 확인"]}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=2007,
+                affected_scope_keys={"character:원유성"},
+                episode_rows=[],
+                episode_texts_by_no=episode_texts_by_no,
+                summary_client=object(),
+                inventory_map={
+                    "character:원유성": {
+                        "canonical_character_key": "character:원유성",
+                        "source_character_keys": ["protagonist:first_person", "named:원유성"],
+                        "display_name": "원유성",
+                        "aliases": ["원유성"],
+                        "entity_kind": "person",
+                        "is_protagonist": True,
+                        "work_role": "main_protagonist",
+                        "public_chat_eligible": True,
+                        "public_slot_eligible": True,
+                        "distinct_episode_count": 7,
+                        "evidence_episode_nos": [3, 4, 5, 6, 7, 8, 9],
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual([item["summary_type"] for item in upserted], [
+            "character_rp_profile",
+            "character_rp_examples",
+            "character_chat_internal_prompt",
+        ])
+        self.assertEqual(upserted[0]["scope_key"], "character:원유성")
+        self.assertEqual(upserted[1]["scope_key"], "character:원유성")
+        profile_payload = json.loads(upserted[0]["summary_text"])
+        example_payload = json.loads(upserted[1]["summary_text"])
+        self.assertEqual(profile_payload["character_key"], "character:원유성")
+        self.assertEqual(profile_payload["display_name"], "원유성")
+        self.assertEqual(example_payload["character_key"], "character:원유성")
+        self.assertEqual(len(example_payload["examples"]), 3)
+        self.assertEqual(internal_prompt_mock.await_args.kwargs["profile_payload"]["speech_style"], legacy_profile_payload["speech_style"])
+        self.assertEqual(internal_prompt_mock.await_args.kwargs["example_payload"]["character_key"], "character:원유성")
+
     async def test_delta_rp_build_uses_rule_dialogue_when_direct_limited_but_profile_ready(self):
         module = load_module()
         conn = FakeConnection()
