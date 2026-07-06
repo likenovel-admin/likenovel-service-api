@@ -2381,6 +2381,41 @@ def build_signal_repair_episode_id_set(cur, *, product_id: int, product_rows: li
     return repair_episode_ids
 
 
+def build_character_inventory_evidence_episode_id_set(
+    cur,
+    *,
+    product_id: int,
+    product_rows: list[dict],
+    scope_keys: set[str],
+) -> set[int]:
+    normalized_scope_keys = {str(scope_key or "").strip() for scope_key in scope_keys if str(scope_key or "").strip()}
+    if not normalized_scope_keys:
+        return set()
+    inventory_map = fetch_active_character_inventory_map(
+        cur,
+        product_id=product_id,
+        summary_type="character_inventory_v3",
+    )
+    evidence_episode_nos: set[int] = set()
+    for scope_key in normalized_scope_keys:
+        inventory_item = dict(inventory_map.get(scope_key) or {})
+        for value in list(inventory_item.get("evidence_episode_nos") or []):
+            try:
+                episode_no = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if episode_no > 0:
+                evidence_episode_nos.add(episode_no)
+    if not evidence_episode_nos:
+        return set()
+    return {
+        int(row.get("episode_id") or 0)
+        for row in product_rows
+        if int(row.get("episode_id") or 0) > 0
+        and int(row.get("episode_no") or 0) in evidence_episode_nos
+    }
+
+
 def build_character_chat_asset_repair_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
     readiness = fetch_character_chat_asset_readiness_verification(
         cur,
@@ -2404,11 +2439,18 @@ def build_character_chat_asset_repair_episode_id_set(cur, *, product_id: int, pr
     }
     if not any(int(block_reasons.get(reason) or 0) > 0 for reason in repair_reasons):
         return set()
-    return {
+    all_episode_ids = {
         int(row.get("episode_id") or 0)
         for row in product_rows
         if int(row.get("episode_id") or 0) > 0
     }
+    evidence_episode_ids = build_character_inventory_evidence_episode_id_set(
+        cur,
+        product_id=product_id,
+        product_rows=product_rows,
+        scope_keys=collect_character_chat_asset_repair_scope_keys(readiness),
+    )
+    return evidence_episode_ids or all_episode_ids
 
 
 def build_character_chat_scene_repair_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
@@ -2423,11 +2465,23 @@ def build_character_chat_scene_repair_episode_id_set(cur, *, product_id: int, pr
     block_reasons = dict(readiness.get("block_reason_counts") or {})
     if int(block_reasons.get("missing_usable_scene") or 0) <= 0:
         return set()
-    return {
+    all_episode_ids = {
         int(row.get("episode_id") or 0)
         for row in product_rows
         if int(row.get("episode_id") or 0) > 0
     }
+    missing_scope_keys = {
+        str(scope_key or "").strip()
+        for scope_key in list(readiness.get("missing_usable_scene_scope_keys") or [])
+        if str(scope_key or "").strip()
+    }
+    evidence_episode_ids = build_character_inventory_evidence_episode_id_set(
+        cur,
+        product_id=product_id,
+        product_rows=product_rows,
+        scope_keys=missing_scope_keys,
+    )
+    return evidence_episode_ids or all_episode_ids
 
 
 def delta_episode_sort_key(row: dict) -> tuple[int, int]:
@@ -6279,8 +6333,11 @@ async def build_rp_summaries(
         )
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
-        dialogue_items: list[dict[str, object]] = []
-        if not bool(direct_voice_quality.get("strict_chat_ready")):
+        dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
+        if (
+            not bool(direct_voice_quality.get("strict_chat_ready"))
+            and not is_rp_profile_dialogue_item_set_ready(dialogue_items, aliases)
+        ):
             try:
                 dialogue_items = await collect_llm_rp_dialogue_items(
                     summary_client,
@@ -6301,8 +6358,6 @@ async def build_rp_summaries(
                     str(direct_voice_quality.get("status") or "unknown"),
                 )
                 continue
-        else:
-            dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
         if not dialogue_items:
             logger.info(
                 "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
@@ -6593,9 +6648,12 @@ async def build_rp_summaries_delta(
             continue
 
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
-        dialogue_items: list[dict[str, object]] = []
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
-        if not bool(direct_voice_quality.get("strict_chat_ready")):
+        dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
+        if (
+            not bool(direct_voice_quality.get("strict_chat_ready"))
+            and not is_rp_profile_dialogue_item_set_ready(dialogue_items, aliases)
+        ):
             try:
                 dialogue_items = await collect_llm_rp_dialogue_items(
                     summary_client,
@@ -6617,8 +6675,6 @@ async def build_rp_summaries_delta(
                 )
                 counts["keep_old_dialogue_missing_count"] += 1
                 continue
-        else:
-            dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
 
         dialogue_items = dedupe_rp_dialogue_items(dialogue_items, limit=80)
         dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
@@ -13709,6 +13765,12 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
 
                     if args.apply and should_refresh_delta_rp(args) and is_character_chat_repair_only_rows(product_rows):
                         needs_scene_repair = has_character_chat_scene_repair_rows(product_rows)
+                        scene_repair_episode_nos = {
+                            int(row.get("episode_no") or 0)
+                            for row in product_rows
+                            if str(row.get("_delta_reason") or "").strip() == "character_chat_scene_repair"
+                            and int(row.get("episode_no") or 0) > 0
+                        }
                         with work_cursor(work_conn) as cur:
                             all_episode_summary_rows = fetch_active_summary_rows(
                                 cur=cur,
@@ -13719,7 +13781,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 cur,
                                 product_id=product_id,
                                 summary_type="episode_summary",
-                                episode_nos=touched_episode_nos,
+                                episode_nos=scene_repair_episode_nos,
                             )
                             episode_texts_by_no = fetch_active_episode_texts_by_no(
                                 cur,

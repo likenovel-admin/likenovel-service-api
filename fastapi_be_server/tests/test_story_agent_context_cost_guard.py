@@ -756,7 +756,13 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(module, "fetch_active_relation_inventory_map", return_value={}))
             stack.enter_context(patch.object(module, "build_canonical_relation_inventory_map", return_value={}))
             stack.enter_context(patch.object(module, "fetch_active_summary_state_map", return_value={}))
-            stack.enter_context(patch.object(module, "fetch_active_summary_rows_for_episode_nos", return_value=[{"episode_from": 1, "summary_text": "[1화] 루벤이 싸운다."}]))
+            def fake_fetch_summary_rows_for_episode_nos(cur, *, product_id, summary_type, episode_nos):
+                return [
+                    {"episode_from": int(episode_no), "summary_text": f"[{int(episode_no)}화] 루벤이 싸운다."}
+                    for episode_no in sorted(int(value) for value in episode_nos)
+                ]
+
+            stack.enter_context(patch.object(module, "fetch_active_summary_rows_for_episode_nos", side_effect=fake_fetch_summary_rows_for_episode_nos))
             stack.enter_context(patch.object(module, "fetch_active_summary_rows", return_value=[{"episode_from": 1, "summary_text": "[1화] 루벤이 싸운다."}]))
             stack.enter_context(patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "루벤이 말했다. \"움직여.\""}))
             stack.enter_context(patch.object(module, "fetch_product_context_status", return_value="ready"))
@@ -793,6 +799,13 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                         "episode_no": 1,
                         "title": "테스트 작품",
                         "_delta_reason": "character_chat_scene_repair",
+                    },
+                    {
+                        "product_id": 687,
+                        "episode_id": 1002,
+                        "episode_no": 2,
+                        "title": "테스트 작품",
+                        "_delta_reason": "character_chat_asset_repair",
                     }
                 ],
                 args,
@@ -801,6 +814,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         resolve_source.assert_not_awaited()
         signals.assert_not_awaited()
         scenes.assert_awaited_once()
+        self.assertEqual(
+            [row["episode_from"] for row in scenes.await_args.kwargs["episode_rows"]],
+            [1],
+        )
         inventory_v3.assert_not_called()
         rp_delta.assert_awaited_once()
         opening.assert_awaited_once()
@@ -1619,6 +1636,106 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["deactivated_profile_count"], 0)
         self.assertEqual(counts["deactivated_examples_count"], 0)
         deactivate_scope.assert_not_called()
+
+    async def test_delta_rp_build_uses_rule_dialogue_when_direct_limited_but_profile_ready(self):
+        module = load_module()
+        conn = FakeConnection()
+        episode_texts_by_no = {
+            1: "\n".join(
+                [
+                    '카론이 조심스레 물었다. "도련님, 아직 몸이 성치 않으십니다. 먼저 죽을 드셔야 합니다."',
+                    '카론이 작게 웃었다. "제가 곁에 있겠습니다. 저택 일은 걱정하지 마십시오."',
+                ]
+            ),
+            2: "\n".join(
+                [
+                    '카론이 고개를 숙였다. "허허, 도련님이 만족하셨으면 다행입니다. 더 필요한 것이 있으면 이 카론에게 말씀하십시오."',
+                    '카론이 화를 냈다. "감히 도련님께 무슨 망발이냐! 당장 물러서지 못하겠느냐!"',
+                ]
+            ),
+        }
+        target = {
+            "character_key": "character:카론",
+            "display_name": "카론",
+            "aliases": ["카론"],
+            "collection_rules": {"use_dialogue": True, "speaker_anchors": ["카론"]},
+        }
+        rule_items = [
+            {
+                "kind": "dialogue",
+                "episode_no": 1,
+                "context": "카론이 반을 돌본다.",
+                "text": "도련님, 아직 몸이 성치 않으십니다. 먼저 죽을 드셔야 합니다.",
+            },
+            {
+                "kind": "dialogue",
+                "episode_no": 1,
+                "context": "카론이 반 곁을 지킨다.",
+                "text": "제가 곁에 있겠습니다. 저택 일은 걱정하지 마십시오.",
+            },
+            {
+                "kind": "dialogue",
+                "episode_no": 2,
+                "context": "카론이 반을 보호한다.",
+                "text": "감히 도련님께 무슨 망발이냐! 당장 물러서지 못하겠느냐!",
+            },
+        ]
+
+        profile_payload = {
+            "speech_style": {"tone": "정중"},
+            "personality_core": ["충직"],
+            "baseline_attitude": "보호적",
+            "example_dialogues": [
+                "도련님, 아직 몸이 성치 않으십니다. 먼저 죽을 드셔야 합니다.",
+                "제가 곁에 있겠습니다. 저택 일은 걱정하지 마십시오.",
+                "감히 도련님께 무슨 망발이냐! 당장 물러서지 못하겠느냐!",
+            ],
+        }
+        llm_dialogue_mock = AsyncMock(return_value=[])
+        profile_mock = AsyncMock(return_value=profile_payload)
+        internal_prompt_mock = AsyncMock(return_value={"internal_prompt": "[현재 장면] 카론이 반을 보좌한다."})
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(
+                 module,
+                 "build_direct_voice_evidence_quality",
+                 return_value={"status": "direct_limited", "strict_chat_ready": False},
+             ), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=rule_items), \
+             patch.object(module, "collect_llm_rp_dialogue_items", llm_dialogue_mock), \
+             patch.object(module, "request_rp_profile_payload", profile_mock), \
+             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={"character:카론": []}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True), ({"summary_id": 3}, True)]):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=687,
+                affected_scope_keys={"character:카론"},
+                episode_rows=[],
+                episode_texts_by_no=episode_texts_by_no,
+                summary_client=object(),
+                inventory_map={
+                    "character:카론": {
+                        "canonical_character_key": "character:카론",
+                        "display_name": "카론",
+                        "aliases": ["카론"],
+                        "entity_kind": "person",
+                        "distinct_episode_count": 5,
+                        "voice_evidence_count": 7,
+                        "summary_mention_count": 10,
+                        "evidence_episode_nos": [1, 2],
+                    }
+                },
+                relation_map={},
+            )
+
+        llm_dialogue_mock.assert_not_awaited()
+        profile_mock.assert_awaited_once()
+        internal_prompt_mock.assert_awaited_once()
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
 
     async def test_character_chat_opening_build_upserts_exact_v3_scope_only(self):
         module = load_module()
@@ -7053,6 +7170,44 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
 
         self.assertEqual(repair_ids, {101, 102})
 
+    def test_character_chat_asset_repair_uses_inventory_evidence_episode_nos(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+            {"product_id": 687, "episode_id": 103, "episode_no": 3},
+            {"product_id": 687, "episode_id": 104, "episode_no": 4},
+        ]
+
+        with patch.object(
+            module,
+            "fetch_character_chat_asset_readiness_verification",
+            return_value={
+                "character_chat_status": "hold",
+                "public_candidate_count": 1,
+                "ready_public_candidate_count": 0,
+                "missing_profile_scope_keys": ["character:카론"],
+                "missing_examples_scope_keys": ["character:카론"],
+                "missing_internal_prompt_scope_keys": ["character:카론"],
+                "missing_opening_scope_keys": ["character:카론"],
+                "block_reason_counts": {"missing_profile": 1, "missing_examples": 1},
+            },
+        ), \
+             patch.object(
+                 module,
+                 "fetch_active_character_inventory_map",
+                 return_value={"character:카론": {"evidence_episode_nos": [1, 3]}},
+             ), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_total_episode_count", return_value=4):
+            repair_ids = module.build_character_chat_asset_repair_episode_id_set(
+                object(),
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, {101, 103})
+
     def test_character_chat_scene_repair_requires_missing_usable_scene(self):
         module = load_module()
         rows = [
@@ -7070,6 +7225,83 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
                 "block_reason_counts": {"missing_usable_scene": 1},
             },
         ), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_total_episode_count", return_value=2):
+            repair_ids = module.build_character_chat_scene_repair_episode_id_set(
+                object(),
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, {101, 102})
+
+    def test_character_chat_scene_repair_uses_inventory_evidence_episode_nos(self):
+        module = load_module()
+        cur = object()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+            {"product_id": 687, "episode_id": 103, "episode_no": 3},
+            {"product_id": 687, "episode_id": 104, "episode_no": 4},
+        ]
+
+        with patch.object(
+            module,
+            "fetch_character_chat_asset_readiness_verification",
+            return_value={
+                "character_chat_status": "hold",
+                "public_candidate_count": 2,
+                "ready_public_candidate_count": 0,
+                "missing_usable_scene_scope_keys": ["character:반", "character:카론"],
+                "block_reason_counts": {"missing_usable_scene": 2},
+            },
+        ), \
+             patch.object(
+                 module,
+                 "fetch_active_character_inventory_map",
+                 return_value={
+                     "character:반": {"evidence_episode_nos": [1, 3]},
+                     "character:카론": {"evidence_episode_nos": [2]},
+                 },
+             ) as inventory_map, \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_total_episode_count", return_value=4):
+            repair_ids = module.build_character_chat_scene_repair_episode_id_set(
+                cur,
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, {101, 102, 103})
+        inventory_map.assert_called_once_with(
+            cur,
+            product_id=687,
+            summary_type="character_inventory_v3",
+        )
+
+    def test_character_chat_scene_repair_keeps_full_scope_without_inventory_evidence(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(
+            module,
+            "fetch_character_chat_asset_readiness_verification",
+            return_value={
+                "character_chat_status": "hold",
+                "public_candidate_count": 1,
+                "ready_public_candidate_count": 0,
+                "missing_usable_scene_scope_keys": ["character:반"],
+                "block_reason_counts": {"missing_usable_scene": 1},
+            },
+        ), \
+             patch.object(
+                 module,
+                 "fetch_active_character_inventory_map",
+                 return_value={"character:반": {"evidence_episode_nos": []}},
+             ), \
              patch.object(module, "fetch_product_context_status", return_value="ready"), \
              patch.object(module, "fetch_total_episode_count", return_value=2):
             repair_ids = module.build_character_chat_scene_repair_episode_id_set(
