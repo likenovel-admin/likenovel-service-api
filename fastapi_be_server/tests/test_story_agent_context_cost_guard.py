@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import tempfile
-from contextlib import contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
@@ -124,9 +124,25 @@ class FakeRowsCursor:
         return self.rows
 
 
+class FakeEmptyCursor:
+    def __init__(self):
+        self.query = ""
+        self.params = None
+
+    def execute(self, query, params=None):
+        self.query = query
+        self.params = params
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
 @contextmanager
 def fake_work_cursor(_conn):
-    yield object()
+    yield FakeEmptyCursor()
 
 
 class FakeResponse:
@@ -190,11 +206,14 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         module = load_module()
 
         self.assertEqual(module.EPISODE_SUMMARY_MODEL, "deepseek/deepseek-v3.2")
-        self.assertEqual(module.EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL, "deepseek/deepseek-v3.2")
+        self.assertEqual(module.EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL, "google/gemma-4-31b-it")
         self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL, "deepseek/deepseek-v4-pro")
         self.assertEqual(module.EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS, 10000)
         self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS, 120.0)
         self.assertEqual(module.RP_OPENROUTER_MODEL, "google/gemma-4-31b-it")
+        self.assertEqual(module.CHARACTER_CHAT_ASSET_OPENROUTER_MODEL, "deepseek/deepseek-v4-pro")
+        self.assertEqual(module.CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY, "")
+        self.assertEqual(module.CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS, 120.0)
 
     async def test_apply_preflights_openrouter_payment_before_product_lock(self):
         module = load_module()
@@ -490,6 +509,225 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         deactivate_scope.assert_not_called()
         self.assertEqual(conn.commit_count, 0)
 
+    def test_episode_character_signal_quality_regression_detects_voice_loss(self):
+        module = load_module()
+        old_payload = {
+            "episode_no": 1,
+            "mentioned_characters": [
+                signal_character(
+                    character_key="protagonist:named:루벤",
+                    display_name="루벤",
+                    is_protagonist=True,
+                    scene_weight="high",
+                    role_in_episode="lead",
+                    voice_mode="dialogue",
+                    relation_edges=[
+                        {"target_label": "란", "relation_tag": "보호", "direction": "to_target"},
+                    ],
+                )
+            ],
+            "cliffhanger_hooks": [],
+        }
+        new_payload = module.normalize_episode_character_signals_payload(
+            {
+                "mentioned_characters": [
+                    {
+                        "display_name": "루벤",
+                        "is_protagonist": True,
+                        "is_work_protagonist": True,
+                    }
+                ],
+                "cliffhanger_hooks": [],
+            },
+            episode_no=1,
+        )
+
+        self.assertTrue(
+            module.is_episode_character_signals_quality_regression(
+                old_payload=old_payload,
+                new_payload=new_payload,
+            )
+        )
+
+    def test_episode_character_signal_quality_regression_protects_counterpart_voice(self):
+        module = load_module()
+        old_payload = {
+            "episode_no": 4,
+            "mentioned_characters": [
+                signal_character(
+                    character_key="named:란",
+                    display_name="란",
+                    scene_weight="high",
+                    role_in_episode="counterpart",
+                    voice_mode="dialogue",
+                )
+            ],
+            "cliffhanger_hooks": [],
+        }
+        new_payload = module.normalize_episode_character_signals_payload(
+            {
+                "mentioned_characters": [
+                    {
+                        "display_name": "란",
+                    }
+                ],
+                "cliffhanger_hooks": [],
+            },
+            episode_no=4,
+        )
+
+        self.assertTrue(
+            module.is_episode_character_signals_quality_regression(
+                old_payload=old_payload,
+                new_payload=new_payload,
+            )
+        )
+
+    async def test_episode_character_signal_quality_regression_keeps_old_active_row(self):
+        module = load_module()
+        conn = FakeConnection()
+        row = {
+            "summary_id": 777,
+            "scope_key": "episode:1001",
+            "episode_from": 1,
+            "source_hash": "episode-summary-hash-new",
+            "summary_text": "[1화] 전투\n주인공이 란을 지킨다.",
+        }
+        old_payload = {
+            "episode_no": 1,
+            "mentioned_characters": [
+                signal_character(
+                    character_key="protagonist:named:루벤",
+                    display_name="루벤",
+                    is_protagonist=True,
+                    scene_weight="high",
+                    role_in_episode="lead",
+                    voice_mode="dialogue",
+                    relation_edges=[
+                        {"target_label": "란", "relation_tag": "보호", "direction": "to_target"},
+                    ],
+                )
+            ],
+            "cliffhanger_hooks": [],
+        }
+        request_mock = AsyncMock(
+            return_value={
+                "mentioned_characters": [
+                    {
+                        "display_name": "루벤",
+                        "is_protagonist": True,
+                        "is_work_protagonist": True,
+                    }
+                ],
+                "cliffhanger_hooks": [],
+            }
+        )
+
+        with patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "is_episode_character_signals_provider_available", return_value=True), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(
+                 module,
+                 "fetch_active_summary_row_by_scope",
+                 return_value={"summary_id": 123, "summary_text": json.dumps(old_payload, ensure_ascii=False)},
+             ), \
+             patch.object(module, "request_episode_character_signals_payload", request_mock), \
+             patch.object(module, "upsert_summary", return_value=(999, True)) as upsert:
+            inserted, reused = await module.build_episode_character_signals_summaries(
+                conn,
+                product_id=687,
+                episode_rows=[row],
+                summary_client=object(),
+                cleanup_missing_scopes=False,
+                verbose=True,
+            )
+
+        self.assertEqual((inserted, reused), (0, 1))
+        request_mock.assert_awaited_once()
+        upsert.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
+
+    async def test_delta_character_chat_asset_repair_fast_path_skips_foundation_rebuild(self):
+        module = load_module()
+        conn = FakeConnection()
+        args = SimpleNamespace(apply=True, verbose=False, use_epub_fallback=False, refresh_rp=True)
+        rp_counts = module.build_empty_delta_rp_counts()
+        rp_counts["profile"][1] = 1
+        rp_counts["examples"][1] = 1
+        status_row = {
+            "product_id": 687,
+            "context_status": "ready",
+            "total_episode_count": 10,
+            "ready_episode_count": 10,
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(module, "OPENROUTER_API_KEY", ""))
+            stack.enter_context(patch.object(module.settings, "ANTHROPIC_API_KEY", ""))
+            stack.enter_context(patch.object(module, "DEEPSEEK_API_KEY", ""))
+            stack.enter_context(patch.object(module, "db_connect", return_value=conn))
+            stack.enter_context(patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())))
+            stack.enter_context(patch.object(module, "work_cursor", fake_work_cursor))
+            stack.enter_context(patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()))
+            stack.enter_context(patch.object(module, "fetch_total_episode_count", return_value=10))
+            stack.enter_context(patch.object(module, "fetch_active_character_inventory_map", return_value={"character:루벤": {"display_name": "루벤"}}))
+            stack.enter_context(patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_relation_inventory_map", return_value={}))
+            stack.enter_context(patch.object(module, "build_canonical_relation_inventory_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_summary_state_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_summary_rows_for_episode_nos", return_value=[]))
+            stack.enter_context(patch.object(module, "fetch_active_summary_rows", return_value=[]))
+            stack.enter_context(patch.object(module, "fetch_active_episode_texts_by_no", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_product_context_status", return_value="ready"))
+            stack.enter_context(
+                patch.object(
+                    module,
+                    "fetch_character_chat_asset_readiness_verification",
+                    return_value={
+                        "character_chat_status": "hold",
+                        "public_candidate_count": 1,
+                        "ready_public_candidate_count": 0,
+                        "missing_internal_prompt_scope_keys": ["character:루벤"],
+                        "missing_opening_scope_keys": ["character:루벤"],
+                        "block_reason_counts": {"missing_internal_prompt": 1, "missing_character_chat_opening": 1},
+                    },
+                )
+            )
+            rp_delta = stack.enter_context(patch.object(module, "build_rp_summaries_delta", AsyncMock(return_value=rp_counts)))
+            opening = stack.enter_context(patch.object(module, "build_character_chat_opening_summaries", AsyncMock(return_value=(1, 0))))
+            stack.enter_context(patch.object(module, "refresh_product_context_status", return_value=status_row))
+            stack.enter_context(patch.object(module, "attach_character_chat_asset_readiness_to_status_row", side_effect=lambda cur, row: row))
+            stack.enter_context(patch.object(module, "build_delta_inventory_verification", return_value={"product_id": 687}))
+            stack.enter_context(patch.object(module, "build_rp_delta_verification", return_value={"affected_scope_keys": ["character:루벤"]}))
+            resolve_source = stack.enter_context(patch.object(module, "resolve_source_payload", AsyncMock()))
+            signals = stack.enter_context(patch.object(module, "build_episode_character_signals_summaries", AsyncMock(return_value=(0, 0))))
+            scenes = stack.enter_context(patch.object(module, "build_episode_scene_extraction_summaries", AsyncMock(return_value=(0, 0))))
+            inventory_v3 = stack.enter_context(patch.object(module, "build_character_inventory_v3_summaries", return_value=(0, 0)))
+            results = await module.build_context_rows_delta(
+                [
+                    {
+                        "product_id": 687,
+                        "episode_id": 1001,
+                        "episode_no": 1,
+                        "title": "테스트 작품",
+                        "_delta_reason": "character_chat_asset_repair",
+                    }
+                ],
+                args,
+            )
+
+        resolve_source.assert_not_awaited()
+        signals.assert_not_awaited()
+        scenes.assert_not_awaited()
+        inventory_v3.assert_not_called()
+        rp_delta.assert_awaited_once()
+        opening.assert_awaited_once()
+        self.assertEqual(results["inserted_episode_character_signals"], 0)
+        self.assertEqual(results["inserted_episode_scene_extractions"], 0)
+        self.assertEqual(results["inserted_character_inventory_v3"], 0)
+        self.assertEqual(results["inserted_character_chat_openings"], 1)
+        self.assertEqual(results["products"], [status_row])
+
     async def test_episode_character_signals_keep_old_when_provider_unavailable(self):
         module = load_module()
         conn = FakeConnection()
@@ -702,7 +940,9 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "DEEPSEEK_API_KEY", "deepseek-key"), \
              patch.object(module, "RP_DEEPSEEK_FALLBACK_MODEL", "deepseek-v4-pro"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
-             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"):
+             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY", ""):
             line = module.build_storyctx_provider_summary_line()
 
         self.assertIn("episode_summary_provider=openrouter", line)
@@ -712,6 +952,9 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertIn("rp_profile_provider=openrouter", line)
         self.assertIn("rp_profile_model=google/gemma-4-31b-it", line)
         self.assertIn("rp_openrouter_provider_only=deepinfra,together", line)
+        self.assertIn("character_chat_asset_provider=openrouter", line)
+        self.assertIn("character_chat_asset_model=deepseek/deepseek-v4-pro", line)
+        self.assertIn("character_chat_asset_provider_only=none", line)
 
     def test_episode_summary_prompt_uses_episode_summary_input_cap(self):
         module = load_module()
@@ -833,6 +1076,110 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(request_json["reasoning"], {"effort": "none", "exclude": True})
         self.assertEqual(request_json["response_format"], {"type": "json_object"})
         self.assertNotIn(":free", request_json["model"])
+
+    async def test_character_chat_internal_prompt_uses_asset_model_without_rp_provider_limit(self):
+        module = load_module()
+        client = FakeOpenRouterClient(
+            {
+                "internal_prompt": "루벤은 원작 장면의 압력 안에서 먼저 행동을 제안한다. 짧은 입력에도 지문과 대사로 장면을 전진시킨다.",
+            }
+        )
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY", ""):
+            payload = await module.request_character_chat_internal_prompt_payload(
+                client,
+                target={"display_name": "루벤", "reference_name": "루벤 세이린", "aliases": ["루벤", "루벤 세이린"]},
+                profile_payload={
+                    "display_name": "루벤",
+                    "speech_style": {"tone": ["거친"], "formality": "반말"},
+                    "personality_core": ["냉정"],
+                    "baseline_attitude": "경계",
+                },
+                example_payload={"examples": [{"episode_no": 1, "text": "뒤로 물러서. 이번엔 내가 길을 열 테니까."}]},
+                dialogue_items=[{"kind": "dialogue", "episode_no": 1, "text": "뒤로 물러서. 이번엔 내가 길을 열 테니까."}],
+                summary_context_lines=["[1화] 루벤이 전투 상황을 주도한다."],
+            )
+
+        self.assertIn("루벤", payload["internal_prompt"])
+        self.assertEqual(len(client.calls), 1)
+        request_json = client.calls[0]["json"]
+        self.assertEqual(request_json["model"], "deepseek/deepseek-v4-pro")
+        self.assertNotIn("provider", request_json)
+        self.assertEqual(request_json["response_format"], {"type": "json_object"})
+
+    async def test_character_chat_opening_uses_asset_model_without_rp_provider_limit(self):
+        module = load_module()
+        client = FakeOpenRouterClient(
+            {
+                "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
+                "chat_target": {"scope_key": "character:루벤세이린", "display_name": "루벤", "aliases": ["루벤"]},
+                "opening_scene": {"situation": "전투 직후", "immediate_conflict": "추가 적 접근", "props_or_anchors": [], "nearby_characters": []},
+                "opening_message": {
+                    "narration": "전장 가장자리의 먼지가 아직 가라앉지 않았다. 루벤은 롱소드를 낮게 세운 채 숲 쪽의 움직임을 재고 있었다. 부러진 나뭇가지 사이로 검은 그림자가 하나 더 늘고, 쓰러진 해머 옆의 흙먼지가 다시 흔들렸다. 숲 안쪽에서 같은 박자의 발소리가 겹치자 루벤의 손목에 감긴 마나가 짧게 빛났다. 그는 정면의 적에게서 시선을 떼지 않은 채 검끝을 조금 낮췄다. 멀리서 금속 고리가 부딪히는 소리가 한 번 더 울렸다. 울타의 해머 아래 눌린 흙이 낮게 갈라졌다.",
+                    "dialogue": "저쪽 움직임을 확인해. 나는 정면을 막는다.",
+                    "opening_text": "전장 가장자리의 먼지가 아직 가라앉지 않았다. 루벤은 롱소드를 낮게 세운 채 숲 쪽의 움직임을 재고 있었다. 부러진 나뭇가지 사이로 검은 그림자가 하나 더 늘고, 쓰러진 해머 옆의 흙먼지가 다시 흔들렸다. 숲 안쪽에서 같은 박자의 발소리가 겹치자 루벤의 손목에 감긴 마나가 짧게 빛났다. 그는 정면의 적에게서 시선을 떼지 않은 채 검끝을 조금 낮췄다. 멀리서 금속 고리가 부딪히는 소리가 한 번 더 울렸다. 울타의 해머 아래 눌린 흙이 낮게 갈라졌다.\n\n\"저쪽 움직임을 확인해. 나는 정면을 막는다.\"",
+                    "user_objective": "숲 쪽 움직임을 짧게 확인한다.",
+                },
+                "user_role": {
+                    "role_type": "임시 조력자",
+                    "relationship_to_character": "낮은 신뢰의 협력자",
+                    "scene_entry_reason": "전투 현장에 같이 엮임",
+                    "first_turn_affordance": "숲 쪽 움직임을 보고한다.",
+                },
+                "character_drive": {
+                    "immediate_objective": "추가 적의 접근을 막는다.",
+                    "pressure": "포위망이 좁혀진다.",
+                    "longer_desire": "적의 힘의 출처를 확인한다.",
+                },
+                "agency_contract": {
+                    "character_moves_first": True,
+                    "non_user_dependent_action": "루벤이 정면의 적을 막는다.",
+                    "decision_character_must_make": "추가 적을 추격할지 제압할지 결정한다.",
+                    "user_influence_boundary": "접근 방향과 수를 알려 판단에 영향을 준다.",
+                },
+                "progression_engine": {
+                    "short_term_goal": "포위망 확인",
+                    "mid_term_escalation": "추가 적의 개입",
+                    "scene_exit_condition": "적의 방향이 확인됨",
+                },
+                "runtime_formula_seed": {
+                    "formula_type": "FORMULA_COMBAT_PATTERN_BREAK",
+                    "p_to_user_request": "숲 쪽 움직임을 확인한다.",
+                    "user_task_type": "UT_MONITOR_REACTION",
+                    "user_task_success_condition": "접근 방향을 말한다.",
+                    "protagonist_state_delta": "루벤이 정면과 측면 대응을 나눈다.",
+                    "open_loop": "새 적의 정체",
+                    "mutation_policy": "MP_SAME_HAZARD_NEW_LOCATION",
+                },
+                "user_affordance_contract": {"primary_affordances": [], "forbidden_agency_load": [], "safe_response_examples": []},
+                "canon_safe_expansion": {"safe_new_event_pattern": "작은 방해", "allowed_inventions": [], "forbidden_inventions": [], "must_preserve_facts": []},
+            }
+        )
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY", ""):
+            payload = await module.request_character_chat_opening_payload(
+                client,
+                scope_key="character:루벤세이린",
+                target={"display_name": "루벤", "reference_name": "루벤 세이린", "aliases": ["루벤", "루벤 세이린"]},
+                profile_payload={"display_name": "루벤", "speech_style": {}, "personality_core": ["냉정"], "baseline_attitude": "경계"},
+                example_payload={"examples": [{"episode_no": 1, "text": "저쪽 움직임을 확인해."}]},
+                internal_prompt_payload={"internal_prompt": "루벤은 전투 압력 속에서 먼저 행동한다."},
+                summary_context_lines=["[1화] 루벤이 울타를 제압한다."],
+            )
+
+        self.assertEqual(payload["readiness"]["status"], "ready")
+        request_json = client.calls[0]["json"]
+        self.assertEqual(request_json["model"], "deepseek/deepseek-v4-pro")
+        self.assertNotIn("provider", request_json)
+        self.assertEqual(request_json["response_format"], {"type": "json_object"})
 
     async def test_rp_openrouter_rejects_free_model_variant_before_network_call(self):
         module = load_module()
@@ -1853,6 +2200,47 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertFalse(module.has_enough_rp_example_texts(["첫 번째", "두 번째"]))
         self.assertTrue(module.has_enough_rp_example_texts(["첫 번째", "두 번째", "세 번째"]))
 
+    def test_rp_profile_dialogue_ready_accepts_compact_strong_examples(self):
+        module = load_module()
+        items = [
+            {
+                "kind": "dialogue",
+                "episode_no": 1,
+                "context": "루벤 세이린이 란을 막아선다.",
+                "text": "뒤로 물러서. 이번엔 내가 직접 길을 열 테니까.",
+            },
+            {
+                "kind": "dialogue",
+                "episode_no": 4,
+                "context": "루벤 세이린이 교수의 의도를 떠본다.",
+                "text": "그 말이 사실이라면, 당신은 처음부터 우리를 시험한 거군.",
+            },
+            {
+                "kind": "dialogue",
+                "episode_no": 9,
+                "context": "루벤 세이린이 전투 직전 결정을 내린다.",
+                "text": "망설일 시간 없어. 살아남으려면 지금 움직여야 해.",
+            },
+        ]
+        short_items = [
+            {"kind": "dialogue", "episode_no": 1, "text": "가자."},
+            {"kind": "dialogue", "episode_no": 2, "text": "그래."},
+            {"kind": "dialogue", "episode_no": 3, "text": "알겠어."},
+        ]
+
+        self.assertTrue(
+            module.is_rp_profile_dialogue_item_set_ready(
+                items,
+                ["루벤", "루벤 세이린"],
+            )
+        )
+        self.assertFalse(
+            module.is_rp_profile_dialogue_item_set_ready(
+                short_items,
+                ["루벤", "루벤 세이린"],
+            )
+        )
+
     def test_character_chat_context_richness_report_compares_prod_baseline_and_shadow(self):
         module = load_module()
         baseline = {
@@ -2087,6 +2475,45 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         }
 
         self.assertEqual(module.collect_rule_based_rp_dialogue_items(target, text), [])
+
+    def test_rp_target_aliases_drop_other_character_display_names(self):
+        module = load_module()
+        target = {
+            "display_name": "루벤",
+            "aliases": ["루벤", "루벤 세이린", "란", "호기"],
+            "collection_rules": {"speaker_anchors": ["루벤", "란", "호기"]},
+        }
+        inventory_map = {
+            "character:루벤세이린": {"display_name": "루벤"},
+            "character:란": {"display_name": "란"},
+            "character:호기": {"display_name": "호기"},
+        }
+
+        filtered = module.attach_competing_speaker_anchors(
+            target,
+            current_scope_key="character:루벤세이린",
+            inventory_map=inventory_map,
+        )
+
+        self.assertEqual(filtered["aliases"], ["루벤", "루벤 세이린"])
+        self.assertEqual(filtered["collection_rules"]["speaker_anchors"], ["루벤"])
+        self.assertIn("란", filtered["collection_rules"]["competing_speaker_anchors"])
+        self.assertIn("호기", filtered["collection_rules"]["competing_speaker_anchors"])
+
+    def test_inventory_rp_target_uses_scope_matching_alias_as_reference_name(self):
+        module = load_module()
+
+        target = module.build_inventory_rp_target(
+            scope_key="character:루벤세이린",
+            inventory_item={
+                "display_name": "루벤",
+                "aliases": ["루벤", "루벤 세이린"],
+                "is_protagonist": True,
+            },
+        )
+
+        self.assertEqual(target["display_name"], "루벤")
+        self.assertEqual(target["reference_name"], "루벤 세이린")
 
     def test_direct_voice_quality_does_not_count_unanchored_first_person_quotes(self):
         module = load_module()
@@ -6396,6 +6823,96 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
 
         self.assertEqual([row["episode_no"] for row in filtered], [2])
         self.assertEqual([row["_delta_reason"] for row in filtered], ["signal_repair"])
+
+    def test_delta_candidate_filter_skips_character_chat_asset_repair_without_refresh_rp(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value={101, 102}) as repair:
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=0)
+
+        self.assertEqual(filtered, [])
+        repair.assert_not_called()
+
+    def test_delta_candidate_filter_includes_character_chat_asset_repair_with_refresh_rp(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+            {"product_id": 687, "episode_id": 103, "episode_no": 3},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value={101, 102, 103}):
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=2, refresh_rp=True)
+
+        self.assertEqual([row["episode_no"] for row in filtered], [1, 2])
+        self.assertEqual(
+            [row["_delta_reason"] for row in filtered],
+            ["character_chat_asset_repair", "character_chat_asset_repair"],
+        )
+
+    def test_character_chat_asset_repair_requires_hold_with_missing_assets(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(
+            module,
+            "fetch_character_chat_asset_readiness_verification",
+            return_value={
+                "character_chat_status": "hold",
+                "public_candidate_count": 1,
+                "ready_public_candidate_count": 0,
+                "block_reason_counts": {"missing_character_chat_opening": 1},
+            },
+        ), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_total_episode_count", return_value=2):
+            repair_ids = module.build_character_chat_asset_repair_episode_id_set(
+                object(),
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, {101, 102})
+
+    def test_character_chat_asset_repair_keeps_partial_ready_product_repairable(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(
+            module,
+            "fetch_character_chat_asset_readiness_verification",
+            return_value={
+                "character_chat_status": "ready",
+                "public_candidate_count": 2,
+                "ready_public_candidate_count": 1,
+                "block_reason_counts": {"missing_internal_prompt": 1},
+            },
+        ), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_total_episode_count", return_value=2):
+            repair_ids = module.build_character_chat_asset_repair_episode_id_set(
+                object(),
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, {101, 102})
 
     def test_signal_repair_episode_id_set_uses_episode_character_signal_scope_keys(self):
         module = load_module()

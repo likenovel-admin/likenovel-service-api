@@ -69,7 +69,7 @@ RP_REASONING_THINKING_DISPLAY = (os.getenv("STORY_AGENT_RP_REASONING_THINKING_DI
 EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS", "2600"))
 EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL = (
     os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL", "").strip()
-    or EPISODE_SUMMARY_MODEL
+    or RP_OPENROUTER_MODEL
 )
 EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS = float(
     os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS", "60")
@@ -124,6 +124,18 @@ EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL = (
 )
 EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS = float(
     os.getenv("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS", "120")
+)
+CHARACTER_CHAT_ASSET_OPENROUTER_MODEL = (
+    os.getenv("STORY_AGENT_CHARACTER_CHAT_ASSET_OPENROUTER_MODEL", "").strip()
+    or EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL
+    or RP_OPENROUTER_MODEL
+)
+CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY = os.getenv(
+    "STORY_AGENT_CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY",
+    "",
+).strip()
+CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS = float(
+    os.getenv("STORY_AGENT_CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS", "120")
 )
 EPISODE_CHARACTER_SIGNALS_TOOL_NAME = "submit_episode_character_signals"
 EPISODE_SCENE_EXTRACTION_TOOL_NAME = "submit_episode_scene_extraction"
@@ -1363,6 +1375,15 @@ def require_paid_episode_scene_extraction_openrouter_model() -> str:
     return model
 
 
+def require_paid_character_chat_asset_openrouter_model() -> str:
+    model = str(CHARACTER_CHAT_ASSET_OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("STORY_AGENT_CHARACTER_CHAT_ASSET_OPENROUTER_MODEL is empty")
+    if model.lower().endswith(":free"):
+        raise RuntimeError("STORY_AGENT_CHARACTER_CHAT_ASSET_OPENROUTER_MODEL must not use :free")
+    return model
+
+
 def build_rp_openrouter_payload(
     *,
     system_prompt: str,
@@ -1381,6 +1402,33 @@ def build_rp_openrouter_payload(
         ],
     }
     provider_only = split_csv_values(RP_OPENROUTER_PROVIDER_ONLY)
+    if provider_only:
+        payload["provider"] = {
+            "only": provider_only,
+            "order": provider_only,
+            "allow_fallbacks": len(provider_only) > 1,
+        }
+    return payload
+
+
+def build_character_chat_asset_openrouter_payload(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model": require_paid_character_chat_asset_openrouter_model(),
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "reasoning": {"effort": "none", "exclude": True},
+        "messages": [
+            {"role": "system", "content": f"{system_prompt}\n\n반드시 유효한 JSON object만 반환하라."},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    provider_only = split_csv_values(CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY)
     if provider_only:
         payload["provider"] = {
             "only": provider_only,
@@ -1447,6 +1495,34 @@ async def request_rp_openrouter_json_payload(
             ),
         ),
         timeout=RP_OPENROUTER_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return extract_json_object(extract_openrouter_message_text(response.json()))
+
+
+async def request_character_chat_asset_openrouter_json_payload(
+    client: AsyncClient,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    title: str,
+) -> dict | None:
+    response = await asyncio.wait_for(
+        client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": title,
+            },
+            json=build_character_chat_asset_openrouter_payload(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+            ),
+        ),
+        timeout=CHARACTER_CHAT_ASSET_OPENROUTER_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return extract_json_object(extract_openrouter_message_text(response.json()))
@@ -1983,6 +2059,11 @@ def is_episode_character_signals_provider_available() -> bool:
 def build_storyctx_provider_summary_line() -> str:
     episode_summary_provider = "openrouter" if OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL else "local_fallback"
     rp_openrouter_provider = "openrouter" if OPENROUTER_API_KEY and RP_OPENROUTER_MODEL else "disabled"
+    character_chat_asset_provider = (
+        "openrouter"
+        if OPENROUTER_API_KEY and CHARACTER_CHAT_ASSET_OPENROUTER_MODEL
+        else "disabled"
+    )
     if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
         signal_provider = "anthropic"
         signal_model = RP_REASONING_MODEL
@@ -2023,7 +2104,10 @@ def build_storyctx_provider_summary_line() -> str:
         f"rp_character_plan_model={_log_value(RP_OPENROUTER_MODEL)} "
         f"rp_profile_provider={rp_openrouter_provider} "
         f"rp_profile_model={_log_value(RP_OPENROUTER_MODEL)} "
-        f"rp_openrouter_provider_only={_log_value(RP_OPENROUTER_PROVIDER_ONLY)}"
+        f"rp_openrouter_provider_only={_log_value(RP_OPENROUTER_PROVIDER_ONLY)} "
+        f"character_chat_asset_provider={character_chat_asset_provider} "
+        f"character_chat_asset_model={_log_value(CHARACTER_CHAT_ASSET_OPENROUTER_MODEL)} "
+        f"character_chat_asset_provider_only={_log_value(CHARACTER_CHAT_ASSET_OPENROUTER_PROVIDER_ONLY)}"
     )
 
 
@@ -2079,6 +2163,29 @@ def fetch_active_summary_rows(cur, product_id: int, summary_type: str) -> list[d
         (product_id, summary_type),
     )
     return list(cur.fetchall())
+
+
+def fetch_active_summary_row_by_scope(
+    cur,
+    *,
+    product_id: int,
+    summary_type: str,
+    scope_key: str,
+) -> dict | None:
+    cur.execute(
+        """
+        SELECT summary_id, scope_key, episode_from, episode_to, source_hash, summary_text
+          FROM tb_story_agent_context_summary
+         WHERE product_id = %s
+           AND summary_type = %s
+           AND scope_key = %s
+           AND is_active = 'Y'
+         ORDER BY summary_id DESC
+         LIMIT 1
+        """,
+        (product_id, summary_type, scope_key),
+    )
+    return cur.fetchone()
 
 
 def fetch_active_summary_rows_for_episode_nos(
@@ -2274,11 +2381,47 @@ def build_signal_repair_episode_id_set(cur, *, product_id: int, product_rows: li
     return repair_episode_ids
 
 
+def build_character_chat_asset_repair_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
+    readiness = fetch_character_chat_asset_readiness_verification(
+        cur,
+        product_id=product_id,
+        story_context_status=fetch_product_context_status(cur, product_id=product_id),
+        total_episode_count=fetch_total_episode_count(cur, product_id=product_id),
+    )
+    if int(readiness.get("public_candidate_count") or 0) <= 0:
+        return set()
+    if int(readiness.get("ready_public_candidate_count") or 0) >= int(readiness.get("public_candidate_count") or 0):
+        return set()
+    block_reasons = dict(readiness.get("block_reason_counts") or {})
+    repair_reasons = {
+        "legacy_profile_scope_key_mismatch",
+        "legacy_examples_scope_key_mismatch",
+        "missing_profile",
+        "missing_examples",
+        "missing_internal_prompt",
+        "missing_character_chat_opening",
+        "invalid_character_chat_opening",
+    }
+    if not any(int(block_reasons.get(reason) or 0) > 0 for reason in repair_reasons):
+        return set()
+    return {
+        int(row.get("episode_id") or 0)
+        for row in product_rows
+        if int(row.get("episode_id") or 0) > 0
+    }
+
+
 def delta_episode_sort_key(row: dict) -> tuple[int, int]:
     return (int(row.get("episode_no") or 0), int(row.get("episode_id") or 0))
 
 
-def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes: int = 0) -> list[dict]:
+def filter_delta_candidate_rows(
+    cur,
+    rows: Iterable[dict],
+    *,
+    max_delta_episodes: int = 0,
+    refresh_rp: bool = False,
+) -> list[dict]:
     rows_by_product: dict[int, list[dict]] = {}
     for row in rows:
         rows_by_product.setdefault(int(row["product_id"]), []).append(row)
@@ -2300,6 +2443,15 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
             product_id=product_id,
             product_rows=product_rows,
         )
+        character_chat_asset_repair_episode_ids = (
+            build_character_chat_asset_repair_episode_id_set(
+                cur,
+                product_id=product_id,
+                product_rows=product_rows,
+            )
+            if refresh_rp
+            else set()
+        )
         product_filtered_rows: list[dict] = []
         for row in sorted(product_rows, key=delta_episode_sort_key):
             episode_id = int(row.get("episode_id") or 0)
@@ -2314,6 +2466,10 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
             elif episode_id in signal_repair_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "signal_repair"
+                product_filtered_rows.append(next_row)
+            elif episode_id in character_chat_asset_repair_episode_ids:
+                next_row = dict(row)
+                next_row["_delta_reason"] = "character_chat_asset_repair"
                 product_filtered_rows.append(next_row)
         if max_delta_episodes > 0:
             product_filtered_rows = product_filtered_rows[:max_delta_episodes]
@@ -2373,6 +2529,39 @@ def build_delta_scope_plans(cur, rows: Iterable[dict]) -> list[DeltaBuildScopePl
             )
         )
     return plans
+
+
+def is_character_chat_asset_repair_only_rows(rows: Iterable[dict]) -> bool:
+    row_list = list(rows)
+    return bool(row_list) and all(
+        str(row.get("_delta_reason") or "").strip() == "character_chat_asset_repair"
+        for row in row_list
+    )
+
+
+def collect_character_chat_asset_repair_scope_keys(readiness: dict[str, object]) -> set[str]:
+    scope_keys: set[str] = set()
+    for field_name in (
+        "missing_profile_scope_keys",
+        "missing_examples_scope_keys",
+        "missing_internal_prompt_scope_keys",
+        "missing_opening_scope_keys",
+        "invalid_opening_scope_keys",
+        "legacy_profile_scope_key_mismatch_scope_keys",
+        "legacy_examples_scope_key_mismatch_scope_keys",
+    ):
+        scope_keys.update(
+            str(value or "").strip()
+            for value in list(readiness.get(field_name) or [])
+            if str(value or "").strip()
+        )
+    for candidate in list(readiness.get("public_candidates") or []):
+        if not isinstance(candidate, dict) or bool(candidate.get("ready")):
+            continue
+        scope_key = str(candidate.get("scope_key") or "").strip()
+        if scope_key:
+            scope_keys.add(scope_key)
+    return scope_keys
 
 
 def print_delta_scope_plans(plans: list[DeltaBuildScopePlan]) -> None:
@@ -3280,6 +3469,36 @@ def normalize_episode_character_signals_payload(
         "mentioned_characters": normalized_characters[:6],
         "cliffhanger_hooks": cliffhanger_hooks,
     }
+
+
+def score_episode_character_signals_payload_quality(payload: dict | None) -> int:
+    score = 0
+    for item in list((payload or {}).get("mentioned_characters") or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("character_key") or "").strip():
+            score += 2
+        if bool(item.get("is_protagonist")):
+            score += 4
+        if str(item.get("voice_mode") or "").strip().lower() in {"dialogue", "monologue"}:
+            score += 8
+        if str(item.get("scene_weight") or "").strip().lower() == "high":
+            score += 4
+        if str(item.get("role_in_episode") or "").strip().lower() in {"lead", "counterpart"}:
+            score += 3
+        score += min(len(list(item.get("relation_edges") or [])), 5) * 2
+        score += min(len(list(item.get("identity_claims") or [])), 4) * 2
+    return score
+
+
+def is_episode_character_signals_quality_regression(
+    *,
+    old_payload: dict | None,
+    new_payload: dict | None,
+) -> bool:
+    old_score = score_episode_character_signals_payload_quality(old_payload)
+    new_score = score_episode_character_signals_payload_quality(new_payload)
+    return old_score >= 16 and new_score <= max(8, old_score // 3)
 
 
 def build_rp_dialogue_collection_user_prompt(target: dict[str, object], normalized_text: str) -> str:
@@ -4573,6 +4792,17 @@ def is_strict_dialogue_item_set_ready(items: list[dict[str, object]], aliases: l
     )
 
 
+def is_rp_profile_dialogue_item_set_ready(items: list[dict[str, object]], aliases: list[str]) -> bool:
+    if is_strict_dialogue_item_set_ready(items, aliases):
+        return True
+    stats = build_voice_evidence_stats(items, aliases)
+    return (
+        int(stats["item_count"]) >= RP_PROFILE_MIN_EXAMPLE_TEXTS
+        and int(stats["example_count"]) >= RP_PROFILE_MIN_EXAMPLE_TEXTS
+        and int(stats["total_chars"]) >= 80
+    )
+
+
 def collect_rule_based_rp_dialogue_items_by_episode(
     target: dict[str, object],
     episode_texts_by_no: dict[int, str],
@@ -5070,7 +5300,7 @@ async def request_character_chat_internal_prompt_payload(
     relation_context_lines: list[str] | None = None,
     scene_context_lines: list[str] | None = None,
 ) -> dict[str, str] | None:
-    payload = await request_rp_openrouter_json_payload(
+    payload = await request_character_chat_asset_openrouter_json_payload(
         client,
         system_prompt=CHARACTER_CHAT_INTERNAL_PROMPT_SYSTEM,
         user_prompt=build_character_chat_internal_prompt_user_prompt(
@@ -5310,7 +5540,7 @@ async def request_character_chat_opening_payload(
     scene_context_lines: list[str] | None = None,
 ) -> dict[str, object] | None:
     display_name = str(target.get("display_name") or "").strip()
-    payload = await request_rp_openrouter_json_payload(
+    payload = await request_character_chat_asset_openrouter_json_payload(
         client,
         system_prompt=CHARACTER_CHAT_OPENING_SYSTEM,
         user_prompt=build_character_chat_opening_user_prompt(
@@ -5533,6 +5763,12 @@ def build_inventory_rp_target(
             aliases.append(alias_text)
     if is_protagonist and "주인공" not in aliases:
         aliases.append("주인공")
+    normalized_scope_label = normalize_signal_entity_label(str(scope_key).split(":", 1)[-1])
+    reference_name = display_name
+    for alias in aliases:
+        if normalize_signal_entity_label(alias) == normalized_scope_label:
+            reference_name = alias
+            break
     evidence_episode_nos = [
         int(value)
         for value in list(inventory_item.get("evidence_episode_nos") or [])
@@ -5541,7 +5777,7 @@ def build_inventory_rp_target(
     return {
         "character_key": scope_key,
         "display_name": display_name,
-        "reference_name": display_name,
+        "reference_name": reference_name,
         "is_protagonist": is_protagonist,
         "is_first_person": is_first_person,
         "aliases": aliases[:6],
@@ -5580,6 +5816,28 @@ def attach_competing_speaker_anchors(
 ) -> dict[str, object]:
     copied = dict(target)
     rules = dict(copied.get("collection_rules") or {})
+    blocked_alias_labels = {
+        normalize_signal_entity_label(str(item.get("display_name") or ""))
+        for scope_key, item in (inventory_map or {}).items()
+        if str(scope_key) != str(current_scope_key)
+        and normalize_signal_entity_label(str(item.get("display_name") or ""))
+    }
+    filtered_aliases: list[str] = []
+    for alias in list(copied.get("aliases") or []):
+        alias_text = str(alias or "").strip()
+        if not alias_text:
+            continue
+        alias_label = normalize_signal_entity_label(alias_text)
+        if alias_label in blocked_alias_labels:
+            continue
+        if alias_text not in filtered_aliases:
+            filtered_aliases.append(alias_text)
+    copied["aliases"] = filtered_aliases[:6]
+    rules["speaker_anchors"] = [
+        anchor
+        for anchor in list(rules.get("speaker_anchors") or [])
+        if normalize_signal_entity_label(str(anchor or "")) not in blocked_alias_labels
+    ][:6]
     target_anchors = {
         str(anchor).strip()
         for anchor in [copied.get("display_name"), *list(copied.get("aliases") or []), *list(rules.get("speaker_anchors") or [])]
@@ -5985,7 +6243,7 @@ async def build_rp_summaries(
                 if verbose:
                     print(f"[rp-dialogue-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
                 dialogue_items = []
-            if not is_strict_dialogue_item_set_ready(dialogue_items, aliases):
+            if not is_rp_profile_dialogue_item_set_ready(dialogue_items, aliases):
                 logger.info(
                     "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
                     product_id,
@@ -6300,7 +6558,7 @@ async def build_rp_summaries_delta(
                 if verbose:
                     print(f"[rp-delta-dialogue-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
                 dialogue_items = []
-            if not is_strict_dialogue_item_set_ready(dialogue_items, aliases):
+            if not is_rp_profile_dialogue_item_set_ready(dialogue_items, aliases):
                 logger.info(
                     "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
                     product_id,
@@ -6676,7 +6934,14 @@ async def build_episode_character_signals_summaries(
             ],
         )
         existing_summary_id = 0
+        active_summary_before = None
         with work_cursor(conn) as cur:
+            active_summary_before = fetch_active_summary_row_by_scope(
+                cur,
+                product_id=product_id,
+                summary_type="episode_character_signals",
+                scope_key=scope_key,
+            )
             existing = fetch_existing_summary(
                 cur=cur,
                 product_id=product_id,
@@ -6738,6 +7003,24 @@ async def build_episode_character_signals_summaries(
                 print(f"[character-signals-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
             continue
         normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
+        previous_payload = (
+            extract_json_object(str(active_summary_before.get("summary_text") or ""))
+            if active_summary_before
+            else None
+        )
+        if is_episode_character_signals_quality_regression(
+            old_payload=previous_payload,
+            new_payload=normalized_payload,
+        ):
+            if verbose:
+                print(
+                    f"[character-signals-keep-old] product_id={product_id} episode_no={episode_no} "
+                    "reason=quality_regression "
+                    f"old_score={score_episode_character_signals_payload_quality(previous_payload)} "
+                    f"new_score={score_episode_character_signals_payload_quality(normalized_payload)}"
+                )
+            reused_count += 1
+            continue
         with work_cursor(conn) as cur:
             _, inserted = upsert_summary(
                 cur,
@@ -13375,6 +13658,120 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             episode_nos=touched_episode_nos,
                         )
 
+                    if args.apply and should_refresh_delta_rp(args) and is_character_chat_asset_repair_only_rows(product_rows):
+                        with work_cursor(work_conn) as cur:
+                            all_episode_summary_rows = fetch_active_summary_rows(
+                                cur=cur,
+                                product_id=product_id,
+                                summary_type="episode_summary",
+                            )
+                            episode_texts_by_no = fetch_active_episode_texts_by_no(
+                                cur,
+                                product_id=product_id,
+                            )
+                            inventory_v3_map = fetch_active_character_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                                summary_type="character_inventory_v3",
+                            )
+                            relation_scope_map = fetch_active_relation_inventory_map(cur=cur, product_id=product_id)
+                            relation_scope_map = build_canonical_relation_inventory_map(
+                                relation_map=relation_scope_map,
+                                inventory_map=inventory_v3_map,
+                            )
+                            readiness = fetch_character_chat_asset_readiness_verification(
+                                cur,
+                                product_id=product_id,
+                                story_context_status=fetch_product_context_status(cur, product_id=product_id),
+                                total_episode_count=total_episode_count,
+                            )
+                        rp_affected_scope_keys = collect_character_chat_asset_repair_scope_keys(readiness)
+                        rp_counts = build_empty_delta_rp_counts()
+                        opening_counts = (0, 0)
+                        if rp_affected_scope_keys:
+                            rp_counts = await build_rp_summaries_delta(
+                                conn=work_conn,
+                                product_id=product_id,
+                                affected_scope_keys=rp_affected_scope_keys,
+                                episode_rows=all_episode_summary_rows,
+                                episode_texts_by_no=episode_texts_by_no,
+                                summary_client=summary_client,
+                                inventory_map=inventory_v3_map,
+                                relation_map=relation_scope_map,
+                                verbose=args.verbose,
+                            )
+                            opening_counts = await build_character_chat_opening_summaries(
+                                conn=work_conn,
+                                product_id=product_id,
+                                episode_rows=all_episode_summary_rows,
+                                summary_client=summary_client,
+                                inventory_map=inventory_v3_map,
+                                relation_map=relation_scope_map,
+                                affected_scope_keys=rp_affected_scope_keys,
+                                cleanup_missing_scopes=False,
+                                verbose=args.verbose,
+                            )
+                        results["inserted_character_rp_profiles"] += int((rp_counts.get("profile") or (0, 0))[0])
+                        results["reused_character_rp_profiles"] += int((rp_counts.get("profile") or (0, 0))[1])
+                        results["inserted_character_rp_examples"] += int((rp_counts.get("examples") or (0, 0))[0])
+                        results["reused_character_rp_examples"] += int((rp_counts.get("examples") or (0, 0))[1])
+                        results["inserted_character_chat_openings"] += opening_counts[0]
+                        results["reused_character_chat_openings"] += opening_counts[1]
+                        with work_cursor(work_conn) as cur:
+                            new_profile_map = fetch_active_summary_state_map(
+                                cur=cur,
+                                product_id=product_id,
+                                summary_type="character_rp_profile",
+                            )
+                            new_examples_map = fetch_active_summary_state_map(
+                                cur=cur,
+                                product_id=product_id,
+                                summary_type="character_rp_examples",
+                            )
+                            results["delta_verifications"].append(
+                                build_delta_inventory_verification(
+                                    product_id=product_id,
+                                    old_inventory_map=old_inventory_v3_map,
+                                    new_inventory_map=inventory_v3_map,
+                                    old_relation_map=old_relation_map,
+                                    new_relation_map=old_relation_map,
+                                    old_touched_signal_rows=[],
+                                    new_touched_signal_rows=[],
+                                    character_delta_stats={
+                                        "touched_scope_keys": set(),
+                                        "new_scope_keys": set(),
+                                        "keep_old_missing_scope_keys": set(),
+                                        "skip_new_scope_keys": set(),
+                                    },
+                                    relation_delta_stats={
+                                        "touched_relation_keys": set(),
+                                        "new_relation_keys": set(),
+                                        "keep_old_missing_relation_keys": set(),
+                                        "skip_new_relation_keys": set(),
+                                    },
+                                )
+                            )
+                            results["delta_verifications"][-1]["rp"] = build_rp_delta_verification(
+                                product_id=product_id,
+                                affected_scope_keys=rp_affected_scope_keys,
+                                inventory_map=inventory_v3_map,
+                                profile_map=new_profile_map,
+                                examples_map=new_examples_map,
+                                rp_counts=rp_counts,
+                            )
+                            status_row = refresh_product_context_status(
+                                cur=cur,
+                                product_id=product_id,
+                                total_episode_count=total_episode_count,
+                            )
+                            status_row = attach_character_chat_asset_readiness_to_status_row(
+                                cur,
+                                status_row,
+                            )
+                        work_conn.commit()
+                        results["products"].append(status_row)
+                        continue
+
                     for row in product_rows:
                         source = await resolve_source_payload(row=row, use_epub_fallback=args.use_epub_fallback)
                         if source is None:
@@ -13856,6 +14253,7 @@ async def main() -> int:
                     cur,
                     rows,
                     max_delta_episodes=args.max_delta_episodes,
+                    refresh_rp=should_refresh_delta_rp(args),
                 )
             if args.build_mode == "delta" and not args.apply:
                 plans = build_delta_scope_plans(cur, rows)
