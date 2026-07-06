@@ -6749,6 +6749,8 @@ async def build_rp_summaries_delta(
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
         dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
+        prebuilt_profile_payload = None
+        prebuilt_example_payload = None
         if (
             not bool(direct_voice_quality.get("strict_chat_ready"))
             and not is_rp_profile_dialogue_item_set_ready(dialogue_items, aliases)
@@ -6765,15 +6767,24 @@ async def build_rp_summaries_delta(
                     print(f"[rp-delta-dialogue-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
                 dialogue_items = []
             if not is_rp_profile_dialogue_item_set_ready(dialogue_items, aliases):
-                logger.info(
-                    "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
-                    product_id,
-                    scope_key,
-                    "direct_voice_not_ready",
-                    str(direct_voice_quality.get("status") or "unknown"),
+                migrated_payloads = build_canonical_rp_payloads_from_legacy(
+                    scope_key=scope_key,
+                    target=target,
+                    inventory_item=inventory_item,
+                    profile_rows_by_scope=active_profile_rows_by_scope,
+                    example_rows_by_scope=active_example_rows_by_scope,
                 )
-                counts["keep_old_dialogue_missing_count"] += 1
-                continue
+                if not migrated_payloads:
+                    logger.info(
+                        "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
+                        product_id,
+                        scope_key,
+                        "direct_voice_not_ready",
+                        str(direct_voice_quality.get("status") or "unknown"),
+                    )
+                    counts["keep_old_dialogue_missing_count"] += 1
+                    continue
+                prebuilt_profile_payload, prebuilt_example_payload, dialogue_items = migrated_payloads
 
         dialogue_items = dedupe_rp_dialogue_items(dialogue_items, limit=80)
         dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
@@ -6793,41 +6804,24 @@ async def build_rp_summaries_delta(
             relation_map=relation_map,
         )
         scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
-        try:
-            payload = await request_rp_profile_payload(
-                summary_client,
-                target=target,
-                dialogue_items=dialogue_items,
-                summary_context_lines=summary_context_lines,
-                inventory_item=inventory_item,
-                relation_context_lines=relation_context_lines,
-            )
-        except Exception as exc:
-            if verbose:
-                print(f"[rp-delta-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
-            continue
-        if not payload:
-            migrated_payloads = build_canonical_rp_payloads_from_legacy(
-                scope_key=scope_key,
-                target=target,
-                inventory_item=inventory_item,
-                profile_rows_by_scope=active_profile_rows_by_scope,
-                example_rows_by_scope=active_example_rows_by_scope,
-            )
-            if not migrated_payloads:
-                continue
-            profile_payload, example_payload, dialogue_items = migrated_payloads
+        if prebuilt_profile_payload is not None and prebuilt_example_payload is not None:
+            profile_payload = prebuilt_profile_payload
+            example_payload = prebuilt_example_payload
         else:
-            profile_payload = {
-                "character_key": scope_key,
-                "display_name": str(target.get("display_name") or "").strip() or str(target.get("reference_name") or "").strip(),
-                "aliases": [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()],
-                "speech_style": payload.get("speech_style") or {},
-                "personality_core": [str(item).strip() for item in (payload.get("personality_core") or []) if str(item).strip()][:2],
-                "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
-            }
-            example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
-            if not has_enough_rp_example_texts(example_texts):
+            try:
+                payload = await request_rp_profile_payload(
+                    summary_client,
+                    target=target,
+                    dialogue_items=dialogue_items,
+                    summary_context_lines=summary_context_lines,
+                    inventory_item=inventory_item,
+                    relation_context_lines=relation_context_lines,
+                )
+            except Exception as exc:
+                if verbose:
+                    print(f"[rp-delta-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
+                continue
+            if not payload:
                 migrated_payloads = build_canonical_rp_payloads_from_legacy(
                     scope_key=scope_key,
                     target=target,
@@ -6836,32 +6830,53 @@ async def build_rp_summaries_delta(
                     example_rows_by_scope=active_example_rows_by_scope,
                 )
                 if not migrated_payloads:
-                    logger.info(
-                        "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s selected_examples=%s min_examples=%s",
-                        product_id,
-                        scope_key,
-                        "example_texts_below_min",
-                        len(example_texts),
-                        RP_PROFILE_MIN_EXAMPLE_TEXTS,
-                    )
-                    counts["keep_old_examples_missing_count"] += 1
                     continue
                 profile_payload, example_payload, dialogue_items = migrated_payloads
             else:
-                example_payload = {
+                profile_payload = {
                     "character_key": scope_key,
-                    "examples": [],
+                    "display_name": str(target.get("display_name") or "").strip() or str(target.get("reference_name") or "").strip(),
+                    "aliases": [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()],
+                    "speech_style": payload.get("speech_style") or {},
+                    "personality_core": [str(item).strip() for item in (payload.get("personality_core") or []) if str(item).strip()][:2],
+                    "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
                 }
-                for example_text in example_texts:
-                    matched_item = next((item for item in dialogue_items if str(item.get("text") or "").strip() == example_text), None)
-                    example_payload["examples"].append(
-                        {
-                            "episode_no": int((matched_item or {}).get("episode_no") or 0),
-                            "source_kind": str((matched_item or {}).get("kind") or "dialogue"),
-                            "text": example_text,
-                            "confidence": 0.9 if matched_item else 0.7,
-                        }
+                example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
+                if not has_enough_rp_example_texts(example_texts):
+                    migrated_payloads = build_canonical_rp_payloads_from_legacy(
+                        scope_key=scope_key,
+                        target=target,
+                        inventory_item=inventory_item,
+                        profile_rows_by_scope=active_profile_rows_by_scope,
+                        example_rows_by_scope=active_example_rows_by_scope,
                     )
+                    if not migrated_payloads:
+                        logger.info(
+                            "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s selected_examples=%s min_examples=%s",
+                            product_id,
+                            scope_key,
+                            "example_texts_below_min",
+                            len(example_texts),
+                            RP_PROFILE_MIN_EXAMPLE_TEXTS,
+                        )
+                        counts["keep_old_examples_missing_count"] += 1
+                        continue
+                    profile_payload, example_payload, dialogue_items = migrated_payloads
+                else:
+                    example_payload = {
+                        "character_key": scope_key,
+                        "examples": [],
+                    }
+                    for example_text in example_texts:
+                        matched_item = next((item for item in dialogue_items if str(item.get("text") or "").strip() == example_text), None)
+                        example_payload["examples"].append(
+                            {
+                                "episode_no": int((matched_item or {}).get("episode_no") or 0),
+                                "source_kind": str((matched_item or {}).get("kind") or "dialogue"),
+                                "text": example_text,
+                                "confidence": 0.9 if matched_item else 0.7,
+                            }
+                        )
         internal_prompt_payload: dict[str, str] | None = None
         try:
             internal_prompt_payload = await request_character_chat_internal_prompt_payload(
