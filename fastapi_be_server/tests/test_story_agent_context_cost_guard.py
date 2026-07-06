@@ -827,6 +827,150 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["inserted_character_chat_openings"], 1)
         self.assertEqual(results["products"], [status_row])
 
+    async def test_primary_delta_refresh_rp_includes_readiness_repair_scopes(self):
+        module = load_module()
+        conn = FakeConnection()
+        args = SimpleNamespace(apply=True, verbose=False, use_epub_fallback=False, refresh_rp=True)
+        rp_counts = module.build_empty_delta_rp_counts()
+        rp_counts["profile"][0] = 1
+        rp_counts["examples"][0] = 1
+        status_row = {
+            "product_id": 687,
+            "context_status": "ready",
+            "total_episode_count": 10,
+            "ready_episode_count": 10,
+        }
+        episode_summary_rows = [
+            {"episode_from": 8, "summary_text": "[8화] 원유성이 무대를 확인한다."}
+        ]
+        inventory_map = {
+            "character:원유성": {
+                "canonical_character_key": "character:원유성",
+                "source_character_keys": ["protagonist:first_person", "named:원유성"],
+                "display_name": "원유성",
+                "aliases": ["원유성"],
+                "entity_kind": "person",
+                "is_protagonist": True,
+                "work_role": "main_protagonist",
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+            }
+        }
+
+        def fake_fetch_summary_rows_for_episode_nos(_cur, *, summary_type, **_kwargs):
+            if summary_type == "episode_summary":
+                return episode_summary_rows
+            return []
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(module, "OPENROUTER_API_KEY", ""))
+            stack.enter_context(patch.object(module.settings, "ANTHROPIC_API_KEY", ""))
+            stack.enter_context(patch.object(module, "DEEPSEEK_API_KEY", ""))
+            stack.enter_context(patch.object(module, "db_connect", return_value=conn))
+            stack.enter_context(patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())))
+            stack.enter_context(patch.object(module, "work_cursor", fake_work_cursor))
+            stack.enter_context(patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()))
+            stack.enter_context(patch.object(module, "fetch_total_episode_count", return_value=10))
+            stack.enter_context(
+                patch.object(
+                    module,
+                    "resolve_source_payload",
+                    AsyncMock(return_value={"source_type": "episode_content", "source_locator": "episode:1001", "html_content": "원유성이 말했다."}),
+                )
+            )
+            stack.enter_context(patch.object(module, "normalize_episode_html", return_value='원유성이 말했다. "움직여."'))
+            stack.enter_context(patch.object(module, "build_chunks", return_value=[{"chunk_index": 0, "content": "원유성"}]))
+            stack.enter_context(patch.object(module, "fetch_existing_doc", return_value={"context_doc_id": 1}))
+            stack.enter_context(patch.object(module, "insert_doc_and_chunks", return_value=1))
+            stack.enter_context(patch.object(module, "insert_episode_summary", AsyncMock(return_value=(100, False, {"used_llm": False}))))
+            stack.enter_context(patch.object(module, "build_episode_character_signals_summaries", AsyncMock(return_value=(0, 1))))
+            stack.enter_context(patch.object(module, "fetch_active_summary_rows_for_episode_nos", side_effect=fake_fetch_summary_rows_for_episode_nos))
+            stack.enter_context(patch.object(module, "fetch_active_summary_rows", return_value=episode_summary_rows))
+            stack.enter_context(patch.object(module, "build_work_protagonist_resolution_for_inventory_v3", AsyncMock(return_value={})))
+            stack.enter_context(patch.object(module, "build_compound_summaries_delta", return_value={"range": (0, 1), "product": (0, 1)}))
+            stack.enter_context(
+                patch.object(
+                    module,
+                    "build_character_inventory_summaries_delta",
+                    return_value={
+                        "inserted_count": 0,
+                        "reused_count": 1,
+                        "keep_old_missing_count": 0,
+                        "skip_new_count": 0,
+                        "touched_key_count": 1,
+                    },
+                )
+            )
+            stack.enter_context(patch.object(module, "build_character_inventory_v3_summaries", return_value=(0, 1)))
+            stack.enter_context(
+                patch.object(
+                    module,
+                    "build_relation_inventory_summaries_delta",
+                    return_value={
+                        "inserted_count": 0,
+                        "reused_count": 0,
+                        "keep_old_missing_count": 0,
+                        "skip_new_count": 0,
+                        "touched_key_count": 0,
+                    },
+                )
+            )
+            stack.enter_context(patch.object(module, "cleanup_duplicate_character_inventory_rows", return_value={"touched_scope_keys": set(), "canonical_character_key_by_display_name": {}}))
+            stack.enter_context(patch.object(module, "cleanup_duplicate_relation_inventory_rows"))
+            stack.enter_context(patch.object(module, "fetch_active_character_inventory_map", return_value=inventory_map))
+            stack.enter_context(patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_relation_inventory_map", return_value={}))
+            stack.enter_context(patch.object(module, "build_canonical_relation_inventory_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_episode_texts_by_no", return_value={8: '원유성이 말했다. "움직여."'}))
+            stack.enter_context(patch.object(module, "build_episode_scene_extraction_summaries", AsyncMock(return_value=(0, 0))))
+            stack.enter_context(patch.object(module, "build_character_chat_scene_context_lines_by_scope", return_value={}))
+            stack.enter_context(patch.object(module, "compute_rp_affected_scope_keys", return_value=set()))
+            stack.enter_context(patch.object(module, "fetch_product_context_status", return_value="ready"))
+            stack.enter_context(
+                patch.object(
+                    module,
+                    "fetch_character_chat_asset_readiness_verification",
+                    return_value={
+                        "character_chat_status": "hold",
+                        "public_candidate_count": 1,
+                        "ready_public_candidate_count": 0,
+                        "legacy_profile_scope_key_mismatch_scope_keys": ["character:원유성"],
+                        "missing_internal_prompt_scope_keys": ["character:원유성"],
+                        "missing_opening_scope_keys": ["character:원유성"],
+                        "block_reason_counts": {
+                            "legacy_profile_scope_key_mismatch": 1,
+                            "missing_internal_prompt": 1,
+                            "missing_character_chat_opening": 1,
+                        },
+                    },
+                )
+            )
+            rp_delta = stack.enter_context(patch.object(module, "build_rp_summaries_delta", AsyncMock(return_value=rp_counts)))
+            opening = stack.enter_context(patch.object(module, "build_character_chat_opening_summaries", AsyncMock(return_value=(1, 0))))
+            stack.enter_context(patch.object(module, "refresh_product_context_status", return_value=status_row))
+            stack.enter_context(patch.object(module, "attach_character_chat_asset_readiness_to_status_row", side_effect=lambda cur, row: row))
+            stack.enter_context(patch.object(module, "build_delta_inventory_verification", return_value={"product_id": 687}))
+            stack.enter_context(patch.object(module, "build_rp_delta_verification", return_value={"affected_scope_keys": ["character:원유성"]}))
+            stack.enter_context(patch.object(module, "assert_story_agent_foundation_invariants"))
+
+            await module.build_context_rows_delta(
+                [
+                    {
+                        "product_id": 687,
+                        "episode_id": 1001,
+                        "episode_no": 8,
+                        "title": "테스트 작품",
+                        "_delta_reason": "sync_repair",
+                    }
+                ],
+                args,
+            )
+
+        rp_delta.assert_awaited_once()
+        opening.assert_awaited_once()
+        self.assertIn("character:원유성", rp_delta.await_args.kwargs["affected_scope_keys"])
+        self.assertIn("character:원유성", opening.await_args.kwargs["affected_scope_keys"])
+
     async def test_episode_character_signals_keep_old_when_provider_unavailable(self):
         module = load_module()
         conn = FakeConnection()

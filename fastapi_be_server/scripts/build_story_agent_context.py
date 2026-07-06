@@ -14126,6 +14126,17 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             cleanup_scope_keys=set(character_cleanup.get("touched_scope_keys") or []),
                         )
                         rp_affected_scope_keys.update(scene_affected_scope_keys)
+                        if should_refresh_delta_rp(args):
+                            with work_cursor(work_conn) as cur:
+                                readiness = fetch_character_chat_asset_readiness_verification(
+                                    cur,
+                                    product_id=product_id,
+                                    story_context_status=fetch_product_context_status(cur, product_id=product_id),
+                                    total_episode_count=total_episode_count,
+                                )
+                            rp_affected_scope_keys.update(
+                                collect_character_chat_asset_repair_scope_keys(readiness)
+                            )
                         rp_counts = build_empty_delta_rp_counts()
                         opening_counts = (0, 0)
                         if should_refresh_delta_rp(args):
