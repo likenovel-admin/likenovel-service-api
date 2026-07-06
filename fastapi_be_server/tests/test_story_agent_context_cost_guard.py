@@ -728,6 +728,88 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["inserted_character_chat_openings"], 1)
         self.assertEqual(results["products"], [status_row])
 
+    async def test_delta_character_chat_scene_repair_fast_path_runs_scene_without_signal_rebuild(self):
+        module = load_module()
+        conn = FakeConnection()
+        args = SimpleNamespace(apply=True, verbose=False, use_epub_fallback=False, refresh_rp=True)
+        rp_counts = module.build_empty_delta_rp_counts()
+        rp_counts["profile"][1] = 1
+        rp_counts["examples"][1] = 1
+        status_row = {
+            "product_id": 687,
+            "context_status": "ready",
+            "total_episode_count": 10,
+            "ready_episode_count": 10,
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(module, "OPENROUTER_API_KEY", ""))
+            stack.enter_context(patch.object(module.settings, "ANTHROPIC_API_KEY", ""))
+            stack.enter_context(patch.object(module, "DEEPSEEK_API_KEY", ""))
+            stack.enter_context(patch.object(module, "db_connect", return_value=conn))
+            stack.enter_context(patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())))
+            stack.enter_context(patch.object(module, "work_cursor", fake_work_cursor))
+            stack.enter_context(patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()))
+            stack.enter_context(patch.object(module, "fetch_total_episode_count", return_value=10))
+            stack.enter_context(patch.object(module, "fetch_active_character_inventory_map", return_value={"character:루벤": {"display_name": "루벤"}}))
+            stack.enter_context(patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_relation_inventory_map", return_value={}))
+            stack.enter_context(patch.object(module, "build_canonical_relation_inventory_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_summary_state_map", return_value={}))
+            stack.enter_context(patch.object(module, "fetch_active_summary_rows_for_episode_nos", return_value=[{"episode_from": 1, "summary_text": "[1화] 루벤이 싸운다."}]))
+            stack.enter_context(patch.object(module, "fetch_active_summary_rows", return_value=[{"episode_from": 1, "summary_text": "[1화] 루벤이 싸운다."}]))
+            stack.enter_context(patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "루벤이 말했다. \"움직여.\""}))
+            stack.enter_context(patch.object(module, "fetch_product_context_status", return_value="ready"))
+            stack.enter_context(
+                patch.object(
+                    module,
+                    "fetch_character_chat_asset_readiness_verification",
+                    return_value={
+                        "character_chat_status": "hold",
+                        "public_candidate_count": 1,
+                        "ready_public_candidate_count": 0,
+                        "missing_usable_scene_scope_keys": ["character:루벤"],
+                        "missing_internal_prompt_scope_keys": ["character:루벤"],
+                        "missing_opening_scope_keys": ["character:루벤"],
+                        "block_reason_counts": {"missing_usable_scene": 1, "missing_internal_prompt": 1, "missing_character_chat_opening": 1},
+                    },
+                )
+            )
+            rp_delta = stack.enter_context(patch.object(module, "build_rp_summaries_delta", AsyncMock(return_value=rp_counts)))
+            opening = stack.enter_context(patch.object(module, "build_character_chat_opening_summaries", AsyncMock(return_value=(1, 0))))
+            stack.enter_context(patch.object(module, "refresh_product_context_status", return_value=status_row))
+            stack.enter_context(patch.object(module, "attach_character_chat_asset_readiness_to_status_row", side_effect=lambda cur, row: row))
+            stack.enter_context(patch.object(module, "build_delta_inventory_verification", return_value={"product_id": 687}))
+            stack.enter_context(patch.object(module, "build_rp_delta_verification", return_value={"affected_scope_keys": ["character:루벤"]}))
+            resolve_source = stack.enter_context(patch.object(module, "resolve_source_payload", AsyncMock()))
+            signals = stack.enter_context(patch.object(module, "build_episode_character_signals_summaries", AsyncMock(return_value=(0, 0))))
+            scenes = stack.enter_context(patch.object(module, "build_episode_scene_extraction_summaries", AsyncMock(return_value=(2, 0))))
+            inventory_v3 = stack.enter_context(patch.object(module, "build_character_inventory_v3_summaries", return_value=(0, 0)))
+            results = await module.build_context_rows_delta(
+                [
+                    {
+                        "product_id": 687,
+                        "episode_id": 1001,
+                        "episode_no": 1,
+                        "title": "테스트 작품",
+                        "_delta_reason": "character_chat_scene_repair",
+                    }
+                ],
+                args,
+            )
+
+        resolve_source.assert_not_awaited()
+        signals.assert_not_awaited()
+        scenes.assert_awaited_once()
+        inventory_v3.assert_not_called()
+        rp_delta.assert_awaited_once()
+        opening.assert_awaited_once()
+        self.assertEqual(results["inserted_episode_scene_extractions"], 2)
+        self.assertEqual(results["inserted_episode_character_signals"], 0)
+        self.assertEqual(results["inserted_character_inventory_v3"], 0)
+        self.assertEqual(results["inserted_character_chat_openings"], 1)
+        self.assertEqual(results["products"], [status_row])
+
     async def test_episode_character_signals_keep_old_when_provider_unavailable(self):
         module = load_module()
         conn = FakeConnection()
@@ -1658,6 +1740,48 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             },
             scope_key="character:백이현",
             display_name="백이현",
+        )
+
+        self.assertIsNone(normalized)
+
+    def test_opening_payload_normalization_rejects_user_identity_probe_dialogue(self):
+        module = load_module()
+        narration = (
+            "숲속 공터에 저무는 해가 나무 사이로 길게 그림자를 드리운다. "
+            "갤러해드 지그문트는 막 사기를 거둔 손을 허리춤에 가볍게 얹고, "
+            "덤불 너머의 소리를 재고 있었다. 발밑의 낙엽이 바람도 없이 바스락거리고, "
+            "방금 전까지 이곳에 감돌던 미세한 사기의 잔향이 천천히 흩어졌다. "
+            "그는 공터 가장자리의 그림자가 길어지는 방향을 보며 낮게 숨을 골랐다."
+        )
+        dialogue = '"이 시간에 이런 곳에 웬일이지? 설마 나를 찾아온 건 아니겠지."'
+
+        normalized = module.normalize_character_chat_opening_payload(
+            {
+                "readiness": {"status": "ready"},
+                "chat_target": {"scope_key": "character:갤러해드지그문트", "display_name": "갤러해드 지그문트"},
+                "opening_scene": {"situation": "숲속 공터"},
+                "opening_message": {
+                    "narration": narration,
+                    "dialogue": dialogue,
+                    "opening_text": f"{narration}\n\n{dialogue}",
+                    "user_objective": "공터 가장자리에서 들린 소리의 방향을 짧게 말한다.",
+                },
+                "user_role": {"role_type": "임시 조력자"},
+                "character_drive": {"immediate_objective": "공터 주변의 위험을 확인한다."},
+                "agency_contract": {"character_moves_first": True},
+                "progression_engine": {"short_term_goal": "주변 움직임을 확인한다."},
+                "runtime_formula_seed": {
+                    "formula_type": "FORMULA_ALLY_TRUST_CONVERSION",
+                    "p_to_user_request": "소리의 방향을 확인한다.",
+                    "user_task_type": "UT_MONITOR_REACTION",
+                    "user_task_success_condition": "소리의 방향을 말한다.",
+                    "protagonist_state_delta": "갤러해드가 경계 방향을 바꾼다.",
+                    "open_loop": "덤불 너머의 움직임",
+                    "mutation_policy": "MP_SAME_HAZARD_NEW_LOCATION",
+                },
+            },
+            scope_key="character:갤러해드지그문트",
+            display_name="갤러해드 지그문트",
         )
 
         self.assertIsNone(normalized)
@@ -6834,11 +6958,13 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
              patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
              patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
-             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value={101, 102}) as repair:
+             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value={101, 102}) as repair, \
+             patch.object(module, "build_character_chat_scene_repair_episode_id_set", return_value={101, 102}) as scene_repair:
             filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=0)
 
         self.assertEqual(filtered, [])
         repair.assert_not_called()
+        scene_repair.assert_not_called()
 
     def test_delta_candidate_filter_includes_character_chat_asset_repair_with_refresh_rp(self):
         module = load_module()
@@ -6851,7 +6977,8 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
              patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
              patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
-             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value={101, 102, 103}):
+             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value={101, 102, 103}), \
+             patch.object(module, "build_character_chat_scene_repair_episode_id_set", return_value=set()):
             filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=2, refresh_rp=True)
 
         self.assertEqual([row["episode_no"] for row in filtered], [1, 2])
@@ -6859,6 +6986,45 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             [row["_delta_reason"] for row in filtered],
             ["character_chat_asset_repair", "character_chat_asset_repair"],
         )
+
+    def test_delta_candidate_filter_includes_character_chat_scene_repair_with_refresh_rp(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_character_chat_scene_repair_episode_id_set", return_value={101, 102}):
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=0, refresh_rp=True)
+
+        self.assertEqual([row["episode_no"] for row in filtered], [1, 2])
+        self.assertEqual(
+            [row["_delta_reason"] for row in filtered],
+            ["character_chat_scene_repair", "character_chat_scene_repair"],
+        )
+
+    def test_delta_candidate_filter_defers_character_chat_repair_when_primary_delta_exists(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value={102}), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_character_chat_asset_repair_episode_id_set", return_value={101}) as asset_repair, \
+             patch.object(module, "build_character_chat_scene_repair_episode_id_set", return_value={101}) as scene_repair:
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=0, refresh_rp=True)
+
+        self.assertEqual([row["episode_no"] for row in filtered], [2])
+        self.assertEqual([row["_delta_reason"] for row in filtered], ["open_add"])
+        asset_repair.assert_not_called()
+        scene_repair.assert_not_called()
 
     def test_character_chat_asset_repair_requires_hold_with_missing_assets(self):
         module = load_module()
@@ -6880,6 +7046,33 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
              patch.object(module, "fetch_product_context_status", return_value="ready"), \
              patch.object(module, "fetch_total_episode_count", return_value=2):
             repair_ids = module.build_character_chat_asset_repair_episode_id_set(
+                object(),
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, {101, 102})
+
+    def test_character_chat_scene_repair_requires_missing_usable_scene(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(
+            module,
+            "fetch_character_chat_asset_readiness_verification",
+            return_value={
+                "character_chat_status": "hold",
+                "public_candidate_count": 1,
+                "ready_public_candidate_count": 0,
+                "block_reason_counts": {"missing_usable_scene": 1},
+            },
+        ), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_total_episode_count", return_value=2):
+            repair_ids = module.build_character_chat_scene_repair_episode_id_set(
                 object(),
                 product_id=687,
                 product_rows=rows,

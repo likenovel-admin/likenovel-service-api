@@ -2411,6 +2411,25 @@ def build_character_chat_asset_repair_episode_id_set(cur, *, product_id: int, pr
     }
 
 
+def build_character_chat_scene_repair_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
+    readiness = fetch_character_chat_asset_readiness_verification(
+        cur,
+        product_id=product_id,
+        story_context_status=fetch_product_context_status(cur, product_id=product_id),
+        total_episode_count=fetch_total_episode_count(cur, product_id=product_id),
+    )
+    if int(readiness.get("public_candidate_count") or 0) <= 0:
+        return set()
+    block_reasons = dict(readiness.get("block_reason_counts") or {})
+    if int(block_reasons.get("missing_usable_scene") or 0) <= 0:
+        return set()
+    return {
+        int(row.get("episode_id") or 0)
+        for row in product_rows
+        if int(row.get("episode_id") or 0) > 0
+    }
+
+
 def delta_episode_sort_key(row: dict) -> tuple[int, int]:
     return (int(row.get("episode_no") or 0), int(row.get("episode_id") or 0))
 
@@ -2443,13 +2462,23 @@ def filter_delta_candidate_rows(
             product_id=product_id,
             product_rows=product_rows,
         )
+        primary_episode_ids = open_add_episode_ids | repair_episode_ids | signal_repair_episode_ids
         character_chat_asset_repair_episode_ids = (
             build_character_chat_asset_repair_episode_id_set(
                 cur,
                 product_id=product_id,
                 product_rows=product_rows,
             )
-            if refresh_rp
+            if refresh_rp and not primary_episode_ids
+            else set()
+        )
+        character_chat_scene_repair_episode_ids = (
+            build_character_chat_scene_repair_episode_id_set(
+                cur,
+                product_id=product_id,
+                product_rows=product_rows,
+            )
+            if refresh_rp and not primary_episode_ids
             else set()
         )
         product_filtered_rows: list[dict] = []
@@ -2466,6 +2495,10 @@ def filter_delta_candidate_rows(
             elif episode_id in signal_repair_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "signal_repair"
+                product_filtered_rows.append(next_row)
+            elif episode_id in character_chat_scene_repair_episode_ids:
+                next_row = dict(row)
+                next_row["_delta_reason"] = "character_chat_scene_repair"
                 product_filtered_rows.append(next_row)
             elif episode_id in character_chat_asset_repair_episode_ids:
                 next_row = dict(row)
@@ -2531,11 +2564,19 @@ def build_delta_scope_plans(cur, rows: Iterable[dict]) -> list[DeltaBuildScopePl
     return plans
 
 
-def is_character_chat_asset_repair_only_rows(rows: Iterable[dict]) -> bool:
+def is_character_chat_repair_only_rows(rows: Iterable[dict]) -> bool:
     row_list = list(rows)
     return bool(row_list) and all(
-        str(row.get("_delta_reason") or "").strip() == "character_chat_asset_repair"
+        str(row.get("_delta_reason") or "").strip()
+        in {"character_chat_asset_repair", "character_chat_scene_repair"}
         for row in row_list
+    )
+
+
+def has_character_chat_scene_repair_rows(rows: Iterable[dict]) -> bool:
+    return any(
+        str(row.get("_delta_reason") or "").strip() == "character_chat_scene_repair"
+        for row in rows
     )
 
 
@@ -2546,6 +2587,7 @@ def collect_character_chat_asset_repair_scope_keys(readiness: dict[str, object])
         "missing_examples_scope_keys",
         "missing_internal_prompt_scope_keys",
         "missing_opening_scope_keys",
+        "missing_usable_scene_scope_keys",
         "invalid_opening_scope_keys",
         "legacy_profile_scope_key_mismatch_scope_keys",
         "legacy_examples_scope_key_mismatch_scope_keys",
@@ -5490,6 +5532,13 @@ def has_character_chat_opening_agency_violation(text: str) -> bool:
         "정체가 뭐",
         "누구냐",
         "왜 여기",
+        "왜 왔",
+        "왜 온",
+        "웬일",
+        "무슨 용건",
+        "나를 찾아",
+        "찾아온 건",
+        "찾아왔",
         "대답해",
         "네가 가리킨",
         "네가 들고",
@@ -13658,12 +13707,19 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             episode_nos=touched_episode_nos,
                         )
 
-                    if args.apply and should_refresh_delta_rp(args) and is_character_chat_asset_repair_only_rows(product_rows):
+                    if args.apply and should_refresh_delta_rp(args) and is_character_chat_repair_only_rows(product_rows):
+                        needs_scene_repair = has_character_chat_scene_repair_rows(product_rows)
                         with work_cursor(work_conn) as cur:
                             all_episode_summary_rows = fetch_active_summary_rows(
                                 cur=cur,
                                 product_id=product_id,
                                 summary_type="episode_summary",
+                            )
+                            scene_episode_summary_rows = fetch_active_summary_rows_for_episode_nos(
+                                cur,
+                                product_id=product_id,
+                                summary_type="episode_summary",
+                                episode_nos=touched_episode_nos,
                             )
                             episode_texts_by_no = fetch_active_episode_texts_by_no(
                                 cur,
@@ -13687,7 +13743,20 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             )
                         rp_affected_scope_keys = collect_character_chat_asset_repair_scope_keys(readiness)
                         rp_counts = build_empty_delta_rp_counts()
+                        scene_counts = (0, 0)
                         opening_counts = (0, 0)
+                        if needs_scene_repair:
+                            scene_counts = await build_episode_scene_extraction_summaries(
+                                conn=work_conn,
+                                product_id=product_id,
+                                product_title=str(product_rows[0].get("title") or ""),
+                                episode_rows=scene_episode_summary_rows,
+                                episode_texts_by_no=episode_texts_by_no,
+                                summary_client=summary_client,
+                                canonical_character_packet=build_episode_scene_canonical_character_packet(inventory_v3_map),
+                                cleanup_missing_scopes=False,
+                                verbose=args.verbose,
+                            )
                         if rp_affected_scope_keys:
                             rp_counts = await build_rp_summaries_delta(
                                 conn=work_conn,
@@ -13715,6 +13784,8 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                         results["reused_character_rp_profiles"] += int((rp_counts.get("profile") or (0, 0))[1])
                         results["inserted_character_rp_examples"] += int((rp_counts.get("examples") or (0, 0))[0])
                         results["reused_character_rp_examples"] += int((rp_counts.get("examples") or (0, 0))[1])
+                        results["inserted_episode_scene_extractions"] += scene_counts[0]
+                        results["reused_episode_scene_extractions"] += scene_counts[1]
                         results["inserted_character_chat_openings"] += opening_counts[0]
                         results["reused_character_chat_openings"] += opening_counts[1]
                         with work_cursor(work_conn) as cur:
