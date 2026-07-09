@@ -1150,6 +1150,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "request_rp_character_plan_payload", plan_mock), \
              patch.object(module, "request_rp_profile_payload", profile_mock), \
              patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
              patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={"character:백이현": scene_context_lines}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True), ({"summary_id": 3}, True)]), \
@@ -1186,6 +1187,210 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["deactivated_examples_count"], 0)
         deactivate_scope.assert_not_called()
 
+    async def test_delta_rp_build_bridges_legacy_profile_examples_to_canonical_internal_prompt(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:백이현"
+        legacy_scope_key = "protagonist:named:백이현"
+        profile_payload = {
+            "character_key": legacy_scope_key,
+            "display_name": "백이현",
+            "aliases": ["백이현"],
+            "speech_style": {"tone": "단호"},
+            "personality_core": ["원칙적"],
+            "baseline_attitude": "경계",
+        }
+        example_payload = {
+            "character_key": legacy_scope_key,
+            "examples": [
+                {"episode_no": 1, "source_kind": "dialogue", "text": "나는 여기서 물러서지 않을 거야.", "confidence": 0.9},
+                {"episode_no": 2, "source_kind": "dialogue", "text": "겁먹을 시간은 없어, 먼저 사람들을 빼내.", "confidence": 0.9},
+                {"episode_no": 3, "source_kind": "dialogue", "text": "이 기록은 내가 맡을게, 누구에게도 넘기지 마.", "confidence": 0.9},
+            ],
+        }
+        state_maps = {
+            "character_rp_profile": {
+                legacy_scope_key: {
+                    "summary_id": 11,
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-profile-hash",
+                    "payload": profile_payload,
+                }
+            },
+            "character_rp_examples": {
+                legacy_scope_key: {
+                    "summary_id": 12,
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-examples-hash",
+                    "payload": example_payload,
+                }
+            },
+        }
+        internal_prompt_mock = AsyncMock(
+            return_value={"internal_prompt": "[핵심] 백이현은 기존 RP 자료를 바탕으로 먼저 움직인다."}
+        )
+        profile_mock = AsyncMock(return_value={"speech_style": {"tone": "unused"}})
+        upserted = []
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return {"summary_id": len(upserted)}, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "request_rp_profile_payload", profile_mock), \
+             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
+             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=[])) as dialogue_mock, \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["[1화] 압력=문서 봉인 | hook=흔적 확인"]}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert), \
+             patch.object(module, "deactivate_active_scope", return_value=1) as deactivate_scope:
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=687,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no={},
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "source_character_keys": [legacy_scope_key, "named:백이현"],
+                        "display_name": "백이현",
+                        "aliases": ["백이현"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 3,
+                        "voice_evidence_count": 0,
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
+        dialogue_mock.assert_not_awaited()
+        profile_mock.assert_not_awaited()
+        internal_prompt_mock.assert_awaited_once()
+        self.assertEqual(internal_prompt_mock.await_args.kwargs["profile_payload"]["character_key"], scope_key)
+        self.assertEqual(internal_prompt_mock.await_args.kwargs["example_payload"]["character_key"], scope_key)
+        self.assertEqual([item["summary_type"] for item in upserted], [
+            "character_rp_profile",
+            "character_rp_examples",
+            "character_chat_internal_prompt",
+        ])
+        self.assertTrue(all(item["scope_key"] == scope_key for item in upserted))
+        deactivate_scope.assert_not_called()
+
+    async def test_delta_rp_build_does_not_bridge_when_canonical_rows_exist(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:백이현"
+        legacy_scope_key = "named:백이현"
+        episode_texts_by_no = {
+            1: "\n".join(
+                [
+                    '백이현이 말했다. "나는 여기서 물러서지 않을 거야, 네 선택을 다시 확인해."',
+                    '백이현이 낮게 물었다. "그 말이 사실이라면 지금 당장 증거를 보여 줘."',
+                    '백이현은 고개를 저으며 말했다. "아직 끝난 게 아니야, 내가 직접 확인하겠어."',
+                ]
+            ),
+            2: "\n".join(
+                [
+                    '백이현이 숨을 고르며 답했다. "겁먹을 시간은 없어, 먼저 사람들을 빼내."',
+                    '백이현이 검을 세우며 말했다. "네가 막는다면 나도 돌아가지 않겠어."',
+                    '백이현이 짧게 웃었다. "좋아, 이번엔 네 방식대로 움직여 보자."',
+                ]
+            ),
+            3: "\n".join(
+                [
+                    '백이현이 문서를 접으며 말했다. "이 기록은 내가 맡을게, 누구에게도 넘기지 마."',
+                    '백이현이 뒤돌아서며 말했다. "따라오지 마, 여기서부터는 내가 정리한다."',
+                    '백이현이 조용히 말했다. "약속은 지킬 거야, 대신 너도 물러서지 마."',
+                ]
+            ),
+        }
+        canonical_profile_payload = {"character_key": scope_key, "display_name": "백이현", "speech_style": {"tone": "old"}}
+        canonical_example_payload = {
+            "character_key": scope_key,
+            "examples": [{"episode_no": 1, "text": "낡은 대표 대사"}],
+        }
+        legacy_profile_payload = {"character_key": legacy_scope_key, "display_name": "백이현", "speech_style": {"tone": "legacy"}}
+        legacy_example_payload = {
+            "character_key": legacy_scope_key,
+            "examples": [{"episode_no": 1, "text": "legacy 대표 대사"}],
+        }
+        state_maps = {
+            "character_rp_profile": {
+                scope_key: {"scope_key": scope_key, "source_hash": "canonical-profile-hash", "payload": canonical_profile_payload},
+                legacy_scope_key: {"scope_key": legacy_scope_key, "source_hash": "legacy-profile-hash", "payload": legacy_profile_payload},
+            },
+            "character_rp_examples": {
+                scope_key: {"scope_key": scope_key, "source_hash": "canonical-examples-hash", "payload": canonical_example_payload},
+                legacy_scope_key: {"scope_key": legacy_scope_key, "source_hash": "legacy-examples-hash", "payload": legacy_example_payload},
+            },
+        }
+        profile_mock = AsyncMock(
+            return_value={
+                "speech_style": {"tone": "new"},
+                "personality_core": ["원칙적"],
+                "baseline_attitude": "경계",
+                "example_dialogues": [
+                    "나는 여기서 물러서지 않을 거야, 네 선택을 다시 확인해.",
+                    "겁먹을 시간은 없어, 먼저 사람들을 빼내.",
+                    "이 기록은 내가 맡을게, 누구에게도 넘기지 마.",
+                ],
+            }
+        )
+        internal_prompt_mock = AsyncMock(return_value={"internal_prompt": "[핵심] 새 대사 근거로 다시 조립한다."})
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "request_rp_profile_payload", profile_mock), \
+             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["[1화] 압력=문서 봉인 | hook=흔적 확인"]}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True), ({"summary_id": 3}, True)]), \
+             patch.object(module, "deactivate_active_scope", return_value=1):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=687,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no=episode_texts_by_no,
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "source_character_keys": [legacy_scope_key],
+                        "display_name": "백이현",
+                        "aliases": ["백이현"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 3,
+                        "voice_evidence_count": 9,
+                        "evidence_episode_nos": [1, 2, 3],
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        profile_mock.assert_awaited_once()
+        internal_prompt_mock.assert_awaited_once()
+        self.assertNotEqual(
+            internal_prompt_mock.await_args.kwargs["profile_payload"]["speech_style"],
+            legacy_profile_payload["speech_style"],
+        )
+
     async def test_character_chat_opening_build_upserts_exact_v3_scope_only(self):
         module = load_module()
         conn = FakeConnection()
@@ -1209,6 +1414,15 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "character_drive": {"immediate_objective": "문서의 흔적을 확인한다."},
             "agency_contract": {"character_moves_first": True},
             "progression_engine": {"short_term_goal": "봉인 문서를 확인한다."},
+            "runtime_formula_seed": {
+                "formula_type": "FORMULA_CASE_TO_NETWORK",
+                "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
+                "user_task_type": "UT_INSPECT_CLUE",
+                "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
+                "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
+                "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
+                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+            },
         }
         state_maps = {
             "character_rp_profile": {
@@ -1282,6 +1496,112 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(saved_payload["chat_target"]["scope_key"], scope_key)
         deactivate_missing.assert_called_once()
 
+    async def test_character_chat_opening_build_uses_legacy_alias_summary_rows(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:백이현"
+        legacy_scope_key = "named:백이현"
+        profile_payload = {
+            "character_key": legacy_scope_key,
+            "display_name": "백이현",
+            "aliases": ["백이현"],
+            "speech_style": {"tone": "단호"},
+        }
+        example_payload = {
+            "character_key": legacy_scope_key,
+            "examples": [{"episode_no": 1, "text": "나는 여기서 물러서지 않을 거야."}],
+        }
+        internal_prompt_payload = {"character_key": legacy_scope_key, "internal_prompt": "[핵심] 백이현은 물러서지 않는다."}
+        opening_payload = {
+            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
+            "chat_target": {"scope_key": scope_key, "display_name": "백이현"},
+            "opening_scene": {"situation": "백이현이 봉인된 문서 앞에서 멈춘다."},
+            "user_role": {"role_type": "임시 조력자"},
+            "character_drive": {"immediate_objective": "문서의 흔적을 확인한다."},
+            "agency_contract": {"character_moves_first": True},
+            "progression_engine": {"short_term_goal": "봉인 문서를 확인한다."},
+            "runtime_formula_seed": {
+                "formula_type": "FORMULA_CASE_TO_NETWORK",
+                "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
+                "user_task_type": "UT_INSPECT_CLUE",
+                "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
+                "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
+                "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
+                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+            },
+        }
+        state_maps = {
+            "character_rp_profile": {
+                legacy_scope_key: {
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-profile-hash",
+                    "payload": profile_payload,
+                }
+            },
+            "character_rp_examples": {
+                legacy_scope_key: {
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-examples-hash",
+                    "payload": example_payload,
+                }
+            },
+            "character_chat_internal_prompt": {
+                legacy_scope_key: {
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-internal-hash",
+                    "payload": internal_prompt_payload,
+                }
+            },
+        }
+        request_mock = AsyncMock(return_value=opening_payload)
+        upserted = []
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return 88, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(module, "request_character_chat_opening_payload", request_mock), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["- 1화 장면1: 압력=문서 봉인 | hook=흔적 확인"]}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert), \
+             patch.object(module, "deactivate_missing_active_scopes"):
+            counts = await module.build_character_chat_opening_summaries(
+                conn=conn,
+                product_id=687,
+                episode_rows=[],
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "source_character_keys": [legacy_scope_key],
+                        "display_name": "백이현",
+                        "aliases": ["백이현"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 3,
+                        "voice_evidence_count": 6,
+                        "public_chat_eligible": True,
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts, (1, 0))
+        request_mock.assert_awaited_once()
+        self.assertEqual(request_mock.await_args.kwargs["profile_payload"]["character_key"], scope_key)
+        self.assertEqual(request_mock.await_args.kwargs["example_payload"]["character_key"], scope_key)
+        self.assertEqual(request_mock.await_args.kwargs["internal_prompt_payload"]["character_key"], scope_key)
+        self.assertEqual(request_mock.await_args.kwargs["scene_context_lines"], ["- 1화 장면1: 압력=문서 봉인 | hook=흔적 확인"])
+        self.assertEqual(len(upserted), 1)
+        self.assertEqual(upserted[0]["summary_type"], "character_chat_opening_v1")
+        self.assertEqual(upserted[0]["scope_key"], scope_key)
+
     def test_opening_payload_normalization_rejects_scope_mismatch(self):
         module = load_module()
 
@@ -1301,7 +1621,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         self.assertIsNone(normalized)
 
-    async def test_character_chat_opening_reuses_existing_summary_before_llm_call(self):
+    async def test_character_chat_opening_regenerates_legacy_summary_without_runtime_formula_seed(self):
         module = load_module()
         conn = FakeConnection()
         scope_key = "character:백이현"
@@ -1346,9 +1666,24 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "agency_contract": {"character_moves_first": True},
             "progression_engine": {"short_term_goal": "문서 훼손 단서를 확인한다."},
         }
+        regenerated_opening_payload = dict(existing_opening_payload)
+        regenerated_opening_payload["runtime_formula_seed"] = {
+            "formula_type": "FORMULA_CASE_TO_NETWORK",
+            "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
+            "user_task_type": "UT_INSPECT_CLUE",
+            "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
+            "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
+            "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
+            "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
+        }
+        upserted = []
 
         def fake_fetch_state_map(*, summary_type, **_kwargs):
             return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return 92, True
 
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
@@ -1359,10 +1694,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                  return_value={"summary_id": 91, "summary_text": json.dumps(existing_opening_payload, ensure_ascii=False)},
              ), \
              patch.object(module, "activate_existing_summary") as activate_existing, \
-             patch.object(module, "request_character_chat_opening_payload", AsyncMock()) as request_mock, \
+             patch.object(module, "request_character_chat_opening_payload", AsyncMock(return_value=regenerated_opening_payload)) as request_mock, \
              patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["- 1화 장면1: 압력=문서 봉인"]}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "upsert_summary") as upsert_mock, \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert) as upsert_mock, \
              patch.object(module, "deactivate_missing_active_scopes"):
             counts = await module.build_character_chat_opening_summaries(
                 conn=conn,
@@ -1382,10 +1717,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 relation_map={},
             )
 
-        self.assertEqual(counts, (0, 1))
-        request_mock.assert_not_called()
-        upsert_mock.assert_not_called()
-        activate_existing.assert_called_once()
+        self.assertEqual(counts, (1, 0))
+        request_mock.assert_awaited_once()
+        upsert_mock.assert_called_once()
+        activate_existing.assert_not_called()
+        self.assertEqual(json.loads(upserted[0]["summary_text"])["runtime_formula_seed"]["user_task_type"], "UT_INSPECT_CLUE")
 
     async def test_rp_build_preserves_keep_old_scope_when_another_v3_target_succeeds(self):
         module = load_module()
