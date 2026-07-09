@@ -105,6 +105,16 @@ CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v3"
 CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
 CHARACTER_CHAT_INTERNAL_PROMPT_FORMAT_VERSION = "character_chat_internal_prompt_v1"
 CHARACTER_CHAT_OPENING_FORMAT_VERSION = "character_chat_opening_v1"
+CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION = "runtime_formula_seed_v1"
+CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS = (
+    "formula_type",
+    "p_to_user_request",
+    "user_task_type",
+    "user_task_success_condition",
+    "protagonist_state_delta",
+    "open_loop",
+    "mutation_policy",
+)
 EPISODE_SCENE_EXTRACTION_FORMAT_VERSION = "episode_scene_extraction_v1"
 EPISODE_SCENE_EXTRACTION_MAX_INPUT_CHARS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_INPUT_CHARS", "18000"))
 EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS", "6000"))
@@ -352,9 +362,10 @@ internal_prompt 필수 구성:
 4. [첫인사 오프닝]: 사용자가 아직 말하기 전 캐릭터가 먼저 말을 거는 장면을 어떻게 열지 쓴다. 장소의 공기/소리/빛, 캐릭터의 자세/시선/거리, 사용자를 붙잡는 즉각적 긴장, 첫 대사의 상황 질문/협력 요청/선택 여지 hook을 포함한다.
 5. [시작/현재 장면 운용]: 읽은 범위 기준 앵커를 받아 그 시점에서 확인 가능한 장소, 긴장, 행동만 사용한다. 시작 장면을 매 턴 리셋하지 않는다.
 6. [원작 기반 새 사건 운용]: 원작 세계관, 설정, 인물성, 읽은 범위의 갈등은 최대한 유지하되 원작 사건을 그대로 재연하지 않는다. 원작 플롯은 앵커로만 쓰고, 답변의 중심은 원작에서 파생된 새 사이드 사건/새 변수/새 단서여야 한다. 새 사건의 비중을 원작 요약보다 높게 두되, 새 사건은 기존 세계관과 캐릭터 동기에서 자연스럽게 생긴 작은 위기, 요청, 방해, 단서, 관계 압력이어야 한다. 원작 결말/배후/미래 사건을 새로 확정하지 않는다.
-7. [짧은 입력 처리]: 사용자가 '응', '그래', '뭐야?'처럼 짧게 말해도 캐릭터가 지문+대사로 반응하고 작은 사건/질문/행동 하나, 또는 새 변수/관계 반응/장면 변화 하나로 장면을 전진시킨다.
-8. [금지]: 사용자 행동/감정/대사를 대신 확정하지 않는다. 사용자의 표정/떨림/긴장/신체 반응/숨소리/소지품/서 있는 자세도 단정하지 않는다. 얼굴/발끝/몸을 훑는 지문도 쓰지 않는다. 지문에서는 2인칭 대명사 전체를 쓰지 않는다. 사용자의 정체를 추궁하거나 '너 누구냐', '왜 여기 있지', '수상한 놈', '침입자냐'로 시작하지 않는다. 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 않는다. AI/시스템/프롬프트/규칙을 언급하지 않는다. 공개 읽은 범위 밖 스포일러를 만들지 않는다. 원문 대사를 그대로 복붙하지 않는다.
-9. [응답 감각]: 첫인사는 5~8문장 지문 + 2~3문장 대사로 장면을 충분히 연다. 이후 답변은 지문 2~4문장 뒤 캐릭터 대사 1~3문장을 기본으로 하되, 매 턴 물리적 행동/새 변수/관계 반응/장면 변화/hook 하나를 둔다.
+7. [런타임 전개 공식]: 캐릭터가 유저에게 맡길 1~3턴짜리 구체 작업, 그 작업이 영향을 줄 주인공의 다음 행동, 작업 뒤 생길 state_delta/open_loop를 함께 둔다. 유저 작업은 관찰/추론/타이밍/선택/증거/경로/반응 읽기처럼 즉시 답할 수 있어야 하며 최종 승리나 결말이 아니어야 한다.
+8. [짧은 입력 처리]: 사용자가 '응', '그래', '뭐야?'처럼 짧게 말해도 캐릭터가 지문+대사로 반응하고 작은 사건/질문/행동 하나, 또는 새 변수/관계 반응/장면 변화 하나로 장면을 전진시킨다.
+9. [금지]: 사용자 행동/감정/대사를 대신 확정하지 않는다. 사용자의 표정/떨림/긴장/신체 반응/숨소리/소지품/서 있는 자세도 단정하지 않는다. 얼굴/발끝/몸을 훑는 지문도 쓰지 않는다. 지문에서는 2인칭 대명사 전체를 쓰지 않는다. 사용자의 정체를 추궁하거나 '너 누구냐', '왜 여기 있지', '수상한 놈', '침입자냐'로 시작하지 않는다. 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 않는다. AI/시스템/프롬프트/규칙을 언급하지 않는다. 공개 읽은 범위 밖 스포일러를 만들지 않는다. 원문 대사를 그대로 복붙하지 않는다.
+10. [응답 감각]: 첫인사는 5~8문장 지문 + 2~3문장 대사로 장면을 충분히 연다. 이후 답변은 지문 2~4문장 뒤 캐릭터 대사 1~3문장을 기본으로 하되, 매 턴 물리적 행동/새 변수/관계 반응/장면 변화/hook 하나를 둔다.
 
 규칙:
 - 정보가 부족하면 모른다고 해설하지 말고, 확인 가능한 현재 장면의 반응으로 좁혀라.
@@ -365,6 +376,7 @@ internal_prompt 필수 구성:
 - 캐릭터가 경계심이 강해도 의심은 말투 한 줄 이하로만 두고, 정체 미스터리/심문 루프를 사건 엔진으로 쓰지 마라. 첫인사는 현재 사건의 목적, 위기, 행동 hook으로 열어라.
 - 치료 보조, 기록 담당, 임시 동행자, 현장 보조자처럼 장면을 돕는 약한 역할 라벨은 가능하지만 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 마라.
 - 원작은 대본이 아니라 제약 조건이다. 원작 장면을 요약하거나 반복하지 말고, 읽은 범위의 갈등/관계/장소/물건에서 파생된 새 곁가지 사건으로 시작하라.
+- 전개 공식은 `공개 평가 뒤집기`, `초기 자원 확보`, `전투 패턴 깨기`, `불확실한 인물의 신뢰 전환`, `작은 사건의 확장` 중 입력 근거와 가장 가까운 것을 우선 사용하라. 장면마다 유저에게 관찰/단서 확인/타이밍 콜/선택지 계산/답변 작성/경로 파악/증거 준비 중 하나를 맡기고, 캐릭터가 그 결과를 자신의 행동 변화로 받아 장면을 전진시키게 하라.
 - 캐릭터는 장면 목적과 stake를 제공하되, 사용자를 심부름시키는 명령문보다 장면 압력, 협력 요청, 자연스러운 1~2개 행동 방향으로 유도하라.
 - 사건 진행만 밀지 말고, 사용자의 말에 대한 캐릭터의 관계 반응을 최소 하나 포함하게 하라.
 - 압박감은 캐릭터의 자세, 주변 사물, 출입구, 거리 조절, 질문으로 만들고 사용자의 내면/신체 상태/구체 위치/소지품을 쓰지 마라.
@@ -527,6 +539,15 @@ CHARACTER_CHAT_OPENING_SYSTEM = """너는 웹소설 원작 기반 캐릭터챗�
     "mid_term_escalation": "10~30턴 사이 새 압박",
     "scene_exit_condition": "다음 국면으로 넘어가는 조건"
   },
+  "runtime_formula_seed": {
+    "formula_type": "FORMULA_* 라벨. 우선 후보: FORMULA_PUBLIC_TEST_FLIP|FORMULA_RESOURCE_BOOTSTRAP|FORMULA_COMBAT_PATTERN_BREAK|FORMULA_ALLY_TRUST_CONVERSION|FORMULA_CASE_TO_NETWORK",
+    "p_to_user_request": "캐릭터가 유저에게 맡기는 1~3턴짜리 구체 작업",
+    "user_task_type": "UT_* 라벨. 우선 후보: UT_MONITOR_REACTION|UT_INSPECT_CLUE|UT_CALL_TIMING|UT_CALCULATE_OPTION|UT_CRAFT_RESPONSE|UT_MAP_ROUTE|UT_PREPARE_EVIDENCE|UT_MONITOR_STATUS",
+    "user_task_success_condition": "유저가 짧은 응답으로 달성할 수 있는 즉시 성공조건",
+    "protagonist_state_delta": "유저 응답 뒤 캐릭터가 행동으로 만들 상태 변화",
+    "open_loop": "다음 3~5턴으로 남길 새 변수/위험/단서",
+    "mutation_policy": "MP_SAME_RELATION_NEW_TEST|MP_SAME_PRESSURE_NEW_ROUTE|MP_SAME_CASE_NEW_SCOPE|MP_SAME_ASSET_NEW_CLUE|MP_SAME_HAZARD_NEW_LOCATION|MP_SAME_RULE_NEW_EXCEPTION|MP_SAME_DEADLINE_NEW_OBSTACLE|MP_SAME_RIVAL_NEW_MOVE"
+  },
   "user_affordance_contract": {
     "primary_affordances": [],
     "forbidden_agency_load": [],
@@ -551,14 +572,16 @@ CHARACTER_CHAT_OPENING_SYSTEM = """너는 웹소설 원작 기반 캐릭터챗�
 3. opening_message는 실제 첫 assistant 응답 초안이다. 일반 캐릭터챗 위저드의 첫시작처럼 intro(서술형 지문) + first_line(첫대사) 구조로 만든다. 대사만 있거나 지문만 있으면 ready가 아니다.
 4. 유저를 특정 원작 인물, 연인, 가족, 포로, 환자, 짐승, 주인공으로 확정하지 마라.
 5. 캐릭터가 장면 목적과 stake를 제공하고, 대화가 20~30턴 반복되지 않게 progression_engine을 채워라.
-6. opening_message.narration은 300~500자 분량의 서술형 지문이다. 사건 한복판에서 시작하고, 빛/소리/온도/냄새 중 1~2개 감각 디테일, 캐릭터의 3인칭 행동, 즉시 압박, 관계 훅을 넣어라.
-7. opening_message.narration은 캐릭터/환경/사물/사건만 묘사한다. 지문에서 사용자의 행동, 감정, 자세, 소지품, 신체 반응, 위치를 확정하지 마라.
-8. opening_message.dialogue는 chat_target 캐릭터가 직접 말하는 1~3문장 대사여야 한다. 대사 안에는 유저가 지금 할 수 있는 구체 행동/선택/협력 요청을 넣어라.
+6. runtime_formula_seed는 반드시 progression_engine과 같은 사건을 가리켜야 한다. 첫 턴에서 유저가 할 일은 최종 payoff가 아니라 관찰/단서 확인/타이밍 콜/선택지 계산/답변 작성/경로 파악/증거 준비처럼 1~3턴 안에 끝나는 작은 작업이어야 한다. 그 작업 뒤 캐릭터가 어떻게 움직일지 protagonist_state_delta와 open_loop를 채워라.
+7. runtime_formula_seed.formula_type은 장르가 아니라 장면을 움직이는 행동 공식이다. 공개 평가를 뒤집는 장면은 FORMULA_PUBLIC_TEST_FLIP, 첫 자원/장비/접근권을 만드는 장면은 FORMULA_RESOURCE_BOOTSTRAP, 적의 패턴/위험 동선을 깨는 장면은 FORMULA_COMBAT_PATTERN_BREAK, 불확실한 인물을 협력자로 바꾸는 장면은 FORMULA_ALLY_TRUST_CONVERSION, 작은 단서가 더 큰 사건으로 번지는 장면은 FORMULA_CASE_TO_NETWORK를 우선 고른다. 이 다섯 가지가 맞지 않으면 입력 근거에 가장 가까운 다른 FORMULA_* 라벨을 사용하되 새 라벨을 만들지 마라.
+8. opening_message.narration은 300~500자 분량의 서술형 지문이다. 사건 한복판에서 시작하고, 빛/소리/온도/냄새 중 1~2개 감각 디테일, 캐릭터의 3인칭 행동, 즉시 압박, 관계 훅을 넣어라.
+9. opening_message.narration은 캐릭터/환경/사물/사건만 묘사한다. 지문에서 사용자의 행동, 감정, 자세, 소지품, 신체 반응, 위치를 확정하지 마라.
+10. opening_message.dialogue는 chat_target 캐릭터가 직접 말하는 1~3문장 대사여야 한다. 대사 안에는 유저가 지금 할 수 있는 구체 행동/선택/협력 요청을 넣어라.
    단, 대사에서도 사용자가 이미 멍하니 서 있다/숨어 있다/어슬렁거린다/침입했다/허가받지 않았다/목적을 숨긴다/대답해야 한다고 단정하지 마라.
    협력 요청은 "저 박스 근처로 누가 다가오면 알려", "왼쪽 문양과 오른쪽 발소리 중 하나를 확인해"처럼 외부 사물과 선택지를 향해야 한다.
    첫 대사는 "거기,"로 시작하지 마라. 사용자를 부르는 대신 곧바로 외부 사건/사물/선택지를 제시하라.
    좋은 형식: "저 박스 근처로 누가 다가오면 바로 알려. 나는 이 상태창부터 확인할게." / "왼쪽 문양과 오른쪽 발소리 중 하나를 먼저 봐. 둘 다 놓치면 늦어."
-9. opening_message.opening_text는 첫 화면에 그대로 띄울 순수 본문이다. 반드시 `narration` 문단, 빈 줄, 큰따옴표 대사 순서로 작성하라. 단답 대사, 안내문, 자기소개, "무엇을 도와줄까"식 일반 인사는 금지다.
+11. opening_message.opening_text는 첫 화면에 그대로 띄울 순수 본문이다. 반드시 `narration` 문단, 빈 줄, 큰따옴표 대사 순서로 작성하라. 단답 대사, 안내문, 자기소개, "무엇을 도와줄까"식 일반 인사는 금지다.
 """
 
 RP_CHARACTER_PLAN_PROMPT = """너는 웹소설 episode_summary를 보고 RP용 중심인물 계획을 세우는 추론기다.
@@ -5154,17 +5177,36 @@ def normalize_character_chat_opening_payload(
         "character_drive",
         "agency_contract",
         "progression_engine",
+        "runtime_formula_seed",
     ]
     if any(not isinstance(payload.get(field_name), dict) or not payload.get(field_name) for field_name in required_dict_fields):
         return None
     opening_message = normalize_character_chat_opening_message(payload.get("opening_message"))
     if opening_message is None:
         return None
+    runtime_formula_seed = normalize_character_chat_runtime_formula_seed(
+        payload.get("runtime_formula_seed")
+    )
+    if runtime_formula_seed is None:
+        return None
     normalized = dict(payload)
     normalized["schema_version"] = CHARACTER_CHAT_OPENING_FORMAT_VERSION
     normalized["readiness"] = readiness
     normalized["chat_target"] = chat_target
     normalized["opening_message"] = opening_message
+    normalized["runtime_formula_seed"] = runtime_formula_seed
+    return normalized
+
+
+def normalize_character_chat_runtime_formula_seed(value: object) -> dict[str, str] | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    normalized: dict[str, str] = {}
+    for field_name in CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS:
+        field_value = normalize_rp_text(str(value.get(field_name) or ""), limit=700)
+        if not field_value:
+            return None
+        normalized[field_name] = field_value
     return normalized
 
 
@@ -5460,6 +5502,7 @@ def build_character_chat_opening_source_hash(
     return build_compound_summary_source_hash(
         CHARACTER_CHAT_OPENING_FORMAT_VERSION,
         [
+            CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION,
             character_key,
             build_rp_profile_model_signature(),
             *build_character_chat_inventory_signature_parts(inventory_item),
@@ -5587,14 +5630,95 @@ def build_inventory_rp_targets(
     return [target for _, target in sorted(candidates, key=lambda item: item[0])[:limit]]
 
 
-def build_inventory_scope_alias_keys(scope_key: str, inventory_item: dict[str, object] | None) -> set[str]:
-    alias_keys = {str(scope_key or "").strip()}
+def build_inventory_scope_alias_key_candidates(scope_key: str, inventory_item: dict[str, object] | None) -> list[str]:
+    alias_keys: list[str] = []
+
+    def append_key(value: object) -> None:
+        alias_key = str(value or "").strip()
+        if alias_key and alias_key not in alias_keys:
+            alias_keys.append(alias_key)
+
+    append_key(scope_key)
     payload = dict(inventory_item or {})
     for field_name in ("character_key", "canonical_character_key"):
-        alias_keys.add(str(payload.get(field_name) or "").strip())
+        append_key(payload.get(field_name))
     for source_key in list(payload.get("source_character_keys") or []):
-        alias_keys.add(str(source_key or "").strip())
-    return {alias_key for alias_key in alias_keys if alias_key}
+        append_key(source_key)
+    return alias_keys
+
+
+def build_inventory_scope_alias_keys(scope_key: str, inventory_item: dict[str, object] | None) -> set[str]:
+    return set(build_inventory_scope_alias_key_candidates(scope_key, inventory_item))
+
+
+def fetch_summary_state_for_inventory_alias(
+    rows_by_scope: dict[str, dict[str, object]],
+    *,
+    scope_key: str,
+    inventory_item: dict[str, object] | None,
+) -> dict[str, object]:
+    for alias_key in build_inventory_scope_alias_key_candidates(scope_key, inventory_item):
+        row = rows_by_scope.get(alias_key)
+        if row:
+            return dict(row)
+    return {}
+
+
+def fetch_legacy_summary_state_for_inventory_alias(
+    rows_by_scope: dict[str, dict[str, object]],
+    *,
+    scope_key: str,
+    inventory_item: dict[str, object] | None,
+) -> dict[str, object]:
+    for alias_key in build_inventory_scope_alias_key_candidates(scope_key, inventory_item):
+        if alias_key == scope_key:
+            continue
+        row = rows_by_scope.get(alias_key)
+        if row:
+            return dict(row)
+    return {}
+
+
+def canonicalize_character_chat_payload_scope(
+    payload: dict[str, object],
+    *,
+    scope_key: str,
+    display_name: str,
+) -> dict[str, object]:
+    copied = dict(payload or {})
+    copied["character_key"] = scope_key
+    if display_name and not str(copied.get("display_name") or "").strip():
+        copied["display_name"] = display_name
+    return copied
+
+
+def build_rp_dialogue_items_from_example_payload(example_payload: dict[str, object]) -> list[dict[str, object]]:
+    dialogue_items: list[dict[str, object]] = []
+    for item in list(example_payload.get("examples") or []):
+        if not isinstance(item, dict):
+            continue
+        payload = dict(item or {})
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            episode_no = int(payload.get("episode_no") or 0)
+        except (TypeError, ValueError):
+            episode_no = 0
+        try:
+            confidence = float(payload.get("confidence") or 0.7)
+        except (TypeError, ValueError):
+            confidence = 0.7
+        dialogue_items.append(
+            {
+                "episode_no": episode_no,
+                "kind": str(payload.get("source_kind") or "dialogue").strip() or "dialogue",
+                "text": text,
+                "confidence": confidence,
+                "is_example_candidate": True,
+            }
+        )
+    return dialogue_items
 
 
 def is_batch_rp_candidate(inventory_item: dict[str, object] | None) -> bool:
@@ -6170,6 +6294,17 @@ async def build_rp_summaries_delta(
         conn,
         product_id=product_id,
     )
+    with work_cursor(conn) as cur:
+        existing_profile_rows_by_scope = fetch_active_summary_state_map(
+            cur=cur,
+            product_id=product_id,
+            summary_type="character_rp_profile",
+        )
+        existing_example_rows_by_scope = fetch_active_summary_state_map(
+            cur=cur,
+            product_id=product_id,
+            summary_type="character_rp_examples",
+        )
     source_scope_key_map = build_inventory_source_scope_key_map(inventory_map or {})
     processed_scope_keys: set[str] = set()
     for scope_key in sorted(affected_scope_keys):
@@ -6243,6 +6378,131 @@ async def build_rp_summaries_delta(
             continue
 
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
+        summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
+        relation_context_lines = build_rp_relation_context_lines(
+            character_key=scope_key,
+            relation_map=relation_map,
+        )
+        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
+        existing_profile_row: dict[str, object] = {}
+        existing_example_row: dict[str, object] = {}
+        if not existing_profile_rows_by_scope.get(scope_key) and not existing_example_rows_by_scope.get(scope_key):
+            existing_profile_row = fetch_legacy_summary_state_for_inventory_alias(
+                existing_profile_rows_by_scope,
+                scope_key=scope_key,
+                inventory_item=inventory_item,
+            )
+            existing_example_row = fetch_legacy_summary_state_for_inventory_alias(
+                existing_example_rows_by_scope,
+                scope_key=scope_key,
+                inventory_item=inventory_item,
+            )
+        existing_profile_payload = dict(existing_profile_row.get("payload") or {})
+        existing_example_payload = dict(existing_example_row.get("payload") or {})
+        existing_dialogue_items = build_rp_dialogue_items_from_example_payload(existing_example_payload)
+        if existing_profile_payload and existing_example_payload and existing_dialogue_items:
+            profile_payload = {
+                **existing_profile_payload,
+                "character_key": scope_key,
+                "display_name": str(
+                    existing_profile_payload.get("display_name")
+                    or target.get("display_name")
+                    or target.get("reference_name")
+                    or ""
+                ).strip(),
+            }
+            example_payload = {
+                **existing_example_payload,
+                "character_key": scope_key,
+            }
+            try:
+                internal_prompt_payload = await request_character_chat_internal_prompt_payload(
+                    summary_client,
+                    target=target,
+                    profile_payload=profile_payload,
+                    example_payload=example_payload,
+                    dialogue_items=existing_dialogue_items,
+                    summary_context_lines=summary_context_lines,
+                    inventory_item=inventory_item,
+                    relation_context_lines=relation_context_lines,
+                    scene_context_lines=scene_context_lines,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s source=alias error=%s",
+                    product_id,
+                    scope_key,
+                    str(exc)[:200],
+                )
+                internal_prompt_payload = None
+            if internal_prompt_payload:
+                internal_prompt_payload = {
+                    "character_key": scope_key,
+                    "display_name": str(profile_payload.get("display_name") or "").strip(),
+                    **internal_prompt_payload,
+                }
+                profile_source_hash = build_compound_summary_source_hash(
+                    CHARACTER_RP_PROFILE_FORMAT_VERSION,
+                    [
+                        "alias_bridge_v1",
+                        scope_key,
+                        str(existing_profile_row.get("scope_key") or ""),
+                        str(existing_profile_row.get("source_hash") or ""),
+                        json.dumps(build_character_chat_inventory_signature_parts(inventory_item), ensure_ascii=False),
+                    ],
+                )
+                examples_source_hash = build_compound_summary_source_hash(
+                    CHARACTER_RP_EXAMPLES_FORMAT_VERSION,
+                    [
+                        "alias_bridge_v1",
+                        scope_key,
+                        str(existing_example_row.get("scope_key") or ""),
+                        str(existing_example_row.get("source_hash") or ""),
+                        json.dumps(build_character_chat_inventory_signature_parts(inventory_item), ensure_ascii=False),
+                    ],
+                )
+                internal_prompt_source_hash = build_character_chat_internal_prompt_source_hash(
+                    character_key=scope_key,
+                    inventory_item=inventory_item,
+                    profile_payload=profile_payload,
+                    example_payload=example_payload,
+                    dialogue_items=existing_dialogue_items,
+                    summary_context_lines=summary_context_lines,
+                    relation_context_lines=relation_context_lines,
+                    scene_context_lines=scene_context_lines,
+                )
+                with work_cursor(conn) as cur:
+                    _, profile_inserted = upsert_summary(
+                        cur,
+                        product_id=product_id,
+                        summary_type="character_rp_profile",
+                        scope_key=scope_key,
+                        source_hash=profile_source_hash,
+                        source_doc_count=1,
+                        summary_text=json.dumps(profile_payload, ensure_ascii=False),
+                    )
+                    _, examples_inserted = upsert_summary(
+                        cur,
+                        product_id=product_id,
+                        summary_type="character_rp_examples",
+                        scope_key=scope_key,
+                        source_hash=examples_source_hash,
+                        source_doc_count=len(existing_dialogue_items),
+                        summary_text=json.dumps(example_payload, ensure_ascii=False),
+                    )
+                    upsert_summary(
+                        cur,
+                        product_id=product_id,
+                        summary_type="character_chat_internal_prompt",
+                        scope_key=scope_key,
+                        source_hash=internal_prompt_source_hash,
+                        source_doc_count=len(existing_dialogue_items),
+                        summary_text=json.dumps(internal_prompt_payload, ensure_ascii=False),
+                    )
+                counts["profile"][0 if profile_inserted else 1] += 1
+                counts["examples"][0 if examples_inserted else 1] += 1
+                continue
+
         dialogue_items: list[dict[str, object]] = []
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
         if not bool(direct_voice_quality.get("strict_chat_ready")):
@@ -6282,12 +6542,6 @@ async def build_rp_summaries_delta(
             counts["keep_old_dialogue_missing_count"] += 1
             continue
 
-        summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
-        relation_context_lines = build_rp_relation_context_lines(
-            character_key=scope_key,
-            relation_map=relation_map,
-        )
-        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
         try:
             payload = await request_rp_profile_payload(
                 summary_client,
@@ -6497,16 +6751,41 @@ async def build_character_chat_opening_summaries(
         )
         if get_rp_target_skip_reason(target):
             continue
-        profile_row = dict(profile_rows_by_scope.get(scope_key) or {})
-        example_row = dict(example_rows_by_scope.get(scope_key) or {})
-        internal_prompt_row = dict(internal_prompt_rows_by_scope.get(scope_key) or {})
+        profile_row = fetch_summary_state_for_inventory_alias(
+            profile_rows_by_scope,
+            scope_key=scope_key,
+            inventory_item=inventory_item,
+        )
+        example_row = fetch_summary_state_for_inventory_alias(
+            example_rows_by_scope,
+            scope_key=scope_key,
+            inventory_item=inventory_item,
+        )
+        internal_prompt_row = fetch_summary_state_for_inventory_alias(
+            internal_prompt_rows_by_scope,
+            scope_key=scope_key,
+            inventory_item=inventory_item,
+        )
         scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
         if not profile_row or not example_row or not internal_prompt_row or not scene_context_lines:
             continue
 
-        profile_payload = dict(profile_row.get("payload") or {})
-        example_payload = dict(example_row.get("payload") or {})
-        internal_prompt_payload = dict(internal_prompt_row.get("payload") or {})
+        display_name = str(target.get("display_name") or target.get("reference_name") or "").strip()
+        profile_payload = canonicalize_character_chat_payload_scope(
+            dict(profile_row.get("payload") or {}),
+            scope_key=scope_key,
+            display_name=display_name,
+        )
+        example_payload = canonicalize_character_chat_payload_scope(
+            dict(example_row.get("payload") or {}),
+            scope_key=scope_key,
+            display_name=display_name,
+        )
+        internal_prompt_payload = canonicalize_character_chat_payload_scope(
+            dict(internal_prompt_row.get("payload") or {}),
+            scope_key=scope_key,
+            display_name=display_name,
+        )
         if not profile_payload or not example_payload or not internal_prompt_payload:
             continue
 
