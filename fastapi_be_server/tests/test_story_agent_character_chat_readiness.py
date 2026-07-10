@@ -55,6 +55,17 @@ def inventory_payload(scope_key="protagonist:named:데시", *, public_chat=True,
     }
 
 
+def profile_payload(scope_key="protagonist:named:데시"):
+    return {"character_key": scope_key, "display_name": "데시"}
+
+
+def examples_payload(scope_key="protagonist:named:데시"):
+    return {
+        "character_key": scope_key,
+        "examples": [{"episode_no": 3, "text": "움직여."}],
+    }
+
+
 def scene_payload(scope_key="protagonist:named:데시"):
     return {
         "episode_no": 3,
@@ -73,6 +84,18 @@ def scene_payload(scope_key="protagonist:named:데시"):
                 "action_ownership": [{"actor_scope_key": scope_key, "action": "흔적을 확인한다"}],
             }
         ],
+    }
+
+
+def runtime_formula_seed():
+    return {
+        "formula_type": "FORMULA_COMBAT_PATTERN_BREAK",
+        "p_to_user_request": "문틈 아래 흔적과 발소리 중 먼저 확인할 대상을 고르게 한다.",
+        "user_task_type": "UT_INSPECT_CLUE",
+        "user_task_success_condition": "유저가 흔적 또는 발소리 중 하나를 선택한다.",
+        "protagonist_state_delta": "데시가 선택된 단서를 기준으로 다음 방 진입 방식을 바꾼다.",
+        "open_loop": "문 안쪽의 금속음이 다음 압박으로 남는다.",
+        "mutation_policy": "MP_SAME_HAZARD_NEW_LOCATION",
     }
 
 
@@ -95,6 +118,7 @@ def opening_payload(scope_key="protagonist:named:데시"):
             "non_user_dependent_action": "데시가 먼저 문고리와 바닥 흔적을 확인한다.",
         },
         "progression_engine": {"scene_exit_condition": "흔적을 확인하고 다음 방으로 이동한다."},
+        "runtime_formula_seed": runtime_formula_seed(),
         "progression": {"next_beats": [{"beat": "문틈 확인"}, {"beat": "발소리 접근"}]},
     }
 
@@ -122,14 +146,13 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         self.assertEqual(verification["ready_public_candidate_count"], 0)
         self.assertEqual(verification["missing_profile_scope_keys"], ["protagonist:named:데시"])
         self.assertEqual(verification["missing_examples_scope_keys"], ["protagonist:named:데시"])
-        self.assertEqual(verification["missing_internal_prompt_scope_keys"], ["protagonist:named:데시"])
-        self.assertEqual(verification["missing_opening_scope_keys"], ["protagonist:named:데시"])
+        self.assertEqual(verification["missing_internal_prompt_scope_keys"], [])
+        self.assertEqual(verification["missing_opening_scope_keys"], [])
         self.assertEqual(verification["missing_usable_scene_scope_keys"], ["protagonist:named:데시"])
         self.assertEqual(verification["block_reason_counts"]["missing_profile"], 1)
-        self.assertEqual(verification["block_reason_counts"]["missing_character_chat_opening"], 1)
         self.assertEqual(verification["block_reason_counts"]["missing_usable_scene"], 1)
 
-    def test_character_chat_holds_without_opening_asset_even_if_other_assets_exist(self):
+    def test_character_chat_is_ready_without_legacy_static_opening(self):
         module = load_module()
         scope_key = "protagonist:named:데시"
 
@@ -139,8 +162,8 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             total_episode_count=3,
             summary_rows_by_type={
                 "character_inventory_v3": [row("character_inventory_v3", scope_key, inventory_payload(scope_key))],
-                "character_rp_profile": [row("character_rp_profile", scope_key, {"display_name": "데시"})],
-                "character_rp_examples": [row("character_rp_examples", scope_key, {"examples": [{"text": "움직여."}]})],
+                "character_rp_profile": [row("character_rp_profile", scope_key, profile_payload(scope_key))],
+                "character_rp_examples": [row("character_rp_examples", scope_key, examples_payload(scope_key))],
                 "character_chat_internal_prompt": [
                     row("character_chat_internal_prompt", scope_key, {"internal_prompt": "[핵심] 데시는 먼저 움직인다."})
                 ],
@@ -148,12 +171,58 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             },
         )
 
+        self.assertEqual(verification["character_chat_status"], "ready")
+        self.assertEqual(verification["ready_public_candidate_count"], 1)
+        self.assertEqual(verification["missing_opening_scope_keys"], [])
+
+    def test_character_chat_holds_invalid_rp_payloads_that_runtime_rejects(self):
+        module = load_module()
+        scope_key = "protagonist:named:데시"
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=108,
+            story_context_status="ready",
+            total_episode_count=3,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row("character_inventory_v3", scope_key, inventory_payload(scope_key))
+                ],
+                "character_rp_profile": [
+                    row(
+                        "character_rp_profile",
+                        scope_key,
+                        profile_payload("character:다른인물"),
+                    )
+                ],
+                "character_rp_examples": [
+                    row(
+                        "character_rp_examples",
+                        scope_key,
+                        {
+                            "character_key": scope_key,
+                            "examples": [{"text": "회차 근거가 없다."}],
+                        },
+                    )
+                ],
+                "episode_scene_extraction": [
+                    row(
+                        "episode_scene_extraction",
+                        "episode:3",
+                        scene_payload(scope_key),
+                        episode_from=3,
+                    )
+                ],
+            },
+        )
+
         self.assertEqual(verification["character_chat_status"], "hold")
         self.assertEqual(verification["ready_public_candidate_count"], 0)
-        self.assertEqual(verification["missing_opening_scope_keys"], [scope_key])
-        self.assertEqual(verification["block_reason_counts"]["missing_character_chat_opening"], 1)
+        self.assertEqual(verification["invalid_profile_scope_keys"], [scope_key])
+        self.assertEqual(verification["invalid_examples_scope_keys"], [scope_key])
+        self.assertEqual(verification["block_reason_counts"]["invalid_profile_payload"], 1)
+        self.assertEqual(verification["block_reason_counts"]["invalid_examples_payload"], 1)
 
-    def test_character_chat_holds_when_opening_asset_scope_mismatches(self):
+    def test_legacy_static_opening_scope_mismatch_is_ignored(self):
         module = load_module()
         scope_key = "protagonist:named:데시"
         invalid_opening = opening_payload("protagonist:named:다른인물")
@@ -164,8 +233,8 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             total_episode_count=3,
             summary_rows_by_type={
                 "character_inventory_v3": [row("character_inventory_v3", scope_key, inventory_payload(scope_key))],
-                "character_rp_profile": [row("character_rp_profile", scope_key, {"display_name": "데시"})],
-                "character_rp_examples": [row("character_rp_examples", scope_key, {"examples": [{"text": "움직여."}]})],
+                "character_rp_profile": [row("character_rp_profile", scope_key, profile_payload(scope_key))],
+                "character_rp_examples": [row("character_rp_examples", scope_key, examples_payload(scope_key))],
                 "character_chat_internal_prompt": [
                     row("character_chat_internal_prompt", scope_key, {"internal_prompt": "[핵심] 데시는 먼저 움직인다."})
                 ],
@@ -174,10 +243,35 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(verification["character_chat_status"], "hold")
-        self.assertEqual(verification["ready_public_candidate_count"], 0)
-        self.assertEqual(verification["invalid_opening_scope_keys"], [scope_key])
-        self.assertEqual(verification["block_reason_counts"]["invalid_character_chat_opening"], 1)
+        self.assertEqual(verification["character_chat_status"], "ready")
+        self.assertEqual(verification["ready_public_candidate_count"], 1)
+        self.assertEqual(verification["invalid_opening_scope_keys"], [])
+
+    def test_legacy_static_opening_formula_is_not_a_v2_readiness_requirement(self):
+        module = load_module()
+        scope_key = "protagonist:named:데시"
+        legacy_opening = opening_payload(scope_key)
+        legacy_opening.pop("runtime_formula_seed")
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=107,
+            story_context_status="ready",
+            total_episode_count=3,
+            summary_rows_by_type={
+                "character_inventory_v3": [row("character_inventory_v3", scope_key, inventory_payload(scope_key))],
+                "character_rp_profile": [row("character_rp_profile", scope_key, profile_payload(scope_key))],
+                "character_rp_examples": [row("character_rp_examples", scope_key, examples_payload(scope_key))],
+                "character_chat_internal_prompt": [
+                    row("character_chat_internal_prompt", scope_key, {"internal_prompt": "[핵심] 데시는 먼저 움직인다."})
+                ],
+                "character_chat_opening_v1": [row("character_chat_opening_v1", scope_key, legacy_opening)],
+                "episode_scene_extraction": [row("episode_scene_extraction", "episode:3", scene_payload(scope_key), episode_from=3)],
+            },
+        )
+
+        self.assertEqual(verification["character_chat_status"], "ready")
+        self.assertEqual(verification["ready_public_candidate_count"], 1)
+        self.assertEqual(verification["invalid_opening_scope_keys"], [])
 
     def test_legacy_rp_scope_key_mismatch_is_reported_without_becoming_ready(self):
         module = load_module()
@@ -192,9 +286,9 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             total_episode_count=3,
             summary_rows_by_type={
                 "character_inventory_v3": [row("character_inventory_v3", scope_key, payload)],
-                "character_rp_profile": [row("character_rp_profile", legacy_scope_key, {"display_name": "데시"})],
+                "character_rp_profile": [row("character_rp_profile", legacy_scope_key, profile_payload(legacy_scope_key))],
                 "character_rp_examples": [
-                    row("character_rp_examples", legacy_scope_key, {"examples": [{"text": "움직여."}]})
+                    row("character_rp_examples", legacy_scope_key, examples_payload(legacy_scope_key))
                 ],
                 "character_chat_internal_prompt": [
                     row("character_chat_internal_prompt", scope_key, {"internal_prompt": "[핵심] 데시는 먼저 움직인다."})
@@ -215,7 +309,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         self.assertNotIn("missing_profile", verification["block_reason_counts"])
         self.assertNotIn("missing_examples", verification["block_reason_counts"])
 
-    def test_character_chat_ready_requires_exact_scope_profile_examples_prompt_scene_and_opening(self):
+    def test_character_chat_ready_requires_exact_scope_profile_examples_and_scene(self):
         module = load_module()
         scope_key = "protagonist:named:데시"
 
@@ -225,8 +319,8 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             total_episode_count=3,
             summary_rows_by_type={
                 "character_inventory_v3": [row("character_inventory_v3", scope_key, inventory_payload(scope_key))],
-                "character_rp_profile": [row("character_rp_profile", scope_key, {"display_name": "데시"})],
-                "character_rp_examples": [row("character_rp_examples", scope_key, {"examples": [{"text": "움직여."}]})],
+                "character_rp_profile": [row("character_rp_profile", scope_key, profile_payload(scope_key))],
+                "character_rp_examples": [row("character_rp_examples", scope_key, examples_payload(scope_key))],
                 "character_chat_internal_prompt": [
                     row("character_chat_internal_prompt", scope_key, {"internal_prompt": "[핵심] 데시는 먼저 움직인다."})
                 ],
@@ -267,7 +361,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
     def test_status_row_is_enriched_with_character_chat_asset_readiness(self):
         module = load_module()
         readiness = {
-            "schema_version": "character_chat_asset_readiness_v1",
+            "schema_version": "character_chat_asset_readiness_v2",
             "character_chat_status": "hold",
         }
         fake_cursor = object()

@@ -186,6 +186,85 @@ class FakeStatusErrorAsyncClient:
 
 
 class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
+    async def test_rp_examples_hash_changes_when_provenance_changes(self):
+        module = load_module()
+        common = {
+            "character_key": "character:루벤",
+            "inventory_item": None,
+            "summary_context_lines": [],
+            "relation_context_lines": [],
+        }
+        first_hash = module.build_rp_examples_source_hash(
+            **common,
+            example_payload={
+                "examples": [
+                    {
+                        "episode_no": 1,
+                        "source_kind": "dialogue",
+                        "text": "그만 물러서.",
+                        "confidence": 0.9,
+                    }
+                ]
+            },
+        )
+        corrected_hash = module.build_rp_examples_source_hash(
+            **common,
+            example_payload={
+                "examples": [
+                    {
+                        "episode_no": 2,
+                        "source_kind": "dialogue",
+                        "text": "그만 물러서.",
+                        "confidence": 0.9,
+                    }
+                ]
+            },
+        )
+        source_kind_hash = module.build_rp_examples_source_hash(
+            **common,
+            example_payload={
+                "examples": [
+                    {
+                        "episode_no": 1,
+                        "source_kind": "narration",
+                        "text": "그만 물러서.",
+                        "confidence": 0.9,
+                    }
+                ]
+            },
+        )
+        confidence_hash = module.build_rp_examples_source_hash(
+            **common,
+            example_payload={
+                "examples": [
+                    {
+                        "episode_no": 1,
+                        "source_kind": "dialogue",
+                        "text": "그만 물러서.",
+                        "confidence": 0.7,
+                    }
+                ]
+            },
+        )
+        repeated_hash = module.build_rp_examples_source_hash(
+            **common,
+            example_payload={
+                "examples": [
+                    {
+                        "episode_no": 1,
+                        "source_kind": "dialogue",
+                        "text": "그만 물러서.",
+                        "confidence": 0.9,
+                    }
+                ]
+            },
+        )
+
+        self.assertNotEqual(first_hash, corrected_hash)
+        self.assertNotEqual(first_hash, source_kind_hash)
+        self.assertNotEqual(first_hash, confidence_hash)
+        self.assertEqual(first_hash, repeated_hash)
+
     async def test_apply_preflights_openrouter_payment_before_product_lock(self):
         module = load_module()
         client = FakeStatusErrorAsyncClient(402)
@@ -382,28 +461,20 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertIn("장면 압력, 협력 요청, 자연스러운 1~2개 행동 방향", prompt)
         self.assertIn("관계 반응을 최소 하나 포함", prompt)
         self.assertIn("이미 장면에 엮인 비네임드 조력자/동행자/관계자", prompt)
-        self.assertIn("사용자의 정체를 추궁", prompt)
-        self.assertIn("'너 누구냐', '왜 여기 있지', '수상한 놈', '침입자냐'", prompt)
-        self.assertIn("정체 미스터리/심문 루프", prompt)
+        self.assertIn("사용자의 정체를 심문하는 반복 전개", prompt)
+        self.assertIn("정체 심문을 사건 엔진으로 쓰지 마라", prompt)
         self.assertIn("현재 사건의 목적, 위기, 행동 hook", prompt)
         self.assertIn("원작 기존 네임드/짐승/환자/포로로 확정하지 마라", prompt)
-        self.assertIn("지문에서는 2인칭 대명사 전체를 쓰지 마라", prompt)
-        self.assertIn("'너/네/당신/상대/보조자'", prompt)
-        self.assertIn("'곁에 선 이', '옆의 사람', '너를 향해', '너에게'", prompt)
-        self.assertIn("시선, 턱짓, 속삭임, 대답, 명령의 대상이 사용자인 표현도 금지", prompt)
-        self.assertIn("'저 약재', '밖 소리', '저쪽 통로'", prompt)
-        self.assertIn("'네가 가리킨', '네가 들고 있는', '네가 내민'", prompt)
-        self.assertIn("'기록판을 들고 있다', '약재를 가리켰다', '레지던트 때처럼'", prompt)
-        self.assertIn("협력 요청은 대사 속 선택형으로만 하라", prompt)
-        self.assertIn("'너/네/당신/상대/보조자/곁에 선 이/옆의 사람/너에게'", prompt)
-        self.assertIn("'밀어 넣/떠밀/잡아채/끌어당겨/짓눌러/몸을 낮추게'", prompt)
-        self.assertIn("'곁에 선 너', '멍하니 서서', '네가 멈춰 선', '네가 가리킨', '네 발치'", prompt)
-        self.assertIn("'상대의 어깨/눈/손/발치/몸'", prompt)
-        self.assertIn("사용자를 잡아채거나 끌어당기거나 짓누르거나 몸을 낮추게", prompt)
-        self.assertIn("'밀어 넣/떠밀/잡아채/끌어당겨/짓눌러/몸을 낮추게'", prompt)
-        self.assertIn("'너를 쏘아보았다', '너를 힐끗 보았다', '너를 쳐다보지도 않았다'", prompt)
-        self.assertIn("'문 앞을 지키고 서서/뒤에 숨어서'", prompt)
-        self.assertIn("관계 반응은 대사, 말투, 판단, 주변 사물에 대한 반응으로 드러내게 하라", prompt)
+        self.assertIn("[사용자 agency]", prompt)
+        self.assertIn("사용자가 직전 입력에서 직접 밝힌 행동/말/상태만 이어받는다", prompt)
+        self.assertIn("사용자가 직전 입력에서 직접 묘사한 행동과 상태는 이어받을 수 있지만", prompt)
+        self.assertIn("캐릭터 자신의 접근/시선/접촉은 캐릭터 행동으로 쓸 수 있으나", prompt)
+        self.assertIn("협력 요청은 대사 안에서 선택 가능하게 남기고", prompt)
+        self.assertIn("구체적인 금지 표현 목록을 만들지 마라", prompt)
+        self.assertIn("사용자에 관한 서술마다 직전 입력의 근거가 있는지 확인", prompt)
+        self.assertNotIn("곁에 선 이", prompt)
+        self.assertNotIn("네가 가리킨", prompt)
+        self.assertNotIn("잡아채", prompt)
         self.assertNotIn("첫 대사의 압박/질문/명령 hook", prompt)
 
     async def test_existing_episode_character_signal_reuses_without_llm_call(self):

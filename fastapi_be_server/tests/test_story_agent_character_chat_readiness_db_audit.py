@@ -68,7 +68,6 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
                     "ready_public_candidate_count": 0,
                     "public_slot_ready_count": 0,
                     "block_reason_counts": {
-                        "missing_character_chat_opening": 1,
                         "missing_usable_scene": 1,
                     },
                 },
@@ -93,12 +92,11 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         )
         self.assertEqual(
             summary["blockReasonCounts"],
-            {"missing_character_chat_opening": 1, "missing_usable_scene": 1},
+            {"missing_usable_scene": 1},
         )
         self.assertEqual(
             summary["actionPlanCounts"],
             {
-                "generate_character_chat_opening": 1,
                 "generate_episode_scene_extraction": 1,
                 "ready": 1,
                 "build_story_context_foundation": 1,
@@ -107,14 +105,13 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         self.assertEqual(rows[0]["assetActionPlan"], ["ready"])
         self.assertEqual(
             rows[1]["assetActionPlan"],
-            ["generate_episode_scene_extraction", "generate_character_chat_opening"],
+            ["generate_episode_scene_extraction"],
         )
         self.assertEqual(rows[2]["assetActionPlan"], ["build_story_context_foundation"])
         self.assertEqual(
             summary["candidateProductIdsByAction"],
             {
                 "build_story_context_foundation": [3],
-                "generate_character_chat_opening": [2],
                 "generate_episode_scene_extraction": [2],
                 "ready": [1],
             },
@@ -152,7 +149,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         self.assertEqual(value, "127.0.0.1")
         self.assertNotIn("BAD-NAME", os.environ)
 
-    def test_build_asset_action_plan_prioritizes_v3_rp_rebuild_over_opening(self):
+    def test_build_asset_action_plan_ignores_legacy_prompt_and_opening_reasons(self):
         module = load_module()
 
         actions = module.build_asset_action_plan(
@@ -173,11 +170,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
 
         self.assertEqual(
             actions,
-            [
-                "rebuild_rp_assets_with_v3_scope",
-                "generate_character_chat_internal_prompt",
-                "generate_character_chat_opening",
-            ],
+            ["rebuild_rp_assets_with_v3_scope"],
         )
 
 

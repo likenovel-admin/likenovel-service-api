@@ -466,6 +466,28 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
 
         self.assertNotEqual(helper_contract, clue_contract)
 
+    def test_character_chat_opening_source_hash_includes_runtime_formula_contract(self):
+        module = load_module()
+        kwargs = {
+            "character_key": "character:아델리트",
+            "inventory_item": {
+                "display_name": "아델리트",
+                "read_range_state_snapshot": {"as_of_episode_no": 3},
+            },
+            "profile_row": {"source_hash": "profile-hash"},
+            "examples_row": {"source_hash": "examples-hash"},
+            "internal_prompt_row": {"source_hash": "internal-hash"},
+            "summary_context_lines": ["3화: 문 앞 압박"],
+            "relation_context_lines": ["아델리트 -> 문지기: 경계"],
+            "scene_context_lines": ["[3화] 압력=발소리 접근 | hook=문틈 확인"],
+        }
+
+        first_hash = module.build_character_chat_opening_source_hash(**kwargs)
+        module.CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION = "runtime_formula_seed_v2"
+        second_hash = module.build_character_chat_opening_source_hash(**kwargs)
+
+        self.assertNotEqual(first_hash, second_hash)
+
     def test_character_chat_opening_payload_requires_narration_dialogue_and_objective(self):
         module = load_module()
         base_payload = {
@@ -485,6 +507,15 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                 "non_user_dependent_action": "아델리트가 먼저 발소리의 위치를 확인한다.",
             },
             "progression_engine": {"scene_exit_condition": "문 앞 단서를 확인하면 다음 방으로 이동한다."},
+            "runtime_formula_seed": {
+                "formula_type": "FORMULA_PUBLIC_TEST_FLIP",
+                "p_to_user_request": "열쇠와 그림자 중 먼저 확인할 대상을 고르게 한다.",
+                "user_task_type": "UT_INSPECT_CLUE",
+                "user_task_success_condition": "유저가 열쇠 또는 그림자 중 하나를 선택한다.",
+                "protagonist_state_delta": "아델리트가 선택된 단서를 기준으로 문 앞 대응을 바꾼다.",
+                "open_loop": "문 안쪽의 움직임이 다음 압박으로 남는다.",
+                "mutation_policy": "MP_SAME_PRESSURE_NEW_ROUTE",
+            },
         }
 
         normalized = module.normalize_character_chat_opening_payload(
@@ -498,6 +529,17 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         self.assertIn("\n\n", normalized["opening_message"]["opening_text"])
         self.assertIn("\"발소리가 멎었어.", normalized["opening_message"]["opening_text"])
         self.assertEqual(normalized["opening_message"]["user_objective"], "열쇠를 돌릴지 그림자를 확인할지 선택한다.")
+        self.assertEqual(normalized["runtime_formula_seed"]["user_task_type"], "UT_INSPECT_CLUE")
+
+        missing_formula_seed = dict(base_payload)
+        missing_formula_seed.pop("runtime_formula_seed")
+        self.assertIsNone(
+            module.normalize_character_chat_opening_payload(
+                missing_formula_seed,
+                scope_key="character:아델리트",
+                display_name="아델리트",
+            )
+        )
 
         dialogue_only = dict(base_payload)
         dialogue_only["opening_message"] = {
