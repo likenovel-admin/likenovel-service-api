@@ -12,6 +12,10 @@ WEBSOCHAT_SCOPE_SUMMARY_LIMIT = 6
 WEBSOCHAT_SCOPE_CHARACTER_LIMIT = 12
 WEBSOCHAT_SCOPE_RELATION_LIMIT = 16
 WEBSOCHAT_SCOPE_HOOK_LIMIT = 8
+WEBSOCHAT_CHARACTER_ENTRY_SCENE_LIMIT = 64
+WEBSOCHAT_CHARACTER_ENTRY_SUMMARY_MAX_CHARS = 1600
+WEBSOCHAT_CHARACTER_ENTRY_SCENE_VALUE_MAX_CHARS = 800
+WEBSOCHAT_CHARACTER_ENTRY_MAX_BYTES = 32000
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +75,382 @@ def _normalize_scope_summary_row(row: dict[str, Any]) -> dict[str, Any]:
         "episode_to": _coerce_int(row.get("episodeTo")),
         "summary_text": str(row.get("summaryText") or "").strip(),
     }
+
+
+def _scene_matches_character_scope(scene: dict[str, Any], scope_keys: set[str]) -> bool:
+    participant_scope_keys = {
+        str(item.get("scope_key") or "").strip()
+        for item in scene.get("participants") or []
+        if isinstance(item, dict) and str(item.get("scope_key") or "").strip()
+    }
+    action_scope_keys = {
+        str(item.get("actor_scope_key") or "").strip()
+        for item in scene.get("action_ownership") or []
+        if isinstance(item, dict) and str(item.get("actor_scope_key") or "").strip()
+    }
+    return bool(scope_keys & (participant_scope_keys | action_scope_keys))
+
+
+def _compact_character_entry_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.strip()[:WEBSOCHAT_CHARACTER_ENTRY_SCENE_VALUE_MAX_CHARS]
+    if isinstance(value, list):
+        return [_compact_character_entry_value(item) for item in value[:8]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _compact_character_entry_value(item)
+            for key, item in list(value.items())[:12]
+        }
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value).strip()[:WEBSOCHAT_CHARACTER_ENTRY_SCENE_VALUE_MAX_CHARS]
+
+
+def _compact_character_entry_scene(
+    scene: dict[str, Any],
+    *,
+    selected_scope_keys: set[str],
+) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "scene_index",
+        "scene_kind",
+        "scene_gist",
+        "current_action",
+        "action_ownership",
+        "immediate_pressure",
+        "character_initiative_reason",
+        "user_entry_role",
+        "user_hook",
+        "user_can_do",
+        "opening_grounding",
+        "pressure_clock",
+        "conversation_fuel_tags",
+        "beat_ladder",
+        "turn_continuation_contract",
+        "knowledge_boundary",
+        "progression_seed",
+    ):
+        value = scene.get(key)
+        if value not in (None, "", [], {}):
+            compact[key] = _compact_character_entry_value(value)
+
+    opening_grounding = (
+        scene.get("opening_grounding")
+        if isinstance(scene.get("opening_grounding"), dict)
+        else {}
+    )
+    turn_contract = (
+        scene.get("turn_continuation_contract")
+        if isinstance(scene.get("turn_continuation_contract"), dict)
+        else {}
+    )
+    creative_grounding = {
+        "previous_place_anchor": opening_grounding.get("place_anchor"),
+        "sensory_anchors": opening_grounding.get("sensory_anchors"),
+        "prop_anchors": opening_grounding.get("prop_anchors"),
+        "forbidden_inventions": opening_grounding.get("forbidden_opening_inventions"),
+        "canon_safe_new_event_types": turn_contract.get("canon_safe_new_event_types"),
+    }
+    creative_grounding = {
+        key: _compact_character_entry_value(value)
+        for key, value in creative_grounding.items()
+        if value not in (None, "", [], {})
+    }
+    if creative_grounding:
+        compact["creative_grounding"] = creative_grounding
+
+    selected_names: set[str] = set()
+    other_character_names: list[str] = []
+    for participant in scene.get("participants") or []:
+        if not isinstance(participant, dict):
+            continue
+        participant_scope_key = str(participant.get("scope_key") or "").strip()
+        participant_names = [
+            str(participant.get(key) or "").strip()
+            for key in ("mention_label", "display_name")
+            if str(participant.get(key) or "").strip()
+        ]
+        if participant_scope_key in selected_scope_keys:
+            selected_names.update(participant_names)
+            continue
+        for name in participant_names:
+            if name not in other_character_names:
+                other_character_names.append(name)
+
+    raw_identity_boundary = (
+        scene.get("scene_identity_boundary")
+        if isinstance(scene.get("scene_identity_boundary"), dict)
+        else {}
+    )
+    prior_scene_addressees = [
+        str(name or "").strip()
+        for name in (raw_identity_boundary.get("allowed_address_names") or [])
+        if str(name or "").strip()
+        and str(name or "").strip() not in selected_names
+    ]
+    identity_safety = {
+        "must_not_address_user_as": raw_identity_boundary.get("must_not_address_as"),
+        "prior_scene_addressees": prior_scene_addressees,
+        "prior_scene_other_characters": other_character_names,
+        "identity_spoiler_risk": raw_identity_boundary.get("identity_spoiler_risk"),
+    }
+    identity_safety = {
+        key: _compact_character_entry_value(value)
+        for key, value in identity_safety.items()
+        if value not in (None, "", [], {})
+    }
+    if identity_safety:
+        compact["identity_safety"] = identity_safety
+    return compact
+
+
+def _is_websochat_character_entry_context_v2(
+    payload: Any,
+    *,
+    expected_read_episode_to: int | None = None,
+    expected_product_id: int | None = None,
+    expected_character_scope_key: str | None = None,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("schema_version") != "character_chat_entry_context_v2":
+        return False
+
+    read_episode_to = _coerce_int(payload.get("read_episode_to"))
+    if read_episode_to <= 0:
+        return False
+    if expected_read_episode_to is not None and read_episode_to != int(expected_read_episode_to or 0):
+        return False
+    product_id = _coerce_int(payload.get("product_id"))
+    character_scope_key = str(payload.get("character_scope_key") or "").strip()
+    if product_id <= 0 or not character_scope_key:
+        return False
+    if expected_product_id is not None and product_id != int(expected_product_id or 0):
+        return False
+    if (
+        expected_character_scope_key is not None
+        and character_scope_key != str(expected_character_scope_key or "").strip()
+    ):
+        return False
+
+    recent_episode_from = _coerce_int(payload.get("recent_episode_from"))
+    recent_episode_to = _coerce_int(payload.get("recent_episode_to"))
+    if recent_episode_from != max(1, read_episode_to - 1) or recent_episode_to != read_episode_to:
+        return False
+
+    required_episode_nos = set(range(recent_episode_from, read_episode_to + 1))
+    recent_plot_rows = payload.get("recent_plot_rows")
+    if not isinstance(recent_plot_rows, list):
+        return False
+    plot_episode_nos: set[int] = set()
+    for row in recent_plot_rows:
+        if not isinstance(row, dict):
+            return False
+        episode_no = _coerce_int(row.get("episode_no"))
+        summary_text = str(row.get("summary_text") or "").strip()
+        if episode_no not in required_episode_nos or not summary_text:
+            return False
+        plot_episode_nos.add(episode_no)
+    if plot_episode_nos != required_episode_nos:
+        return False
+
+    anchor_episode_no = _coerce_int(payload.get("character_anchor_episode_no"))
+    character_scene = payload.get("character_scene")
+    if not bool(
+        0 < anchor_episode_no <= read_episode_to
+        and isinstance(character_scene, dict)
+        and str(character_scene.get("scene_gist") or "").strip()
+    ):
+        return False
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= WEBSOCHAT_CHARACTER_ENTRY_MAX_BYTES
+
+
+def _build_websochat_character_entry_context_v2(
+    *,
+    product_id: int,
+    read_episode_to: int,
+    character_scope_keys: list[str],
+    plot_rows: list[dict[str, Any]],
+    scene_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    safe_read_episode_to = max(int(read_episode_to or 0), 0)
+    normalized_scope_keys = _normalize_string_list(character_scope_keys, limit=20)
+    scope_keys = set(normalized_scope_keys)
+    if int(product_id or 0) <= 0 or safe_read_episode_to <= 0 or not scope_keys:
+        return {}
+
+    recent_episode_from = max(1, safe_read_episode_to - 1)
+    required_episode_nos = set(range(recent_episode_from, safe_read_episode_to + 1))
+    recent_plot_by_episode: dict[int, dict[str, Any]] = {}
+    for row in plot_rows:
+        episode_no = _coerce_int(
+            row.get("episode_to")
+            or row.get("episodeTo")
+            or row.get("episode_from")
+            or row.get("episodeFrom")
+        )
+        if episode_no not in required_episode_nos or episode_no in recent_plot_by_episode:
+            continue
+        summary_text = str(row.get("summary_text") or row.get("summaryText") or "").strip()[
+            :WEBSOCHAT_CHARACTER_ENTRY_SUMMARY_MAX_CHARS
+        ]
+        if not summary_text:
+            continue
+        recent_plot_by_episode[episode_no] = {
+            "episode_no": episode_no,
+            "summary_text": summary_text,
+        }
+    if set(recent_plot_by_episode) != required_episode_nos:
+        return {}
+
+    character_scene_candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for row in scene_rows:
+        payload = _extract_json_object(str(row.get("summary_text") or row.get("summaryText") or "")) or {}
+        episode_no = _coerce_int(
+            payload.get("episode_no")
+            or row.get("episode_to")
+            or row.get("episodeTo")
+            or row.get("episode_from")
+            or row.get("episodeFrom")
+        )
+        if episode_no <= 0 or episode_no > safe_read_episode_to:
+            continue
+        if str(payload.get("status") or "ok").strip().lower() not in {"ok", "partial"}:
+            continue
+        for scene in payload.get("scenes") or []:
+            if not isinstance(scene, dict) or not _scene_matches_character_scope(scene, scope_keys):
+                continue
+            scene_index = _coerce_int(scene.get("scene_index"))
+            character_scene_candidates.append((episode_no, scene_index, scene))
+
+    if not character_scene_candidates:
+        return {}
+    anchor_episode_no, _, selected_scene = max(
+        character_scene_candidates,
+        key=lambda item: (item[0], item[1]),
+    )
+    compact_scene = _compact_character_entry_scene(
+        selected_scene,
+        selected_scope_keys=scope_keys,
+    )
+    if not compact_scene.get("scene_gist"):
+        return {}
+
+    context = {
+        "schema_version": "character_chat_entry_context_v2",
+        "product_id": int(product_id),
+        "character_scope_key": normalized_scope_keys[0],
+        "read_episode_to": safe_read_episode_to,
+        "recent_episode_from": recent_episode_from,
+        "recent_episode_to": safe_read_episode_to,
+        "recent_plot_rows": [
+            recent_plot_by_episode[episode_no]
+            for episode_no in sorted(recent_plot_by_episode)
+        ],
+        "character_anchor_episode_no": anchor_episode_no,
+        "character_scene": compact_scene,
+    }
+    if not _is_websochat_character_entry_context_v2(
+        context,
+        expected_read_episode_to=safe_read_episode_to,
+        expected_product_id=int(product_id),
+        expected_character_scope_key=normalized_scope_keys[0],
+    ):
+        return {}
+    return context
+
+
+async def load_websochat_character_entry_context_v2(
+    *,
+    product_id: int,
+    read_episode_to: int,
+    latest_episode_no: int,
+    character_scope_keys: list[str],
+    db: AsyncSession,
+) -> dict[str, Any]:
+    safe_scope = min(
+        max(int(read_episode_to or 0), 0),
+        max(int(latest_episode_no or 0), 0),
+    )
+    normalized_scope_keys = [
+        str(scope_key or "").strip()
+        for scope_key in character_scope_keys
+        if str(scope_key or "").strip()
+    ]
+    if safe_scope <= 0 or not normalized_scope_keys:
+        return {}
+
+    recent_episode_from = max(1, safe_scope - 1)
+    plot_result = await db.execute(
+        text(
+            """
+            SELECT episode_from AS episodeFrom,
+                   episode_to AS episodeTo,
+                   summary_text AS summaryText
+            FROM tb_story_agent_context_summary
+            WHERE product_id = :product_id
+              AND summary_type = 'episode_summary'
+              AND is_active = 'Y'
+              AND episode_to BETWEEN :episode_from AND :episode_to
+            ORDER BY episode_to DESC, summary_id DESC
+            """
+        ),
+        {
+            "product_id": product_id,
+            "episode_from": recent_episode_from,
+            "episode_to": safe_scope,
+        },
+    )
+    plot_rows = [dict(row) for row in plot_result.mappings().all()]
+
+    scope_clauses: list[str] = []
+    params: dict[str, Any] = {
+        "product_id": product_id,
+        "read_episode_to": safe_scope,
+        "limit": WEBSOCHAT_CHARACTER_ENTRY_SCENE_LIMIT,
+    }
+    for index, scope_key in enumerate(normalized_scope_keys):
+        param_name = f"scope_key_{index}"
+        scope_clauses.append(
+            f"INSTR(summary_text, CONCAT('\"', :{param_name}, '\"')) > 0"
+        )
+        params[param_name] = scope_key
+    scene_result = await db.execute(
+        text(
+            f"""
+            SELECT episode_from AS episodeFrom,
+                   episode_to AS episodeTo,
+                   summary_text AS summaryText
+            FROM tb_story_agent_context_summary
+            WHERE product_id = :product_id
+              AND summary_type = 'episode_scene_extraction'
+              AND is_active = 'Y'
+              AND episode_to <= :read_episode_to
+              AND ({' OR '.join(scope_clauses)})
+            ORDER BY episode_to DESC, summary_id DESC
+            LIMIT :limit
+            """
+        ),
+        params,
+    )
+    scene_rows = [dict(row) for row in scene_result.mappings().all()]
+    context = _build_websochat_character_entry_context_v2(
+        product_id=product_id,
+        read_episode_to=safe_scope,
+        character_scope_keys=normalized_scope_keys,
+        plot_rows=plot_rows,
+        scene_rows=scene_rows,
+    )
+    logger.info(
+        "websochat character_entry_context product_id=%s read_episode_to=%s character_scope_keys=%s ready=%s anchor_episode_no=%s",
+        product_id,
+        safe_scope,
+        normalized_scope_keys,
+        bool(context),
+        int(context.get("character_anchor_episode_no") or 0),
+    )
+    return context
 
 
 def _finalize_scoped_characters(character_map: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:

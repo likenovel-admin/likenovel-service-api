@@ -3,7 +3,10 @@ from unittest.mock import AsyncMock, patch
 
 from app.exceptions import CustomResponseException
 from app.routers.websochat import websochat_command
-from app.schemas.websochat import PostWebsochatMessageReqBody
+from app.schemas.websochat import (
+    PostWebsochatCharacterChoicesReqBody,
+    PostWebsochatMessageReqBody,
+)
 
 
 class WebsochatCommandRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -72,6 +75,42 @@ class WebsochatCommandRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(called_kwargs["req_body"].starter_mode_key, "qa")
         self.assertEqual(called_kwargs["req_body"].qa_action_key, "next_episode_write")
         self.assertEqual(called_kwargs["req_body"].content, "다음회차 써줘")
+
+    async def test_character_chat_choices_route_delegates_to_service(self):
+        req_body = PostWebsochatCharacterChoicesReqBody(
+            guest_key="guest-1",
+            source_assistant_message_id=77,
+        )
+        db = object()
+
+        with patch.object(
+            websochat_command.websochat_service,
+            "post_character_chat_choices",
+            new_callable=AsyncMock,
+        ) as post_choices:
+            post_choices.return_value = {
+                "data": {
+                    "choices": [],
+                    "sourceAssistantMessageId": 77,
+                }
+            }
+
+            result = await websochat_command.post_websochat_character_chat_choices(
+                session_id=123,
+                req_body=req_body,
+                user={"sub": "kc-user-id"},
+                db=db,
+            )
+
+        self.assertEqual(
+            result,
+            {"data": {"choices": [], "sourceAssistantMessageId": 77}},
+        )
+        called_kwargs = post_choices.await_args.kwargs
+        self.assertEqual(called_kwargs["session_id"], 123)
+        self.assertIs(called_kwargs["req_body"], req_body)
+        self.assertEqual(called_kwargs["kc_user_id"], "kc-user-id")
+        self.assertIs(called_kwargs["db"], db)
 
 
 if __name__ == "__main__":

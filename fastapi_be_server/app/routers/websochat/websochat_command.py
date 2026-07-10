@@ -131,6 +131,25 @@ async def delete_websochat_session(
 
 
 @router.post(
+    "/sessions/{session_id}/character-chat/choices",
+    tags=["웹소챗"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_websochat_character_chat_choices(
+    session_id: int,
+    req_body: websochat_schema.PostWebsochatCharacterChoicesReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await websochat_service.post_character_chat_choices(
+        session_id=session_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.post(
     "/sessions/{session_id}/messages",
     tags=["웹소챗"],
     dependencies=[Depends(analysis_logger)],

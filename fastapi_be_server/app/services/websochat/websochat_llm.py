@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -41,15 +42,28 @@ def to_websochat_gemini_contents(messages: list[dict[str, str]]) -> list[dict[st
     return contents
 
 
+def sanitize_websochat_model_text(text: str) -> str:
+    text_value = str(text or "")
+    if not text_value:
+        return text_value
+    text_value = text_value.replace("\r\n", "\n").replace("\r", "\n")
+    text_value = re.sub(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]", "", text_value)
+    text_value = re.sub(r"[\u200B-\u200D\uFEFF\uFFFD\u2D30-\u2D7F]", "", text_value)
+    text_value = re.sub(r"([.!?。！？])([가-힣A-Za-z0-9])", r"\1 \2", text_value)
+    text_value = re.sub(r"(?<=[.!?。！？])([\"”’])([가-힣A-Za-z0-9])", r"\1 \2", text_value)
+    lines = [re.sub(r"[ \t]{2,}", " ", line).rstrip() for line in text_value.split("\n")]
+    return "\n".join(lines).strip()
+
+
 def extract_websochat_gemini_text(response_json: dict[str, Any]) -> str:
     texts: list[str] = []
     for candidate in response_json.get("candidates") or []:
         content = candidate.get("content") or {}
         for part in content.get("parts") or []:
-            text_value = str(part.get("text") or "").strip()
+            text_value = sanitize_websochat_model_text(str(part.get("text") or ""))
             if text_value:
                 texts.append(text_value)
-    return "\n".join(texts).strip()
+    return sanitize_websochat_model_text("\n".join(texts))
 
 
 def _compute_websochat_stream_delta(accumulated: str, current_text: str) -> str:
@@ -173,6 +187,7 @@ async def call_websochat_gemini(
     messages: list[dict[str, Any]],
     max_tokens: int = WEBSOCHAT_REPLY_MAX_TOKENS,
     temperature: float = WEBSOCHAT_QA_TEMPERATURE,
+    stream: bool | None = None,
     timeout_seconds: float = WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
 ) -> str:
     if not settings.GEMINI_API_KEY:
@@ -182,7 +197,8 @@ async def call_websochat_gemini(
             message=WEBSOCHAT_AI_PROVIDER_AUTH_MESSAGE,
         )
 
-    if is_websochat_stream_enabled():
+    stream_enabled = is_websochat_stream_enabled() if stream is None else stream
+    if stream_enabled:
         try:
             return await _call_websochat_gemini_stream(
                 system_prompt=system_prompt,
