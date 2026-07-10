@@ -93,7 +93,16 @@ async def check_user(kc_user_id: str | None, db: AsyncSession, role: str = "") -
             status_code=status.HTTP_401_UNAUTHORIZED, message=ErrorMessages.LOGIN_PLEASE
         )
     query = text("""
-        select user_id, role_type, (select apply_type from tb_user_profile_apply where user_id = u.user_id order by created_date desc limit 1) as apply_type from tb_user u where kc_user_id = :kc_user_id
+        select user_id, role_type,
+               (select apply_type
+                  from tb_user_profile_apply
+                 where user_id = u.user_id
+                   and approval_code = 'accepted'
+                   and approval_date is not null
+                 order by created_date desc
+                 limit 1) as apply_type
+          from tb_user u
+         where kc_user_id = :kc_user_id
     """)
     results = await db.execute(query, {"kc_user_id": kc_user_id})
     row = results.mappings().one_or_none()
