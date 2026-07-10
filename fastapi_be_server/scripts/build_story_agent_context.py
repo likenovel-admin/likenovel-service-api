@@ -364,7 +364,7 @@ internal_prompt 필수 구성:
 6. [원작 기반 새 사건 운용]: 원작 세계관, 설정, 인물성, 읽은 범위의 갈등은 최대한 유지하되 원작 사건을 그대로 재연하지 않는다. 원작 플롯은 앵커로만 쓰고, 답변의 중심은 원작에서 파생된 새 사이드 사건/새 변수/새 단서여야 한다. 새 사건의 비중을 원작 요약보다 높게 두되, 새 사건은 기존 세계관과 캐릭터 동기에서 자연스럽게 생긴 작은 위기, 요청, 방해, 단서, 관계 압력이어야 한다. 원작 결말/배후/미래 사건을 새로 확정하지 않는다.
 7. [런타임 전개 공식]: 캐릭터가 유저에게 맡길 1~3턴짜리 구체 작업, 그 작업이 영향을 줄 주인공의 다음 행동, 작업 뒤 생길 state_delta/open_loop를 함께 둔다. 유저 작업은 관찰/추론/타이밍/선택/증거/경로/반응 읽기처럼 즉시 답할 수 있어야 하며 최종 승리나 결말이 아니어야 한다.
 8. [짧은 입력 처리]: 사용자가 '응', '그래', '뭐야?'처럼 짧게 말해도 캐릭터가 지문+대사로 반응하고 작은 사건/질문/행동 하나, 또는 새 변수/관계 반응/장면 변화 하나로 장면을 전진시킨다.
-9. [금지]: 사용자 행동/감정/대사를 대신 확정하지 않는다. 사용자의 표정/떨림/긴장/신체 반응/숨소리/소지품/서 있는 자세도 단정하지 않는다. 얼굴/발끝/몸을 훑는 지문도 쓰지 않는다. 지문에서는 2인칭 대명사 전체를 쓰지 않는다. 사용자의 정체를 추궁하거나 '너 누구냐', '왜 여기 있지', '수상한 놈', '침입자냐'로 시작하지 않는다. 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 않는다. AI/시스템/프롬프트/규칙을 언급하지 않는다. 공개 읽은 범위 밖 스포일러를 만들지 않는다. 원문 대사를 그대로 복붙하지 않는다.
+9. [사용자 agency]: 사용자가 직전 입력에서 직접 밝힌 행동/말/상태만 이어받는다. 캐릭터는 자신의 행동을 먼저 할 수 있지만 사용자의 감정/반응/성공/다음 행동은 확정하지 않는다. 협력 요청은 선택 가능하게 남긴다. 사용자의 정체를 심문하는 반복 전개, 원작 기존 인물로의 확정, 공개 읽은 범위 밖 스포일러, 메타 발언, 원문 대사 복붙은 만들지 않는다.
 10. [응답 감각]: 첫인사는 5~8문장 지문 + 2~3문장 대사로 장면을 충분히 연다. 이후 답변은 지문 2~4문장 뒤 캐릭터 대사 1~3문장을 기본으로 하되, 매 턴 물리적 행동/새 변수/관계 반응/장면 변화/hook 하나를 둔다.
 
 규칙:
@@ -373,22 +373,17 @@ internal_prompt 필수 구성:
 - 예시는 말투 기준으로만 짧게 포함하고, 원문 대사를 길게 인용하지 마라.
 - 첫인사는 일반 인사말이 아니라 독자가 스크롤을 멈출 만큼 구체적인 장면 진입이어야 한다.
 - 사용자는 원작 기존 네임드가 아니라 이미 장면에 엮인 비네임드 조력자/동행자/관계자다. 기본 역할은 낮은 신뢰의 협력자, 임시 동행자, 현장 보조자, 목격자, 같이 휘말린 사람 중 장면에 맞게 약하게만 둔다.
-- 캐릭터가 경계심이 강해도 의심은 말투 한 줄 이하로만 두고, 정체 미스터리/심문 루프를 사건 엔진으로 쓰지 마라. 첫인사는 현재 사건의 목적, 위기, 행동 hook으로 열어라.
+- 캐릭터가 경계심이 강해도 의심은 말투 한 줄 이하로만 두고, 정체 심문을 사건 엔진으로 쓰지 마라. 첫인사는 현재 사건의 목적, 위기, 행동 hook으로 열어라.
 - 치료 보조, 기록 담당, 임시 동행자, 현장 보조자처럼 장면을 돕는 약한 역할 라벨은 가능하지만 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 마라.
 - 원작은 대본이 아니라 제약 조건이다. 원작 장면을 요약하거나 반복하지 말고, 읽은 범위의 갈등/관계/장소/물건에서 파생된 새 곁가지 사건으로 시작하라.
 - 전개 공식은 `공개 평가 뒤집기`, `초기 자원 확보`, `전투 패턴 깨기`, `불확실한 인물의 신뢰 전환`, `작은 사건의 확장` 중 입력 근거와 가장 가까운 것을 우선 사용하라. 장면마다 유저에게 관찰/단서 확인/타이밍 콜/선택지 계산/답변 작성/경로 파악/증거 준비 중 하나를 맡기고, 캐릭터가 그 결과를 자신의 행동 변화로 받아 장면을 전진시키게 하라.
 - 캐릭터는 장면 목적과 stake를 제공하되, 사용자를 심부름시키는 명령문보다 장면 압력, 협력 요청, 자연스러운 1~2개 행동 방향으로 유도하라.
 - 사건 진행만 밀지 말고, 사용자의 말에 대한 캐릭터의 관계 반응을 최소 하나 포함하게 하라.
-- 압박감은 캐릭터의 자세, 주변 사물, 출입구, 거리 조절, 질문으로 만들고 사용자의 내면/신체 상태/구체 위치/소지품을 쓰지 마라.
-- 지문에서는 2인칭 대명사 전체를 쓰지 마라. '너/네/당신/상대/보조자'를 지문 주어·목적어·방향어로 쓰지 말고, '곁에 선 이', '옆의 사람', '너를 향해', '너에게' 같은 우회 표현도 쓰지 마라. 사용자를 향한 말은 캐릭터 대사 안에만 넣어라.
-- 지문에서 시선, 턱짓, 속삭임, 대답, 명령의 대상이 사용자인 표현도 금지다. '보조자를 돌아보며', '보조자 쪽으로'처럼 사용자 대체어를 쓰는 방식도 금지다.
-- '저 약재', '밖 소리', '저쪽 통로' 같은 사용자 입력은 사용자가 손짓하거나 움직였다는 뜻이 아니다. 지문에서 '네가 가리킨', '네가 들고 있는', '네가 내민', '네 손', '네 발치', '너를 향해', '너를 돌아보며'처럼 입력 밖 행동을 만들지 마라.
-- 사용자가 입력하지 않은 행동, 소지품, 자세, 이동, 과거 경력, 원작 관계를 만들지 마라. '기록판을 들고 있다', '약재를 가리켰다', '레지던트 때처럼', '통로로 밀었다', '손을 잡았다'는 금지다.
-- 협력 요청은 대사 속 선택형으로만 하라. 캐릭터가 사용자의 몸을 밀거나 이동시키거나 환부를 닦게 하거나 증거를 쥐여 주었다고 지문에서 확정하지 마라.
-- '곁에 선 너', '멍하니 서서', '네가 멈춰 선', '네가 가리킨', '네 발치'처럼 사용자의 자세, 위치, 손짓, 시선을 새로 만드는 표현도 금지하라.
-- '상대의 어깨/눈/손/발치/몸', '상대의 귓가', '짐승의 털 속에 숨으라'처럼 사용자의 신체, 시선, 위치, 접촉 상태를 우회해서 확정하지 마라. 캐릭터가 사용자를 잡아채거나 끌어당기거나 짓누르거나 몸을 낮추게 만드는 물리 조작도 금지하라.
-- '너를 쏘아보았다', '너를 힐끗 보았다', '너를 쳐다보지도 않았다', '문 앞을 지키고 서서', '뒤에 숨어서'처럼 사용자를 특정 위치/자세로 배치하거나 캐릭터 시선의 대상으로 고정하는 표현도 금지하라. 관계 반응은 대사, 말투, 판단, 주변 사물에 대한 반응으로 드러내게 하라.
-- 출력 전 자체검수 기준을 내부 프롬프트에 포함하라. 지문 안의 '너/네/당신/상대/보조자/곁에 선 이/옆의 사람/너에게', 사용자 얼굴/눈/어깨/손/발끝/몸/위아래 훑기, 숨소리/떨림/긴장, 서 있음/움직임 단정, '네가 가리킨/멈춰 선/들고 있는/내민', '너를 향해/돌아보며/쏘아보/힐끗 보/쳐다보', '문 앞을 지키고 서서/뒤에 숨어서', '밀어 넣/떠밀/잡아채/끌어당겨/짓눌러/몸을 낮추게'가 나오면 캐릭터의 시선이 출입구/복도/주변 사물로 향하거나 캐릭터 자신만 움직이는 묘사로 고치게 하라.
+- 압박감과 관계 반응은 캐릭터 자신의 자세/행동/판단, 주변 사물, 출입구, 환경 변화, 대사로 만든다.
+- 사용자가 직전 입력에서 직접 묘사한 행동과 상태는 이어받을 수 있지만, 입력에 없는 사용자 행동/상태/소지품/관계/결과를 덧붙이지 않는다.
+- 캐릭터 자신의 접근/시선/접촉은 캐릭터 행동으로 쓸 수 있으나, 그에 대한 사용자의 감정과 반응은 다음 입력 전에 확정하지 않는다.
+- 사용자의 말에 대한 협력 요청은 대사 안에서 선택 가능하게 남기고, 사용자의 실행과 결과는 다음 입력 전에 확정하지 않는다.
+- 내부 프롬프트에 구체적인 금지 표현 목록을 만들지 마라. 출력 전에는 사용자에 관한 서술마다 직전 입력의 근거가 있는지 확인하게 하라.
 """
 
 EPISODE_SCENE_EXTRACTION_SYSTEM = """너는 웹소설 원문을 캐릭터챗용 장면 단위로 나누는 전처리기다.
@@ -5456,7 +5451,17 @@ def build_rp_examples_source_hash(
             *build_rp_inventory_signature_parts(inventory_item),
             *(f"summary:{line}" for line in summary_context_lines[:8]),
             *(f"relation:{line}" for line in relation_context_lines[:6]),
-            *(str(item.get("text") or "") for item in list(example_payload.get("examples") or [])),
+            *(
+                "example:"
+                + json.dumps(
+                    dict(item),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for item in list(example_payload.get("examples") or [])
+                if isinstance(item, dict)
+            ),
         ],
     )
 
@@ -12217,8 +12222,6 @@ CHARACTER_CHAT_ASSET_READINESS_SUMMARY_TYPES = (
     "episode_scene_extraction",
     "character_rp_profile",
     "character_rp_examples",
-    "character_chat_internal_prompt",
-    "character_chat_opening_v1",
 )
 
 
@@ -12234,6 +12237,34 @@ def _summary_rows_by_scope(rows: list[dict[str, object]]) -> dict[str, dict[str,
 def _summary_row_payload(row: dict[str, object]) -> dict[str, object]:
     payload = extract_json_object(str(row.get("summary_text") or "")) or {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _is_character_chat_profile_row_ready(
+    row: dict[str, object] | None,
+    *,
+    scope_key: str,
+) -> bool:
+    payload = _summary_row_payload(row or {})
+    return str(payload.get("character_key") or "").strip() == scope_key
+
+
+def _is_character_chat_examples_row_ready(
+    row: dict[str, object] | None,
+    *,
+    scope_key: str,
+) -> bool:
+    payload = _summary_row_payload(row or {})
+    if str(payload.get("character_key") or "").strip() != scope_key:
+        return False
+    for item in list(payload.get("examples") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            if int(item.get("episode_no") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _inventory_row_scope_key(row: dict[str, object], payload: dict[str, object]) -> str:
@@ -12290,8 +12321,10 @@ def build_character_chat_asset_readiness_verification(
 ) -> dict[str, object]:
     """Verify that story-agent summaries are sufficient for character-chat exposure.
 
-    Story context readiness only proves episode summaries exist. Character chat needs
-    an exact-key inventory/profile/examples/internal-prompt/scene chain.
+    Story context readiness only proves episode summaries exist. Character chat v2
+    needs an exact-key inventory/profile/examples/episode-scene chain. The old global
+    internal prompt and static opening are not runtime inputs because they are not
+    bound to the reader's episode boundary.
     """
     rows_by_type = {
         summary_type: list(summary_rows_by_type.get(summary_type) or [])
@@ -12299,8 +12332,6 @@ def build_character_chat_asset_readiness_verification(
     }
     profile_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_profile"])
     example_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_examples"])
-    internal_prompt_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_chat_internal_prompt"])
-    opening_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_chat_opening_v1"])
     scene_scope_keys = set(build_character_chat_scene_context_lines_by_scope(rows_by_type["episode_scene_extraction"]).keys())
 
     public_candidates: list[dict[str, object]] = []
@@ -12311,6 +12342,8 @@ def build_character_chat_asset_readiness_verification(
     missing_opening_scope_keys: list[str] = []
     invalid_opening_scope_keys: list[str] = []
     missing_usable_scene_scope_keys: list[str] = []
+    invalid_profile_scope_keys: list[str] = []
+    invalid_examples_scope_keys: list[str] = []
     legacy_profile_scope_key_mismatch_scope_keys: list[str] = []
     legacy_examples_scope_key_mismatch_scope_keys: list[str] = []
     ready_scope_keys: list[str] = []
@@ -12328,7 +12361,8 @@ def build_character_chat_asset_readiness_verification(
             continue
 
         missing_reasons: list[str] = []
-        if scope_key not in profile_rows_by_scope:
+        profile_row = profile_rows_by_scope.get(scope_key)
+        if profile_row is None:
             missing_profile_scope_keys.append(scope_key)
             if _has_summary_row_for_inventory_alias(
                 scope_key=scope_key,
@@ -12339,7 +12373,12 @@ def build_character_chat_asset_readiness_verification(
                 missing_reasons.append("legacy_profile_scope_key_mismatch")
             else:
                 missing_reasons.append("missing_profile")
-        if scope_key not in example_rows_by_scope:
+        elif not _is_character_chat_profile_row_ready(profile_row, scope_key=scope_key):
+            invalid_profile_scope_keys.append(scope_key)
+            missing_reasons.append("invalid_profile_payload")
+
+        examples_row = example_rows_by_scope.get(scope_key)
+        if examples_row is None:
             missing_examples_scope_keys.append(scope_key)
             if _has_summary_row_for_inventory_alias(
                 scope_key=scope_key,
@@ -12350,16 +12389,9 @@ def build_character_chat_asset_readiness_verification(
                 missing_reasons.append("legacy_examples_scope_key_mismatch")
             else:
                 missing_reasons.append("missing_examples")
-        if scope_key not in internal_prompt_rows_by_scope:
-            missing_internal_prompt_scope_keys.append(scope_key)
-            missing_reasons.append("missing_internal_prompt")
-        opening_row = opening_rows_by_scope.get(scope_key)
-        if not opening_row:
-            missing_opening_scope_keys.append(scope_key)
-            missing_reasons.append("missing_character_chat_opening")
-        elif not _is_character_chat_opening_row_ready(opening_row, scope_key=scope_key):
-            invalid_opening_scope_keys.append(scope_key)
-            missing_reasons.append("invalid_character_chat_opening")
+        elif not _is_character_chat_examples_row_ready(examples_row, scope_key=scope_key):
+            invalid_examples_scope_keys.append(scope_key)
+            missing_reasons.append("invalid_examples_payload")
         if scope_key not in scene_scope_keys:
             missing_usable_scene_scope_keys.append(scope_key)
             missing_reasons.append("missing_usable_scene")
@@ -12392,7 +12424,7 @@ def build_character_chat_asset_readiness_verification(
         character_chat_status = "hold"
 
     return {
-        "schema_version": "character_chat_asset_readiness_v1",
+        "schema_version": "character_chat_asset_readiness_v2",
         "product_id": product_id,
         "story_context_status": story_context_status,
         "character_chat_status": character_chat_status,
@@ -12412,6 +12444,8 @@ def build_character_chat_asset_readiness_verification(
         "missing_opening_scope_keys": sorted(set(missing_opening_scope_keys)),
         "invalid_opening_scope_keys": sorted(set(invalid_opening_scope_keys)),
         "missing_usable_scene_scope_keys": sorted(set(missing_usable_scene_scope_keys)),
+        "invalid_profile_scope_keys": sorted(set(invalid_profile_scope_keys)),
+        "invalid_examples_scope_keys": sorted(set(invalid_examples_scope_keys)),
         "legacy_profile_scope_key_mismatch_scope_keys": sorted(set(legacy_profile_scope_key_mismatch_scope_keys)),
         "legacy_examples_scope_key_mismatch_scope_keys": sorted(set(legacy_examples_scope_key_mismatch_scope_keys)),
         "malformed_inventory_scope_keys": sorted(set(malformed_inventory_scope_keys)),
@@ -13485,18 +13519,6 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                         results["reused_character_rp_profiles"] += rp_counts["profile"][1]
                         results["inserted_character_rp_examples"] += rp_counts["examples"][0]
                         results["reused_character_rp_examples"] += rp_counts["examples"][1]
-                        opening_counts = await build_character_chat_opening_summaries(
-                            conn=work_conn,
-                            product_id=product_id,
-                            episode_rows=episode_summary_rows,
-                            summary_client=summary_client,
-                            inventory_map=inventory_v3_map,
-                            relation_map=relation_map,
-                            verbose=args.verbose,
-                        )
-                        results["inserted_character_chat_openings"] += opening_counts[0]
-                        results["reused_character_chat_openings"] += opening_counts[1]
-
                         with work_cursor(work_conn) as cur:
                             status_row = refresh_product_context_status(
                                 cur=cur,
@@ -13837,17 +13859,6 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 summary_client=summary_client,
                                 inventory_map=new_inventory_v3_map,
                                 relation_map=new_relation_scope_map,
-                                verbose=args.verbose,
-                            )
-                            opening_counts = await build_character_chat_opening_summaries(
-                                conn=work_conn,
-                                product_id=product_id,
-                                episode_rows=all_episode_summary_rows,
-                                summary_client=summary_client,
-                                inventory_map=new_inventory_v3_map,
-                                relation_map=new_relation_scope_map,
-                                affected_scope_keys=rp_affected_scope_keys,
-                                cleanup_missing_scopes=False,
                                 verbose=args.verbose,
                             )
                         elif args.verbose and rp_affected_scope_keys:
