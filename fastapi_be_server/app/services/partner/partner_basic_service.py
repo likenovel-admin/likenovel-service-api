@@ -50,7 +50,9 @@ async def partner_profiles_of_partner(user_id, db: AsyncSession):
                     CASE
                         WHEN u.role_type = 'admin' THEN 'admin'
                         WHEN (SELECT apply_type FROM tb_user_profile_apply
-                              WHERE user_id = u.user_id AND approval_date IS NOT NULL
+                              WHERE user_id = u.user_id
+                                AND approval_code = 'accepted'
+                                AND approval_date IS NOT NULL
                               ORDER BY created_date DESC LIMIT 1) = 'cp' THEN 'CP'
                         ELSE 'author'
                     END as role_type,
