@@ -142,12 +142,23 @@ def build_public_main_character_slots_query() -> str:
           AND (mcs.publish_end_date IS NULL OR mcs.publish_end_date > NOW())
           AND p.open_yn = 'Y'
           AND COALESCE(p.blind_yn, 'N') = 'N'
+          AND (:adult_yn = 'Y' OR p.ratings_code != 'adult')
+          AND EXISTS (
+              SELECT 1
+              FROM tb_product_episode pe
+              WHERE pe.product_id = p.product_id
+                AND pe.use_yn = 'Y'
+                AND pe.open_yn = 'Y'
+          )
         ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC
     """
 
 
-async def get_public_main_character_slots(db: AsyncSession):
-    result = await db.execute(text(build_public_main_character_slots_query()), {})
+async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
+    result = await db.execute(
+        text(build_public_main_character_slots_query()),
+        {"adult_yn": adult_yn},
+    )
     return {"data": [dict(row) for row in result.mappings().all()]}
 
 
@@ -264,10 +275,11 @@ async def _validated_character_slot_params(
         character_scope_key=req_body.character_scope_key,
         db=db,
     )
-    await _ensure_character_image_file(
-        character_image_file_id=req_body.character_image_file_id,
-        db=db,
-    )
+    if req_body.character_image_file_id is not None:
+        await _ensure_character_image_file(
+            character_image_file_id=req_body.character_image_file_id,
+            db=db,
+        )
     return _main_character_slot_params(
         req_body,
         character_name=character_name,
@@ -373,7 +385,10 @@ async def update_admin_main_character_slot(
                 product_id = :product_id,
                 character_scope_key = :character_scope_key,
                 character_name = :character_name,
-                character_image_file_id = :character_image_file_id,
+                character_image_file_id = COALESCE(
+                    :character_image_file_id,
+                    character_image_file_id
+                ),
                 card_order = :card_order,
                 publish_start_date = COALESCE(:publish_start_at, publish_start_date),
                 publish_end_date = :publish_end_at,
