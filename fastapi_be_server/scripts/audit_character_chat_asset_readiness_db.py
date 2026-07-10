@@ -175,13 +175,6 @@ def build_asset_action_plan(row: dict[str, Any]) -> list[str]:
         actions.append("generate_rp_profile_examples")
     if int(block_counts.get("missing_usable_scene") or 0) > 0:
         actions.append("generate_episode_scene_extraction")
-    if int(block_counts.get("missing_internal_prompt") or 0) > 0:
-        actions.append("generate_character_chat_internal_prompt")
-    if (
-        int(block_counts.get("missing_character_chat_opening") or 0) > 0
-        or int(block_counts.get("invalid_character_chat_opening") or 0) > 0
-    ):
-        actions.append("generate_character_chat_opening")
     return list(dict.fromkeys(actions or ["inspect_character_chat_assets"]))
 
 
