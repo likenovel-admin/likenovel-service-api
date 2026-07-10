@@ -274,6 +274,11 @@ class DeleteWebsochatSessionReqBody(BaseModel):
     guest_key: Optional[str] = Field(default=None, max_length=64)
 
 
+class PostWebsochatCharacterChoicesReqBody(BaseModel):
+    guest_key: Optional[str] = Field(default=None, max_length=64)
+    source_assistant_message_id: int = Field(..., gt=0)
+
+
 class PostWebsochatMessageReqBody(BaseModel):
     guest_key: Optional[str] = Field(default=None, max_length=64)
     client_message_id: str = Field(..., min_length=1, max_length=64)

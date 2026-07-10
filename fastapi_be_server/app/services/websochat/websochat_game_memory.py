@@ -5,6 +5,10 @@ import logging
 import re
 from typing import Any
 
+from app.services.websochat.websochat_context_loader import (
+    _is_websochat_character_entry_context_v2,
+)
+
 WEBSOCHAT_ALLOWED_RP_MODES = {"free", "scene"}
 WEBSOCHAT_ALLOWED_GAME_MODES = {"ideal_worldcup", "vs_game"}
 WEBSOCHAT_ALLOWED_MODE_KEYS = {"qa", "rp", "ideal_worldcup"}
@@ -263,6 +267,18 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         read_episode_to = max(int(parsed.get("read_episode_to") or 0), 0) or None
     except Exception:
         read_episode_to = None
+    raw_entry_context = (
+        parsed.get("character_chat_entry_context")
+        if isinstance(parsed.get("character_chat_entry_context"), dict)
+        else {}
+    )
+    character_chat_entry_context = dict(raw_entry_context)
+    if not _is_websochat_character_entry_context_v2(
+        character_chat_entry_context,
+        expected_read_episode_to=int(read_episode_to or 0),
+        expected_character_scope_key=locked_character_scope_key,
+    ):
+        character_chat_entry_context = {}
     read_scope_prompted = _normalize_websochat_bool(parsed.get("read_scope_prompted"))
     read_scope_state = str(parsed.get("read_scope_state") or "").strip().lower() or None
     if read_scope_state not in WEBSOCHAT_ALLOWED_READ_SCOPE_STATES:
@@ -354,6 +370,7 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         "read_scope_prompted": read_scope_prompted,
         "read_scope_state": read_scope_state,
         "read_scope_source": read_scope_source,
+        "character_chat_entry_context": character_chat_entry_context,
         "active_character": active_character,
         "active_character_label": active_character_label,
         "rp_mode": rp_mode,

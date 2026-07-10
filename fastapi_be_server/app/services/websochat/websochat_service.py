@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from datetime import datetime
+from time import monotonic
 from typing import Any
 
 from fastapi import status
@@ -18,6 +20,7 @@ from app.exceptions import CustomResponseException
 from app.rdb import likenovel_db_engine
 from app.schemas.websochat import (
     PostWebsochatMessageReqBody,
+    PostWebsochatCharacterChoicesReqBody,
     PostWebsochatSessionReqBody,
     PatchWebsochatSessionModeReqBody,
     PatchWebsochatSessionReadScopeReqBody,
@@ -41,6 +44,10 @@ from app.services.websochat.websochat_concierge import (
     build_websochat_concierge_payload,
 )
 from app.services.websochat.websochat_context_assembler import assemble_websochat_scope_context
+from app.services.websochat.websochat_context_loader import (
+    _is_websochat_character_entry_context_v2,
+    load_websochat_character_entry_context_v2,
+)
 from app.services.websochat.websochat_contracts import (
     WebsochatCtaCard,
     WebsochatEvidenceBundle,
@@ -94,6 +101,7 @@ from app.services.websochat.websochat_qa_executor import (
 )
 from app.services.websochat.websochat_qa_renderer import build_websochat_recent_context_message
 from app.services.websochat.websochat_rp_renderer import (
+    generate_character_chat_adjacent_opening_with_gemini,
     generate_websochat_rp_reply_with_gemini,
 )
 from app.services.websochat.websochat_renderers import generate_websochat_vs_comparison
@@ -113,6 +121,7 @@ from app.services.websochat.websochat_scope_resolver import (
 from app.services.websochat.websochat_stream import emit_websochat_stream_text_if_needed
 from app.services.websochat.websochat_llm import (
     call_websochat_gemini,
+    sanitize_websochat_model_text,
     to_websochat_gemini_contents,
 )
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
@@ -132,6 +141,22 @@ WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_CANDIDATE_LIMIT = 12
 WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_MIN_RATIO = 0.34
 WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS = 220
 WEBSOCHAT_ACTIVE_CHARACTER_SINGLE_CANDIDATE_FALLBACK_MIN_RATIO = 0.5
+WEBSOCHAT_CHARACTER_CHAT_CHOICES_PROMPT_VERSION = "v8-bigram-anchor-id-shadow"
+WEBSOCHAT_CHARACTER_CHAT_CHOICES_MAX_TOKENS = 420
+WEBSOCHAT_CHARACTER_CHAT_CHOICE_ANCHOR_SOURCE_MAX_CHARS = 1600
+WEBSOCHAT_CHARACTER_CHAT_CHOICES_CACHE_TTL_SECONDS = 60 * 60
+WEBSOCHAT_CHARACTER_CHAT_CHOICES_RATE_WINDOW_SECONDS = 60.0
+WEBSOCHAT_CHARACTER_CHAT_CHOICES_ACTOR_RATE_LIMIT = 30
+WEBSOCHAT_CHARACTER_CHAT_CHOICES_SESSION_RATE_LIMIT = 10
+WEBSOCHAT_CHARACTER_CHAT_CHOICE_INTENT_KINDS = frozenset(
+    {"observe", "ask", "move", "interact", "assist", "wait"}
+)
+
+_WEBSOCHAT_CHARACTER_CHAT_CHOICES_CACHE: dict[
+    str,
+    tuple[float, dict[str, Any]],
+] = {}
+_WEBSOCHAT_CHARACTER_CHAT_CHOICES_RATE_BUCKETS: dict[str, list[float]] = {}
 
 
 def _build_websochat_session_contract_payload(session_memory: dict[str, Any]) -> dict[str, Any]:
@@ -197,9 +222,432 @@ async def _call_websochat_gemini_json(
         ),
         max_tokens=max_tokens,
         temperature=0.1,
+        stream=False,
     )
     parsed = _extract_websochat_json_object(raw_reply)
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_websochat_character_chat_choices_cache_key(
+    *,
+    session_id: int,
+    source_assistant_message_id: int,
+    product_id: int,
+    character_scope_key: str,
+    read_episode_to: int,
+    prompt_version: str = WEBSOCHAT_CHARACTER_CHAT_CHOICES_PROMPT_VERSION,
+) -> str:
+    return (
+        f"{prompt_version}:{int(session_id)}:{int(source_assistant_message_id)}:"
+        f"{int(product_id)}:{int(read_episode_to)}:{str(character_scope_key or '').strip()}"
+    )
+
+
+def _get_websochat_character_chat_choices_cache(
+    cache_key: str,
+) -> dict[str, Any] | None:
+    cached = _WEBSOCHAT_CHARACTER_CHAT_CHOICES_CACHE.get(cache_key)
+    if not cached:
+        return None
+    expires_at, payload = cached
+    if monotonic() >= expires_at:
+        _WEBSOCHAT_CHARACTER_CHAT_CHOICES_CACHE.pop(cache_key, None)
+        return None
+    return {
+        "choices": [dict(choice) for choice in list(payload.get("choices") or [])],
+        "generationSource": str(payload.get("generationSource") or "generated"),
+    }
+
+
+def _set_websochat_character_chat_choices_cache(
+    cache_key: str,
+    *,
+    choices: list[dict[str, str]],
+    generation_source: str,
+) -> None:
+    if not choices:
+        return
+    normalized_generation_source = str(generation_source or "").strip() or "generated"
+    if normalized_generation_source != "generated":
+        return
+    _WEBSOCHAT_CHARACTER_CHAT_CHOICES_CACHE[cache_key] = (
+        monotonic() + WEBSOCHAT_CHARACTER_CHAT_CHOICES_CACHE_TTL_SECONDS,
+        {
+            "choices": [dict(choice) for choice in choices],
+            "generationSource": normalized_generation_source,
+        },
+    )
+
+
+def _prune_websochat_character_chat_choice_rate_bucket(
+    key: str,
+    now: float,
+) -> list[float]:
+    floor = now - WEBSOCHAT_CHARACTER_CHAT_CHOICES_RATE_WINDOW_SECONDS
+    bucket = [
+        timestamp
+        for timestamp in _WEBSOCHAT_CHARACTER_CHAT_CHOICES_RATE_BUCKETS.get(key, [])
+        if timestamp >= floor
+    ]
+    _WEBSOCHAT_CHARACTER_CHAT_CHOICES_RATE_BUCKETS[key] = bucket
+    return bucket
+
+
+def _enforce_websochat_character_chat_choice_rate_limit(
+    *,
+    user_id: int | None,
+    guest_key: str | None,
+    session_id: int,
+) -> None:
+    now = monotonic()
+    actor_key = f"user:{user_id}" if user_id is not None else f"guest:{guest_key or 'unknown'}"
+    checks = [
+        (f"actor:{actor_key}", WEBSOCHAT_CHARACTER_CHAT_CHOICES_ACTOR_RATE_LIMIT),
+        (f"session:{int(session_id)}", WEBSOCHAT_CHARACTER_CHAT_CHOICES_SESSION_RATE_LIMIT),
+    ]
+    for key, limit in checks:
+        if len(_prune_websochat_character_chat_choice_rate_bucket(key, now)) >= limit:
+            raise CustomResponseException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                code="CHARACTER_CHAT_CHOICES_RATE_LIMITED",
+                message="선택지 생성 요청이 잠시 많아요. 직접 입력은 계속 사용할 수 있어요.",
+            )
+    for key, _ in checks:
+        _WEBSOCHAT_CHARACTER_CHAT_CHOICES_RATE_BUCKETS.setdefault(key, []).append(now)
+
+
+def _clean_websochat_character_chat_choice_text(value: Any, max_len: int) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+    cleaned = cleaned.strip("`").strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[:max_len].rstrip()
+
+
+def _looks_like_websochat_character_spoken_choice(
+    *,
+    label: str,
+    dialogue: str,
+    narration: str,
+    active_character_scope_key: str,
+    active_character_label: str,
+) -> bool:
+    del active_character_scope_key
+    character_label = str(active_character_label or "").strip()
+    if character_label:
+        escaped_label = re.escape(character_label)
+        if re.match(rf"^{escaped_label}\s*[:：]", dialogue):
+            return True
+        if re.match(
+            rf"^{escaped_label}(?:은|는|이|가|도)?\s*"
+            r"(말했다|중얼거렸다|외쳤다|대답했다|속삭였다)",
+            dialogue,
+        ):
+            return True
+        if re.search(
+            rf"{escaped_label}(?:은|는|이|가|도)?\s*"
+            r"(말했다|중얼거렸다|외쳤다|대답했다|속삭였다)",
+            narration,
+        ):
+            return True
+    if re.search(r"(말했다|중얼거렸다|외쳤다|대답했다|속삭였다)", dialogue):
+        return True
+    if re.match(r"^[가-힣A-Za-z0-9_:-]{1,24}\s*[:：]", dialogue):
+        return True
+    return False
+
+
+def _looks_like_websochat_identity_loop_choice(text_value: str) -> bool:
+    normalized = re.sub(r"\s+", "", text_value)
+    if not normalized:
+        return False
+    return any(
+        pattern in normalized
+        for pattern in (
+            "넌누구",
+            "너는누구",
+            "당신은누구",
+            "정체가뭐",
+            "왜여기",
+            "내가왜여기",
+        )
+    )
+
+
+def _looks_like_websochat_overpowered_choice(text_value: str) -> bool:
+    return any(
+        keyword in text_value
+        for keyword in (
+            "모든 흑막",
+            "원작 결말",
+            "미래를 전부",
+            "다 알고",
+            "한 번에 해결",
+            "전부 끝내",
+            "절대자",
+            "주인공으로서",
+            "원작 주인공",
+        )
+    )
+
+
+def _looks_like_websochat_resolved_outcome_choice(text_value: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(text_value or ""))
+    if not normalized:
+        return False
+    if re.search(
+        r"(아님|아니라고|맞음|맞다고|범인|배후|정답|결과|출처|진실|거짓)"
+        r".{0,12}(보고|말하기|전달|알리기|공개)",
+        normalized,
+    ):
+        return True
+    if re.search(r"(자백|실토|고백)시키", normalized):
+        return True
+    if re.search(r"(증거|물증|단서).{0,8}(확보|획득|빼앗)", normalized):
+        return not re.search(r"(시도|제안|요청|확인|살피|찾아보)", normalized)
+    if re.search(r"(확실히|완전히|바로).{0,8}(끝내|해결)", normalized):
+        return True
+    return False
+
+
+def _build_websochat_character_chat_choice_anchor_candidates(
+    source_assistant_text: str,
+) -> list[str]:
+    normalized_source = unicodedata.normalize(
+        "NFC", str(source_assistant_text or "")
+    )[:WEBSOCHAT_CHARACTER_CHAT_CHOICE_ANCHOR_SOURCE_MAX_CHARS]
+    matches = list(WEBSOCHAT_KEYWORD_RE.finditer(normalized_source))
+    candidates_by_width: dict[int, list[str]] = {}
+    for width in (2, 1):
+        width_candidates: list[str] = []
+        width_seen: set[str] = set()
+        for start in range(len(matches) - width + 1):
+            group = matches[start : start + width]
+            tokens = [match.group(0) for match in group]
+            if all(token in WEBSOCHAT_KEYWORD_STOPWORDS for token in tokens):
+                continue
+            candidate = normalized_source[group[0].start() : group[-1].end()].strip()
+            if (
+                not 2 <= len(candidate) <= 24
+                or re.search(r"[\r\n.!?。！？]", candidate)
+                or candidate in width_seen
+            ):
+                continue
+            width_seen.add(candidate)
+            width_candidates.append(candidate)
+        candidates_by_width[width] = width_candidates
+
+    phrase_candidates = candidates_by_width[2]
+    return phrase_candidates or candidates_by_width[1]
+
+
+def _parse_and_validate_websochat_character_chat_choices(
+    parsed: dict[str, Any],
+    *,
+    active_character_scope_key: str,
+    active_character_label: str,
+    source_assistant_text: str = "",
+) -> list[dict[str, str]]:
+    raw_choices = parsed.get("choices") if isinstance(parsed, dict) else []
+    if not isinstance(raw_choices, list):
+        return []
+
+    anchor_candidates = _build_websochat_character_chat_choice_anchor_candidates(
+        source_assistant_text
+    )
+    anchor_by_id = {
+        f"a{index}": candidate
+        for index, candidate in enumerate(anchor_candidates, start=1)
+    }
+    choices: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_choices:
+        if not isinstance(item, dict):
+            continue
+        label = _clean_websochat_character_chat_choice_text(item.get("label"), 28)
+        dialogue = _clean_websochat_character_chat_choice_text(item.get("dialogue"), 120)
+        narration = _clean_websochat_character_chat_choice_text(item.get("narration"), 120)
+        if not label or not dialogue:
+            continue
+        joined = f"{label}\n{dialogue}\n{narration}"
+        if _looks_like_websochat_character_spoken_choice(
+            label=label,
+            dialogue=dialogue,
+            narration=narration,
+            active_character_scope_key=active_character_scope_key,
+            active_character_label=active_character_label,
+        ):
+            continue
+        if _looks_like_websochat_identity_loop_choice(joined):
+            continue
+        if _looks_like_websochat_overpowered_choice(joined):
+            continue
+        if _looks_like_websochat_resolved_outcome_choice(joined):
+            continue
+        dedupe_key = re.sub(r"\W+", "", joined.lower())
+        if not dedupe_key or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        choice = {
+            "label": label,
+            "dialogue": dialogue,
+            "narration": narration,
+        }
+        intent_kind = str(item.get("intentKind") or "").strip().lower()
+        target_anchor_id = str(item.get("targetAnchorId") or "").strip().lower()
+        target_anchor = anchor_by_id.get(target_anchor_id, "")
+        if (
+            intent_kind in WEBSOCHAT_CHARACTER_CHAT_CHOICE_INTENT_KINDS
+            and target_anchor
+        ):
+            choice["intentKind"] = intent_kind
+            choice["targetAnchor"] = target_anchor
+        choices.append(choice)
+        if len(choices) >= 3:
+            break
+    return choices
+
+
+def _build_websochat_character_chat_choice_floor(
+    *,
+    active_character_label: str,
+) -> list[dict[str, str]]:
+    character_label = str(active_character_label or "상대").strip() or "상대"
+    return [
+        {
+            "label": "상황 확인",
+            "dialogue": f"{character_label}, 지금 제가 먼저 확인해야 할 게 뭐예요?",
+            "narration": "나는 주변을 살피며 다음 움직임을 고른다.",
+        },
+        {
+            "label": "직접 확인",
+            "dialogue": "제가 가까이 가서 확인해 볼게요.",
+            "narration": "성급히 결론 내리지 않고 단서 쪽으로 조심스럽게 다가간다.",
+        },
+        {
+            "label": "단서 비교",
+            "dialogue": "다른 단서도 같이 비교해 보면 어떨까요?",
+            "narration": "나는 방금 나온 말과 주변 상황을 다시 맞춰 본다.",
+        },
+    ]
+
+
+def _complete_websochat_character_chat_choices_floor(
+    *,
+    choices: list[dict[str, str]],
+    active_character_scope_key: str,
+    active_character_label: str,
+) -> list[dict[str, str]]:
+    completed = [dict(choice) for choice in choices[:3]]
+    if len(completed) >= 3:
+        return completed
+    seen = {
+        re.sub(
+            r"\W+",
+            "",
+            f"{choice.get('label')}\n{choice.get('dialogue')}\n{choice.get('narration')}".lower(),
+        )
+        for choice in completed
+    }
+    floor_choices = _parse_and_validate_websochat_character_chat_choices(
+        {"choices": _build_websochat_character_chat_choice_floor(active_character_label=active_character_label)},
+        active_character_scope_key=active_character_scope_key,
+        active_character_label=active_character_label,
+    )
+    for choice in floor_choices:
+        key = re.sub(
+            r"\W+",
+            "",
+            f"{choice.get('label')}\n{choice.get('dialogue')}\n{choice.get('narration')}".lower(),
+        )
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        completed.append(choice)
+        if len(completed) >= 3:
+            break
+    return completed
+
+
+def _build_websochat_character_chat_choice_prompt(
+    *,
+    product_row: dict[str, Any],
+    rp_context: dict[str, Any],
+    recent_messages: list[dict[str, Any]],
+    source_assistant_message: dict[str, Any],
+) -> dict[str, str]:
+    title = str(product_row.get("title") or "작품").strip()
+    display_name = str(rp_context.get("display_name") or "캐릭터").strip()
+    entry_context = (
+        rp_context.get("character_chat_entry_context")
+        if isinstance(rp_context.get("character_chat_entry_context"), dict)
+        else {}
+    )
+    session_memory = (
+        rp_context.get("session_memory")
+        if isinstance(rp_context.get("session_memory"), dict)
+        else {}
+    )
+    latest_assistant = unicodedata.normalize(
+        "NFC", str(source_assistant_message.get("content") or "")
+    )[:WEBSOCHAT_CHARACTER_CHAT_CHOICE_ANCHOR_SOURCE_MAX_CHARS]
+    anchor_candidates = _build_websochat_character_chat_choice_anchor_candidates(
+        latest_assistant
+    )
+    compact_context = {
+        "product_title": title,
+        "active_character": display_name,
+        "active_character_scope_key": rp_context.get("active_character"),
+        "source_assistant_message_id": source_assistant_message.get("messageId"),
+        "latest_assistant": latest_assistant,
+        "target_anchor_candidates": [
+            {"id": f"a{index}", "text": candidate}
+            for index, candidate in enumerate(anchor_candidates, start=1)
+        ],
+        "recent_messages": [
+            {
+                "role": str(message.get("role") or "user"),
+                "content": str(message.get("content") or "")[:1200],
+            }
+            for message in recent_messages[-8:]
+            if str(message.get("content") or "").strip()
+        ],
+        "recent_rp_facts": list(session_memory.get("recent_rp_facts") or [])[:8],
+        "character_chat_entry_context": entry_context,
+    }
+    system_prompt = (
+        "너는 캐릭터챗 composer 선택지 생성기다.\n"
+        "캐릭터의 다음 답변을 쓰지 않는다.\n"
+        "사용자가 다음에 보낼 수 있는 입력 후보만 만든다.\n"
+        "출력은 JSON object 하나만 반환한다. markdown, 설명, 코드블록을 쓰지 않는다."
+    )
+    user_prompt = (
+        "[목표]\n"
+        "- 사용자가 막히지 않도록 다음 입력 후보를 만든다.\n"
+        "- 선택지는 캐릭터 대사가 아니라 사용자가 다음에 보낼 수 있는 입력 후보여야 한다.\n"
+        "- 아래 문맥에는 최신 assistant 메시지가 있으므로 choices는 반드시 3개를 반환한다.\n"
+        "- generic fallback은 만들지 않는다.\n\n"
+        "[JSON schema]\n"
+        "{\"choices\":[{\"label\":\"짧은 버튼 라벨\",\"dialogue\":\"사용자가 1인칭으로 보낼 대사\",\"narration\":\"사용자 측 행동/의도 또는 빈 문자열\",\"intentKind\":\"observe|ask|move|interact|assist|wait\",\"targetAnchorId\":\"target_anchor_candidates 후보의 id 중 하나\"}]}\n\n"
+        "[선택지 규칙]\n"
+        "- dialogue는 사용자가 직접 말하는 1인칭 문장이어야 한다.\n"
+        "- narration은 사용자의 작은 행동/의도만 쓴다.\n"
+        f"- 캐릭터 {display_name}의 대사나 답변을 쓰지 마라.\n"
+        "- 선택지는 아직 일어나지 않은 결과를 확정하지 말고, 사용자의 시도/제안/질문/관찰만 써라.\n"
+        "- intentKind는 사용자가 시도할 행동의 종류다. targetAnchorId는 target_anchor_candidates 후보의 id 중 하나를 고른다.\n"
+        "- targetAnchorId 대신 대상 문자열을 새로 쓰지 마라.\n"
+        "- 금지 예: '투표 용지가 아님을 보고', '증거를 확보한다', '자백시키기'.\n"
+        "- 허용 예: '종이 정체 확인하기', '증거 촬영 제안', '배후를 다시 묻기'.\n"
+        "- 사용자를 원작 네임드, 주인공, 흑막, 절대자, 이미 정답을 아는 인물로 만들지 마라.\n"
+        "- 원작 문제를 한 번에 해결하거나 캐릭터/세계관을 압도하는 행동을 만들지 마라.\n"
+        "- 정체 확인 질문만 반복하지 마라.\n"
+        "- 최근 assistant가 제시한 사건, 단서, 압박, 요청 중 하나를 이어받아야 한다.\n"
+        "- character_chat_entry_context의 읽은 범위와 캐릭터 장면을 넘지 말고, 직전 assistant가 연 현재 장면을 한 칸 전진시켜라.\n"
+        "- 각 선택지는 서로 다른 플레이 방향이어야 한다.\n\n"
+        "[문맥]\n"
+        f"{json.dumps(compact_context, ensure_ascii=False, sort_keys=True)}"
+    )
+    return {"system": system_prompt, "user": user_prompt}
 
 
 def _resolve_websochat_message_cash_cost(
@@ -419,6 +867,11 @@ def _strip_websochat_noncanonical_message_marker(content: str) -> str:
     if not normalized.startswith(WEBSOCHAT_NONCANONICAL_NEXT_EPISODE_MARKER):
         return normalized
     return normalized[len(WEBSOCHAT_NONCANONICAL_NEXT_EPISODE_MARKER):]
+
+
+def _sanitize_websochat_assistant_reply_text(content: str) -> str:
+    return sanitize_websochat_model_text(content)
+
 
 _STORY_AGENT_SUMMARY_OVERRIDE_CACHE: dict[str, Any] = {
     "path": None,
@@ -2630,6 +3083,50 @@ async def _get_websochat_recent_messages(session_id: int, db: AsyncSession) -> l
     ]
 
 
+async def _get_websochat_recent_messages_with_ids(
+    session_id: int,
+    db: AsyncSession,
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                message_id AS messageId,
+                role,
+                content,
+                DATE_FORMAT(created_date, '%Y-%m-%d %H:%i:%s') AS createdDate
+            FROM tb_story_agent_message
+            WHERE session_id = :session_id
+            ORDER BY message_id DESC
+            LIMIT :limit
+            """
+        ),
+        {
+            "session_id": session_id,
+            "limit": max(min(int(limit or 8), 20), 1),
+        },
+    )
+    rows = [dict(row) for row in result.mappings().all()]
+    rows.reverse()
+    messages: list[dict[str, Any]] = []
+    for row in rows:
+        raw_content = str(row.get("content") or "")
+        content = _strip_websochat_noncanonical_message_marker(raw_content).strip()
+        if not content or _is_websochat_noncanonical_message(raw_content):
+            continue
+        messages.append(
+            {
+                "messageId": int(row.get("messageId") or 0),
+                "role": str(row.get("role") or "user"),
+                "content": content[:2000],
+                "createdDate": row.get("createdDate"),
+            }
+        )
+    return messages
+
+
 def _build_websochat_system_prompt(product_row: dict[str, Any]) -> str:
     title = str(product_row.get("title") or "작품")
     latest_episode_no = int(product_row.get("latestEpisodeNo") or 0)
@@ -4276,8 +4773,30 @@ def _is_websochat_summary_payload_scope_compatible(
         return False
     payload_scope_key = str(payload.get("character_key") or "").strip()
     if not payload_scope_key:
-        return True
+        return False
     return payload_scope_key == expected_scope_key
+
+
+_WEBSOCHAT_CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS = (
+    "formula_type",
+    "p_to_user_request",
+    "user_task_type",
+    "user_task_success_condition",
+    "protagonist_state_delta",
+    "open_loop",
+    "mutation_policy",
+)
+
+
+def _is_websochat_character_chat_runtime_formula_seed_compatible(
+    value: Any,
+) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    return all(
+        bool(str(value.get(field_name) or "").strip())
+        for field_name in _WEBSOCHAT_CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS
+    )
 
 
 def _is_websochat_character_chat_opening_payload_compatible(
@@ -4303,6 +4822,10 @@ def _is_websochat_character_chat_opening_payload_compatible(
         return False
     readiness = payload.get("readiness")
     if isinstance(readiness, dict) and str(readiness.get("status") or "").strip() not in ("", "ready"):
+        return False
+    if not _is_websochat_character_chat_runtime_formula_seed_compatible(
+        payload.get("runtime_formula_seed")
+    ):
         return False
     opening_message = payload.get("opening_message")
     if not isinstance(opening_message, dict):
@@ -4358,29 +4881,134 @@ def _has_websochat_character_chat_opening_agency_violation(text: str) -> bool:
 
 def _is_websochat_character_chat_rp_context_ready(
     *,
+    product_id: int | None = None,
+    read_episode_to: int | None = None,
     resolved_active_character: str,
     profile: dict[str, Any] | None,
     examples_payload: dict[str, Any] | None,
     internal_prompt_payload: dict[str, Any] | None,
     internal_prompt: str,
     inventory_payload: dict[str, Any] | None,
-    opening_payload: dict[str, Any] | None,
+    entry_context: dict[str, Any] | None,
 ) -> bool:
     resolved_scope_key = str(resolved_active_character or "").strip()
-    if not resolved_scope_key or not profile or examples_payload is None or not str(internal_prompt or "").strip():
+    if not resolved_scope_key or not profile or examples_payload is None:
         return False
-    if not _is_websochat_character_chat_opening_payload_compatible(opening_payload, scope_key=resolved_scope_key):
+    if not [item for item in list(examples_payload.get("examples") or []) if isinstance(item, dict)]:
+        return False
+    if not _is_websochat_character_entry_context_v2(
+        entry_context,
+        expected_read_episode_to=read_episode_to,
+        expected_product_id=product_id,
+        expected_character_scope_key=resolved_scope_key,
+    ):
         return False
     if not _has_websochat_inventory_public_gate(inventory_payload):
         return False
     if not _is_websochat_inventory_rp_eligible(inventory_payload):
         return False
-    for payload in (profile, examples_payload, internal_prompt_payload):
+    for payload in (profile, examples_payload):
         if payload is None:
             return False
         if not _is_websochat_summary_payload_scope_compatible(payload, scope_key=resolved_scope_key):
             return False
     return True
+
+
+def _build_websochat_character_chat_safe_speech_style(profile: dict[str, Any]) -> dict[str, Any]:
+    raw_speech_style = profile.get("speech_style")
+    speech_style = raw_speech_style if isinstance(raw_speech_style, dict) else {}
+    return {
+        key: speech_style[key]
+        for key in ("tone", "formality", "sentence_length")
+        if speech_style.get(key) not in (None, "", [], {})
+    }
+
+
+def _filter_websochat_character_chat_examples_by_read_scope(
+    examples: Any,
+    *,
+    read_episode_to: int,
+) -> list[dict[str, Any]]:
+    bounded_examples: list[dict[str, Any]] = []
+    for item in examples or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            episode_no = int(item.get("episode_no") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 0 < episode_no <= int(read_episode_to or 0):
+            bounded_examples.append(item)
+    return bounded_examples
+
+
+async def _ensure_websochat_character_chat_entry_context(
+    *,
+    session_memory: dict[str, Any],
+    product_id: int,
+    latest_episode_no: int,
+    resolved_active_character: str,
+    resolution: dict[str, Any],
+    db: AsyncSession,
+) -> dict[str, Any]:
+    normalized_memory = _normalize_websochat_session_memory(session_memory)
+    if not _is_websochat_character_chat_session(normalized_memory):
+        return normalized_memory
+    canonical_scope_key = str(resolved_active_character or "").strip()
+    if canonical_scope_key:
+        normalized_memory["locked_character_scope_key"] = canonical_scope_key
+        normalized_memory["active_character"] = canonical_scope_key
+
+    read_episode_to = int(normalized_memory.get("read_episode_to") or 0)
+    current_entry_context = normalized_memory.get("character_chat_entry_context") or {}
+    if _is_websochat_character_entry_context_v2(
+        current_entry_context,
+        expected_read_episode_to=read_episode_to,
+        expected_product_id=product_id,
+        expected_character_scope_key=canonical_scope_key,
+    ):
+        return normalized_memory
+
+    entry_context = await load_websochat_character_entry_context_v2(
+        product_id=product_id,
+        read_episode_to=read_episode_to,
+        latest_episode_no=latest_episode_no,
+        character_scope_keys=_build_websochat_rp_lookup_scope_keys(
+            normalized_memory=normalized_memory,
+            resolved_active_character=canonical_scope_key,
+            resolution=resolution,
+        ),
+        db=db,
+    )
+    if not _is_websochat_character_entry_context_v2(
+        entry_context,
+        expected_read_episode_to=read_episode_to,
+        expected_product_id=product_id,
+        expected_character_scope_key=canonical_scope_key,
+    ):
+        raise CustomResponseException(
+            status_code=status.HTTP_409_CONFLICT,
+            code="CHARACTER_CHAT_ENTRY_NOT_READY",
+            message="읽은 회차에 맞는 캐릭터 장면을 준비하는 중이에요. 잠시 후 다시 시도해 주세요.",
+        )
+    normalized_memory["character_chat_entry_context"] = entry_context
+    return normalized_memory
+
+
+def _assert_websochat_character_chat_read_scope_not_decreased(
+    *,
+    current_read_episode_to: int,
+    next_read_episode_to: int,
+) -> None:
+    current_scope = max(int(current_read_episode_to or 0), 0)
+    next_scope = max(int(next_read_episode_to or 0), 0)
+    if current_scope > 0 and next_scope < current_scope:
+        raise CustomResponseException(
+            status_code=status.HTTP_409_CONFLICT,
+            code="CHARACTER_CHAT_READ_SCOPE_DECREASE_REQUIRES_NEW_SESSION",
+            message="이전 대화의 스포일러를 막기 위해 읽은 범위를 낮출 때는 새 캐릭터챗을 시작해 주세요.",
+        )
 
 
 async def _build_websochat_rp_trajectory_context(
@@ -4918,21 +5546,20 @@ async def _load_websochat_rp_context(
         scope_keys=cluster_scope_keys,
         db=db,
     )
-    internal_prompt_row = await _get_websochat_first_available_summary_row(
-        product_id=product_id,
-        summary_type="character_chat_internal_prompt",
-        scope_keys=cluster_scope_keys,
-        db=db,
-    )
-    opening_row = (
-        await _get_websochat_first_available_summary_row(
+    internal_prompt_row = (
+        None
+        if is_character_chat_session
+        else await _get_websochat_first_available_summary_row(
             product_id=product_id,
-            summary_type="character_chat_opening_v1",
+            summary_type="character_chat_internal_prompt",
             scope_keys=cluster_scope_keys,
             db=db,
         )
+    )
+    entry_context = (
+        dict(normalized_memory.get("character_chat_entry_context") or {})
         if is_character_chat_session
-        else None
+        else {}
     )
     inventory_v3_row = await _get_websochat_first_available_summary_row(
         product_id=product_id,
@@ -4950,10 +5577,18 @@ async def _load_websochat_rp_context(
     examples_payload = _extract_websochat_json_object(str((examples_row or {}).get("summaryText") or ""))
     internal_prompt_payload = _extract_websochat_json_object(str((internal_prompt_row or {}).get("summaryText") or ""))
     internal_prompt = str((internal_prompt_payload or {}).get("internal_prompt") or "").strip()
-    opening_payload = _extract_websochat_json_object(str((opening_row or {}).get("summaryText") or ""))
     inventory_payload = _extract_websochat_json_object(
         str(((inventory_v3_row or inventory_row) or {}).get("summaryText") or "")
     )
+    if is_character_chat_session and examples_payload is not None:
+        read_episode_to = int(normalized_memory.get("read_episode_to") or 0)
+        examples_payload = {
+            **examples_payload,
+            "examples": _filter_websochat_character_chat_examples_by_read_scope(
+                examples_payload.get("examples"),
+                read_episode_to=read_episode_to,
+            ),
+        }
     canonical_inventory_payload = dict(resolution.get("inventoryPayload") or {})
     canonical_inventory_has_public_gate = _has_websochat_inventory_public_gate(canonical_inventory_payload)
     if canonical_inventory_has_public_gate and not _is_websochat_inventory_rp_eligible(canonical_inventory_payload):
@@ -4967,22 +5602,24 @@ async def _load_websochat_rp_context(
         if merged_inventory_payload:
             inventory_payload = merged_inventory_payload
     if is_character_chat_session and not _is_websochat_character_chat_rp_context_ready(
+        product_id=product_id,
+        read_episode_to=int(normalized_memory.get("read_episode_to") or 0),
         resolved_active_character=resolved_active_character,
         profile=profile,
         examples_payload=examples_payload,
         internal_prompt_payload=internal_prompt_payload,
         internal_prompt=internal_prompt,
         inventory_payload=inventory_payload,
-        opening_payload=opening_payload,
+        entry_context=entry_context,
     ):
         logger.info(
-            "websochat character_chat_context_unavailable product_id=%s scope_key=%s profile=%s examples=%s internal_prompt=%s opening=%s inventory_gate=%s",
+            "websochat character_chat_context_unavailable product_id=%s scope_key=%s profile=%s examples=%s internal_prompt=%s entry_context=%s inventory_gate=%s",
             product_id,
             resolved_active_character,
             bool(profile),
             examples_payload is not None,
             bool(internal_prompt),
-            bool(opening_payload),
+            bool(entry_context),
             _has_websochat_inventory_public_gate(inventory_payload),
         )
         return None
@@ -5027,37 +5664,48 @@ async def _load_websochat_rp_context(
         inventory_seed_used,
     )
 
+    safe_speech_style = (
+        _build_websochat_character_chat_safe_speech_style(profile)
+        if is_character_chat_session
+        else profile.get("speech_style") or {}
+    )
     context: dict[str, Any] = {
         "active_character": resolved_active_character,
         "rp_mode": rp_mode,
         "display_name": str(profile.get("display_name") or resolved_active_character).strip(),
-        "speech_style": profile.get("speech_style") or {},
-        "personality_core": profile.get("personality_core") or [],
-        "baseline_attitude": str(profile.get("baseline_attitude") or "").strip(),
+        "speech_style": safe_speech_style,
+        "personality_core": [] if is_character_chat_session else profile.get("personality_core") or [],
+        "baseline_attitude": "" if is_character_chat_session else str(profile.get("baseline_attitude") or "").strip(),
         "examples": list(examples_payload.get("examples") or []),
-        "internal_prompt": internal_prompt,
-        "inventory": inventory_payload or {},
+        "internal_prompt": "" if is_character_chat_session else internal_prompt,
+        "inventory": {} if is_character_chat_session else inventory_payload or {},
         "session_memory": normalized_memory,
     }
-    if is_character_chat_session and opening_payload:
-        context["character_chat_opening"] = opening_payload
+    if is_character_chat_session:
+        context["character_chat_entry_context"] = entry_context
 
-    relation_payloads = await _load_websochat_character_relation_payloads(
-        product_id=product_id,
-        scope_keys=cluster_scope_keys,
-        display_name=str(context.get("display_name") or "").strip(),
-        db=db,
+    if not is_character_chat_session:
+        relation_payloads = await _load_websochat_character_relation_payloads(
+            product_id=product_id,
+            scope_keys=cluster_scope_keys,
+            display_name=str(context.get("display_name") or "").strip(),
+            db=db,
+        )
+        character_relation_lines = _build_websochat_character_relation_lines(relation_payloads)
+        if character_relation_lines:
+            context["character_relation_lines"] = character_relation_lines
+
+    trajectory_profile = (
+        {"display_name": str(context.get("display_name") or "").strip()}
+        if is_character_chat_session
+        else profile
     )
-    character_relation_lines = _build_websochat_character_relation_lines(relation_payloads)
-    if character_relation_lines:
-        context["character_relation_lines"] = character_relation_lines
-
     trajectory_context = await _build_websochat_rp_trajectory_context(
         product_id=product_id,
         latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
         read_episode_to=int(normalized_memory.get("read_episode_to") or 0),
         active_character_scope_key=resolved_active_character,
-        profile=profile,
+        profile=trajectory_profile,
         examples=list(examples_payload.get("examples") or []),
         db=db,
     )
@@ -6934,6 +7582,34 @@ async def create_session(
         synced_latest_episode_no=synced_latest_episode_no,
         db=db,
     )
+    if session_kind == "character_chat":
+        session_memory = await _ensure_websochat_character_chat_entry_context(
+            session_memory=session_memory,
+            product_id=req_body.product_id,
+            latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+            resolved_active_character=str(resolved_active_character or ""),
+            resolution=resolution,
+            db=db,
+        )
+    opening_text = ""
+    if session_kind == "character_chat":
+        rp_context = await _load_websochat_rp_context(
+            product_row=product_row,
+            session_memory=session_memory,
+            db=db,
+        )
+        if not rp_context:
+            raise CustomResponseException(
+                status_code=status.HTTP_409_CONFLICT,
+                code="CHARACTER_CHAT_ENTRY_NOT_READY",
+                message="이 캐릭터와의 대화를 아직 시작할 수 없습니다.",
+            )
+        opening_payload = await generate_character_chat_adjacent_opening_with_gemini(
+            product_row=product_row,
+            rp_context=rp_context,
+        )
+        opening_text = str(opening_payload.get("opening_text") or "").strip()
+
     session_memory_json = _serialize_websochat_session_memory(session_memory)
     query = text(
         f"""
@@ -6966,6 +7642,12 @@ async def create_session(
         },
     )
     session_id = result.lastrowid
+    if opening_text:
+        await _insert_websochat_assistant_message(
+            session_id=int(session_id),
+            content=opening_text,
+            db=db,
+        )
 
     return {
         "data": {
@@ -7156,6 +7838,11 @@ async def patch_session_read_scope(
                 else ErrorMessages.NOT_FOUND_EPISODE
             ),
         )
+    if _is_websochat_character_chat_session(session_memory):
+        _assert_websochat_character_chat_read_scope_not_decreased(
+            current_read_episode_to=current_read_episode_to,
+            next_read_episode_to=int(requested_read_episode_to or 0),
+        )
 
     current_authorized_read_episode_to = _resolve_websochat_requested_episode_to(
         current_authorized_scope.get("authorizedReadEpisodeTo")
@@ -7174,6 +7861,28 @@ async def patch_session_read_scope(
         session_memory["read_episode_to"] = resolved_read_episode_to
         session_memory["read_scope_state"] = "known"
         session_memory["read_scope_source"] = "viewer"
+        if _is_websochat_character_chat_session(session_memory):
+            locked_character_scope_key = str(
+                session_memory.get("locked_character_scope_key") or ""
+            ).strip()
+            resolution = await _resolve_websochat_active_character_resolution(
+                product_id=int(session_row["product_id"]),
+                active_character=locked_character_scope_key,
+                db=db,
+            )
+            resolved_active_character = str(resolution.get("scopeKey") or "").strip()
+            session_memory = await _ensure_websochat_character_chat_entry_context(
+                session_memory=session_memory,
+                product_id=int(session_row["product_id"]),
+                latest_episode_no=int(
+                    product_state.get("latestEpisodeNo")
+                    or synced_latest_episode_no
+                    or 0
+                ),
+                resolved_active_character=resolved_active_character,
+                resolution=resolution,
+                db=db,
+            )
         await db.execute(
             text(
                 f"""
@@ -7234,6 +7943,241 @@ async def delete_session(
         },
     )
     return {"data": {"sessionId": session_id, "deletedYn": "Y"}}
+
+
+def _build_websochat_character_chat_choices_payload(
+    *,
+    choices: list[dict[str, str]] | None,
+    source_assistant_message_id: int,
+    generation_source: str = "none",
+) -> dict[str, Any]:
+    return {
+        "data": {
+            "choices": [dict(choice) for choice in (choices or [])],
+            "sourceAssistantMessageId": int(source_assistant_message_id or 0),
+            "generationSource": str(generation_source or "none"),
+        }
+    }
+
+
+@handle_exceptions
+async def post_character_chat_choices(
+    session_id: int,
+    req_body: PostWebsochatCharacterChoicesReqBody,
+    kc_user_id: str | None,
+    db: AsyncSession,
+):
+    user_id, resolved_guest_key = await _resolve_actor(kc_user_id, req_body.guest_key, db)
+    session_row = await _get_session_row(session_id, user_id, resolved_guest_key, db)
+    session_memory = _normalize_websochat_session_memory(session_row.get("session_memory_json"))
+    if not _is_websochat_character_chat_session(session_memory):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="NOT_CHARACTER_CHAT_SESSION",
+            message="캐릭터챗 세션에서만 선택지 보조를 사용할 수 있어요.",
+        )
+    locked_character_scope_key = str(
+        session_memory.get("locked_character_scope_key") or ""
+    ).strip()
+    if not locked_character_scope_key:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="CHARACTER_CHAT_LOCK_MISSING",
+            message="캐릭터챗 세션의 고정 인물 정보가 없습니다.",
+        )
+
+    requested_source_assistant_id = int(req_body.source_assistant_message_id)
+    session_lock_conn = await _acquire_websochat_session_lock(session_id=session_id)
+    if session_lock_conn is None:
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=requested_source_assistant_id,
+        )
+    await _release_websochat_session_lock(session_id=session_id, conn=session_lock_conn)
+
+    recent_messages = await _get_websochat_recent_messages_with_ids(
+        session_id=session_id,
+        limit=8,
+        db=db,
+    )
+    latest_visible = recent_messages[-1] if recent_messages else None
+    if not latest_visible or str(latest_visible.get("role") or "") != "assistant":
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=requested_source_assistant_id,
+        )
+    latest_assistant_id = int(latest_visible.get("messageId") or 0)
+    if latest_assistant_id != requested_source_assistant_id:
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
+
+    effective_adult_yn = await _resolve_effective_adult_yn(
+        kc_user_id=kc_user_id,
+        adult_yn="Y",
+        db=db,
+    )
+    product_row = await _get_websochat_product(
+        product_id=int(session_row["product_id"]),
+        adult_yn=effective_adult_yn,
+        db=db,
+    )
+    if not product_row:
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
+    try:
+        _assert_websochat_product_context_available(product_row)
+    except CustomResponseException:
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
+
+    session_memory["active_character"] = locked_character_scope_key
+    session_memory["rp_mode"] = "free"
+    session_memory["active_mode"] = "rp"
+    current_read_episode_to = int(session_memory.get("read_episode_to") or 0)
+    session_memory, authorized_scope = await _clamp_websochat_session_read_scope_to_authorized(
+        session_memory=session_memory,
+        product_id=int(session_row["product_id"]),
+        user_id=user_id,
+        synced_latest_episode_no=_resolve_websochat_synced_latest_episode_no(product_row),
+        db=db,
+    )
+    if int(authorized_scope.get("maxAuthorizedEpisodeTo") or 0) <= 0:
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
+    if _resolve_websochat_read_scope_state(session_memory) != "known":
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
+
+    _assert_websochat_character_chat_read_scope_not_decreased(
+        current_read_episode_to=current_read_episode_to,
+        next_read_episode_to=int(session_memory.get("read_episode_to") or 0),
+    )
+    resolution = await _resolve_websochat_active_character_resolution(
+        product_id=int(session_row["product_id"]),
+        active_character=locked_character_scope_key,
+        db=db,
+    )
+    resolved_active_character = str(resolution.get("scopeKey") or "").strip()
+    if not resolved_active_character:
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
+    session_memory = await _ensure_websochat_character_chat_entry_context(
+        session_memory=session_memory,
+        product_id=int(session_row["product_id"]),
+        latest_episode_no=int(product_row.get("latestEpisodeNo") or 0),
+        resolved_active_character=resolved_active_character,
+        resolution=resolution,
+        db=db,
+    )
+
+    rp_context = await _load_websochat_rp_context(
+        product_row=product_row,
+        session_memory=session_memory,
+        db=db,
+    )
+    if not rp_context:
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
+
+    cache_key = _build_websochat_character_chat_choices_cache_key(
+        session_id=session_id,
+        source_assistant_message_id=latest_assistant_id,
+        product_id=int(session_row["product_id"]),
+        character_scope_key=resolved_active_character,
+        read_episode_to=int(session_memory.get("read_episode_to") or 0),
+    )
+    cached_choices = _get_websochat_character_chat_choices_cache(cache_key)
+    if cached_choices is not None:
+        return _build_websochat_character_chat_choices_payload(
+            choices=list(cached_choices.get("choices") or []),
+            source_assistant_message_id=latest_assistant_id,
+            generation_source=str(cached_choices.get("generationSource") or "generated"),
+        )
+    _enforce_websochat_character_chat_choice_rate_limit(
+        user_id=user_id,
+        guest_key=resolved_guest_key,
+        session_id=session_id,
+    )
+
+    prompt = _build_websochat_character_chat_choice_prompt(
+        product_row=product_row,
+        rp_context=rp_context,
+        recent_messages=recent_messages,
+        source_assistant_message=latest_visible,
+    )
+    choices: list[dict[str, str]] = []
+    active_character_label = str(rp_context.get("display_name") or "").strip()
+    generation_source = "none"
+    for attempt in range(2):
+        attempt_user_prompt = prompt["user"]
+        if attempt > 0:
+            attempt_user_prompt += (
+                "\n\n[재생성 지시]\n"
+                "- 이전 출력은 선택지가 3개 미만이거나 결과를 미리 확정해 폐기됐다.\n"
+                "- 최신 assistant 메시지 직후 사용자가 할 수 있는 시도/제안/질문/관찰 3개를 반드시 JSON으로만 반환한다.\n"
+                "- 각 선택지에 intentKind와 target_anchor_candidates 후보의 id인 targetAnchorId를 포함한다.\n"
+                "- 결과 확정 표현 금지: ~임을 보고, ~아님을 보고, 증거 확보, 자백시키기.\n"
+            )
+        parsed: dict[str, Any] = {}
+        try:
+            raw_reply = await call_websochat_gemini(
+                system_prompt=prompt["system"],
+                messages=to_websochat_gemini_contents(
+                    [{"role": "user", "content": attempt_user_prompt}]
+                ),
+                max_tokens=WEBSOCHAT_CHARACTER_CHAT_CHOICES_MAX_TOKENS,
+                temperature=0.5 if attempt == 0 else 0.65,
+            )
+            extracted = _extract_websochat_json_object(raw_reply)
+            parsed = extracted if isinstance(extracted, dict) else {}
+        except Exception:
+            logger.warning(
+                "websochat character_chat_choices_generation_failed session_id=%s source_assistant_message_id=%s attempt=%s",
+                session_id,
+                latest_assistant_id,
+                attempt + 1,
+                exc_info=True,
+            )
+        choices = _parse_and_validate_websochat_character_chat_choices(
+            parsed,
+            active_character_scope_key=locked_character_scope_key,
+            active_character_label=active_character_label,
+            source_assistant_text=str(latest_visible.get("content") or ""),
+        )
+        if len(choices) >= 3:
+            generation_source = "generated"
+            break
+    if generation_source != "generated":
+        choices = _complete_websochat_character_chat_choices_floor(
+            choices=choices,
+            active_character_scope_key=locked_character_scope_key,
+            active_character_label=active_character_label,
+        )
+        generation_source = "floor" if choices else "none"
+    _set_websochat_character_chat_choices_cache(
+        cache_key,
+        choices=choices,
+        generation_source=generation_source,
+    )
+    return _build_websochat_character_chat_choices_payload(
+        choices=choices,
+        source_assistant_message_id=latest_assistant_id,
+        generation_source=generation_source,
+    )
 
 
 @handle_exceptions
@@ -7424,6 +8368,19 @@ async def post_message(
         synced_latest_episode_no=synced_latest_episode_no,
         db=db,
     )
+    if is_character_chat_session:
+        _assert_websochat_character_chat_read_scope_not_decreased(
+            current_read_episode_to=int(current_session_memory.get("read_episode_to") or 0),
+            next_read_episode_to=int(next_session_memory.get("read_episode_to") or 0),
+        )
+        next_session_memory = await _ensure_websochat_character_chat_entry_context(
+            session_memory=next_session_memory,
+            product_id=int(session_row["product_id"]),
+            latest_episode_no=latest_episode_no,
+            resolved_active_character=str(resolved_active_character or ""),
+            resolution=resolution,
+            db=db,
+        )
 
     display_read_episode_to = _resolve_websochat_display_read_episode_to(
         scope_state=_resolve_websochat_read_scope_state(next_session_memory),
@@ -7766,6 +8723,7 @@ async def post_message(
                 db=db,
                 forced_route=forced_route,
             )
+        assistant_reply = _sanitize_websochat_assistant_reply_text(assistant_reply)
         await emit_websochat_stream_text_if_needed(assistant_reply)
         route_referenced_episode_nos: list[int] = []
         if route_session_memory is not None:
