@@ -41,8 +41,41 @@ def _cp_owned_product_ids_subquery(user_id: int) -> str:
         SELECT product_id
         FROM tb_product
         WHERE cp_user_id = {user_id}
-           OR user_id = {user_id}
     """
+
+
+async def _assert_product_sales_access(
+    product_id: int, db: AsyncSession, user_data: dict
+) -> None:
+    role = user_data.get("role")
+    if role == "admin":
+        return
+    elif role == "author":
+        access_where = "AND p.author_id = :user_id"
+    elif role == "CP":
+        access_where = "AND p.cp_user_id = :user_id"
+    else:
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
+
+    access_query = text(f"""
+        SELECT 1
+          FROM tb_product p
+         WHERE p.product_id = :product_id
+           {access_where}
+         LIMIT 1
+    """)
+    access_result = await db.execute(
+        access_query,
+        {"product_id": product_id, "user_id": user_data["user_id"]},
+    )
+    if access_result.scalar() is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
 
 
 def _cp_company_name_product_ids_subquery(search_word: str) -> str:
@@ -495,9 +528,13 @@ async def monthly_sales_by_product_list(
             INNER JOIN tb_product p ON pps.product_id = p.product_id
         """
         where += f"""
-            AND (p.cp_user_id = {user_data["user_id"]}
-                 OR p.user_id = {user_data["user_id"]})
+            AND p.cp_user_id = {user_data["user_id"]}
         """
+    elif user_data["role"] != "admin":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
 
     if search_word != "":
         if search_target == CommonConstants.SEARCH_PRODUCT_TITLE:
@@ -616,29 +653,7 @@ async def monthly_sales_by_product_detail_by_product_id(
     Returns:
         dict: 해당 작품의 월매출 상세 데이터
     """
-    access_where = ""
-    if user_data["role"] == "author":
-        access_where = "AND author_id = :user_id"
-    elif user_data["role"] == "CP":
-        access_where = "AND (cp_user_id = :user_id OR user_id = :user_id)"
-
-    if access_where:
-        access_query = text(f"""
-            SELECT 1
-              FROM tb_product
-             WHERE product_id = :product_id
-               {access_where}
-             LIMIT 1
-        """)
-        access_result = await db.execute(
-            access_query,
-            {"product_id": id, "user_id": user_data["user_id"]},
-        )
-        if access_result.scalar() is None:
-            raise CustomResponseException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                message=ErrorMessages.PERMISSION_DENIED,
-            )
+    await _assert_product_sales_access(id, db, user_data)
 
     query = text("""
         SELECT
@@ -922,6 +937,11 @@ async def sales_by_episode_list(
                 {_cp_owned_product_ids_subquery(user_data["user_id"])}
             )
         """
+    elif user_data["role"] != "admin":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
 
     if search_word != "":
         if search_target == CommonConstants.SEARCH_PRODUCT_TITLE:
@@ -1036,6 +1056,7 @@ async def sales_by_episode_list_by_product_id(
     page: int,
     count_per_page: int,
     db: AsyncSession,
+    user_data: dict,
 ):
     """
     특정 작품의 회차별 매출 데이터를 조건에 따라 검색하고 페이징된 목록을 반환
@@ -1054,9 +1075,7 @@ async def sales_by_episode_list_by_product_id(
         dict: 전체 개수, 페이징 정보, 해당 작품의 회차별 매출 데이터 목록
     """
 
-    where = f"""
-                 AND product_id = {product_id}
-                 """
+    await _assert_product_sales_access(product_id, db, user_data)
 
     where, params = build_search_where_clause(
         search_word,
@@ -1156,6 +1175,11 @@ async def daily_ticket_list(
                 {_cp_owned_product_ids_subquery(user_data["user_id"])}
             )
         """
+    elif user_data["role"] != "admin":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
 
     if search_word != "":
         if search_target == CommonConstants.SEARCH_PRODUCT_TITLE:
@@ -1256,6 +1280,11 @@ async def monthly_settlement_list(
                 {_cp_owned_product_ids_subquery(user_data["user_id"])}
             )
         """
+    elif user_data["role"] != "admin":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
 
     if search_word != "":
         if search_target == "author-name":
@@ -1379,6 +1408,11 @@ async def product_contract_offer_deduction_list(
                 {_cp_owned_product_ids_subquery(user_data["user_id"])}
             )
         """
+    elif user_data["role"] != "admin":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
 
     if search_word != "":
         if search_target == CommonConstants.SEARCH_PRODUCT_TITLE:
