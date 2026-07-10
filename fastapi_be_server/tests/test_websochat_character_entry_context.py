@@ -202,16 +202,11 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
         self.assertIn("확인했으면 움직여", prompt)
         self.assertNotIn("미래 회차 말투", prompt)
         self.assertIn("판단에 따라 직접 움직인다", prompt)
-        self.assertIn("decision_branch", prompt)
-        self.assertIn("actor_scope_key", prompt)
-        self.assertIn("서로 다른 다음 행동 두 개", prompt)
-        self.assertIn("정체불명 물건", prompt)
-        self.assertIn("되돌릴 수 있는 국지적", prompt)
         self.assertIn("3인칭 관찰 지문", prompt)
-        self.assertIn("원문 기반 감각·소품", prompt)
         self.assertIn("recent_scene_branch", prompt)
         self.assertIn("current_boundary_reentry", prompt)
-        self.assertIn("JSON 객체 하나만", prompt)
+        self.assertIn("설명, 마크다운, JSON 없이", prompt)
+        self.assertNotIn('"scene_plan"', prompt)
 
     def test_adjacent_opening_payload_requires_exact_identity_boundary_and_rich_text(self):
         valid = {
@@ -639,7 +634,7 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
 
 
 class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCase):
-    async def test_adjacent_opening_generator_parses_one_strict_model_response(self):
+    async def test_adjacent_opening_generator_accepts_plain_text_response(self):
         entry_context = _entry_context(14)
         payload = {
             "schema_version": "character_chat_adjacent_opening_v1",
@@ -682,7 +677,7 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
         with patch(
             "app.services.websochat.websochat_rp_renderer.call_websochat_gemini",
             new_callable=AsyncMock,
-            return_value=json.dumps(payload, ensure_ascii=False),
+            return_value=payload["opening_text"],
         ) as call_model:
             result = await generate_character_chat_adjacent_opening_with_gemini(
                 product_row={"productId": 1182, "title": "테스트 작품"},

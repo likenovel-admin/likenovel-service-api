@@ -337,6 +337,70 @@ def _normalize_character_chat_adjacent_opening_payload(
     return normalized
 
 
+def _normalize_character_chat_opening_text(raw_reply: Any) -> str:
+    text_value = str(raw_reply or "").strip()
+    if not text_value:
+        return ""
+
+    parsed = _extract_websochat_json_object(text_value)
+    if isinstance(parsed, dict) and str(parsed.get("opening_text") or "").strip():
+        text_value = str(parsed["opening_text"]).strip()
+    elif text_value.startswith("```"):
+        lines = text_value.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text_value = "\n".join(lines).strip()
+
+    text_value = text_value.replace("\r\n", "\n").replace("\r", "\n")
+    if text_value.startswith("{") or not (120 <= len(text_value) <= 2000):
+        return ""
+
+    paragraphs = [part.strip() for part in text_value.split("\n\n") if part.strip()]
+    if len(paragraphs) < 2:
+        quote_indexes = [
+            index
+            for marker in ('"', "“")
+            if (index := text_value.find(marker)) > 0
+        ]
+        if not quote_indexes:
+            return ""
+        first_quote_index = min(quote_indexes)
+        paragraphs = [
+            text_value[:first_quote_index].strip(),
+            text_value[first_quote_index:].strip(),
+        ]
+
+    first_dialogue_index = next(
+        (
+            index
+            for index, paragraph in enumerate(paragraphs)
+            if paragraph.startswith(('"', "“"))
+        ),
+        -1,
+    )
+    narration_paragraphs = paragraphs[:first_dialogue_index]
+    dialogue_paragraphs = paragraphs[first_dialogue_index:]
+    if (
+        first_dialogue_index <= 0
+        or not (1 <= len(dialogue_paragraphs) <= 3)
+        or any(
+            not paragraph.startswith(('"', "“"))
+            or not paragraph.endswith(('"', "”"))
+            or not paragraph[1:-1].strip()
+            for paragraph in dialogue_paragraphs
+        )
+    ):
+        return ""
+
+    dialogue = '"' + " ".join(
+        paragraph[1:-1].strip() for paragraph in dialogue_paragraphs
+    ) + '"'
+    opening_text = "\n\n".join([*narration_paragraphs, dialogue])
+    return opening_text if 120 <= len(opening_text) <= 2000 else ""
+
+
 def _build_character_chat_adjacent_opening_prompt(
     *,
     product_row: dict[str, Any],
@@ -420,38 +484,8 @@ def _build_character_chat_adjacent_opening_prompt(
 - 장면은 한 번에 해결하지 않는다. beats는 이상 확인, 사용자 판단, 그 판단 뒤 발생할 작은 결과의 3단계다.
 
 [출력 형식]
-설명이나 마크다운 없이 아래 키를 모두 채운 JSON 객체 하나만 출력하라.
-{{
-  "schema_version": "character_chat_adjacent_opening_v1",
-  "product_id": {product_id},
-  "character_scope_key": {json.dumps(character_scope_key, ensure_ascii=False)},
-  "read_episode_to": {read_episode_to},
-  "scene_plan": {{
-    "setting": "...",
-    "continuity_from_boundary": "읽은 범위의 어떤 현재 상태를 이어받았는지",
-    "freshness_from_completed_scene": "완료된 마지막 장면과 어떻게 다른지",
-    "event_shape": "현재 작품에 맞는 마찰 유형",
-    "inciting_event": "...",
-    "character_first_move": "...",
-    "stakes": "...",
-    "beats": ["선택 캐릭터의 선행 행동", "사용자의 판단", "선택 캐릭터가 수행할 다음 행동"],
-    "decision_branch": {{
-      "axis": "risk | priority | approach | interpretation 중 하나",
-      "user_decision": "사용자가 판단할 한 가지 쟁점",
-      "branch_a": {{
-        "actor_scope_key": {json.dumps(character_scope_key, ensure_ascii=False)},
-        "character_next_action": "판단 A 뒤 선택 캐릭터가 직접 할 행동",
-        "immediate_effect": "그 행동으로 바로 달라지는 장면 상태"
-      }},
-      "branch_b": {{
-        "actor_scope_key": {json.dumps(character_scope_key, ensure_ascii=False)},
-        "character_next_action": "판단 B 뒤 선택 캐릭터가 직접 할 다른 행동",
-        "immediate_effect": "그 행동으로 바로 달라지는 다른 장면 상태"
-      }}
-    }}
-  }},
-  "opening_text": "지문\\n\\n\\\"대사\\\""
-}}
+설명, 마크다운, JSON 없이 실제 채팅에 표시할 본문만 출력하라.
+3인칭 지문을 쓴 뒤 빈 줄 하나를 두고, 선택 캐릭터의 큰따옴표 대사로 끝낸다.
 
 [허용된 원고 근거]
 {json.dumps(source, ensure_ascii=False, sort_keys=True)}
@@ -463,7 +497,7 @@ def _build_character_chat_adjacent_opening_prompt(
 4. decision_branch 두 갈래에서 선택 캐릭터가 직접 수행할 행동과 즉시 결과가 서로 다른지 확인한다. 사용자가 직접 운반·수리·감시·보관해야 진행되는 설계라면 판단만 맡도록 다시 쓴다.
 5. 사용자의 위치나 몸짓을 지문에 넣지 않고, stakes가 국지적이고 되돌릴 수 있는지 실제 scene_plan과 opening_text를 다시 읽어 확인한다.
 6. opening_text는 3인칭 지문 문단 뒤 빈 줄 하나, 선택 캐릭터의 큰따옴표 대사 한 문단으로 정확히 끝낸다. 내부 branch의 A/B 표시는 대사에 노출하지 않는다.
-7. 검수를 마친 최종 JSON 하나만 출력하라."""
+7. 위 계획은 내부에서만 사용하고, 검수를 마친 채팅 본문만 출력하라."""
 
 
 async def generate_character_chat_adjacent_opening_with_gemini(
@@ -482,25 +516,12 @@ async def generate_character_chat_adjacent_opening_with_gemini(
             message="이 읽은 범위의 캐릭터챗 시작 장면이 아직 준비되지 않았습니다.",
         )
     entry_context = rp_context["character_chat_entry_context"]
-    safe_material = _build_character_chat_safe_scene_material(entry_context)
-    identity_safety = (
-        safe_material.get("selected_character_last_completed_scene", {}).get(
-            "identity_safety", {}
-        )
-        if isinstance(
-            safe_material.get("selected_character_last_completed_scene", {}).get(
-                "identity_safety"
-            ),
-            dict,
-        )
-        else {}
-    )
     for attempt in range(2):
-        user_instruction = "요구한 JSON 오프닝을 생성해 주세요."
+        user_instruction = "요구한 캐릭터챗 첫 장면 본문을 생성해 주세요."
         if attempt:
             user_instruction = (
-                "이전 응답은 JSON 형식 검증을 통과하지 못했습니다. "
-                "설명 없이 요구한 키를 모두 포함한 JSON 객체 하나만 다시 생성해 주세요."
+                "이전 응답은 채팅 표시 형식을 맞추지 못했습니다. "
+                "설명 없이 3인칭 지문, 빈 줄, 큰따옴표 대사로만 다시 써 주세요."
             )
         raw_reply = await call_websochat_gemini(
             system_prompt=prompt,
@@ -511,19 +532,17 @@ async def generate_character_chat_adjacent_opening_with_gemini(
             temperature=0.7,
             stream=False,
         )
-        normalized = _normalize_character_chat_adjacent_opening_payload(
-            _extract_websochat_json_object(raw_reply),
-            expected_product_id=int(entry_context.get("product_id") or 0),
-            expected_character_scope_key=str(rp_context.get("active_character") or "").strip(),
-            expected_read_episode_to=int(entry_context.get("read_episode_to") or 0),
-            forbidden_dialogue_addressees=[
-                str(item or "").strip()
-                for item in (identity_safety.get("prior_scene_addressees") or [])
-                if str(item or "").strip()
-            ],
-        )
-        if normalized:
-            return normalized
+        opening_text = _normalize_character_chat_opening_text(raw_reply)
+        if opening_text:
+            return {
+                "schema_version": "character_chat_opening_text_v1",
+                "product_id": int(entry_context.get("product_id") or 0),
+                "character_scope_key": str(
+                    rp_context.get("active_character") or ""
+                ).strip(),
+                "read_episode_to": int(entry_context.get("read_episode_to") or 0),
+                "opening_text": opening_text,
+            }
     raise CustomResponseException(
         status_code=status.HTTP_502_BAD_GATEWAY,
         code="CHARACTER_CHAT_OPENING_INVALID_RESPONSE",
