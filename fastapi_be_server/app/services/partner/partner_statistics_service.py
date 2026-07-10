@@ -343,7 +343,22 @@ async def product_episode_statistics_list(
         회차별 통계 리스트 및 페이징 정보
     """
 
-    where = build_role_where_clause(user_data)
+    if user_data["role"] == "author":
+        where = f"""
+            AND s.product_id IN (
+                SELECT product_id
+                FROM tb_product
+                WHERE author_id = {user_data["user_id"]}
+            )
+        """
+    elif user_data["role"] == "CP":
+        where = f"""
+            AND s.product_id IN (
+                {_cp_owned_product_ids_subquery(user_data["user_id"])}
+            )
+        """
+    else:
+        where = ""
 
     if search_word != "":
         if search_target == CommonConstants.SEARCH_PRODUCT_TITLE:
