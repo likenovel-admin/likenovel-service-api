@@ -3077,7 +3077,7 @@ async def _get_product_brief(product_id: int, db: AsyncSession) -> dict | None:
                   AND q.file_group_id = p.thumbnail_file_id)) AS cover_url
         FROM tb_product p
         LEFT JOIN tb_product_trend_index pti ON pti.product_id = p.product_id
-        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
         LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND p69.status = 'ing' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
         WHERE p.product_id = :pid
           AND p.open_yn = 'Y'
@@ -4131,7 +4131,7 @@ async def _preset_recommend(
               ON r1.product_id = r2.product_id
              AND r1.created_date = r2.max_created_date
         ) pr ON pr.product_id = p.product_id
-        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
         LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND p69.status = 'ing' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
         WHERE p.open_yn = 'Y'
           AND m.analysis_status = 'success'

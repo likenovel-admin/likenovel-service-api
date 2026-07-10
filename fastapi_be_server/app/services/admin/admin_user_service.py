@@ -21,6 +21,9 @@ from app.const import ErrorMessages
 
 logger = logging.getLogger("admin_app")
 
+WAITING_FOR_FREE_ACTIVATION_DELAY_MINUTES = 5
+DEFAULT_WAITING_FOR_FREE_PERIOD_MONTHS = 12
+
 """
 Admin user management service functions.
 """
@@ -959,6 +962,92 @@ async def deny_apply_rank_up(apply_id: int, db: AsyncSession):
     return {"result": True}
 
 
+async def _apply_waiting_for_free_by_admin(
+    product_id: int,
+    period_months: int,
+    admin_user_id: int,
+    db: AsyncSession,
+):
+    query = text("""
+                 SELECT id, status
+                   FROM tb_applied_promotion
+                  WHERE product_id = :product_id
+                    AND type = 'waiting-for-free'
+                    AND status IN ('apply', 'ing')
+                  ORDER BY id DESC
+                  LIMIT 1
+                  FOR UPDATE
+                 """)
+    result = await db.execute(query, {"product_id": product_id})
+    existing = result.mappings().one_or_none()
+
+    if existing and existing["status"] == "ing":
+        return existing["id"]
+
+    query = text("""
+                 SELECT COUNT(*)
+                   FROM tb_applied_promotion
+                  WHERE status = 'ing'
+                    AND created_date >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)
+                    AND created_date < DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 7 DAY)
+                 """)
+    result = await db.execute(query)
+    if (result.scalar() or 0) >= 20:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.NO_AVAILABLE_APPLIED_PROMOTION_SLOT,
+        )
+
+    if existing:
+        query = text(f"""
+                     UPDATE tb_applied_promotion
+                        SET status = 'ing',
+                            start_date = DATE_ADD(NOW(), INTERVAL {WAITING_FOR_FREE_ACTIVATION_DELAY_MINUTES} MINUTE),
+                            end_date = DATE_ADD(CURDATE(), INTERVAL :period_months MONTH),
+                            num_of_ticket_per_person = 1,
+                            updated_id = :admin_user_id,
+                            updated_date = NOW()
+                      WHERE id = :promotion_id
+                        AND status = 'apply'
+                     """)
+        result = await db.execute(
+            query,
+            {
+                "promotion_id": existing["id"],
+                "period_months": period_months,
+                "admin_user_id": admin_user_id,
+            },
+        )
+        if result.rowcount != 1:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="기다리면 무료 신청 상태를 갱신할 수 없습니다.",
+            )
+        return existing["id"]
+
+    query = text(f"""
+                 INSERT INTO tb_applied_promotion (
+                     product_id, type, status, start_date, end_date,
+                     num_of_ticket_per_person, created_id, created_date,
+                     updated_id, updated_date
+                 ) VALUES (
+                     :product_id, 'waiting-for-free', 'ing',
+                     DATE_ADD(NOW(), INTERVAL {WAITING_FOR_FREE_ACTIVATION_DELAY_MINUTES} MINUTE),
+                     DATE_ADD(CURDATE(), INTERVAL :period_months MONTH),
+                     1, :admin_user_id, NOW(), :admin_user_id, NOW()
+                 )
+                 """)
+    result = await db.execute(
+        query,
+        {
+            "product_id": product_id,
+            "period_months": period_months,
+            "admin_user_id": admin_user_id,
+        },
+    )
+    return result.lastrowid
+
+
 async def apply_paid_conversion_by_admin(
     apply_id: int,
     req_body: admin_schema.PostApplyPaidConversionReqBody,
@@ -1061,10 +1150,35 @@ async def apply_paid_conversion_by_admin(
             message="유료전환 적용 대상 작품을 확인할 수 없습니다.",
         )
 
+    waiting_for_free_promotion_id = None
+    waiting_for_free_period_months = None
+    if req_body.waiting_for_free_enabled:
+        waiting_for_free_period_months = (
+            req_body.waiting_for_free_period_months
+            or DEFAULT_WAITING_FOR_FREE_PERIOD_MONTHS
+        )
+        waiting_for_free_promotion_id = await _apply_waiting_for_free_by_admin(
+            product_id=product_id,
+            period_months=waiting_for_free_period_months,
+            admin_user_id=admin_user_id,
+            db=db,
+        )
+
     return {
         "data": {
             "productId": product_id,
             "paidEpisodeNo": paid_episode_no,
+            "waitingForFreeEnabled": bool(req_body.waiting_for_free_enabled),
+            "waitingForFreePromotionId": waiting_for_free_promotion_id,
+            "waitingForFreePeriodMonths": waiting_for_free_period_months,
+            "waitingForFreeActivationDelayMinutes": (
+                WAITING_FOR_FREE_ACTIVATION_DELAY_MINUTES
+                if waiting_for_free_promotion_id
+                else None
+            ),
+            "waitingForFreeDirectSlotManual": bool(
+                waiting_for_free_promotion_id
+            ),
         }
     }
 

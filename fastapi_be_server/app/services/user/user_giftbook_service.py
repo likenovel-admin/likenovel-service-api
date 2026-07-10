@@ -18,6 +18,34 @@ user_giftbook 선물함 개별 서비스 함수 모음
 """
 
 
+async def _assert_active_waiting_for_free_promotion(
+    acquisition_type: str | None,
+    acquisition_id: int | None,
+    db: AsyncSession,
+):
+    if acquisition_type != "applied_promotion" or acquisition_id is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.EXPIRED_GIFT_VALIDITY,
+        )
+
+    query = text("""
+                 SELECT id
+                   FROM tb_applied_promotion
+                  WHERE id = :promotion_id
+                    AND type = 'waiting-for-free'
+                    AND status = 'ing'
+                    AND start_date <= NOW()
+                    AND (end_date IS NULL OR DATE(end_date) >= CURDATE())
+                 """)
+    result = await db.execute(query, {"promotion_id": acquisition_id})
+    if result.mappings().one_or_none() is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.EXPIRED_GIFT_VALIDITY,
+        )
+
+
 def _build_giftbook_query_with_joins(
     where_clause: str = "", order_by_clause: str = ""
 ) -> str:
@@ -99,7 +127,7 @@ def _build_giftbook_query_with_joins(
             WHERE price_type = 'free' AND open_yn = 'Y'
             GROUP BY product_id
         ) free_ep ON free_ep.product_id = p.product_id
-        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
         LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
         LEFT JOIN (
             SELECT cf.file_group_id, cfi.file_path, ub.user_id
@@ -741,6 +769,16 @@ async def post_user_giftbook(
     if req_body is not None:
         logger.info(f"post_user_giftbook: {req_body}")
 
+    promotion_type = getattr(req_body, "promotion_type", None)
+    acquisition_type = getattr(req_body, "acquisition_type", None)
+    acquisition_id = getattr(req_body, "acquisition_id", None)
+    if promotion_type == "waiting-for-free":
+        await _assert_active_waiting_for_free_promotion(
+            acquisition_type=acquisition_type,
+            acquisition_id=acquisition_id,
+            db=db,
+        )
+
     columns, values, params = build_insert_query(
         req_body,
         required_fields=["user_id", "ticket_type", "own_type", "reason", "amount"],
@@ -768,9 +806,6 @@ async def post_user_giftbook(
     await statistics_service.insert_site_statistics_log(
         db=db, type="active", user_id=user_id
     )
-
-    promotion_type = getattr(req_body, "promotion_type", None)
-    acquisition_type = getattr(req_body, "acquisition_type", None)
 
     # 알림 전송 (이미 자체 알림이 있는 호출자는 제외)
     # - quest: quest_service.py에서 자체 알림 처리
@@ -899,6 +934,9 @@ async def post_user_giftbook(
                     db=db,
                 )
         except Exception as e:
+            if promotion_type == "waiting-for-free":
+                logger.error(f"Failed to auto-receive waiting-for-free giftbook: {e}")
+                raise
             logger.error(f"Failed to auto-receive giftbook: {e}")
 
     return {"result": req_body}
@@ -937,12 +975,45 @@ async def put_user_giftbook(
     return {"result": req_body}
 
 
-async def delete_user_giftbook(id: int, db: AsyncSession):
-    query = text("""
-                        delete from tb_user_giftbook where id = :id
-                    """)
+async def delete_user_giftbook(id: int, kc_user_id: str, db: AsyncSession):
+    user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
 
-    await db.execute(query, {"id": id})
+    query = text("""
+                 SELECT ug.id, ug.user_id, ug.promotion_type
+                   FROM tb_user_giftbook ug
+                  WHERE ug.id = :id
+                  FOR UPDATE
+                 """)
+    result = await db.execute(query, {"id": id})
+    giftbook = result.mappings().one_or_none()
+    if giftbook is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND,
+        )
+    if giftbook["user_id"] != user_id:
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
+    if giftbook["promotion_type"] == "waiting-for-free":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="기다리면 무료 원천 선물은 삭제할 수 없습니다.",
+        )
+
+    query = text("""
+                 DELETE ug
+                   FROM tb_user_giftbook ug
+                  WHERE ug.id = :id
+                    AND ug.user_id = :user_id
+                 """)
+    await db.execute(query, {"id": id, "user_id": user_id})
 
     return {"result": True}
 
@@ -1039,7 +1110,7 @@ async def receive_user_giftbook(
         )
 
     promotion_type = giftbook.get("promotion_type")
-    # acquisition_type = giftbook.get("acquisition_type")
+    acquisition_type = giftbook.get("acquisition_type")
     acquisition_id = giftbook.get("acquisition_id")
 
     # 선물함 유효기간 확인 (promotion_type에 따라 다르게 처리)
@@ -1059,9 +1130,13 @@ async def receive_user_giftbook(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 message=ErrorMessages.EXPIRED_GIFT_VALIDITY,
             )
-    # 기다리면 무료의 경우: 유효기간 없음 (만료 체크 스킵)
+    # 기다리면 무료는 원 신청 프로모션이 진행 중일 때만 받을 수 있다.
     elif promotion_type == "waiting-for-free":
-        pass  # 유효기간 없음
+        await _assert_active_waiting_for_free_promotion(
+            acquisition_type=acquisition_type,
+            acquisition_id=acquisition_id,
+            db=db,
+        )
     # 그 외: expiration_date 확인
     elif expiration_date and datetime.now() > expiration_date:
         raise CustomResponseException(
@@ -1331,7 +1406,7 @@ async def user_gift_transaction_list(kc_user_id: str, type: str, db: AsyncSessio
             WHERE price_type = 'free' AND open_yn = 'Y'
             GROUP BY product_id
         ) free_ep ON free_ep.product_id = p.product_id
-        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+        LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
         LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
         LEFT JOIN (
             SELECT cf.file_group_id, cfi.file_path, ub.user_id

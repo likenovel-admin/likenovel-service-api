@@ -421,15 +421,26 @@ update tb_applied_promotion
    and status = 'ing'
 ;
 
--- 기다리면 무료 (waiting-for-free) 프로모션 종료시 해당 대여권 삭제
-delete from tb_user_productbook
- where acquisition_type = 'applied_promotion'
-   and acquisition_id in (
-       select id from tb_applied_promotion
-        where type = 'waiting-for-free'
-          and status = 'end'
+-- 기다리면 무료 (waiting-for-free) 프로모션 종료시 미사용 대여권 삭제
+delete upb
+  from tb_user_productbook upb
+  left join tb_applied_promotion ap_direct
+    on upb.acquisition_type = 'applied_promotion'
+   and upb.acquisition_id = ap_direct.id
+  left join tb_user_giftbook ug
+    on upb.acquisition_type = 'gift'
+   and upb.acquisition_id = ug.id
+  left join tb_applied_promotion ap_from_gift
+    on ug.acquisition_type = 'applied_promotion'
+   and ug.acquisition_id = ap_from_gift.id
+ where upb.use_yn = 'N'
+   and (
+       (ap_direct.type = 'waiting-for-free' and ap_direct.status = 'end')
+       or
+       (ug.promotion_type = 'waiting-for-free'
+        and ap_from_gift.type = 'waiting-for-free'
+        and ap_from_gift.status = 'end')
    )
-   and use_yn = 'N'  -- 사용하지 않은 대여권만 삭제
 ;
 
 update tb_cms_batch_job_process a
