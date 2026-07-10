@@ -466,7 +466,12 @@ class PostMainCharacterSlotReqBody(MainCharacterSlotReqBody):
 
 
 class PutMainCharacterSlotReqBody(PostMainCharacterSlotReqBody):
-    pass
+    character_image_file_id: Optional[int] = Field(
+        default=None,
+        examples=[10],
+        description="교체할 character 이미지 파일 그룹 ID(NULL이면 기존 이미지 유지)",
+        gt=0,
+    )
 
 
 class PostMainCharacterSlotPublishNowReqBody(MainCharacterSlotReqBody):

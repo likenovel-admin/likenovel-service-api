@@ -118,13 +118,19 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "(mcs.publish_end_date IS NULL OR mcs.publish_end_date > NOW())" in query
     assert "p.open_yn = 'Y'" in query
     assert "COALESCE(p.blind_yn, 'N') = 'N'" in query
+    assert "(:adult_yn = 'Y' OR p.ratings_code != 'adult')" in query
+    assert "EXISTS (" in query
+    assert "FROM tb_product_episode pe" in query
     assert "q.group_type = 'character'" in query
     assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
     assert "ROW_NUMBER()" not in query
 
 
 def test_main_character_slot_request_schema_enforces_optional_period_contract():
-    from app.schemas.admin import PostMainCharacterSlotReqBody
+    from app.schemas.admin import (
+        PostMainCharacterSlotReqBody,
+        PutMainCharacterSlotReqBody,
+    )
 
     req = PostMainCharacterSlotReqBody(
         product_id=1182,
@@ -148,6 +154,14 @@ def test_main_character_slot_request_schema_enforces_optional_period_contract():
     )
     assert immediate_req.publish_start_at is None
     assert immediate_req.publish_end_at is None
+
+    update_req = PutMainCharacterSlotReqBody(
+        product_id=1182,
+        character_scope_key="character:adelite",
+        card_order=2,
+        publish_start_at="2026-07-11T12:00:00+09:00",
+    )
+    assert update_req.character_image_file_id is None
 
     with pytest.raises(ValueError):
         PostMainCharacterSlotReqBody(
@@ -248,6 +262,45 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "UPDATE tb_main_character_slot" not in executed_sql
         assert db.execute.await_args.kwargs == {}
         assert db.execute.await_args.args[1]["character_name"] == "아델리트"
+        assert result == {"result": {"characterSlotId": 91}}
+
+    async def test_update_keeps_existing_image_when_cms_does_not_upload_replacement(self):
+        from app.schemas.admin import PutMainCharacterSlotReqBody
+        from app.services.product import main_character_slot_service
+
+        req = PutMainCharacterSlotReqBody(
+            product_id=1182,
+            character_scope_key="character:adelite",
+            card_order=3,
+            publish_start_at="2026-07-11T12:00:00+09:00",
+        )
+        db = AsyncMock()
+        db.execute.return_value.rowcount = 1
+
+        with (
+            patch.object(
+                main_character_slot_service,
+                "_ensure_character_slot_selection_eligible",
+                new_callable=AsyncMock,
+                return_value="아델리트",
+            ),
+            patch.object(
+                main_character_slot_service,
+                "_ensure_character_image_file",
+                new_callable=AsyncMock,
+            ) as ensure_image,
+        ):
+            result = await main_character_slot_service.update_admin_main_character_slot(
+                character_slot_id=91,
+                req_body=req,
+                admin_user_id=7,
+                db=db,
+            )
+
+        ensure_image.assert_not_awaited()
+        executed_sql = str(db.execute.await_args.args[0])
+        assert "character_image_file_id = COALESCE" in executed_sql
+        assert db.execute.await_args.args[1]["character_image_file_id"] is None
         assert result == {"result": {"characterSlotId": 91}}
 
 

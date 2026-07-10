@@ -1028,14 +1028,13 @@ async def _apply_websochat_account_read_scope(
 def _resolve_websochat_initial_account_read_episode_to(
     *,
     session_kind: str,
-    user_id: int | None,
     requested_episode_to: int | None,
     max_authorized_episode_to: int | None,
 ) -> int | None:
     requested = _resolve_websochat_requested_episode_to(requested_episode_to)
     if requested is not None:
         return requested
-    if session_kind != "character_chat" or user_id is not None:
+    if session_kind != "character_chat":
         return None
     return _resolve_websochat_requested_episode_to(max_authorized_episode_to)
 
@@ -7575,7 +7574,6 @@ async def create_session(
         session_memory["allowed_modes"] = ["qa", "rp", "ideal_worldcup"]
     initial_account_read_episode_to = _resolve_websochat_initial_account_read_episode_to(
         session_kind=session_kind,
-        user_id=user_id,
         requested_episode_to=req_body.account_read_episode_to,
         max_authorized_episode_to=authorized_scope.get("maxAuthorizedEpisodeTo"),
     )

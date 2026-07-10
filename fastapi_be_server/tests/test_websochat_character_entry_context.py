@@ -878,42 +878,36 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             db=db,
         )
 
-    def test_character_chat_guest_default_does_not_expand_authenticated_or_websochat_scope(self):
+    def test_character_chat_missing_boundary_uses_authorized_scope_without_affecting_websochat(self):
         resolver = websochat_service._resolve_websochat_initial_account_read_episode_to
 
         assert resolver(
             session_kind="character_chat",
-            user_id=None,
             requested_episode_to=None,
             max_authorized_episode_to=14,
         ) == 14
         assert resolver(
             session_kind="character_chat",
-            user_id=200,
             requested_episode_to=None,
             max_authorized_episode_to=30,
-        ) is None
+        ) == 30
         assert resolver(
             session_kind="character_chat",
-            user_id=200,
             requested_episode_to=5,
             max_authorized_episode_to=30,
         ) == 5
         assert resolver(
             session_kind="websochat",
-            user_id=None,
             requested_episode_to=None,
             max_authorized_episode_to=30,
         ) is None
         assert resolver(
             session_kind="websochat",
-            user_id=None,
             requested_episode_to=5,
             max_authorized_episode_to=30,
         ) == 5
         assert resolver(
             session_kind="character_chat",
-            user_id=None,
             requested_episode_to=5,
             max_authorized_episode_to=30,
         ) == 5
