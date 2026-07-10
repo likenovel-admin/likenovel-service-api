@@ -1025,6 +1025,21 @@ async def _apply_websochat_account_read_scope(
     return normalized
 
 
+def _resolve_websochat_initial_account_read_episode_to(
+    *,
+    session_kind: str,
+    user_id: int | None,
+    requested_episode_to: int | None,
+    max_authorized_episode_to: int | None,
+) -> int | None:
+    requested = _resolve_websochat_requested_episode_to(requested_episode_to)
+    if requested is not None:
+        return requested
+    if session_kind != "character_chat" or user_id is not None:
+        return None
+    return _resolve_websochat_requested_episode_to(max_authorized_episode_to)
+
+
 async def _clamp_websochat_session_read_scope_to_authorized(
     *,
     session_memory: dict[str, Any],
@@ -7558,9 +7573,15 @@ async def create_session(
         session_memory["pending_rp_character_selection"] = False
     else:
         session_memory["allowed_modes"] = ["qa", "rp", "ideal_worldcup"]
+    initial_account_read_episode_to = _resolve_websochat_initial_account_read_episode_to(
+        session_kind=session_kind,
+        user_id=user_id,
+        requested_episode_to=req_body.account_read_episode_to,
+        max_authorized_episode_to=authorized_scope.get("maxAuthorizedEpisodeTo"),
+    )
     session_memory = await _apply_websochat_account_read_scope(
         session_memory,
-        req_body.account_read_episode_to,
+        initial_account_read_episode_to,
         product_id=req_body.product_id,
         user_id=user_id,
         synced_latest_episode_no=synced_latest_episode_no,

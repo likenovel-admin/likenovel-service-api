@@ -24,9 +24,68 @@ from app.services.admin import (
     admin_user_service,
 )
 import app.services.product.main_single_slot_service as main_single_slot_service
+import app.services.product.main_character_slot_service as main_character_slot_service
 from app.utils.common import check_user
 
 router = APIRouter(prefix="/admins")
+
+
+@router.get(
+    "/main-character-slots",
+    tags=["CMS - 메인 주인공 카드"],
+    responses={200: {"description": "메인 주인공 카드 목록"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def main_character_slot_list(
+    page: int = Query(1, ge=1, description="페이지"),
+    count_per_page: int = Query(20, ge=1, le=200, description="한 페이지 내 갯수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.get_admin_main_character_slots(
+        page=page,
+        count_per_page=count_per_page,
+        db=db,
+    )
+
+
+@router.get(
+    "/main-character-slots/products/search",
+    tags=["CMS - 메인 주인공 카드"],
+    responses={200: {"description": "메인 주인공 카드 작품 검색"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def main_character_slot_product_search(
+    search_word: str = Query(default="", description="작품명 검색어"),
+    limit: int = Query(default=50, ge=1, le=100, description="출력 개수"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.search_admin_main_character_slot_products(
+        search_word=search_word,
+        limit=limit,
+        db=db,
+    )
+
+
+@router.get(
+    "/main-character-slots/products/{product_id}/characters",
+    tags=["CMS - 메인 주인공 카드"],
+    responses={200: {"description": "작품의 메인 주인공 슬롯 로스터"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def main_character_slot_roster(
+    product_id: int = Path(..., description="작품 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.get_admin_main_character_roster(
+        product_id=product_id,
+        db=db,
+    )
 
 
 @router.get(

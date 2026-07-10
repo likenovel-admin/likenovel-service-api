@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from fastapi import status
 
@@ -759,7 +759,6 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             session_kind="character_chat",
             entry_source="home_character_slot",
             locked_character_scope_key="character:아델리트",
-            account_read_episode_to=14,
         )
         product_row = {
             "productId": 1182,
@@ -861,6 +860,14 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             )
 
         self.assertEqual(result["data"]["sessionId"], 77)
+        apply_read_scope.assert_awaited_once_with(
+            ANY,
+            14,
+            product_id=1182,
+            user_id=None,
+            synced_latest_episode_no=14,
+            db=db,
+        )
         generate_opening.assert_awaited_once_with(
             product_row=product_row,
             rp_context=load_rp_context.return_value,
@@ -870,6 +877,46 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             content=opening["opening_text"],
             db=db,
         )
+
+    def test_character_chat_guest_default_does_not_expand_authenticated_or_websochat_scope(self):
+        resolver = websochat_service._resolve_websochat_initial_account_read_episode_to
+
+        assert resolver(
+            session_kind="character_chat",
+            user_id=None,
+            requested_episode_to=None,
+            max_authorized_episode_to=14,
+        ) == 14
+        assert resolver(
+            session_kind="character_chat",
+            user_id=200,
+            requested_episode_to=None,
+            max_authorized_episode_to=30,
+        ) is None
+        assert resolver(
+            session_kind="character_chat",
+            user_id=200,
+            requested_episode_to=5,
+            max_authorized_episode_to=30,
+        ) == 5
+        assert resolver(
+            session_kind="websochat",
+            user_id=None,
+            requested_episode_to=None,
+            max_authorized_episode_to=30,
+        ) is None
+        assert resolver(
+            session_kind="websochat",
+            user_id=None,
+            requested_episode_to=5,
+            max_authorized_episode_to=30,
+        ) == 5
+        assert resolver(
+            session_kind="character_chat",
+            user_id=None,
+            requested_episode_to=5,
+            max_authorized_episode_to=30,
+        ) == 5
 
     async def test_character_chat_patch_rejects_requested_lower_read_boundary(self):
         req_body = PatchWebsochatSessionReadScopeReqBody(read_episode_to=14)
