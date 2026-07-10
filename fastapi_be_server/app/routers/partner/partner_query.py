@@ -2280,7 +2280,7 @@ async def sales_by_episode_list_by_product_id(
     파트너 - 매출 및 정산 > 회차별 매출
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        user_data = await check_user(kc_user_id=user.get("sub"), db=db)
     except Exception as e:
         raise e
 
@@ -2293,6 +2293,7 @@ async def sales_by_episode_list_by_product_id(
         page,
         count_per_page,
         db,
+        user_data,
     )
 
 
@@ -2385,12 +2386,20 @@ async def sales_by_episode_list_by_product_id_for_download(
     파트너 - 매출 및 정산 > 회차별 매출
     """
     try:
-        await check_user(kc_user_id=user.get("sub"), db=db)
+        user_data = await check_user(kc_user_id=user.get("sub"), db=db)
     except Exception as e:
         raise e
 
     return await partner_sales_service.sales_by_episode_list_by_product_id(
-        id, search_target, search_word, search_start_date, search_end_date, -1, -1, db
+        id,
+        search_target,
+        search_word,
+        search_start_date,
+        search_end_date,
+        -1,
+        -1,
+        db,
+        user_data,
     )
 
 

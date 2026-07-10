@@ -145,10 +145,20 @@ async def product_list(
             AND a.author_id = {user_data["user_id"]}
         """
     elif user_data["role"] == "CP":
-        where += f"""
-            AND (a.user_id = {user_data["user_id"]}
-                 OR a.cp_user_id = {user_data["user_id"]})
-        """
+        if from_episode_sales_page:
+            where += f"""
+                AND a.cp_user_id = {user_data["user_id"]}
+            """
+        else:
+            where += f"""
+                AND (a.user_id = {user_data["user_id"]}
+                     OR a.cp_user_id = {user_data["user_id"]})
+            """
+    elif from_episode_sales_page and user_data["role"] != "admin":
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
 
     if contract_type == CommonConstants.CONTRACT_NORMAL:
         where += f"""
