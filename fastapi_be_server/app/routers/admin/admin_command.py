@@ -27,10 +27,85 @@ from app.services.admin import (
     admin_user_service,
 )
 import app.services.product.main_single_slot_service as main_single_slot_service
+import app.services.product.main_character_slot_service as main_character_slot_service
 import app.services.auth.auth_service as auth_service
 from app.utils.common import check_user
 
 router = APIRouter(prefix="/admins")
+
+
+@router.post(
+    "/main-character-slots",
+    tags=["CMS - 메인 주인공 카드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_main_character_slot(
+    req_body: admin_schema.PostMainCharacterSlotReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.post_admin_main_character_slot(
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.post(
+    "/main-character-slots/publish-now",
+    tags=["CMS - 메인 주인공 카드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_main_character_slot_publish_now(
+    req_body: admin_schema.PostMainCharacterSlotPublishNowReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.publish_admin_main_character_slot_now(
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.put(
+    "/main-character-slots/{character_slot_id}",
+    tags=["CMS - 메인 주인공 카드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_main_character_slot(
+    req_body: admin_schema.PutMainCharacterSlotReqBody,
+    character_slot_id: int = Path(..., description="메인 주인공 카드 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.update_admin_main_character_slot(
+        character_slot_id=character_slot_id,
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.delete(
+    "/main-character-slots/{character_slot_id}",
+    tags=["CMS - 메인 주인공 카드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def delete_main_character_slot(
+    character_slot_id: int = Path(..., description="메인 주인공 카드 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.delete_admin_main_character_slot(
+        character_slot_id=character_slot_id,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
 
 
 @router.post(

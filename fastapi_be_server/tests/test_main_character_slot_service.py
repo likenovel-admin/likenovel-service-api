@@ -1,0 +1,269 @@
+import json
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _row(
+    scope_key="character:adelite",
+    *,
+    display_name="아델리트",
+    aliases=None,
+    public_slot_eligible=True,
+    safety_status="pass",
+    work_role="main_protagonist",
+):
+    return {
+        "scopeKey": scope_key,
+        "summaryText": json.dumps(
+            {
+                "canonical_character_key": scope_key,
+                "display_name": display_name,
+                "aliases": aliases or [display_name],
+                "public_slot_eligible": public_slot_eligible,
+                "display_safety": {"status": safety_status},
+                "work_role": work_role,
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
+def test_main_character_slot_roster_accepts_only_strict_public_main_protagonists():
+    from app.services.product.main_character_slot_service import (
+        extract_eligible_main_character_roster,
+    )
+
+    roster = extract_eligible_main_character_roster(
+        [
+            _row(aliases=["아델리트", "공녀", "공녀"]),
+            _row("character:false", public_slot_eligible=False),
+            _row("character:string", public_slot_eligible="true"),
+            _row("character:missing", public_slot_eligible=None),
+            _row("character:fail", safety_status="fail"),
+            _row("character:review", safety_status="review"),
+            _row("character:support", work_role="major_character"),
+        ]
+    )
+
+    assert roster == [
+        {
+            "scopeKey": "character:adelite",
+            "displayName": "아델리트",
+            "aliases": ["아델리트", "공녀"],
+        }
+    ]
+
+
+def test_main_character_slot_roster_missing_v3_is_empty_and_duplicate_scope_is_removed():
+    from app.services.product.main_character_slot_service import (
+        extract_eligible_main_character_roster,
+    )
+
+    assert extract_eligible_main_character_roster([]) == []
+    assert extract_eligible_main_character_roster([_row(), _row(display_name="중복")]) == [
+        {
+            "scopeKey": "character:adelite",
+            "displayName": "아델리트",
+            "aliases": ["아델리트"],
+        }
+    ]
+
+
+def test_main_character_slot_migration_and_model_follow_project_conventions():
+    migration = (ROOT / "dist/init/106-create-main-character-slot.sql").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CREATE TABLE IF NOT EXISTS tb_main_character_slot" in migration
+    for column in (
+        "product_id",
+        "character_scope_key",
+        "character_name",
+        "character_image_file_id",
+        "card_order",
+        "publish_start_date",
+        "publish_end_date",
+        "use_yn",
+        "deleted_yn",
+        "created_id",
+        "created_date",
+        "updated_id",
+        "updated_date",
+    ):
+        assert column in migration
+    assert "idx_main_character_slot_public" in migration
+    assert "idx_main_character_slot_product" in migration
+
+    from app.models.product import MainCharacterSlot
+
+    assert MainCharacterSlot.__tablename__ == "tb_main_character_slot"
+
+
+def test_public_main_character_slot_query_filters_current_cards_and_stably_orders_all():
+    from app.services.product.main_character_slot_service import (
+        build_public_main_character_slots_query,
+    )
+
+    query = build_public_main_character_slots_query()
+
+    assert "mcs.use_yn = 'Y'" in query
+    assert "mcs.deleted_yn = 'N'" in query
+    assert "mcs.publish_start_date <= NOW()" in query
+    assert "(mcs.publish_end_date IS NULL OR mcs.publish_end_date > NOW())" in query
+    assert "p.open_yn = 'Y'" in query
+    assert "COALESCE(p.blind_yn, 'N') = 'N'" in query
+    assert "q.group_type = 'character'" in query
+    assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
+    assert "ROW_NUMBER()" not in query
+
+
+def test_main_character_slot_request_schema_enforces_optional_period_contract():
+    from app.schemas.admin import PostMainCharacterSlotReqBody
+
+    req = PostMainCharacterSlotReqBody(
+        product_id=1182,
+        character_scope_key=" character:adelite ",
+        character_image_file_id=10,
+        card_order=1,
+        publish_start_at="2026-07-11T12:00:00+09:00",
+        publish_end_at="",
+    )
+
+    assert req.character_scope_key == "character:adelite"
+    assert not hasattr(req, "character_name")
+    assert not hasattr(req, "use_yn")
+    assert req.publish_end_at is None
+
+    immediate_req = PostMainCharacterSlotReqBody(
+        product_id=1182,
+        character_scope_key="character:adelite",
+        character_image_file_id=10,
+        card_order=1,
+    )
+    assert immediate_req.publish_start_at is None
+    assert immediate_req.publish_end_at is None
+
+    with pytest.raises(ValueError):
+        PostMainCharacterSlotReqBody(
+            product_id=1182,
+            character_scope_key="character:adelite",
+            character_image_file_id=10,
+            card_order=1,
+            publish_start_at="2026-07-12T12:00:00+09:00",
+            publish_end_at="2026-07-11T12:00:00+09:00",
+        )
+
+
+def test_storage_upload_accepts_character_group_type_through_existing_validator():
+    from app.schemas.storage import UploadReqBody, available_group_types
+
+    assert "character" in available_group_types
+    assert UploadReqBody(group_type="character", file_name="hero.webp").group_type == "character"
+
+
+class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_roster_query_reads_only_active_character_inventory_v3(self):
+        from app.services.product import main_character_slot_service
+
+        db = AsyncMock()
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = []
+        db.execute.return_value = result
+
+        response = await main_character_slot_service.get_admin_main_character_roster(
+            product_id=1182,
+            db=db,
+        )
+
+        query = str(db.execute.await_args.args[0])
+        assert "summary_type = 'character_inventory_v3'" in query
+        assert "is_active = 'Y'" in query
+        assert "character_inventory'" not in query
+        assert "relation_inventory" not in query
+        assert response == {"data": []}
+
+    async def test_selection_validation_rejects_scope_missing_from_strict_roster(self):
+        from app.exceptions import CustomResponseException
+        from app.services.product import main_character_slot_service
+
+        with patch.object(
+            main_character_slot_service,
+            "_load_eligible_main_character_roster",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            with self.assertRaises(CustomResponseException):
+                await main_character_slot_service._ensure_character_slot_selection_eligible(
+                    product_id=1182,
+                    character_scope_key="character:ineligible",
+                    db=object(),
+                )
+
+    async def test_publish_now_adds_server_roster_name_without_closing_existing_cards(self):
+        from app.schemas.admin import PostMainCharacterSlotPublishNowReqBody
+        from app.services.product import main_character_slot_service
+
+        req = PostMainCharacterSlotPublishNowReqBody(
+            product_id=1182,
+            character_scope_key="character:adelite",
+            character_image_file_id=10,
+            card_order=2,
+        )
+        db = AsyncMock()
+        db.execute.return_value.lastrowid = 91
+
+        with (
+            patch.object(
+                main_character_slot_service,
+                "_ensure_character_slot_selection_eligible",
+                new_callable=AsyncMock,
+                return_value="아델리트",
+            ) as ensure_selection,
+            patch.object(
+                main_character_slot_service,
+                "_ensure_character_image_file",
+                new_callable=AsyncMock,
+            ) as ensure_image,
+        ):
+            result = await main_character_slot_service.publish_admin_main_character_slot_now(
+                req_body=req,
+                admin_user_id=7,
+                db=db,
+            )
+
+        ensure_selection.assert_awaited_once_with(
+            product_id=1182,
+            character_scope_key="character:adelite",
+            db=db,
+        )
+        ensure_image.assert_awaited_once_with(character_image_file_id=10, db=db)
+        executed_sql = "\n".join(str(call.args[0]) for call in db.execute.await_args_list)
+        assert "INSERT INTO tb_main_character_slot" in executed_sql
+        assert "UPDATE tb_main_character_slot" not in executed_sql
+        assert db.execute.await_args.kwargs == {}
+        assert db.execute.await_args.args[1]["character_name"] == "아델리트"
+        assert result == {"result": {"characterSlotId": 91}}
+
+
+def test_main_character_slot_router_service_model_schema_imports_and_routes():
+    from app.models.product import MainCharacterSlot
+    from app.routers.admin import admin_command, admin_query
+    from app.routers.common import main_query
+    from app.schemas.admin import PostMainCharacterSlotReqBody
+    from app.services.product import main_character_slot_service
+
+    assert MainCharacterSlot
+    assert PostMainCharacterSlotReqBody
+    assert main_character_slot_service
+    assert "/products/main-character-slots" in {route.path for route in main_query.router.routes}
+    assert "/admins/main-character-slots" in {route.path for route in admin_query.router.routes}
+    assert "/admins/main-character-slots/products/{product_id}/characters" in {
+        route.path for route in admin_query.router.routes
+    }
+    assert "/admins/main-character-slots" in {route.path for route in admin_command.router.routes}

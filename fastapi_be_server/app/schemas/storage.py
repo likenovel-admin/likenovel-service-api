@@ -1,6 +1,14 @@
 from pydantic import BaseModel, Field
 
-available_group_types = ["badge", "cover", "episode", "panel", "user", "epub"]
+available_group_types = [
+    "badge",
+    "cover",
+    "episode",
+    "panel",
+    "user",
+    "epub",
+    "character",
+]
 
 
 class StorageBase(BaseModel):

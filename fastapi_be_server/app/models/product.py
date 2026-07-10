@@ -226,6 +226,76 @@ class MainSingleSlot(Base):
     )
 
 
+class MainCharacterSlot(Base):
+    __tablename__ = "tb_main_character_slot"
+    __table_args__ = (
+        Index(
+            "idx_main_character_slot_public",
+            "use_yn",
+            "deleted_yn",
+            "publish_start_date",
+            "publish_end_date",
+            "card_order",
+            "main_character_slot_id",
+        ),
+        Index("idx_main_character_slot_product", "product_id", "deleted_yn"),
+    )
+
+    main_character_slot_id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="노출 작품 ID"
+    )
+    character_scope_key: Mapped[str] = mapped_column(
+        String(80), nullable=False, comment="character_inventory_v3 canonical scope key"
+    )
+    character_name: Mapped[str] = mapped_column(
+        String(100), nullable=False, comment="노출 캐릭터명"
+    )
+    character_image_file_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="character 파일 그룹 ID"
+    )
+    card_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="카드 노출 순서"
+    )
+    publish_start_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        comment="노출 시작 일시",
+    )
+    publish_end_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=True, comment="노출 종료 일시(NULL이면 항시)"
+    )
+    use_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE),
+        nullable=False,
+        server_default="Y",
+        comment="사용 여부",
+    )
+    deleted_yn: Mapped[str] = mapped_column(
+        String(settings.VARCHAR_YN_SIZE),
+        nullable=False,
+        server_default="N",
+        comment="삭제 여부",
+    )
+    created_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 생성한 id"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(
+        Integer, nullable=True, comment="row를 갱신한 id"
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
 class ProductEpisode(Base):
     __tablename__ = "tb_product_episode"  # 회차 마스터 (회차 저장/등록에서 ins)
     __table_args__ = (

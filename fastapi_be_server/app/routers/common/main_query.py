@@ -4,8 +4,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger
 import app.services.common.main_service as main_service
+import app.services.product.main_character_slot_service as main_character_slot_service
 
 router = APIRouter()
+
+
+@router.get(
+    "/products/main-character-slots",
+    tags=["홈"],
+    responses={200: {"description": "현재 노출 중인 메인 주인공 카드 목록"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_main_character_slots(
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await main_character_slot_service.get_public_main_character_slots(db=db)
 
 
 @router.get(
