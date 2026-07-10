@@ -41,13 +41,16 @@ async def put_user_giftbook(
 @router.delete("/{id}", tags=["선물함"], dependencies=[Depends(analysis_logger)])
 async def delete_user_giftbook(
     id: int = Path(..., description="선물함 번호"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     """
     선물함 삭제
     """
 
-    return await user_giftbook_service.delete_user_giftbook(id, db=db)
+    return await user_giftbook_service.delete_user_giftbook(
+        id, kc_user_id=user.get("sub"), db=db
+    )
 
 
 @router.post(

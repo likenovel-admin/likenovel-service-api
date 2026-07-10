@@ -1,3 +1,14 @@
+SET @job_lock_name = 'lk_summary_hourly_batch';
+SET @job_lock_acquired = GET_LOCK(@job_lock_name, 30);
+SET @job_lock_guard_sql = IF(
+    @job_lock_acquired = 1,
+    'SELECT 1',
+    'SELECT * FROM __summary_hourly_lock_not_acquired__'
+);
+PREPARE stmt_job_lock_guard FROM @job_lock_guard_sql;
+EXECUTE stmt_job_lock_guard;
+DEALLOCATE PREPARE stmt_job_lock_guard;
+
 update tb_cms_batch_job_process a
    set a.completed_yn = 'N'
      , a.created_id = 0
@@ -173,42 +184,110 @@ from tb_product p;
 
 -- 기다리면 무료 (waiting-for-free) 24시간 후 추가 발급
 -- 대여권을 사용한지 24시간이 지났고, 현재 사용하지 않은 대여권이 없는 유저에게 1개 추가 발급
-insert into tb_user_productbook (user_id, profile_id, product_id, episode_id, own_type, ticket_type, acquisition_type, acquisition_id, use_yn, created_id, updated_id)
-select upb.user_id
-     , upb.profile_id
-     , upb.product_id
+insert into tb_user_productbook (user_id, profile_id, product_id, episode_id, own_type, ticket_type, acquisition_type, acquisition_id, use_yn, created_id, created_date, updated_id, updated_date)
+select seed.user_id
+     , seed.profile_id
+     , seed.product_id
      , NULL as episode_id
      , 'rental' as own_type
-     , upb.ticket_type
+     , 'waiting-for-free' as ticket_type
      , 'applied_promotion' as acquisition_type
-     , upb.acquisition_id
+     , seed.promotion_id
      , 'N' as use_yn
      , 0 as created_id
+     , NOW() as created_date
      , 0 as updated_id
-  from tb_user_productbook upb
- inner join tb_applied_promotion ap on upb.acquisition_id = ap.id
- where upb.acquisition_type = 'applied_promotion'
+     , NOW() as updated_date
+  from (
+      select source.user_id
+           , source.profile_id
+           , source.product_id
+           , source.promotion_id
+           , max(source.use_date) as last_use_date
+        from (
+            select upb.user_id
+                 , upb.profile_id
+                 , upb.product_id
+                 , upb.acquisition_id as promotion_id
+                 , upb.use_date
+              from tb_user_productbook upb
+             inner join tb_applied_promotion ap
+                on upb.acquisition_type = 'applied_promotion'
+               and upb.acquisition_id = ap.id
+             where upb.use_yn = 'Y'
+               and upb.use_date is not null
+               and ap.type = 'waiting-for-free'
+               and ap.status = 'ing'
+               and ap.start_date <= NOW()
+               and (ap.end_date IS NULL OR DATE(ap.end_date) >= CURDATE())
+            union all
+            select upb.user_id
+                 , upb.profile_id
+                 , upb.product_id
+                 , ug.acquisition_id as promotion_id
+                 , upb.use_date
+              from tb_user_productbook upb
+             inner join tb_user_giftbook ug
+                on upb.acquisition_type = 'gift'
+               and upb.acquisition_id = ug.id
+             inner join tb_applied_promotion ap
+                on ug.acquisition_type = 'applied_promotion'
+               and ug.acquisition_id = ap.id
+             where upb.use_yn = 'Y'
+               and upb.use_date is not null
+               and ug.promotion_type = 'waiting-for-free'
+               and ug.acquisition_type = 'applied_promotion'
+               and ap.type = 'waiting-for-free'
+               and ap.status = 'ing'
+               and ap.start_date <= NOW()
+               and (ap.end_date IS NULL OR DATE(ap.end_date) >= CURDATE())
+        ) source
+       group by source.user_id
+              , source.profile_id
+              , source.product_id
+              , source.promotion_id
+  ) seed
+ inner join tb_applied_promotion ap on ap.id = seed.promotion_id
+ where timestampdiff(hour, seed.last_use_date, now()) >= 24
    and ap.type = 'waiting-for-free'
    and ap.status = 'ing'
-   and (ap.end_date IS NULL OR ap.end_date >= NOW())
-   and upb.use_yn = 'Y'  -- 사용한 대여권
-   and upb.use_date is not null
-   and timestampdiff(hour, upb.use_date, now()) >= 24  -- 사용한지 24시간 이상 경과
+   and ap.start_date <= NOW()
+   and (ap.end_date IS NULL OR DATE(ap.end_date) >= CURDATE())
    -- 해당 유저가 이 프로모션으로 사용하지 않은 대여권이 없는지 체크
    and not exists (
-       select 1 from tb_user_productbook upb2
-        where upb2.user_id = upb.user_id
-          and upb2.acquisition_id = upb.acquisition_id
-          and upb2.acquisition_type = 'applied_promotion'
+       select 1
+         from tb_user_productbook upb2
+         left join tb_user_giftbook ug2
+           on upb2.acquisition_type = 'gift'
+          and upb2.acquisition_id = ug2.id
+        where upb2.user_id = seed.user_id
+          and upb2.profile_id = seed.profile_id
+          and upb2.product_id = seed.product_id
           and upb2.use_yn = 'N'
+          and (
+              (upb2.acquisition_type = 'applied_promotion' and upb2.acquisition_id = seed.promotion_id)
+              or
+              (upb2.acquisition_type = 'gift' and ug2.promotion_type = 'waiting-for-free'
+               and ug2.acquisition_type = 'applied_promotion' and ug2.acquisition_id = seed.promotion_id)
+          )
    )
    -- 마지막 사용 후 이미 추가 발급 받았는지 체크 (중복 발급 방지)
    and not exists (
-       select 1 from tb_user_productbook upb3
-        where upb3.user_id = upb.user_id
-          and upb3.acquisition_id = upb.acquisition_id
-          and upb3.acquisition_type = 'applied_promotion'
-          and upb3.created_date > upb.use_date  -- 사용 이후에 생성된 대여권
+       select 1
+         from tb_user_productbook upb3
+         left join tb_user_giftbook ug3
+           on upb3.acquisition_type = 'gift'
+          and upb3.acquisition_id = ug3.id
+        where upb3.user_id = seed.user_id
+          and upb3.profile_id = seed.profile_id
+          and upb3.product_id = seed.product_id
+          and upb3.created_date > seed.last_use_date
+          and (
+              (upb3.acquisition_type = 'applied_promotion' and upb3.acquisition_id = seed.promotion_id)
+              or
+              (upb3.acquisition_type = 'gift' and ug3.promotion_type = 'waiting-for-free'
+               and ug3.acquisition_type = 'applied_promotion' and ug3.acquisition_id = seed.promotion_id)
+          )
    )
 ;
 
@@ -220,3 +299,5 @@ update tb_cms_batch_job_process a
 ;
 
 commit;
+
+SELECT RELEASE_LOCK(@job_lock_name) INTO @job_lock_released;

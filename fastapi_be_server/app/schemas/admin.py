@@ -34,6 +34,22 @@ class PostApplyPaidConversionReqBody(AdminBase):
         description="운영자가 대신 설정하는 유료 시작 회차",
         gt=0,
     )
+    waiting_for_free_enabled: bool = Field(
+        default=False,
+        examples=[True],
+        description="유료전환과 함께 기다리면 무료를 적용할지 여부",
+    )
+    waiting_for_free_period_months: Optional[int] = Field(
+        default=None,
+        examples=[12],
+        description="기다리면 무료 적용 기간(3, 6, 12, 36개월)",
+    )
+
+    @field_validator("waiting_for_free_period_months")
+    def validate_waiting_for_free_period_months(cls, value):
+        if value is not None and value not in {3, 6, 12, 36}:
+            raise ValueError("기다리면 무료 기간은 3, 6, 12, 36개월만 가능합니다.")
+        return value
 
 
 class PutProductReviewReqBody(AdminBase):

@@ -916,6 +916,7 @@ async def apply_applied_promotion(
             select *
             from tb_product
             where product_id = :product_id
+            for update
         """)
         result = await db.execute(query, {"product_id": product_id})
         db_rst = result.mappings().one_or_none()
@@ -1191,7 +1192,7 @@ async def get_contract_offered(kc_user_id: str, db: AsyncSession):
             , (SELECT GROUP_CONCAT(DISTINCT sk2.keyword_name SEPARATOR '|') FROM tb_mapped_product_keyword mpk2 LEFT JOIN tb_standard_keyword sk2 ON sk2.keyword_id = mpk2.keyword_id WHERE mpk2.product_id = p.product_id) as keywords
           from tb_product_contract_offer offer
          inner join tb_product p on offer.product_id = p.product_id
-          LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+          LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
           LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
           LEFT JOIN tb_standard_keyword pg ON pg.keyword_id = p.primary_genre_id AND pg.use_yn = 'Y' AND pg.major_genre_yn = 'Y'
           LEFT JOIN tb_standard_keyword sg ON sg.keyword_id = p.sub_genre_id AND sg.use_yn = 'Y' AND sg.major_genre_yn = 'Y'

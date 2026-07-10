@@ -511,7 +511,7 @@ def get_select_fields_and_joins_for_product(
                 GROUP BY product_id
             ) ep_count ON ep_count.product_id = p.product_id
             """
-        + "LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())"
+        + "LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())"
         + "LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND p69.status = 'ing' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())"
         # + "LEFT JOIN tb_direct_promotion fff ON fff.product_id = p.product_id AND fff.type = 'free-for-first'"
         + (
@@ -819,7 +819,7 @@ def get_select_fields_and_joins_for_home_card_product(
                 WHERE use_yn = 'Y'
                 GROUP BY product_id
             ) episode_stats ON episode_stats.product_id = p.product_id
-            LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND DATE(wff.start_date) <= CURDATE() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
+            LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
             LEFT JOIN tb_applied_promotion p69 ON p69.product_id = p.product_id AND p69.type = '6-9-path' AND p69.status = 'ing' AND DATE(p69.start_date) <= CURDATE() AND (p69.end_date IS NULL OR DATE(p69.end_date) >= CURDATE())
             """
         + (
@@ -2057,6 +2057,12 @@ async def product_details_group_by_product_id(
 
         # 湲곕떎由щ㈃ 臾대즺 (waiting-for-free) 理쒖큹 1媛??먮룞 諛쒓툒 -> ?좊Ъ?⑥쑝濡?吏湲?
         if user_id and user_id != -1:
+            # 동일 사용자의 동시 상세 조회를 트랜잭션 종료까지 직렬화한다.
+            await db.execute(
+                text("SELECT user_id FROM tb_user WHERE user_id = :user_id FOR UPDATE"),
+                {"user_id": user_id},
+            )
+
             # 吏꾪뻾以묒씤 waiting-for-free ?꾨줈紐⑥뀡 議고쉶
             query = text("""
                 select ap.id, ap.product_id, ap.type
@@ -2064,8 +2070,14 @@ async def product_details_group_by_product_id(
                  where ap.product_id = :product_id
                    and ap.type = 'waiting-for-free'
                    and ap.status = 'ing'
-                   and DATE(ap.start_date) <= CURDATE()
+                   and ap.start_date <= NOW()
                    and (ap.end_date IS NULL OR DATE(ap.end_date) >= CURDATE())
+                   and exists (
+                       select 1
+                         from tb_product p
+                        where p.product_id = ap.product_id
+                          and p.price_type = 'paid'
+                   )
             """)
             result = await db.execute(query, {"product_id": product_id})
             waiting_promotion = result.mappings().one_or_none()
@@ -2073,20 +2085,22 @@ async def product_details_group_by_product_id(
             if waiting_promotion:
                 # ?대? ???꾨줈紐⑥뀡?쇰줈 ?좊Ъ?⑥뿉 諛쏆븯?붿? 泥댄겕
                 query = text("""
-                    select count(*) as already_received
-                      from tb_user_giftbook
-                     where user_id = :user_id
-                       and acquisition_type = 'applied_promotion'
-                       and acquisition_id = :promotion_id
+                    SELECT id
+                      FROM tb_user_giftbook
+                     WHERE user_id = :user_id
+                       AND acquisition_type = 'applied_promotion'
+                       AND acquisition_id = :promotion_id
+                     LIMIT 1
+                     FOR UPDATE
                 """)
                 result = await db.execute(
                     query,
                     {"user_id": user_id, "promotion_id": waiting_promotion["id"]},
                 )
-                already_received = result.scalar()
+                already_received = result.mappings().one_or_none()
 
                 # ?꾩쭅 諛쏆? ?딆븯?쇰㈃ ?좊Ъ?⑥쑝濡?1媛?諛쒓툒
-                if already_received == 0:
+                if not already_received:
                     # 湲곕떎由щ㈃ 臾대즺: ?좏슚湲곌컙 ?놁쓬
                     giftbook_req = user_giftbook_schema.PostUserGiftbookReqBody(
                         user_id=user_id,
@@ -2163,6 +2177,8 @@ async def product_details_group_by_product_id(
 
         return res_body
 
+    except CustomResponseException:
+        raise
     except Exception:
         raise CustomResponseException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
