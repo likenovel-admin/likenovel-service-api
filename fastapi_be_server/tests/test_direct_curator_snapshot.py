@@ -166,6 +166,7 @@ class DirectCuratorSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("@example.com", str(result))
         self.assertIn("[redacted-email]", str(result))
         self.assertIsNotNone(result["objective_checks"])
+        self.assertIsNone(result["objective_checks_error"])
         db.rollback.assert_awaited_once_with()
 
     async def test_concurrent_slot_change_disables_objective_checks(self):
@@ -191,6 +192,29 @@ class DirectCuratorSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["slot_snapshot_stable"])
         self.assertIsNone(result["objective_checks"])
+        self.assertEqual(
+            result["objective_checks_error"],
+            "direct slot snapshot changed during collection",
+        )
+
+    def test_missing_required_slot_returns_explicit_policy_check_error(self):
+        slots_without_paid_openrun = [
+            slot
+            for slot in self.slots
+            if slot["name"] != direct_curator_service.SLOT_PAID_OPENRUN
+        ]
+
+        result = direct_curator_service._build_compact_snapshot(
+            slots_without_paid_openrun,
+            self.candidates,
+            stable=True,
+        )
+
+        self.assertIsNone(result["objective_checks"])
+        self.assertIn(
+            direct_curator_service.SLOT_PAID_OPENRUN,
+            result["objective_checks_error"],
+        )
 
 
 if __name__ == "__main__":
