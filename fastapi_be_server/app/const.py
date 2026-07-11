@@ -234,6 +234,10 @@ class Settings(BaseSettings):
         "AI_READER_ACCOUNT_ALLOWED_DOMAINS",
         "ai-reader.likenovel.dev,ai-reader.likenovel.net",
     )
+    DIRECT_CURATOR_SNAPSHOT_TOKEN: str = os.getenv(
+        "DIRECT_CURATOR_SNAPSHOT_TOKEN",
+        "",
+    )
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     WEBSOCHAT_GEMINI_MODEL: str = os.getenv(
         "WEBSOCHAT_GEMINI_MODEL",
