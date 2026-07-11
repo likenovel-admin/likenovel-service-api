@@ -464,6 +464,16 @@ def _build_compact_snapshot(
             ]
         )
 
+    objective_checks = None
+    objective_checks_error = None
+    if stable:
+        try:
+            objective_checks = build_objective_checks(slots, candidates)
+        except SnapshotBuildError as exc:
+            objective_checks_error = str(exc)
+    else:
+        objective_checks_error = "direct slot snapshot changed during collection"
+
     return {
         "schema_version": 1,
         "mode": "proposal_only",
@@ -476,7 +486,8 @@ def _build_compact_snapshot(
         },
         "slot_snapshot_stable": stable,
         "candidate_count": len(candidates),
-        "objective_checks": build_objective_checks(slots, candidates) if stable else None,
+        "objective_checks": objective_checks,
+        "objective_checks_error": objective_checks_error,
         "snapshot_format": "scheduled_compact_v1",
         "slots": slots,
         "candidate_row_fields": list(SCHEDULED_CANDIDATE_FIELDS),
