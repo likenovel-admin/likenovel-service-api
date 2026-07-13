@@ -247,7 +247,8 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         self.assertIn("장면당 participants 최대 3명", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
         self.assertIn("evidence에는 L0001 같은 라인 prefix를 넣지 말고", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
         self.assertIn("현장에 등장해 직접 판단, 행동, 대화, 관계 반응", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
-        self.assertIn("현장에 등장하는 장면을 최소 4개", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
+        self.assertIn("핵심 장면 2~3개", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
+        self.assertIn("현장에 등장하는 장면을 최대 3개", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
         self.assertIn("가능하면 모든 scene의 participants에 주인공/대상 캐릭터", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
         self.assertIn("user_entry_role", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
         self.assertIn("character_initiative_reason", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
@@ -750,6 +751,8 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         async def run():
             with patch.object(module, "work_cursor", fake_work_cursor), \
                  patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+                 patch.object(module, "RP_OPENROUTER_MODEL", ""), \
+                 patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
                  patch.object(module, "fetch_existing_summary", return_value=None), \
                  patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
                  patch.object(module, "upsert_summary") as upsert_summary:

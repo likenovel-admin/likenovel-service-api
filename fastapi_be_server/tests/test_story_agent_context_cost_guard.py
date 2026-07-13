@@ -720,6 +720,20 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(client.calls[0]["json"]["model"], "google/gemma-4-31b-it")
 
+    def test_episode_scene_extraction_defaults_to_compact_deepseek_request(self):
+        with patch.dict(
+            os.environ,
+            {
+                "STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL": "",
+                "STORY_AGENT_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS": "5000",
+            },
+        ):
+            module = load_module()
+
+        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL, "deepseek/deepseek-v4-pro")
+        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS, 5000)
+        self.assertIn("핵심 장면 2~3개", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
+
     def test_episode_character_signals_source_hash_uses_primary_model(self):
         module = load_module()
 
