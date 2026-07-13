@@ -5748,6 +5748,21 @@ async def _load_websochat_rp_context(
     return context
 
 
+def _build_websochat_rp_session_list_state(
+    session_memory: dict[str, Any],
+) -> dict[str, Any]:
+    """Build sidebar state without loading the full RP context for every session."""
+    rp_stage = _resolve_websochat_rp_stage(session_memory)
+    if rp_stage not in WEBSOCHAT_ALLOWED_RP_STAGES:
+        rp_stage = "idle"
+    return {
+        "rpStage": rp_stage,
+        "rpActiveCharacterLabel": _resolve_websochat_active_character_label(
+            session_memory
+        ),
+    }
+
+
 async def _build_websochat_rp_session_state(
     *,
     product_row: dict[str, Any],
@@ -7149,11 +7164,7 @@ async def get_sessions(
             )
         product_state = product_state_cache[current_product_id]
         session_memory = _normalize_websochat_session_memory(row.get("sessionMemoryJson"))
-        rp_session_state = await _build_websochat_rp_session_state(
-            product_row=product_state,
-            session_memory=session_memory,
-            db=db,
-        )
+        rp_session_state = _build_websochat_rp_session_list_state(session_memory)
         scope_state = _resolve_websochat_read_scope_state(session_memory)
         requested_read_episode_to = max(int(session_memory.get("read_episode_to") or 0), 0) or None
         authorized_scope_key = (current_product_id, requested_read_episode_to)
