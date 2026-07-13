@@ -56,11 +56,6 @@ RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLE
 RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "12"))
 RP_DIALOGUE_FALLBACK_MAX_EPISODES = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_MAX_EPISODES", "18"))
 RP_DIALOGUE_FALLBACK_EXCERPT_CHARS = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_EXCERPT_CHARS", "4600"))
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-RP_DEEPSEEK_FALLBACK_MODEL = (
-    os.getenv("STORY_AGENT_RP_DEEPSEEK_FALLBACK_MODEL", "").strip() or "deepseek-v4-pro"
-)
 RP_REASONING_MODEL = os.getenv("STORY_AGENT_RP_REASONING_MODEL", "").strip()
 if RP_REASONING_MODEL.startswith("anthropic."):
     RP_REASONING_MODEL = RP_REASONING_MODEL.split(".", 1)[1].strip()
@@ -69,7 +64,7 @@ RP_REASONING_THINKING_DISPLAY = (os.getenv("STORY_AGENT_RP_REASONING_THINKING_DI
 EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS", "2600"))
 EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL = (
     os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL", "").strip()
-    or RP_OPENROUTER_MODEL
+    or "deepseek/deepseek-v4-pro"
 )
 EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS = float(
     os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS", "60")
@@ -1315,18 +1310,6 @@ def extract_anthropic_tool_input(payload: dict, *, tool_name: str) -> dict | Non
     return None
 
 
-def build_deepseek_chat_url() -> str:
-    return f"{DEEPSEEK_BASE_URL}/chat/completions"
-
-
-def deepseek_headers(*, title: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-        "X-Title": title,
-    }
-
-
 def split_csv_values(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
@@ -1363,9 +1346,13 @@ def build_rp_openrouter_payload(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
+    model: str | None = None,
 ) -> dict[str, object]:
+    selected_model = str(model or "").strip() or require_paid_rp_openrouter_model()
+    if selected_model.lower().endswith(":free"):
+        raise RuntimeError("OpenRouter model must not use :free")
     payload: dict[str, object] = {
-        "model": require_paid_rp_openrouter_model(),
+        "model": selected_model,
         "temperature": 0.0,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
@@ -1426,6 +1413,7 @@ async def request_rp_openrouter_json_payload(
     user_prompt: str,
     max_tokens: int,
     title: str,
+    model: str | None = None,
 ) -> dict | None:
     response = await asyncio.wait_for(
         client.post(
@@ -1439,6 +1427,7 @@ async def request_rp_openrouter_json_payload(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
+                model=model,
             ),
         ),
         timeout=RP_OPENROUTER_TIMEOUT_SECONDS,
@@ -1463,80 +1452,6 @@ async def request_episode_scene_extraction_openrouter_json_payload(
             json=build_episode_scene_extraction_openrouter_payload(user_prompt=user_prompt),
         ),
         timeout=EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    return extract_json_object(extract_openrouter_message_text(response.json()))
-
-
-async def request_deepseek_json_payload(
-    client: AsyncClient,
-    *,
-    system_prompt: str,
-    user_prompt: str,
-    max_tokens: int,
-    title: str,
-) -> dict | None:
-    if not DEEPSEEK_API_KEY:
-        return None
-    response = await client.post(
-        build_deepseek_chat_url(),
-        headers=deepseek_headers(title=title),
-        json={
-            "model": RP_DEEPSEEK_FALLBACK_MODEL,
-            "thinking": {"type": "disabled"},
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": f"{system_prompt}\n\n반드시 유효한 JSON object만 반환하라."},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
-    )
-    response.raise_for_status()
-    return extract_json_object(extract_openrouter_message_text(response.json()))
-
-
-async def request_deepseek_tool_payload(
-    client: AsyncClient,
-    *,
-    system_prompt: str,
-    user_prompt: str,
-    tool_schema: dict,
-    tool_name: str,
-    max_tokens: int,
-    title: str,
-) -> dict | None:
-    if not DEEPSEEK_API_KEY:
-        return None
-    response = await client.post(
-        build_deepseek_chat_url(),
-        headers=deepseek_headers(title=title),
-        json={
-            "model": RP_DEEPSEEK_FALLBACK_MODEL,
-            "thinking": {"type": "disabled"},
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        f"{system_prompt}\n\n"
-                        "반드시 유효한 JSON object만 반환하라. "
-                        "반환 JSON은 제공된 schema의 parameters 구조와 같은 최상위 필드를 사용해야 한다."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"schema_parameters:\n"
-                        f"{json.dumps(tool_schema.get('input_schema') or {}, ensure_ascii=False)}\n\n"
-                        f"{user_prompt}"
-                    ),
-                },
-            ],
-        },
     )
     response.raise_for_status()
     return extract_json_object(extract_openrouter_message_text(response.json()))
@@ -1933,13 +1848,6 @@ def build_rp_reasoning_signature() -> str:
                 RP_REASONING_THINKING_DISPLAY,
             ]
         )
-    if DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
-        return "|".join(
-            [
-                "deepseek",
-                RP_DEEPSEEK_FALLBACK_MODEL,
-            ]
-        )
     if not OPENROUTER_API_KEY or not EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
         return "none"
     return "|".join(
@@ -1970,7 +1878,6 @@ def _log_value(value: object) -> str:
 def is_episode_character_signals_provider_available() -> bool:
     return bool(
         (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
-        or (DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL)
         or (OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL)
     )
 
@@ -1981,20 +1888,12 @@ def build_storyctx_provider_summary_line() -> str:
     if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
         signal_provider = "anthropic"
         signal_model = RP_REASONING_MODEL
-        if DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
-            signal_fallback_provider = "deepseek"
-            signal_fallback_model = RP_DEEPSEEK_FALLBACK_MODEL
-        elif OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
+        if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
             signal_fallback_provider = "openrouter"
             signal_fallback_model = EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL
         else:
             signal_fallback_provider = "none"
             signal_fallback_model = "none"
-    elif DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
-        signal_provider = "deepseek"
-        signal_model = RP_DEEPSEEK_FALLBACK_MODEL
-        signal_fallback_provider = "openrouter" if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL else "none"
-        signal_fallback_model = EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL if signal_fallback_provider == "openrouter" else "none"
     elif OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
         signal_provider = "openrouter"
         signal_model = EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL
@@ -4940,33 +4839,6 @@ async def request_episode_character_signals_payload(
     if parsed_text:
         return parsed_text
 
-    try:
-        deepseek_payload = await request_deepseek_tool_payload(
-            client,
-            system_prompt=EPISODE_CHARACTER_SIGNALS_PROMPT,
-            user_prompt=(
-                build_episode_character_signals_user_prompt(row, summary_text)
-                + "\n\nJSON function arguments must satisfy the provided schema exactly."
-            ),
-            tool_schema=EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA,
-            tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME,
-            max_tokens=EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
-            title="LikeNovel Story Agent Episode Character Signals DeepSeek",
-        )
-        if deepseek_payload:
-            logger.info(
-                "[storyctx] episode_character_signals provider=deepseek model=%s episode_no=%s",
-                RP_DEEPSEEK_FALLBACK_MODEL,
-                episode_no,
-            )
-            return deepseek_payload
-    except (HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "[storyctx] episode_character_signals deepseek fallback failed episode_no=%s: %s",
-            episode_no,
-            exc,
-        )
-
     if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
         for attempt in range(2):
             try:
@@ -5007,7 +4879,7 @@ async def request_episode_character_signals_payload(
     diagnostics = build_episode_character_signals_parse_diagnostics(raw_text)
     raise EpisodeCharacterSignalsParseError(
         episode_no=episode_no,
-        model=RP_REASONING_MODEL or RP_DEEPSEEK_FALLBACK_MODEL or EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+        model=RP_REASONING_MODEL or EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
         request_id=request_id,
         json_parse_ok=bool(diagnostics["json_parse_ok"]),
         line_parse_ok=bool(diagnostics["line_parse_ok"]),
@@ -10050,32 +9922,24 @@ async def request_work_protagonist_resolution_payload(
         resolver_input,
         episode_summary_evidence=episode_summary_evidence,
     )
-    if DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL:
-        return await request_deepseek_tool_payload(
-            client,
-            system_prompt=WORK_PROTAGONIST_RESOLUTION_PROMPT,
-            user_prompt=user_prompt,
-            tool_schema=WORK_PROTAGONIST_RESOLUTION_TOOL_SCHEMA,
-            tool_name=str(WORK_PROTAGONIST_RESOLUTION_TOOL_SCHEMA.get("name") or "submit_work_protagonist_resolution"),
-            max_tokens=WORK_PROTAGONIST_RESOLUTION_MAX_OUTPUT_TOKENS,
-            title="LikeNovel Story Agent Work Protagonist Resolution",
-        )
-    if OPENROUTER_API_KEY and RP_OPENROUTER_MODEL:
+    user_prompt = (
+        f"{user_prompt}\n\nschema_parameters:\n"
+        f"{json.dumps(WORK_PROTAGONIST_RESOLUTION_TOOL_SCHEMA.get('input_schema') or {}, ensure_ascii=False)}"
+    )
+    if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
         return await request_rp_openrouter_json_payload(
             client,
             system_prompt=WORK_PROTAGONIST_RESOLUTION_PROMPT,
             user_prompt=user_prompt,
             max_tokens=WORK_PROTAGONIST_RESOLUTION_MAX_OUTPUT_TOKENS,
             title="LikeNovel Story Agent Work Protagonist Resolution",
+            model=require_paid_character_signals_openrouter_model(),
         )
     return None
 
 
 def is_work_protagonist_resolution_provider_configured() -> bool:
-    return bool(
-        (DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL)
-        or (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
-    )
+    return bool(OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL)
 
 
 def _work_protagonist_score(row: dict[str, object]) -> float:
@@ -13266,7 +13130,6 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
     if (
         (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL)
         or (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
-        or (DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL)
         or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
     ):
         summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)
@@ -13587,7 +13450,6 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
     if (
         (OPENROUTER_API_KEY and EPISODE_SUMMARY_MODEL)
         or (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
-        or (DEEPSEEK_API_KEY and RP_DEEPSEEK_FALLBACK_MODEL)
         or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
     ):
         summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)

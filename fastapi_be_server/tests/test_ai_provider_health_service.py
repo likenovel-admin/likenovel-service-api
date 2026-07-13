@@ -99,7 +99,6 @@ class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
             patch.object(ai_provider_health_service.settings, "WEBSOCHAT_GEMINI_MODEL", "gemini-test"),
             patch.object(ai_provider_health_service.settings, "ANTHROPIC_API_KEY", ""),
             patch.object(ai_provider_health_service.settings, "OPENROUTER_API_KEY", ""),
-            patch.object(ai_provider_health_service.settings, "DEEPSEEK_API_KEY", ""),
         ):
             rows = await ai_provider_health_service.get_ai_provider_health_summary(db)
 
@@ -108,7 +107,7 @@ class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_provider["gemini"]["last_success_at"], "2026-06-09 16:00:00")
         self.assertEqual(by_provider["claude"]["status"], "not_configured")
         self.assertEqual(by_provider["openrouter"]["status"], "not_configured")
-        self.assertEqual(by_provider["deepseek"]["status"], "not_configured")
+        self.assertEqual(by_provider["openrouter_deepseek"]["status"], "not_configured")
 
     async def test_run_health_check_records_not_configured_without_http_call(self):
         db = AsyncMock()
@@ -117,7 +116,6 @@ class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
             patch.object(ai_provider_health_service.settings, "GEMINI_API_KEY", ""),
             patch.object(ai_provider_health_service.settings, "ANTHROPIC_API_KEY", ""),
             patch.object(ai_provider_health_service.settings, "OPENROUTER_API_KEY", ""),
-            patch.object(ai_provider_health_service.settings, "DEEPSEEK_API_KEY", ""),
             patch.object(ai_provider_health_service, "_post_health_prompt", new=AsyncMock()) as post_prompt,
         ):
             result = await ai_provider_health_service.run_ai_provider_health_checks(db)
@@ -155,21 +153,22 @@ class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
             {"only": ["friendli", "deepinfra"], "require_parameters": True},
         )
 
-    async def test_deepseek_health_uses_story_context_chat_completion_path(self):
+    async def test_deepseek_health_uses_openrouter_chat_completion_path(self):
         FakeAsyncClient.calls = []
         spec = ai_provider_health_service.ProviderSpec(
-            provider="deepseek",
-            model="deepseek-v4-flash",
-            api_key="deepseek-key",
-            base_url="https://api.deepseek.com/",
+            provider="openrouter_deepseek",
+            model="deepseek/deepseek-v4-pro",
+            api_key="openrouter-key",
+            base_url="https://openrouter.ai/api/v1/",
             affected_features="story_context",
-            api_kind="deepseek",
+            api_kind="openai_compatible",
         )
 
         with patch.object(ai_provider_health_service.httpx, "AsyncClient", FakeAsyncClient):
             await ai_provider_health_service._post_health_prompt(spec)
 
-        self.assertEqual(FakeAsyncClient.calls[0]["url"], "https://api.deepseek.com/chat/completions")
+        self.assertEqual(FakeAsyncClient.calls[0]["url"], "https://openrouter.ai/api/v1/chat/completions")
+        self.assertNotIn("provider", FakeAsyncClient.calls[0]["json"])
 
     async def test_check_provider_records_non_200_response_status(self):
         spec = ai_provider_health_service.ProviderSpec(

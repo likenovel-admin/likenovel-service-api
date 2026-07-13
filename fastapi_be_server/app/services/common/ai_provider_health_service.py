@@ -16,7 +16,7 @@ from app.const import settings
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_ORDER = ("gemini", "claude", "openrouter", "deepseek")
+PROVIDER_ORDER = ("gemini", "claude", "openrouter", "openrouter_deepseek")
 SUCCESS_STATUS = "ok"
 NOT_CONFIGURED_STATUS = "not_configured"
 NOT_CHECKED_STATUS = "not_checked"
@@ -60,12 +60,12 @@ def _provider_specs() -> list[ProviderSpec]:
             api_kind="openai_compatible",
         ),
         ProviderSpec(
-            provider="deepseek",
-            model=settings.AI_PROVIDER_HEALTH_DEEPSEEK_MODEL,
-            api_key=settings.DEEPSEEK_API_KEY,
-            base_url=settings.DEEPSEEK_BASE_URL,
+            provider="openrouter_deepseek",
+            model=settings.AI_PROVIDER_HEALTH_OPENROUTER_DEEPSEEK_MODEL,
+            api_key=settings.OPENROUTER_API_KEY,
+            base_url=settings.OPENROUTER_BASE_URL,
             affected_features="story_context,dna_fallback",
-            api_kind="deepseek",
+            api_kind="openai_compatible",
         ),
     ]
 
@@ -280,7 +280,7 @@ async def _post_health_prompt(spec: ProviderSpec) -> httpx.Response:
             "max_tokens": 4,
             "messages": [{"role": "user", "content": "Reply exactly OK."}],
         }
-        if spec.api_kind == "openai_compatible":
+        if spec.api_kind == "openai_compatible" and spec.provider == "openrouter":
             provider_only = _split_csv(settings.AI_READER_OPENROUTER_PROVIDER_ONLY)
             if provider_only:
                 payload["provider"] = {
