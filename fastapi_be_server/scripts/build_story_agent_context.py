@@ -112,10 +112,10 @@ CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS = (
 )
 EPISODE_SCENE_EXTRACTION_FORMAT_VERSION = "episode_scene_extraction_v1"
 EPISODE_SCENE_EXTRACTION_MAX_INPUT_CHARS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_INPUT_CHARS", "18000"))
-EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS", "6000"))
+EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS", "5000"))
 EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL = (
     os.getenv("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL", "").strip()
-    or RP_OPENROUTER_MODEL
+    or "deepseek/deepseek-v4-pro"
 )
 EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS = float(
     os.getenv("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS", "60")
@@ -385,7 +385,7 @@ EPISODE_SCENE_EXTRACTION_SYSTEM = """너는 웹소설 원문을 캐릭터챗용 
 반드시 JSON만 반환하라. 첫인사, RP 대사, 새 사건, 감상평을 만들지 마라.
 
 목표:
-- 회차 원문을 캐릭터가 움직일 수 있는 장면 4~6개로 나눈다.
+- 회차 원문에서 캐릭터가 움직일 수 있는 핵심 장면 2~3개를 고른다.
 - 각 장면은 원문에 실제로 있는 시작 앵커(boundary_anchor_start)를 가져야 한다.
 - boundary_anchor_start는 원문에서 그대로 찾을 수 있는 8~80자 문자열이어야 한다.
 - 인물 scope_key는 입력의 canonical_character_packet에 있는 값만 사용한다. 모르면 scope_key를 null로 둔다.
@@ -463,9 +463,9 @@ EPISODE_SCENE_EXTRACTION_SYSTEM = """너는 웹소설 원문을 캐릭터챗용 
 5. 원문 전체를 빠짐없이 요약하려 하지 말고 캐릭터챗에서 재사용 가능한 핵심 장면을 고른다.
 6. evidence에는 L0001 같은 라인 prefix를 넣지 말고 원문 표현만 짧게 넣어라.
 7. 중요하지 않은 단역/동물/장소/직책은 participants에 넣지 마라.
-8. 먼저 주인공/대상 캐릭터가 실제로 현장에 등장하는 장면을 최소 4개까지 찾는다. 원문에 그런 장면이 4개 미만일 때만 더 적게 낸다.
+8. 먼저 주인공/대상 캐릭터가 실제로 현장에 등장하는 장면을 최대 3개까지 찾는다. 원문에 그런 장면이 2개 미만이면 1개만 내도 된다.
 9. 가능하면 모든 scene의 participants에 주인공/대상 캐릭터의 canonical scope_key를 포함하라. 단, 원문상 그 인물이 실제로 등장하거나 행동/판단의 중심일 때만 포함한다.
-10. 주인공/대상 캐릭터가 현장에 없는 배경, 적대자 회의, 설명 장면은 위 8번을 채운 뒤에도 회차 전개 이해에 꼭 필요할 때만 최대 1개 고른다.
+10. 주인공/대상 캐릭터가 현장에 없는 배경, 적대자 회의, 설명 장면은 핵심 장면을 고른 뒤에도 회차 전개 이해에 꼭 필요할 때만 최대 1개 고른다.
 11. current_action은 원문 장면에서 캐릭터가 실제로 하는 행동/판단만 쓴다. 성격 설명이나 장르 설명을 쓰지 마라.
 12. immediate_pressure는 첫인사에서 바로 걸 수 있는 압력이어야 한다. "자기소개", "상황 설명"처럼 정지된 문구는 쓰지 마라.
 13. character_initiative_reason은 캐릭터가 먼저 말을 걸 이유다. 사용자의 정체를 캐묻는 미스터리로 만들지 말고 현재 사건/압력/협력 필요에서 뽑아라.
@@ -6950,7 +6950,7 @@ async def build_episode_scene_extraction_summaries(
     cleanup_missing_scopes: bool = True,
     verbose: bool = False,
 ) -> tuple[int, int]:
-    if summary_client is None or not OPENROUTER_API_KEY or not RP_OPENROUTER_MODEL:
+    if summary_client is None or not OPENROUTER_API_KEY or not EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL:
         return 0, 0
     packet_characters = (
         list(canonical_character_packet.get("characters") or [])
