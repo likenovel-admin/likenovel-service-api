@@ -150,11 +150,6 @@ if [ -z "${DB_USER:-}" ] || [ -z "${DB_PW:-}" ]; then
   exit 1
 fi
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${DEEPSEEK_API_KEY:-}" ]; then
-  log "[error] missing both ANTHROPIC_API_KEY and DEEPSEEK_API_KEY env"
-  exit 1
-fi
-
 if [ -z "${OPENROUTER_API_KEY:-}" ]; then
   log "[error] missing OPENROUTER_API_KEY env"
   exit 1

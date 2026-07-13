@@ -90,8 +90,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--deepseek-model",
-        help="지정 시 DeepSeek 공식 API로 직접 호출(예: deepseek-v4-pro). "
-        "anthropic→deepseek fallback 경로를 타며 OpenRouter를 우회. DEEPSEEK_API_KEY 필요",
+        help="지정 시 OpenRouter에서 해당 DeepSeek 모델로 호출(예: deepseek-v4-pro). "
+        "OPENROUTER_API_KEY 필요",
     )
     parser.add_argument(
         "--dump-full",
@@ -120,17 +120,14 @@ def main() -> int:
 
     allowed_labels = module.load_allowed_labels()
     if args.deepseek_model:
-        # DeepSeek 공식 API 직접 호출 모드(모델 업그레이드 실험용).
-        # call_claude를 빈 키로 즉시 raise시켜 call_deepseek(fallback) 경로로 보낸다.
-        # 라이브 배치 코드는 무수정, 실험 러너에서 module 전역만 덮어쓴다.
-        import os as _os
-        if not _os.environ.get("DEEPSEEK_API_KEY"):
-            raise SystemExit("DEEPSEEK_API_KEY 환경변수가 필요합니다(--deepseek-model 모드).")
-        module.AI_DNA_PROVIDER = "anthropic"
-        module.ANTHROPIC_API_KEY = ""
-        module.DEEPSEEK_API_KEY = _os.environ["DEEPSEEK_API_KEY"]
-        module.AI_DNA_DEEPSEEK_FALLBACK_MODEL = args.deepseek_model
-        print(f"[INFO] DeepSeek 직접 호출 모드: model={args.deepseek_model}, base={module.DEEPSEEK_BASE_URL}")
+        model = str(args.deepseek_model).strip()
+        if "/" not in model:
+            model = f"deepseek/{model}"
+        if not module.OPENROUTER_API_KEY:
+            raise SystemExit("OPENROUTER_API_KEY 환경변수가 필요합니다(--deepseek-model 모드).")
+        module.AI_DNA_PROVIDER = "openrouter"
+        module.AI_DNA_OPENROUTER_MODEL = model
+        print(f"[INFO] OpenRouter DeepSeek 호출 모드: model={model}, base={module.OPENROUTER_BASE_URL}")
     else:
         module._validate_runtime_config(allowed_labels)  # OPENROUTER_API_KEY 등 누락 시 즉시 실패
 

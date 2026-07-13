@@ -193,31 +193,31 @@ class AiDnaCodebookContractTest(TestCase):
         self.assertIn("추상 홍보문구", prompt)
 
 
-class AiDnaDeepseekFallbackTest(TestCase):
-    def test_anthropic_failure_falls_back_to_deepseek_v4flash(self):
+class AiDnaOpenRouterFallbackTest(TestCase):
+    def test_anthropic_failure_falls_back_to_openrouter_deepseek(self):
         module = load_module()
         module.AI_DNA_PROVIDER = "anthropic"
         module.ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-        module.DEEPSEEK_API_KEY = "test-key"
-        module.AI_DNA_DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"
+        module.OPENROUTER_API_KEY = "test-key"
+        module.AI_DNA_OPENROUTER_MODEL = "deepseek/deepseek-v4-pro"
+        allowed_labels = {axis: set() for axis in module.AXIS_ORDER}
 
         with patch.object(module, "call_claude", side_effect=RuntimeError("Claude API error: 429 credit")), \
-             patch.object(module, "call_deepseek", return_value=("{}", {"total_tokens": 123})) as mocked_deepseek:
-            raw, meta = module._call_llm("system", "user", {axis: set() for axis in module.AXIS_ORDER})
+             patch.object(module, "call_openrouter", return_value=("{}", {"total_tokens": 123})) as mocked_openrouter:
+            raw, meta = module._call_llm("system", "user", allowed_labels)
 
         self.assertEqual(raw, "{}")
-        mocked_deepseek.assert_called_once()
-        self.assertEqual(meta["provider"], "deepseek")
+        mocked_openrouter.assert_called_once_with("system", "user", allowed_labels)
+        self.assertEqual(meta["provider"], "openrouter")
         self.assertEqual(meta["fallback_from"], "anthropic")
-        self.assertEqual(meta["model"], "deepseek-v4-flash")
+        self.assertEqual(meta["model"], "deepseek/deepseek-v4-pro")
         self.assertIn("Claude API error", meta["fallback_reason"])
         self.assertEqual(meta["usage"], {"prompt_tokens": None, "completion_tokens": None, "total_tokens": 123, "cost": None})
 
-    def test_anthropic_failure_without_deepseek_key_raises_original_error(self):
+    def test_anthropic_failure_without_openrouter_key_raises_original_error(self):
         module = load_module()
         module.AI_DNA_PROVIDER = "anthropic"
-        module.DEEPSEEK_API_KEY = ""
-        module.AI_DNA_DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"
+        module.OPENROUTER_API_KEY = ""
 
         with patch.object(module, "call_claude", side_effect=RuntimeError("Claude API error: 429 credit")):
             with self.assertRaisesRegex(RuntimeError, "Claude API error"):
