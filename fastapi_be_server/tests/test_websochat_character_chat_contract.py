@@ -11,6 +11,7 @@ from app.services.websochat.websochat_game_memory import (
 from app.services.websochat.websochat_service import (
     _assert_websochat_session_allows_mode,
     _build_websochat_rp_lookup_scope_keys,
+    _build_websochat_rp_session_list_state,
     _build_websochat_session_contract_payload,
     _is_websochat_character_chat_rp_context_ready,
     _is_websochat_character_chat_session,
@@ -51,6 +52,23 @@ def _entry_context(
 
 
 class WebsochatCharacterChatContractTest(unittest.TestCase):
+    def test_session_list_state_uses_persisted_character_without_context_load(self):
+        state = _build_websochat_rp_session_list_state(
+            {
+                "active_character": "character:루벤세이린",
+                "active_character_label": "루벤",
+                "rp_mode": "free",
+            }
+        )
+
+        self.assertEqual(
+            state,
+            {
+                "rpStage": "chatting",
+                "rpActiveCharacterLabel": "루벤",
+            },
+        )
+
     def test_character_chat_memory_locks_to_rp_and_scope_key(self):
         normalized = _normalize_websochat_session_memory(
             {
@@ -255,6 +273,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
         self.assertIn("관찰, 가설, 검증을 서로 다른 턴으로 나눈다", prompt)
         self.assertIn("관계 반응을 최소 하나 포함하라", prompt)
         self.assertIn("첫 줄은 지문", prompt)
+        self.assertIn("모든 큰따옴표 대사 앞에 실제 화자명이나 호칭과 콜론", prompt)
         self.assertIn("사용자가 단답", prompt)
         self.assertIn("사용자가 입력에서 직접 묘사한 몸짓이나 위치는 이어받을 수 있지만", prompt)
         self.assertIn("사용자에 관한 서술마다 직전 입력의 근거가 있는지 확인한다", prompt)
