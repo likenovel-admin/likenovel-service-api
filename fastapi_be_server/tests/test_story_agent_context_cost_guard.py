@@ -2868,6 +2868,9 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertIn("p.price_type IN ('free', 'paid')", query)
         self.assertIn("p.status_code = 'ongoing'", query)
         self.assertIn("pe.open_yn = 'Y'", query)
+        self.assertIn("COALESCE(p.blind_yn, 'N') = 'N'", query)
+        self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", query)
+        self.assertIn("COALESCE(sacp.context_status, 'pending') <> 'disabled'", query)
         self.assertNotIn("p.price_type = 'free'", query)
 
     def test_total_episode_count_matches_paid_ongoing_scope(self):
