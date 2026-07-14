@@ -9,6 +9,9 @@ from app.utils.query import get_file_path_sub_query, get_pagination_params
 from app.utils.response import build_paginated_response
 
 
+MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT = 10
+
+
 def _normalize_aliases(raw_aliases) -> list[str]:
     aliases: list[str] = []
     if not isinstance(raw_aliases, list):
@@ -35,9 +38,7 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
             continue
         if str(display_safety.get("status") or "").strip().lower() != "pass":
             continue
-        if payload.get("public_slot_eligible") is not True:
-            continue
-        if str(payload.get("work_role") or "").strip() != "main_protagonist":
+        if payload.get("public_chat_eligible") is not True:
             continue
 
         scope_key = str(payload.get("canonical_character_key") or "").strip()
@@ -59,13 +60,24 @@ async def _load_eligible_main_character_roster(
     product_id: int, db: AsyncSession
 ) -> list[dict]:
     result = await db.execute(
-        text("""
-            SELECT scope_key AS scopeKey, summary_text AS summaryText
-            FROM tb_story_agent_context_summary
-            WHERE product_id = :product_id
-              AND summary_type = 'character_inventory_v3'
-              AND is_active = 'Y'
-            ORDER BY summary_id DESC
+        text(f"""
+            SELECT sacs.scope_key AS scopeKey, sacs.summary_text AS summaryText
+            FROM tb_story_agent_context_summary sacs
+            INNER JOIN tb_product p ON p.product_id = sacs.product_id
+            WHERE sacs.product_id = :product_id
+              AND sacs.summary_type = 'character_inventory_v3'
+              AND sacs.is_active = 'Y'
+              AND p.open_yn = 'Y'
+              AND COALESCE(p.blind_yn, 'N') = 'N'
+              AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
+              AND (
+                  SELECT COUNT(*)
+                  FROM tb_product_episode pe
+                  WHERE pe.product_id = p.product_id
+                    AND pe.use_yn = 'Y'
+                    AND pe.open_yn = 'Y'
+              ) >= {MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT}
+            ORDER BY sacs.summary_id DESC
         """),
         {"product_id": product_id},
     )
@@ -90,7 +102,7 @@ async def _ensure_character_slot_selection_eligible(
     if selected is None:
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            message="메인 주인공 카드에 사용할 수 없는 캐릭터입니다.",
+            message="메인 캐릭터 카드에 사용할 수 없는 인물입니다.",
         )
     return selected["displayName"]
 
@@ -142,14 +154,15 @@ def build_public_main_character_slots_query() -> str:
           AND (mcs.publish_end_date IS NULL OR mcs.publish_end_date > NOW())
           AND p.open_yn = 'Y'
           AND COALESCE(p.blind_yn, 'N') = 'N'
+          AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
           AND (:adult_yn = 'Y' OR p.ratings_code != 'adult')
-          AND EXISTS (
-              SELECT 1
+          AND (
+              SELECT COUNT(*)
               FROM tb_product_episode pe
               WHERE pe.product_id = p.product_id
                 AND pe.use_yn = 'Y'
                 AND pe.open_yn = 'Y'
-          )
+          ) >= {MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT}
         ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC
     """
 
@@ -233,6 +246,21 @@ async def search_admin_main_character_slot_products(
             ) cf ON cf.file_group_id = p.thumbnail_file_id
             WHERE p.open_yn = 'Y'
               AND COALESCE(p.blind_yn, 'N') = 'N'
+              AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
+              AND episode_stats.open_episode_count >= :minimum_open_episode_count
+              AND EXISTS (
+                  SELECT 1
+                  FROM tb_story_agent_context_summary sacs
+                  WHERE sacs.product_id = p.product_id
+                    AND sacs.summary_type = 'character_inventory_v3'
+                    AND sacs.is_active = 'Y'
+                    AND JSON_UNQUOTE(
+                        JSON_EXTRACT(sacs.summary_text, '$.public_chat_eligible')
+                    ) = 'true'
+                    AND JSON_UNQUOTE(
+                        JSON_EXTRACT(sacs.summary_text, '$.display_safety.status')
+                    ) = 'pass'
+              )
               AND (:search_word = '%%' OR p.title LIKE :search_word)
             ORDER BY p.updated_date DESC, p.product_id DESC
             LIMIT :limit_count
@@ -240,6 +268,7 @@ async def search_admin_main_character_slot_products(
         {
             "search_word": f"%{normalized_search_word}%",
             "limit_count": limit,
+            "minimum_open_episode_count": MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT,
         },
     )
     return {"data": [dict(row) for row in result.mappings().all()]}

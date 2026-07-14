@@ -14,6 +14,7 @@ def _row(
     *,
     display_name="아델리트",
     aliases=None,
+    public_chat_eligible=True,
     public_slot_eligible=True,
     safety_status="pass",
     work_role="main_protagonist",
@@ -25,6 +26,7 @@ def _row(
                 "canonical_character_key": scope_key,
                 "display_name": display_name,
                 "aliases": aliases or [display_name],
+                "public_chat_eligible": public_chat_eligible,
                 "public_slot_eligible": public_slot_eligible,
                 "display_safety": {"status": safety_status},
                 "work_role": work_role,
@@ -34,7 +36,7 @@ def _row(
     }
 
 
-def test_main_character_slot_roster_accepts_only_strict_public_main_protagonists():
+def test_main_character_slot_roster_accepts_chat_eligible_main_and_major_characters():
     from app.services.product.main_character_slot_service import (
         extract_eligible_main_character_roster,
     )
@@ -42,12 +44,17 @@ def test_main_character_slot_roster_accepts_only_strict_public_main_protagonists
     roster = extract_eligible_main_character_roster(
         [
             _row(aliases=["아델리트", "공녀", "공녀"]),
-            _row("character:false", public_slot_eligible=False),
-            _row("character:string", public_slot_eligible="true"),
-            _row("character:missing", public_slot_eligible=None),
+            _row(
+                "character:follower",
+                display_name="추종자",
+                work_role="major_character",
+                public_slot_eligible=False,
+            ),
+            _row("character:false", public_chat_eligible=False),
+            _row("character:string", public_chat_eligible="true"),
+            _row("character:missing", public_chat_eligible=None),
             _row("character:fail", safety_status="fail"),
             _row("character:review", safety_status="review"),
-            _row("character:support", work_role="major_character"),
         ]
     )
 
@@ -56,7 +63,12 @@ def test_main_character_slot_roster_accepts_only_strict_public_main_protagonists
             "scopeKey": "character:adelite",
             "displayName": "아델리트",
             "aliases": ["아델리트", "공녀"],
-        }
+        },
+        {
+            "scopeKey": "character:follower",
+            "displayName": "추종자",
+            "aliases": ["추종자"],
+        },
     ]
 
 
@@ -118,8 +130,10 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "(mcs.publish_end_date IS NULL OR mcs.publish_end_date > NOW())" in query
     assert "p.open_yn = 'Y'" in query
     assert "COALESCE(p.blind_yn, 'N') = 'N'" in query
+    assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+    assert ">= 10" in query
     assert "(:adult_yn = 'Y' OR p.ratings_code != 'adult')" in query
-    assert "EXISTS (" in query
+    assert "SELECT COUNT(*)" in query
     assert "FROM tb_product_episode pe" in query
     assert "q.group_type = 'character'" in query
     assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
@@ -198,8 +212,34 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         query = str(db.execute.await_args.args[0])
         assert "summary_type = 'character_inventory_v3'" in query
         assert "is_active = 'Y'" in query
+        assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+        assert ">= 10" in query
         assert "character_inventory'" not in query
         assert "relation_inventory" not in query
+        assert response == {"data": []}
+
+    async def test_product_search_only_returns_consented_products_with_ten_public_episodes(self):
+        from app.services.product import main_character_slot_service
+
+        db = AsyncMock()
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = []
+        db.execute.return_value = result
+
+        response = await main_character_slot_service.search_admin_main_character_slot_products(
+            search_word="테스트",
+            limit=100,
+            db=db,
+        )
+
+        query = str(db.execute.await_args.args[0])
+        params = db.execute.await_args.args[1]
+        assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+        assert "episode_stats.open_episode_count >= :minimum_open_episode_count" in query
+        assert "summary_type = 'character_inventory_v3'" in query
+        assert "$.public_chat_eligible" in query
+        assert "$.display_safety.status" in query
+        assert params["minimum_open_episode_count"] == 10
         assert response == {"data": []}
 
     async def test_selection_validation_rejects_scope_missing_from_strict_roster(self):
