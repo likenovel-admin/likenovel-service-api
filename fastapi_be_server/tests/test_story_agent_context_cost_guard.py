@@ -1098,6 +1098,86 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         deactivate_missing.assert_any_call(ANY, 687, "character_rp_examples", expected_scope_keys)
         self.assertEqual(conn.commit_count, 2)
 
+    async def test_rp_build_reuses_existing_examples_when_new_voice_extraction_is_not_ready(self):
+        module = load_module()
+        conn = FakeConnection()
+        legacy_scope_key = "protagonist:named:승택"
+        legacy_examples = {
+            "examples": [
+                {
+                    "episode_no": episode_no,
+                    "source_kind": "dialogue",
+                    "text": text,
+                    "confidence": 0.9,
+                }
+                for episode_no, text in enumerate(
+                    (
+                        "내가 직접 확인하겠어.",
+                        "지금은 물러서지 않아.",
+                        "약속은 반드시 지킨다.",
+                        "기록은 내가 맡을게.",
+                        "이번에는 네 판단을 믿지.",
+                    ),
+                    start=1,
+                )
+            ]
+        }
+        profile_payload = {
+            "speech_style": {"tone": "단호"},
+            "personality_core": ["원칙적"],
+            "baseline_attitude": "경계",
+            "example_dialogues": [item["text"] for item in legacy_examples["examples"][:3]],
+        }
+        internal_prompt_payload = {"internal_prompt": "[핵심 정체성] 전승택은 직접 판단하고 움직인다."}
+        upserted_types = []
+
+        def fake_upsert(cur, **kwargs):
+            upserted_types.append(kwargs["summary_type"])
+            return {"summary_id": len(upserted_types)}, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=[])), \
+             patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
+             patch.object(module, "request_character_chat_internal_prompt_payload", AsyncMock(return_value=internal_prompt_payload)), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={
+                 legacy_scope_key: {
+                     "scope_key": legacy_scope_key,
+                     "payload": legacy_examples,
+                 }
+             }), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert), \
+             patch.object(module, "deactivate_missing_active_scopes"):
+            counts = await module.build_rp_summaries(
+                conn,
+                product_id=756,
+                episode_rows=[],
+                episode_texts_by_no={1: "전승택은 말없이 문을 열었다."},
+                summary_client=object(),
+                inventory_map={
+                    "character:전승택": {
+                        "canonical_character_key": "character:전승택",
+                        "source_character_keys": [legacy_scope_key],
+                        "display_name": "전승택",
+                        "aliases": ["전승택", "승택"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 16,
+                        "public_chat_eligible": False,
+                        "display_safety": {
+                            "status": "pass",
+                            "reason": "resolved_named_identity",
+                        },
+                    }
+                },
+            )
+
+        self.assertEqual(counts, {"profile": (1, 0), "examples": (1, 0)})
+        self.assertEqual(
+            upserted_types,
+            ["character_rp_profile", "character_rp_examples", "character_chat_internal_prompt"],
+        )
+
     async def test_rp_build_upserts_character_chat_internal_prompt_when_generated(self):
         module = load_module()
         conn = FakeConnection()
@@ -1845,6 +1925,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "request_rp_character_plan_payload", AsyncMock(return_value={"characters": []})), \
              patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=[])), \
              patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True)]), \
              patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
@@ -1889,6 +1970,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "request_rp_character_plan_payload", AsyncMock(return_value={"characters": []})), \
              patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=[])), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
             counts = await module.build_rp_summaries(
