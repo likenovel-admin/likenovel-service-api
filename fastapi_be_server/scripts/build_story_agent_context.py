@@ -13175,6 +13175,42 @@ def build_empty_results() -> dict[str, object]:
     }
 
 
+def select_full_build_episode_rows(
+    *,
+    product_rows: list[dict],
+    episode_summary_rows: list[dict],
+    args: argparse.Namespace,
+) -> tuple[list[dict], bool]:
+    is_partial_build = bool(
+        getattr(args, "episode_ids", None)
+        or getattr(args, "episode_nos", None)
+        or int(getattr(args, "limit", 0) or 0) > 0
+    )
+    if not is_partial_build:
+        return episode_summary_rows, True
+
+    selected_episode_ids = {
+        int(row.get("episode_id") or 0)
+        for row in product_rows
+        if int(row.get("episode_id") or 0) > 0
+    }
+    selected_episode_nos = {
+        int(row.get("episode_no") or 0)
+        for row in product_rows
+        if int(row.get("episode_no") or 0) > 0
+    }
+    selected_rows = [
+        row
+        for row in episode_summary_rows
+        if (
+            str(row.get("scope_key") or "").removeprefix("episode:").isdigit()
+            and int(str(row.get("scope_key") or "").removeprefix("episode:")) in selected_episode_ids
+        )
+        or int(row.get("episode_from") or 0) in selected_episode_nos
+    ]
+    return selected_rows, False
+
+
 async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> dict[str, object]:
     results = build_empty_results()
 
@@ -13347,12 +13383,18 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
 
                         with work_cursor(work_conn) as cur:
                             episode_summary_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_summary")
+                        episode_processing_rows, cleanup_episode_scopes = select_full_build_episode_rows(
+                            product_rows=product_rows,
+                            episode_summary_rows=episode_summary_rows,
+                            args=args,
+                        )
                         signal_counts = await build_episode_character_signals_summaries(
                             conn=work_conn,
                             product_id=product_id,
-                            episode_rows=episode_summary_rows,
+                            episode_rows=episode_processing_rows,
                             summary_client=summary_client,
                             verbose=args.verbose,
+                            cleanup_missing_scopes=cleanup_episode_scopes,
                         )
                         results["inserted_episode_character_signals"] += signal_counts[0]
                         results["reused_episode_character_signals"] += signal_counts[1]
@@ -13368,7 +13410,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             product_title=str(product_rows[0].get("title") or ""),
                             signal_rows=inventory_signal_rows,
                             summary_client=summary_client,
-                            episode_summary_rows=episode_summary_rows,
+                            episode_summary_rows=episode_processing_rows,
                             verbose=args.verbose,
                         )
 
@@ -13415,11 +13457,12 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             conn=work_conn,
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),
-                            episode_rows=episode_summary_rows,
+                            episode_rows=episode_processing_rows,
                             episode_texts_by_no=episode_texts_by_no,
                             summary_client=summary_client,
                             canonical_character_packet=build_episode_scene_canonical_character_packet(inventory_v3_map),
                             verbose=args.verbose,
+                            cleanup_missing_scopes=cleanup_episode_scopes,
                         )
                         results["inserted_episode_scene_extractions"] += scene_counts[0]
                         results["reused_episode_scene_extractions"] += scene_counts[1]
@@ -13427,7 +13470,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                         rp_counts = await build_rp_summaries(
                             conn=work_conn,
                             product_id=product_id,
-                            episode_rows=episode_summary_rows,
+                            episode_rows=episode_processing_rows,
                             episode_texts_by_no=episode_texts_by_no,
                             summary_client=summary_client,
                             inventory_map=inventory_v3_map,
