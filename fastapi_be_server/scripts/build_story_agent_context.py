@@ -5924,6 +5924,7 @@ async def build_rp_summaries(
         conn,
         product_id=product_id,
     )
+    existing_example_rows_by_scope: dict[str, dict[str, object]] | None = None
     valid_scope_keys = build_inventory_rp_retained_scope_keys(inventory_map or {})
     for target in targets:
         character_key = str(target.get("character_key") or "").strip()
@@ -5961,14 +5962,30 @@ async def build_rp_summaries(
                     print(f"[rp-dialogue-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
                 dialogue_items = []
             if not is_strict_dialogue_item_set_ready(dialogue_items, aliases):
-                logger.info(
-                    "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
-                    product_id,
-                    character_key,
-                    "direct_voice_not_ready",
-                    str(direct_voice_quality.get("status") or "unknown"),
+                if existing_example_rows_by_scope is None:
+                    with work_cursor(conn) as cur:
+                        existing_example_rows_by_scope = fetch_active_summary_state_map(
+                            cur=cur,
+                            product_id=product_id,
+                            summary_type="character_rp_examples",
+                        )
+                existing_example_row = fetch_summary_state_for_inventory_alias(
+                    existing_example_rows_by_scope,
+                    scope_key=character_key,
+                    inventory_item=inventory_item,
                 )
-                continue
+                dialogue_items = build_rp_dialogue_items_from_example_payload(
+                    dict(existing_example_row.get("payload") or {})
+                )
+                if not dialogue_items:
+                    logger.info(
+                        "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
+                        product_id,
+                        character_key,
+                        "direct_voice_not_ready",
+                        str(direct_voice_quality.get("status") or "unknown"),
+                    )
+                    continue
         else:
             dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
         if not dialogue_items:
