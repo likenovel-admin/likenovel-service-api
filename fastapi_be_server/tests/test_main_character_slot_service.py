@@ -18,6 +18,8 @@ def _row(
     public_slot_eligible=True,
     safety_status="pass",
     work_role="main_protagonist",
+    distinct_episode_count=10,
+    voice_evidence_count=10,
 ):
     return {
         "scopeKey": scope_key,
@@ -30,6 +32,8 @@ def _row(
                 "public_slot_eligible": public_slot_eligible,
                 "display_safety": {"status": safety_status},
                 "work_role": work_role,
+                "distinct_episode_count": distinct_episode_count,
+                "voice_evidence_count": voice_evidence_count,
             },
             ensure_ascii=False,
         ),
@@ -87,6 +91,43 @@ def test_main_character_slot_roster_missing_v3_is_empty_and_duplicate_scope_is_r
     ]
 
 
+def test_main_character_slot_roster_keeps_only_top_two_characters():
+    from app.services.product.main_character_slot_service import (
+        extract_eligible_main_character_roster,
+    )
+
+    roster = extract_eligible_main_character_roster(
+        [
+            _row(
+                "character:minor",
+                display_name="조연",
+                work_role="major_character",
+                distinct_episode_count=4,
+                voice_evidence_count=3,
+            ),
+            _row(
+                "character:lead",
+                display_name="주인공",
+                work_role="main_protagonist",
+                distinct_episode_count=15,
+                voice_evidence_count=8,
+            ),
+            _row(
+                "character:major",
+                display_name="주요 인물",
+                work_role="major_character",
+                distinct_episode_count=12,
+                voice_evidence_count=7,
+            ),
+        ]
+    )
+
+    assert [item["scopeKey"] for item in roster] == [
+        "character:lead",
+        "character:major",
+    ]
+
+
 def test_main_character_slot_migration_and_model_follow_project_conventions():
     migration = (ROOT / "dist/init/106-create-main-character-slot.sql").read_text(
         encoding="utf-8"
@@ -131,7 +172,7 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "p.open_yn = 'Y'" in query
     assert "COALESCE(p.blind_yn, 'N') = 'N'" in query
     assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
-    assert ">= 10" in query
+    assert ">= 15" in query
     assert "(:adult_yn = 'Y' OR p.ratings_code != 'adult')" in query
     assert "SELECT COUNT(*)" in query
     assert "FROM tb_product_episode pe" in query
@@ -213,12 +254,12 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "summary_type = 'character_inventory_v3'" in query
         assert "is_active = 'Y'" in query
         assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
-        assert ">= 10" in query
+        assert ">= 15" in query
         assert "character_inventory'" not in query
         assert "relation_inventory" not in query
         assert response == {"data": []}
 
-    async def test_product_search_only_returns_consented_products_with_ten_public_episodes(self):
+    async def test_product_search_only_returns_consented_products_with_fifteen_public_episodes(self):
         from app.services.product import main_character_slot_service
 
         db = AsyncMock()
@@ -239,7 +280,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "summary_type = 'character_inventory_v3'" in query
         assert "$.public_chat_eligible" in query
         assert "$.display_safety.status" in query
-        assert params["minimum_open_episode_count"] == 10
+        assert params["minimum_open_episode_count"] == 15
         assert response == {"data": []}
 
     async def test_selection_validation_rejects_scope_missing_from_strict_roster(self):

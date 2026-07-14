@@ -2589,6 +2589,32 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual([target["character_key"] for target in targets], ["character:백이현"])
 
+    def test_inventory_rp_targets_default_to_two_and_preserve_other_valid_scopes(self):
+        module = load_module()
+        inventory = {
+            f"character:{name}": {
+                "canonical_character_key": f"character:{name}",
+                "display_name": name,
+                "aliases": [name],
+                "is_protagonist": name == "백이현",
+                "distinct_episode_count": episode_count,
+                "voice_evidence_count": episode_count,
+            }
+            for name, episode_count in (("백이현", 15), ("동료", 12), ("라이벌", 10))
+        }
+
+        targets = module.build_inventory_rp_targets(inventory)
+        retained_scope_keys = module.build_inventory_rp_retained_scope_keys(inventory)
+
+        self.assertEqual(
+            [target["character_key"] for target in targets],
+            ["character:백이현", "character:동료"],
+        )
+        self.assertEqual(
+            retained_scope_keys,
+            {"character:백이현", "character:동료", "character:라이벌"},
+        )
+
     def test_direct_voice_quality_accepts_distributed_first_person_monologue(self):
         module = load_module()
         target = {
