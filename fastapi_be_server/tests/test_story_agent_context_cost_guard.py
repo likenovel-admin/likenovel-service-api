@@ -186,6 +186,49 @@ class FakeStatusErrorAsyncClient:
 
 
 class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
+    def test_partial_full_build_scopes_downstream_rows_without_cleanup(self):
+        module = load_module()
+        product_rows = [
+            {"episode_id": 1000 + episode_no, "episode_no": episode_no}
+            for episode_no in range(1, 16)
+        ]
+        active_rows = [
+            {
+                "scope_key": f"episode:{1000 + episode_no}",
+                "episode_from": episode_no,
+            }
+            for episode_no in range(1, 24)
+        ]
+
+        selected_rows, cleanup_missing_scopes = module.select_full_build_episode_rows(
+            product_rows=product_rows,
+            episode_summary_rows=active_rows,
+            args=SimpleNamespace(
+                episode_ids=[],
+                episode_nos=list(range(1, 16)),
+                limit=0,
+            ),
+        )
+
+        self.assertEqual(
+            [int(row["episode_from"]) for row in selected_rows],
+            list(range(1, 16)),
+        )
+        self.assertFalse(cleanup_missing_scopes)
+
+    def test_unfiltered_full_build_keeps_all_rows_and_cleanup(self):
+        module = load_module()
+        active_rows = [{"scope_key": "episode:1001", "episode_from": 1}]
+
+        selected_rows, cleanup_missing_scopes = module.select_full_build_episode_rows(
+            product_rows=[{"episode_id": 1001, "episode_no": 1}],
+            episode_summary_rows=active_rows,
+            args=SimpleNamespace(episode_ids=[], episode_nos=[], limit=0),
+        )
+
+        self.assertIs(selected_rows, active_rows)
+        self.assertTrue(cleanup_missing_scopes)
+
     async def test_rp_examples_hash_changes_when_provenance_changes(self):
         module = load_module()
         common = {
