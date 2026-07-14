@@ -679,6 +679,7 @@ def _build_websochat_billing_status_payload(
 
 
 WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE = "비공개된 작품과는 더이상 이야기하실 수 없습니다."
+WEBSOCHAT_CONSENT_DISABLED_MESSAGE = "작가의 웹소챗 이용 동의가 해제되어 새 대화를 이어갈 수 없습니다."
 WEBSOCHAT_CONTEXT_PENDING_MESSAGE = "이 작품은 아직 대화 준비 중입니다."
 WEBSOCHAT_CONTEXT_DISABLED_MESSAGE = "현재 웹소챗이 비활성화된 작품입니다."
 WEBSOCHAT_ACCESS_REQUIRED_MESSAGE = "구매/대여한 회차 또는 무료 공개 회차 범위 안에서만 웹소챗을 사용할 수 있습니다."
@@ -1648,6 +1649,7 @@ async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSessio
         WHERE p.product_id = :product_id
           AND p.open_yn = 'Y'
           AND p.blind_yn = 'N'
+          AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
           AND COALESCE(sacp.context_status, 'pending') = 'ready'
           {ratings_filter}
         GROUP BY p.product_id, p.title, p.author_name, p.story_agent_setting_text, p.thumbnail_file_id, p.status_code, p.price_type, sacp.context_status, sacp.ready_episode_count
@@ -1679,6 +1681,7 @@ async def _get_websochat_product_session_state(
             p.price_type AS priceType,
             p.open_yn AS openYn,
             p.blind_yn AS blindYn,
+            COALESCE(p.ai_content_service_enabled_yn, 'N') AS aiContentServiceEnabledYn,
             p.ratings_code AS ratingsCode,
             COALESCE(sacp.context_status, 'pending') AS contextStatus,
             COALESCE(MAX(e.episode_no), 0) AS latestEpisodeNo,
@@ -1700,6 +1703,7 @@ async def _get_websochat_product_session_state(
             p.price_type,
             p.open_yn,
             p.blind_yn,
+            p.ai_content_service_enabled_yn,
             p.ratings_code,
             sacp.context_status,
             sacp.ready_episode_count
@@ -1723,6 +1727,7 @@ async def _get_websochat_product_session_state(
     can_send_message = (
         product.get("openYn") == "Y"
         and product.get("blindYn") == "N"
+        and product.get("aiContentServiceEnabledYn") == "Y"
         and product.get("contextStatus") == "ready"
         and int(product.get("latestEpisodeNo") or 0) > 0
         and _resolve_websochat_synced_latest_episode_no(product) > 0
@@ -1736,6 +1741,8 @@ async def _get_websochat_product_session_state(
             or int(product.get("latestEpisodeNo") or 0) <= 0
         ):
             unavailable_message = WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE
+        elif product.get("aiContentServiceEnabledYn") != "Y":
+            unavailable_message = WEBSOCHAT_CONSENT_DISABLED_MESSAGE
         elif product.get("contextStatus") == "disabled":
             unavailable_message = WEBSOCHAT_CONTEXT_DISABLED_MESSAGE
         elif product.get("contextStatus") != "ready":
@@ -7078,6 +7085,7 @@ async def search_products(
          AND e.open_yn = 'Y'
         WHERE p.open_yn = 'Y'
           AND p.blind_yn = 'N'
+          AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
           {ratings_filter}
           AND (
             p.title LIKE :keyword
