@@ -1016,6 +1016,9 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
         "pe.use_yn = 'Y'",
         "pe.open_yn = 'Y'",
         "p.open_yn = 'Y'",
+        "COALESCE(p.blind_yn, 'N') = 'N'",
+        "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'",
+        "COALESCE(sacp.context_status, 'pending') <> 'disabled'",
     ]
     params: list[object] = []
 
@@ -1065,6 +1068,8 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
         FROM tb_product p
         JOIN tb_product_episode pe
           ON pe.product_id = p.product_id
+        LEFT JOIN tb_story_agent_context_product sacp
+          ON sacp.product_id = p.product_id
         {file_join_sql}
         WHERE {where_sql}
         ORDER BY p.product_id ASC, pe.episode_no ASC

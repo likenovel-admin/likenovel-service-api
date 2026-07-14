@@ -20,6 +20,8 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("p.price_type IN ('free', 'paid')", script)
         self.assertIn("p.status_code = 'ongoing'", script)
         self.assertIn("p.blind_yn = 'N'", script)
+        self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", script)
+        self.assertIn("COALESCE(sacp.context_status, 'pending') <> 'disabled'", script)
         self.assertIn("tb_story_agent_context_summary", script)
         self.assertIn("sacs.summary_type = 'episode_summary'", script)
         self.assertIn("sacs.is_active = 'Y'", script)

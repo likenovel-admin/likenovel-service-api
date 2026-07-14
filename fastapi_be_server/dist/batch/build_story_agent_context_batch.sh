@@ -226,6 +226,7 @@ FROM (
     AND p.status_code = 'ongoing'
     AND p.open_yn = 'Y'
     AND p.blind_yn = 'N'
+    AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
     AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
   GROUP BY
     p.product_id,
