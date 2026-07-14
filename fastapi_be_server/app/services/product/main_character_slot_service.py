@@ -245,6 +245,104 @@ async def search_admin_main_character_slot_products(
     return {"data": [dict(row) for row in result.mappings().all()]}
 
 
+def _admin_main_character_slot_product_where_clause() -> str:
+    return """
+        WHERE p.open_yn = 'Y'
+          AND COALESCE(p.blind_yn, 'N') = 'N'
+          AND EXISTS (
+              SELECT 1
+              FROM tb_product_episode pe
+              WHERE pe.product_id = p.product_id
+                AND pe.use_yn = 'Y'
+                AND pe.open_yn = 'Y'
+          )
+          AND (
+              :search_word = '%%'
+              OR p.title LIKE :search_word
+              OR p.author_name LIKE :search_word
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM tb_story_agent_context_summary sacs
+              WHERE sacs.product_id = p.product_id
+                AND sacs.summary_type = 'character_inventory_v3'
+                AND sacs.is_active = 'Y'
+                AND JSON_VALID(sacs.summary_text)
+                AND LOWER(TRIM(JSON_UNQUOTE(
+                    JSON_EXTRACT(sacs.summary_text, '$.display_safety.status')
+                ))) = 'pass'
+                AND JSON_TYPE(
+                    JSON_EXTRACT(sacs.summary_text, '$.public_slot_eligible')
+                ) = 'BOOLEAN'
+                AND JSON_UNQUOTE(
+                    JSON_EXTRACT(sacs.summary_text, '$.public_slot_eligible')
+                ) = 'true'
+                AND TRIM(JSON_UNQUOTE(
+                    JSON_EXTRACT(sacs.summary_text, '$.work_role')
+                )) = 'main_protagonist'
+                AND TRIM(COALESCE(JSON_UNQUOTE(
+                    JSON_EXTRACT(sacs.summary_text, '$.canonical_character_key')
+                ), '')) != ''
+                AND TRIM(COALESCE(JSON_UNQUOTE(
+                    JSON_EXTRACT(sacs.summary_text, '$.display_name')
+                ), '')) != ''
+          )
+    """
+
+
+async def get_admin_main_character_slot_products(
+    *,
+    page: int,
+    count_per_page: int,
+    search_word: str | None,
+    db: AsyncSession,
+):
+    normalized_search_word = (search_word or "").strip()
+    search_params = {"search_word": f"%{normalized_search_word}%"}
+    where_clause = _admin_main_character_slot_product_where_clause()
+
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) AS total_count FROM tb_product p {where_clause}"),
+        search_params,
+    )
+    count_row = count_result.mappings().first()
+    total_count = int(dict(count_row or {}).get("total_count") or 0)
+
+    limit_clause, limit_params = get_pagination_params(page, count_per_page)
+    result = await db.execute(
+        text(f"""
+            SELECT
+                p.product_id AS productId,
+                p.title,
+                p.author_name AS authorNickname,
+                cf.file_path AS coverImagePath,
+                episode_stats.open_episode_count AS openEpisodeCount
+            FROM tb_product p
+            INNER JOIN (
+                SELECT product_id, COUNT(*) AS open_episode_count
+                FROM tb_product_episode
+                WHERE use_yn = 'Y' AND open_yn = 'Y'
+                GROUP BY product_id
+            ) episode_stats ON episode_stats.product_id = p.product_id
+            LEFT JOIN (
+                SELECT cf.file_group_id, cfi.file_path
+                FROM tb_common_file cf
+                INNER JOIN tb_common_file_item cfi
+                    ON cfi.file_group_id = cf.file_group_id
+                   AND cfi.use_yn = 'Y'
+                WHERE cf.use_yn = 'Y' AND cf.group_type = 'cover'
+            ) cf ON cf.file_group_id = p.thumbnail_file_id
+            {where_clause}
+            ORDER BY p.updated_date DESC, p.product_id DESC
+            {limit_clause}
+        """),
+        {**search_params, **limit_params},
+    )
+    return build_paginated_response(
+        result.mappings().all(), total_count, page, count_per_page
+    )
+
+
 def _main_character_slot_params(
     req_body,
     *,

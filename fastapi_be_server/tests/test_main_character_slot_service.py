@@ -182,6 +182,65 @@ def test_storage_upload_accepts_character_group_type_through_existing_validator(
 
 
 class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_product_picker_lists_only_slot_eligible_products_with_search_and_pagination(self):
+        from app.services.product import main_character_slot_service
+
+        count_result = MagicMock()
+        count_result.mappings.return_value.first.return_value = {"total_count": 2}
+        list_result = MagicMock()
+        list_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "title": "아델리트",
+                "authorNickname": "작가",
+                "coverImagePath": None,
+                "openEpisodeCount": 12,
+            }
+        ]
+        db = AsyncMock()
+        db.execute.side_effect = [count_result, list_result]
+
+        response = await main_character_slot_service.get_admin_main_character_slot_products(
+            page=2,
+            count_per_page=20,
+            search_word=" 작가 ",
+            db=db,
+        )
+
+        count_sql = str(db.execute.await_args_list[0].args[0])
+        list_sql = str(db.execute.await_args_list[1].args[0])
+        for query in (count_sql, list_sql):
+            assert "FROM tb_product_episode pe" in query
+            assert "summary_type = 'character_inventory_v3'" in query
+            assert "is_active = 'Y'" in query
+            assert "JSON_VALID" in query
+            assert "public_slot_eligible" in query
+            assert "main_protagonist" in query
+            assert "display_safety" in query
+            assert "p.title LIKE :search_word" in query
+            assert "p.author_name LIKE :search_word" in query
+        assert "LIMIT :limit_count OFFSET :offset_count" in list_sql
+        assert db.execute.await_args_list[0].args[1] == {"search_word": "%작가%"}
+        assert db.execute.await_args_list[1].args[1] == {
+            "search_word": "%작가%",
+            "limit_count": 20,
+            "offset_count": 20,
+        }
+        assert response == {
+            "total_count": 2,
+            "page": 2,
+            "count_per_page": 20,
+            "results": [
+                {
+                    "productId": 1182,
+                    "title": "아델리트",
+                    "authorNickname": "작가",
+                    "coverImagePath": None,
+                    "openEpisodeCount": 12,
+                }
+            ],
+        }
+
     async def test_roster_query_reads_only_active_character_inventory_v3(self):
         from app.services.product import main_character_slot_service
 
@@ -316,6 +375,9 @@ def test_main_character_slot_router_service_model_schema_imports_and_routes():
     assert main_character_slot_service
     assert "/products/main-character-slots" in {route.path for route in main_query.router.routes}
     assert "/admins/main-character-slots" in {route.path for route in admin_query.router.routes}
+    assert "/admins/main-character-slots/products" in {
+        route.path for route in admin_query.router.routes
+    }
     assert "/admins/main-character-slots/products/{product_id}/characters" in {
         route.path for route in admin_query.router.routes
     }
