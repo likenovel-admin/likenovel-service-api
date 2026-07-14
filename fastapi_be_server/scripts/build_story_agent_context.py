@@ -53,7 +53,7 @@ RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma
 RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
 RP_OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("STORY_AGENT_RP_OPENROUTER_TIMEOUT_SECONDS", "90"))
 RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "3"))
-RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "12"))
+RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "2"))
 RP_DIALOGUE_FALLBACK_MAX_EPISODES = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_MAX_EPISODES", "18"))
 RP_DIALOGUE_FALLBACK_EXCERPT_CHARS = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_EXCERPT_CHARS", "4600"))
 RP_REASONING_MODEL = os.getenv("STORY_AGENT_RP_REASONING_MODEL", "").strip()
@@ -5507,6 +5507,25 @@ def build_inventory_rp_targets(
     return [target for _, target in sorted(candidates, key=lambda item: item[0])[:limit]]
 
 
+def build_inventory_rp_retained_scope_keys(
+    inventory_map: dict[str, dict[str, object]],
+) -> set[str]:
+    retained_scope_keys: set[str] = set()
+    for scope_key, inventory_item in (inventory_map or {}).items():
+        inventory_payload = dict(inventory_item or {})
+        if not is_batch_rp_candidate(inventory_payload):
+            continue
+        target = build_inventory_rp_target(
+            scope_key=str(scope_key), inventory_item=inventory_payload
+        )
+        if not target or get_rp_target_skip_reason(target):
+            continue
+        retained_scope_keys.update(
+            build_inventory_scope_alias_keys(str(scope_key), inventory_payload)
+        )
+    return retained_scope_keys
+
+
 def build_inventory_scope_alias_key_candidates(scope_key: str, inventory_item: dict[str, object] | None) -> list[str]:
     alias_keys: list[str] = []
 
@@ -5907,7 +5926,7 @@ async def build_rp_summaries(
         conn,
         product_id=product_id,
     )
-    valid_scope_keys: set[str] = set()
+    valid_scope_keys = build_inventory_rp_retained_scope_keys(inventory_map or {})
     for target in targets:
         character_key = str(target.get("character_key") or "").strip()
         if not character_key:
@@ -6183,6 +6202,17 @@ async def build_rp_summaries_delta(
             summary_type="character_rp_examples",
         )
     source_scope_key_map = build_inventory_source_scope_key_map(inventory_map or {})
+    selected_scope_keys: set[str] = set()
+    for selected_target in build_inventory_rp_targets(inventory_map or {}):
+        selected_scope_key = str(selected_target.get("character_key") or "").strip()
+        if not selected_scope_key:
+            continue
+        selected_scope_keys.update(
+            build_inventory_scope_alias_keys(
+                selected_scope_key,
+                dict((inventory_map or {}).get(selected_scope_key) or {}),
+            )
+        )
     processed_scope_keys: set[str] = set()
     for scope_key in sorted(affected_scope_keys):
         raw_scope_key = str(scope_key or "").strip()
@@ -6190,6 +6220,17 @@ async def build_rp_summaries_delta(
         if not scope_key or scope_key in processed_scope_keys:
             continue
         processed_scope_keys.add(scope_key)
+        if (
+            raw_scope_key not in selected_scope_keys
+            and scope_key not in selected_scope_keys
+        ):
+            logger.info(
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s",
+                product_id,
+                scope_key,
+                "target_limit",
+            )
+            continue
         inventory_item = dict(inventory_map.get(scope_key) or {})
         if not inventory_item:
             with work_cursor(conn) as cur:
