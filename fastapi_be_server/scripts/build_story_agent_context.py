@@ -2724,8 +2724,6 @@ def get_rp_target_skip_reason(target: dict[str, object]) -> str:
         return "generic_display_name"
     if display_safety_status and display_safety_status != "pass":
         return f"display_safety_{display_safety_status}"
-    if target.get("public_chat_eligible") is False:
-        return "not_public_chat_eligible"
     return ""
 
 

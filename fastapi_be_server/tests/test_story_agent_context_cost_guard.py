@@ -2589,6 +2589,27 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual([target["character_key"] for target in targets], ["character:백이현"])
 
+    def test_inventory_rp_targets_do_not_require_public_chat_voice_gate(self):
+        module = load_module()
+        targets = module.build_inventory_rp_targets(
+            {
+                "character:전승택": {
+                    "canonical_character_key": "character:전승택",
+                    "display_name": "전승택",
+                    "aliases": ["전승택", "승택"],
+                    "is_protagonist": True,
+                    "distinct_episode_count": 16,
+                    "public_chat_eligible": False,
+                    "display_safety": {
+                        "status": "pass",
+                        "reason": "resolved_named_identity",
+                    },
+                }
+            }
+        )
+
+        self.assertEqual([target["character_key"] for target in targets], ["character:전승택"])
+
     def test_inventory_rp_targets_default_to_two_and_preserve_other_valid_scopes(self):
         module = load_module()
         inventory = {
