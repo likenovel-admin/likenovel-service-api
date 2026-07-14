@@ -709,7 +709,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
-             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"):
+             patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"), \
+             patch.object(module, "DEEPSEEK_OPENROUTER_PROVIDER_ONLY", "together"):
             payload = await module.request_episode_character_signals_payload(
                 client,
                 row={"episode_no": 1, "title": "테스트", "episode_title": "1화"},
@@ -720,6 +721,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["url"], "https://openrouter.ai/api/v1/chat/completions")
         self.assertEqual(client.calls[0]["json"]["model"], "google/gemma-4-31b-it")
+        self.assertEqual(
+            client.calls[0]["json"]["provider"],
+            {"only": ["together"], "order": ["together"], "allow_fallbacks": False},
+        )
         self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals OpenRouter")
 
     async def test_episode_character_signals_openrouter_timeout_does_not_hang(self):
@@ -747,6 +752,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "DEEPSEEK_OPENROUTER_PROVIDER_ONLY", "together"), \
              patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS", 0.01):
             payload = await module.request_episode_scene_extraction_payload(
                 client,
@@ -762,6 +768,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(payload, {})
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(client.calls[0]["json"]["model"], "google/gemma-4-31b-it")
+        self.assertEqual(
+            client.calls[0]["json"]["provider"],
+            {"only": ["together"], "order": ["together"], "allow_fallbacks": False},
+        )
 
     def test_episode_scene_extraction_defaults_to_compact_deepseek_request(self):
         with patch.dict(
