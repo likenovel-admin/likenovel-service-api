@@ -51,6 +51,10 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 EPISODE_SUMMARY_MODEL = os.getenv("STORY_AGENT_SUMMARY_MODEL", "deepseek/deepseek-v3.2").strip()
 RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma-4-31b-it").strip()
 RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
+DEEPSEEK_OPENROUTER_PROVIDER_ONLY = os.getenv(
+    "STORY_AGENT_DEEPSEEK_OPENROUTER_PROVIDER_ONLY",
+    "together",
+).strip()
 RP_OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("STORY_AGENT_RP_OPENROUTER_TIMEOUT_SECONDS", "90"))
 RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "3"))
 RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "2"))
@@ -1373,7 +1377,7 @@ def build_rp_openrouter_payload(
 
 
 def build_character_signals_openrouter_payload(*, user_prompt: str) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "model": require_paid_character_signals_openrouter_model(),
         "temperature": 0.0,
         "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
@@ -1387,10 +1391,18 @@ def build_character_signals_openrouter_payload(*, user_prompt: str) -> dict[str,
             {"role": "user", "content": user_prompt},
         ],
     }
+    provider_only = split_csv_values(DEEPSEEK_OPENROUTER_PROVIDER_ONLY)
+    if provider_only:
+        payload["provider"] = {
+            "only": provider_only,
+            "order": provider_only,
+            "allow_fallbacks": len(provider_only) > 1,
+        }
+    return payload
 
 
 def build_episode_scene_extraction_openrouter_payload(*, user_prompt: str) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "model": require_paid_episode_scene_extraction_openrouter_model(),
         "temperature": 0.0,
         "max_tokens": EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS,
@@ -1404,6 +1416,14 @@ def build_episode_scene_extraction_openrouter_payload(*, user_prompt: str) -> di
             {"role": "user", "content": user_prompt},
         ],
     }
+    provider_only = split_csv_values(DEEPSEEK_OPENROUTER_PROVIDER_ONLY)
+    if provider_only:
+        payload["provider"] = {
+            "only": provider_only,
+            "order": provider_only,
+            "allow_fallbacks": len(provider_only) > 1,
+        }
+    return payload
 
 
 async def request_rp_openrouter_json_payload(
