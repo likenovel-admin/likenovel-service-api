@@ -9,7 +9,8 @@ from app.utils.query import get_file_path_sub_query, get_pagination_params
 from app.utils.response import build_paginated_response
 
 
-MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT = 10
+MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT = 15
+MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT = 2
 
 
 def _normalize_aliases(raw_aliases) -> list[str]:
@@ -24,7 +25,7 @@ def _normalize_aliases(raw_aliases) -> list[str]:
 
 
 def extract_eligible_main_character_roster(rows) -> list[dict]:
-    roster: list[dict] = []
+    roster: list[tuple[tuple[object, ...], dict]] = []
     seen_scope_keys: set[str] = set()
     for row in rows:
         row_data = dict(row)
@@ -47,13 +48,30 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
             continue
         seen_scope_keys.add(scope_key)
         roster.append(
-            {
-                "scopeKey": scope_key,
-                "displayName": display_name,
-                "aliases": _normalize_aliases(payload.get("aliases")),
-            }
+            (
+                (
+                    0
+                    if str(payload.get("work_role") or "").strip().lower()
+                    == "main_protagonist"
+                    or payload.get("is_protagonist") is True
+                    else 1,
+                    -int(payload.get("distinct_episode_count") or 0),
+                    -int(payload.get("voice_evidence_count") or 0),
+                    display_name,
+                ),
+                {
+                    "scopeKey": scope_key,
+                    "displayName": display_name,
+                    "aliases": _normalize_aliases(payload.get("aliases")),
+                },
+            )
         )
-    return roster
+    return [
+        item
+        for _, item in sorted(roster, key=lambda candidate: candidate[0])[
+            :MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT
+        ]
+    ]
 
 
 async def _load_eligible_main_character_roster(
