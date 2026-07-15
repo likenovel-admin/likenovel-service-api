@@ -24,6 +24,41 @@ def _normalize_aliases(raw_aliases) -> list[str]:
     return aliases
 
 
+def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
+    canonical_scope_key = f"""COALESCE(
+        NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+            {inventory_alias}.summary_text, '$.canonical_character_key'
+        ))), ''),
+        {inventory_alias}.scope_key
+    )"""
+    return f"""
+        AND EXISTS (
+            SELECT 1
+            FROM tb_story_agent_context_summary profile
+            WHERE profile.product_id = {inventory_alias}.product_id
+              AND profile.scope_key = {canonical_scope_key}
+              AND profile.summary_type = 'character_rp_profile'
+              AND profile.is_active = 'Y'
+              AND JSON_VALID(profile.summary_text)
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM tb_story_agent_context_summary examples
+            WHERE examples.product_id = {inventory_alias}.product_id
+              AND examples.scope_key = {canonical_scope_key}
+              AND examples.summary_type = 'character_rp_examples'
+              AND examples.is_active = 'Y'
+              AND JSON_VALID(examples.summary_text)
+              AND JSON_TYPE(JSON_EXTRACT(
+                  examples.summary_text, '$.examples'
+              )) = 'ARRAY'
+              AND JSON_LENGTH(JSON_EXTRACT(
+                  examples.summary_text, '$.examples'
+              )) > 0
+        )
+    """
+
+
 def extract_eligible_main_character_roster(rows) -> list[dict]:
     roster: list[tuple[tuple[object, ...], dict]] = []
     seen_scope_keys: set[str] = set()
@@ -85,6 +120,7 @@ async def _load_eligible_main_character_roster(
             WHERE sacs.product_id = :product_id
               AND sacs.summary_type = 'character_inventory_v3'
               AND sacs.is_active = 'Y'
+              AND JSON_VALID(sacs.summary_text)
               AND p.open_yn = 'Y'
               AND COALESCE(p.blind_yn, 'N') = 'N'
               AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
@@ -95,6 +131,7 @@ async def _load_eligible_main_character_roster(
                     AND pe.use_yn = 'Y'
                     AND pe.open_yn = 'Y'
               ) >= {MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT}
+              {_chat_ready_rp_assets_predicate("sacs")}
             ORDER BY sacs.summary_id DESC
         """),
         {"product_id": product_id},
@@ -290,6 +327,103 @@ async def search_admin_main_character_slot_products(
         },
     )
     return {"data": [dict(row) for row in result.mappings().all()]}
+
+
+def _admin_chat_ready_product_where_clause() -> str:
+    return f"""
+        WHERE p.open_yn = 'Y'
+          AND COALESCE(p.blind_yn, 'N') = 'N'
+          AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
+          AND (
+              SELECT COUNT(*)
+              FROM tb_product_episode pe
+              WHERE pe.product_id = p.product_id
+                AND pe.use_yn = 'Y'
+                AND pe.open_yn = 'Y'
+          ) >= :minimum_open_episode_count
+          AND (
+              :search_word = '%%'
+              OR p.title LIKE :search_word
+              OR p.author_name LIKE :search_word
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM tb_story_agent_context_summary inventory
+              WHERE inventory.product_id = p.product_id
+                AND inventory.summary_type = 'character_inventory_v3'
+                AND inventory.is_active = 'Y'
+                AND JSON_VALID(inventory.summary_text)
+                AND JSON_UNQUOTE(JSON_EXTRACT(
+                    inventory.summary_text, '$.public_chat_eligible'
+                )) = 'true'
+                AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                    inventory.summary_text, '$.display_safety.status'
+                )))) = 'pass'
+                AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                    inventory.summary_text, '$.canonical_character_key'
+                )), '')) != ''
+                AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                    inventory.summary_text, '$.display_name'
+                )), '')) != ''
+                {_chat_ready_rp_assets_predicate("inventory")}
+          )
+    """
+
+
+async def get_admin_main_character_slot_products(
+    *,
+    page: int,
+    count_per_page: int,
+    search_word: str | None,
+    db: AsyncSession,
+):
+    normalized_search_word = (search_word or "").strip()
+    params = {
+        "search_word": f"%{normalized_search_word}%",
+        "minimum_open_episode_count": MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT,
+    }
+    where_clause = _admin_chat_ready_product_where_clause()
+
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) AS total_count FROM tb_product p {where_clause}"),
+        params,
+    )
+    count_row = count_result.mappings().first()
+    total_count = int(dict(count_row or {}).get("total_count") or 0)
+
+    limit_clause, limit_params = get_pagination_params(page, count_per_page)
+    result = await db.execute(
+        text(f"""
+            SELECT
+                p.product_id AS productId,
+                p.title,
+                p.author_name AS authorNickname,
+                cf.file_path AS coverImagePath,
+                (
+                    SELECT COUNT(*)
+                    FROM tb_product_episode pe
+                    WHERE pe.product_id = p.product_id
+                      AND pe.use_yn = 'Y'
+                      AND pe.open_yn = 'Y'
+                ) AS openEpisodeCount
+            FROM tb_product p
+            LEFT JOIN (
+                SELECT cf.file_group_id, cfi.file_path
+                FROM tb_common_file cf
+                INNER JOIN tb_common_file_item cfi
+                    ON cfi.file_group_id = cf.file_group_id
+                   AND cfi.use_yn = 'Y'
+                WHERE cf.use_yn = 'Y' AND cf.group_type = 'cover'
+            ) cf ON cf.file_group_id = p.thumbnail_file_id
+            {where_clause}
+            ORDER BY p.updated_date DESC, p.product_id DESC
+            {limit_clause}
+        """),
+        {**params, **limit_params},
+    )
+    return build_paginated_response(
+        result.mappings().all(), total_count, page, count_per_page
+    )
 
 
 def _main_character_slot_params(
