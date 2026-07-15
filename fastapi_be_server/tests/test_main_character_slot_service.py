@@ -415,15 +415,40 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             {
                 **_row(distinct_episode_count=15),
                 "productId": 1192,
-                "exampleCount": 5,
-                "sceneCount": 5,
             }
+        ]
+        asset_result = MagicMock()
+        asset_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1192,
+                "scopeKey": "character:adelite",
+                "summaryType": "character_rp_profile",
+                "exampleCount": 0,
+            },
+            {
+                "productId": 1192,
+                "scopeKey": "character:adelite",
+                "summaryType": "character_rp_examples",
+                "exampleCount": 5,
+            },
+        ]
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1192,
+                "summaryText": json.dumps(
+                    {"characters": ["character:adelite"]}, ensure_ascii=False
+                ),
+            }
+            for _ in range(5)
         ]
         db = AsyncMock()
         db.execute.side_effect = [
             count_result,
             list_result,
             candidate_result,
+            asset_result,
+            scene_result,
         ]
 
         response = await main_character_slot_service.get_admin_main_character_slot_products(
@@ -450,9 +475,13 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert params["minimum_open_episode_count"] == 15
         assert params["limit_count"] == 20
         assert params["offset_count"] == 20
-        quality_query = str(db.execute.await_args_list[2].args[0])
-        assert "summary_type = 'episode_scene_extraction'" in quality_query
-        assert "JSON_QUOTE" in quality_query
+        candidate_query = str(db.execute.await_args_list[2].args[0])
+        asset_query = str(db.execute.await_args_list[3].args[0])
+        scene_query = str(db.execute.await_args_list[4].args[0])
+        assert "INSTR" not in candidate_query
+        assert "character_rp_profile" in asset_query
+        assert "character_rp_examples" in asset_query
+        assert "summary_type = 'episode_scene_extraction'" in scene_query
         assert response["total_count"] == 1
         assert response["results"][0]["productId"] == 1192
         assert response["results"][0]["chatQuality"] == "good"
