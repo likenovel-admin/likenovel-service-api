@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 
 from fastapi import status
@@ -453,43 +454,10 @@ async def _load_main_character_chat_quality(
     if not product_ids:
         return {}
 
-    candidate_query = text(f"""
+    candidate_query = text("""
         SELECT
             inventory.product_id AS productId,
-            inventory.summary_text AS summaryText,
-            (
-                SELECT MAX(JSON_LENGTH(JSON_EXTRACT(
-                    examples.summary_text, '$.examples'
-                )))
-                FROM tb_story_agent_context_summary examples
-                WHERE examples.product_id = inventory.product_id
-                  AND examples.scope_key = COALESCE(
-                      NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
-                          inventory.summary_text, '$.canonical_character_key'
-                      ))), ''),
-                      inventory.scope_key
-                  )
-                  AND examples.summary_type = 'character_rp_examples'
-                  AND examples.is_active = 'Y'
-                  AND JSON_VALID(examples.summary_text)
-            ) AS exampleCount,
-            (
-                SELECT COUNT(*)
-                FROM tb_story_agent_context_summary scenes
-                WHERE scenes.product_id = inventory.product_id
-                  AND scenes.summary_type = 'episode_scene_extraction'
-                  AND scenes.is_active = 'Y'
-                  AND INSTR(
-                      scenes.summary_text,
-                      JSON_QUOTE(COALESCE(
-                          NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
-                              inventory.summary_text,
-                              '$.canonical_character_key'
-                          ))), ''),
-                          inventory.scope_key
-                      ))
-                  ) > 0
-            ) AS sceneCount
+            inventory.summary_text AS summaryText
         FROM tb_story_agent_context_summary inventory
         WHERE inventory.product_id IN :product_ids
           AND inventory.summary_type = 'character_inventory_v3'
@@ -501,7 +469,6 @@ async def _load_main_character_chat_quality(
           AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
               inventory.summary_text, '$.display_safety.status'
           )))) = 'pass'
-          {_chat_ready_rp_assets_predicate("inventory")}
         ORDER BY inventory.product_id ASC, inventory.summary_id DESC
     """).bindparams(bindparam("product_ids", expanding=True))
     candidate_result = await db.execute(
@@ -509,8 +476,84 @@ async def _load_main_character_chat_quality(
         {"product_ids": product_ids},
     )
 
+    asset_query = text("""
+        SELECT
+            product_id AS productId,
+            scope_key AS scopeKey,
+            summary_type AS summaryType,
+            CASE
+                WHEN summary_type = 'character_rp_examples'
+                 AND JSON_TYPE(JSON_EXTRACT(summary_text, '$.examples')) = 'ARRAY'
+                THEN JSON_LENGTH(JSON_EXTRACT(summary_text, '$.examples'))
+                ELSE 0
+            END AS exampleCount
+        FROM tb_story_agent_context_summary
+        WHERE product_id IN :product_ids
+          AND summary_type IN ('character_rp_profile', 'character_rp_examples')
+          AND is_active = 'Y'
+          AND JSON_VALID(summary_text)
+    """).bindparams(bindparam("product_ids", expanding=True))
+    asset_result = await db.execute(asset_query, {"product_ids": product_ids})
+
+    scene_query = text("""
+        SELECT product_id AS productId, summary_text AS summaryText
+        FROM tb_story_agent_context_summary
+        WHERE product_id IN :product_ids
+          AND summary_type = 'episode_scene_extraction'
+          AND is_active = 'Y'
+    """).bindparams(bindparam("product_ids", expanding=True))
+    scene_result = await db.execute(scene_query, {"product_ids": product_ids})
+
+    profile_keys: set[tuple[int, str]] = set()
+    example_counts: dict[tuple[int, str], int] = defaultdict(int)
+    for row in asset_result.mappings().all():
+        row_data = dict(row)
+        key = (
+            int(row_data.get("productId") or 0),
+            str(row_data.get("scopeKey") or "").strip(),
+        )
+        if not key[0] or not key[1]:
+            continue
+        if row_data.get("summaryType") == "character_rp_profile":
+            profile_keys.add(key)
+        elif row_data.get("summaryType") == "character_rp_examples":
+            example_counts[key] = max(
+                example_counts[key], int(row_data.get("exampleCount") or 0)
+            )
+
+    scene_texts: dict[int, list[str]] = defaultdict(list)
+    for row in scene_result.mappings().all():
+        row_data = dict(row)
+        scene_texts[int(row_data.get("productId") or 0)].append(
+            str(row_data.get("summaryText") or "")
+        )
+
+    enriched_candidates: list[dict] = []
+    for row in candidate_result.mappings().all():
+        row_data = dict(row)
+        payload = _extract_eligible_character_payload(row_data)
+        if not payload:
+            continue
+        product_id = int(row_data.get("productId") or 0)
+        scope_key = str(payload.get("canonical_character_key") or "").strip()
+        key = (product_id, scope_key)
+        example_count = example_counts.get(key, 0)
+        if key not in profile_keys or example_count <= 0:
+            continue
+        scope_token = json.dumps(scope_key, ensure_ascii=False)
+        enriched_candidates.append(
+            {
+                **row_data,
+                "exampleCount": example_count,
+                "sceneCount": sum(
+                    scope_token in scene_text
+                    for scene_text in scene_texts.get(product_id, [])
+                ),
+            }
+        )
+
     return build_main_character_chat_quality_by_product(
-        candidate_result.mappings().all()
+        enriched_candidates
     )
 
 
