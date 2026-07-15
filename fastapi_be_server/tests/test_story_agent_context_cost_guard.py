@@ -2117,6 +2117,80 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         dialogue_mock.assert_awaited_once()
         profile_mock.assert_awaited_once()
 
+    async def test_rp_build_keeps_enough_verified_rule_based_examples_below_strict_voice_gate(self):
+        module = load_module()
+        conn = FakeConnection()
+        dialogue_items = [
+            {
+                "episode_no": episode_no,
+                "kind": "dialogue",
+                "text": f"검증된 원문 대사 {episode_no}입니다.",
+                "is_example_candidate": True,
+            }
+            for episode_no in range(1, 6)
+        ]
+        profile_payload = {
+            "speech_style": {"tone": "단호"},
+            "personality_core": ["책임감"],
+            "baseline_attitude": "경계",
+            "example_dialogues": [item["text"] for item in dialogue_items[:3]],
+        }
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": False, "status": "direct_limited"}), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=dialogue_items), \
+             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=[])), \
+             patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True)]), \
+             patch.object(module, "deactivate_missing_active_scopes"):
+            counts = await module.build_rp_summaries(
+                conn,
+                product_id=687,
+                episode_rows=[],
+                episode_texts_by_no={episode_no: item["text"] for episode_no, item in enumerate(dialogue_items, 1)},
+                summary_client=object(),
+                inventory_map={
+                    "character:백이현": {
+                        "canonical_character_key": "character:백이현",
+                        "display_name": "백이현",
+                        "aliases": ["백이현"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 5,
+                    }
+                },
+            )
+
+        self.assertEqual(counts, {"profile": (1, 0), "examples": (1, 0)})
+
+    def test_safe_main_protagonist_remains_public_without_summary_voice_label(self):
+        module = load_module()
+        protagonist = {
+            "canonical_character_key": "character:환진",
+            "display_name": "환진",
+            "identity_status": "RESOLVED_NAMED",
+            "identity_conflict_reasons": [],
+            "entity_kind": "person",
+            "work_role": "main_protagonist",
+            "is_protagonist": True,
+            "distinct_episode_count": 14,
+            "voice_mode_counts": {"dialogue": 0, "monologue": 0, "narration_only": 14},
+            "relation_episode_count": 0,
+            "rp_signal_quality": {
+                "status": "insufficient",
+                "needs_review": False,
+            },
+            "display_safety": {
+                "status": "pass",
+                "reason": "resolved_named_identity",
+            },
+        }
+
+        self.assertTrue(module.is_public_chat_inventory_candidate(protagonist))
+        self.assertTrue(module.is_public_slot_inventory_candidate(protagonist))
+
 
 class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
     def test_fetch_active_character_inventory_map_accepts_v3_summary_type(self):
