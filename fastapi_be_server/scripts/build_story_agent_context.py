@@ -5973,10 +5973,11 @@ async def build_rp_summaries(
         )
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
+        direct_dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
         dialogue_items: list[dict[str, object]] = []
         if not bool(direct_voice_quality.get("strict_chat_ready")):
             try:
-                dialogue_items = await collect_llm_rp_dialogue_items(
+                llm_dialogue_items = await collect_llm_rp_dialogue_items(
                     summary_client,
                     target=target,
                     episode_texts_by_no=episode_texts_by_no,
@@ -5985,8 +5986,13 @@ async def build_rp_summaries(
             except Exception as exc:
                 if verbose:
                     print(f"[rp-dialogue-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
-                dialogue_items = []
-            if not is_strict_dialogue_item_set_ready(dialogue_items, aliases):
+                llm_dialogue_items = []
+            dialogue_items = dedupe_rp_dialogue_items(
+                [*direct_dialogue_items, *llm_dialogue_items],
+                limit=80,
+            )
+            dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
+            if sum(bool(item.get("is_example_candidate")) for item in dialogue_items) < RP_PROFILE_MIN_EXAMPLE_TEXTS:
                 if existing_example_rows_by_scope is None:
                     with work_cursor(conn) as cur:
                         existing_example_rows_by_scope = fetch_active_summary_state_map(
@@ -6012,7 +6018,7 @@ async def build_rp_summaries(
                     )
                     continue
         else:
-            dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
+            dialogue_items = direct_dialogue_items
         if not dialogue_items:
             logger.info(
                 "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
@@ -9137,11 +9143,16 @@ def is_public_chat_inventory_candidate(row: dict[str, object]) -> bool:
         return False
     if not (_inventory_identity_is_public_resolved(row) or _has_strong_role_like_persona_evidence(row)):
         return False
-    if str(row.get("work_role") or "") not in {"main_protagonist", "major_character"}:
+    work_role = str(row.get("work_role") or "")
+    if work_role not in {"main_protagonist", "major_character"}:
         return False
-    if str(dict(row.get("rp_signal_quality") or {}).get("status") or "") != "summary_ready":
+    rp_signal_status = str(dict(row.get("rp_signal_quality") or {}).get("status") or "")
+    minimum_episode_count = 3 if work_role == "main_protagonist" and rp_signal_status != "summary_ready" else 2
+    if int(row.get("distinct_episode_count") or 0) < minimum_episode_count:
         return False
-    if int(row.get("distinct_episode_count") or 0) < 2:
+    if work_role == "main_protagonist":
+        return True
+    if rp_signal_status != "summary_ready":
         return False
     voice_counts = dict(row.get("voice_mode_counts") or {})
     speaking_episode_count = int(voice_counts.get("dialogue") or 0) + int(voice_counts.get("monologue") or 0)
@@ -9155,6 +9166,8 @@ def is_public_slot_inventory_candidate(row: dict[str, object]) -> bool:
         return False
     if int(row.get("distinct_episode_count") or 0) < 3:
         return False
+    if str(row.get("work_role") or "") == "main_protagonist":
+        return True
     voice_counts = dict(row.get("voice_mode_counts") or {})
     speaking_episode_count = int(voice_counts.get("dialogue") or 0) + int(voice_counts.get("monologue") or 0)
     return speaking_episode_count >= 2 or int(row.get("relation_episode_count") or 0) >= 2
