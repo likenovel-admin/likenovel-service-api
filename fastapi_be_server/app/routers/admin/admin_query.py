@@ -71,6 +71,28 @@ async def main_character_slot_product_search(
 
 
 @router.get(
+    "/main-character-slots/products",
+    tags=["CMS - 메인 주인공 카드"],
+    responses={200: {"description": "캐릭터챗 준비 완료 작품 목록"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def main_character_slot_products(
+    page: int = Query(1, ge=1, description="페이지"),
+    count_per_page: int = Query(20, ge=1, le=100, description="한 페이지 내 갯수"),
+    search_word: str = Query(default="", description="작품명 또는 작가명 검색어"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.get_admin_main_character_slot_products(
+        page=page,
+        count_per_page=count_per_page,
+        search_word=search_word,
+        db=db,
+    )
+
+
+@router.get(
     "/main-character-slots/products/{product_id}/characters",
     tags=["CMS - 메인 주인공 카드"],
     responses={200: {"description": "작품의 메인 주인공 슬롯 로스터"}},

@@ -253,8 +253,12 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         query = str(db.execute.await_args.args[0])
         assert "summary_type = 'character_inventory_v3'" in query
         assert "is_active = 'Y'" in query
+        assert "JSON_VALID(sacs.summary_text)" in query
         assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
         assert ">= 15" in query
+        assert "summary_type = 'character_rp_profile'" in query
+        assert "summary_type = 'character_rp_examples'" in query
+        assert "JSON_LENGTH" in query
         assert "character_inventory'" not in query
         assert "relation_inventory" not in query
         assert response == {"data": []}
@@ -282,6 +286,51 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "$.display_safety.status" in query
         assert params["minimum_open_episode_count"] == 15
         assert response == {"data": []}
+
+    async def test_product_picker_lists_only_chat_ready_products_with_search_and_pagination(self):
+        from app.services.product import main_character_slot_service
+
+        count_result = MagicMock()
+        count_result.mappings.return_value.first.return_value = {"total_count": 1}
+        list_result = MagicMock()
+        list_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1192,
+                "title": "테스트 작품",
+                "authorNickname": "테스트 작가",
+                "coverImagePath": None,
+                "openEpisodeCount": 15,
+            }
+        ]
+        db = AsyncMock()
+        db.execute.side_effect = [count_result, list_result]
+
+        response = await main_character_slot_service.get_admin_main_character_slot_products(
+            page=2,
+            count_per_page=20,
+            search_word=" 테스트 ",
+            db=db,
+        )
+
+        count_query = str(db.execute.await_args_list[0].args[0])
+        list_query = str(db.execute.await_args_list[1].args[0])
+        params = db.execute.await_args_list[1].args[1]
+        for query in (count_query, list_query):
+            assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+            assert "summary_type = 'character_inventory_v3'" in query
+            assert "$.public_chat_eligible" in query
+            assert "$.display_safety.status" in query
+            assert "summary_type = 'character_rp_profile'" in query
+            assert "summary_type = 'character_rp_examples'" in query
+            assert "JSON_LENGTH" in query
+            assert ">= :minimum_open_episode_count" in query
+        assert "p.author_name LIKE :search_word" in list_query
+        assert params["search_word"] == "%테스트%"
+        assert params["minimum_open_episode_count"] == 15
+        assert params["limit_count"] == 20
+        assert params["offset_count"] == 20
+        assert response["total_count"] == 1
+        assert response["results"][0]["productId"] == 1192
 
     async def test_selection_validation_rejects_scope_missing_from_strict_roster(self):
         from app.exceptions import CustomResponseException
@@ -397,6 +446,9 @@ def test_main_character_slot_router_service_model_schema_imports_and_routes():
     assert main_character_slot_service
     assert "/products/main-character-slots" in {route.path for route in main_query.router.routes}
     assert "/admins/main-character-slots" in {route.path for route in admin_query.router.routes}
+    assert "/admins/main-character-slots/products" in {
+        route.path for route in admin_query.router.routes
+    }
     assert "/admins/main-character-slots/products/{product_id}/characters" in {
         route.path for route in admin_query.router.routes
     }
