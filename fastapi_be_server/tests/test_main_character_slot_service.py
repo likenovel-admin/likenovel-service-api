@@ -128,6 +128,114 @@ def test_main_character_slot_roster_keeps_only_top_two_characters():
     ]
 
 
+def test_chat_quality_is_good_when_both_selectable_characters_have_rich_assets():
+    from app.services.product.main_character_slot_service import (
+        build_main_character_chat_quality_by_product,
+    )
+
+    candidates = [
+        {
+            **_row(
+                "character:lead",
+                display_name="주인공",
+                distinct_episode_count=20,
+            ),
+            "productId": 1192,
+            "exampleCount": 5,
+            "sceneCount": 5,
+        },
+        {
+            **_row(
+                "character:major",
+                display_name="주요 인물",
+                work_role="major_character",
+                distinct_episode_count=12,
+            ),
+            "productId": 1192,
+            "exampleCount": 4,
+            "sceneCount": 5,
+        },
+        {
+            **_row(
+                "character:third",
+                display_name="세 번째 인물",
+                work_role="major_character",
+                distinct_episode_count=2,
+            ),
+            "productId": 1192,
+            "exampleCount": 1,
+            "sceneCount": 0,
+        },
+    ]
+
+    assert build_main_character_chat_quality_by_product(candidates) == {
+        1192: "good"
+    }
+
+
+def test_chat_quality_is_normal_when_a_selectable_character_has_few_scenes():
+    from app.services.product.main_character_slot_service import (
+        build_main_character_chat_quality_by_product,
+    )
+
+    candidates = [
+        {
+            **_row(distinct_episode_count=20),
+            "productId": 1170,
+            "exampleCount": 5,
+            "sceneCount": 4,
+        }
+    ]
+
+    assert build_main_character_chat_quality_by_product(candidates) == {
+        1170: "normal"
+    }
+
+
+def test_chat_quality_is_insufficient_without_a_usable_character_scene():
+    from app.services.product.main_character_slot_service import (
+        build_main_character_chat_quality_by_product,
+    )
+
+    candidates = [
+        {
+            **_row("character:ann", display_name="안", distinct_episode_count=20),
+            "productId": 1122,
+            "exampleCount": 5,
+            "sceneCount": 0,
+        }
+    ]
+
+    assert build_main_character_chat_quality_by_product(candidates) == {
+        1122: "insufficient"
+    }
+
+
+def test_chat_quality_ignores_inventory_without_a_selectable_display_name():
+    from app.services.product.main_character_slot_service import (
+        build_main_character_chat_quality_by_product,
+    )
+
+    candidates = [
+        {
+            **_row(distinct_episode_count=20),
+            "productId": 1122,
+            "exampleCount": 5,
+            "sceneCount": 5,
+        },
+        {
+            **_row("character:broken", display_name=""),
+            "productId": 1122,
+            "exampleCount": 0,
+            "sceneCount": 0,
+        },
+    ]
+
+    assert build_main_character_chat_quality_by_product(candidates) == {
+        1122: "good"
+    }
+
+
 def test_main_character_slot_migration_and_model_follow_project_conventions():
     migration = (ROOT / "dist/init/106-create-main-character-slot.sql").read_text(
         encoding="utf-8"
@@ -302,8 +410,21 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "openEpisodeCount": 15,
             }
         ]
+        candidate_result = MagicMock()
+        candidate_result.mappings.return_value.all.return_value = [
+            {
+                **_row(distinct_episode_count=15),
+                "productId": 1192,
+                "exampleCount": 5,
+                "sceneCount": 5,
+            }
+        ]
         db = AsyncMock()
-        db.execute.side_effect = [count_result, list_result]
+        db.execute.side_effect = [
+            count_result,
+            list_result,
+            candidate_result,
+        ]
 
         response = await main_character_slot_service.get_admin_main_character_slot_products(
             page=2,
@@ -329,8 +450,12 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert params["minimum_open_episode_count"] == 15
         assert params["limit_count"] == 20
         assert params["offset_count"] == 20
+        quality_query = str(db.execute.await_args_list[2].args[0])
+        assert "summary_type = 'episode_scene_extraction'" in quality_query
+        assert "JSON_QUOTE" in quality_query
         assert response["total_count"] == 1
         assert response["results"][0]["productId"] == 1192
+        assert response["results"][0]["chatQuality"] == "good"
 
     async def test_selection_validation_rejects_scope_missing_from_strict_roster(self):
         from app.exceptions import CustomResponseException

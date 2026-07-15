@@ -1,5 +1,7 @@
+from collections import defaultdict
+
 from fastapi import status
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.schemas.admin as admin_schema
@@ -11,6 +13,9 @@ from app.utils.response import build_paginated_response
 
 MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT = 15
 MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT = 2
+MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES = 10
+MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES = 4
+MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES = 5
 
 
 def _normalize_aliases(raw_aliases) -> list[str]:
@@ -59,22 +64,42 @@ def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
     """
 
 
+def _extract_eligible_character_payload(row) -> dict | None:
+    row_data = dict(row)
+    payload = _extract_websochat_json_object(
+        str(row_data.get("summaryText") or row_data.get("summary_text") or "")
+    )
+    if not payload:
+        return None
+    display_safety = payload.get("display_safety")
+    if not isinstance(display_safety, dict):
+        return None
+    if str(display_safety.get("status") or "").strip().lower() != "pass":
+        return None
+    if payload.get("public_chat_eligible") is not True:
+        return None
+    return payload
+
+
+def _character_priority(payload: dict) -> tuple[object, ...]:
+    return (
+        0
+        if str(payload.get("work_role") or "").strip().lower()
+        == "main_protagonist"
+        or payload.get("is_protagonist") is True
+        else 1,
+        -int(payload.get("distinct_episode_count") or 0),
+        -int(payload.get("voice_evidence_count") or 0),
+        str(payload.get("display_name") or "").strip(),
+    )
+
+
 def extract_eligible_main_character_roster(rows) -> list[dict]:
     roster: list[tuple[tuple[object, ...], dict]] = []
     seen_scope_keys: set[str] = set()
     for row in rows:
-        row_data = dict(row)
-        payload = _extract_websochat_json_object(
-            str(row_data.get("summaryText") or row_data.get("summary_text") or "")
-        )
+        payload = _extract_eligible_character_payload(row)
         if not payload:
-            continue
-        display_safety = payload.get("display_safety")
-        if not isinstance(display_safety, dict):
-            continue
-        if str(display_safety.get("status") or "").strip().lower() != "pass":
-            continue
-        if payload.get("public_chat_eligible") is not True:
             continue
 
         scope_key = str(payload.get("canonical_character_key") or "").strip()
@@ -84,16 +109,7 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
         seen_scope_keys.add(scope_key)
         roster.append(
             (
-                (
-                    0
-                    if str(payload.get("work_role") or "").strip().lower()
-                    == "main_protagonist"
-                    or payload.get("is_protagonist") is True
-                    else 1,
-                    -int(payload.get("distinct_episode_count") or 0),
-                    -int(payload.get("voice_evidence_count") or 0),
-                    display_name,
-                ),
+                _character_priority(payload),
                 {
                     "scopeKey": scope_key,
                     "displayName": display_name,
@@ -107,6 +123,67 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
             :MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT
         ]
     ]
+
+
+def build_main_character_chat_quality_by_product(candidate_rows) -> dict[int, str]:
+    candidates_by_product: dict[
+        int, list[tuple[tuple[object, ...], dict[str, object]]]
+    ] = defaultdict(list)
+    seen_scope_keys: set[tuple[int, str]] = set()
+    for row in candidate_rows:
+        row_data = dict(row)
+        product_id = int(row_data.get("productId") or 0)
+        payload = _extract_eligible_character_payload(row_data)
+        if not product_id or not payload:
+            continue
+        scope_key = str(payload.get("canonical_character_key") or "").strip()
+        display_name = str(payload.get("display_name") or "").strip()
+        if (
+            not scope_key
+            or not display_name
+            or (product_id, scope_key) in seen_scope_keys
+        ):
+            continue
+        seen_scope_keys.add((product_id, scope_key))
+        candidates_by_product[product_id].append(
+            (
+                _character_priority(payload),
+                {
+                    "scopeKey": scope_key,
+                    "distinctEpisodeCount": int(
+                        payload.get("distinct_episode_count") or 0
+                    ),
+                    "exampleCount": int(row_data.get("exampleCount") or 0),
+                    "sceneCount": int(row_data.get("sceneCount") or 0),
+                },
+            )
+        )
+
+    quality_by_product: dict[int, str] = {}
+    severity = {"good": 0, "normal": 1, "insufficient": 2}
+    for product_id, candidates in candidates_by_product.items():
+        candidate_qualities: list[str] = []
+        for _, candidate in sorted(candidates, key=lambda item: item[0])[
+            :MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT
+        ]:
+            scene_count = candidate["sceneCount"]
+            if scene_count == 0:
+                candidate_qualities.append("insufficient")
+            elif (
+                candidate["distinctEpisodeCount"]
+                >= MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES
+                and candidate["exampleCount"] >= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
+                and scene_count >= MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES
+            ):
+                candidate_qualities.append("good")
+            else:
+                candidate_qualities.append("normal")
+
+        if candidate_qualities:
+            quality_by_product[product_id] = max(
+                candidate_qualities, key=severity.__getitem__
+            )
+    return quality_by_product
 
 
 async def _load_eligible_main_character_roster(
@@ -370,6 +447,73 @@ def _admin_chat_ready_product_where_clause() -> str:
     """
 
 
+async def _load_main_character_chat_quality(
+    product_ids: list[int], db: AsyncSession
+) -> dict[int, str]:
+    if not product_ids:
+        return {}
+
+    candidate_query = text(f"""
+        SELECT
+            inventory.product_id AS productId,
+            inventory.summary_text AS summaryText,
+            (
+                SELECT MAX(JSON_LENGTH(JSON_EXTRACT(
+                    examples.summary_text, '$.examples'
+                )))
+                FROM tb_story_agent_context_summary examples
+                WHERE examples.product_id = inventory.product_id
+                  AND examples.scope_key = COALESCE(
+                      NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                          inventory.summary_text, '$.canonical_character_key'
+                      ))), ''),
+                      inventory.scope_key
+                  )
+                  AND examples.summary_type = 'character_rp_examples'
+                  AND examples.is_active = 'Y'
+                  AND JSON_VALID(examples.summary_text)
+            ) AS exampleCount,
+            (
+                SELECT COUNT(*)
+                FROM tb_story_agent_context_summary scenes
+                WHERE scenes.product_id = inventory.product_id
+                  AND scenes.summary_type = 'episode_scene_extraction'
+                  AND scenes.is_active = 'Y'
+                  AND INSTR(
+                      scenes.summary_text,
+                      JSON_QUOTE(COALESCE(
+                          NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                              inventory.summary_text,
+                              '$.canonical_character_key'
+                          ))), ''),
+                          inventory.scope_key
+                      ))
+                  ) > 0
+            ) AS sceneCount
+        FROM tb_story_agent_context_summary inventory
+        WHERE inventory.product_id IN :product_ids
+          AND inventory.summary_type = 'character_inventory_v3'
+          AND inventory.is_active = 'Y'
+          AND JSON_VALID(inventory.summary_text)
+          AND JSON_UNQUOTE(JSON_EXTRACT(
+              inventory.summary_text, '$.public_chat_eligible'
+          )) = 'true'
+          AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+              inventory.summary_text, '$.display_safety.status'
+          )))) = 'pass'
+          {_chat_ready_rp_assets_predicate("inventory")}
+        ORDER BY inventory.product_id ASC, inventory.summary_id DESC
+    """).bindparams(bindparam("product_ids", expanding=True))
+    candidate_result = await db.execute(
+        candidate_query,
+        {"product_ids": product_ids},
+    )
+
+    return build_main_character_chat_quality_by_product(
+        candidate_result.mappings().all()
+    )
+
+
 async def get_admin_main_character_slot_products(
     *,
     page: int,
@@ -421,9 +565,16 @@ async def get_admin_main_character_slot_products(
         """),
         {**params, **limit_params},
     )
-    return build_paginated_response(
-        result.mappings().all(), total_count, page, count_per_page
+    products = [dict(row) for row in result.mappings().all()]
+    quality_by_product = await _load_main_character_chat_quality(
+        [int(product["productId"]) for product in products],
+        db,
     )
+    for product in products:
+        product["chatQuality"] = quality_by_product.get(
+            int(product["productId"]), "insufficient"
+        )
+    return build_paginated_response(products, total_count, page, count_per_page)
 
 
 def _main_character_slot_params(
