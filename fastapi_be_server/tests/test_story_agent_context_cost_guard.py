@@ -547,6 +547,41 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertNotIn("잡아채", prompt)
         self.assertNotIn("첫 대사의 압박/질문/명령 hook", prompt)
 
+    async def test_character_chat_internal_prompt_uses_dedicated_timeout(self):
+        module = load_module()
+        client = FakeOpenRouterClient(
+            {"internal_prompt": "[핵심 정체성] 이시혁은 상황을 직접 판단하고 움직인다."}
+        )
+
+        payload = await module.request_character_chat_internal_prompt_payload(
+            client,
+            target={"character_key": "character:이시혁", "display_name": "이시혁", "aliases": ["이시혁"]},
+            profile_payload={"display_name": "이시혁", "speech_style": {}, "personality_core": []},
+            example_payload={"examples": []},
+            dialogue_items=[],
+            summary_context_lines=[],
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertGreater(
+            module.CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS,
+            module.RP_OPENROUTER_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            client.calls[0]["timeout"],
+            module.CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS,
+        )
+
+        default_client = FakeOpenRouterClient({"ok": True})
+        await module.request_rp_openrouter_json_payload(
+            default_client,
+            system_prompt="system",
+            user_prompt="user",
+            max_tokens=100,
+            title="test",
+        )
+        self.assertEqual(default_client.calls[0]["timeout"], module.RP_OPENROUTER_TIMEOUT_SECONDS)
+
     async def test_existing_episode_character_signal_reuses_without_llm_call(self):
         module = load_module()
         conn = FakeConnection()

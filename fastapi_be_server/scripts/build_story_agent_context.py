@@ -56,6 +56,9 @@ DEEPSEEK_OPENROUTER_PROVIDER_ONLY = os.getenv(
     "together",
 ).strip()
 RP_OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("STORY_AGENT_RP_OPENROUTER_TIMEOUT_SECONDS", "90"))
+CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS = float(
+    os.getenv("STORY_AGENT_CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS", "180")
+)
 RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "2"))
 RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "2"))
 RP_DIALOGUE_FALLBACK_MAX_EPISODES = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_MAX_EPISODES", "18"))
@@ -1439,7 +1442,9 @@ async def request_rp_openrouter_json_payload(
     max_tokens: int,
     title: str,
     model: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict | None:
+    request_timeout_seconds = timeout_seconds or RP_OPENROUTER_TIMEOUT_SECONDS
     response = await asyncio.wait_for(
         client.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
@@ -1454,8 +1459,9 @@ async def request_rp_openrouter_json_payload(
                 max_tokens=max_tokens,
                 model=model,
             ),
+            timeout=request_timeout_seconds,
         ),
-        timeout=RP_OPENROUTER_TIMEOUT_SECONDS,
+        timeout=request_timeout_seconds,
     )
     response.raise_for_status()
     return extract_json_object(extract_openrouter_message_text(response.json()))
@@ -5060,6 +5066,7 @@ async def request_character_chat_internal_prompt_payload(
         ),
         max_tokens=3200,
         title="LikeNovel Story Agent Character Chat Internal Prompt Batch",
+        timeout_seconds=CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS,
     )
     return normalize_character_chat_internal_prompt_payload(payload)
 
@@ -6291,10 +6298,10 @@ async def build_rp_summaries(
                 "story_agent_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
                 product_id,
                 character_key,
-                str(exc)[:200],
+                repr(exc)[:200],
             )
             if verbose:
-                print(f"[character-chat-prompt-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
+                print(f"[character-chat-prompt-skip] product_id={product_id} character={character_key} error={repr(exc)[:160]}")
         if internal_prompt_payload:
             internal_prompt_payload = {
                 "character_key": character_key,
@@ -6577,7 +6584,7 @@ async def build_rp_summaries_delta(
                     "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s source=alias error=%s",
                     product_id,
                     scope_key,
-                    str(exc)[:200],
+                    repr(exc)[:200],
                 )
                 internal_prompt_payload = None
             if internal_prompt_payload:
@@ -6762,10 +6769,10 @@ async def build_rp_summaries_delta(
                 "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
                 product_id,
                 scope_key,
-                str(exc)[:200],
+                repr(exc)[:200],
             )
             if verbose:
-                print(f"[character-chat-delta-prompt-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
+                print(f"[character-chat-delta-prompt-skip] product_id={product_id} character={scope_key} error={repr(exc)[:160]}")
         if internal_prompt_payload:
             internal_prompt_payload = {
                 "character_key": scope_key,
