@@ -168,6 +168,33 @@ class FakeHangingOpenRouterClient:
         await asyncio.sleep(3600)
 
 
+class FakeRateLimitedOpenRouterClient:
+    def __init__(self, content, *, retry_after: str = "7"):
+        self.content = content
+        self.retry_after = retry_after
+        self.calls = []
+
+    async def post(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        if len(self.calls) == 1:
+            request = httpx.Request("POST", url)
+            return httpx.Response(
+                429,
+                headers={"Retry-After": self.retry_after},
+                request=request,
+            )
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": json.dumps(self.content, ensure_ascii=False)},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+
 class FakeStatusErrorAsyncClient:
     def __init__(self, status_code: int, body: str = ""):
         self.status_code = status_code
@@ -561,16 +588,22 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         activate_existing.assert_called_once_with(ANY, 123, 687, "episode_character_signals", "episode:1001")
         self.assertEqual(conn.commit_count, 1)
 
-    async def test_episode_character_signal_failure_deactivates_stale_scope(self):
+    async def test_episode_character_signal_failure_deactivates_stale_scope_and_stops_product(self):
         module = load_module()
         conn = FakeConnection()
-        row = {
+        rows = [{
             "summary_id": 777,
             "scope_key": "episode:1001",
             "episode_from": 1,
             "source_hash": "episode-summary-hash-new",
             "summary_text": "[1화] 바뀐 회차\n주인공 후보가 바뀐다.\n핵심: 주인공, 후보, 변경",
-        }
+        }, {
+            "summary_id": 778,
+            "scope_key": "episode:1002",
+            "episode_from": 2,
+            "source_hash": "episode-summary-hash-next",
+            "summary_text": "[2화] 다음 회차\n주인공이 앞으로 나아간다.",
+        }]
         request_mock = AsyncMock(side_effect=module.RequestError("upstream timeout"))
 
         with patch.object(module, "work_cursor", fake_work_cursor), \
@@ -580,16 +613,15 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "fetch_existing_summary", return_value=None), \
              patch.object(module, "request_episode_character_signals_payload", request_mock), \
              patch.object(module, "deactivate_active_scope", return_value=1) as deactivate_scope:
-            inserted, reused = await module.build_episode_character_signals_summaries(
-                conn,
-                product_id=687,
-                episode_rows=[row],
-                summary_client=object(),
-                cleanup_missing_scopes=False,
-            )
+            with self.assertRaises(module.RequestError):
+                await module.build_episode_character_signals_summaries(
+                    conn,
+                    product_id=687,
+                    episode_rows=rows,
+                    summary_client=object(),
+                    cleanup_missing_scopes=False,
+                )
 
-        self.assertEqual(inserted, 0)
-        self.assertEqual(reused, 0)
         request_mock.assert_awaited_once()
         deactivate_scope.assert_called_once_with(
             ANY,
@@ -598,6 +630,46 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             scope_key="episode:1001",
         )
         self.assertEqual(conn.commit_count, 1)
+
+    async def test_episode_character_signals_429_honors_retry_after_before_retry(self):
+        module = load_module()
+        client = FakeRateLimitedOpenRouterClient(
+            {
+                "episode_no": 1,
+                "mentioned_characters": [],
+                "cliffhanger_hooks": [],
+            },
+            retry_after="7",
+        )
+
+        with patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module.asyncio, "sleep", AsyncMock()) as sleep_mock:
+            payload = await module.request_episode_character_signals_payload(
+                client,
+                row={"episode_no": 1, "title": "테스트", "episode_title": "1화"},
+                summary_text="[1화] 테스트\n주인공이 움직인다.",
+            )
+
+        self.assertEqual(payload["episode_no"], 1)
+        self.assertEqual(len(client.calls), 2)
+        sleep_mock.assert_awaited_once_with(7.0)
+
+    def test_openrouter_retry_delay_is_bounded_and_rate_limit_only(self):
+        module = load_module()
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+
+        def status_error(status_code: int, retry_after: str | None):
+            headers = {"Retry-After": retry_after} if retry_after is not None else {}
+            response = httpx.Response(status_code, headers=headers, request=request)
+            return httpx.HTTPStatusError("provider error", request=request, response=response)
+
+        self.assertEqual(module.get_openrouter_retry_delay_seconds(status_error(429, "bad")), 10.0)
+        self.assertEqual(module.get_openrouter_retry_delay_seconds(status_error(429, "120")), 60.0)
+        self.assertEqual(module.get_openrouter_retry_delay_seconds(status_error(503, "0")), 1.0)
+        self.assertIsNone(module.get_openrouter_retry_delay_seconds(status_error(400, "10")))
 
     async def test_episode_character_signals_keep_old_when_provider_unavailable(self):
         module = load_module()
@@ -772,6 +844,41 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             client.calls[0]["json"]["provider"],
             {"only": ["together"], "order": ["together"], "allow_fallbacks": False},
         )
+
+    async def test_episode_scene_extraction_429_honors_retry_after_before_retry(self):
+        module = load_module()
+        normalized_text = '루벤은 검을 들었다. "문을 열어."'
+        client = FakeRateLimitedOpenRouterClient(
+            {
+                "episode_no": 1,
+                "scenes": [
+                    {
+                        "scene_id": "scene_1",
+                        "summary": "루벤이 문을 연다.",
+                        "characters": ["character:루벤"],
+                        "opening_anchor": "루벤은 검을 들었다.",
+                    }
+                ],
+            },
+            retry_after="5",
+        )
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module.asyncio, "sleep", AsyncMock()) as sleep_mock:
+            await module.request_episode_scene_extraction_payload(
+                client,
+                product_title="테스트 작품",
+                episode_no=1,
+                episode_title="1화",
+                normalized_text=normalized_text,
+                canonical_character_packet={
+                    "characters": [{"scope_key": "character:루벤", "display_name": "루벤"}]
+                },
+            )
+
+        self.assertEqual(len(client.calls), 2)
+        sleep_mock.assert_awaited_once_with(5.0)
 
     def test_episode_scene_extraction_defaults_to_compact_deepseek_request(self):
         with patch.dict(
@@ -2914,6 +3021,67 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             args = module.parse_args()
         self.assertTrue(args.refresh_rp)
         self.assertTrue(module.should_refresh_delta_rp(args))
+
+    def test_delta_rp_scope_selection_repairs_only_missing_canonical_targets(self):
+        module = load_module()
+        inventory_map = {
+            "character:루벤": {
+                "display_name": "루벤",
+                "aliases": ["루벤"],
+                "is_protagonist": True,
+                "distinct_episode_count": 15,
+                "voice_evidence_count": 12,
+            },
+            "character:티르": {
+                "display_name": "티르",
+                "aliases": ["티르"],
+                "is_protagonist": False,
+                "distinct_episode_count": 12,
+                "voice_evidence_count": 8,
+            },
+            "character:세실": {
+                "display_name": "세실",
+                "aliases": ["세실"],
+                "is_protagonist": False,
+                "distinct_episode_count": 8,
+                "voice_evidence_count": 6,
+            },
+        }
+        complete_profile = {"payload": {"character_key": "character:티르", "speech_style": {"tone": "차분"}}}
+        complete_examples = {
+            "payload": {
+                "character_key": "character:티르",
+                "examples": [{"episode_no": 1, "text": "준비하겠습니다."}],
+            }
+        }
+
+        selected = module.select_delta_rp_scope_keys(
+            refresh_requested=False,
+            affected_scope_keys={"character:티르"},
+            inventory_map=inventory_map,
+            profile_map={"character:티르": complete_profile},
+            examples_map={
+                "character:티르": complete_examples,
+                "protagonist:named:루벤": {
+                    "payload": {"examples": [{"episode_no": 1, "text": "legacy only"}]}
+                },
+            },
+        )
+
+        self.assertEqual(selected, {"character:루벤"})
+
+    def test_delta_rp_scope_selection_refresh_uses_affected_scope_keys(self):
+        module = load_module()
+
+        selected = module.select_delta_rp_scope_keys(
+            refresh_requested=True,
+            affected_scope_keys={"character:루벤", "character:티르"},
+            inventory_map={},
+            profile_map={},
+            examples_map={},
+        )
+
+        self.assertEqual(selected, {"character:루벤", "character:티르"})
 
     def test_delta_cli_accepts_max_delta_episode_cap(self):
         module = load_module()
