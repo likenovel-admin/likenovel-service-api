@@ -77,7 +77,7 @@ def _extract_eligible_character_payload(row) -> dict | None:
         return None
     if str(display_safety.get("status") or "").strip().lower() != "pass":
         return None
-    if payload.get("public_chat_eligible") is not True:
+    if payload.get("public_slot_eligible") is not True:
         return None
     return payload
 
@@ -355,7 +355,7 @@ async def search_admin_main_character_slot_products(
 ):
     normalized_search_word = (search_word or "").strip()
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT
                 p.product_id AS productId,
                 p.title,
@@ -388,11 +388,12 @@ async def search_admin_main_character_slot_products(
                     AND sacs.summary_type = 'character_inventory_v3'
                     AND sacs.is_active = 'Y'
                     AND JSON_UNQUOTE(
-                        JSON_EXTRACT(sacs.summary_text, '$.public_chat_eligible')
+                        JSON_EXTRACT(sacs.summary_text, '$.public_slot_eligible')
                     ) = 'true'
                     AND JSON_UNQUOTE(
                         JSON_EXTRACT(sacs.summary_text, '$.display_safety.status')
                     ) = 'pass'
+                    {_chat_ready_rp_assets_predicate("sacs")}
               )
               AND (:search_word = '%%' OR p.title LIKE :search_word)
             ORDER BY p.updated_date DESC, p.product_id DESC
@@ -432,7 +433,7 @@ def _admin_chat_ready_product_where_clause() -> str:
                 AND inventory.is_active = 'Y'
                 AND JSON_VALID(inventory.summary_text)
                 AND JSON_UNQUOTE(JSON_EXTRACT(
-                    inventory.summary_text, '$.public_chat_eligible'
+                    inventory.summary_text, '$.public_slot_eligible'
                 )) = 'true'
                 AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
                     inventory.summary_text, '$.display_safety.status'
@@ -464,7 +465,7 @@ async def _load_main_character_chat_quality(
           AND inventory.is_active = 'Y'
           AND JSON_VALID(inventory.summary_text)
           AND JSON_UNQUOTE(JSON_EXTRACT(
-              inventory.summary_text, '$.public_chat_eligible'
+              inventory.summary_text, '$.public_slot_eligible'
           )) = 'true'
           AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
               inventory.summary_text, '$.display_safety.status'
