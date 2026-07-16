@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 from pydantic import ValidationError
 
 from app.schemas.support import PostSupportQnaReqBody
+from app.routers.content import support_command
 from app.services.content import support_service
 
 
@@ -21,6 +22,14 @@ class FakeDb:
 
 
 class SupportQnaServiceTest(unittest.IsolatedAsyncioTestCase):
+    def test_support_command_router_registers_qna_post(self):
+        route = next(
+            route
+            for route in support_command.router.routes
+            if getattr(route, "path", None) == "/support/qnas"
+        )
+        self.assertIn("POST", route.methods)
+
     async def test_post_support_qna_persists_and_notifies(self):
         db = FakeDb()
         send_email = AsyncMock()
