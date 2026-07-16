@@ -1241,6 +1241,32 @@ async def product_by_product_id(product_id: str, kc_user_id: str, db: AsyncSessi
     return res_body
 
 
+async def public_product_detail_shell_by_product_id(
+    product_id: str, db: AsyncSession
+):
+    """Return side-effect-free public data for the initial product-detail HTML."""
+    query_parts = get_select_fields_and_joins_for_home_card_product(
+        user_id=None, rank_area_code=None
+    )
+    query = text(f"""
+        SELECT {query_parts["select_fields"]}
+        FROM tb_product p
+        {query_parts["joins"]}
+        WHERE p.product_id = :product_id
+          AND p.open_yn = 'Y'
+    """)
+    result = await db.execute(query, {"product_id": product_id})
+    row = result.mappings().one_or_none()
+
+    if row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_PRODUCT,
+        )
+
+    return {"data": convert_home_card_product_data(row)}
+
+
 async def products_all(
     price_type: str,
     product_type: str,
