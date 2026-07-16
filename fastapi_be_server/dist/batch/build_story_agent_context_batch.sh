@@ -176,7 +176,8 @@ if [ -n "${MYSQL_SSL_OPT:-}" ]; then
   MYSQL_CMD+=("${MYSQL_SSL_OPT}")
 fi
 
-readarray -t CANDIDATE_ROWS < <("${MYSQL_CMD[@]}" <<SQL
+CANDIDATE_OUTPUT=""
+if ! CANDIDATE_OUTPUT="$("${MYSQL_CMD[@]}" <<SQL
 SELECT
   candidates.product_id,
   candidates.title
@@ -185,8 +186,10 @@ FROM (
     p.product_id,
     REPLACE(REPLACE(p.title, '\t', ' '), '\n', ' ') AS title,
     COALESCE(sacp.context_status, 'pending') AS context_status,
+    sacp.last_built_at AS last_built_at,
     SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count,
     SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_character_signal_count,
+    SUM(CASE WHEN sacs_scene.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_scene_count,
     GREATEST(
       SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END),
       SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END)
@@ -222,6 +225,36 @@ FROM (
    AND sacs_signal.summary_type = 'episode_character_signals'
    AND sacs_signal.is_active = 'Y'
    AND sacs_signal.scope_key = CONCAT('episode:', pe.episode_id)
+  LEFT JOIN tb_story_agent_context_summary sacs_scene
+    ON sacs_scene.product_id = p.product_id
+   AND sacs_scene.summary_type = 'episode_scene_extraction'
+   AND sacs_scene.is_active = 'Y'
+   AND sacs_scene.scope_key = CONCAT('episode:', pe.episode_id)
+   AND sacs_scene.summary_id > sacs.summary_id
+   AND LOWER(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+         IF(JSON_VALID(sacs_scene.summary_text), sacs_scene.summary_text, '{}'),
+         '$.status'
+       )), ''))) IN ('ok', 'partial')
+   AND JSON_TYPE(JSON_EXTRACT(
+         IF(JSON_VALID(sacs_scene.summary_text), sacs_scene.summary_text, '{}'),
+         '$.scene_count'
+       )) = 'INTEGER'
+   AND CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+         IF(JSON_VALID(sacs_scene.summary_text), sacs_scene.summary_text, '{}'),
+         '$.scene_count'
+       )), '0') AS SIGNED) > 0
+   AND JSON_TYPE(JSON_EXTRACT(
+         IF(JSON_VALID(sacs_scene.summary_text), sacs_scene.summary_text, '{}'),
+         '$.scenes'
+       )) = 'ARRAY'
+   AND COALESCE(JSON_LENGTH(JSON_EXTRACT(
+         IF(JSON_VALID(sacs_scene.summary_text), sacs_scene.summary_text, '{}'),
+         '$.scenes'
+       )), 0) > 0
+   AND NULLIF(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+         IF(JSON_VALID(sacs_scene.summary_text), sacs_scene.summary_text, '{}'),
+         '$.scenes[0].scene_gist'
+       )), '')), '') IS NOT NULL
   WHERE p.price_type IN ('free', 'paid')
     AND p.status_code = 'ongoing'
     AND p.open_yn = 'Y'
@@ -231,9 +264,11 @@ FROM (
   GROUP BY
     p.product_id,
     p.title,
-    sacp.context_status
+    sacp.context_status,
+    sacp.last_built_at
   HAVING
     missing_foundation_episode_count > 0
+    OR missing_open_scene_count > 0
     OR (
       context_status = 'failed'
       AND missing_foundation_episode_count = 0
@@ -255,10 +290,20 @@ ORDER BY
   END ASC,
   candidates.missing_foundation_episode_count DESC,
   candidates.missing_open_character_signal_count DESC,
+  candidates.last_built_at ASC,
+  candidates.missing_open_scene_count DESC,
   candidates.product_id ASC
 LIMIT ${MAX_PARALLEL};
 SQL
-)
+)"; then
+  log "[error] candidate query failed"
+  exit 1
+fi
+
+CANDIDATE_ROWS=()
+if [ -n "${CANDIDATE_OUTPUT}" ]; then
+  readarray -t CANDIDATE_ROWS <<< "${CANDIDATE_OUTPUT}"
+fi
 
 if [ "${#CANDIDATE_ROWS[@]}" -eq 0 ]; then
   log "[batch-empty] no eligible products"

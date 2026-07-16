@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from fastapi import status
@@ -10,11 +11,13 @@ from app.services.websochat.websochat_game_memory import (
 )
 from app.services.websochat.websochat_service import (
     _assert_websochat_session_allows_mode,
+    _build_websochat_inventory_v3_scope_aliases,
     _build_websochat_rp_lookup_scope_keys,
     _build_websochat_rp_session_list_state,
     _build_websochat_session_contract_payload,
     _is_websochat_character_chat_rp_context_ready,
     _is_websochat_character_chat_session,
+    _resolve_websochat_inventory_v3_alias_rows,
     _resolve_websochat_requested_mode_key,
 )
 from app.services.websochat.websochat_rp_renderer import (
@@ -52,6 +55,59 @@ def _entry_context(
 
 
 class WebsochatCharacterChatContractTest(unittest.TestCase):
+    def test_inventory_v3_alias_resolution_rejects_ambiguous_source_only_match(self):
+        rows = [
+            {
+                "scopeKey": "character:민준A",
+                "summaryText": json.dumps(
+                    {
+                        "canonical_character_key": "character:민준A",
+                        "source_character_keys": ["named:민준"],
+                        "display_name": "민준A",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            {
+                "scopeKey": "character:민준B",
+                "summaryText": json.dumps(
+                    {
+                        "canonical_character_key": "character:민준B",
+                        "source_character_keys": ["named:민준"],
+                        "display_name": "민준B",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+
+        self.assertIsNone(
+            _resolve_websochat_inventory_v3_alias_rows(
+                rows,
+                scope_key="named:민준",
+            )
+        )
+        exact = _resolve_websochat_inventory_v3_alias_rows(
+            rows,
+            scope_key="character:민준A",
+        )
+        self.assertEqual(exact["scopeKey"], "character:민준A")
+
+    def test_inventory_v3_aliases_include_locked_protagonist_identity_history(self):
+        aliases = _build_websochat_inventory_v3_scope_aliases(
+            scope_key="character:조렌테이머",
+            payload={
+                "canonical_character_key": "character:조렌테이머",
+                "source_character_keys": ["named:조렌테이머"],
+                "protagonist_identity_scope_keys": ["character:방호영", "character:조렌테이머"],
+            },
+        )
+
+        self.assertEqual(
+            aliases,
+            ["character:조렌테이머", "named:조렌테이머", "character:방호영"],
+        )
+
     def test_session_list_state_uses_persisted_character_without_context_load(self):
         state = _build_websochat_rp_session_list_state(
             {
@@ -419,6 +475,36 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
         )
 
         self.assertFalse(ready)
+
+    def test_character_chat_context_accepts_locked_protagonist_identity_assets(self):
+        canonical_scope_key = "character:조렌테이머"
+        previous_identity_scope_key = "character:방호영"
+        ready = _is_websochat_character_chat_rp_context_ready(
+            product_id=1182,
+            read_episode_to=14,
+            resolved_active_character=canonical_scope_key,
+            compatible_scope_keys=[canonical_scope_key, previous_identity_scope_key],
+            profile={
+                "character_key": previous_identity_scope_key,
+                "display_name": "조렌테이머",
+            },
+            examples_payload={
+                "character_key": previous_identity_scope_key,
+                "examples": [{"text": "가자."}],
+            },
+            internal_prompt_payload=None,
+            internal_prompt="",
+            inventory_payload={
+                "display_name": "조렌테이머",
+                "public_chat_eligible": True,
+                "display_safety": {"status": "pass"},
+            },
+            entry_context=_entry_context(
+                character_scope_key=canonical_scope_key,
+            ),
+        )
+
+        self.assertTrue(ready)
 
     def test_character_chat_context_requires_character_key_on_all_assets(self):
         scope_key = "character:신미아:dup:be14d6b7"

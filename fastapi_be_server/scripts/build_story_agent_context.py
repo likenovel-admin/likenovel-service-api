@@ -2193,6 +2193,51 @@ def build_signal_repair_episode_id_set(cur, *, product_id: int, product_rows: li
     return repair_episode_ids
 
 
+def build_scene_repair_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
+    active_scene_rows = fetch_active_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_scene_extraction",
+    )
+    active_episode_summary_rows = fetch_active_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_summary",
+    )
+    episode_summary_id_by_scope = {
+        str(row.get("scope_key") or "").strip(): int(row.get("summary_id") or 0)
+        for row in active_episode_summary_rows
+        if str(row.get("scope_key") or "").strip()
+    }
+    usable_scene_scope_keys = {
+        str(row.get("scope_key") or "").strip()
+        for row in active_scene_rows
+        if str(row.get("scope_key") or "").strip()
+        and int(row.get("summary_id") or 0)
+        > int(episode_summary_id_by_scope.get(str(row.get("scope_key") or "").strip()) or 0)
+        and _is_usable_episode_scene_payload(
+            extract_json_object(str(row.get("summary_text") or "")) or {}
+        )
+    }
+
+    repair_episode_ids: set[int] = set()
+    for row in product_rows:
+        episode_id = int(row.get("episode_id") or 0)
+        episode_no = int(row.get("episode_no") or 0)
+        if episode_id <= 0:
+            continue
+        scope_key = f"episode:{episode_id}"
+        if scope_key in usable_scene_scope_keys:
+            continue
+        logger.info(
+            "story_agent_delta_candidate product_id=%s episode_no=%s reason=scene_repair has_usable_scene=0",
+            product_id,
+            episode_no,
+        )
+        repair_episode_ids.add(episode_id)
+    return repair_episode_ids
+
+
 def delta_episode_sort_key(row: dict) -> tuple[int, int]:
     return (int(row.get("episode_no") or 0), int(row.get("episode_id") or 0))
 
@@ -2219,8 +2264,13 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
             product_id=product_id,
             product_rows=product_rows,
         )
+        scene_repair_episode_ids = build_scene_repair_episode_id_set(
+            cur,
+            product_id=product_id,
+            product_rows=product_rows,
+        )
         product_filtered_rows: list[dict] = []
-        for row in sorted(product_rows, key=delta_episode_sort_key):
+        for row in product_rows:
             episode_id = int(row.get("episode_id") or 0)
             if episode_id in open_add_episode_ids:
                 next_row = dict(row)
@@ -2234,6 +2284,22 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
                 next_row = dict(row)
                 next_row["_delta_reason"] = "signal_repair"
                 product_filtered_rows.append(next_row)
+            elif episode_id in scene_repair_episode_ids:
+                next_row = dict(row)
+                next_row["_delta_reason"] = "scene_repair"
+                product_filtered_rows.append(next_row)
+        reason_priority = {
+            "open_add": 0,
+            "sync_repair": 1,
+            "signal_repair": 2,
+            "scene_repair": 3,
+        }
+        product_filtered_rows.sort(
+            key=lambda row: (
+                reason_priority.get(str(row.get("_delta_reason") or ""), 99),
+                *delta_episode_sort_key(row),
+            )
+        )
         if max_delta_episodes > 0:
             product_filtered_rows = product_filtered_rows[:max_delta_episodes]
         filtered_rows.extend(product_filtered_rows)
@@ -3698,12 +3764,18 @@ def _normalize_episode_scene_turn_contract(value) -> dict[str, object]:
 
 
 def _is_usable_episode_scene_payload(payload: object) -> bool:
-    return (
-        isinstance(payload, dict)
-        and str(payload.get("status") or "").strip().lower() != "failed"
-        and int(payload.get("scene_count") or 0) > 0
-        and isinstance(payload.get("scenes"), list)
-    )
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("status") or "").strip().lower() not in {"ok", "partial"}:
+        return False
+    scene_count = payload.get("scene_count")
+    if not isinstance(scene_count, int) or isinstance(scene_count, bool):
+        return False
+    scenes = payload.get("scenes")
+    if scene_count <= 0 or not isinstance(scenes, list) or not scenes:
+        return False
+    first_scene = scenes[0]
+    return isinstance(first_scene, dict) and bool(str(first_scene.get("scene_gist") or "").strip())
 
 
 EPISODE_SCENE_KIND_VALUES = {"dialogue", "action", "conflict", "exposition", "transition", "mixed"}
@@ -5575,8 +5647,11 @@ def fetch_summary_state_for_inventory_alias(
     *,
     scope_key: str,
     inventory_item: dict[str, object] | None,
+    allowed_alias_keys: set[str] | None = None,
 ) -> dict[str, object]:
     for alias_key in build_inventory_scope_alias_key_candidates(scope_key, inventory_item):
+        if alias_key != scope_key and allowed_alias_keys is not None and alias_key not in allowed_alias_keys:
+            continue
         row = rows_by_scope.get(alias_key)
         if row:
             return dict(row)
@@ -5588,9 +5663,12 @@ def fetch_legacy_summary_state_for_inventory_alias(
     *,
     scope_key: str,
     inventory_item: dict[str, object] | None,
+    allowed_alias_keys: set[str] | None = None,
 ) -> dict[str, object]:
     for alias_key in build_inventory_scope_alias_key_candidates(scope_key, inventory_item):
         if alias_key == scope_key:
+            continue
+        if allowed_alias_keys is not None and alias_key not in allowed_alias_keys:
             continue
         row = rows_by_scope.get(alias_key)
         if row:
@@ -5670,22 +5748,51 @@ def extract_relation_character_keys(
 
 
 def build_inventory_source_scope_key_map(inventory_map: dict[str, dict[str, object]]) -> dict[str, str]:
-    source_scope_key_map: dict[str, str] = {}
+    exact_claims: dict[str, set[str]] = {}
+    source_claims: dict[str, set[str]] = {}
     for scope_key, inventory_item in (inventory_map or {}).items():
         normalized_scope_key = str(scope_key or "").strip()
         if not normalized_scope_key:
             continue
-        source_scope_key_map[normalized_scope_key] = normalized_scope_key
+        exact_claims.setdefault(normalized_scope_key, set()).add(normalized_scope_key)
         payload = dict(inventory_item or {})
         for field_name in ("character_key", "canonical_character_key"):
             source_key = str(payload.get(field_name) or "").strip()
             if source_key:
-                source_scope_key_map[source_key] = normalized_scope_key
+                exact_claims.setdefault(source_key, set()).add(normalized_scope_key)
         for source_key_value in list(payload.get("source_character_keys") or []):
             source_key = str(source_key_value or "").strip()
             if source_key:
-                source_scope_key_map[source_key] = normalized_scope_key
+                source_claims.setdefault(source_key, set()).add(normalized_scope_key)
+    source_scope_key_map = {
+        alias_key: next(iter(owner_scope_keys))
+        for alias_key, owner_scope_keys in exact_claims.items()
+        if len(owner_scope_keys) == 1
+    }
+    for alias_key, owner_scope_keys in source_claims.items():
+        if alias_key in exact_claims or len(owner_scope_keys) != 1:
+            continue
+        source_scope_key_map[alias_key] = next(iter(owner_scope_keys))
     return source_scope_key_map
+
+
+def build_inventory_ambiguous_source_scope_keys(
+    inventory_map: dict[str, dict[str, object]],
+) -> set[str]:
+    source_claims: dict[str, set[str]] = {}
+    for scope_key, inventory_item in (inventory_map or {}).items():
+        normalized_scope_key = str(scope_key or "").strip()
+        if not normalized_scope_key:
+            continue
+        for source_key_value in list(dict(inventory_item or {}).get("source_character_keys") or []):
+            source_key = str(source_key_value or "").strip()
+            if source_key:
+                source_claims.setdefault(source_key, set()).add(normalized_scope_key)
+    return {
+        source_key
+        for source_key, owner_scope_keys in source_claims.items()
+        if len(owner_scope_keys) > 1
+    }
 
 
 def compute_rp_affected_scope_keys(
@@ -5713,6 +5820,10 @@ def compute_rp_affected_scope_keys(
     relation_character_keys = extract_relation_character_keys(changed_relation_keys, old_relation_map, new_relation_map)
     old_source_scope_key_map = build_inventory_source_scope_key_map(old_inventory_map or {})
     new_source_scope_key_map = build_inventory_source_scope_key_map(new_inventory_map or {})
+    ambiguous_source_scope_keys = (
+        build_inventory_ambiguous_source_scope_keys(old_inventory_map or {})
+        | build_inventory_ambiguous_source_scope_keys(new_inventory_map or {})
+    )
 
     def resolve_inventory_scope_keys(raw_scope_keys: set[str]) -> set[str]:
         resolved_scope_keys: set[str] = set()
@@ -5730,9 +5841,16 @@ def compute_rp_affected_scope_keys(
             }
             if mapped_scope_keys:
                 resolved_scope_keys.update(mapped_scope_keys)
-            else:
+            elif source_key not in ambiguous_source_scope_keys:
                 resolved_scope_keys.add(source_key)
-            if source_key in old_profile_map or source_key in old_examples_map or source_key in old_internal_prompt_map:
+            if (
+                source_key not in ambiguous_source_scope_keys
+                and (
+                    source_key in old_profile_map
+                    or source_key in old_examples_map
+                    or source_key in old_internal_prompt_map
+                )
+            ):
                 resolved_scope_keys.add(source_key)
         return resolved_scope_keys
 
@@ -5950,6 +6068,7 @@ async def build_rp_summaries(
         product_id=product_id,
     )
     existing_example_rows_by_scope: dict[str, dict[str, object]] | None = None
+    source_scope_key_map = build_inventory_source_scope_key_map(inventory_map or {})
     valid_scope_keys = build_inventory_rp_retained_scope_keys(inventory_map or {})
     for target in targets:
         character_key = str(target.get("character_key") or "").strip()
@@ -6004,6 +6123,11 @@ async def build_rp_summaries(
                     existing_example_rows_by_scope,
                     scope_key=character_key,
                     inventory_item=inventory_item,
+                    allowed_alias_keys={
+                        alias_key
+                        for alias_key, owner_scope_key in source_scope_key_map.items()
+                        if owner_scope_key == character_key
+                    },
                 )
                 dialogue_items = build_rp_dialogue_items_from_example_payload(
                     dict(existing_example_row.get("payload") or {})
@@ -6355,11 +6479,21 @@ async def build_rp_summaries_delta(
                 existing_profile_rows_by_scope,
                 scope_key=scope_key,
                 inventory_item=inventory_item,
+                allowed_alias_keys={
+                    alias_key
+                    for alias_key, owner_scope_key in source_scope_key_map.items()
+                    if owner_scope_key == scope_key
+                },
             )
             existing_example_row = fetch_legacy_summary_state_for_inventory_alias(
                 existing_example_rows_by_scope,
                 scope_key=scope_key,
                 inventory_item=inventory_item,
+                allowed_alias_keys={
+                    alias_key
+                    for alias_key, owner_scope_key in source_scope_key_map.items()
+                    if owner_scope_key == scope_key
+                },
             )
         existing_profile_payload = dict(existing_profile_row.get("payload") or {})
         existing_example_payload = dict(existing_example_row.get("payload") or {})
@@ -6719,16 +6853,31 @@ async def build_character_chat_opening_summaries(
             profile_rows_by_scope,
             scope_key=scope_key,
             inventory_item=inventory_item,
+            allowed_alias_keys={
+                alias_key
+                for alias_key, owner_scope_key in source_scope_key_map.items()
+                if owner_scope_key == scope_key
+            },
         )
         example_row = fetch_summary_state_for_inventory_alias(
             example_rows_by_scope,
             scope_key=scope_key,
             inventory_item=inventory_item,
+            allowed_alias_keys={
+                alias_key
+                for alias_key, owner_scope_key in source_scope_key_map.items()
+                if owner_scope_key == scope_key
+            },
         )
         internal_prompt_row = fetch_summary_state_for_inventory_alias(
             internal_prompt_rows_by_scope,
             scope_key=scope_key,
             inventory_item=inventory_item,
+            allowed_alias_keys={
+                alias_key
+                for alias_key, owner_scope_key in source_scope_key_map.items()
+                if owner_scope_key == scope_key
+            },
         )
         scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
         if not profile_row or not example_row or not internal_prompt_row or not scene_context_lines:
@@ -7102,16 +7251,14 @@ async def build_episode_scene_extraction_summaries(
                 canonical_character_packet=canonical_character_packet,
             )
         except Exception as exc:
+            logger.warning(
+                "story_agent_scene_extraction_failed product_id=%s episode_no=%s error=%s",
+                product_id,
+                episode_no,
+                str(exc)[:240],
+            )
             if verbose:
                 print(f"[episode-scene-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
-            with work_cursor(conn) as cur:
-                deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="episode_scene_extraction",
-                    scope_key=scope_key,
-                )
-            conn.commit()
             continue
 
         if not _is_usable_episode_scene_payload(payload):
@@ -7160,6 +7307,29 @@ async def build_episode_scene_extraction_summaries(
             deactivate_missing_active_scopes(cur, product_id, "episode_scene_extraction", valid_scope_keys)
         conn.commit()
     return inserted_count, reused_count
+
+
+async def build_episode_scene_extraction_summaries_nonblocking(
+    conn,
+    **kwargs,
+) -> tuple[int, int]:
+    try:
+        return await build_episode_scene_extraction_summaries(conn, **kwargs)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            logger.exception(
+                "story_agent_scene_extraction_rollback_failed product_id=%s",
+                kwargs.get("product_id"),
+            )
+            raise
+        logger.exception(
+            "story_agent_scene_extraction_storage_failed product_id=%s error=%s",
+            kwargs.get("product_id"),
+            str(exc)[:240],
+        )
+        return 0, 0
 
 
 def upsert_summary(
@@ -8930,6 +9100,7 @@ def _classify_character_inventory_v3_rows(
     total_signal_episodes: int,
     *,
     protagonist_resolution: dict | None = None,
+    locked_protagonist_rows: list[dict[str, object]] | None = None,
 ) -> None:
     scored_rows = []
     total_episodes = max(total_signal_episodes, 1)
@@ -9066,6 +9237,7 @@ def _classify_character_inventory_v3_rows(
     else:
         _apply_work_protagonist_resolution(rows, protagonist_resolution)
 
+    _apply_locked_work_protagonist_rows(rows, list(locked_protagonist_rows or []))
     _apply_protagonist_identity_groups(rows)
 
     for row in rows:
@@ -10261,6 +10433,155 @@ def _apply_work_protagonist_resolution(
     return resolution
 
 
+def _work_protagonist_identity_scope_keys(row: dict[str, object]) -> set[str]:
+    keys = {
+        str(row.get("canonical_character_key") or "").strip(),
+        str(row.get("identity_group_key") or "").strip(),
+        *[
+            str(value or "").strip()
+            for value in list(row.get("protagonist_identity_scope_keys") or [])
+        ],
+        *[
+            str(item.get("scope_key") or "").strip()
+            for item in list(row.get("identity_group_members") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    return {key for key in keys if key}
+
+
+def _work_protagonist_source_keys(row: dict[str, object]) -> set[str]:
+    return {
+        key
+        for key in [
+            str(value or "").strip()
+            for value in list(row.get("source_character_keys") or [])
+        ]
+        if key and not _is_generic_protagonist_source_key(key)
+    }
+
+
+def _work_protagonist_rows_share_identity(
+    locked_row: dict[str, object],
+    candidate_row: dict[str, object],
+    *,
+    allow_source_overlap: bool = False,
+) -> bool:
+    if _inventory_identity_blocking_conflict_reasons(candidate_row):
+        return False
+    if (
+        _work_protagonist_identity_scope_keys(locked_row)
+        & _work_protagonist_identity_scope_keys(candidate_row)
+    ):
+        return True
+    return allow_source_overlap and bool(
+        _work_protagonist_source_keys(locked_row)
+        & _work_protagonist_source_keys(candidate_row)
+    )
+
+
+def _locked_work_protagonist_candidate_rank(
+    locked_row: dict[str, object],
+    candidate_row: dict[str, object],
+) -> tuple[int, int, int, int, str]:
+    locked_key = str(locked_row.get("canonical_character_key") or "").strip()
+    candidate_key = str(candidate_row.get("canonical_character_key") or "").strip()
+    identity_overlap = len(
+        _work_protagonist_identity_scope_keys(locked_row)
+        & _work_protagonist_identity_scope_keys(candidate_row)
+    )
+    source_overlap = len(_work_protagonist_source_keys(locked_row) & _work_protagonist_source_keys(candidate_row))
+    return (
+        0 if locked_key and candidate_key == locked_key else 1,
+        -identity_overlap,
+        -source_overlap,
+        -int(candidate_row.get("distinct_episode_count") or 0),
+        candidate_key,
+    )
+
+
+def _apply_locked_work_protagonist_rows(
+    rows: list[dict[str, object]],
+    locked_protagonist_rows: list[dict[str, object]],
+) -> set[str]:
+    locked_rows = [
+        row
+        for row in locked_protagonist_rows
+        if str(row.get("work_role") or "") == "main_protagonist"
+        and str(row.get("canonical_character_key") or "").strip()
+    ]
+    if not locked_rows:
+        return set()
+
+    resolved_main_candidate_ids = {
+        id(row)
+        for row in rows
+        if str(row.get("work_role") or "") == "main_protagonist"
+    }
+    for row in rows:
+        if str(row.get("work_role") or "") != "main_protagonist":
+            continue
+        row["work_role"] = "major_character" if int(row.get("distinct_episode_count") or 0) >= 1 else "unknown"
+        row["role_confidence"] = "medium" if str(row.get("work_role") or "") == "major_character" else "low"
+
+    matched_scope_keys: set[str] = set()
+    used_candidate_ids: set[int] = set()
+    for locked_row in locked_rows:
+        candidates = [
+            row
+            for row in rows
+            if id(row) not in used_candidate_ids
+            and _work_protagonist_rows_share_identity(
+                locked_row,
+                row,
+                allow_source_overlap=id(row) in resolved_main_candidate_ids,
+            )
+        ]
+        if not candidates:
+            continue
+        selected_row = min(
+            candidates,
+            key=lambda row: (
+                0 if id(row) in resolved_main_candidate_ids else 1,
+                *_locked_work_protagonist_candidate_rank(locked_row, row),
+            ),
+        )
+        used_candidate_ids.add(id(selected_row))
+
+        locked_scope_key = str(locked_row.get("canonical_character_key") or "").strip()
+        selected_scope_key = str(selected_row.get("canonical_character_key") or "").strip()
+        identity_scope_keys = list(
+            dict.fromkeys(
+                [
+                    *[
+                        str(value or "").strip()
+                        for value in list(locked_row.get("protagonist_identity_scope_keys") or [])
+                    ],
+                    locked_scope_key,
+                    selected_scope_key,
+                ]
+            )
+        )
+        selected_row["work_role"] = "main_protagonist"
+        selected_row["role_confidence"] = "high"
+        selected_row["classification_status"] = "AUTO_RESOLVED"
+        selected_row["review_reasons"] = []
+        selected_row["identity_group_key"] = str(
+            locked_row.get("identity_group_key") or locked_scope_key
+        ).strip()
+        selected_row["identity_group_role"] = "current_protagonist"
+        selected_row["protagonist_identity_scope_keys"] = [key for key in identity_scope_keys if key]
+        selected_row["is_protagonist_identity_member"] = True
+        if isinstance(locked_row.get("identity_group_members"), list):
+            selected_row["identity_group_members"] = list(locked_row.get("identity_group_members") or [])
+        if isinstance(locked_row.get("work_protagonist_resolution"), dict):
+            selected_row["work_protagonist_resolution"] = dict(
+                locked_row.get("work_protagonist_resolution") or {}
+            )
+        matched_scope_keys.add(locked_scope_key)
+    return matched_scope_keys
+
+
 def _row_episode_count(row: dict[str, object], field_name: str) -> int:
     return int(dict(row.get(field_name) or {}).get("episode_count") or 0)
 
@@ -10499,6 +10820,7 @@ def aggregate_character_inventory_v3_rows(
     signal_rows: list[dict],
     *,
     protagonist_resolution: dict | None = None,
+    locked_protagonist_rows: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     observations = build_character_inventory_v3_observations(signal_rows)
     clusters = resolve_character_inventory_v3_clusters(observations)
@@ -10657,6 +10979,7 @@ def aggregate_character_inventory_v3_rows(
         rows,
         total_signal_episodes,
         protagonist_resolution=protagonist_resolution,
+        locked_protagonist_rows=locked_protagonist_rows,
     )
     _suppress_duplicate_public_display_rows(rows)
     _suppress_main_alias_public_slot_rows(rows)
@@ -10765,19 +11088,49 @@ def build_character_inventory_v3_summaries_from_signal_rows(
     signal_rows: list[dict],
     protagonist_resolution: dict | None = None,
 ) -> tuple[int, int]:
+    old_inventory_map = fetch_active_character_inventory_map(
+        cur=cur,
+        product_id=product_id,
+        summary_type="character_inventory_v3",
+    )
+    locked_protagonist_rows: list[dict[str, object]] = []
+    for scope_key, payload in old_inventory_map.items():
+        if str(payload.get("work_role") or "") != "main_protagonist":
+            continue
+        locked_row = dict(payload)
+        locked_row.setdefault("canonical_character_key", scope_key)
+        locked_protagonist_rows.append(locked_row)
+    locked_protagonist_by_scope = {
+        str(row.get("canonical_character_key") or "").strip(): row
+        for row in locked_protagonist_rows
+        if str(row.get("canonical_character_key") or "").strip()
+    }
+
     inventory_rows = aggregate_character_inventory_v3_rows(
         signal_rows,
         protagonist_resolution=protagonist_resolution,
+        locked_protagonist_rows=locked_protagonist_rows,
     )
-    if signal_rows and not inventory_rows:
+    if signal_rows and not inventory_rows and not locked_protagonist_rows:
         raise ValueError(f"character_inventory_v3 aggregation returned 0 rows despite active signals: product_id={product_id}")
 
     inserted_count = 0
     reused_count = 0
     valid_scope_keys: set[str] = set()
+    preserved_locked_scope_keys: set[str] = set()
     for item in inventory_rows:
         scope_key = str(item.get("canonical_character_key") or "").strip()
         if not scope_key:
+            continue
+        if scope_key in locked_protagonist_by_scope and _inventory_identity_blocking_conflict_reasons(item):
+            valid_scope_keys.add(scope_key)
+            preserved_locked_scope_keys.add(scope_key)
+            reused_count += 1
+            logger.warning(
+                "story_agent_protagonist_lock_preserved product_id=%s scope_key=%s reason=identity_conflict_in_current_inventory",
+                product_id,
+                scope_key,
+            )
             continue
         valid_scope_keys.add(scope_key)
         inserted = upsert_character_inventory_v3_item(cur, product_id=product_id, item=item)
@@ -10785,6 +11138,26 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             inserted_count += 1
         else:
             reused_count += 1
+
+    for locked_row in locked_protagonist_rows:
+        locked_scope_key = str(locked_row.get("canonical_character_key") or "").strip()
+        if not locked_scope_key:
+            continue
+        if locked_scope_key in preserved_locked_scope_keys:
+            continue
+        if any(
+            str(item.get("work_role") or "") == "main_protagonist"
+            and _work_protagonist_rows_share_identity(locked_row, item)
+            for item in inventory_rows
+        ):
+            continue
+        valid_scope_keys.add(locked_scope_key)
+        reused_count += 1
+        logger.warning(
+            "story_agent_protagonist_lock_preserved product_id=%s scope_key=%s reason=identity_not_in_current_inventory",
+            product_id,
+            locked_scope_key,
+        )
 
     deactivate_missing_active_scopes(cur, product_id, "character_inventory_v3", valid_scope_keys)
     return inserted_count, reused_count
@@ -13491,7 +13864,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                         results["inserted_relation_inventories"] += relation_counts[0]
                         results["reused_relation_inventories"] += relation_counts[1]
 
-                        scene_counts = await build_episode_scene_extraction_summaries(
+                        scene_counts = await build_episode_scene_extraction_summaries_nonblocking(
                             conn=work_conn,
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),
@@ -13810,7 +14183,8 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 cur,
                                 product_id=product_id,
                             )
-                        scene_counts = await build_episode_scene_extraction_summaries(
+                        work_conn.commit()
+                        scene_counts = await build_episode_scene_extraction_summaries_nonblocking(
                             conn=work_conn,
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),

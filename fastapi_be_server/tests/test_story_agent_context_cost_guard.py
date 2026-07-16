@@ -2377,8 +2377,11 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         def fake_fetch(*, cur, product_id, summary_type):
             self.assertEqual(product_id, 687)
-            self.assertEqual(summary_type, "episode_character_signals")
-            return rows
+            if summary_type == "episode_character_signals":
+                return rows
+            if summary_type == "character_inventory_v3":
+                return []
+            self.fail(f"unexpected summary_type: {summary_type}")
 
         def fake_upsert(cur, *, product_id, item):
             inserted_items.append(item)
@@ -3318,6 +3321,430 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual([row["display_name"] for row in main_rows], ["득구"])
         self.assertEqual(main_rows[0]["work_protagonist_resolution"]["decision"], "RESOLVED")
         self.assertFalse(any(row["display_name"] == "설총" and row["is_protagonist"] for row in inventory))
+
+    def test_inventory_v3_keeps_locked_main_when_later_resolution_selects_another_person(self):
+        module = load_module()
+        initial_rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:named:란",
+                        display_name="란",
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+        locked_main = next(
+            row
+            for row in module.aggregate_character_inventory_v3_rows(initial_rows)
+            if row["work_role"] == "main_protagonist"
+        )
+        all_rows = [
+            *initial_rows,
+            *[
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:카인",
+                            display_name="카인",
+                            is_protagonist=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        )
+                    ],
+                )
+                for episode_no in range(4, 9)
+            ],
+        ]
+        unlocked_inventory = module.aggregate_character_inventory_v3_rows(all_rows)
+        kain_key = next(
+            row["canonical_character_key"]
+            for row in unlocked_inventory
+            if row["display_name"] == "카인"
+        )
+        later_resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": kain_key,
+            "work_protagonist_keys": [kain_key],
+            "confidence": "high",
+            "reason_code": "single_clear",
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+
+        inventory = module.aggregate_character_inventory_v3_rows(
+            all_rows,
+            protagonist_resolution=later_resolution,
+            locked_protagonist_rows=[locked_main],
+        )
+
+        main_rows = [row for row in inventory if row["work_role"] == "main_protagonist"]
+        self.assertEqual([row["display_name"] for row in main_rows], ["란"])
+        self.assertFalse(next(row for row in inventory if row["display_name"] == "카인")["is_protagonist"])
+
+    def test_locked_main_can_move_to_known_identity_group_surface(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:방호영",
+            "display_name": "방호영",
+            "source_character_keys": ["named:방호영"],
+            "work_role": "main_protagonist",
+            "identity_group_key": "character:방호영",
+            "protagonist_identity_scope_keys": ["character:방호영", "character:조렌테이머"],
+        }
+        current_surface = {
+            "canonical_character_key": "character:조렌테이머",
+            "display_name": "조렌테이머",
+            "source_character_keys": ["named:조렌테이머"],
+            "distinct_episode_count": 12,
+            "work_role": "major_character",
+            "role_confidence": "medium",
+            "classification_status": "AUTO_RESOLVED",
+            "review_reasons": [],
+        }
+
+        matched_scope_keys = module._apply_locked_work_protagonist_rows(
+            [current_surface],
+            [locked_main],
+        )
+
+        self.assertEqual(matched_scope_keys, {"character:방호영"})
+        self.assertEqual(current_surface["work_role"], "main_protagonist")
+        self.assertEqual(current_surface["identity_group_key"], "character:방호영")
+        self.assertEqual(
+            current_surface["protagonist_identity_scope_keys"],
+            ["character:방호영", "character:조렌테이머"],
+        )
+
+    def test_locked_identity_group_prefers_current_resolved_surface_over_old_exact_row(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:방호영",
+            "display_name": "방호영",
+            "source_character_keys": ["named:방호영"],
+            "work_role": "main_protagonist",
+            "identity_group_key": "character:방호영",
+            "protagonist_identity_scope_keys": ["character:방호영", "character:조렌테이머"],
+        }
+        rows = [
+            {
+                "canonical_character_key": "character:방호영",
+                "display_name": "방호영",
+                "source_character_keys": ["named:방호영"],
+                "distinct_episode_count": 15,
+                "work_role": "major_character",
+            },
+            {
+                "canonical_character_key": "character:조렌테이머",
+                "display_name": "조렌테이머",
+                "source_character_keys": ["named:조렌테이머"],
+                "distinct_episode_count": 14,
+                "work_role": "main_protagonist",
+            },
+        ]
+
+        module._apply_locked_work_protagonist_rows(rows, [locked_main])
+
+        self.assertEqual(
+            [row["display_name"] for row in rows if row["work_role"] == "main_protagonist"],
+            ["조렌테이머"],
+        )
+
+    def test_locked_main_rejects_source_key_only_match_with_identity_conflict(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:민준",
+            "display_name": "민준",
+            "source_character_keys": ["named:민준"],
+            "work_role": "main_protagonist",
+        }
+        conflicting_candidate = {
+            "canonical_character_key": "character:다른민준",
+            "display_name": "다른 민준",
+            "source_character_keys": ["named:민준"],
+            "identity_conflict_reasons": ["cannot_link_name_conflict"],
+            "distinct_episode_count": 10,
+            "work_role": "main_protagonist",
+            "classification_status": "NEEDS_REVIEW",
+            "review_reasons": ["cannot_link_name_conflict"],
+        }
+
+        matched_scope_keys = module._apply_locked_work_protagonist_rows(
+            [conflicting_candidate],
+            [locked_main],
+        )
+
+        self.assertEqual(matched_scope_keys, set())
+        self.assertEqual(conflicting_candidate["work_role"], "major_character")
+        self.assertEqual(conflicting_candidate["review_reasons"], ["cannot_link_name_conflict"])
+
+    def test_locked_main_moves_to_current_resolved_surface_with_old_source_provenance(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:방호영",
+            "display_name": "방호영",
+            "source_character_keys": ["protagonist:named:방호영"],
+            "work_role": "main_protagonist",
+            "identity_group_key": "character:방호영",
+        }
+        current_surface = {
+            "canonical_character_key": "character:조렌테이머",
+            "display_name": "조렌테이머",
+            "source_character_keys": [
+                "protagonist:named:방호영",
+                "protagonist:named:조렌테이머",
+            ],
+            "distinct_episode_count": 8,
+            "work_role": "main_protagonist",
+            "role_confidence": "high",
+            "classification_status": "AUTO_RESOLVED",
+            "review_reasons": [],
+            "identity_conflict_reasons": [],
+        }
+
+        matched_scope_keys = module._apply_locked_work_protagonist_rows(
+            [current_surface],
+            [locked_main],
+        )
+
+        self.assertEqual(matched_scope_keys, {"character:방호영"})
+        self.assertEqual(current_surface["work_role"], "main_protagonist")
+        self.assertEqual(current_surface["identity_group_key"], "character:방호영")
+        self.assertEqual(
+            current_surface["protagonist_identity_scope_keys"],
+            ["character:방호영", "character:조렌테이머"],
+        )
+
+    def test_locked_main_does_not_move_on_source_overlap_without_current_main_resolution(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:방호영",
+            "display_name": "방호영",
+            "source_character_keys": ["protagonist:named:방호영"],
+            "work_role": "main_protagonist",
+        }
+        supporting_character = {
+            "canonical_character_key": "character:조렌테이머",
+            "display_name": "조렌테이머",
+            "source_character_keys": ["protagonist:named:방호영"],
+            "distinct_episode_count": 8,
+            "work_role": "major_character",
+            "identity_conflict_reasons": [],
+        }
+
+        matched_scope_keys = module._apply_locked_work_protagonist_rows(
+            [supporting_character],
+            [locked_main],
+        )
+
+        self.assertEqual(matched_scope_keys, set())
+        self.assertEqual(supporting_character["work_role"], "major_character")
+
+    def test_locked_main_rejects_exact_scope_candidate_with_identity_conflict(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:민준",
+            "display_name": "민준",
+            "source_character_keys": ["named:민준"],
+            "work_role": "main_protagonist",
+        }
+        conflicting_candidate = {
+            "canonical_character_key": "character:민준",
+            "display_name": "민준",
+            "source_character_keys": ["named:민준"],
+            "identity_conflict_reasons": ["cannot_link_name_conflict"],
+            "distinct_episode_count": 10,
+            "work_role": "main_protagonist",
+            "classification_status": "NEEDS_REVIEW",
+            "review_reasons": ["cannot_link_name_conflict"],
+        }
+
+        matched_scope_keys = module._apply_locked_work_protagonist_rows(
+            [conflicting_candidate],
+            [locked_main],
+        )
+
+        self.assertEqual(matched_scope_keys, set())
+        self.assertEqual(conflicting_candidate["work_role"], "major_character")
+        self.assertEqual(conflicting_candidate["review_reasons"], ["cannot_link_name_conflict"])
+
+    def test_inventory_v3_preserves_locked_main_scope_when_current_signals_do_not_rebuild_it(self):
+        module = load_module()
+        cur = object()
+        locked_main = {
+            "canonical_character_key": "character:란",
+            "display_name": "란",
+            "work_role": "main_protagonist",
+        }
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value={"character:란": locked_main},
+        ), patch.object(
+            module,
+            "aggregate_character_inventory_v3_rows",
+            return_value=[],
+        ), patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
+            counts = module.build_character_inventory_v3_summaries_from_signal_rows(
+                cur,
+                product_id=687,
+                signal_rows=[{"summary_text": "{}"}],
+            )
+
+        self.assertEqual(counts, (0, 1))
+        deactivate_missing.assert_called_once_with(
+            cur,
+            687,
+            "character_inventory_v3",
+            {"character:란"},
+        )
+
+    def test_inventory_v3_does_not_overwrite_locked_main_with_conflicting_same_scope_row(self):
+        module = load_module()
+        cur = object()
+        locked_main = {
+            "canonical_character_key": "character:민준",
+            "display_name": "민준",
+            "work_role": "main_protagonist",
+        }
+        conflicting_current_row = {
+            "canonical_character_key": "character:민준",
+            "display_name": "민준",
+            "work_role": "major_character",
+            "identity_conflict_reasons": ["cannot_link_name_conflict"],
+        }
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value={"character:민준": locked_main},
+        ), patch.object(
+            module,
+            "aggregate_character_inventory_v3_rows",
+            return_value=[conflicting_current_row],
+        ), patch.object(
+            module,
+            "upsert_character_inventory_v3_item",
+        ) as upsert_item, patch.object(
+            module,
+            "deactivate_missing_active_scopes",
+        ) as deactivate_missing:
+            counts = module.build_character_inventory_v3_summaries_from_signal_rows(
+                cur,
+                product_id=687,
+                signal_rows=[{"summary_text": "{}"}],
+            )
+
+        self.assertEqual(counts, (0, 1))
+        upsert_item.assert_not_called()
+        deactivate_missing.assert_called_once_with(
+            cur,
+            687,
+            "character_inventory_v3",
+            {"character:민준"},
+        )
+
+    def test_locked_main_still_accumulates_new_episode_and_voice_evidence(self):
+        module = load_module()
+        initial_rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key="protagonist:named:란",
+                        display_name="란",
+                        is_protagonist=True,
+                        role_in_episode="lead",
+                        voice_mode="dialogue",
+                        scene_weight="high",
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+        locked_main = next(
+            row
+            for row in module.aggregate_character_inventory_v3_rows(initial_rows)
+            if row["work_role"] == "main_protagonist"
+        )
+        expanded_rows = [
+            *initial_rows,
+            *[
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="named:란",
+                            display_name="란",
+                            is_work_protagonist=True,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            voice_mode="dialogue",
+                            scene_weight="high",
+                        )
+                    ],
+                )
+                for episode_no in range(4, 6)
+            ],
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(
+            expanded_rows,
+            locked_protagonist_rows=[locked_main],
+        )
+        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+
+        self.assertEqual(main["display_name"], "란")
+        self.assertEqual(main["latest_seen_episode_no"], 5)
+        self.assertEqual(main["distinct_episode_count"], 5)
+        self.assertEqual(main["voice_mode_counts"]["dialogue"], 5)
+
+    def test_locked_co_main_set_is_preserved(self):
+        module = load_module()
+        locked_rows = [
+            {
+                "canonical_character_key": f"character:{name}",
+                "display_name": name,
+                "source_character_keys": [f"named:{name}"],
+                "work_role": "main_protagonist",
+            }
+            for name in ["득구", "한설총"]
+        ]
+        rows = [
+            {
+                "canonical_character_key": f"character:{name}",
+                "display_name": name,
+                "source_character_keys": [f"named:{name}"],
+                "distinct_episode_count": 8,
+                "work_role": "main_protagonist" if name == "새후보" else "major_character",
+            }
+            for name in ["득구", "한설총", "새후보"]
+        ]
+
+        matched_scope_keys = module._apply_locked_work_protagonist_rows(rows, locked_rows)
+
+        self.assertEqual(matched_scope_keys, {"character:득구", "character:한설총"})
+        self.assertEqual(
+            {row["display_name"] for row in rows if row["work_role"] == "main_protagonist"},
+            {"득구", "한설총"},
+        )
 
     def test_inventory_v3_work_level_resolution_preserves_other_chat_targets(self):
         module = load_module()
@@ -7044,7 +7471,8 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
 
         with patch.object(module, "build_open_add_episode_id_set", return_value={101, 102, 103, 104}), \
              patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
-             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()):
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_scene_repair_episode_id_set", return_value=set()):
             filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=2)
 
         self.assertEqual([row["episode_no"] for row in filtered], [1, 2])
@@ -7059,7 +7487,8 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
 
         with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
              patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
-             patch.object(module, "build_signal_repair_episode_id_set", return_value={102}):
+             patch.object(module, "build_signal_repair_episode_id_set", return_value={102}), \
+             patch.object(module, "build_scene_repair_episode_id_set", return_value=set()):
             filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=0)
 
         self.assertEqual([row["episode_no"] for row in filtered], [2])
@@ -7090,6 +7519,251 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             summary_type="episode_character_signals",
         )
         self.assertEqual(repair_ids, {102})
+
+    def test_scene_repair_episode_id_set_requires_usable_active_scene(self):
+        module = load_module()
+        cur = object()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+            {"product_id": 687, "episode_id": 103, "episode_no": 3},
+            {"product_id": 687, "episode_id": 104, "episode_no": 4},
+            {"product_id": 687, "episode_id": 105, "episode_no": 5},
+        ]
+        active_scene_rows = [
+            {
+                "summary_id": 20,
+                "scope_key": "episode:101",
+                "summary_text": json.dumps(
+                    {
+                        "status": "ok",
+                        "scene_count": 1,
+                        "scenes": [{"scene_index": 1, "scene_gist": "렌이 문을 연다."}],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            {
+                "summary_id": 20,
+                "scope_key": "episode:102",
+                "summary_text": json.dumps(
+                    {"status": "failed", "scene_count": 1, "scenes": [{"scene_index": 1}]},
+                    ensure_ascii=False,
+                ),
+            },
+            {
+                "summary_id": 20,
+                "scope_key": "episode:104",
+                "summary_text": json.dumps(
+                    {"status": "ok", "scene_count": "not-a-number", "scenes": [{"scene_index": 1}]},
+                    ensure_ascii=False,
+                ),
+            },
+            {
+                "summary_id": 20,
+                "scope_key": "episode:105",
+                "summary_text": json.dumps(
+                    {"status": "ok", "scene_count": 1, "scenes": {"scene_index": 1}},
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+
+        with patch.object(
+            module,
+            "fetch_active_summary_rows",
+            side_effect=[
+                active_scene_rows,
+                [
+                    {"summary_id": 10, "scope_key": f"episode:{episode_id}"}
+                    for episode_id in range(101, 106)
+                ],
+            ],
+        ) as fetch_rows:
+            repair_ids = module.build_scene_repair_episode_id_set(
+                cur,
+                product_id=687,
+                product_rows=rows,
+            )
+
+        fetch_rows.assert_any_call(
+            cur=cur,
+            product_id=687,
+            summary_type="episode_scene_extraction",
+        )
+        self.assertEqual(repair_ids, {102, 103, 104, 105})
+
+    def test_scene_repair_marks_scene_stale_when_episode_summary_is_newer(self):
+        module = load_module()
+        cur = object()
+        rows = [{"product_id": 687, "episode_id": 101, "episode_no": 1}]
+        active_scene_rows = [
+            {
+                "summary_id": 10,
+                "scope_key": "episode:101",
+                "summary_text": json.dumps(
+                    {
+                        "status": "ok",
+                        "scene_count": 1,
+                        "scenes": [{"scene_index": 1, "scene_gist": "렌이 문을 연다."}],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+        active_episode_summary_rows = [
+            {"summary_id": 20, "scope_key": "episode:101", "summary_text": "새 요약"}
+        ]
+
+        with patch.object(
+            module,
+            "fetch_active_summary_rows",
+            side_effect=[active_scene_rows, active_episode_summary_rows],
+        ):
+            repair_ids = module.build_scene_repair_episode_id_set(
+                cur,
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, {101})
+
+    def test_scene_repair_keeps_scene_when_it_is_newer_than_episode_summary(self):
+        module = load_module()
+        cur = object()
+        rows = [{"product_id": 687, "episode_id": 101, "episode_no": 1}]
+        active_scene_rows = [
+            {
+                "summary_id": 30,
+                "scope_key": "episode:101",
+                "summary_text": json.dumps(
+                    {
+                        "status": "partial",
+                        "scene_count": 1,
+                        "scenes": [{"scene_index": 1, "scene_gist": "렌이 문을 연다."}],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+        active_episode_summary_rows = [
+            {"summary_id": 20, "scope_key": "episode:101", "summary_text": "현재 요약"}
+        ]
+
+        with patch.object(
+            module,
+            "fetch_active_summary_rows",
+            side_effect=[active_scene_rows, active_episode_summary_rows],
+        ):
+            repair_ids = module.build_scene_repair_episode_id_set(
+                cur,
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(repair_ids, set())
+
+    def test_delta_commits_accumulated_context_before_nonblocking_scene_stage(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        delta_inventory_anchor = source.index(
+            "new_inventory_v3_map = fetch_active_character_inventory_map("
+        )
+        scene_call = source.index(
+            "scene_counts = await build_episode_scene_extraction_summaries_nonblocking(",
+            delta_inventory_anchor,
+        )
+        commit_before_scene = source.index("work_conn.commit()", delta_inventory_anchor)
+
+        self.assertLess(commit_before_scene, scene_call)
+
+    def test_delta_candidate_filter_includes_scene_debt_after_foundation_repairs(self):
+        module = load_module()
+        rows = [
+            {"product_id": 687, "episode_id": 101, "episode_no": 1},
+            {"product_id": 687, "episode_id": 102, "episode_no": 2},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value=set()), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_scene_repair_episode_id_set", return_value={102}):
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=0)
+
+        self.assertEqual([row["episode_no"] for row in filtered], [2])
+        self.assertEqual([row["_delta_reason"] for row in filtered], ["scene_repair"])
+
+    def test_delta_candidate_filter_prioritizes_new_foundation_over_old_scene_debt(self):
+        module = load_module()
+        rows = [
+            *[
+                {"product_id": 687, "episode_id": episode_no, "episode_no": episode_no}
+                for episode_no in range(1, 7)
+            ],
+            {"product_id": 687, "episode_id": 100, "episode_no": 100},
+        ]
+
+        with patch.object(module, "build_open_add_episode_id_set", return_value={100}), \
+             patch.object(module, "build_sync_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_signal_repair_episode_id_set", return_value=set()), \
+             patch.object(module, "build_scene_repair_episode_id_set", return_value=set(range(1, 7))):
+            filtered = module.filter_delta_candidate_rows(object(), rows, max_delta_episodes=5)
+
+        self.assertEqual(filtered[0]["episode_no"], 100)
+        self.assertEqual(filtered[0]["_delta_reason"], "open_add")
+        self.assertEqual(len(filtered), 5)
+
+    def test_inventory_source_scope_map_rejects_ambiguous_source_alias(self):
+        module = load_module()
+        inventory_map = {
+            "character:민준A": {
+                "canonical_character_key": "character:민준A",
+                "source_character_keys": ["named:민준"],
+            },
+            "character:민준B": {
+                "canonical_character_key": "character:민준B",
+                "source_character_keys": ["named:민준", "named:민준B"],
+            },
+        }
+
+        alias_map = module.build_inventory_source_scope_key_map(inventory_map)
+
+        self.assertNotIn("named:민준", alias_map)
+        self.assertEqual(alias_map["character:민준A"], "character:민준A")
+        self.assertEqual(alias_map["named:민준B"], "character:민준B")
+        legacy_row = module.fetch_legacy_summary_state_for_inventory_alias(
+            {"named:민준": {"scope_key": "named:민준"}},
+            scope_key="character:민준A",
+            inventory_item=inventory_map["character:민준A"],
+            allowed_alias_keys={
+                alias_key
+                for alias_key, owner_scope_key in alias_map.items()
+                if owner_scope_key == "character:민준A"
+            },
+        )
+        self.assertEqual(legacy_row, {})
+
+        affected_scope_keys = module.compute_rp_affected_scope_keys(
+            old_inventory_map=inventory_map,
+            new_inventory_map=inventory_map,
+            old_relation_map={},
+            new_relation_map={},
+            old_touched_signal_rows=[],
+            new_touched_signal_rows=[
+                signal_row(
+                    1,
+                    1,
+                    [
+                        signal_character(
+                            character_key="named:민준",
+                            display_name="민준",
+                        )
+                    ],
+                )
+            ],
+            old_profile_map={"named:민준": {"character_key": "named:민준"}},
+            old_examples_map={"named:민준": {"character_key": "named:민준"}},
+        )
+        self.assertNotIn("named:민준", affected_scope_keys)
 
     def test_delta_mode_allows_product_only_apply_for_internal_changed_row_filtering(self):
         module = load_module()

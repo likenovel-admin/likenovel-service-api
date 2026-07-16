@@ -16,9 +16,13 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "build_story_age
 class FakeConnection:
     def __init__(self):
         self.commit_count = 0
+        self.rollback_count = 0
 
     def commit(self):
         self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
 
 
 @contextmanager
@@ -45,6 +49,29 @@ def load_module():
 
 
 class StoryAgentSceneExtractionTest(unittest.TestCase):
+    def test_usable_scene_payload_requires_known_status_and_scene_gist(self):
+        module = load_module()
+
+        self.assertFalse(
+            module._is_usable_episode_scene_payload(
+                {"scene_count": 1, "scenes": [{}]}
+            )
+        )
+        self.assertFalse(
+            module._is_usable_episode_scene_payload(
+                {"status": "garbage", "scene_count": 1, "scenes": [{}]}
+            )
+        )
+        self.assertTrue(
+            module._is_usable_episode_scene_payload(
+                {
+                    "status": "partial",
+                    "scene_count": 1,
+                    "scenes": [{"scene_gist": "주인공이 문을 연다."}],
+                }
+            )
+        )
+
     def test_line_index_and_anchor_resolution_support_whitespace_normalized_match(self):
         module = load_module()
         text = "문이 열렸다.\n아델리트는  낮게 말했다.\n\"움직이지 마.\"\n"
@@ -785,6 +812,71 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         request_mock.assert_awaited_once()
         upsert_summary.assert_not_called()
         self.assertEqual(conn.commit_count, 0)
+
+    def test_scene_extraction_provider_failure_does_not_deactivate_existing_scope(self):
+        module = load_module()
+        conn = FakeConnection()
+        request_mock = AsyncMock(side_effect=module.RequestError("upstream timeout"))
+
+        async def run():
+            with patch.object(module, "work_cursor", fake_work_cursor), \
+                 patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+                 patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+                 patch.object(module, "fetch_existing_summary", return_value=None), \
+                 patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
+                 patch.object(module, "deactivate_active_scope") as deactivate_scope:
+                inserted, reused = await module.build_episode_scene_extraction_summaries(
+                    conn,
+                    product_id=687,
+                    product_title="테스트 작품",
+                    episode_rows=[
+                        {
+                            "summary_id": 11,
+                            "scope_key": "episode:1",
+                            "episode_from": 1,
+                            "source_hash": "summary-hash",
+                            "summary_text": "[1화] 시작",
+                        }
+                    ],
+                    episode_texts_by_no={1: "아델리트는 문을 열었다."},
+                    summary_client=object(),
+                    canonical_character_packet={
+                        "characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]
+                    },
+                    cleanup_missing_scopes=False,
+                )
+            return inserted, reused, deactivate_scope
+
+        inserted, reused, deactivate_scope = asyncio.run(run())
+
+        self.assertEqual((inserted, reused), (0, 0))
+        request_mock.assert_awaited_once()
+        deactivate_scope.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
+
+    def test_scene_extraction_storage_failure_rolls_back_without_failing_product_build(self):
+        module = load_module()
+        conn = FakeConnection()
+        build_mock = AsyncMock(side_effect=RuntimeError("scene upsert failed"))
+
+        async def run():
+            with patch.object(
+                module,
+                "build_episode_scene_extraction_summaries",
+                build_mock,
+            ):
+                return await module.build_episode_scene_extraction_summaries_nonblocking(
+                    conn,
+                    product_id=687,
+                    product_title="테스트 작품",
+                    episode_rows=[],
+                    episode_texts_by_no={},
+                    summary_client=object(),
+                    canonical_character_packet={"characters": []},
+                )
+
+        self.assertEqual(asyncio.run(run()), (0, 0))
+        self.assertEqual(conn.rollback_count, 1)
 
     def test_scene_extraction_does_not_reuse_existing_failed_payload(self):
         module = load_module()
