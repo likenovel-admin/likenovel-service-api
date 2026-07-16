@@ -2105,6 +2105,16 @@ def should_refresh_delta_rp(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "refresh_rp", False))
 
 
+def get_openrouter_retry_delay_seconds(exc: Exception) -> float | None:
+    if not isinstance(exc, HTTPStatusError) or exc.response.status_code not in {429, 503}:
+        return None
+    try:
+        retry_after = float(exc.response.headers.get("Retry-After") or 10.0)
+    except (TypeError, ValueError):
+        retry_after = 10.0
+    return max(1.0, min(retry_after, 60.0))
+
+
 def build_open_add_episode_id_set(cur, *, product_id: int, product_rows: list[dict]) -> set[int]:
     active_episode_summary_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_summary")
     active_episode_scope_keys = {
@@ -4970,6 +4980,9 @@ async def request_episode_character_signals_payload(
                     attempt + 1,
                     exc,
                 )
+                retry_delay = get_openrouter_retry_delay_seconds(exc)
+                if attempt == 0 and retry_delay is not None:
+                    await asyncio.sleep(retry_delay)
 
     diagnostics = build_episode_character_signals_parse_diagnostics(raw_text)
     raise EpisodeCharacterSignalsParseError(
@@ -5332,6 +5345,9 @@ async def request_episode_scene_extraction_payload(
                 attempt + 1,
                 exc,
             )
+            retry_delay = get_openrouter_retry_delay_seconds(exc)
+            if attempt == 0 and retry_delay is not None:
+                await asyncio.sleep(retry_delay)
             continue
         normalized_payload = normalize_episode_scene_extraction_payload(
             payload,
@@ -5716,6 +5732,29 @@ def build_rp_dialogue_items_from_example_payload(example_payload: dict[str, obje
             }
         )
     return dialogue_items
+
+
+def select_delta_rp_scope_keys(
+    *,
+    refresh_requested: bool,
+    affected_scope_keys: set[str],
+    inventory_map: dict[str, dict[str, object]],
+    profile_map: dict[str, dict[str, object]],
+    examples_map: dict[str, dict[str, object]],
+) -> set[str]:
+    if refresh_requested:
+        return set(affected_scope_keys)
+
+    missing_scope_keys: set[str] = set()
+    for target in build_inventory_rp_targets(inventory_map or {}):
+        scope_key = str(target.get("character_key") or "").strip()
+        if not scope_key:
+            continue
+        profile_payload = dict(dict((profile_map or {}).get(scope_key) or {}).get("payload") or {})
+        examples_payload = dict(dict((examples_map or {}).get(scope_key) or {}).get("payload") or {})
+        if not profile_payload or not build_rp_dialogue_items_from_example_payload(examples_payload):
+            missing_scope_keys.add(scope_key)
+    return missing_scope_keys
 
 
 def is_batch_rp_candidate(inventory_item: dict[str, object] | None) -> bool:
@@ -7093,7 +7132,7 @@ async def build_episode_character_signals_summaries(
                     scope_key=scope_key,
                 )
             conn.commit()
-            continue
+            raise
         normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
         with work_cursor(conn) as cur:
             _, inserted = upsert_summary(
@@ -14222,11 +14261,23 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                         rp_affected_scope_keys.update(scene_affected_scope_keys)
                         rp_counts = build_empty_delta_rp_counts()
                         opening_counts = (0, 0)
-                        if should_refresh_delta_rp(args):
+                        rp_scope_keys_to_build = select_delta_rp_scope_keys(
+                            refresh_requested=should_refresh_delta_rp(args),
+                            affected_scope_keys=rp_affected_scope_keys,
+                            inventory_map=new_inventory_v3_map,
+                            profile_map=old_profile_map,
+                            examples_map=old_examples_map,
+                        )
+                        if rp_scope_keys_to_build:
+                            if args.verbose and not should_refresh_delta_rp(args):
+                                print(
+                                    f"[delta-rp-missing-build] product_id={product_id} "
+                                    f"scope_keys={','.join(sorted(rp_scope_keys_to_build))}"
+                                )
                             rp_counts = await build_rp_summaries_delta(
                                 conn=work_conn,
                                 product_id=product_id,
-                                affected_scope_keys=rp_affected_scope_keys,
+                                affected_scope_keys=rp_scope_keys_to_build,
                                 episode_rows=all_episode_summary_rows,
                                 episode_texts_by_no=episode_texts_by_no,
                                 summary_client=summary_client,
