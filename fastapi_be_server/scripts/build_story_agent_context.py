@@ -56,7 +56,7 @@ DEEPSEEK_OPENROUTER_PROVIDER_ONLY = os.getenv(
     "together",
 ).strip()
 RP_OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("STORY_AGENT_RP_OPENROUTER_TIMEOUT_SECONDS", "90"))
-RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "3"))
+RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "2"))
 RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "2"))
 RP_DIALOGUE_FALLBACK_MAX_EPISODES = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_MAX_EPISODES", "18"))
 RP_DIALOGUE_FALLBACK_EXCERPT_CHARS = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_EXCERPT_CHARS", "4600"))
@@ -5762,6 +5762,14 @@ def is_batch_rp_candidate(inventory_item: dict[str, object] | None) -> bool:
         return False
     if bool(inventory_item.get("is_protagonist")):
         return True
+    identity_conflict_reasons = {
+        str(reason).strip()
+        for field_name in ("identity_conflict_reasons", "review_reasons")
+        for reason in list(inventory_item.get(field_name) or [])
+        if str(reason).strip()
+    }
+    if "duplicate_canonical_key" in identity_conflict_reasons:
+        return False
     entity_kind = str(inventory_item.get("entity_kind") or "").strip().lower() or "person"
     if entity_kind not in {"person", "stable_role"}:
         return False
@@ -6640,11 +6648,12 @@ async def build_rp_summaries_delta(
                 counts["examples"][0 if examples_inserted else 1] += 1
                 continue
 
+        direct_dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
         dialogue_items: list[dict[str, object]] = []
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
         if not bool(direct_voice_quality.get("strict_chat_ready")):
             try:
-                dialogue_items = await collect_llm_rp_dialogue_items(
+                llm_dialogue_items = await collect_llm_rp_dialogue_items(
                     summary_client,
                     target=target,
                     episode_texts_by_no=episode_texts_by_no,
@@ -6653,8 +6662,13 @@ async def build_rp_summaries_delta(
             except Exception as exc:
                 if verbose:
                     print(f"[rp-delta-dialogue-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
-                dialogue_items = []
-            if not is_strict_dialogue_item_set_ready(dialogue_items, aliases):
+                llm_dialogue_items = []
+            dialogue_items = dedupe_rp_dialogue_items(
+                [*direct_dialogue_items, *llm_dialogue_items],
+                limit=80,
+            )
+            dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
+            if sum(bool(item.get("is_example_candidate")) for item in dialogue_items) < RP_PROFILE_MIN_EXAMPLE_TEXTS:
                 logger.info(
                     "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
                     product_id,
@@ -6665,7 +6679,7 @@ async def build_rp_summaries_delta(
                 counts["keep_old_dialogue_missing_count"] += 1
                 continue
         else:
-            dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
+            dialogue_items = direct_dialogue_items
 
         dialogue_items = dedupe_rp_dialogue_items(dialogue_items, limit=80)
         dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)

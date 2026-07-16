@@ -1507,6 +1507,66 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["deactivated_examples_count"], 0)
         deactivate_scope.assert_not_called()
 
+    async def test_delta_rp_build_accepts_two_grounded_examples_below_strict_distribution_gate(self):
+        module = load_module()
+        conn = FakeConnection()
+        dialogue_items = [
+            {
+                "episode_no": 3,
+                "kind": "dialogue",
+                "text": "아저씨 얼른 저 따라오세요. 여기 위험해요.",
+            },
+            {
+                "episode_no": 3,
+                "kind": "dialogue",
+                "text": "이번에는 제가 아저씨를 살려드릴게요.",
+            },
+        ]
+        aliases = ["이시혁"]
+        self.assertFalse(module.is_strict_dialogue_item_set_ready(dialogue_items, aliases))
+
+        profile_payload = {
+            "speech_style": {"tone": "단호"},
+            "personality_core": ["책임감"],
+            "baseline_attitude": "보호",
+            "example_dialogues": [item["text"] for item in dialogue_items],
+        }
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": False, "status": "insufficient"}), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
+             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=dialogue_items)), \
+             patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
+             patch.object(module, "request_character_chat_internal_prompt_payload", AsyncMock(return_value=None)), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True)]), \
+             patch.object(module, "deactivate_active_scope", return_value=0):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1099,
+                affected_scope_keys={"character:이시혁"},
+                episode_rows=[],
+                episode_texts_by_no={3: "원문"},
+                summary_client=object(),
+                inventory_map={
+                    "character:이시혁": {
+                        "canonical_character_key": "character:이시혁",
+                        "display_name": "이시혁",
+                        "aliases": aliases,
+                        "is_protagonist": True,
+                        "distinct_episode_count": 83,
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
+
     async def test_delta_rp_build_bridges_legacy_profile_examples_to_canonical_internal_prompt(self):
         module = load_module()
         conn = FakeConnection()
@@ -2578,8 +2638,8 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
     def test_rp_profile_requires_minimum_exact_examples(self):
         module = load_module()
 
-        self.assertFalse(module.has_enough_rp_example_texts(["첫 번째", "두 번째"]))
-        self.assertTrue(module.has_enough_rp_example_texts(["첫 번째", "두 번째", "세 번째"]))
+        self.assertFalse(module.has_enough_rp_example_texts(["첫 번째"]))
+        self.assertTrue(module.has_enough_rp_example_texts(["첫 번째", "두 번째"]))
 
     def test_character_chat_context_richness_report_compares_prod_baseline_and_shadow(self):
         module = load_module()
@@ -2908,6 +2968,59 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([target["character_key"] for target in targets], ["character:백이현"])
+
+    def test_inventory_rp_targets_exclude_non_protagonist_duplicate_canonical_rows(self):
+        module = load_module()
+        targets = module.build_inventory_rp_targets(
+            {
+                "character:이시혁": {
+                    "display_name": "이시혁",
+                    "aliases": ["이시혁", "1000번"],
+                    "is_protagonist": True,
+                    "distinct_episode_count": 83,
+                    "review_reasons": ["duplicate_canonical_key"],
+                },
+                "character:1000번:dup:fed5c7cd": {
+                    "display_name": "1000번",
+                    "aliases": ["1000번", "주인공"],
+                    "is_protagonist": False,
+                    "distinct_episode_count": 40,
+                    "review_reasons": ["AMBIGUOUS_TOP_CANDIDATES", "duplicate_canonical_key"],
+                },
+                "character:당화린": {
+                    "display_name": "당화린",
+                    "aliases": ["당화린"],
+                    "is_protagonist": False,
+                    "distinct_episode_count": 13,
+                },
+            }
+        )
+
+        self.assertEqual(
+            [target["character_key"] for target in targets],
+            ["character:이시혁", "character:당화린"],
+        )
+        self.assertEqual(
+            module.build_inventory_rp_retained_scope_keys(
+                {
+                    "character:이시혁": {
+                        "display_name": "이시혁",
+                        "aliases": ["이시혁", "1000번"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 83,
+                        "review_reasons": ["duplicate_canonical_key"],
+                    },
+                    "character:1000번:dup:fed5c7cd": {
+                        "display_name": "1000번",
+                        "aliases": ["1000번", "주인공"],
+                        "is_protagonist": False,
+                        "distinct_episode_count": 40,
+                        "review_reasons": ["duplicate_canonical_key"],
+                    },
+                }
+            ),
+            {"character:이시혁"},
+        )
 
     def test_inventory_rp_targets_do_not_require_public_chat_voice_gate(self):
         module = load_module()
