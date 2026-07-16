@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 HOME_TICKER_REFRESH_AFTER_SECONDS = 60
 HOME_TICKER_ROTATE_EVERY_MS = 5000
-HOME_TICKER_LIMIT = 10
+HOME_TICKER_LIMIT = 15
 HOME_TICKER_CACHE_TTL_SECONDS = 60
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -32,6 +32,17 @@ def _visibility_filter(adult_yn: str | None) -> str:
         "p.open_yn = 'Y'",
         "COALESCE(p.blind_yn, 'N') = 'N'",
         "p.status_code IN ('ongoing', 'end')",
+        """EXISTS (
+              SELECT 1
+              FROM tb_product_episode visible_episode
+              WHERE visible_episode.product_id = p.product_id
+                AND visible_episode.open_yn = 'Y'
+                AND visible_episode.use_yn = 'Y'
+                AND (
+                    visible_episode.publish_reserve_date IS NULL
+                    OR visible_episode.publish_reserve_date <= NOW()
+                )
+          )""",
     ]
     if _normalize_adult_yn(adult_yn) != "Y":
         clauses.append("p.ratings_code = 'all'")
@@ -143,15 +154,22 @@ def build_recent_episode_query(adult_yn: str | None) -> tuple[str, dict[str, Any
             END AS message,
             90 AS priority,
             'near_real_time' AS freshness
-        FROM tb_product_episode e
-        INNER JOIN tb_product p ON p.product_id = e.product_id
+        FROM (
+            SELECT
+                e.product_id,
+                MAX(e.publish_reserve_date) AS latest_publish_reserve_date
+            FROM tb_product_episode e
+            WHERE e.open_yn = 'Y'
+              AND e.use_yn = 'Y'
+              AND e.publish_reserve_date <= NOW()
+              AND e.publish_reserve_date >= DATE_SUB(NOW(), INTERVAL 6 HOUR)
+            GROUP BY e.product_id
+        ) recent_episode
+        INNER JOIN tb_product p ON p.product_id = recent_episode.product_id
         WHERE {_visibility_filter(adult_yn)}
-          AND e.open_yn = 'Y'
-          AND e.use_yn = 'Y'
-          AND e.publish_reserve_date <= NOW()
-          AND e.publish_reserve_date >= DATE_SUB(NOW(), INTERVAL 2 HOUR)
-        ORDER BY e.publish_reserve_date DESC, e.episode_id DESC
-        LIMIT 5
+          AND p.status_code = 'ongoing'
+        ORDER BY recent_episode.latest_publish_reserve_date DESC, p.product_id DESC
+        LIMIT 10
     """
     return query, {}
 
