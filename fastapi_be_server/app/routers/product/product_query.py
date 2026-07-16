@@ -411,6 +411,22 @@ async def episodes_by_product_id(
 
 
 @router.get(
+    "/{product_id}/detail-shell",
+    tags=["작품"],
+    responses={200: {"description": "작품 상세 초기 렌더링 정보"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def public_product_detail_shell_by_product_id(
+    product_id: str = Path(..., description="작품 아이디"),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await product_service.public_product_detail_shell_by_product_id(
+        product_id=product_id,
+        db=db,
+    )
+
+
+@router.get(
     "/{product_id}/details-group",
     tags=["작품"],
     responses={
