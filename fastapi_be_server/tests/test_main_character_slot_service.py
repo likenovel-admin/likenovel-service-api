@@ -40,7 +40,7 @@ def _row(
     }
 
 
-def test_main_character_slot_roster_accepts_chat_eligible_main_and_major_characters():
+def test_main_character_slot_roster_accepts_only_slot_eligible_characters():
     from app.services.product.main_character_slot_service import (
         extract_eligible_main_character_roster,
     )
@@ -54,9 +54,16 @@ def test_main_character_slot_roster_accepts_chat_eligible_main_and_major_charact
                 work_role="major_character",
                 public_slot_eligible=False,
             ),
-            _row("character:false", public_chat_eligible=False),
-            _row("character:string", public_chat_eligible="true"),
-            _row("character:missing", public_chat_eligible=None),
+            _row(
+                "character:ally",
+                display_name="동료",
+                work_role="major_character",
+                public_chat_eligible=False,
+                public_slot_eligible=True,
+            ),
+            _row("character:false", public_slot_eligible=False),
+            _row("character:string", public_slot_eligible="true"),
+            _row("character:missing", public_slot_eligible=None),
             _row("character:fail", safety_status="fail"),
             _row("character:review", safety_status="review"),
         ]
@@ -69,9 +76,9 @@ def test_main_character_slot_roster_accepts_chat_eligible_main_and_major_charact
             "aliases": ["아델리트", "공녀"],
         },
         {
-            "scopeKey": "character:follower",
-            "displayName": "추종자",
-            "aliases": ["추종자"],
+            "scopeKey": "character:ally",
+            "displayName": "동료",
+            "aliases": ["동료"],
         },
     ]
 
@@ -390,8 +397,12 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
         assert "episode_stats.open_episode_count >= :minimum_open_episode_count" in query
         assert "summary_type = 'character_inventory_v3'" in query
-        assert "$.public_chat_eligible" in query
+        assert "$.public_slot_eligible" in query
+        assert "$.public_chat_eligible" not in query
         assert "$.display_safety.status" in query
+        assert "summary_type = 'character_rp_profile'" in query
+        assert "summary_type = 'character_rp_examples'" in query
+        assert "{_chat_ready_rp_assets_predicate" not in query
         assert params["minimum_open_episode_count"] == 15
         assert response == {"data": []}
 
@@ -464,7 +475,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         for query in (count_query, list_query):
             assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
             assert "summary_type = 'character_inventory_v3'" in query
-            assert "$.public_chat_eligible" in query
+            assert "$.public_slot_eligible" in query
+            assert "$.public_chat_eligible" not in query
             assert "$.display_safety.status" in query
             assert "summary_type = 'character_rp_profile'" in query
             assert "summary_type = 'character_rp_examples'" in query
