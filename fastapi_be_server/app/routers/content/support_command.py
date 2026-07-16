@@ -4,6 +4,7 @@ from typing import Dict, Any
 
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger, chk_cur_user
+import app.schemas.support as support_schema
 import app.services.content.support_service as support_service
 
 router = APIRouter(prefix="/support")
