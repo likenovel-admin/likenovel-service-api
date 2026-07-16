@@ -1,3 +1,5 @@
+from html import escape
+
 from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +10,9 @@ import app.schemas.support as support_schema
 
 from app.config.log_config import service_error_logger
 from app.const import LOGGER_TYPE, ErrorMessages
+from app.const import settings
+from app.services.common import comm_service
+from app.utils.email import send_email
 
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_INSTANCE_NAME_FOR_SERVICE_ERROR)
 
@@ -175,5 +180,57 @@ async def get_support_faqs_faq_id(faq_id: str, db: AsyncSession):
     return res_body
 
 
-async def post_support_qnas(kc_user_id: str, db: AsyncSession):
-    return
+async def post_support_qnas(
+    req_body: support_schema.PostSupportQnaReqBody,
+    kc_user_id: str,
+    db: AsyncSession,
+):
+    try:
+        async with db.begin():
+            user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+            if not user_id:
+                raise CustomResponseException(status_code=status.HTTP_401_UNAUTHORIZED)
+            result = await db.execute(
+                text(
+                    """
+                    INSERT INTO tb_qna
+                        (category, subject, content, email, user_id, attach_file_id,
+                         created_id)
+                    VALUES
+                        (:category, :subject, :content, :email, :user_id, NULL,
+                         :user_id)
+                    """
+                ),
+                {
+                    "category": req_body.category,
+                    "subject": req_body.subject,
+                    "content": req_body.content,
+                    "email": req_body.email,
+                    "user_id": user_id,
+                },
+            )
+            qna_id = int(result.lastrowid)
+    except SQLAlchemyError as exc:
+        error_logger.error(f"qnaCreate: {exc}")
+        raise CustomResponseException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message=ErrorMessages.DB_OPERATION_ERROR,
+        )
+
+    try:
+        email_subject = " ".join(req_body.subject.splitlines())
+        await send_email(
+            settings.SUPPORT_EMAIL,
+            f"[라이크노벨 1:1 문의 #{qna_id}] {email_subject}",
+            (
+                f"<p><strong>접수번호:</strong> {qna_id}</p>"
+                f"<p><strong>분류:</strong> {escape(req_body.category)}</p>"
+                f"<p><strong>회신 이메일:</strong> {escape(req_body.email)}</p>"
+                f"<p><strong>제목:</strong> {escape(req_body.subject)}</p>"
+                f"<p><strong>내용:</strong><br>{escape(req_body.content).replace(chr(10), '<br>')}</p>"
+            ),
+        )
+    except Exception as exc:
+        error_logger.error(f"qnaNotification: qna_id={qna_id} error={exc}")
+
+    return {"data": {"qnaId": qna_id}}

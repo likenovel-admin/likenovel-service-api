@@ -95,6 +95,13 @@ fastapi_be_server/
 | `statistics.py` | 통계 테이블 |
 | `comm.py` | 공통 테이블 |
 
+## 1:1 문의 접수
+
+- `POST /v1/command/support/qnas`는 로그인 사용자의 문의를 `tb_qna`에 저장한다.
+- 요청 필드는 `category`, `subject`, `content`, `email`이며 성공 시 `data.qnaId`를 반환한다.
+- 저장 후 `SUPPORT_EMAIL`(기본값 `admin@likenovel.net`)로 운영 알림을 발송한다. 메일 실패는 저장된 문의를 취소하지 않고 오류 로그로 남긴다.
+- 첨부파일은 현재 지원하지 않는다.
+
 #### schemas/ (Pydantic 스키마)
 API 요청/응답 데이터 구조 정의 (27개 파일)
 - `admin.py`, `auth.py`, `user.py`, `product.py`, `episode.py`, `partner.py` 등

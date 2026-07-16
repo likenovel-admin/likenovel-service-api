@@ -206,6 +206,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
     SMTP_FROM_EMAIL: str = os.getenv("SMTP_FROM_EMAIL", "noreply@likenovel.net")
     SMTP_FROM_NAME: str = os.getenv("SMTP_FROM_NAME", "라이크노벨")
+    SUPPORT_EMAIL: str = os.getenv("SUPPORT_EMAIL", "admin@likenovel.net")
     SERVICE_FRONTEND_URL: str = os.getenv("SERVICE_FRONTEND_URL", "https://www.likenovel.net")
 
     # anthropic (AI 추천)

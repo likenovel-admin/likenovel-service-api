@@ -1,7 +1,8 @@
-from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_camel
-
 from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
 
 
 class SupportBase(BaseModel):
@@ -11,6 +12,30 @@ class SupportBase(BaseModel):
 """
 request area
 """
+
+
+class PostSupportQnaReqBody(SupportBase):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    category: Literal[
+        "서비스문의",
+        "결제문의",
+        "정산문의",
+        "바라는점",
+        "회원상태문의",
+        "버그리포팅",
+        "제휴문의",
+        "작품신고",
+        "악성유저신고",
+        "게시물신고",
+    ]
+    subject: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1, max_length=20000)
+    email: str = Field(
+        min_length=3,
+        max_length=100,
+        pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$",
+    )
 
 """
 response area
