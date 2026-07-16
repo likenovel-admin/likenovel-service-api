@@ -4666,9 +4666,15 @@ def _build_websochat_inventory_v3_scope_aliases(
 ) -> list[str]:
     raw_source_keys = payload.get("source_character_keys") or []
     source_keys = [raw_source_keys] if isinstance(raw_source_keys, str) else list(raw_source_keys)
+    identity_scope_keys = [
+        str(value or "").strip()
+        for value in list(payload.get("protagonist_identity_scope_keys") or [])
+        if str(value or "").strip()
+    ]
     return _merge_websochat_ordered_texts(
         [str(payload.get("canonical_character_key") or "").strip(), str(scope_key or "").strip()],
         [str(source_key or "").strip() for source_key in source_keys],
+        identity_scope_keys,
     )
 
 
@@ -4694,32 +4700,75 @@ async def _resolve_websochat_inventory_v3_scope_alias(
         ),
         {"product_id": product_id},
     )
-    for row in result.mappings().all():
+    return _resolve_websochat_inventory_v3_alias_rows(
+        result.mappings().all(),
+        scope_key=normalized_scope_key,
+    )
+
+
+def _resolve_websochat_inventory_v3_alias_rows(
+    rows: list[dict[str, Any]],
+    *,
+    scope_key: str,
+) -> dict[str, Any] | None:
+    normalized_scope_key = str(scope_key or "").strip()
+    if not normalized_scope_key:
+        return None
+    matches: list[tuple[int, dict[str, Any]]] = []
+    for row in rows:
         row_scope_key = str(row.get("scopeKey") or "").strip()
         payload = _extract_websochat_json_object(str(row.get("summaryText") or "")) or {}
+        canonical_scope_key = str(payload.get("canonical_character_key") or row_scope_key).strip() or row_scope_key
+        identity_scope_keys = {
+            str(value or "").strip()
+            for value in list(payload.get("protagonist_identity_scope_keys") or [])
+            if str(value or "").strip()
+        }
+        raw_source_keys = payload.get("source_character_keys") or []
+        source_scope_keys = {
+            str(value or "").strip()
+            for value in ([raw_source_keys] if isinstance(raw_source_keys, str) else list(raw_source_keys))
+            if str(value or "").strip()
+        }
+        if normalized_scope_key in {row_scope_key, canonical_scope_key}:
+            match_rank = 0
+        elif normalized_scope_key in identity_scope_keys:
+            match_rank = 1
+        elif normalized_scope_key in source_scope_keys:
+            match_rank = 2
+        else:
+            continue
         alias_scope_keys = _build_websochat_inventory_v3_scope_aliases(
             scope_key=row_scope_key,
             payload=payload,
         )
-        if normalized_scope_key not in set(alias_scope_keys):
-            continue
-        canonical_scope_key = str(payload.get("canonical_character_key") or row_scope_key).strip() or row_scope_key
         display_name = str(payload.get("display_name") or "").strip()
         if not display_name and "named:" in normalized_scope_key:
             display_name = normalized_scope_key.split("named:", 1)[1].strip()
         if not display_name:
             display_name = canonical_scope_key.split(":", 1)[-1].strip() or canonical_scope_key
-        return {
-            "scopeKey": canonical_scope_key,
-            "displayName": display_name,
-            "aliasScopeKeys": _merge_websochat_ordered_texts(
-                [canonical_scope_key],
-                alias_scope_keys,
-                [normalized_scope_key],
-            ),
-            "inventoryPayload": payload,
-        }
-    return None
+        matches.append(
+            (
+                match_rank,
+                {
+                    "scopeKey": canonical_scope_key,
+                    "displayName": display_name,
+                    "aliasScopeKeys": _merge_websochat_ordered_texts(
+                        [canonical_scope_key],
+                        alias_scope_keys,
+                        [normalized_scope_key],
+                    ),
+                    "inventoryPayload": payload,
+                },
+            )
+        )
+    if not matches:
+        return None
+    best_rank = min(rank for rank, _ in matches)
+    best_matches = [match for rank, match in matches if rank == best_rank]
+    if len({str(match.get("scopeKey") or "") for match in best_matches}) != 1:
+        return None
+    return best_matches[0]
 
 
 def _build_websochat_inventory_v3_resolution(
@@ -4770,6 +4819,7 @@ def _is_websochat_summary_payload_scope_compatible(
     payload: dict[str, Any] | None,
     *,
     scope_key: str,
+    compatible_scope_keys: list[str] | None = None,
 ) -> bool:
     if not isinstance(payload, dict) or not payload:
         return False
@@ -4779,7 +4829,18 @@ def _is_websochat_summary_payload_scope_compatible(
     payload_scope_key = str(payload.get("character_key") or "").strip()
     if not payload_scope_key:
         return False
-    return payload_scope_key == expected_scope_key
+    allowed_scope_keys = {
+        value
+        for value in [
+            expected_scope_key,
+            *[
+                str(value or "").strip()
+                for value in list(compatible_scope_keys or [])
+            ],
+        ]
+        if value
+    }
+    return payload_scope_key in allowed_scope_keys
 
 
 _WEBSOCHAT_CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS = (
@@ -4889,6 +4950,7 @@ def _is_websochat_character_chat_rp_context_ready(
     product_id: int | None = None,
     read_episode_to: int | None = None,
     resolved_active_character: str,
+    compatible_scope_keys: list[str] | None = None,
     profile: dict[str, Any] | None,
     examples_payload: dict[str, Any] | None,
     internal_prompt_payload: dict[str, Any] | None,
@@ -4915,7 +4977,11 @@ def _is_websochat_character_chat_rp_context_ready(
     for payload in (profile, examples_payload):
         if payload is None:
             return False
-        if not _is_websochat_summary_payload_scope_compatible(payload, scope_key=resolved_scope_key):
+        if not _is_websochat_summary_payload_scope_compatible(
+            payload,
+            scope_key=resolved_scope_key,
+            compatible_scope_keys=compatible_scope_keys,
+        ):
             return False
     return True
 
@@ -5610,6 +5676,7 @@ async def _load_websochat_rp_context(
         product_id=product_id,
         read_episode_to=int(normalized_memory.get("read_episode_to") or 0),
         resolved_active_character=resolved_active_character,
+        compatible_scope_keys=cluster_scope_keys,
         profile=profile,
         examples_payload=examples_payload,
         internal_prompt_payload=internal_prompt_payload,
