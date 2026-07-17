@@ -886,11 +886,7 @@ def build_websochat_rp_system_prompt(
         recent_messages=recent_messages,
         scene_summary_text=str(rp_context.get("scene_summary_text") or "").strip(),
         relationship_stage=relationship_stage,
-        read_episode_to=(
-            int(session_memory.get("read_episode_to") or 0)
-            if is_character_chat_session
-            else 0
-        ),
+        read_episode_to=int(session_memory.get("read_episode_to") or 0),
     )
 
     blocks: list[str] = [f"너는 {display_name}이다."]
