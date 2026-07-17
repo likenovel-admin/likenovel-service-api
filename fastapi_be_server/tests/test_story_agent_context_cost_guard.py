@@ -2411,8 +2411,9 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(ready_episode_count, 7)
         update_sql = " ".join(cursor.execute.call_args_list[1].args[0].split())
+        self.assertIn("context_status = IF(", update_sql)
         self.assertIn(
-            "context_status = IF(context_status IN ('disabled', 'ready'), context_status, 'failed')",
+            "context_status = 'ready' AND VALUES(ready_episode_count) > 0",
             update_sql,
         )
         self.assertIn(
@@ -2421,6 +2422,42 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         )
         conn.commit.assert_called_once_with()
         conn.close.assert_called_once_with()
+
+    def test_refresh_preserves_ready_status_while_new_episodes_sync(self):
+        module = load_module()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "ready_episode_count": 7,
+            "current_context_status": "ready",
+        }
+
+        status_row = module.refresh_product_context_status(
+            cursor,
+            product_id=687,
+            total_episode_count=8,
+        )
+
+        self.assertEqual(status_row["context_status"], "ready")
+        select_sql = " ".join(cursor.execute.call_args_list[0].args[0].split())
+        self.assertIn("current_context_status", select_sql)
+        insert_params = cursor.execute.call_args_list[1].args[1]
+        self.assertEqual(insert_params[1], "ready")
+
+    def test_refresh_keeps_never_ready_context_processing(self):
+        module = load_module()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "ready_episode_count": 7,
+            "current_context_status": "processing",
+        }
+
+        status_row = module.refresh_product_context_status(
+            cursor,
+            product_id=687,
+            total_episode_count=8,
+        )
+
+        self.assertEqual(status_row["context_status"], "processing")
 
     def test_fetch_active_character_inventory_map_accepts_v3_summary_type(self):
         module = load_module()

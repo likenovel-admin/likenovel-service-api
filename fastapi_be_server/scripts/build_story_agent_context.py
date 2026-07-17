@@ -13389,18 +13389,29 @@ async def insert_episode_summary(
 def refresh_product_context_status(cur, product_id: int, total_episode_count: int) -> dict[str, object]:
     cur.execute(
         """
-        SELECT COUNT(*) AS ready_episode_count
+        SELECT COUNT(*) AS ready_episode_count,
+               (
+                   SELECT context_status
+                   FROM tb_story_agent_context_product
+                   WHERE product_id = %s
+                   LIMIT 1
+               ) AS current_context_status
           FROM tb_story_agent_context_summary
          WHERE product_id = %s
            AND summary_type = 'episode_summary'
            AND is_active = 'Y'
         """,
-        (product_id,),
+        (product_id, product_id),
     )
     row = cur.fetchone() or {}
     ready_episode_count = int(row.get("ready_episode_count") or 0)
+    current_context_status = str(row.get("current_context_status") or "").strip()
 
-    if ready_episode_count <= 0:
+    if current_context_status == "disabled":
+        context_status = "disabled"
+    elif current_context_status == "ready" and ready_episode_count > 0:
+        context_status = "ready"
+    elif ready_episode_count <= 0:
         context_status = "pending"
     elif ready_episode_count < total_episode_count:
         context_status = "processing"
@@ -13539,7 +13550,15 @@ def mark_product_context_failed(*, product_id: int, total_episode_count: int, er
                     updated_id
                 ) VALUES (%s, 'failed', %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    context_status = IF(context_status IN ('disabled', 'ready'), context_status, 'failed'),
+                    context_status = IF(
+                        context_status = 'disabled',
+                        context_status,
+                        IF(
+                            context_status = 'ready' AND VALUES(ready_episode_count) > 0,
+                            context_status,
+                            'failed'
+                        )
+                    ),
                     total_episode_count = VALUES(total_episode_count),
                     ready_episode_count = VALUES(ready_episode_count),
                     last_error_message = IF(context_status = 'disabled', last_error_message, VALUES(last_error_message)),
