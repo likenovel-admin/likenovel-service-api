@@ -241,3 +241,41 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
 
         self.assertEqual(normalized["protagonist_job_tags"], ["헌터"])
         self.assertEqual(normalized["axis_label_scores"]["직"], [{"label": "헌터", "score": 0.7}])
+
+
+class FakeAsyncSession:
+    def __init__(self):
+        self.sql = ""
+        self.params = None
+        self.committed = False
+
+    async def execute(self, statement, params=None):
+        self.sql = str(statement)
+        self.params = params
+
+    async def commit(self):
+        self.committed = True
+
+
+class AdminAiMetadataFailureGuardTest(unittest.IsolatedAsyncioTestCase):
+    async def test_mark_analysis_failed_does_not_overwrite_existing_success(self):
+        db = FakeAsyncSession()
+
+        await admin_ai_metadata_service._mark_analysis_failed(
+            product_id=1162,
+            analysis_attempt_count=3,
+            error_message="provider failed",
+            db=db,
+        )
+
+        for column in (
+            "analysis_status",
+            "analysis_attempt_count",
+            "analysis_error_message",
+            "model_version",
+        ):
+            self.assertRegex(
+                db.sql,
+                rf"{column}\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*{column},\s*VALUES\({column}\)\s*\)",
+            )
+        self.assertTrue(db.committed)

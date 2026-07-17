@@ -609,10 +609,10 @@ def save_failed(conn, product_id: int, attempt_count: int, error_message: str):
                 %s, 'failed', %s, %s, %s
             )
             ON DUPLICATE KEY UPDATE
-                analysis_status = 'failed',
-                analysis_attempt_count = VALUES(analysis_attempt_count),
-                analysis_error_message = VALUES(analysis_error_message),
-                model_version = VALUES(model_version)
+                analysis_status = IF(analysis_status = 'success', analysis_status, VALUES(analysis_status)),
+                analysis_attempt_count = IF(analysis_status = 'success', analysis_attempt_count, VALUES(analysis_attempt_count)),
+                analysis_error_message = IF(analysis_status = 'success', analysis_error_message, VALUES(analysis_error_message)),
+                model_version = IF(analysis_status = 'success', model_version, VALUES(model_version))
             """,
             (
                 product_id,

@@ -945,10 +945,10 @@ async def _mark_analysis_failed(
             :product_id, 'failed', :analysis_attempt_count, :analysis_error_message, :model_version
         )
         ON DUPLICATE KEY UPDATE
-            analysis_status = 'failed',
-            analysis_attempt_count = VALUES(analysis_attempt_count),
-            analysis_error_message = VALUES(analysis_error_message),
-            model_version = VALUES(model_version),
+            analysis_status = IF(analysis_status = 'success', analysis_status, VALUES(analysis_status)),
+            analysis_attempt_count = IF(analysis_status = 'success', analysis_attempt_count, VALUES(analysis_attempt_count)),
+            analysis_error_message = IF(analysis_status = 'success', analysis_error_message, VALUES(analysis_error_message)),
+            model_version = IF(analysis_status = 'success', model_version, VALUES(model_version)),
             updated_date = NOW()
         """
     )
