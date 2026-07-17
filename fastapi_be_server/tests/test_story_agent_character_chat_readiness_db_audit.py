@@ -132,6 +132,8 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         self.assertEqual(summary["readyPublicCandidateTotal"], 1)
         self.assertEqual(summary["publicSlotReadyTotal"], 1)
         self.assertEqual(summary["readyProductIds"], [1])
+        self.assertEqual(summary["readyWithoutMainProtagonistCount"], 1)
+        self.assertEqual(summary["readyWithoutMainProtagonistProductIds"], [1])
         self.assertEqual(summary["holdProductIdsSample"], [2])
 
     def test_load_env_file_reads_key_values_without_printing_or_sourcing(self):
