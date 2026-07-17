@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dist" / "batch" / "extract_product_dna.py"
+LEGACY_MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "extract_product_dna.py"
 REPO_ROOT = MODULE_PATH.parents[5]
 FASTAPI_ROOT = MODULE_PATH.parents[2]
 CODEBOOK_DIRS = [
@@ -24,6 +25,14 @@ PILOT_LABELS_BY_AXIS = {
 
 def load_module():
     spec = importlib.util.spec_from_file_location("extract_product_dna_batch", MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_legacy_module():
+    spec = importlib.util.spec_from_file_location("extract_product_dna_legacy", LEGACY_MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -616,6 +625,28 @@ class AiDnaProductTargetQueryTest(TestCase):
             conn.last_cursor.sql,
             r"model_version\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*model_version,\s*VALUES\(model_version\)\s*\)",
         )
+
+    def test_legacy_save_failed_does_not_overwrite_existing_success(self):
+        module = load_legacy_module()
+        conn = FakeConnection()
+
+        module.save_failed(
+            conn,
+            product_id=1162,
+            attempt_count=3,
+            error_message="provider failed",
+        )
+
+        for column in (
+            "analysis_status",
+            "analysis_attempt_count",
+            "analysis_error_message",
+            "model_version",
+        ):
+            self.assertRegex(
+                conn.last_cursor.sql,
+                rf"{column}\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*{column},\s*VALUES\({column}\)\s*\)",
+            )
 
 
 class AiDnaEmptyAxisPolicyTest(TestCase):
