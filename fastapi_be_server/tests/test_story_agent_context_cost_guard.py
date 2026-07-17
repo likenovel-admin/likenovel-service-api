@@ -1602,7 +1602,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["examples"], [1, 0])
         self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
 
-    async def test_delta_rp_build_bridges_legacy_profile_examples_to_canonical_internal_prompt(self):
+    async def test_delta_rp_build_materializes_legacy_profile_examples_without_provider_dependency(self):
         module = load_module()
         conn = FakeConnection()
         scope_key = "character:백이현"
@@ -1654,8 +1654,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             upserted.append(kwargs)
             return {"summary_id": len(upserted)}, True
 
-        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module, "RP_OPENROUTER_MODEL", ""), \
              patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
              patch.object(module, "request_rp_profile_payload", profile_mock), \
              patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
@@ -1670,7 +1670,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 affected_scope_keys={scope_key},
                 episode_rows=[],
                 episode_texts_by_no={},
-                summary_client=object(),
+                summary_client=None,
                 inventory_map={
                     scope_key: {
                         "canonical_character_key": scope_key,
@@ -1690,18 +1690,15 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
         dialogue_mock.assert_not_awaited()
         profile_mock.assert_not_awaited()
-        internal_prompt_mock.assert_awaited_once()
-        self.assertEqual(internal_prompt_mock.await_args.kwargs["profile_payload"]["character_key"], scope_key)
-        self.assertEqual(internal_prompt_mock.await_args.kwargs["example_payload"]["character_key"], scope_key)
+        internal_prompt_mock.assert_not_awaited()
         self.assertEqual([item["summary_type"] for item in upserted], [
             "character_rp_profile",
             "character_rp_examples",
-            "character_chat_internal_prompt",
         ])
         self.assertTrue(all(item["scope_key"] == scope_key for item in upserted))
         deactivate_scope.assert_not_called()
 
-    async def test_delta_rp_build_does_not_bridge_when_canonical_rows_exist(self):
+    async def test_delta_rp_build_preserves_successful_canonical_rows(self):
         module = load_module()
         conn = FakeConnection()
         scope_key = "character:백이현"
@@ -1773,7 +1770,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
              patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["[1화] 압력=문서 봉인 | hook=흔적 확인"]}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True), ({"summary_id": 3}, True)]), \
+             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True), ({"summary_id": 3}, True)]) as upsert_mock, \
              patch.object(module, "deactivate_active_scope", return_value=1):
             counts = await module.build_rp_summaries_delta(
                 conn,
@@ -1797,14 +1794,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 relation_map={},
             )
 
-        self.assertEqual(counts["profile"], [1, 0])
-        self.assertEqual(counts["examples"], [1, 0])
-        profile_mock.assert_awaited_once()
-        internal_prompt_mock.assert_awaited_once()
-        self.assertNotEqual(
-            internal_prompt_mock.await_args.kwargs["profile_payload"]["speech_style"],
-            legacy_profile_payload["speech_style"],
-        )
+        self.assertEqual(counts["profile"], [0, 1])
+        self.assertEqual(counts["examples"], [0, 1])
+        profile_mock.assert_not_awaited()
+        internal_prompt_mock.assert_not_awaited()
+        upsert_mock.assert_not_called()
 
     async def test_character_chat_opening_build_upserts_exact_v3_scope_only(self):
         module = load_module()
@@ -2459,6 +2453,16 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         results["products"][0]["context_status"] = "ready"
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
+
+        results["products"][0]["character_chat_asset_readiness"] = {
+            "character_chat_status": "ready",
+            "public_candidate_count": 2,
+            "ready_public_candidate_count": 1,
+            "block_reason_counts": {
+                "legacy_profile_scope_key_mismatch": 1,
+            },
+        }
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
 
     def test_failed_delta_status_repair_refreshes_when_foundation_complete(self):
         module = load_module()
@@ -7175,6 +7179,78 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertTrue(all(key.startswith("character:설총:dup:") for key in keys))
         self.assertTrue(all(row["identity_status"] == "CONFLICT" for row in inventory))
         self.assertTrue(all("duplicate_canonical_key" in row["identity_conflict_reasons"] for row in inventory))
+
+    def test_inventory_v3_reuses_durable_key_when_observation_hash_changes(self):
+        module = load_module()
+        old_scope_key = "character:레이븐:dup:be810f0c"
+        new_scope_key = "character:레이븐:dup:faa369a2"
+        rows = [
+            {
+                "canonical_character_key": new_scope_key,
+                "display_name": "레이븐",
+                "source_character_keys": ["protagonist:named:레이븐"],
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "review_reasons": ["duplicate_canonical_key"],
+            }
+        ]
+        old_inventory_map = {
+            old_scope_key: {
+                "canonical_character_key": old_scope_key,
+                "display_name": "레이븐",
+                "source_character_keys": ["protagonist:named:레이븐"],
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+            }
+        }
+
+        reconciled = module.reconcile_character_inventory_v3_scope_keys(
+            rows,
+            old_inventory_map=old_inventory_map,
+        )
+
+        self.assertEqual(reconciled[0]["canonical_character_key"], old_scope_key)
+        self.assertEqual(reconciled[0]["legacy_scope_keys"], [new_scope_key])
+        self.assertEqual(reconciled[0]["continuity_status"], "reused")
+
+    def test_inventory_v3_name_only_continuity_is_fail_closed(self):
+        module = load_module()
+        new_scope_key = "character:레이븐:dup:new"
+        rows = [
+            {
+                "canonical_character_key": new_scope_key,
+                "display_name": "레이븐",
+                "source_character_keys": ["named:레이븐:new"],
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "identity_conflict_reasons": [],
+                "review_reasons": [],
+            }
+        ]
+        old_inventory_map = {
+            "character:레이븐:dup:old": {
+                "canonical_character_key": "character:레이븐:dup:old",
+                "display_name": "레이븐",
+                "source_character_keys": ["named:레이븐:old"],
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+            }
+        }
+
+        reconciled = module.reconcile_character_inventory_v3_scope_keys(
+            rows,
+            old_inventory_map=old_inventory_map,
+        )
+
+        self.assertEqual(reconciled[0]["canonical_character_key"], new_scope_key)
+        self.assertEqual(reconciled[0]["continuity_status"], "ambiguous")
+        self.assertFalse(reconciled[0]["public_chat_eligible"])
+        self.assertFalse(reconciled[0]["public_slot_eligible"])
+        self.assertIn(
+            "identity_continuity_ambiguous",
+            reconciled[0]["identity_conflict_reasons"],
+        )
 
     def test_inventory_v3_does_not_bridge_cannot_linked_characters_through_aliases(self):
         module = load_module()

@@ -150,7 +150,20 @@ def build_asset_action_plan(row: dict[str, Any]) -> list[str]:
     readiness = dict(row.get("character_chat_asset_readiness") or {})
     status = str(readiness.get("character_chat_status") or "missing")
     context_status = str(row.get("context_status") or "").strip()
-    if status == "ready":
+    block_counts = dict(readiness.get("block_reason_counts") or {})
+    has_legacy_scope_mismatch = bool(
+        readiness.get("legacy_profile_scope_key_mismatch_scope_keys")
+        or readiness.get("legacy_examples_scope_key_mismatch_scope_keys")
+        or int(block_counts.get("legacy_profile_scope_key_mismatch") or 0) > 0
+        or int(block_counts.get("legacy_examples_scope_key_mismatch") or 0) > 0
+    )
+    has_identity_continuity_ambiguity = bool(
+        readiness.get("continuity_ambiguous_scope_keys")
+        or int(block_counts.get("identity_continuity_ambiguous") or 0) > 0
+    )
+    if status == "ready" and not (
+        has_legacy_scope_mismatch or has_identity_continuity_ambiguity
+    ):
         return ["ready"]
     actions: list[str] = []
     if context_status != "ready":
@@ -159,14 +172,14 @@ def build_asset_action_plan(row: dict[str, Any]) -> list[str]:
         if not actions:
             actions.append("no_public_character_candidate")
         return actions
-    if status == "failed" or readiness.get("malformed_inventory_scope_keys"):
+    if (
+        status == "failed"
+        or readiness.get("malformed_inventory_scope_keys")
+        or has_identity_continuity_ambiguity
+    ):
         actions.append("repair_character_inventory")
 
-    block_counts = dict(readiness.get("block_reason_counts") or {})
-    if (
-        int(block_counts.get("legacy_profile_scope_key_mismatch") or 0) > 0
-        or int(block_counts.get("legacy_examples_scope_key_mismatch") or 0) > 0
-    ):
+    if has_legacy_scope_mismatch:
         actions.append("rebuild_rp_assets_with_v3_scope")
     if (
         int(block_counts.get("missing_profile") or 0) > 0
@@ -178,6 +191,22 @@ def build_asset_action_plan(row: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(actions or ["inspect_character_chat_assets"]))
 
 
+def build_audit_exit_code(
+    summary: dict[str, Any],
+    *,
+    fail_on_actionable: bool,
+) -> int:
+    if not fail_on_actionable:
+        return 0
+    non_actionable = {"ready", "no_public_character_candidate"}
+    return int(
+        any(
+            action not in non_actionable and int(count or 0) > 0
+            for action, count in dict(summary.get("actionPlanCounts") or {}).items()
+        )
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="dev DB character_chat asset readiness read-only audit")
     parser.add_argument("--env-file", default=".env", help="DB env file. Values are loaded but never printed.")
@@ -186,6 +215,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-closed", action="store_true", help="Include closed/private/non-ongoing products.")
     parser.add_argument("--out", default="", help="Optional JSONL detail output path.")
     parser.add_argument("--summary-out", default="", help="Optional JSON summary output path.")
+    parser.add_argument(
+        "--fail-on-actionable",
+        action="store_true",
+        help="Exit 1 when the audit finds an actionable character-chat asset gap.",
+    )
     return parser.parse_args()
 
 
@@ -227,7 +261,10 @@ def main() -> int:
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         summary["summaryOut"] = str(summary_path)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return build_audit_exit_code(
+        summary,
+        fail_on_actionable=bool(args.fail_on_actionable),
+    )
 
 
 if __name__ == "__main__":
