@@ -24,6 +24,17 @@ def load_module():
 
 
 class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
+    def test_dev_deploy_package_includes_character_chat_asset_audit(self):
+        workflow = (
+            BACKEND_ROOT / ".github" / "workflows" / "deploy_be_actions_dev.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "cp ../scripts/audit_character_chat_asset_readiness_db.py "
+            "./scripts/audit_character_chat_asset_readiness_db.py",
+            workflow,
+        )
+
     def test_prod_deploy_package_includes_character_chat_asset_audit(self):
         workflow = (
             BACKEND_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
