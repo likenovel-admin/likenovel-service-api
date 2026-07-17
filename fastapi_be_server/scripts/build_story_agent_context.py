@@ -6402,17 +6402,21 @@ async def build_rp_summaries_delta(
     verbose: bool = False,
 ) -> dict[str, object]:
     counts = build_empty_delta_rp_counts()
-    if (
-        not affected_scope_keys
-        or summary_client is None
-        or not OPENROUTER_API_KEY
-        or not RP_OPENROUTER_MODEL
-    ):
+    if not affected_scope_keys:
         return counts
 
-    scene_context_lines_by_scope = load_character_chat_scene_context_lines_by_scope(
-        conn,
-        product_id=product_id,
+    provider_available = bool(
+        summary_client is not None
+        and OPENROUTER_API_KEY
+        and RP_OPENROUTER_MODEL
+    )
+    scene_context_lines_by_scope = (
+        load_character_chat_scene_context_lines_by_scope(
+            conn,
+            product_id=product_id,
+        )
+        if provider_available
+        else {}
     )
     with work_cursor(conn) as cur:
         existing_profile_rows_by_scope = fetch_active_summary_state_map(
@@ -6457,47 +6461,19 @@ async def build_rp_summaries_delta(
             continue
         inventory_item = dict(inventory_map.get(scope_key) or {})
         if not inventory_item:
-            with work_cursor(conn) as cur:
-                counts["deactivated_profile_count"] += deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_rp_profile",
-                    scope_key=scope_key,
-                )
-                counts["deactivated_examples_count"] += deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_rp_examples",
-                    scope_key=scope_key,
-                )
-                deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_chat_internal_prompt",
-                    scope_key=scope_key,
-                )
+            logger.info(
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=inventory_missing",
+                product_id,
+                scope_key,
+            )
             continue
 
         if not is_batch_rp_candidate(inventory_item):
-            with work_cursor(conn) as cur:
-                counts["deactivated_profile_count"] += deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_rp_profile",
-                    scope_key=scope_key,
-                )
-                counts["deactivated_examples_count"] += deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_rp_examples",
-                    scope_key=scope_key,
-                )
-                deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_chat_internal_prompt",
-                    scope_key=scope_key,
-                )
+            logger.info(
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=not_current_candidate",
+                product_id,
+                scope_key,
+            )
             continue
 
         target = dict(build_inventory_rp_target(scope_key=scope_key, inventory_item=inventory_item) or {})
@@ -6519,36 +6495,48 @@ async def build_rp_summaries_delta(
             counts["keep_old_examples_missing_count"] += 1
             continue
 
-        aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
-        summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
-        relation_context_lines = build_rp_relation_context_lines(
-            character_key=scope_key,
-            relation_map=relation_map,
+        exact_profile_row = dict(existing_profile_rows_by_scope.get(scope_key) or {})
+        exact_example_row = dict(existing_example_rows_by_scope.get(scope_key) or {})
+        exact_profile_payload = dict(exact_profile_row.get("payload") or {})
+        exact_example_payload = dict(exact_example_row.get("payload") or {})
+        canonical_profile_ready = (
+            str(exact_profile_payload.get("character_key") or "").strip() == scope_key
         )
-        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
+        canonical_examples_ready = (
+            str(exact_example_payload.get("character_key") or "").strip() == scope_key
+            and bool(build_rp_dialogue_items_from_example_payload(exact_example_payload))
+        )
+        if canonical_profile_ready and canonical_examples_ready:
+            counts["profile"][1] += 1
+            counts["examples"][1] += 1
+            continue
+
         existing_profile_row: dict[str, object] = {}
         existing_example_row: dict[str, object] = {}
-        if not existing_profile_rows_by_scope.get(scope_key) and not existing_example_rows_by_scope.get(scope_key):
-            existing_profile_row = fetch_legacy_summary_state_for_inventory_alias(
-                existing_profile_rows_by_scope,
-                scope_key=scope_key,
-                inventory_item=inventory_item,
-                allowed_alias_keys={
-                    alias_key
-                    for alias_key, owner_scope_key in source_scope_key_map.items()
-                    if owner_scope_key == scope_key
-                },
-            )
-            existing_example_row = fetch_legacy_summary_state_for_inventory_alias(
-                existing_example_rows_by_scope,
-                scope_key=scope_key,
-                inventory_item=inventory_item,
-                allowed_alias_keys={
-                    alias_key
-                    for alias_key, owner_scope_key in source_scope_key_map.items()
-                    if owner_scope_key == scope_key
-                },
-            )
+        allowed_alias_keys = {
+            alias_key
+            for alias_key, owner_scope_key in source_scope_key_map.items()
+            if owner_scope_key == scope_key
+        }
+        if not canonical_profile_ready and not canonical_examples_ready:
+            for alias_key in build_inventory_scope_alias_key_candidates(
+                scope_key,
+                inventory_item,
+            ):
+                if alias_key == scope_key or alias_key not in allowed_alias_keys:
+                    continue
+                legacy_profile_row = dict(existing_profile_rows_by_scope.get(alias_key) or {})
+                legacy_example_row = dict(existing_example_rows_by_scope.get(alias_key) or {})
+                legacy_profile_payload = dict(legacy_profile_row.get("payload") or {})
+                legacy_example_payload = dict(legacy_example_row.get("payload") or {})
+                if (
+                    str(legacy_profile_payload.get("character_key") or "").strip() == alias_key
+                    and str(legacy_example_payload.get("character_key") or "").strip() == alias_key
+                    and build_rp_dialogue_items_from_example_payload(legacy_example_payload)
+                ):
+                    existing_profile_row = legacy_profile_row
+                    existing_example_row = legacy_example_row
+                    break
         existing_profile_payload = dict(existing_profile_row.get("payload") or {})
         existing_example_payload = dict(existing_example_row.get("payload") or {})
         existing_dialogue_items = build_rp_dialogue_items_from_example_payload(existing_example_payload)
@@ -6567,93 +6555,62 @@ async def build_rp_summaries_delta(
                 **existing_example_payload,
                 "character_key": scope_key,
             }
-            try:
-                internal_prompt_payload = await request_character_chat_internal_prompt_payload(
-                    summary_client,
-                    target=target,
-                    profile_payload=profile_payload,
-                    example_payload=example_payload,
-                    dialogue_items=existing_dialogue_items,
-                    summary_context_lines=summary_context_lines,
-                    inventory_item=inventory_item,
-                    relation_context_lines=relation_context_lines,
-                    scene_context_lines=scene_context_lines,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s source=alias error=%s",
-                    product_id,
+            profile_source_hash = build_compound_summary_source_hash(
+                CHARACTER_RP_PROFILE_FORMAT_VERSION,
+                [
+                    "alias_bridge_v2",
                     scope_key,
-                    repr(exc)[:200],
+                    str(existing_profile_row.get("scope_key") or ""),
+                    str(existing_profile_row.get("source_hash") or ""),
+                ],
+            )
+            examples_source_hash = build_compound_summary_source_hash(
+                CHARACTER_RP_EXAMPLES_FORMAT_VERSION,
+                [
+                    "alias_bridge_v2",
+                    scope_key,
+                    str(existing_example_row.get("scope_key") or ""),
+                    str(existing_example_row.get("source_hash") or ""),
+                ],
+            )
+            with work_cursor(conn) as cur:
+                _, profile_inserted = upsert_summary(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_rp_profile",
+                    scope_key=scope_key,
+                    source_hash=profile_source_hash,
+                    source_doc_count=1,
+                    summary_text=json.dumps(profile_payload, ensure_ascii=False),
                 )
-                internal_prompt_payload = None
-            if internal_prompt_payload:
-                internal_prompt_payload = {
-                    "character_key": scope_key,
-                    "display_name": str(profile_payload.get("display_name") or "").strip(),
-                    **internal_prompt_payload,
-                }
-                profile_source_hash = build_compound_summary_source_hash(
-                    CHARACTER_RP_PROFILE_FORMAT_VERSION,
-                    [
-                        "alias_bridge_v1",
-                        scope_key,
-                        str(existing_profile_row.get("scope_key") or ""),
-                        str(existing_profile_row.get("source_hash") or ""),
-                        json.dumps(build_character_chat_inventory_signature_parts(inventory_item), ensure_ascii=False),
-                    ],
+                _, examples_inserted = upsert_summary(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_rp_examples",
+                    scope_key=scope_key,
+                    source_hash=examples_source_hash,
+                    source_doc_count=len(existing_dialogue_items),
+                    summary_text=json.dumps(example_payload, ensure_ascii=False),
                 )
-                examples_source_hash = build_compound_summary_source_hash(
-                    CHARACTER_RP_EXAMPLES_FORMAT_VERSION,
-                    [
-                        "alias_bridge_v1",
-                        scope_key,
-                        str(existing_example_row.get("scope_key") or ""),
-                        str(existing_example_row.get("source_hash") or ""),
-                        json.dumps(build_character_chat_inventory_signature_parts(inventory_item), ensure_ascii=False),
-                    ],
-                )
-                internal_prompt_source_hash = build_character_chat_internal_prompt_source_hash(
-                    character_key=scope_key,
-                    inventory_item=inventory_item,
-                    profile_payload=profile_payload,
-                    example_payload=example_payload,
-                    dialogue_items=existing_dialogue_items,
-                    summary_context_lines=summary_context_lines,
-                    relation_context_lines=relation_context_lines,
-                    scene_context_lines=scene_context_lines,
-                )
-                with work_cursor(conn) as cur:
-                    _, profile_inserted = upsert_summary(
-                        cur,
-                        product_id=product_id,
-                        summary_type="character_rp_profile",
-                        scope_key=scope_key,
-                        source_hash=profile_source_hash,
-                        source_doc_count=1,
-                        summary_text=json.dumps(profile_payload, ensure_ascii=False),
-                    )
-                    _, examples_inserted = upsert_summary(
-                        cur,
-                        product_id=product_id,
-                        summary_type="character_rp_examples",
-                        scope_key=scope_key,
-                        source_hash=examples_source_hash,
-                        source_doc_count=len(existing_dialogue_items),
-                        summary_text=json.dumps(example_payload, ensure_ascii=False),
-                    )
-                    upsert_summary(
-                        cur,
-                        product_id=product_id,
-                        summary_type="character_chat_internal_prompt",
-                        scope_key=scope_key,
-                        source_hash=internal_prompt_source_hash,
-                        source_doc_count=len(existing_dialogue_items),
-                        summary_text=json.dumps(internal_prompt_payload, ensure_ascii=False),
-                    )
-                counts["profile"][0 if profile_inserted else 1] += 1
-                counts["examples"][0 if examples_inserted else 1] += 1
-                continue
+            counts["profile"][0 if profile_inserted else 1] += 1
+            counts["examples"][0 if examples_inserted else 1] += 1
+            continue
+
+        if not provider_available:
+            logger.info(
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=provider_unavailable",
+                product_id,
+                scope_key,
+            )
+            continue
+
+        aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
+        summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
+        relation_context_lines = build_rp_relation_context_lines(
+            character_key=scope_key,
+            relation_map=relation_map,
+        )
+        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
 
         direct_dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
         dialogue_items: list[dict[str, object]] = []
@@ -6808,24 +6765,28 @@ async def build_rp_summaries_delta(
             )
 
         with work_cursor(conn) as cur:
-            _, profile_inserted = upsert_summary(
-                cur,
-                product_id=product_id,
-                summary_type="character_rp_profile",
-                scope_key=scope_key,
-                source_hash=profile_source_hash,
-                source_doc_count=len(dialogue_items),
-                summary_text=json.dumps(profile_payload, ensure_ascii=False),
-            )
-            _, examples_inserted = upsert_summary(
-                cur,
-                product_id=product_id,
-                summary_type="character_rp_examples",
-                scope_key=scope_key,
-                source_hash=examples_source_hash,
-                source_doc_count=len(example_payload["examples"]),
-                summary_text=json.dumps(example_payload, ensure_ascii=False),
-            )
+            profile_inserted = False
+            examples_inserted = False
+            if not canonical_profile_ready:
+                _, profile_inserted = upsert_summary(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_rp_profile",
+                    scope_key=scope_key,
+                    source_hash=profile_source_hash,
+                    source_doc_count=len(dialogue_items),
+                    summary_text=json.dumps(profile_payload, ensure_ascii=False),
+                )
+            if not canonical_examples_ready:
+                _, examples_inserted = upsert_summary(
+                    cur,
+                    product_id=product_id,
+                    summary_type="character_rp_examples",
+                    scope_key=scope_key,
+                    source_hash=examples_source_hash,
+                    source_doc_count=len(example_payload["examples"]),
+                    summary_text=json.dumps(example_payload, ensure_ascii=False),
+                )
             if internal_prompt_payload:
                 upsert_summary(
                     cur,
@@ -10876,6 +10837,179 @@ def _suppress_main_alias_public_slot_rows(rows: list[dict[str, object]]) -> None
         )
 
 
+def _character_inventory_continuity_aliases(
+    scope_key: str,
+    payload: dict[str, object],
+) -> set[str]:
+    aliases = {
+        str(value or "").strip()
+        for field_name in (
+            "source_character_keys",
+            "protagonist_identity_scope_keys",
+        )
+        for value in list(payload.get(field_name) or [])
+        if str(value or "").strip()
+    }
+    for field_name in ("identity_group_key", "identity_linked_to_scope_key"):
+        value = str(payload.get(field_name) or "").strip()
+        if value:
+            aliases.add(value)
+    if scope_key:
+        aliases.add(scope_key)
+    return aliases
+
+
+def _remap_character_inventory_identity_references(
+    row: dict[str, object],
+    scope_key_map: dict[str, str],
+) -> None:
+    for field_name in ("identity_group_key", "identity_linked_to_scope_key"):
+        value = str(row.get(field_name) or "").strip()
+        if value in scope_key_map:
+            row[field_name] = scope_key_map[value]
+    for field_name in ("protagonist_identity_scope_keys",):
+        if not isinstance(row.get(field_name), list):
+            continue
+        row[field_name] = list(
+            dict.fromkeys(
+                scope_key_map.get(str(value or "").strip(), str(value or "").strip())
+                for value in list(row.get(field_name) or [])
+                if str(value or "").strip()
+            )
+        )
+    if isinstance(row.get("identity_group_members"), list):
+        members: list[dict[str, object]] = []
+        for raw_member in list(row.get("identity_group_members") or []):
+            if not isinstance(raw_member, dict):
+                continue
+            member = dict(raw_member)
+            member_scope_key = str(member.get("scope_key") or "").strip()
+            if member_scope_key in scope_key_map:
+                member["scope_key"] = scope_key_map[member_scope_key]
+            members.append(member)
+        row["identity_group_members"] = members
+
+
+def _has_character_serving_contract(payload: dict[str, object] | None) -> bool:
+    item = dict(payload or {})
+    readiness = dict(item.get("chat_readiness_v1") or {})
+    return bool(
+        item.get("public_chat_eligible")
+        or item.get("public_slot_eligible")
+        or readiness.get("character_chat_allowed")
+        or readiness.get("public_slot_allowed")
+    )
+
+
+def reconcile_character_inventory_v3_scope_keys(
+    rows: list[dict[str, object]],
+    *,
+    old_inventory_map: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    reconciled_rows = [dict(row) for row in rows]
+    old_rows = {
+        str(scope_key or "").strip(): {
+            **dict(payload or {}),
+            "canonical_character_key": str(
+                dict(payload or {}).get("canonical_character_key") or scope_key or ""
+            ).strip(),
+        }
+        for scope_key, payload in (old_inventory_map or {}).items()
+        if str(scope_key or "").strip()
+    }
+    if not old_rows or not reconciled_rows:
+        return reconciled_rows
+
+    old_alias_owners: dict[str, set[str]] = {}
+    for old_scope_key, old_payload in old_rows.items():
+        for alias_key in _character_inventory_continuity_aliases(
+            old_scope_key,
+            old_payload,
+        ):
+            old_alias_owners.setdefault(alias_key, set()).add(old_scope_key)
+
+    new_alias_owners: dict[str, set[str]] = {}
+    for row in reconciled_rows:
+        generated_scope_key = str(row.get("canonical_character_key") or "").strip()
+        for alias_key in _character_inventory_continuity_aliases(
+            generated_scope_key,
+            row,
+        ):
+            new_alias_owners.setdefault(alias_key, set()).add(generated_scope_key)
+
+    claimed_old_scope_keys: set[str] = set()
+    scope_key_map: dict[str, str] = {}
+    for row in reconciled_rows:
+        generated_scope_key = str(row.get("canonical_character_key") or "").strip()
+        candidates: set[str] = set()
+        if generated_scope_key in old_rows:
+            candidates.add(generated_scope_key)
+        else:
+            for alias_key in _character_inventory_continuity_aliases(
+                generated_scope_key,
+                row,
+            ):
+                old_owners = old_alias_owners.get(alias_key, set())
+                new_owners = new_alias_owners.get(alias_key, set())
+                if len(old_owners) == 1 and len(new_owners) == 1:
+                    candidates.update(old_owners)
+
+        available_candidates = candidates - claimed_old_scope_keys
+        if len(available_candidates) == 1:
+            durable_scope_key = next(iter(available_candidates))
+            claimed_old_scope_keys.add(durable_scope_key)
+            scope_key_map[generated_scope_key] = durable_scope_key
+            if durable_scope_key != generated_scope_key:
+                old_payload = old_rows[durable_scope_key]
+                legacy_scope_keys = sorted(
+                    {
+                        generated_scope_key,
+                        *list(old_payload.get("legacy_scope_keys") or []),
+                        *list(row.get("legacy_scope_keys") or []),
+                    }
+                    - {durable_scope_key, ""}
+                )
+                row["canonical_character_key"] = durable_scope_key
+                row["durable_character_key"] = durable_scope_key
+                row["legacy_scope_keys"] = legacy_scope_keys
+                row["continuity_status"] = "reused"
+                row["continuity_reason"] = "unique_identity_alias"
+                row["continuity_version"] = 1
+            continue
+
+        normalized_display_name = normalize_signal_entity_label(
+            str(row.get("display_name") or "")
+        )
+        same_name_old_scope_keys = {
+            old_scope_key
+            for old_scope_key, old_payload in old_rows.items()
+            if old_scope_key not in claimed_old_scope_keys
+            and normalized_display_name
+            and normalize_signal_entity_label(
+                str(old_payload.get("display_name") or "")
+            )
+            == normalized_display_name
+        }
+        if candidates or same_name_old_scope_keys:
+            row["continuity_status"] = "ambiguous"
+            row["continuity_reason"] = "non_unique_or_name_only"
+            row["continuity_version"] = 1
+            row["public_chat_eligible"] = False
+            row["public_slot_eligible"] = False
+            row["identity_conflict_reasons"] = sorted(
+                set(list(row.get("identity_conflict_reasons") or []))
+                | {"identity_continuity_ambiguous"}
+            )
+            row["review_reasons"] = sorted(
+                set(list(row.get("review_reasons") or []))
+                | {"IDENTITY_CONTINUITY_AMBIGUOUS"}
+            )
+
+    for row in reconciled_rows:
+        _remap_character_inventory_identity_references(row, scope_key_map)
+    return reconciled_rows
+
+
 def aggregate_character_inventory_v3_rows(
     signal_rows: list[dict],
     *,
@@ -11171,6 +11305,10 @@ def build_character_inventory_v3_summaries_from_signal_rows(
         protagonist_resolution=protagonist_resolution,
         locked_protagonist_rows=locked_protagonist_rows,
     )
+    inventory_rows = reconcile_character_inventory_v3_scope_keys(
+        inventory_rows,
+        old_inventory_map=old_inventory_map,
+    )
     if signal_rows and not inventory_rows and not locked_protagonist_rows:
         raise ValueError(f"character_inventory_v3 aggregation returned 0 rows despite active signals: product_id={product_id}")
 
@@ -11181,6 +11319,16 @@ def build_character_inventory_v3_summaries_from_signal_rows(
     for item in inventory_rows:
         scope_key = str(item.get("canonical_character_key") or "").strip()
         if not scope_key:
+            continue
+        old_item = dict(old_inventory_map.get(scope_key) or {})
+        if _has_character_serving_contract(old_item) and not _has_character_serving_contract(item):
+            valid_scope_keys.add(scope_key)
+            reused_count += 1
+            logger.warning(
+                "story_agent_character_lkg_preserved product_id=%s scope_key=%s reason=current_inventory_not_service_eligible",
+                product_id,
+                scope_key,
+            )
             continue
         if scope_key in locked_protagonist_by_scope and _inventory_identity_blocking_conflict_reasons(item):
             valid_scope_keys.add(scope_key)
@@ -11217,6 +11365,22 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             "story_agent_protagonist_lock_preserved product_id=%s scope_key=%s reason=identity_not_in_current_inventory",
             product_id,
             locked_scope_key,
+        )
+
+    for old_scope_key, old_item in old_inventory_map.items():
+        normalized_old_scope_key = str(old_scope_key or "").strip()
+        if (
+            not normalized_old_scope_key
+            or normalized_old_scope_key in valid_scope_keys
+            or not _has_character_serving_contract(old_item)
+        ):
+            continue
+        valid_scope_keys.add(normalized_old_scope_key)
+        reused_count += 1
+        logger.warning(
+            "story_agent_character_lkg_preserved product_id=%s scope_key=%s reason=missing_from_current_inventory",
+            product_id,
+            normalized_old_scope_key,
         )
 
     deactivate_missing_active_scopes(cur, product_id, "character_inventory_v3", valid_scope_keys)
@@ -12740,6 +12904,7 @@ def build_character_chat_asset_readiness_verification(
     ready_scope_keys: list[str] = []
     public_slot_ready_scope_keys: list[str] = []
     malformed_inventory_scope_keys: list[str] = []
+    continuity_ambiguous_scope_keys: list[str] = []
 
     for row in rows_by_type["character_inventory_v3"]:
         payload = _summary_row_payload(row)
@@ -12748,6 +12913,13 @@ def build_character_chat_asset_readiness_verification(
             malformed_inventory_scope_keys.append(str(row.get("summary_id") or "unknown"))
             _increment_reason(block_reason_counts, "inventory_scope_key_missing")
             continue
+        if (
+            str(payload.get("continuity_status") or "").strip() == "ambiguous"
+            or "identity_continuity_ambiguous"
+            in set(payload.get("identity_conflict_reasons") or [])
+        ):
+            continuity_ambiguous_scope_keys.append(scope_key)
+            _increment_reason(block_reason_counts, "identity_continuity_ambiguous")
         if not _is_character_chat_public_candidate(payload):
             continue
 
@@ -12805,7 +12977,7 @@ def build_character_chat_asset_readiness_verification(
             }
         )
 
-    if malformed_inventory_scope_keys:
+    if malformed_inventory_scope_keys or continuity_ambiguous_scope_keys:
         character_chat_status = "failed"
     elif not public_candidates:
         character_chat_status = "none_eligible"
@@ -12840,6 +13012,7 @@ def build_character_chat_asset_readiness_verification(
         "legacy_profile_scope_key_mismatch_scope_keys": sorted(set(legacy_profile_scope_key_mismatch_scope_keys)),
         "legacy_examples_scope_key_mismatch_scope_keys": sorted(set(legacy_examples_scope_key_mismatch_scope_keys)),
         "malformed_inventory_scope_keys": sorted(set(malformed_inventory_scope_keys)),
+        "continuity_ambiguous_scope_keys": sorted(set(continuity_ambiguous_scope_keys)),
         "block_reason_counts": dict(sorted(block_reason_counts.items())),
         "public_candidates": public_candidates[:20],
     }
@@ -12867,17 +13040,61 @@ def fetch_character_chat_asset_readiness_verification(
     )
 
 
+def is_character_chat_asset_readiness_actionable(
+    readiness: dict[str, object] | None,
+) -> bool:
+    payload = dict(readiness or {})
+    status = str(payload.get("character_chat_status") or "").strip()
+    if status == "failed":
+        return True
+    if list(payload.get("continuity_ambiguous_scope_keys") or []):
+        return True
+    if list(payload.get("legacy_profile_scope_key_mismatch_scope_keys") or []):
+        return True
+    if list(payload.get("legacy_examples_scope_key_mismatch_scope_keys") or []):
+        return True
+    block_reason_counts = dict(payload.get("block_reason_counts") or {})
+    if (
+        int(block_reason_counts.get("legacy_profile_scope_key_mismatch") or 0) > 0
+        or int(block_reason_counts.get("legacy_examples_scope_key_mismatch") or 0) > 0
+    ):
+        return True
+    return status == "hold" and int(payload.get("public_candidate_count") or 0) > 0
+
+
 def attach_character_chat_asset_readiness_to_status_row(cur, status_row: dict[str, object]) -> dict[str, object]:
     enriched = dict(status_row)
     product_id = int(enriched.get("product_id") or 0)
     if product_id <= 0:
         return enriched
-    enriched["character_chat_asset_readiness"] = fetch_character_chat_asset_readiness_verification(
+    readiness = fetch_character_chat_asset_readiness_verification(
         cur,
         product_id=product_id,
         story_context_status=str(enriched.get("context_status") or ""),
         total_episode_count=int(enriched.get("total_episode_count") or 0),
     )
+    enriched["character_chat_asset_readiness"] = readiness
+    if (
+        str(enriched.get("context_status") or "").strip() != "disabled"
+        and is_character_chat_asset_readiness_actionable(readiness)
+    ):
+        error_message = (
+            "character_chat_asset_readiness_actionable:"
+            + str(readiness.get("character_chat_status") or "unknown")
+            + ":"
+            + ",".join(sorted(dict(readiness.get("block_reason_counts") or {}).keys()))
+        )[:500]
+        cur.execute(
+            """
+            UPDATE tb_story_agent_context_product
+               SET context_status = IF(context_status = 'disabled', context_status, 'failed'),
+                   last_error_message = IF(context_status = 'disabled', last_error_message, %s),
+                   updated_id = %s
+             WHERE product_id = %s
+            """,
+            (error_message, settings.DB_DML_DEFAULT_ID, product_id),
+        )
+        enriched["context_status"] = "failed"
     return enriched
 
 
@@ -13624,6 +13841,10 @@ def build_delta_exit_code(results: dict[str, object], *, apply: bool) -> int:
         return 0
     for product in list(results.get("products") or []):
         if str((product or {}).get("context_status") or "").strip() == "failed":
+            return 1
+        if is_character_chat_asset_readiness_actionable(
+            dict((product or {}).get("character_chat_asset_readiness") or {})
+        ):
             return 1
     return 0
 

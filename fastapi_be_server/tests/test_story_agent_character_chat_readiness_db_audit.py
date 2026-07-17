@@ -8,6 +8,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 MODULE_PATH = SCRIPT_DIR / "audit_character_chat_asset_readiness_db.py"
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
 def load_module():
@@ -23,6 +24,17 @@ def load_module():
 
 
 class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
+    def test_prod_deploy_package_includes_character_chat_asset_audit(self):
+        workflow = (
+            BACKEND_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "cp ../scripts/audit_character_chat_asset_readiness_db.py "
+            "./scripts/audit_character_chat_asset_readiness_db.py",
+            workflow,
+        )
+
     def test_build_product_query_defaults_to_open_ongoing_public_scope(self):
         module = load_module()
 
@@ -171,6 +183,47 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         self.assertEqual(
             actions,
             ["rebuild_rp_assets_with_v3_scope"],
+        )
+
+    def test_ready_candidate_does_not_hide_legacy_scope_mismatch(self):
+        module = load_module()
+
+        actions = module.build_asset_action_plan(
+            {
+                "product_id": 1103,
+                "context_status": "ready",
+                "character_chat_asset_readiness": {
+                    "character_chat_status": "ready",
+                    "ready_public_candidate_count": 1,
+                    "legacy_profile_scope_key_mismatch_scope_keys": [
+                        "character:레이븐:dup:new"
+                    ],
+                    "block_reason_counts": {
+                        "legacy_profile_scope_key_mismatch": 1,
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(actions, ["rebuild_rp_assets_with_v3_scope"])
+
+    def test_actionable_summary_is_nonzero_only_when_fail_flag_is_enabled(self):
+        module = load_module()
+        summary = {
+            "actionPlanCounts": {
+                "ready": 10,
+                "no_public_character_candidate": 2,
+                "rebuild_rp_assets_with_v3_scope": 1,
+            }
+        }
+
+        self.assertEqual(
+            module.build_audit_exit_code(summary, fail_on_actionable=False),
+            0,
+        )
+        self.assertEqual(
+            module.build_audit_exit_code(summary, fail_on_actionable=True),
+            1,
         )
 
 

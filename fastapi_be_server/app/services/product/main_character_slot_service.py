@@ -296,6 +296,22 @@ def build_public_main_character_slots_query() -> str:
                 AND pe.use_yn = 'Y'
                 AND pe.open_yn = 'Y'
           ) >= {MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT}
+          AND EXISTS (
+              SELECT 1
+              FROM tb_story_agent_context_summary inventory
+              WHERE inventory.product_id = mcs.product_id
+                AND inventory.scope_key = mcs.character_scope_key
+                AND inventory.summary_type = 'character_inventory_v3'
+                AND inventory.is_active = 'Y'
+                AND JSON_VALID(inventory.summary_text)
+                AND JSON_UNQUOTE(
+                    JSON_EXTRACT(inventory.summary_text, '$.public_slot_eligible')
+                ) = 'true'
+                AND JSON_UNQUOTE(
+                    JSON_EXTRACT(inventory.summary_text, '$.display_safety.status')
+                ) = 'pass'
+                {_chat_ready_rp_assets_predicate("inventory")}
+          )
         ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC
     """
 

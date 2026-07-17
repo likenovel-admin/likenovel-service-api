@@ -291,6 +291,11 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "(:adult_yn = 'Y' OR p.ratings_code != 'adult')" in query
     assert "SELECT COUNT(*)" in query
     assert "FROM tb_product_episode pe" in query
+    assert "FROM tb_story_agent_context_summary inventory" in query
+    assert "inventory.scope_key = mcs.character_scope_key" in query
+    assert "inventory.summary_type = 'character_inventory_v3'" in query
+    assert "profile.scope_key" in query
+    assert "examples.scope_key" in query
     assert "q.group_type = 'character'" in query
     assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
     assert "ROW_NUMBER()" not in query

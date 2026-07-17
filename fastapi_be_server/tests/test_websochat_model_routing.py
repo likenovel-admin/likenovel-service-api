@@ -627,6 +627,23 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[관계 맥락]", prompt)
         self.assertIn("제일황자", prompt)
 
+    def test_generic_rp_prompt_filters_examples_after_reader_scope(self):
+        prompt = websochat_rp_renderer.build_websochat_rp_system_prompt(
+            product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 12},
+            rp_context={
+                "display_name": "아델리트",
+                "session_memory": {"read_episode_to": 3},
+                "examples": [
+                    {"episode_no": 2, "text": "지금은 여기까지만 알면 돼."},
+                    {"episode_no": 8, "text": "미래의 정체를 알려 주지."},
+                ],
+            },
+            recent_messages=[],
+        )
+
+        self.assertIn("지금은 여기까지만 알면 돼.", prompt)
+        self.assertNotIn("미래의 정체를 알려 주지.", prompt)
+
     async def test_scene_rp_context_does_not_load_future_episode_over_read_scope(self):
         db = _FakeRpContextDb()
 
