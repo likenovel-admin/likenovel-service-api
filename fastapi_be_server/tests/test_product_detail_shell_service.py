@@ -68,7 +68,12 @@ def test_public_detail_shell_returns_public_product_without_statistics_write():
     assert db.params == {"product_id": "1140"}
     assert "p.product_id = :product_id" in db.query
     assert "p.open_yn = 'Y'" in db.query
-    select_bundle.assert_called_once_with(user_id=None, rank_area_code=None)
+    assert "COALESCE(p.blind_yn, 'N') = 'N'" in db.query
+    select_bundle.assert_called_once_with(
+        user_id=None,
+        rank_area_code=None,
+        scope_episode_stats_to_product=True,
+    )
     convert.assert_called_once_with({"productId": 1140})
     insert_statistics.assert_not_awaited()
 
@@ -102,3 +107,13 @@ def test_public_detail_shell_route_does_not_accept_user_scope():
     )
 
     assert "user" not in inspect.signature(route.endpoint).parameters
+
+
+def test_public_detail_shell_scopes_episode_stats_to_requested_product():
+    query_parts = product_service.get_select_fields_and_joins_for_home_card_product(
+        user_id=None,
+        rank_area_code=None,
+        scope_episode_stats_to_product=True,
+    )
+
+    assert "AND product_id = :product_id" in query_parts["joins"]

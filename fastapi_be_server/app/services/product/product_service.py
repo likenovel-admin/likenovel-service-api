@@ -670,8 +670,14 @@ def get_select_fields_and_joins_for_product(
 def get_select_fields_and_joins_for_home_card_product(
     user_id: int | None = None,
     rank_area_code: str | None = None,
+    scope_episode_stats_to_product: bool = False,
 ):
     join_rank_enabled = rank_area_code is not None
+    episode_stats_product_filter = (
+        "\n                  AND product_id = :product_id"
+        if scope_episode_stats_to_product
+        else ""
+    )
     return {
         "select_fields": ",".join(
             [
@@ -798,7 +804,7 @@ def get_select_fields_and_joins_for_home_card_product(
             if rank_area_code is not None
             else ""
         )
-        + """
+        + f"""
             LEFT JOIN (
                 SELECT cf.file_group_id, cfi.file_path
                 FROM tb_common_file cf
@@ -816,7 +822,7 @@ def get_select_fields_and_joins_for_home_card_product(
                     CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN open_yn = 'Y' THEN episode_id END ORDER BY episode_no DESC, episode_id DESC SEPARATOR ','), ',', 1) AS UNSIGNED) as latest_episode_id,
                     CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN open_yn = 'Y' THEN episode_id END ORDER BY episode_no ASC, episode_id ASC SEPARATOR ','), ',', 1) AS UNSIGNED) as first_episode_id
                 FROM tb_product_episode
-                WHERE use_yn = 'Y'
+                WHERE use_yn = 'Y'{episode_stats_product_filter}
                 GROUP BY product_id
             ) episode_stats ON episode_stats.product_id = p.product_id
             LEFT JOIN tb_applied_promotion wff ON wff.product_id = p.product_id AND wff.type = 'waiting-for-free' AND wff.status = 'ing' AND wff.start_date <= NOW() AND (wff.end_date IS NULL OR DATE(wff.end_date) >= CURDATE())
@@ -1246,7 +1252,9 @@ async def public_product_detail_shell_by_product_id(
 ):
     """Return side-effect-free public data for the initial product-detail HTML."""
     query_parts = get_select_fields_and_joins_for_home_card_product(
-        user_id=None, rank_area_code=None
+        user_id=None,
+        rank_area_code=None,
+        scope_episode_stats_to_product=True,
     )
     query = text(f"""
         SELECT {query_parts["select_fields"]}
@@ -1254,6 +1262,7 @@ async def public_product_detail_shell_by_product_id(
         {query_parts["joins"]}
         WHERE p.product_id = :product_id
           AND p.open_yn = 'Y'
+          AND COALESCE(p.blind_yn, 'N') = 'N'
     """)
     result = await db.execute(query, {"product_id": product_id})
     row = result.mappings().one_or_none()
