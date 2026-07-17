@@ -2,7 +2,7 @@ import json
 import importlib.util
 from pathlib import Path
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dist" / "batch" / "extract_product_dna.py"
@@ -555,6 +555,17 @@ class AiDnaProductTargetQueryTest(TestCase):
         self.assertIn("fe.episode_text_count >= 1000", conn.last_cursor.sql)
         self.assertNotIn("fe.episode_text_count >= 5000", conn.last_cursor.sql)
 
+    def test_success_refresh_waits_for_retry_cooldown(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        module.get_products(conn, force=False)
+
+        self.assertRegex(
+            conn.last_cursor.sql,
+            rf"analysis_status[^\n]+success[\s\S]+updated_date[\s\S]+INTERVAL\s+{module.INCOMPLETE_RETRY_COOLDOWN_DAYS}\s+DAY[\s\S]+episode_no\s*=\s*{module.MAX_ANALYZE_EPISODES}",
+        )
+
     def test_save_dna_writes_axis_label_scores(self):
         module = load_module()
         conn = FakeConnection()
@@ -647,6 +658,76 @@ class AiDnaProductTargetQueryTest(TestCase):
                 conn.last_cursor.sql,
                 rf"{column}\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*{column},\s*VALUES\({column}\)\s*\)",
             )
+
+    def test_openrouter_402_raises_batch_circuit_breaker(self):
+        module = load_module()
+        response = MagicMock()
+        response.status_code = 402
+        response.json.return_value = {
+            "error": {"code": 402, "message": "insufficient credits"}
+        }
+        client = MagicMock()
+        client.__enter__.return_value.post.return_value = response
+
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "AI_DNA_OPENROUTER_MODEL", "test-model"),
+            patch.object(module, "_build_openrouter_response_format", return_value={}),
+            patch.object(module.httpx, "Client", return_value=client),
+        ):
+            with self.assertRaises(module.OpenRouterInsufficientCreditsError):
+                module.call_openrouter("system", "user", {})
+
+    def test_openrouter_non_402_keeps_existing_retry_path(self):
+        module = load_module()
+        response = MagicMock()
+        response.status_code = 429
+        response.json.return_value = {
+            "error": {"code": 429, "message": "rate limited"}
+        }
+        client = MagicMock()
+        client.__enter__.return_value.post.return_value = response
+
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "AI_DNA_OPENROUTER_MODEL", "test-model"),
+            patch.object(module, "_build_openrouter_response_format", return_value={}),
+            patch.object(module.httpx, "Client", return_value=client),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                module.call_openrouter("system", "user", {})
+
+        self.assertNotIsInstance(ctx.exception, module.OpenRouterInsufficientCreditsError)
+
+    def test_main_stops_after_first_openrouter_402(self):
+        module = load_module()
+        conn = MagicMock()
+        products = [
+            {"product_id": 1211, "title": "first"},
+            {"product_id": 1212, "title": "second"},
+        ]
+
+        with (
+            patch.object(module, "load_allowed_labels", return_value={}),
+            patch.object(module, "_validate_runtime_config"),
+            patch.object(module, "db_connect", return_value=conn),
+            patch.object(module, "get_products", return_value=products),
+            patch.object(module, "get_episodes", return_value=[]),
+            patch.object(module, "_build_episode_context", return_value=("context", 10)),
+            patch.object(
+                module,
+                "analyze_product",
+                side_effect=module.OpenRouterInsufficientCreditsError("credits"),
+            ) as analyze,
+            patch.object(module, "save_failed") as save_failed,
+            patch.object(module.time, "sleep"),
+            patch("sys.argv", ["extract_product_dna.py", "--all"]),
+        ):
+            with self.assertRaisesRegex(SystemExit, "1"):
+                module.main()
+
+        self.assertEqual(analyze.call_count, 1)
+        save_failed.assert_called_once_with(conn, 1211, 1, "credits")
 
 
 class AiDnaEmptyAxisPolicyTest(TestCase):

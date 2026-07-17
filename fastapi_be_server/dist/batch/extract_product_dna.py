@@ -254,6 +254,10 @@ class UnsupportedLabelError(ValueError):
         super().__init__(f"axis_labels.{axis} contains unsupported label: {label}")
 
 
+class OpenRouterInsufficientCreditsError(RuntimeError):
+    pass
+
+
 def db_connect():
     if not DB_USER or not DB_PASSWORD:
         raise RuntimeError("BATCH_DB_USER/BATCH_DB_PASSWORD 환경변수를 설정하세요.")
@@ -315,6 +319,8 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
                 )
                 OR (
                     COALESCE(m.analysis_status, 'pending') = 'success'
+                    AND COALESCE(m.updated_date, m.created_date, m.analyzed_at, '1970-01-01 00:00:00')
+                        < DATE_SUB(NOW(), INTERVAL {INCOMPLETE_RETRY_COOLDOWN_DAYS} DAY)
                     AND EXISTS (
                         SELECT 1
                         FROM tb_product_episode le
@@ -326,7 +332,7 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
                     )
                 )
             )
-            """  # 미분석 즉시, 실패는 cooldown 뒤, 10화 공개/수정 시 최종 1회 재분석
+            """  # 미분석 즉시, 실패/refresh 재시도는 cooldown 뒤, 10화 공개/수정 시 최종 1회 재분석
             params.append(f"{UNSUPPORTED_LABEL_ERROR_PREFIX}%")
 
         cur.execute(
@@ -1184,6 +1190,8 @@ def call_openrouter(
             },
             json=payload,
         )
+    if resp.status_code == 402:
+        raise OpenRouterInsufficientCreditsError(_sanitize_openrouter_error(resp))
     if resp.status_code != 200:
         raise RuntimeError(_sanitize_openrouter_error(resp))
 
@@ -1519,6 +1527,7 @@ def main():
 
     success = 0
     fail = 0
+    provider_circuit_open = False
     for i, product in enumerate(products, 1):
         pid = product["product_id"]
         title = product["title"]
@@ -1533,9 +1542,11 @@ def main():
             continue
 
         last_error = "unknown error"
+        last_attempt = 0
         analyzed = False
         for retry_idx in range(MAX_RETRY_COUNT + 1):
             attempt = retry_idx + 1
+            last_attempt = attempt
             try:
                 dna, parsed = analyze_product(product, allowed_labels, episode_context, used_count)
                 save_dna(conn, pid, dna, parsed, attempt)
@@ -1546,6 +1557,10 @@ def main():
             except UnsupportedLabelError as e:
                 last_error = _format_failure_message(e)
                 break
+            except OpenRouterInsufficientCreditsError as e:
+                last_error = _format_failure_message(e)
+                provider_circuit_open = True
+                break
             except Exception as e:
                 last_error = _format_failure_message(e)
                 if attempt <= MAX_RETRY_COUNT:
@@ -1553,14 +1568,18 @@ def main():
 
         if not analyzed:
             fail += 1
-            save_failed(conn, pid, MAX_RETRY_COUNT + 1, last_error)
+            save_failed(conn, pid, last_attempt or 1, last_error)
             print(f"FAIL: {last_error}")
+
+        if provider_circuit_open:
+            print("[ABORT] OpenRouter insufficient credits; stopping AI DNA batch.")
+            break
 
         time.sleep(1)  # rate limit 방지
 
     conn.close()
     print(f"\n[DONE] 성공: {success}, 실패: {fail}")
-    if fail > 0 and success == 0:
+    if provider_circuit_open or (fail > 0 and success == 0):
         raise SystemExit(1)
 
 
