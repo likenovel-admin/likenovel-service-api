@@ -13016,6 +13016,8 @@ def build_character_chat_asset_readiness_verification(
     legacy_examples_scope_key_mismatch_scope_keys: list[str] = []
     ready_scope_keys: list[str] = []
     public_slot_ready_scope_keys: list[str] = []
+    main_protagonist_scope_keys: list[str] = []
+    missing_main_protagonist_scope_keys: list[str] = []
     malformed_inventory_scope_keys: list[str] = []
     continuity_ambiguous_scope_keys: list[str] = []
 
@@ -13035,6 +13037,11 @@ def build_character_chat_asset_readiness_verification(
             _increment_reason(block_reason_counts, "identity_continuity_ambiguous")
         if not _is_character_chat_public_candidate(payload):
             continue
+
+        work_role = str(payload.get("work_role") or "").strip()
+        is_main_protagonist = work_role == "main_protagonist"
+        if is_main_protagonist:
+            main_protagonist_scope_keys.append(scope_key)
 
         missing_reasons: list[str] = []
         profile_row = profile_rows_by_scope.get(scope_key)
@@ -13073,6 +13080,8 @@ def build_character_chat_asset_readiness_verification(
             missing_reasons.append("missing_usable_scene")
         for reason in missing_reasons:
             _increment_reason(block_reason_counts, reason)
+        if is_main_protagonist and missing_reasons:
+            missing_main_protagonist_scope_keys.append(scope_key)
 
         if not missing_reasons:
             ready_scope_keys.append(scope_key)
@@ -13084,6 +13093,7 @@ def build_character_chat_asset_readiness_verification(
             {
                 "scope_key": scope_key,
                 "display_name": str(payload.get("display_name") or "").strip(),
+                "work_role": work_role,
                 "public_slot_eligible": bool(payload.get("public_slot_eligible")),
                 "ready": not missing_reasons,
                 "missing_reasons": missing_reasons,
@@ -13094,6 +13104,8 @@ def build_character_chat_asset_readiness_verification(
         character_chat_status = "failed"
     elif not public_candidates:
         character_chat_status = "none_eligible"
+    elif missing_main_protagonist_scope_keys:
+        character_chat_status = "hold"
     elif ready_scope_keys:
         character_chat_status = "ready"
     else:
@@ -13114,6 +13126,8 @@ def build_character_chat_asset_readiness_verification(
         "public_slot_ready_count": len(public_slot_ready_scope_keys),
         "ready_scope_keys": sorted(ready_scope_keys),
         "public_slot_ready_scope_keys": sorted(public_slot_ready_scope_keys),
+        "main_protagonist_scope_keys": sorted(set(main_protagonist_scope_keys)),
+        "missing_main_protagonist_scope_keys": sorted(set(missing_main_protagonist_scope_keys)),
         "missing_profile_scope_keys": sorted(set(missing_profile_scope_keys)),
         "missing_examples_scope_keys": sorted(set(missing_examples_scope_keys)),
         "missing_internal_prompt_scope_keys": sorted(set(missing_internal_prompt_scope_keys)),

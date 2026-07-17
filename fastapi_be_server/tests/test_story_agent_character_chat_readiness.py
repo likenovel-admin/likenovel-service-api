@@ -41,10 +41,17 @@ def row(summary_type, scope_key, payload, *, episode_from=None, summary_id=1):
     }
 
 
-def inventory_payload(scope_key="protagonist:named:데시", *, public_chat=True, public_slot=True):
+def inventory_payload(
+    scope_key="protagonist:named:데시",
+    *,
+    public_chat=True,
+    public_slot=True,
+    work_role="main_protagonist",
+):
     return {
         "canonical_character_key": scope_key,
         "display_name": "데시",
+        "work_role": work_role,
         "public_chat_eligible": public_chat,
         "public_slot_eligible": public_slot,
         "chat_readiness_v1": {
@@ -336,6 +343,123 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         self.assertEqual(verification["missing_profile_scope_keys"], [])
         self.assertEqual(verification["missing_opening_scope_keys"], [])
         self.assertEqual(verification["missing_usable_scene_scope_keys"], [])
+
+    def test_ready_supporting_character_does_not_hide_missing_main_protagonist_assets(self):
+        module = load_module()
+        protagonist_scope_key = "character:레이븐"
+        supporting_scope_key = "character:소년"
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=1103,
+            story_context_status="ready",
+            total_episode_count=12,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row(
+                        "character_inventory_v3",
+                        protagonist_scope_key,
+                        inventory_payload(protagonist_scope_key),
+                    ),
+                    row(
+                        "character_inventory_v3",
+                        supporting_scope_key,
+                        inventory_payload(
+                            supporting_scope_key,
+                            public_slot=False,
+                            work_role="major_character",
+                        ),
+                    ),
+                ],
+                "character_rp_profile": [
+                    row(
+                        "character_rp_profile",
+                        supporting_scope_key,
+                        profile_payload(supporting_scope_key),
+                    )
+                ],
+                "character_rp_examples": [
+                    row(
+                        "character_rp_examples",
+                        supporting_scope_key,
+                        examples_payload(supporting_scope_key),
+                    )
+                ],
+                "episode_scene_extraction": [
+                    row(
+                        "episode_scene_extraction",
+                        "episode:3",
+                        scene_payload(supporting_scope_key),
+                        episode_from=3,
+                    )
+                ],
+            },
+        )
+
+        self.assertEqual(verification["character_chat_status"], "hold")
+        self.assertEqual(verification["ready_scope_keys"], [supporting_scope_key])
+        self.assertEqual(
+            verification["missing_main_protagonist_scope_keys"],
+            [protagonist_scope_key],
+        )
+        self.assertTrue(module.is_character_chat_asset_readiness_actionable(verification))
+
+    def test_missing_supporting_assets_do_not_fail_a_ready_main_protagonist(self):
+        module = load_module()
+        protagonist_scope_key = "character:레이븐"
+        supporting_scope_key = "character:소년"
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=1103,
+            story_context_status="ready",
+            total_episode_count=12,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row(
+                        "character_inventory_v3",
+                        protagonist_scope_key,
+                        inventory_payload(protagonist_scope_key),
+                    ),
+                    row(
+                        "character_inventory_v3",
+                        supporting_scope_key,
+                        inventory_payload(
+                            supporting_scope_key,
+                            public_slot=False,
+                            work_role="major_character",
+                        ),
+                    ),
+                ],
+                "character_rp_profile": [
+                    row(
+                        "character_rp_profile",
+                        protagonist_scope_key,
+                        profile_payload(protagonist_scope_key),
+                    )
+                ],
+                "character_rp_examples": [
+                    row(
+                        "character_rp_examples",
+                        protagonist_scope_key,
+                        examples_payload(protagonist_scope_key),
+                    )
+                ],
+                "episode_scene_extraction": [
+                    row(
+                        "episode_scene_extraction",
+                        "episode:3",
+                        scene_payload(protagonist_scope_key),
+                        episode_from=3,
+                    )
+                ],
+            },
+        )
+
+        self.assertEqual(verification["character_chat_status"], "ready")
+        self.assertEqual(
+            verification["missing_main_protagonist_scope_keys"],
+            [],
+        )
+        self.assertFalse(module.is_character_chat_asset_readiness_actionable(verification))
 
     def test_no_public_candidate_is_none_eligible_not_ready(self):
         module = load_module()
