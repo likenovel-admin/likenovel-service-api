@@ -89,6 +89,7 @@ jobs:
           chmod +x before_install.sh run_be.sh boot-start-api-dev.sh
           mkdir -p scripts
           cp ../scripts/build_story_agent_context.py ./scripts/build_story_agent_context.py
+          cp ../scripts/audit_character_chat_asset_readiness_db.py ./scripts/audit_character_chat_asset_readiness_db.py
           cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py
 
           # *.whl, appspec.yml, before_install.sh, run_be.sh, gconf.py, boot-start-api-dev.sh, .env.production 파일 압축해서 S3로 보낸 후, codedeploy 트리거 발생
