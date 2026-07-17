@@ -953,6 +953,11 @@ def parse_args() -> argparse.Namespace:
         help="delta 모드에서 캐릭터 RP 프로필/예시를 갱신. 기본 delta/cron에서는 비용 방지를 위해 생략.",
     )
     parser.add_argument(
+        "--repair-character-assets",
+        action="store_true",
+        help="delta 모드에서 신규 회차가 없어도 캐릭터 scene/RP 결손을 제한적으로 복구.",
+    )
+    parser.add_argument(
         "--verification-json-path",
         type=str,
         default="",
@@ -2098,6 +2103,8 @@ def select_touched_range_scopes(episode_nos: list[int]) -> list[tuple[str, int, 
 
 def validate_delta_args(args: argparse.Namespace) -> None:
     if args.build_mode != "delta":
+        if bool(getattr(args, "repair_character_assets", False)):
+            raise ValueError("--repair-character-assets는 --build-mode delta에서만 사용할 수 있습니다.")
         return
     if args.limit:
         raise ValueError("--build-mode delta 에서는 --limit를 지원하지 않습니다.")
@@ -7259,6 +7266,27 @@ def build_episode_scene_extraction_source_hash(
     )
 
 
+def extract_episode_scene_character_scope_keys(
+    payload: dict[str, object] | None,
+) -> set[str]:
+    scope_keys: set[str] = set()
+    for scene in list(dict(payload or {}).get("scenes") or []):
+        if not isinstance(scene, dict):
+            continue
+        scope_keys.update(
+            str(item.get("scope_key") or "").strip()
+            for item in list(scene.get("participants") or [])
+            if isinstance(item, dict) and str(item.get("scope_key") or "").strip()
+        )
+        scope_keys.update(
+            str(item.get("actor_scope_key") or "").strip()
+            for item in list(scene.get("action_ownership") or [])
+            if isinstance(item, dict)
+            and str(item.get("actor_scope_key") or "").strip()
+        )
+    return scope_keys
+
+
 async def build_episode_scene_extraction_summaries(
     conn,
     *,
@@ -7268,6 +7296,7 @@ async def build_episode_scene_extraction_summaries(
     episode_texts_by_no: dict[int, str],
     summary_client: AsyncClient | None,
     canonical_character_packet: object | None,
+    required_scope_keys_by_episode_no: dict[int, set[str]] | None = None,
     cleanup_missing_scopes: bool = True,
     verbose: bool = False,
 ) -> tuple[int, int]:
@@ -7289,6 +7318,10 @@ async def build_episode_scene_extraction_summaries(
         episode_no = int(row.get("episode_from") or row.get("episode_no") or 0)
         normalized_text = str(episode_texts_by_no.get(episode_no) or "").strip()
         scope_key = str(row.get("scope_key") or "").strip()
+        required_scope_keys = set(
+            (required_scope_keys_by_episode_no or {}).get(episode_no) or set()
+        )
+        preserved_scope_keys: set[str] = set()
         if not summary_id or episode_no <= 0 or not normalized_text or not scope_key:
             continue
         valid_scope_keys.add(scope_key)
@@ -7305,7 +7338,15 @@ async def build_episode_scene_extraction_summaries(
             )
             if existing:
                 existing_payload = extract_json_object(str(existing.get("summary_text") or "")) or {}
-                if _is_usable_episode_scene_payload(existing_payload):
+                existing_scope_keys = extract_episode_scene_character_scope_keys(
+                    existing_payload
+                )
+                existing_payload_usable = _is_usable_episode_scene_payload(
+                    existing_payload
+                )
+                if existing_payload_usable and required_scope_keys.issubset(
+                    existing_scope_keys
+                ):
                     existing_summary_id = int(existing["summary_id"])
                     activate_existing_summary(
                         cur,
@@ -7316,6 +7357,8 @@ async def build_episode_scene_extraction_summaries(
                     )
                 else:
                     replace_existing_summary_id = int(existing["summary_id"])
+                    if existing_payload_usable:
+                        preserved_scope_keys.update(existing_scope_keys)
         if existing_summary_id:
             conn.commit()
             reused_count += 1
@@ -7353,6 +7396,17 @@ async def build_episode_scene_extraction_summaries(
                     f"[episode-scene-keep-old] product_id={product_id} episode_no={episode_no} "
                     f"reason=invalid_scene_payload issues={json.dumps(issues, ensure_ascii=False)[:180]}"
                 )
+            continue
+        generated_scope_keys = extract_episode_scene_character_scope_keys(payload)
+        required_output_scope_keys = required_scope_keys | preserved_scope_keys
+        if not required_output_scope_keys.issubset(generated_scope_keys):
+            logger.info(
+                "story_agent_scene_extraction_keep_old product_id=%s episode_no=%s reason=required_scope_missing required=%s generated=%s",
+                product_id,
+                episode_no,
+                ",".join(sorted(required_output_scope_keys)),
+                ",".join(sorted(generated_scope_keys)),
+            )
             continue
 
         with work_cursor(conn) as cur:
@@ -11060,6 +11114,11 @@ def reconcile_character_inventory_v3_scope_keys(
             row["continuity_version"] = 1
             row["public_chat_eligible"] = False
             row["public_slot_eligible"] = False
+            chat_readiness = dict(row.get("chat_readiness_v1") or {})
+            chat_readiness["exposure_decision"] = "hold"
+            chat_readiness["character_chat_allowed"] = False
+            chat_readiness["public_slot_allowed"] = False
+            row["chat_readiness_v1"] = chat_readiness
             row["identity_conflict_reasons"] = sorted(
                 set(list(row.get("identity_conflict_reasons") or []))
                 | {"identity_continuity_ambiguous"}
@@ -13028,18 +13087,21 @@ def build_character_chat_asset_readiness_verification(
             malformed_inventory_scope_keys.append(str(row.get("summary_id") or "unknown"))
             _increment_reason(block_reason_counts, "inventory_scope_key_missing")
             continue
-        if (
+        continuity_ambiguous = (
             str(payload.get("continuity_status") or "").strip() == "ambiguous"
             or "identity_continuity_ambiguous"
             in set(payload.get("identity_conflict_reasons") or [])
+        )
+        work_role = str(payload.get("work_role") or "").strip()
+        is_main_protagonist = work_role == "main_protagonist"
+        if continuity_ambiguous and (
+            _is_character_chat_public_candidate(payload) or is_main_protagonist
         ):
             continuity_ambiguous_scope_keys.append(scope_key)
             _increment_reason(block_reason_counts, "identity_continuity_ambiguous")
         if not _is_character_chat_public_candidate(payload):
             continue
 
-        work_role = str(payload.get("work_role") or "").strip()
-        is_main_protagonist = work_role == "main_protagonist"
         if is_main_protagonist:
             main_protagonist_scope_keys.append(scope_key)
 
@@ -13201,27 +13263,6 @@ def attach_character_chat_asset_readiness_to_status_row(cur, status_row: dict[st
         total_episode_count=int(enriched.get("total_episode_count") or 0),
     )
     enriched["character_chat_asset_readiness"] = readiness
-    if (
-        str(enriched.get("context_status") or "").strip() != "disabled"
-        and is_character_chat_asset_readiness_actionable(readiness)
-    ):
-        error_message = (
-            "character_chat_asset_readiness_actionable:"
-            + str(readiness.get("character_chat_status") or "unknown")
-            + ":"
-            + ",".join(sorted(dict(readiness.get("block_reason_counts") or {}).keys()))
-        )[:500]
-        cur.execute(
-            """
-            UPDATE tb_story_agent_context_product
-               SET context_status = IF(context_status = 'disabled', context_status, 'failed'),
-                   last_error_message = IF(context_status = 'disabled', last_error_message, %s),
-                   updated_id = %s
-             WHERE product_id = %s
-            """,
-            (error_message, settings.DB_DML_DEFAULT_ID, product_id),
-        )
-        enriched["context_status"] = "failed"
     return enriched
 
 
@@ -13963,17 +14004,359 @@ def repair_failed_delta_context_statuses(cur, rows: Iterable[dict]) -> list[dict
     return repaired_products
 
 
+def build_character_chat_asset_repair_plan(
+    readiness: dict[str, object] | None,
+) -> dict[str, object]:
+    payload = dict(readiness or {})
+    blocked_scope_keys = {
+        str(scope_key or "").strip()
+        for scope_key in list(payload.get("continuity_ambiguous_scope_keys") or [])
+        if str(scope_key or "").strip()
+    }
+    rp_scope_keys = {
+        str(scope_key or "").strip()
+        for field_name in (
+            "missing_profile_scope_keys",
+            "missing_examples_scope_keys",
+            "invalid_profile_scope_keys",
+            "invalid_examples_scope_keys",
+            "legacy_profile_scope_key_mismatch_scope_keys",
+            "legacy_examples_scope_key_mismatch_scope_keys",
+        )
+        for scope_key in list(payload.get(field_name) or [])
+        if str(scope_key or "").strip()
+    } - blocked_scope_keys
+    scene_scope_keys = {
+        str(scope_key or "").strip()
+        for scope_key in list(payload.get("missing_usable_scene_scope_keys") or [])
+        if str(scope_key or "").strip()
+    } - blocked_scope_keys
+    return {
+        "rp_scope_keys": sorted(rp_scope_keys),
+        "scene_scope_keys": sorted(scene_scope_keys),
+        "blocked_scope_keys": sorted(blocked_scope_keys),
+        "repairable": bool(rp_scope_keys or scene_scope_keys),
+    }
+
+
+def select_character_chat_scene_repair_rows(
+    *,
+    inventory_map: dict[str, dict[str, object]],
+    episode_summary_rows: list[dict[str, object]],
+    scene_scope_keys: set[str],
+    limit: int,
+) -> tuple[list[dict[str, object]], dict[int, set[str]]]:
+    episode_rows_by_no = {
+        int(row.get("episode_from") or row.get("episode_no") or 0): row
+        for row in episode_summary_rows
+        if int(row.get("episode_from") or row.get("episode_no") or 0) > 0
+    }
+    required_scope_keys_by_episode_no: dict[int, set[str]] = {}
+    ordered_scope_keys = sorted(
+        scene_scope_keys,
+        key=lambda scope_key: (
+            0
+            if str(dict(inventory_map.get(scope_key) or {}).get("work_role") or "")
+            == "main_protagonist"
+            else 1,
+            scope_key,
+        ),
+    )
+    max_rows = max(int(limit or 0), 1)
+    for scope_key in ordered_scope_keys:
+        inventory_item = dict(inventory_map.get(scope_key) or {})
+        evidence_episode_nos = sorted(
+            {
+                int(value)
+                for value in list(inventory_item.get("evidence_episode_nos") or [])
+                if int(value) in episode_rows_by_no
+            },
+            reverse=True,
+        )
+        if not evidence_episode_nos:
+            fallback_episode_no = int(
+                inventory_item.get("latest_seen_episode_no")
+                or inventory_item.get("first_seen_episode_no")
+                or 0
+            )
+            if fallback_episode_no in episode_rows_by_no:
+                evidence_episode_nos = [fallback_episode_no]
+        for episode_no in evidence_episode_nos[:1]:
+            if (
+                episode_no not in required_scope_keys_by_episode_no
+                and len(required_scope_keys_by_episode_no) >= max_rows
+            ):
+                continue
+            required_scope_keys_by_episode_no.setdefault(episode_no, set()).add(
+                scope_key
+            )
+    selected_rows = [
+        episode_rows_by_no[episode_no]
+        for episode_no in sorted(required_scope_keys_by_episode_no)
+    ]
+    return selected_rows, required_scope_keys_by_episode_no
+
+
+def touch_character_asset_repair_attempt(cur, *, product_id: int) -> None:
+    cur.execute(
+        """
+        UPDATE tb_story_agent_context_product
+           SET last_built_at = NOW(),
+               updated_id = %s
+         WHERE product_id = %s
+           AND context_status <> 'disabled'
+        """,
+        (settings.DB_DML_DEFAULT_ID, product_id),
+    )
+
+
+async def repair_character_chat_assets(
+    *,
+    rows: Iterable[dict],
+    args: argparse.Namespace,
+    results: dict[str, object],
+) -> None:
+    product_results = results.setdefault("products", [])
+    repair_records = results.setdefault("character_asset_repairs", [])
+    if not isinstance(product_results, list) or not isinstance(repair_records, list):
+        raise TypeError("story-agent repair results must contain list fields")
+    rows_by_product: dict[int, list[dict]] = {}
+    for row in rows:
+        rows_by_product.setdefault(int(row["product_id"]), []).append(row)
+    if not rows_by_product:
+        return
+
+    summary_client: AsyncClient | None = None
+    if (
+        (OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
+        or (OPENROUTER_API_KEY and EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL)
+        or (settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
+    ):
+        summary_client = AsyncClient(timeout=EPISODE_SUMMARY_TIMEOUT_SECONDS)
+
+    work_conn = db_connect()
+    try:
+        for product_id, product_rows in sorted(rows_by_product.items()):
+            results["character_asset_repair_attempted"] += 1
+            repair_record: dict[str, object] = {"product_id": product_id}
+            try:
+                with product_lock_connection(product_id) if args.apply else nullcontext(None) as lock_conn:
+                    if args.apply and lock_conn is None:
+                        repair_record["status"] = "locked"
+                        results["character_asset_repair_no_progress"] += 1
+                        repair_records.append(repair_record)
+                        continue
+
+                    with work_cursor(work_conn) as cur:
+                        total_episode_count = fetch_total_episode_count(
+                            cur,
+                            product_id=product_id,
+                        )
+                        context_status = fetch_product_context_status(
+                            cur,
+                            product_id=product_id,
+                        )
+                        ready_episode_count = fetch_product_ready_episode_count(
+                            cur,
+                            product_id=product_id,
+                        )
+                        before_readiness = fetch_character_chat_asset_readiness_verification(
+                            cur,
+                            product_id=product_id,
+                            story_context_status=context_status,
+                            total_episode_count=total_episode_count,
+                        )
+                        inventory_map = fetch_active_character_inventory_map(
+                            cur=cur,
+                            product_id=product_id,
+                            summary_type="character_inventory_v3",
+                        )
+                        episode_summary_rows = fetch_active_summary_rows(
+                            cur=cur,
+                            product_id=product_id,
+                            summary_type="episode_summary",
+                        )
+                        episode_texts_by_no = fetch_active_episode_texts_by_no(
+                            cur,
+                            product_id=product_id,
+                        )
+                        relation_map = build_canonical_relation_inventory_map(
+                            relation_map=fetch_active_relation_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                            ),
+                            inventory_map=inventory_map,
+                        )
+                        historical_inventory_state_map = (
+                            fetch_rp_ready_character_inventory_history_state_map(
+                                cur,
+                                product_id=product_id,
+                            )
+                        )
+
+                    repair_plan = build_character_chat_asset_repair_plan(
+                        before_readiness
+                    )
+                    scene_scope_keys = set(repair_plan["scene_scope_keys"])
+                    scene_rows, required_scope_keys_by_episode_no = (
+                        select_character_chat_scene_repair_rows(
+                            inventory_map=inventory_map,
+                            episode_summary_rows=episode_summary_rows,
+                            scene_scope_keys=scene_scope_keys,
+                            limit=int(getattr(args, "max_delta_episodes", 0) or 0),
+                        )
+                    )
+                    scene_counts = (0, 0)
+                    if scene_rows:
+                        scene_counts = await build_episode_scene_extraction_summaries_nonblocking(
+                            conn=work_conn,
+                            product_id=product_id,
+                            product_title=str(product_rows[0].get("title") or ""),
+                            episode_rows=scene_rows,
+                            episode_texts_by_no=episode_texts_by_no,
+                            summary_client=summary_client,
+                            canonical_character_packet=build_episode_scene_canonical_character_packet(
+                                inventory_map
+                            ),
+                            required_scope_keys_by_episode_no=required_scope_keys_by_episode_no,
+                            cleanup_missing_scopes=False,
+                            verbose=args.verbose,
+                        )
+                        results["inserted_episode_scene_extractions"] += scene_counts[0]
+                        results["reused_episode_scene_extractions"] += scene_counts[1]
+
+                    rp_counts = await build_rp_summaries_delta(
+                        conn=work_conn,
+                        product_id=product_id,
+                        affected_scope_keys=set(repair_plan["rp_scope_keys"]),
+                        episode_rows=episode_summary_rows,
+                        episode_texts_by_no=episode_texts_by_no,
+                        summary_client=summary_client,
+                        inventory_map=inventory_map,
+                        relation_map=relation_map,
+                        historical_inventory_state_map=historical_inventory_state_map,
+                        verbose=args.verbose,
+                    )
+                    results["inserted_character_rp_profiles"] += int(
+                        (rp_counts.get("profile") or (0, 0))[0]
+                    )
+                    results["reused_character_rp_profiles"] += int(
+                        (rp_counts.get("profile") or (0, 0))[1]
+                    )
+                    results["inserted_character_rp_examples"] += int(
+                        (rp_counts.get("examples") or (0, 0))[0]
+                    )
+                    results["reused_character_rp_examples"] += int(
+                        (rp_counts.get("examples") or (0, 0))[1]
+                    )
+
+                    with work_cursor(work_conn) as cur:
+                        after_readiness = fetch_character_chat_asset_readiness_verification(
+                            cur,
+                            product_id=product_id,
+                            story_context_status=context_status,
+                            total_episode_count=total_episode_count,
+                        )
+                        touch_character_asset_repair_attempt(
+                            cur,
+                            product_id=product_id,
+                        )
+                    work_conn.commit()
+
+                    recovered = (
+                        is_character_chat_asset_readiness_actionable(before_readiness)
+                        and not is_character_chat_asset_readiness_actionable(after_readiness)
+                    )
+                    results[
+                        "character_asset_repair_recovered"
+                        if recovered
+                        else "character_asset_repair_no_progress"
+                    ] += 1
+                    repair_record.update(
+                        {
+                            "status": "recovered" if recovered else "no_progress",
+                            "before_status": str(
+                                before_readiness.get("character_chat_status") or ""
+                            ),
+                            "after_status": str(
+                                after_readiness.get("character_chat_status") or ""
+                            ),
+                            "rp_scope_keys": list(repair_plan["rp_scope_keys"]),
+                            "scene_scope_keys": list(repair_plan["scene_scope_keys"]),
+                            "blocked_scope_keys": list(
+                                repair_plan["blocked_scope_keys"]
+                            ),
+                        }
+                    )
+                    product_result = {
+                        "product_id": product_id,
+                        "context_status": context_status,
+                        "total_episode_count": total_episode_count,
+                        "ready_episode_count": ready_episode_count,
+                        "character_chat_asset_readiness": after_readiness,
+                        "character_asset_repair": repair_record,
+                    }
+                    existing_product = next(
+                        (
+                            item
+                            for item in product_results
+                            if int(dict(item or {}).get("product_id") or 0)
+                            == product_id
+                        ),
+                        None,
+                    )
+                    if existing_product is None:
+                        product_results.append(product_result)
+                    else:
+                        existing_product.update(product_result)
+                    repair_records.append(repair_record)
+                    logger.info(
+                        "story_agent_character_asset_repair product_id=%s status=%s rp_scopes=%s scene_scopes=%s",
+                        product_id,
+                        repair_record["status"],
+                        len(list(repair_plan["rp_scope_keys"])),
+                        len(list(repair_plan["scene_scope_keys"])),
+                    )
+            except Exception as exc:
+                try:
+                    work_conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    with work_cursor(work_conn) as cur:
+                        touch_character_asset_repair_attempt(
+                            cur,
+                            product_id=product_id,
+                        )
+                    work_conn.commit()
+                except Exception:
+                    try:
+                        work_conn.rollback()
+                    except Exception:
+                        pass
+                results["character_asset_repair_failed"] += 1
+                repair_record.update(
+                    {"status": "failed", "error": str(exc)[:240]}
+                )
+                repair_records.append(repair_record)
+                logger.exception(
+                    "story_agent_character_asset_repair_failed product_id=%s error=%s",
+                    product_id,
+                    str(exc)[:240],
+                )
+    finally:
+        if summary_client is not None:
+            await summary_client.aclose()
+        work_conn.close()
+
+
 def build_delta_exit_code(results: dict[str, object], *, apply: bool) -> int:
     if not apply:
         return 0
     for product in list(results.get("products") or []):
         if str((product or {}).get("context_status") or "").strip() == "failed":
             return 1
-        if is_character_chat_asset_readiness_actionable(
-            dict((product or {}).get("character_chat_asset_readiness") or {})
-        ):
-            return 1
-    return 0
+    return int(int(results.get("character_asset_repair_failed") or 0) > 0)
 
 
 def build_empty_results() -> dict[str, object]:
@@ -14007,6 +14390,11 @@ def build_empty_results() -> dict[str, object]:
         "reused_character_rp_examples": 0,
         "inserted_character_chat_openings": 0,
         "reused_character_chat_openings": 0,
+        "character_asset_repair_attempted": 0,
+        "character_asset_repair_recovered": 0,
+        "character_asset_repair_no_progress": 0,
+        "character_asset_repair_failed": 0,
+        "character_asset_repairs": [],
         "skipped_rows": 0,
         "products": [],
         "delta_verifications": [],
@@ -14815,6 +15203,10 @@ def print_summary(results: dict[str, object], apply: bool) -> None:
         f"inserted_character_rp_profiles={results['inserted_character_rp_profiles']} reused_character_rp_profiles={results['reused_character_rp_profiles']} "
         f"inserted_character_rp_examples={results['inserted_character_rp_examples']} reused_character_rp_examples={results['reused_character_rp_examples']} "
         f"inserted_character_chat_openings={results['inserted_character_chat_openings']} reused_character_chat_openings={results['reused_character_chat_openings']} "
+        f"character_asset_repair_attempted={results['character_asset_repair_attempted']} "
+        f"character_asset_repair_recovered={results['character_asset_repair_recovered']} "
+        f"character_asset_repair_no_progress={results['character_asset_repair_no_progress']} "
+        f"character_asset_repair_failed={results['character_asset_repair_failed']} "
         f"skipped_rows={results['skipped_rows']}"
     )
     for product in list(results.get("products") or [])[:20]:
@@ -14924,6 +15316,7 @@ async def main() -> int:
     validate_delta_args(args)
     query, params = build_target_query(args=args, use_epub_fallback=args.use_epub_fallback)
     rows: list[dict] = []
+    character_asset_repair_rows: list[dict] = []
     delta_status_repaired_products: list[dict[str, object]] = []
     conn = db_connect()
     try:
@@ -14931,6 +15324,8 @@ async def main() -> int:
             cur.execute(query, params)
             rows = list(cur.fetchall())
             if args.build_mode == "delta":
+                if args.apply and bool(args.repair_character_assets):
+                    character_asset_repair_rows = list(rows)
                 if args.apply:
                     delta_status_repaired_products = repair_failed_delta_context_statuses(cur, rows)
                     if delta_status_repaired_products:
@@ -14948,12 +15343,22 @@ async def main() -> int:
         conn.close()
 
     if args.build_mode == "delta":
-        results = await build_context_rows_delta(rows=rows, args=args)
+        results = (
+            await build_context_rows_delta(rows=rows, args=args)
+            if rows
+            else build_empty_results()
+        )
         if delta_status_repaired_products:
             results["products"] = [
                 *delta_status_repaired_products,
                 *list(results.get("products") or []),
             ]
+        if character_asset_repair_rows:
+            await repair_character_chat_assets(
+                rows=character_asset_repair_rows,
+                args=args,
+                results=results,
+            )
         print_summary(results=results, apply=args.apply)
         write_delta_verification_json(args.verification_json_path, results)
         return build_delta_exit_code(results, apply=args.apply)

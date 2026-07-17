@@ -180,7 +180,8 @@ CANDIDATE_OUTPUT=""
 if ! CANDIDATE_OUTPUT="$("${MYSQL_CMD[@]}" <<SQL
 SELECT
   candidates.product_id,
-  candidates.title
+  candidates.title,
+  candidates.character_asset_repair_needed
 FROM (
   SELECT
     p.product_id,
@@ -207,7 +208,94 @@ FROM (
       WHERE civ3.product_id = p.product_id
         AND civ3.summary_type = 'character_inventory_v3'
         AND civ3.is_active = 'Y'
-    ) AS active_character_inventory_v3_count
+    ) AS active_character_inventory_v3_count,
+    (
+      SELECT COUNT(*)
+      FROM tb_story_agent_context_summary repair_inventory
+      WHERE repair_inventory.product_id = p.product_id
+        AND repair_inventory.summary_type = 'character_inventory_v3'
+        AND repair_inventory.is_active = 'Y'
+        AND NULLIF(TRIM(repair_inventory.scope_key), '') IS NOT NULL
+        AND JSON_VALID(repair_inventory.summary_text)
+        AND NOT (
+          LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.continuity_status')), '')) = 'ambiguous'
+          OR JSON_CONTAINS(
+            COALESCE(JSON_EXTRACT(repair_inventory.summary_text, '$.identity_conflict_reasons'), JSON_ARRAY()),
+            JSON_QUOTE('identity_continuity_ambiguous')
+          ) = 1
+        )
+        AND (
+          LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.public_chat_eligible')), 'false')) = 'true'
+          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.public_slot_eligible')), 'false')) = 'true'
+          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.character_chat_allowed')), 'false')) = 'true'
+          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.public_slot_allowed')), 'false')) = 'true'
+          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.exposure_decision')), '')) = 'eligible'
+        )
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM tb_story_agent_context_summary repair_profile
+            WHERE repair_profile.product_id = p.product_id
+              AND repair_profile.summary_type = 'character_rp_profile'
+              AND repair_profile.is_active = 'Y'
+              AND repair_profile.scope_key = repair_inventory.scope_key
+              AND JSON_VALID(repair_profile.summary_text)
+              AND JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_key')) = repair_inventory.scope_key
+          )
+          OR NOT EXISTS (
+            SELECT 1
+            FROM tb_story_agent_context_summary repair_examples
+            WHERE repair_examples.product_id = p.product_id
+              AND repair_examples.summary_type = 'character_rp_examples'
+              AND repair_examples.is_active = 'Y'
+              AND repair_examples.scope_key = repair_inventory.scope_key
+              AND JSON_VALID(repair_examples.summary_text)
+              AND JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_key')) = repair_inventory.scope_key
+              AND JSON_TYPE(JSON_EXTRACT(repair_examples.summary_text, '$.examples')) = 'ARRAY'
+              AND COALESCE(JSON_LENGTH(JSON_EXTRACT(repair_examples.summary_text, '$.examples')), 0) > 0
+              AND EXISTS (
+                SELECT 1
+                FROM JSON_TABLE(
+                  repair_examples.summary_text,
+                  '$.examples[*]' COLUMNS (
+                    example_text TEXT PATH '$.text'
+                  )
+                ) repair_example_item
+                WHERE NULLIF(TRIM(repair_example_item.example_text), '') IS NOT NULL
+              )
+          )
+          OR NOT EXISTS (
+            SELECT 1
+            FROM tb_story_agent_context_summary repair_scene
+            WHERE repair_scene.product_id = p.product_id
+              AND repair_scene.summary_type = 'episode_scene_extraction'
+              AND repair_scene.is_active = 'Y'
+              AND JSON_VALID(repair_scene.summary_text)
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM JSON_TABLE(
+                    repair_scene.summary_text,
+                    '$.scenes[*].participants[*]' COLUMNS (
+                      character_scope_key VARCHAR(255) PATH '$.scope_key'
+                    )
+                  ) repair_scene_participant
+                  WHERE repair_scene_participant.character_scope_key = repair_inventory.scope_key
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM JSON_TABLE(
+                    repair_scene.summary_text,
+                    '$.scenes[*].action_ownership[*]' COLUMNS (
+                      character_scope_key VARCHAR(255) PATH '$.actor_scope_key'
+                    )
+                  ) repair_scene_actor
+                  WHERE repair_scene_actor.character_scope_key = repair_inventory.scope_key
+                )
+              )
+          )
+        )
+    ) AS character_asset_repair_needed
   FROM tb_product p
   JOIN tb_product_episode pe
     ON pe.product_id = p.product_id
@@ -269,6 +357,7 @@ FROM (
   HAVING
     missing_foundation_episode_count > 0
     OR missing_open_scene_count > 0
+    OR character_asset_repair_needed > 0
     OR (
       context_status = 'failed'
       AND missing_foundation_episode_count = 0
@@ -280,8 +369,9 @@ ORDER BY
   CASE
     WHEN candidates.context_status = 'failed' THEN 0
     WHEN candidates.missing_foundation_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1
-    WHEN candidates.missing_foundation_episode_count < ${BACKLOG_PRIORITY_THRESHOLD} THEN 2
-    ELSE 3
+    WHEN candidates.missing_foundation_episode_count > 0 OR candidates.missing_open_scene_count > 0 THEN 2
+    WHEN candidates.character_asset_repair_needed > 0 THEN 3
+    ELSE 4
   END ASC,
   CASE candidates.context_status
     WHEN 'processing' THEN 0
@@ -291,6 +381,7 @@ ORDER BY
   candidates.missing_foundation_episode_count DESC,
   candidates.missing_open_character_signal_count DESC,
   candidates.last_built_at ASC,
+  candidates.character_asset_repair_needed ASC,
   candidates.missing_open_scene_count DESC,
   candidates.product_id ASC
 LIMIT ${MAX_PARALLEL};
@@ -319,15 +410,22 @@ declare -A PID_TO_START_TS=()
 run_product() {
   local product_id="$1"
   local product_title="$2"
+  local character_asset_repair_needed="${3:-0}"
 
   (
     export PYTHONUNBUFFERED=1
-    exec "${PYTHON_BIN}" "${BUILD_SCRIPT}" \
+    command=(
+      "${PYTHON_BIN}" "${BUILD_SCRIPT}"
       --product-id "${product_id}" \
       --build-mode "${BUILD_MODE}" \
       --max-delta-episodes "${MAX_DELTA_EPISODES}" \
       --apply \
       --verbose
+    )
+    if [ "${BUILD_MODE}" = "delta" ] && [ "${character_asset_repair_needed}" -gt 0 ]; then
+      command+=(--repair-character-assets)
+    fi
+    exec "${command[@]}"
   ) > >(append_timestamped_to_log) 2>&1 &
 
   local pid=$!
@@ -339,11 +437,11 @@ run_product() {
 }
 
 for row in "${CANDIDATE_ROWS[@]}"; do
-  IFS=$'\t' read -r product_id product_title <<< "${row}"
+  IFS=$'\t' read -r product_id product_title character_asset_repair_needed <<< "${row}"
   if [ -z "${product_id:-}" ] || [ -z "${product_title:-}" ]; then
     continue
   fi
-  run_product "${product_id}" "${product_title}"
+  run_product "${product_id}" "${product_title}" "${character_asset_repair_needed:-0}"
 done
 
 if [ "${#PIDS[@]}" -eq 0 ]; then

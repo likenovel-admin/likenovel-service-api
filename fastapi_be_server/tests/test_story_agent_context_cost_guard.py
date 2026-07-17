@@ -415,6 +415,75 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         request_mock.assert_not_awaited()
         self.assertEqual(conn.commit_count, 0)
 
+    async def test_scene_repair_keeps_old_when_regeneration_drops_existing_character(self):
+        module = load_module()
+        conn = FakeConnection()
+        required_scope_key = "protagonist:named:데시"
+        other_scope_key = "supporting:named:오리온"
+        existing_payload = {
+            "episode_no": 1,
+            "status": "ok",
+            "scene_count": 1,
+            "scenes": [
+                {
+                    "scene_gist": "오리온이 문을 연다.",
+                    "participants": [{"scope_key": other_scope_key}],
+                    "action_ownership": [],
+                }
+            ],
+        }
+        regenerated_payload = {
+            **existing_payload,
+            "scenes": [
+                {
+                    "scene_gist": "데시가 문을 연다.",
+                    "participants": [{"scope_key": required_scope_key}],
+                    "action_ownership": [],
+                }
+            ],
+        }
+        request_mock = AsyncMock(return_value=regenerated_payload)
+        update_mock = MagicMock()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "test-key"), \
+             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "test-model"), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(
+                 module,
+                 "fetch_existing_summary",
+                 return_value={
+                     "summary_id": 9,
+                     "summary_text": json.dumps(existing_payload, ensure_ascii=False),
+                 },
+             ), \
+             patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
+             patch.object(module, "update_existing_summary_payload", update_mock):
+            counts = await module.build_episode_scene_extraction_summaries(
+                conn,
+                product_id=687,
+                product_title="테스트 작품",
+                episode_rows=[
+                    {
+                        "summary_id": 1,
+                        "scope_key": "episode:1001",
+                        "episode_from": 1,
+                        "source_hash": "hash",
+                        "summary_text": "[1화] 테스트",
+                    }
+                ],
+                episode_texts_by_no={1: "데시와 오리온은 문 앞에 섰다."},
+                summary_client=object(),
+                canonical_character_packet={
+                    "characters": [{"scope_key": required_scope_key, "display_name": "데시"}]
+                },
+                required_scope_keys_by_episode_no={1: {required_scope_key}},
+                cleanup_missing_scopes=False,
+            )
+
+        self.assertEqual(counts, (0, 0))
+        request_mock.assert_awaited_once()
+        update_mock.assert_not_called()
+
     def test_inventory_v3_links_previous_first_person_identity_to_current_protagonist(self):
         module = load_module()
         signal_rows = [
@@ -2719,7 +2788,138 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 "legacy_profile_scope_key_mismatch": 1,
             },
         }
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
+
+        results["character_asset_repair_failed"] = 1
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
+
+    def test_character_asset_repair_plan_routes_only_safe_scopes(self):
+        module = load_module()
+        plan = module.build_character_chat_asset_repair_plan(
+            {
+                "missing_profile_scope_keys": ["character:main", "character:ambiguous"],
+                "missing_examples_scope_keys": ["character:main"],
+                "legacy_profile_scope_key_mismatch_scope_keys": ["character:legacy"],
+                "missing_usable_scene_scope_keys": ["character:main", "character:ambiguous"],
+                "continuity_ambiguous_scope_keys": ["character:ambiguous"],
+            }
+        )
+
+        self.assertEqual(
+            plan["rp_scope_keys"],
+            ["character:legacy", "character:main"],
+        )
+        self.assertEqual(plan["scene_scope_keys"], ["character:main"])
+        self.assertEqual(plan["blocked_scope_keys"], ["character:ambiguous"])
+        self.assertTrue(plan["repairable"])
+
+    def test_scene_repair_selection_prioritizes_main_and_caps_rows(self):
+        module = load_module()
+        rows, required = module.select_character_chat_scene_repair_rows(
+            inventory_map={
+                "character:main": {
+                    "work_role": "main_protagonist",
+                    "evidence_episode_nos": [1, 3],
+                },
+                "character:support": {
+                    "work_role": "supporting",
+                    "evidence_episode_nos": [2],
+                },
+            },
+            episode_summary_rows=[
+                {"episode_from": 1, "scope_key": "episode:101"},
+                {"episode_from": 2, "scope_key": "episode:102"},
+                {"episode_from": 3, "scope_key": "episode:103"},
+            ],
+            scene_scope_keys={"character:main", "character:support"},
+            limit=1,
+        )
+
+        self.assertEqual([row["episode_from"] for row in rows], [3])
+        self.assertEqual(required, {3: {"character:main"}})
+
+    async def test_character_asset_repair_runs_without_foundation_delta_or_provider_preflight(self):
+        module = load_module()
+        conn = FakeConnection()
+        results = module.build_empty_results()
+        scope_key = "character:main"
+        before_readiness = {
+            "character_chat_status": "hold",
+            "public_candidate_count": 1,
+            "missing_profile_scope_keys": [scope_key],
+            "missing_examples_scope_keys": [scope_key],
+            "missing_usable_scene_scope_keys": [scope_key],
+        }
+        after_readiness = {
+            "character_chat_status": "ready",
+            "public_candidate_count": 1,
+            "ready_scope_keys": [scope_key],
+        }
+        inventory_map = {
+            scope_key: {
+                "canonical_character_key": scope_key,
+                "display_name": "데시",
+                "work_role": "main_protagonist",
+                "is_protagonist": True,
+                "evidence_episode_nos": [1],
+            }
+        }
+        episode_rows = [
+            {
+                "summary_id": 1,
+                "scope_key": "episode:101",
+                "episode_from": 1,
+                "source_hash": "summary-hash",
+                "summary_text": "[1화] 테스트",
+            }
+        ]
+        scene_builder = AsyncMock(return_value=(1, 0))
+        rp_builder = AsyncMock(
+            return_value={"profile": [1, 0], "examples": [1, 0]}
+        )
+        preflight = AsyncMock()
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_total_episode_count", return_value=1), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=1), \
+             patch.object(
+                 module,
+                 "fetch_character_chat_asset_readiness_verification",
+                 side_effect=[before_readiness, after_readiness],
+             ), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value=inventory_map), \
+             patch.object(module, "fetch_active_summary_rows", return_value=episode_rows), \
+             patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
+             patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
+             patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
+             patch.object(module, "build_episode_scene_extraction_summaries_nonblocking", scene_builder), \
+             patch.object(module, "build_rp_summaries_delta", rp_builder), \
+             patch.object(module, "touch_character_asset_repair_attempt") as touch, \
+             patch.object(module, "assert_storyctx_apply_providers_ready", preflight):
+            await module.repair_character_chat_assets(
+                rows=[{"product_id": 687, "title": "테스트 작품"}],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    max_delta_episodes=2,
+                ),
+                results=results,
+            )
+
+        preflight.assert_not_awaited()
+        scene_builder.assert_awaited_once()
+        rp_builder.assert_awaited_once()
+        touch.assert_called_once()
+        self.assertEqual(results["character_asset_repair_attempted"], 1)
+        self.assertEqual(results["character_asset_repair_recovered"], 1)
+        self.assertEqual(results["character_asset_repair_failed"], 0)
+        self.assertEqual(results["products"][0]["context_status"], "ready")
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
 
     def test_failed_delta_status_repair_refreshes_when_foundation_complete(self):
         module = load_module()
@@ -7504,6 +7704,9 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual(reconciled[0]["continuity_status"], "ambiguous")
         self.assertFalse(reconciled[0]["public_chat_eligible"])
         self.assertFalse(reconciled[0]["public_slot_eligible"])
+        self.assertFalse(reconciled[0]["chat_readiness_v1"]["character_chat_allowed"])
+        self.assertFalse(reconciled[0]["chat_readiness_v1"]["public_slot_allowed"])
+        self.assertEqual(reconciled[0]["chat_readiness_v1"]["exposure_decision"], "hold")
         self.assertIn(
             "identity_continuity_ambiguous",
             reconciled[0]["identity_conflict_reasons"],

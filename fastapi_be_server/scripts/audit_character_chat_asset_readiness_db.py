@@ -104,6 +104,7 @@ def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
     public_candidate_total = 0
     ready_public_candidate_total = 0
     public_slot_ready_total = 0
+    ready_without_main_protagonist_product_ids: list[int] = []
 
     for row in rows:
         context_status_counts[str(row.get("context_status") or "missing")] += 1
@@ -120,6 +121,8 @@ def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
         product_id = int(row.get("product_id") or 0)
         if character_chat_status == "ready":
             ready_product_ids.append(product_id)
+            if not list(readiness.get("main_protagonist_scope_keys") or []):
+                ready_without_main_protagonist_product_ids.append(product_id)
         elif character_chat_status == "hold":
             hold_product_ids.append(product_id)
         for reason, count in dict(readiness.get("block_reason_counts") or {}).items():
@@ -142,6 +145,12 @@ def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "readyPublicCandidateTotal": ready_public_candidate_total,
         "publicSlotReadyTotal": public_slot_ready_total,
         "readyProductIds": sorted(pid for pid in ready_product_ids if pid > 0),
+        "readyWithoutMainProtagonistCount": len(
+            [pid for pid in ready_without_main_protagonist_product_ids if pid > 0]
+        ),
+        "readyWithoutMainProtagonistProductIds": sorted(
+            pid for pid in ready_without_main_protagonist_product_ids if pid > 0
+        )[:20],
         "holdProductIdsSample": sorted(pid for pid in hold_product_ids if pid > 0)[:20],
     }
 

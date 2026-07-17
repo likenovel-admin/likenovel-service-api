@@ -482,7 +482,35 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         self.assertEqual(verification["public_candidate_count"], 0)
         self.assertEqual(verification["ready_public_candidate_count"], 0)
 
-    def test_ambiguous_identity_continuity_fails_readiness_even_when_hidden(self):
+    def test_hidden_minor_ambiguity_does_not_fail_product_readiness(self):
+        module = load_module()
+        scope_key = "character:레이븐:dup:new"
+        payload = inventory_payload(scope_key, public_chat=False, public_slot=False)
+        payload["work_role"] = "supporting"
+        payload["continuity_status"] = "ambiguous"
+        payload["identity_conflict_reasons"] = ["identity_continuity_ambiguous"]
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=1103,
+            story_context_status="ready",
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row("character_inventory_v3", scope_key, payload)
+                ],
+            },
+        )
+
+        self.assertEqual(verification["character_chat_status"], "none_eligible")
+        self.assertEqual(
+            verification["continuity_ambiguous_scope_keys"],
+            [],
+        )
+        self.assertNotIn(
+            "identity_continuity_ambiguous",
+            verification["block_reason_counts"],
+        )
+
+    def test_hidden_main_protagonist_ambiguity_remains_actionable(self):
         module = load_module()
         scope_key = "character:레이븐:dup:new"
         payload = inventory_payload(scope_key, public_chat=False, public_slot=False)
@@ -500,14 +528,8 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         )
 
         self.assertEqual(verification["character_chat_status"], "failed")
-        self.assertEqual(
-            verification["continuity_ambiguous_scope_keys"],
-            [scope_key],
-        )
-        self.assertEqual(
-            verification["block_reason_counts"]["identity_continuity_ambiguous"],
-            1,
-        )
+        self.assertEqual(verification["continuity_ambiguous_scope_keys"], [scope_key])
+        self.assertTrue(module.is_character_chat_asset_readiness_actionable(verification))
 
     def test_status_row_is_enriched_with_character_chat_asset_readiness(self):
         module = load_module()
@@ -536,9 +558,9 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             story_context_status="ready",
             total_episode_count=12,
         )
-        self.assertEqual(enriched["context_status"], "failed")
+        self.assertEqual(enriched["context_status"], "ready")
         self.assertEqual(enriched["character_chat_asset_readiness"], readiness)
-        fake_cursor.execute.assert_called_once()
+        fake_cursor.execute.assert_not_called()
 
 
 if __name__ == "__main__":

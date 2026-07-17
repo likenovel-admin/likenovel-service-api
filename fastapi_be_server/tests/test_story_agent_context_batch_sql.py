@@ -94,6 +94,14 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("missing_foundation_episode_count", script)
         self.assertIn("active_character_inventory_count", script)
         self.assertIn("active_character_inventory_v3_count", script)
+        self.assertIn("character_asset_repair_needed", script)
+        self.assertIn("character_rp_profile", script)
+        self.assertIn("character_rp_examples", script)
+        self.assertIn("JSON_TABLE", script)
+        self.assertIn("repair_scene_participant.character_scope_key = repair_inventory.scope_key", script)
+        self.assertIn("repair_scene_actor.character_scope_key = repair_inventory.scope_key", script)
+        self.assertIn("repair_example_item.example_text", script)
+        self.assertIn("--repair-character-assets", script)
         self.assertNotIn("MAX(pe.episode_no)", script)
         self.assertNotIn("p.price_type = 'free'", script)
 
@@ -113,9 +121,11 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("missing_foundation_episode_count = 0", script)
         self.assertIn("active_character_inventory_count > 0", script)
         self.assertIn("active_character_inventory_v3_count > 0", script)
+        self.assertIn("character_asset_repair_needed > 0", script)
+        self.assertIn("candidates.character_asset_repair_needed ASC", script)
         failed_priority = "WHEN candidates.context_status = 'failed' THEN 0"
         large_backlog_priority = "WHEN candidates.missing_foundation_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1"
-        small_delta_priority = "WHEN candidates.missing_foundation_episode_count < ${BACKLOG_PRIORITY_THRESHOLD} THEN 2"
+        small_delta_priority = "WHEN candidates.missing_foundation_episode_count > 0 OR candidates.missing_open_scene_count > 0 THEN 2"
         processing_tiebreaker = "WHEN 'processing' THEN 0"
 
         self.assertIn(failed_priority, script)
