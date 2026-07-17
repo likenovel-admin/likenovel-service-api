@@ -589,6 +589,34 @@ class AiDnaProductTargetQueryTest(TestCase):
         self.assertEqual(len(raw_analysis_candidates), 1)
         self.assertEqual(raw_analysis_candidates[0]["unmapped_concepts"], ["짐꾼", "재능거래"])
 
+    def test_save_failed_does_not_overwrite_existing_success(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        module.save_failed(
+            conn,
+            product_id=1162,
+            attempt_count=3,
+            error_message="provider failed",
+        )
+
+        self.assertRegex(
+            conn.last_cursor.sql,
+            r"analysis_status\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*analysis_status,\s*VALUES\(analysis_status\)\s*\)",
+        )
+        self.assertRegex(
+            conn.last_cursor.sql,
+            r"analysis_attempt_count\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*analysis_attempt_count,\s*VALUES\(analysis_attempt_count\)\s*\)",
+        )
+        self.assertRegex(
+            conn.last_cursor.sql,
+            r"analysis_error_message\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*analysis_error_message,\s*VALUES\(analysis_error_message\)\s*\)",
+        )
+        self.assertRegex(
+            conn.last_cursor.sql,
+            r"model_version\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*model_version,\s*VALUES\(model_version\)\s*\)",
+        )
+
 
 class AiDnaEmptyAxisPolicyTest(TestCase):
     """min_items 강제 제거 정책: 부합 라벨이 없는 축은 빈 배열이 정답이다."""
