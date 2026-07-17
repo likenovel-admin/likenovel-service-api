@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
 from unittest import TestCase
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 
@@ -2836,6 +2836,33 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
 
 class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
+    def test_mark_failure_preserves_last_ready_context_status(self):
+        module = load_module()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"ready_episode_count": 7}
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+
+        with patch.object(module, "db_connect", return_value=conn):
+            ready_episode_count = module.mark_product_context_failed(
+                product_id=687,
+                total_episode_count=8,
+                error_message="refresh failed",
+            )
+
+        self.assertEqual(ready_episode_count, 7)
+        update_sql = " ".join(cursor.execute.call_args_list[1].args[0].split())
+        self.assertIn(
+            "context_status = IF(context_status IN ('disabled', 'ready'), context_status, 'failed')",
+            update_sql,
+        )
+        self.assertIn(
+            "last_error_message = IF(context_status = 'disabled', last_error_message, VALUES(last_error_message))",
+            update_sql,
+        )
+        conn.commit.assert_called_once_with()
+        conn.close.assert_called_once_with()
+
     def test_fetch_active_character_inventory_map_accepts_v3_summary_type(self):
         module = load_module()
         cur = object()

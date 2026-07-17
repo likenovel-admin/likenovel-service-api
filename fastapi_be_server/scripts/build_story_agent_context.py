@@ -13976,7 +13976,7 @@ def mark_product_context_failed(*, product_id: int, total_episode_count: int, er
                     updated_id
                 ) VALUES (%s, 'failed', %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    context_status = IF(context_status = 'disabled', context_status, 'failed'),
+                    context_status = IF(context_status IN ('disabled', 'ready'), context_status, 'failed'),
                     total_episode_count = VALUES(total_episode_count),
                     ready_episode_count = VALUES(ready_episode_count),
                     last_error_message = IF(context_status = 'disabled', last_error_message, VALUES(last_error_message)),
