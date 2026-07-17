@@ -54,6 +54,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         self.assertIn("p.price_type IN ('free', 'paid')", query)
         self.assertIn("p.status_code = 'ongoing'", query)
         self.assertIn("p.open_yn = 'Y'", query)
+        self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", query)
         self.assertIn("p.product_id IN (%s, %s)", query)
         self.assertIn("LIMIT %s", query)
         self.assertEqual(params, [100, 200, 10])
@@ -65,6 +66,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
 
         self.assertNotIn("p.price_type IN", query)
         self.assertNotIn("p.status_code = 'ongoing'", query)
+        self.assertNotIn("p.ai_content_service_enabled_yn", query)
         self.assertNotIn("LIMIT %s", query)
         self.assertEqual(params, [])
 

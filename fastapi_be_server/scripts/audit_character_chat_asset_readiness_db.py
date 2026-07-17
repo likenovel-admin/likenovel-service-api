@@ -57,6 +57,7 @@ def build_product_query(*, product_ids: list[int], limit: int, open_only: bool) 
                 "p.price_type IN ('free', 'paid')",
                 "p.status_code = 'ongoing'",
                 "p.open_yn = 'Y'",
+                "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'",
             ]
         )
     if product_ids:
