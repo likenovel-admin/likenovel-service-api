@@ -6399,6 +6399,7 @@ async def build_rp_summaries_delta(
     summary_client: AsyncClient | None,
     inventory_map: dict[str, dict[str, object]],
     relation_map: dict[str, list[dict[str, object]]],
+    historical_inventory_state_map: dict[str, dict[str, object]] | None = None,
     verbose: bool = False,
 ) -> dict[str, object]:
     counts = build_empty_delta_rp_counts()
@@ -6536,6 +6537,69 @@ async def build_rp_summaries_delta(
                 ):
                     existing_profile_row = legacy_profile_row
                     existing_example_row = legacy_example_row
+                    break
+        if (
+            not existing_profile_row
+            and not existing_example_row
+            and not canonical_profile_ready
+            and not canonical_examples_ready
+        ):
+            current_identity_aliases = (
+                _character_inventory_continuity_aliases(scope_key, inventory_item)
+                & allowed_alias_keys
+            ) - {scope_key}
+            historical_candidates = sorted(
+                (historical_inventory_state_map or {}).items(),
+                key=lambda item: int(dict(item[1] or {}).get("summary_id") or 0),
+                reverse=True,
+            )
+            for historical_scope_key, historical_state in historical_candidates:
+                historical_scope_key = str(historical_scope_key or "").strip()
+                if not historical_scope_key or historical_scope_key == scope_key:
+                    continue
+                historical_payload = dict(
+                    dict(historical_state or {}).get("payload") or {}
+                )
+                historical_identity_aliases = (
+                    _character_inventory_continuity_aliases(
+                        historical_scope_key,
+                        historical_payload,
+                    )
+                    - {historical_scope_key}
+                )
+                if not current_identity_aliases.intersection(
+                    historical_identity_aliases
+                ):
+                    continue
+                legacy_profile_row = dict(
+                    existing_profile_rows_by_scope.get(historical_scope_key) or {}
+                )
+                legacy_example_row = dict(
+                    existing_example_rows_by_scope.get(historical_scope_key) or {}
+                )
+                legacy_profile_payload = dict(
+                    legacy_profile_row.get("payload") or {}
+                )
+                legacy_example_payload = dict(
+                    legacy_example_row.get("payload") or {}
+                )
+                if (
+                    str(legacy_profile_payload.get("character_key") or "").strip()
+                    == historical_scope_key
+                    and str(legacy_example_payload.get("character_key") or "").strip()
+                    == historical_scope_key
+                    and build_rp_dialogue_items_from_example_payload(
+                        legacy_example_payload
+                    )
+                ):
+                    existing_profile_row = legacy_profile_row
+                    existing_example_row = legacy_example_row
+                    logger.info(
+                        "story_agent_delta_rp_history_bridge product_id=%s current_scope_key=%s historical_scope_key=%s",
+                        product_id,
+                        scope_key,
+                        historical_scope_key,
+                    )
                     break
         existing_profile_payload = dict(existing_profile_row.get("payload") or {})
         existing_example_payload = dict(existing_example_row.get("payload") or {})
@@ -12187,6 +12251,55 @@ def fetch_active_character_inventory_map(
     return inventory_map
 
 
+def fetch_rp_ready_character_inventory_history_state_map(
+    cur,
+    *,
+    product_id: int,
+) -> dict[str, dict[str, object]]:
+    cur.execute(
+        """
+        SELECT inventory.summary_id,
+               inventory.scope_key,
+               inventory.summary_text
+          FROM tb_story_agent_context_summary inventory
+         WHERE inventory.product_id = %s
+           AND inventory.summary_type = 'character_inventory_v3'
+           AND EXISTS (
+               SELECT 1
+                 FROM tb_story_agent_context_summary profile
+                WHERE profile.product_id = inventory.product_id
+                  AND profile.scope_key = inventory.scope_key
+                  AND profile.summary_type = 'character_rp_profile'
+                  AND profile.is_active = 'Y'
+           )
+           AND EXISTS (
+               SELECT 1
+                 FROM tb_story_agent_context_summary examples
+                WHERE examples.product_id = inventory.product_id
+                  AND examples.scope_key = inventory.scope_key
+                  AND examples.summary_type = 'character_rp_examples'
+                  AND examples.is_active = 'Y'
+           )
+         ORDER BY inventory.summary_id DESC
+        """,
+        (product_id,),
+    )
+    history_state_map: dict[str, dict[str, object]] = {}
+    for row in cur.fetchall():
+        scope_key = str(row.get("scope_key") or "").strip()
+        if not scope_key or scope_key in history_state_map:
+            continue
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        if not isinstance(payload, dict):
+            continue
+        history_state_map[scope_key] = {
+            "summary_id": int(row.get("summary_id") or 0),
+            "scope_key": scope_key,
+            "payload": payload,
+        }
+    return history_state_map
+
+
 def fetch_active_relation_inventory_map(cur, *, product_id: int) -> dict[str, list[dict[str, object]]]:
     relation_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="relation_inventory")
     relation_map: dict[str, list[dict[str, object]]] = {}
@@ -14516,6 +14629,13 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                     f"[delta-rp-missing-build] product_id={product_id} "
                                     f"scope_keys={','.join(sorted(rp_scope_keys_to_build))}"
                                 )
+                            with work_cursor(work_conn) as cur:
+                                historical_inventory_state_map = (
+                                    fetch_rp_ready_character_inventory_history_state_map(
+                                        cur,
+                                        product_id=product_id,
+                                    )
+                                )
                             rp_counts = await build_rp_summaries_delta(
                                 conn=work_conn,
                                 product_id=product_id,
@@ -14525,6 +14645,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 summary_client=summary_client,
                                 inventory_map=new_inventory_v3_map,
                                 relation_map=new_relation_scope_map,
+                                historical_inventory_state_map=historical_inventory_state_map,
                                 verbose=args.verbose,
                             )
                         elif args.verbose and rp_affected_scope_keys:
