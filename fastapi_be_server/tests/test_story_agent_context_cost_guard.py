@@ -1698,6 +1698,199 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertTrue(all(item["scope_key"] == scope_key for item in upserted))
         deactivate_scope.assert_not_called()
 
+    async def test_delta_rp_build_recovers_inactive_inventory_scope_by_strong_history_alias(self):
+        module = load_module()
+        conn = FakeConnection()
+        current_scope_key = "character:레이븐:dup:faa369a2"
+        legacy_scope_key = "character:레이븐:dup:be810f0c"
+        stable_source_key = "protagonist:named:레이븐"
+        state_maps = {
+            "character_rp_profile": {
+                legacy_scope_key: {
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-profile-hash",
+                    "payload": {
+                        "character_key": legacy_scope_key,
+                        "display_name": "레이븐",
+                        "speech_style": {"tone": "건조"},
+                    },
+                }
+            },
+            "character_rp_examples": {
+                legacy_scope_key: {
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-examples-hash",
+                    "payload": {
+                        "character_key": legacy_scope_key,
+                        "examples": [
+                            {
+                                "episode_no": 2,
+                                "source_kind": "dialogue",
+                                "text": "살아남으려면 지금 움직여.",
+                            }
+                        ],
+                    },
+                }
+            },
+        }
+        upserted = []
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return {"summary_id": len(upserted)}, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module, "RP_OPENROUTER_MODEL", ""), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1103,
+                affected_scope_keys={current_scope_key},
+                episode_rows=[],
+                episode_texts_by_no={},
+                summary_client=None,
+                inventory_map={
+                    current_scope_key: {
+                        "canonical_character_key": current_scope_key,
+                        "source_character_keys": [stable_source_key],
+                        "display_name": "레이븐",
+                        "aliases": ["레이븐"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 116,
+                    }
+                },
+                historical_inventory_state_map={
+                    legacy_scope_key: {
+                        "summary_id": 101,
+                        "scope_key": legacy_scope_key,
+                        "payload": {
+                            "canonical_character_key": legacy_scope_key,
+                            "source_character_keys": [stable_source_key],
+                            "display_name": "레이븐",
+                        },
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual(
+            [item["scope_key"] for item in upserted],
+            [current_scope_key, current_scope_key],
+        )
+
+    async def test_delta_rp_build_does_not_recover_history_by_name_only(self):
+        module = load_module()
+        conn = FakeConnection()
+        current_scope_key = "character:레이븐:dup:new"
+        legacy_scope_key = "character:레이븐:dup:old"
+        state_maps = {
+            "character_rp_profile": {
+                legacy_scope_key: {
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-profile-hash",
+                    "payload": {"character_key": legacy_scope_key},
+                }
+            },
+            "character_rp_examples": {
+                legacy_scope_key: {
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-examples-hash",
+                    "payload": {
+                        "character_key": legacy_scope_key,
+                        "examples": [{"episode_no": 1, "text": "기존 대사"}],
+                    },
+                }
+            },
+        }
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module, "RP_OPENROUTER_MODEL", ""), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary") as upsert_mock:
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1103,
+                affected_scope_keys={current_scope_key},
+                episode_rows=[],
+                episode_texts_by_no={},
+                summary_client=None,
+                inventory_map={
+                    current_scope_key: {
+                        "canonical_character_key": current_scope_key,
+                        "source_character_keys": ["named:레이븐:new"],
+                        "display_name": "레이븐",
+                        "aliases": ["레이븐"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 116,
+                    }
+                },
+                historical_inventory_state_map={
+                    legacy_scope_key: {
+                        "summary_id": 101,
+                        "scope_key": legacy_scope_key,
+                        "payload": {
+                            "canonical_character_key": legacy_scope_key,
+                            "source_character_keys": ["named:레이븐:old"],
+                            "display_name": "레이븐",
+                        },
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [0, 0])
+        self.assertEqual(counts["examples"], [0, 0])
+        upsert_mock.assert_not_called()
+
+    def test_rp_ready_inventory_history_reads_latest_scope_with_active_asset_pair(self):
+        module = load_module()
+        scope_key = "character:레이븐:dup:old"
+        cursor = FakeRowsCursor(
+            [
+                {
+                    "summary_id": 12,
+                    "scope_key": scope_key,
+                    "summary_text": json.dumps(
+                        {
+                            "canonical_character_key": scope_key,
+                            "source_character_keys": ["protagonist:named:레이븐"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "summary_id": 11,
+                    "scope_key": scope_key,
+                    "summary_text": "{}",
+                },
+            ]
+        )
+
+        history = module.fetch_rp_ready_character_inventory_history_state_map(
+            cursor,
+            product_id=1103,
+        )
+
+        self.assertEqual(history[scope_key]["summary_id"], 12)
+        self.assertEqual(
+            history[scope_key]["payload"]["source_character_keys"],
+            ["protagonist:named:레이븐"],
+        )
+        self.assertIn("profile.is_active = 'Y'", cursor.query)
+        self.assertIn("examples.is_active = 'Y'", cursor.query)
+        self.assertEqual(cursor.params, (1103,))
+
     async def test_delta_rp_build_preserves_successful_canonical_rows(self):
         module = load_module()
         conn = FakeConnection()
