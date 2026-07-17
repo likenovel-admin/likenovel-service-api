@@ -781,6 +781,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                  patch.object(module, "RP_OPENROUTER_MODEL", ""), \
                  patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
                  patch.object(module, "fetch_existing_summary", return_value=None), \
+                 patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
                  patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
                  patch.object(module, "upsert_summary") as upsert_summary:
                 inserted, reused = await module.build_episode_scene_extraction_summaries(
@@ -823,6 +824,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                  patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
                  patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
                  patch.object(module, "fetch_existing_summary", return_value=None), \
+                 patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
                  patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
                  patch.object(module, "deactivate_active_scope") as deactivate_scope:
                 inserted, reused = await module.build_episode_scene_extraction_summaries(
@@ -911,6 +913,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                          ),
                      },
                  ), \
+                 patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
                  patch.object(module, "activate_existing_summary") as activate_existing, \
                  patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
                  patch.object(module, "upsert_summary") as upsert_summary, \

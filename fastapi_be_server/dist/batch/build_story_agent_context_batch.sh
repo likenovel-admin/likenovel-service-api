@@ -366,6 +366,7 @@ FROM (
     )
 ) candidates
 ORDER BY
+  COALESCE(candidates.last_built_at, '1970-01-01') ASC,
   CASE
     WHEN candidates.context_status = 'failed' THEN 0
     WHEN candidates.missing_foundation_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1
@@ -380,7 +381,6 @@ ORDER BY
   END ASC,
   candidates.missing_foundation_episode_count DESC,
   candidates.missing_open_character_signal_count DESC,
-  candidates.last_built_at ASC,
   candidates.character_asset_repair_needed ASC,
   candidates.missing_open_scene_count DESC,
   candidates.product_id ASC

@@ -385,6 +385,29 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(conn.close_count, 1)
         product_lock.assert_not_called()
 
+    async def test_delta_apply_touches_attempt_before_provider_preflight(self):
+        module = load_module()
+        conn = FakeConnection()
+        preflight = AsyncMock(side_effect=RuntimeError("provider unavailable"))
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "touch_product_context_build_attempt") as touch, \
+             patch.object(module, "assert_storyctx_apply_providers_ready", preflight), \
+             patch.object(module, "product_lock_connection") as product_lock:
+            with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+                await module.build_context_rows_delta(
+                    rows=[{"product_id": 687}],
+                    args=SimpleNamespace(apply=True, verbose=False),
+                )
+
+        touch.assert_called_once_with(ANY, product_id=687)
+        self.assertEqual(conn.commit_count, 1)
+        self.assertEqual(conn.close_count, 1)
+        product_lock.assert_not_called()
+
     async def test_episode_scene_extraction_skips_when_openrouter_key_missing(self):
         module = load_module()
         conn = FakeConnection()
@@ -443,7 +466,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ],
         }
         request_mock = AsyncMock(return_value=regenerated_payload)
-        update_mock = MagicMock()
+        upsert_mock = MagicMock()
 
         with patch.object(module, "OPENROUTER_API_KEY", "test-key"), \
              patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "test-model"), \
@@ -451,13 +474,19 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(
                  module,
                  "fetch_existing_summary",
+                 return_value=None,
+             ), \
+             patch.object(
+                 module,
+                 "fetch_active_summary_by_scope",
                  return_value={
                      "summary_id": 9,
+                     "source_hash": "previous-source-hash",
                      "summary_text": json.dumps(existing_payload, ensure_ascii=False),
                  },
              ), \
              patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
-             patch.object(module, "update_existing_summary_payload", update_mock):
+             patch.object(module, "upsert_summary", upsert_mock):
             counts = await module.build_episode_scene_extraction_summaries(
                 conn,
                 product_id=687,
@@ -482,7 +511,85 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(counts, (0, 0))
         request_mock.assert_awaited_once()
-        update_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+
+    async def test_scene_repair_strict_mode_raises_unexpected_request_error(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "test-key"), \
+             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "test-model"), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
+             patch.object(
+                 module,
+                 "request_episode_scene_extraction_payload",
+                 AsyncMock(side_effect=TypeError("scene normalization bug")),
+             ):
+            with self.assertRaisesRegex(TypeError, "scene normalization bug"):
+                await module.build_episode_scene_extraction_summaries(
+                    conn,
+                    product_id=687,
+                    product_title="테스트 작품",
+                    episode_rows=[
+                        {
+                            "summary_id": 1,
+                            "scope_key": "episode:1001",
+                            "episode_from": 1,
+                            "source_hash": "hash",
+                            "summary_text": "[1화] 테스트",
+                        }
+                    ],
+                    episode_texts_by_no={1: "데시가 문을 연다."},
+                    summary_client=object(),
+                    canonical_character_packet={
+                        "characters": [
+                            {"scope_key": "character:main", "display_name": "데시"}
+                        ]
+                    },
+                    cleanup_missing_scopes=False,
+                    raise_unexpected_errors=True,
+                )
+
+    async def test_scene_repair_strict_mode_propagates_unexpected_value_error(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "test-key"), \
+             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "test-model"), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
+             patch.object(
+                 module,
+                 "request_episode_scene_extraction_openrouter_json_payload",
+                 AsyncMock(side_effect=ValueError("unexpected scene invariant failure")),
+             ):
+            with self.assertRaisesRegex(ValueError, "unexpected scene invariant failure"):
+                await module.build_episode_scene_extraction_summaries(
+                    conn,
+                    product_id=687,
+                    product_title="테스트 작품",
+                    episode_rows=[
+                        {
+                            "summary_id": 1,
+                            "scope_key": "episode:1001",
+                            "episode_from": 1,
+                            "source_hash": "hash",
+                            "summary_text": "[1화] 테스트",
+                        }
+                    ],
+                    episode_texts_by_no={1: "데시가 문을 연다."},
+                    summary_client=object(),
+                    canonical_character_packet={
+                        "characters": [
+                            {"scope_key": "character:main", "display_name": "데시"}
+                        ]
+                    },
+                    cleanup_missing_scopes=False,
+                    raise_unexpected_errors=True,
+                )
 
     def test_inventory_v3_links_previous_first_person_identity_to_current_protagonist(self):
         module = load_module()
@@ -1671,6 +1778,84 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["examples"], [1, 0])
         self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
 
+    async def test_delta_rp_strict_mode_raises_unexpected_dialogue_error(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:데시"
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": False}), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
+             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(side_effect=TypeError("dialogue parser bug"))), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor):
+            with self.assertRaisesRegex(TypeError, "dialogue parser bug"):
+                await module.build_rp_summaries_delta(
+                    conn,
+                    product_id=687,
+                    affected_scope_keys={scope_key},
+                    episode_rows=[],
+                    episode_texts_by_no={1: "데시가 문을 연다."},
+                    summary_client=object(),
+                    inventory_map={
+                        scope_key: {
+                            "canonical_character_key": scope_key,
+                            "display_name": "데시",
+                            "aliases": ["데시"],
+                            "is_protagonist": True,
+                            "distinct_episode_count": 3,
+                        }
+                    },
+                    relation_map={},
+                    raise_unexpected_errors=True,
+                )
+
+    async def test_delta_rp_strict_mode_keeps_provider_402_as_no_progress(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:데시"
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        response = httpx.Response(402, request=request)
+        provider_error = httpx.HTTPStatusError(
+            "402 Payment Required",
+            request=request,
+            response=response,
+        )
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": False, "status": "insufficient"}), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
+             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(side_effect=provider_error)), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=687,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no={1: "데시가 문을 연다."},
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "display_name": "데시",
+                        "aliases": ["데시"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 3,
+                    }
+                },
+                relation_map={},
+                raise_unexpected_errors=True,
+            )
+
+        self.assertEqual(counts["profile"], [0, 0])
+        self.assertEqual(counts["examples"], [0, 0])
+        self.assertEqual(counts["keep_old_dialogue_missing_count"], 1)
+
     async def test_delta_rp_build_materializes_legacy_profile_examples_without_provider_dependency(self):
         module = load_module()
         conn = FakeConnection()
@@ -2833,9 +3018,9 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
              patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
              patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
              patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
-             patch.object(module, "build_episode_scene_extraction_summaries_nonblocking", scene_builder), \
+             patch.object(module, "build_episode_scene_extraction_summaries", scene_builder), \
              patch.object(module, "build_rp_summaries_delta", rp_builder), \
-             patch.object(module, "touch_character_asset_repair_attempt") as touch, \
+             patch.object(module, "touch_product_context_build_attempt") as touch, \
              patch.object(module, "assert_storyctx_apply_providers_ready", preflight):
             await module.repair_character_chat_assets(
                 rows=[{"product_id": 687, "title": "테스트 작품"}],
@@ -2850,12 +3035,59 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         preflight.assert_not_awaited()
         scene_builder.assert_awaited_once()
         rp_builder.assert_awaited_once()
+        self.assertTrue(scene_builder.await_args.kwargs["raise_unexpected_errors"])
+        self.assertTrue(rp_builder.await_args.kwargs["raise_unexpected_errors"])
         touch.assert_called_once()
         self.assertEqual(results["character_asset_repair_attempted"], 1)
         self.assertEqual(results["character_asset_repair_recovered"], 1)
         self.assertEqual(results["character_asset_repair_failed"], 0)
         self.assertEqual(results["products"][0]["context_status"], "ready")
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
+
+    async def test_character_asset_repair_storage_failure_sets_failed_exit(self):
+        module = load_module()
+        conn = FakeConnection()
+        results = module.build_empty_results()
+        scope_key = "character:main"
+        before_readiness = {
+            "character_chat_status": "hold",
+            "public_candidate_count": 1,
+            "missing_usable_scene_scope_keys": [scope_key],
+        }
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_total_episode_count", return_value=1), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=1), \
+             patch.object(module, "fetch_character_chat_asset_readiness_verification", return_value=before_readiness), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value={scope_key: {"canonical_character_key": scope_key, "display_name": "데시", "work_role": "main_protagonist", "is_protagonist": True, "evidence_episode_nos": [1]}}), \
+             patch.object(module, "fetch_active_summary_rows", return_value=[{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}]), \
+             patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
+             patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
+             patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
+             patch.object(module, "build_episode_scene_extraction_summaries", AsyncMock(side_effect=RuntimeError("scene storage failed"))), \
+             patch.object(module, "build_rp_summaries_delta", AsyncMock()) as rp_builder, \
+             patch.object(module, "touch_product_context_build_attempt") as touch:
+            await module.repair_character_chat_assets(
+                rows=[{"product_id": 687, "title": "테스트 작품"}],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    max_delta_episodes=2,
+                ),
+                results=results,
+            )
+
+        rp_builder.assert_not_awaited()
+        touch.assert_called_once()
+        self.assertEqual(results["character_asset_repair_failed"], 1)
+        self.assertEqual(results["character_asset_repair_no_progress"], 0)
+        self.assertEqual(results["character_asset_repairs"][0]["status"], "failed")
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
 
     def test_failed_delta_status_repair_refreshes_when_foundation_complete(self):
         module = load_module()

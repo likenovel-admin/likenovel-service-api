@@ -5352,7 +5352,7 @@ async def request_episode_scene_extraction_payload(
                 client,
                 user_prompt=user_prompt + retry_suffix,
             )
-        except (asyncio.TimeoutError, HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
+        except (asyncio.TimeoutError, HTTPStatusError, RequestError, json.JSONDecodeError) as exc:
             logger.warning(
                 "[storyctx] episode_scene_extraction openrouter failed episode_no=%s attempt=%s: %s",
                 episode_no,
@@ -6396,6 +6396,13 @@ def build_empty_delta_rp_counts() -> dict[str, object]:
     }
 
 
+def is_expected_story_asset_provider_error(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (asyncio.TimeoutError, HTTPStatusError, RequestError, json.JSONDecodeError),
+    )
+
+
 async def build_rp_summaries_delta(
     conn,
     *,
@@ -6407,6 +6414,7 @@ async def build_rp_summaries_delta(
     inventory_map: dict[str, dict[str, object]],
     relation_map: dict[str, list[dict[str, object]]],
     historical_inventory_state_map: dict[str, dict[str, object]] | None = None,
+    raise_unexpected_errors: bool = False,
     verbose: bool = False,
 ) -> dict[str, object]:
     counts = build_empty_delta_rp_counts()
@@ -6695,6 +6703,8 @@ async def build_rp_summaries_delta(
                     aliases=aliases,
                 )
             except Exception as exc:
+                if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+                    raise
                 if verbose:
                     print(f"[rp-delta-dialogue-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
                 llm_dialogue_items = []
@@ -6738,6 +6748,8 @@ async def build_rp_summaries_delta(
                 relation_context_lines=relation_context_lines,
             )
         except Exception as exc:
+            if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+                raise
             if verbose:
                 print(f"[rp-delta-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
             continue
@@ -6793,6 +6805,8 @@ async def build_rp_summaries_delta(
                 scene_context_lines=scene_context_lines,
             )
         except Exception as exc:
+            if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+                raise
             logger.warning(
                 "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
                 product_id,
@@ -7298,6 +7312,7 @@ async def build_episode_scene_extraction_summaries(
     canonical_character_packet: object | None,
     required_scope_keys_by_episode_no: dict[int, set[str]] | None = None,
     cleanup_missing_scopes: bool = True,
+    raise_unexpected_errors: bool = False,
     verbose: bool = False,
 ) -> tuple[int, int]:
     if summary_client is None or not OPENROUTER_API_KEY or not EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL:
@@ -7336,6 +7351,19 @@ async def build_episode_scene_extraction_summaries(
                 scope_key=scope_key,
                 source_hash=source_hash,
             )
+            active = fetch_active_summary_by_scope(
+                cur=cur,
+                product_id=product_id,
+                summary_type="episode_scene_extraction",
+                scope_key=scope_key,
+            )
+            active_payload = extract_json_object(
+                str(dict(active or {}).get("summary_text") or "")
+            ) or {}
+            if _is_usable_episode_scene_payload(active_payload):
+                preserved_scope_keys.update(
+                    extract_episode_scene_character_scope_keys(active_payload)
+                )
             if existing:
                 existing_payload = extract_json_object(str(existing.get("summary_text") or "")) or {}
                 existing_scope_keys = extract_episode_scene_character_scope_keys(
@@ -7344,9 +7372,8 @@ async def build_episode_scene_extraction_summaries(
                 existing_payload_usable = _is_usable_episode_scene_payload(
                     existing_payload
                 )
-                if existing_payload_usable and required_scope_keys.issubset(
-                    existing_scope_keys
-                ):
+                required_existing_scope_keys = required_scope_keys | preserved_scope_keys
+                if existing_payload_usable and required_existing_scope_keys.issubset(existing_scope_keys):
                     existing_summary_id = int(existing["summary_id"])
                     activate_existing_summary(
                         cur,
@@ -7379,6 +7406,8 @@ async def build_episode_scene_extraction_summaries(
                 canonical_character_packet=canonical_character_packet,
             )
         except Exception as exc:
+            if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+                raise
             logger.warning(
                 "story_agent_scene_extraction_failed product_id=%s episode_no=%s error=%s",
                 product_id,
@@ -13532,6 +13561,29 @@ def fetch_existing_summary(cur, product_id: int, summary_type: str, scope_key: s
     return cur.fetchone()
 
 
+def fetch_active_summary_by_scope(
+    cur,
+    *,
+    product_id: int,
+    summary_type: str,
+    scope_key: str,
+) -> dict | None:
+    cur.execute(
+        """
+        SELECT summary_id, version_no, is_active, source_hash, summary_text
+          FROM tb_story_agent_context_summary
+         WHERE product_id = %s
+           AND summary_type = %s
+           AND scope_key = %s
+           AND is_active = 'Y'
+         ORDER BY summary_id DESC
+         LIMIT 1
+        """,
+        (product_id, summary_type, scope_key),
+    )
+    return cur.fetchone()
+
+
 def fetch_next_summary_version_no(cur, product_id: int, summary_type: str, scope_key: str) -> int:
     cur.execute(
         """
@@ -14078,16 +14130,27 @@ def select_character_chat_scene_repair_rows(
     return selected_rows, required_scope_keys_by_episode_no
 
 
-def touch_character_asset_repair_attempt(cur, *, product_id: int) -> None:
+def touch_product_context_build_attempt(cur, *, product_id: int) -> None:
     cur.execute(
         """
-        UPDATE tb_story_agent_context_product
-           SET last_built_at = NOW(),
-               updated_id = %s
-         WHERE product_id = %s
-           AND context_status <> 'disabled'
+        INSERT INTO tb_story_agent_context_product (
+            product_id,
+            context_status,
+            total_episode_count,
+            ready_episode_count,
+            last_built_at,
+            created_id,
+            updated_id
+        ) VALUES (%s, 'pending', 0, 0, NOW(), %s, %s)
+        ON DUPLICATE KEY UPDATE
+            last_built_at = IF(context_status = 'disabled', last_built_at, VALUES(last_built_at)),
+            updated_id = IF(context_status = 'disabled', updated_id, VALUES(updated_id))
         """,
-        (settings.DB_DML_DEFAULT_ID, product_id),
+        (
+            product_id,
+            settings.DB_DML_DEFAULT_ID,
+            settings.DB_DML_DEFAULT_ID,
+        ),
     )
 
 
@@ -14189,7 +14252,7 @@ async def repair_character_chat_assets(
                     )
                     scene_counts = (0, 0)
                     if scene_rows:
-                        scene_counts = await build_episode_scene_extraction_summaries_nonblocking(
+                        scene_counts = await build_episode_scene_extraction_summaries(
                             conn=work_conn,
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),
@@ -14201,6 +14264,7 @@ async def repair_character_chat_assets(
                             ),
                             required_scope_keys_by_episode_no=required_scope_keys_by_episode_no,
                             cleanup_missing_scopes=False,
+                            raise_unexpected_errors=True,
                             verbose=args.verbose,
                         )
                         results["inserted_episode_scene_extractions"] += scene_counts[0]
@@ -14216,6 +14280,7 @@ async def repair_character_chat_assets(
                         inventory_map=inventory_map,
                         relation_map=relation_map,
                         historical_inventory_state_map=historical_inventory_state_map,
+                        raise_unexpected_errors=True,
                         verbose=args.verbose,
                     )
                     results["inserted_character_rp_profiles"] += int(
@@ -14238,7 +14303,7 @@ async def repair_character_chat_assets(
                             story_context_status=context_status,
                             total_episode_count=total_episode_count,
                         )
-                        touch_character_asset_repair_attempt(
+                        touch_product_context_build_attempt(
                             cur,
                             product_id=product_id,
                         )
@@ -14305,7 +14370,7 @@ async def repair_character_chat_assets(
                     pass
                 try:
                     with work_cursor(work_conn) as cur:
-                        touch_character_asset_repair_attempt(
+                        touch_product_context_build_attempt(
                             cur,
                             product_id=product_id,
                         )
@@ -14763,6 +14828,13 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
     work_conn = db_connect()
     try:
         if args.apply:
+            with work_cursor(work_conn) as cur:
+                for product_id in sorted(rows_by_product):
+                    touch_product_context_build_attempt(
+                        cur,
+                        product_id=product_id,
+                    )
+            work_conn.commit()
             await assert_storyctx_apply_providers_ready(summary_client)
         for product_id, product_rows in rows_by_product.items():
             product_failed = False

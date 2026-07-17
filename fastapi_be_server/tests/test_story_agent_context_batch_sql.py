@@ -147,7 +147,11 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             script,
         )
         self.assertLess(
-            script.index("candidates.last_built_at ASC"),
+            script.index("COALESCE(candidates.last_built_at, '1970-01-01') ASC"),
+            script.index(failed_priority),
+        )
+        self.assertLess(
+            script.index("COALESCE(candidates.last_built_at, '1970-01-01') ASC"),
             script.index("candidates.missing_open_scene_count DESC"),
         )
         self.assertNotIn(
