@@ -1,8 +1,14 @@
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 import unittest
+
+from app.services.websochat.character_chat_product_policy import (
+    CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
+    CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +81,19 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("p.blind_yn = 'N'", script)
         self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", script)
         self.assertIn("COALESCE(sacp.context_status, 'pending') <> 'disabled'", script)
+        self.assertIn("collection_cohort.product_id IS NOT NULL", script)
+        self.assertIn("OR COALESCE(sacp.context_status, 'pending') = 'ready'", script)
+        self.assertIn(
+            "CASE WHEN collection_cohort.product_id IS NULL THEN 0 ELSE (\n"
+            "      SELECT COUNT(*)\n"
+            "      FROM tb_story_agent_context_summary repair_inventory",
+            script,
+        )
+        self.assertIn(
+            "FROM tb_story_agent_context_summary ci\n"
+            "      WHERE ci.product_id = p.product_id",
+            script,
+        )
         self.assertIn("tb_story_agent_context_summary", script)
         self.assertIn("sacs.summary_type = 'episode_summary'", script)
         self.assertIn("sacs.is_active = 'Y'", script)
@@ -112,6 +131,26 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("--repair-character-assets", script)
         self.assertNotIn("MAX(pe.episode_no)", script)
         self.assertNotIn("p.price_type = 'free'", script)
+
+    def test_shell_cohort_literals_match_character_chat_policy_ssot(self):
+        script = _batch_sh()
+
+        minimum_match = re.search(r"HAVING COUNT\(\*\) >= (\d+)", script)
+        cutoff_match = re.search(
+            r">= '([^']+)'\s*\n\s*\) collection_cohort",
+            script,
+        )
+
+        self.assertIsNotNone(minimum_match)
+        self.assertIsNotNone(cutoff_match)
+        self.assertEqual(
+            int(minimum_match.group(1)),
+            CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+        )
+        self.assertEqual(
+            cutoff_match.group(1),
+            CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
+        )
 
     def test_batch_defaults_to_delta_and_requires_explicit_full_opt_in(self):
         script = _batch_sh()

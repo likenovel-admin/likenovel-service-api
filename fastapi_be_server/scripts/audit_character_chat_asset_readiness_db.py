@@ -18,6 +18,11 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from app.services.websochat.character_chat_product_policy import (  # noqa: E402
+    build_correlated_character_chat_product_policy_sql,
+    is_character_chat_product_eligible,
+)
+
 
 def load_env_file(path: Path) -> list[str]:
     if not path.exists():
@@ -67,6 +72,10 @@ def build_product_query(*, product_ids: list[int], limit: int, open_only: bool) 
     limit_sql = " LIMIT %s" if limit > 0 else ""
     if limit > 0:
         params.append(int(limit))
+    character_chat_policy_sql = build_correlated_character_chat_product_policy_sql(
+        product_alias="p",
+        episode_alias="cohort_episode",
+    )
     return (
         f"""
         SELECT
@@ -76,7 +85,11 @@ def build_product_query(*, product_ids: list[int], limit: int, open_only: bool) 
             p.status_code,
             COALESCE(cp.context_status, '') AS context_status,
             COALESCE(cp.total_episode_count, 0) AS total_episode_count,
-            COALESCE(cp.ready_episode_count, 0) AS ready_episode_count
+            COALESCE(cp.ready_episode_count, 0) AS ready_episode_count,
+            CASE
+                WHEN 1 = 1 {character_chat_policy_sql} THEN 1
+                ELSE 0
+            END AS characterChatEligible
         FROM tb_product p
         LEFT JOIN tb_story_agent_context_product cp
           ON cp.product_id = p.product_id
@@ -106,20 +119,36 @@ def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ready_public_candidate_total = 0
     public_slot_ready_total = 0
     ready_without_main_protagonist_product_ids: list[int] = []
+    out_of_cohort_hold_product_ids: list[int] = []
 
     for row in rows:
         context_status_counts[str(row.get("context_status") or "missing")] += 1
         readiness = dict(row.get("character_chat_asset_readiness") or {})
-        action_plan = build_asset_action_plan(row)
+        character_chat_status = str(
+            readiness.get("character_chat_status") or "missing"
+        )
+        out_of_cohort_hold = (
+            character_chat_status == "hold"
+            and not is_character_chat_product_eligible(row)
+        )
+        action_plan = (
+            ["out_of_cohort_hold"]
+            if out_of_cohort_hold
+            else build_asset_action_plan(row)
+        )
         row["assetActionPlan"] = action_plan
-        for action in action_plan:
-            action_plan_counts[str(action)] += 1
-            product_id = int(row.get("product_id") or 0)
-            if product_id > 0:
-                product_ids_by_action.setdefault(str(action), []).append(product_id)
-        character_chat_status = str(readiness.get("character_chat_status") or "missing")
-        character_chat_status_counts[character_chat_status] += 1
         product_id = int(row.get("product_id") or 0)
+        if out_of_cohort_hold:
+            if product_id > 0:
+                out_of_cohort_hold_product_ids.append(product_id)
+        else:
+            for action in action_plan:
+                action_plan_counts[str(action)] += 1
+                if product_id > 0:
+                    product_ids_by_action.setdefault(str(action), []).append(
+                        product_id
+                    )
+        character_chat_status_counts[character_chat_status] += 1
         if character_chat_status == "ready":
             ready_product_ids.append(product_id)
             if not list(readiness.get("main_protagonist_scope_keys") or []):
@@ -152,6 +181,10 @@ def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "readyWithoutMainProtagonistProductIds": sorted(
             pid for pid in ready_without_main_protagonist_product_ids if pid > 0
         )[:20],
+        "outOfCohortHoldCount": len(out_of_cohort_hold_product_ids),
+        "outOfCohortHoldProductIds": sorted(set(out_of_cohort_hold_product_ids))[
+            :20
+        ],
         "holdProductIdsSample": sorted(pid for pid in hold_product_ids if pid > 0)[:20],
     }
 
