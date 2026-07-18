@@ -5748,6 +5748,50 @@ def build_rp_dialogue_items_from_example_payload(example_payload: dict[str, obje
     return dialogue_items
 
 
+def backfill_rp_example_episode_evidence(
+    example_payload: dict[str, object],
+    episode_texts_by_no: dict[int, str],
+) -> tuple[dict[str, object], int]:
+    """Attach episode evidence only when an example has one exact source match."""
+    repaired_payload = dict(example_payload or {})
+    repaired_examples: list[object] = []
+    recovered_count = 0
+    for raw_item in list(repaired_payload.get("examples") or []):
+        if not isinstance(raw_item, dict):
+            repaired_examples.append(raw_item)
+            continue
+        item = dict(raw_item)
+        try:
+            episode_no = int(item.get("episode_no") or 0)
+        except (TypeError, ValueError):
+            episode_no = 0
+        text_value = normalize_rp_text(str(item.get("text") or ""), limit=300)
+        if episode_no <= 0 and text_value:
+            matched_episode_nos = [
+                int(candidate_episode_no)
+                for candidate_episode_no, episode_text in episode_texts_by_no.items()
+                if text_value in str(episode_text or "")
+            ]
+            if len(matched_episode_nos) == 1:
+                item["episode_no"] = matched_episode_nos[0]
+                recovered_count += 1
+        repaired_examples.append(item)
+    repaired_payload["examples"] = repaired_examples
+    return repaired_payload, recovered_count
+
+
+def has_rp_example_episode_evidence(example_payload: dict[str, object]) -> bool:
+    for item in list(example_payload.get("examples") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            if int(item.get("episode_no") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def select_delta_rp_scope_keys(
     *,
     refresh_requested: bool,
@@ -6515,16 +6559,61 @@ async def build_rp_summaries_delta(
         exact_example_row = dict(existing_example_rows_by_scope.get(scope_key) or {})
         exact_profile_payload = dict(exact_profile_row.get("payload") or {})
         exact_example_payload = dict(exact_example_row.get("payload") or {})
+        repaired_exact_example_payload, recovered_exact_example_count = (
+            backfill_rp_example_episode_evidence(
+                exact_example_payload,
+                episode_texts_by_no,
+            )
+        )
         canonical_profile_ready = (
             str(exact_profile_payload.get("character_key") or "").strip() == scope_key
         )
         canonical_examples_ready = (
-            str(exact_example_payload.get("character_key") or "").strip() == scope_key
-            and bool(build_rp_dialogue_items_from_example_payload(exact_example_payload))
+            str(repaired_exact_example_payload.get("character_key") or "").strip() == scope_key
+            and has_rp_example_episode_evidence(repaired_exact_example_payload)
         )
         if canonical_profile_ready and canonical_examples_ready:
             counts["profile"][1] += 1
-            counts["examples"][1] += 1
+            if recovered_exact_example_count > 0:
+                examples_source_hash = build_compound_summary_source_hash(
+                    CHARACTER_RP_EXAMPLES_FORMAT_VERSION,
+                    [
+                        "episode_evidence_backfill_v1",
+                        scope_key,
+                        str(exact_example_row.get("source_hash") or ""),
+                        json.dumps(
+                            repaired_exact_example_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ],
+                )
+                with work_cursor(conn) as cur:
+                    _, examples_inserted = upsert_summary(
+                        cur,
+                        product_id=product_id,
+                        summary_type="character_rp_examples",
+                        scope_key=scope_key,
+                        source_hash=examples_source_hash,
+                        source_doc_count=len(
+                            build_rp_dialogue_items_from_example_payload(
+                                repaired_exact_example_payload
+                            )
+                        ),
+                        summary_text=json.dumps(
+                            repaired_exact_example_payload,
+                            ensure_ascii=False,
+                        ),
+                    )
+                counts["examples"][0 if examples_inserted else 1] += 1
+                logger.info(
+                    "story_agent_delta_rp_example_evidence_backfill product_id=%s scope_key=%s recovered=%s",
+                    product_id,
+                    scope_key,
+                    recovered_exact_example_count,
+                )
+            else:
+                counts["examples"][1] += 1
             continue
 
         existing_profile_row: dict[str, object] = {}
@@ -6618,8 +6707,19 @@ async def build_rp_summaries_delta(
                     break
         existing_profile_payload = dict(existing_profile_row.get("payload") or {})
         existing_example_payload = dict(existing_example_row.get("payload") or {})
+        existing_example_payload, recovered_bridge_example_count = (
+            backfill_rp_example_episode_evidence(
+                existing_example_payload,
+                episode_texts_by_no,
+            )
+        )
         existing_dialogue_items = build_rp_dialogue_items_from_example_payload(existing_example_payload)
-        if existing_profile_payload and existing_example_payload and existing_dialogue_items:
+        if (
+            existing_profile_payload
+            and existing_example_payload
+            and existing_dialogue_items
+            and has_rp_example_episode_evidence(existing_example_payload)
+        ):
             profile_payload = {
                 **existing_profile_payload,
                 "character_key": scope_key,
@@ -6650,6 +6750,11 @@ async def build_rp_summaries_delta(
                     scope_key,
                     str(existing_example_row.get("scope_key") or ""),
                     str(existing_example_row.get("source_hash") or ""),
+                    (
+                        json.dumps(existing_example_payload, ensure_ascii=False, sort_keys=True)
+                        if recovered_bridge_example_count > 0
+                        else ""
+                    ),
                 ],
             )
             with work_cursor(conn) as cur:
