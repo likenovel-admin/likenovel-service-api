@@ -8170,6 +8170,93 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual(reconciled[0]["legacy_scope_keys"], [new_scope_key])
         self.assertEqual(reconciled[0]["continuity_status"], "reused")
 
+    def test_inventory_v3_prefers_unique_locked_main_when_reaggregation_absorbs_duplicate(self):
+        module = load_module()
+        main_scope_key = "character:레이븐:dup:faa369a2"
+        duplicate_scope_key = "character:레이븐:dup:d15d08d0"
+        generated_scope_key = "character:레이븐"
+        rows = [
+            {
+                "canonical_character_key": generated_scope_key,
+                "display_name": "레이븐",
+                "work_role": "main_protagonist",
+                "source_character_keys": [
+                    "named:레이븐",
+                    "protagonist:named:레이븐",
+                ],
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "identity_conflict_reasons": [],
+                "review_reasons": [],
+            }
+        ]
+        old_inventory_map = {
+            main_scope_key: {
+                "canonical_character_key": main_scope_key,
+                "display_name": "레이븐",
+                "work_role": "main_protagonist",
+                "source_character_keys": ["protagonist:named:레이븐"],
+            },
+            duplicate_scope_key: {
+                "canonical_character_key": duplicate_scope_key,
+                "display_name": "레이븐",
+                "work_role": "major_character",
+                "source_character_keys": ["named:레이븐"],
+            },
+        }
+
+        reconciled = module.reconcile_character_inventory_v3_scope_keys(
+            rows,
+            old_inventory_map=old_inventory_map,
+        )
+
+        self.assertEqual(reconciled[0]["canonical_character_key"], main_scope_key)
+        self.assertEqual(reconciled[0]["continuity_status"], "reused")
+        self.assertNotIn(
+            "identity_continuity_ambiguous",
+            reconciled[0]["identity_conflict_reasons"],
+        )
+
+    def test_inventory_v3_keeps_ambiguity_when_multiple_locked_mains_match(self):
+        module = load_module()
+        generated_scope_key = "character:레이븐"
+        rows = [
+            {
+                "canonical_character_key": generated_scope_key,
+                "display_name": "레이븐",
+                "work_role": "main_protagonist",
+                "source_character_keys": [
+                    "protagonist:named:레이븐:a",
+                    "protagonist:named:레이븐:b",
+                ],
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "identity_conflict_reasons": [],
+                "review_reasons": [],
+            }
+        ]
+        old_inventory_map = {
+            "character:레이븐:dup:a": {
+                "display_name": "레이븐",
+                "work_role": "main_protagonist",
+                "source_character_keys": ["protagonist:named:레이븐:a"],
+            },
+            "character:레이븐:dup:b": {
+                "display_name": "레이븐",
+                "work_role": "main_protagonist",
+                "source_character_keys": ["protagonist:named:레이븐:b"],
+            },
+        }
+
+        reconciled = module.reconcile_character_inventory_v3_scope_keys(
+            rows,
+            old_inventory_map=old_inventory_map,
+        )
+
+        self.assertEqual(reconciled[0]["canonical_character_key"], generated_scope_key)
+        self.assertEqual(reconciled[0]["continuity_status"], "ambiguous")
+        self.assertFalse(reconciled[0]["public_chat_eligible"])
+
     def test_inventory_v3_name_only_continuity_is_fail_closed(self):
         module = load_module()
         new_scope_key = "character:레이븐:dup:new"
@@ -9574,6 +9661,195 @@ class FakeRollbackConnection(FakeConnection):
 
 
 class InventoryReaggregationTest(IsolatedAsyncioTestCase):
+    def test_generic_first_person_relation_does_not_poison_named_alias_across_episodes(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:레이븐:durable",
+            "display_name": "레이븐",
+            "work_role": "main_protagonist",
+            "source_character_keys": [
+                "protagonist:first_person",
+                "protagonist:named:레이븐",
+            ],
+        }
+        rows = [
+            *[
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:레이븐",
+                            display_name="레이븐",
+                            is_protagonist=True,
+                            is_work_protagonist=True,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            scene_weight="high",
+                        )
+                    ],
+                )
+                for episode_no in range(1, 4)
+            ],
+            signal_row(
+                4,
+                4,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="소년",
+                        aliases=["소년"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        is_first_person=True,
+                        role_in_episode="lead",
+                    ),
+                    signal_character(
+                        character_key="named:레이븐",
+                        display_name="레이븐",
+                        aliases=["레이븐"],
+                        role_in_episode="support",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:first_person",
+                                "target_label": "소년",
+                                "relation_tag": "협력",
+                                "direction": "mutual",
+                            }
+                        ],
+                    ),
+                ],
+            ),
+            signal_row(
+                5,
+                5,
+                [
+                    signal_character(
+                        character_key="named:레이븐",
+                        display_name="레이븐",
+                        aliases=["레이븐"],
+                        role_in_episode="support",
+                    )
+                ],
+            ),
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            locked_protagonist_rows=[locked_main],
+        )
+        raven_rows = [row for row in inventory if row["display_name"] == "레이븐"]
+
+        self.assertEqual(len(raven_rows), 1)
+        self.assertEqual(raven_rows[0]["work_role"], "main_protagonist")
+        self.assertEqual(raven_rows[0]["latest_seen_episode_no"], 5)
+        self.assertEqual(raven_rows[0]["evidence_episode_nos"], [1, 2, 3, 4, 5])
+        self.assertEqual(
+            set(raven_rows[0]["source_character_keys"]),
+            {
+                "named:레이븐",
+                "protagonist:named:레이븐",
+            },
+        )
+        self.assertEqual(
+            len([row for row in inventory if row["display_name"] == "소년"]),
+            1,
+        )
+
+    def test_same_episode_same_label_distinct_source_keys_remain_separate(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:레이븐:durable",
+            "display_name": "레이븐",
+            "work_role": "main_protagonist",
+            "source_character_keys": [
+                "protagonist:first_person",
+                "protagonist:named:레이븐",
+            ],
+        }
+        rows = [
+            *[
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:레이븐",
+                            display_name="레이븐",
+                            is_protagonist=True,
+                            is_work_protagonist=True,
+                            is_episode_focal=True,
+                            role_in_episode="lead",
+                            scene_weight="high",
+                        )
+                    ],
+                )
+                for episode_no in range(1, 4)
+            ],
+            signal_row(
+                4,
+                4,
+                [
+                    signal_character(
+                        character_key="named:레이븐:a",
+                        display_name="레이븐",
+                        role_in_episode="lead",
+                    ),
+                    signal_character(
+                        character_key="named:레이븐:b",
+                        display_name="레이븐",
+                        aliases=["레이븐"],
+                        role_in_episode="support",
+                    ),
+                ],
+            )
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            locked_protagonist_rows=[locked_main],
+        )
+
+        self.assertEqual(
+            len([row for row in inventory if row["display_name"] == "레이븐"]),
+            2,
+        )
+
+    def test_same_episode_canonical_named_and_protagonist_sources_can_merge(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:named:레이븐",
+                        display_name="레이븐",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        role_in_episode="lead",
+                    ),
+                    signal_character(
+                        character_key="named:레이븐",
+                        display_name="레이븐",
+                        aliases=["레이븐"],
+                        role_in_episode="support",
+                    ),
+                ],
+            )
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        raven_rows = [row for row in inventory if row["display_name"] == "레이븐"]
+
+        self.assertEqual(len(raven_rows), 1)
+        self.assertEqual(
+            set(raven_rows[0]["source_character_keys"]),
+            {"named:레이븐", "protagonist:named:레이븐"},
+        )
+
     def test_reaggregate_flag_requires_delta_mode(self):
         module = load_module()
         args = SimpleNamespace(
@@ -9602,23 +9878,58 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         module = load_module()
         conn = FakeRollbackConnection()
         results = module.build_empty_results()
-        inventory_builder = MagicMock(return_value=(1, 2))
-        inventory_v3_builder = MagicMock(return_value=(3, 4))
-        relation_builder = MagicMock(return_value=(0, 5))
-        character_cleanup = MagicMock(
-            return_value={"canonical_character_key_by_display_name": {"레이븐": "character:레이븐"}}
+        active_signal_rows = [
+            signal_row(
+                1,
+                116,
+                [
+                    signal_character(
+                        character_key="named:레이븐",
+                        display_name="레이븐",
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                    )
+                ],
+            )
+        ]
+        old_inventory_map = {
+            "named:레이븐": {
+                "character_key": "named:레이븐",
+                "display_name": "레이븐",
+                "latest_seen_episode_no": 110,
+            }
+        }
+        old_relation_map = {
+            "named:레이븐=>named:소년": {
+                "relation_key": "named:레이븐=>named:소년",
+                "source_key": "named:레이븐",
+                "source_display_name": "레이븐",
+                "target_key": "named:소년",
+                "target_display_name": "소년",
+            }
+        }
+        inventory_builder = MagicMock(
+            return_value={"inserted_count": 1, "reused_count": 2}
         )
-        relation_cleanup = MagicMock()
+        inventory_v3_builder = MagicMock(return_value=(3, 4))
+        relation_builder = MagicMock(
+            return_value={"inserted_count": 0, "reused_count": 5}
+        )
         invariants = MagicMock()
 
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "build_character_inventory_summaries", inventory_builder), \
+             patch.object(module, "fetch_active_summary_rows", return_value=active_signal_rows), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value=old_inventory_map), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value=old_relation_map), \
+             patch.object(module, "build_character_inventory_summaries_delta", inventory_builder), \
              patch.object(module, "build_character_inventory_v3_summaries", inventory_v3_builder), \
-             patch.object(module, "build_relation_inventory_summaries", relation_builder), \
-             patch.object(module, "cleanup_duplicate_character_inventory_rows", character_cleanup), \
-             patch.object(module, "cleanup_duplicate_relation_inventory_rows", relation_cleanup), \
+             patch.object(module, "build_relation_inventory_summaries_delta", relation_builder), \
+             patch.object(module, "build_character_inventory_summaries") as destructive_inventory_builder, \
+             patch.object(module, "build_relation_inventory_summaries") as destructive_relation_builder, \
+             patch.object(module, "cleanup_duplicate_character_inventory_rows") as character_cleanup, \
+             patch.object(module, "cleanup_duplicate_relation_inventory_rows") as relation_cleanup, \
              patch.object(module, "assert_story_agent_foundation_invariants", invariants), \
              patch.object(module, "touch_product_context_build_attempt") as touch:
             await module.reaggregate_character_inventory_foundations(
@@ -9627,19 +9938,34 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
                 results=results,
             )
 
-        inventory_builder.assert_called_once()
+        inventory_builder.assert_called_once_with(
+            ANY,
+            product_id=1103,
+            old_inventory_map=old_inventory_map,
+            old_touched_signal_rows=active_signal_rows,
+            new_touched_signal_rows=active_signal_rows,
+        )
         inventory_v3_builder.assert_called_once_with(
             cur=ANY,
             product_id=1103,
             protagonist_resolution=None,
         )
-        relation_builder.assert_called_once()
-        relation_cleanup.assert_called_once_with(
+        relation_builder.assert_called_once_with(
             ANY,
             product_id=1103,
-            canonical_character_key_by_display_name={"레이븐": "character:레이븐"},
+            old_relation_map=old_relation_map,
+            old_touched_signal_rows=active_signal_rows,
+            new_touched_signal_rows=active_signal_rows,
         )
-        invariants.assert_called_once()
+        destructive_inventory_builder.assert_not_called()
+        destructive_relation_builder.assert_not_called()
+        character_cleanup.assert_not_called()
+        relation_cleanup.assert_not_called()
+        invariants.assert_called_once_with(
+            cur=ANY,
+            product_id=1103,
+            require_signal_coverage=False,
+        )
         touch.assert_called_once()
         self.assertEqual(conn.commit_count, 1)
         self.assertEqual(results["inventory_reaggregation_attempted"], 1)
@@ -9652,15 +9978,17 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         module = load_module()
         conn = FakeRollbackConnection()
         results = module.build_empty_results()
+        active_signal_rows = [signal_row(1, 1, [])]
 
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "build_character_inventory_summaries", MagicMock(return_value=(0, 3))), \
+             patch.object(module, "fetch_active_summary_rows", return_value=active_signal_rows), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value={}), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
+             patch.object(module, "build_character_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 0, "reused_count": 3})), \
              patch.object(module, "build_character_inventory_v3_summaries", MagicMock(return_value=(0, 7))), \
-             patch.object(module, "build_relation_inventory_summaries", MagicMock(return_value=(0, 2))), \
-             patch.object(module, "cleanup_duplicate_character_inventory_rows", MagicMock(return_value={})), \
-             patch.object(module, "cleanup_duplicate_relation_inventory_rows", MagicMock()), \
+             patch.object(module, "build_relation_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 0, "reused_count": 2})), \
              patch.object(module, "assert_story_agent_foundation_invariants", MagicMock()), \
              patch.object(module, "touch_product_context_build_attempt"):
             await module.reaggregate_character_inventory_foundations(
@@ -9673,6 +10001,61 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["inventory_reaggregation_updated"], 0)
         self.assertEqual(results["inventory_reaggregations"][0]["status"], "no_progress")
 
+    async def test_inventory_reaggregation_without_active_signals_is_non_destructive_no_progress(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_active_summary_rows", return_value=[]), \
+             patch.object(module, "build_character_inventory_summaries_delta") as inventory_builder, \
+             patch.object(module, "build_character_inventory_v3_summaries") as inventory_v3_builder, \
+             patch.object(module, "build_relation_inventory_summaries_delta") as relation_builder, \
+             patch.object(module, "touch_product_context_build_attempt") as touch:
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1103, "title": "테스트 작품"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        inventory_builder.assert_not_called()
+        inventory_v3_builder.assert_not_called()
+        relation_builder.assert_not_called()
+        touch.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
+        self.assertEqual(conn.rollback_count, 0)
+        self.assertEqual(results["inventory_reaggregation_no_progress"], 1)
+        self.assertEqual(
+            results["inventory_reaggregations"][0],
+            {
+                "product_id": 1103,
+                "status": "no_progress",
+                "reason": "no_active_character_signals",
+            },
+        )
+
+    def test_reaggregation_invariant_allows_incomplete_signal_coverage(self):
+        module = load_module()
+        count_rows = [
+            {"summary_type": "episode_summary", "cnt": 117},
+            {"summary_type": "episode_character_signals", "cnt": 115},
+            {"summary_type": "character_inventory", "cnt": 123},
+            {"summary_type": "character_inventory_v3", "cnt": 160},
+        ]
+
+        module.assert_story_agent_foundation_invariants(
+            FakeRowsCursor(count_rows),
+            product_id=1103,
+            require_signal_coverage=False,
+        )
+        with self.assertRaisesRegex(ValueError, "episode_summary=117 episode_character_signals=115"):
+            module.assert_story_agent_foundation_invariants(
+                FakeRowsCursor(count_rows),
+                product_id=1103,
+            )
+
     async def test_inventory_reaggregation_failure_rolls_back_and_sets_failed_exit(self):
         module = load_module()
         conn = FakeRollbackConnection()
@@ -9682,11 +10065,12 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "build_character_inventory_summaries", MagicMock(return_value=(1, 0))), \
+             patch.object(module, "fetch_active_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value={}), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
+             patch.object(module, "build_character_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 1, "reused_count": 0})), \
              patch.object(module, "build_character_inventory_v3_summaries", MagicMock(return_value=(1, 0))), \
-             patch.object(module, "build_relation_inventory_summaries", MagicMock(return_value=(1, 0))), \
-             patch.object(module, "cleanup_duplicate_character_inventory_rows", MagicMock(return_value={})), \
-             patch.object(module, "cleanup_duplicate_relation_inventory_rows", MagicMock()), \
+             patch.object(module, "build_relation_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 1, "reused_count": 0})), \
              patch.object(module, "assert_story_agent_foundation_invariants", invariants), \
              patch.object(module, "touch_product_context_build_attempt"):
             await module.reaggregate_character_inventory_foundations(

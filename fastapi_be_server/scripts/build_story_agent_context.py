@@ -9124,7 +9124,20 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
             for right_index in episode_indexes[position + 1:]:
                 right = observations[right_index]
                 right_label = str(right.get("primary_non_generic_label") or "")
-                if right_label and left_label != right_label:
+                left_source_key = str(left.get("source_character_key") or "")
+                right_source_key = str(right.get("source_character_key") or "")
+                canonical_named_source_pair = {
+                    build_named_character_scope_key(left_label),
+                    build_protagonist_scope_key(left_label),
+                }
+                if right_label and (
+                    left_label != right_label
+                    or (
+                        left_source_key != right_source_key
+                        and {left_source_key, right_source_key}
+                        != canonical_named_source_pair
+                    )
+                ):
                     if tuple(sorted((left_index, right_index))) in transfer_identity_bridge_pairs:
                         continue
                     if _label_sets_match_bridge_index(
@@ -9139,7 +9152,18 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
         for edge in list(observation.get("relation_edges") or []):
             if not isinstance(edge, dict):
                 continue
-            for target_index in source_key_to_indexes.get(str(edge.get("target_key") or ""), []):
+            target_key = str(edge.get("target_key") or "")
+            target_indexes = list(source_key_to_indexes.get(target_key, []))
+            if _is_generic_protagonist_source_key(target_key):
+                source_episode_no = int(observation.get("episode_no") or 0)
+                target_indexes = [
+                    target_index
+                    for target_index in target_indexes
+                    if source_episode_no > 0
+                    and int(observations[target_index].get("episode_no") or 0)
+                    == source_episode_no
+                ]
+            for target_index in target_indexes:
                 if source_index != target_index:
                     if tuple(sorted((source_index, target_index))) in transfer_identity_bridge_pairs:
                         continue
@@ -11297,6 +11321,23 @@ def reconcile_character_inventory_v3_scope_keys(
                     candidates.update(old_owners)
 
         available_candidates = candidates - claimed_old_scope_keys
+        if (
+            len(available_candidates) > 1
+            and str(row.get("work_role") or "") == "main_protagonist"
+        ):
+            locked_main_candidates = {
+                old_scope_key
+                for old_scope_key in available_candidates
+                if str(old_rows[old_scope_key].get("work_role") or "")
+                == "main_protagonist"
+                and _work_protagonist_rows_share_identity(
+                    old_rows[old_scope_key],
+                    row,
+                    allow_source_overlap=True,
+                )
+            }
+            if len(locked_main_candidates) == 1:
+                available_candidates = locked_main_candidates
         if len(available_candidates) == 1:
             durable_scope_key = next(iter(available_candidates))
             claimed_old_scope_keys.add(durable_scope_key)
@@ -14087,7 +14128,12 @@ def refresh_product_context_status(cur, product_id: int, total_episode_count: in
     }
 
 
-def assert_story_agent_foundation_invariants(cur, *, product_id: int) -> None:
+def assert_story_agent_foundation_invariants(
+    cur,
+    *,
+    product_id: int,
+    require_signal_coverage: bool = True,
+) -> None:
     cur.execute(
         """
         SELECT summary_type, COUNT(*) AS cnt
@@ -14105,7 +14151,11 @@ def assert_story_agent_foundation_invariants(cur, *, product_id: int) -> None:
     inventory_count = int(counts.get("character_inventory") or 0)
     inventory_v3_count = int(counts.get("character_inventory_v3") or 0)
 
-    if episode_summary_count > 0 and signal_count != episode_summary_count:
+    if (
+        require_signal_coverage
+        and episode_summary_count > 0
+        and signal_count != episode_summary_count
+    ):
         raise ValueError(
             f"story-agent foundation mismatch: product_id={product_id} "
             f"episode_summary={episode_summary_count} episode_character_signals={signal_count}"
@@ -14646,33 +14696,53 @@ async def reaggregate_character_inventory_foundations(
                         continue
 
                     with work_cursor(work_conn) as cur:
-                        inventory_counts = build_character_inventory_summaries(
+                        active_signal_rows = fetch_active_summary_rows(
                             cur=cur,
                             product_id=product_id,
+                            summary_type="episode_character_signals",
+                        )
+                        if not active_signal_rows:
+                            record.update(
+                                {
+                                    "status": "no_progress",
+                                    "reason": "no_active_character_signals",
+                                }
+                            )
+                            results["inventory_reaggregation_no_progress"] += 1
+                            reaggregation_records.append(record)
+                            continue
+
+                        old_inventory_map = fetch_active_character_inventory_map(
+                            cur=cur,
+                            product_id=product_id,
+                        )
+                        old_relation_map = fetch_active_relation_inventory_by_relation_key_map(
+                            cur=cur,
+                            product_id=product_id,
+                        )
+                        inventory_stats = build_character_inventory_summaries_delta(
+                            cur,
+                            product_id=product_id,
+                            old_inventory_map=old_inventory_map,
+                            old_touched_signal_rows=active_signal_rows,
+                            new_touched_signal_rows=active_signal_rows,
                         )
                         inventory_v3_counts = build_character_inventory_v3_summaries(
                             cur=cur,
                             product_id=product_id,
                             protagonist_resolution=None,
                         )
-                        relation_counts = build_relation_inventory_summaries(
-                            cur=cur,
-                            product_id=product_id,
-                        )
-                        character_cleanup = cleanup_duplicate_character_inventory_rows(
+                        relation_stats = build_relation_inventory_summaries_delta(
                             cur,
                             product_id=product_id,
-                        )
-                        cleanup_duplicate_relation_inventory_rows(
-                            cur,
-                            product_id=product_id,
-                            canonical_character_key_by_display_name=dict(
-                                character_cleanup.get("canonical_character_key_by_display_name") or {}
-                            ),
+                            old_relation_map=old_relation_map,
+                            old_touched_signal_rows=active_signal_rows,
+                            new_touched_signal_rows=active_signal_rows,
                         )
                         assert_story_agent_foundation_invariants(
                             cur=cur,
                             product_id=product_id,
+                            require_signal_coverage=False,
                         )
                         touch_product_context_build_attempt(
                             cur,
@@ -14681,9 +14751,9 @@ async def reaggregate_character_inventory_foundations(
                     work_conn.commit()
 
                     changed = (
-                        int(inventory_counts[0])
+                        int(inventory_stats.get("inserted_count") or 0)
                         + int(inventory_v3_counts[0])
-                        + int(relation_counts[0])
+                        + int(relation_stats.get("inserted_count") or 0)
                     ) > 0
                     results[
                         "inventory_reaggregation_updated"
@@ -14693,9 +14763,16 @@ async def reaggregate_character_inventory_foundations(
                     record.update(
                         {
                             "status": "updated" if changed else "no_progress",
-                            "inventory_counts": [int(inventory_counts[0]), int(inventory_counts[1])],
+                            "signal_count": len(active_signal_rows),
+                            "inventory_counts": [
+                                int(inventory_stats.get("inserted_count") or 0),
+                                int(inventory_stats.get("reused_count") or 0),
+                            ],
                             "inventory_v3_counts": [int(inventory_v3_counts[0]), int(inventory_v3_counts[1])],
-                            "relation_counts": [int(relation_counts[0]), int(relation_counts[1])],
+                            "relation_counts": [
+                                int(relation_stats.get("inserted_count") or 0),
+                                int(relation_stats.get("reused_count") or 0),
+                            ],
                         }
                     )
                     reaggregation_records.append(record)
