@@ -185,7 +185,9 @@ class TraceIdMiddleware(BaseHTTPMiddleware):
         # 응답 헤더에 traceId를 추가
         response.headers["trace_id"] = trace_id
 
-        # return response
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if content_type.startswith("text/event-stream"):
+            return response
 
         res_body = b""
         async for chunk in response.body_iterator:
