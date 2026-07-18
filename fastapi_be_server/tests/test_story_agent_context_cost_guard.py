@@ -9562,3 +9562,141 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         )
 
         self.assertEqual(affected, {"protagonist:named:hero", "named:rival"})
+
+
+class FakeRollbackConnection(FakeConnection):
+    def __init__(self):
+        super().__init__()
+        self.rollback_count = 0
+
+    def rollback(self):
+        self.rollback_count += 1
+
+
+class InventoryReaggregationTest(IsolatedAsyncioTestCase):
+    def test_reaggregate_flag_requires_delta_mode(self):
+        module = load_module()
+        args = SimpleNamespace(
+            build_mode="full",
+            repair_character_assets=False,
+            reaggregate_character_inventory=True,
+        )
+        with self.assertRaises(ValueError):
+            module.validate_delta_args(args)
+
+    def test_reaggregate_flag_requires_apply(self):
+        module = load_module()
+        args = SimpleNamespace(
+            build_mode="delta",
+            repair_character_assets=False,
+            reaggregate_character_inventory=True,
+            limit=0,
+            product_ids=[1103],
+            max_delta_episodes=2,
+            apply=False,
+        )
+        with self.assertRaises(ValueError):
+            module.validate_delta_args(args)
+
+    async def test_inventory_reaggregation_runs_without_provider(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+        inventory_builder = MagicMock(return_value=(1, 2))
+        inventory_v3_builder = MagicMock(return_value=(3, 4))
+        relation_builder = MagicMock(return_value=(0, 5))
+        character_cleanup = MagicMock(
+            return_value={"canonical_character_key_by_display_name": {"레이븐": "character:레이븐"}}
+        )
+        relation_cleanup = MagicMock()
+        invariants = MagicMock()
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "build_character_inventory_summaries", inventory_builder), \
+             patch.object(module, "build_character_inventory_v3_summaries", inventory_v3_builder), \
+             patch.object(module, "build_relation_inventory_summaries", relation_builder), \
+             patch.object(module, "cleanup_duplicate_character_inventory_rows", character_cleanup), \
+             patch.object(module, "cleanup_duplicate_relation_inventory_rows", relation_cleanup), \
+             patch.object(module, "assert_story_agent_foundation_invariants", invariants), \
+             patch.object(module, "touch_product_context_build_attempt") as touch:
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1103, "title": "테스트 작품"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        inventory_builder.assert_called_once()
+        inventory_v3_builder.assert_called_once_with(
+            cur=ANY,
+            product_id=1103,
+            protagonist_resolution=None,
+        )
+        relation_builder.assert_called_once()
+        relation_cleanup.assert_called_once_with(
+            ANY,
+            product_id=1103,
+            canonical_character_key_by_display_name={"레이븐": "character:레이븐"},
+        )
+        invariants.assert_called_once()
+        touch.assert_called_once()
+        self.assertEqual(conn.commit_count, 1)
+        self.assertEqual(results["inventory_reaggregation_attempted"], 1)
+        self.assertEqual(results["inventory_reaggregation_updated"], 1)
+        self.assertEqual(results["inventory_reaggregation_failed"], 0)
+        self.assertEqual(results["inventory_reaggregations"][0]["status"], "updated")
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
+
+    async def test_inventory_reaggregation_no_progress_when_nothing_inserted(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "build_character_inventory_summaries", MagicMock(return_value=(0, 3))), \
+             patch.object(module, "build_character_inventory_v3_summaries", MagicMock(return_value=(0, 7))), \
+             patch.object(module, "build_relation_inventory_summaries", MagicMock(return_value=(0, 2))), \
+             patch.object(module, "cleanup_duplicate_character_inventory_rows", MagicMock(return_value={})), \
+             patch.object(module, "cleanup_duplicate_relation_inventory_rows", MagicMock()), \
+             patch.object(module, "assert_story_agent_foundation_invariants", MagicMock()), \
+             patch.object(module, "touch_product_context_build_attempt"):
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1103, "title": "테스트 작품"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        self.assertEqual(results["inventory_reaggregation_no_progress"], 1)
+        self.assertEqual(results["inventory_reaggregation_updated"], 0)
+        self.assertEqual(results["inventory_reaggregations"][0]["status"], "no_progress")
+
+    async def test_inventory_reaggregation_failure_rolls_back_and_sets_failed_exit(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+        invariants = MagicMock(side_effect=ValueError("foundation invariant broken"))
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "build_character_inventory_summaries", MagicMock(return_value=(1, 0))), \
+             patch.object(module, "build_character_inventory_v3_summaries", MagicMock(return_value=(1, 0))), \
+             patch.object(module, "build_relation_inventory_summaries", MagicMock(return_value=(1, 0))), \
+             patch.object(module, "cleanup_duplicate_character_inventory_rows", MagicMock(return_value={})), \
+             patch.object(module, "cleanup_duplicate_relation_inventory_rows", MagicMock()), \
+             patch.object(module, "assert_story_agent_foundation_invariants", invariants), \
+             patch.object(module, "touch_product_context_build_attempt"):
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1103, "title": "테스트 작품"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        self.assertEqual(conn.commit_count, 0)
+        self.assertEqual(conn.rollback_count, 1)
+        self.assertEqual(results["inventory_reaggregation_failed"], 1)
+        self.assertEqual(results["inventory_reaggregations"][0]["status"], "failed")
+        self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
