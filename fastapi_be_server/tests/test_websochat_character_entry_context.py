@@ -767,6 +767,7 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             "publishedLatestEpisodeNo": 14,
             "syncedLatestEpisodeNo": 14,
             "contextStatus": "ready",
+            "characterChatEligible": True,
         }
         session_memory = {
             "session_kind": "character_chat",

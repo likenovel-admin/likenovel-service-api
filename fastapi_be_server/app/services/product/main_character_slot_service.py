@@ -7,12 +7,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.schemas.admin as admin_schema
 from app.exceptions import CustomResponseException
+from app.services.websochat.character_chat_product_policy import (
+    CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
+    CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+    build_correlated_character_chat_product_policy_sql,
+    build_public_episode_opened_at_sql,
+)
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
 from app.utils.query import get_file_path_sub_query, get_pagination_params
 from app.utils.response import build_paginated_response
 
 
-MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT = 15
+MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT = (
+    CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT
+)
 MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT = 2
 MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES = 10
 MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES = 4
@@ -202,13 +210,7 @@ async def _load_eligible_main_character_roster(
               AND p.open_yn = 'Y'
               AND COALESCE(p.blind_yn, 'N') = 'N'
               AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
-              AND (
-                  SELECT COUNT(*)
-                  FROM tb_product_episode pe
-                  WHERE pe.product_id = p.product_id
-                    AND pe.use_yn = 'Y'
-                    AND pe.open_yn = 'Y'
-              ) >= {MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT}
+              {build_correlated_character_chat_product_policy_sql(product_alias="p", episode_alias="pe")}
               {_chat_ready_rp_assets_predicate("sacs")}
             ORDER BY sacs.summary_id DESC
         """),
@@ -289,13 +291,7 @@ def build_public_main_character_slots_query() -> str:
           AND COALESCE(p.blind_yn, 'N') = 'N'
           AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
           AND (:adult_yn = 'Y' OR p.ratings_code != 'adult')
-          AND (
-              SELECT COUNT(*)
-              FROM tb_product_episode pe
-              WHERE pe.product_id = p.product_id
-                AND pe.use_yn = 'Y'
-                AND pe.open_yn = 'Y'
-          ) >= {MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT}
+          {build_correlated_character_chat_product_policy_sql(product_alias="p", episode_alias="pe")}
           AND EXISTS (
               SELECT 1
               FROM tb_story_agent_context_summary inventory
@@ -380,10 +376,13 @@ async def search_admin_main_character_slot_products(
                 episode_stats.open_episode_count AS openEpisodeCount
             FROM tb_product p
             INNER JOIN (
-                SELECT product_id, COUNT(*) AS open_episode_count
-                FROM tb_product_episode
-                WHERE use_yn = 'Y' AND open_yn = 'Y'
-                GROUP BY product_id
+                SELECT
+                    pe.product_id,
+                    COUNT(*) AS open_episode_count,
+                    MIN({build_public_episode_opened_at_sql("pe")}) AS first_public_episode_at
+                FROM tb_product_episode pe
+                WHERE pe.use_yn = 'Y' AND pe.open_yn = 'Y'
+                GROUP BY pe.product_id
             ) episode_stats ON episode_stats.product_id = p.product_id
             LEFT JOIN (
                 SELECT cf.file_group_id, cfi.file_path
@@ -396,7 +395,9 @@ async def search_admin_main_character_slot_products(
             WHERE p.open_yn = 'Y'
               AND COALESCE(p.blind_yn, 'N') = 'N'
               AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
+              AND p.status_code = 'ongoing'
               AND episode_stats.open_episode_count >= :minimum_open_episode_count
+              AND episode_stats.first_public_episode_at >= :first_public_episode_at
               AND EXISTS (
                   SELECT 1
                   FROM tb_story_agent_context_summary sacs
@@ -419,6 +420,7 @@ async def search_admin_main_character_slot_products(
             "search_word": f"%{normalized_search_word}%",
             "limit_count": limit,
             "minimum_open_episode_count": MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT,
+            "first_public_episode_at": CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
         },
     )
     return {"data": [dict(row) for row in result.mappings().all()]}
@@ -429,13 +431,12 @@ def _admin_chat_ready_product_where_clause() -> str:
         WHERE p.open_yn = 'Y'
           AND COALESCE(p.blind_yn, 'N') = 'N'
           AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
-          AND (
-              SELECT COUNT(*)
-              FROM tb_product_episode pe
-              WHERE pe.product_id = p.product_id
-                AND pe.use_yn = 'Y'
-                AND pe.open_yn = 'Y'
-          ) >= :minimum_open_episode_count
+          {build_correlated_character_chat_product_policy_sql(
+              product_alias="p",
+              episode_alias="pe",
+              minimum_open_episode_count_sql=":minimum_open_episode_count",
+              first_public_episode_at_sql=":first_public_episode_at",
+          )}
           AND (
               :search_word = '%%'
               OR p.title LIKE :search_word
@@ -585,6 +586,7 @@ async def get_admin_main_character_slot_products(
     params = {
         "search_word": f"%{normalized_search_word}%",
         "minimum_open_episode_count": MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT,
+        "first_public_episode_at": CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
     }
     where_clause = _admin_chat_ready_product_where_clause()
 
