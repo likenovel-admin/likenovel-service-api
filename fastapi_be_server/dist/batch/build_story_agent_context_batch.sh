@@ -349,6 +349,20 @@ FROM (
     AND p.blind_yn = 'N'
     AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
     AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
+    AND EXISTS (
+      SELECT 1
+      FROM tb_product_episode cohort_episode
+      WHERE cohort_episode.product_id = p.product_id
+        AND cohort_episode.use_yn = 'Y'
+        AND cohort_episode.open_yn = 'Y'
+      GROUP BY cohort_episode.product_id
+      HAVING COUNT(*) >= 15
+         AND MIN(COALESCE(
+           cohort_episode.open_changed_date,
+           cohort_episode.publish_reserve_date,
+           cohort_episode.created_date
+         )) >= '2026-03-01 00:00:00'
+    )
   GROUP BY
     p.product_id,
     p.title,
