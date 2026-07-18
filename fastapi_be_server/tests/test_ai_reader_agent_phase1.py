@@ -5158,19 +5158,45 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user_id, 123)
         db.commit.assert_awaited_once()
 
-    def test_ai_reader_profile_nickname_pool_has_100_valid_entries(self):
+    def test_ai_reader_profile_nickname_pool_supports_1000_unique_readers(self):
         from app.services.admin import admin_ai_reader_service
 
         nickname_pool = admin_ai_reader_service.AI_READER_PROFILE_NICKNAME_POOL
         joined_pool = "\n".join(nickname_pool)
 
-        self.assertEqual(len(nickname_pool), 100)
-        self.assertEqual(len(set(nickname_pool)), 100)
+        self.assertGreaterEqual(len(nickname_pool), 1000)
+        self.assertEqual(len(set(nickname_pool)), len(nickname_pool))
         for nickname in nickname_pool:
             self.assertIsNotNone(re.match(r"^[가-힣a-zA-Z0-9]+$", nickname))
+            self.assertLessEqual(len(nickname), 30)
+            self.assertFalse(
+                re.search(r"[가-힣]", nickname) and re.search(r"\d", nickname),
+                nickname,
+            )
         self.assertNotIn("디씨", joined_pool)
         self.assertNotIn("주갤", joined_pool)
         self.assertNotIn("주갤러", joined_pool)
+        self.assertNotIn("라이크독자", joined_pool)
+        self.assertNotIn("독자", joined_pool)
+        self.assertNotIn("봇", joined_pool)
+        self.assertNotIn("운영", joined_pool)
+        for source_nickname in admin_ai_reader_service.AI_READER_PROFILE_NICKNAME_REFERENCE_EXACT_BLOCKLIST:
+            self.assertNotIn(source_nickname, nickname_pool)
+
+        first_candidates = {
+            admin_ai_reader_service._ai_reader_profile_nickname_candidates(
+                f"prod-ai-reader-{index:04d}@ai-reader.likenovel.net",
+            )[0]
+            for index in range(1, 1001)
+        }
+        self.assertEqual(len(first_candidates), 1000)
+        next_candidates = {
+            admin_ai_reader_service._ai_reader_profile_nickname_candidates(
+                f"prod-ai-reader-{index:04d}@ai-reader.likenovel.net",
+            )[0]
+            for index in range(1001, 2001)
+        }
+        self.assertEqual(len(next_candidates), 1000)
 
     async def test_assign_ai_reader_profile_nickname_skips_duplicate_pool_entry(self):
         from app.services.admin import admin_ai_reader_service
@@ -5208,12 +5234,17 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
             self._FakeMappingsResult([], rowcount=1),
         ]
 
-        nickname = await admin_ai_reader_service._assign_ai_reader_profile_nickname(
-            db,
-            user_id=123,
-            email="prod-ai-reader-0101@ai-reader.likenovel.net",
-            profile_nickname_pool=["새후보1", "새후보2"],
-        )
+        with patch.object(
+            admin_ai_reader_service,
+            "AI_READER_PROFILE_NICKNAME_POOL",
+            ("기본후보1",),
+        ):
+            nickname = await admin_ai_reader_service._assign_ai_reader_profile_nickname(
+                db,
+                user_id=123,
+                email="prod-ai-reader-0002@ai-reader.likenovel.net",
+                profile_nickname_pool=["새후보1", "새후보2"],
+            )
 
         self.assertEqual(nickname, "새후보1")
         self.assertEqual(db.execute.call_args_list[1].args[1]["nickname"], "새후보1")
