@@ -26,6 +26,10 @@ from app.schemas.websochat import (
     PatchWebsochatSessionReadScopeReqBody,
     PatchWebsochatSessionReqBody,
 )
+from app.services.websochat.character_chat_product_policy import (
+    build_aggregate_character_chat_product_eligibility_sql,
+    is_character_chat_product_eligible,
+)
 from app.services.websochat.websochat_compare import (
     _build_websochat_pair_key,
     _build_websochat_worldcup_round,
@@ -683,6 +687,9 @@ WEBSOCHAT_CONSENT_DISABLED_MESSAGE = "작가의 웹소챗 이용 동의가 해�
 WEBSOCHAT_CONTEXT_PENDING_MESSAGE = "이 작품은 아직 대화 준비 중입니다."
 WEBSOCHAT_CONTEXT_DISABLED_MESSAGE = "현재 웹소챗이 비활성화된 작품입니다."
 WEBSOCHAT_ACCESS_REQUIRED_MESSAGE = "구매/대여한 회차 또는 무료 공개 회차 범위 안에서만 웹소챗을 사용할 수 있습니다."
+WEBSOCHAT_CHARACTER_CHAT_PRODUCT_INELIGIBLE_MESSAGE = (
+    "캐릭터챗은 2026년 3월 1일 이후 연재를 시작한 15화 이상 연재중 작품에서만 이용할 수 있습니다."
+)
 WEBSOCHAT_PLACEHOLDER_TEMPLATE = (
     "[{title}] 기준으로 관련 회차와 원문 일부를 먼저 찾았습니다.\n"
     "{context_block}\n\n"
@@ -710,6 +717,50 @@ WEBSOCHAT_ALLOWED_INTENTS = {
 WEBSOCHAT_EPISODE_RANGE_RE = re.compile(r"(\d{1,4})\s*(?:~|-|–|—)\s*(\d{1,4})\s*화")
 WEBSOCHAT_EPISODE_SINGLE_RE = re.compile(r"(\d{1,4})\s*화")
 WEBSOCHAT_ALLOWED_SUMMARY_MODES = {"exact", "early", "latest", "general"}
+
+
+def _assert_websochat_character_chat_product_eligible(
+    product_row: dict[str, Any],
+) -> None:
+    if is_character_chat_product_eligible(product_row):
+        return
+    raise CustomResponseException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        code="CHARACTER_CHAT_PRODUCT_INELIGIBLE",
+        message=WEBSOCHAT_CHARACTER_CHAT_PRODUCT_INELIGIBLE_MESSAGE,
+    )
+
+
+def _resolve_websochat_session_can_send_message(
+    *,
+    product_state: dict[str, Any],
+    session_memory: dict[str, Any],
+    max_authorized_episode_to: int,
+) -> bool:
+    if not bool(product_state.get("canSendMessage")):
+        return False
+    if int(max_authorized_episode_to or 0) <= 0:
+        return False
+    return not _is_websochat_character_chat_session(
+        session_memory
+    ) or is_character_chat_product_eligible(product_state)
+
+
+def _resolve_websochat_session_unavailable_message(
+    *,
+    product_state: dict[str, Any],
+    session_memory: dict[str, Any],
+    max_authorized_episode_to: int,
+) -> str | None:
+    if not bool(product_state.get("canSendMessage")):
+        return product_state.get("unavailableMessage") or WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE
+    if int(max_authorized_episode_to or 0) <= 0:
+        return WEBSOCHAT_ACCESS_REQUIRED_MESSAGE
+    if _is_websochat_character_chat_session(
+        session_memory
+    ) and not is_character_chat_product_eligible(product_state):
+        return WEBSOCHAT_CHARACTER_CHAT_PRODUCT_INELIGIBLE_MESSAGE
+    return None
 
 
 def _resolve_websochat_synced_latest_episode_no(product_row: dict[str, Any] | None) -> int:
@@ -1638,7 +1689,8 @@ async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSessio
             p.price_type AS priceType,
             COALESCE(sacp.context_status, 'pending') AS contextStatus,
             COALESCE(MAX(e.episode_no), 0) AS latestEpisodeNo,
-            LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo
+            LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo,
+            {build_aggregate_character_chat_product_eligibility_sql(product_alias="p", episode_alias="e")} AS characterChatEligible
         FROM tb_product p
         LEFT JOIN tb_story_agent_context_product sacp
           ON sacp.product_id = p.product_id
@@ -1661,6 +1713,7 @@ async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSessio
     if not row:
         return None
     product = dict(row)
+    product["characterChatEligible"] = is_character_chat_product_eligible(product)
     product["publishedLatestEpisodeNo"] = int(product.get("latestEpisodeNo") or 0)
     return product
 
@@ -1685,7 +1738,8 @@ async def _get_websochat_product_session_state(
             p.ratings_code AS ratingsCode,
             COALESCE(sacp.context_status, 'pending') AS contextStatus,
             COALESCE(MAX(e.episode_no), 0) AS latestEpisodeNo,
-            LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo
+            LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo,
+            {build_aggregate_character_chat_product_eligibility_sql(product_alias="p", episode_alias="e")} AS characterChatEligible
         FROM tb_product p
         LEFT JOIN tb_story_agent_context_product sacp
           ON sacp.product_id = p.product_id
@@ -1720,10 +1774,12 @@ async def _get_websochat_product_session_state(
             "publishedLatestEpisodeNo": 0,
             "syncedLatestEpisodeNo": 0,
             "canSendMessage": False,
+            "characterChatEligible": False,
             "unavailableMessage": WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE,
         }
 
     product = dict(row)
+    product["characterChatEligible"] = is_character_chat_product_eligible(product)
     can_send_message = (
         product.get("openYn") == "Y"
         and product.get("blindYn") == "N"
@@ -7266,9 +7322,19 @@ async def get_sessions(
             synced_latest_episode_no=product_state.get("syncedLatestEpisodeNo"),
             requested_read_episode_to=authorized_read_episode_to,
         )
-        can_send_message = bool(product_state.get("canSendMessage")) and int(
+        max_authorized_episode_to = int(
             authorized_scope.get("maxAuthorizedEpisodeTo") or 0
-        ) > 0
+        )
+        can_send_message = _resolve_websochat_session_can_send_message(
+            product_state=product_state,
+            session_memory=session_memory,
+            max_authorized_episode_to=max_authorized_episode_to,
+        )
+        unavailable_message = _resolve_websochat_session_unavailable_message(
+            product_state=product_state,
+            session_memory=session_memory,
+            max_authorized_episode_to=max_authorized_episode_to,
+        )
         read_episode_title = None
         if read_episode_to:
             cache_key = (current_product_id, read_episode_to)
@@ -7303,11 +7369,7 @@ async def get_sessions(
                 "syncedLatestEpisodeNo": product_state.get("syncedLatestEpisodeNo") or 0,
                 "contextStatus": product_state.get("contextStatus"),
                 "canSendMessage": can_send_message,
-                "unavailableMessage": (
-                    product_state.get("unavailableMessage")
-                    if can_send_message
-                    else product_state.get("unavailableMessage") or WEBSOCHAT_ACCESS_REQUIRED_MESSAGE
-                ),
+                "unavailableMessage": None if can_send_message else unavailable_message,
                 "pendingQaActionKey": pending_qa_action_key,
                 "rpStage": rp_session_state["rpStage"],
                 "rpActiveCharacterLabel": rp_session_state["rpActiveCharacterLabel"],
@@ -7384,9 +7446,19 @@ async def get_messages(
         if scope_state == "known" and not authorized_read_episode_to
         else scope_state
     )
-    can_send_message = bool(product_state.get("canSendMessage")) and int(
+    max_authorized_episode_to = int(
         authorized_scope.get("maxAuthorizedEpisodeTo") or 0
-    ) > 0
+    )
+    can_send_message = _resolve_websochat_session_can_send_message(
+        product_state=product_state,
+        session_memory=session_memory,
+        max_authorized_episode_to=max_authorized_episode_to,
+    )
+    unavailable_message = _resolve_websochat_session_unavailable_message(
+        product_state=product_state,
+        session_memory=session_memory,
+        max_authorized_episode_to=max_authorized_episode_to,
+    )
     read_episode_to = _resolve_websochat_display_read_episode_to(
         scope_state=display_scope_state,
         latest_episode_no=latest_episode_no,
@@ -7503,11 +7575,7 @@ async def get_messages(
                 "syncedLatestEpisodeNo": synced_latest_episode_no,
                 "contextStatus": product_state.get("contextStatus"),
                 "canSendMessage": can_send_message,
-                "unavailableMessage": (
-                    product_state.get("unavailableMessage")
-                    if can_send_message
-                    else product_state.get("unavailableMessage") or WEBSOCHAT_ACCESS_REQUIRED_MESSAGE
-                ),
+                "unavailableMessage": None if can_send_message else unavailable_message,
                 "pendingQaActionKey": pending_qa_action_key,
                 "createdDate": (
                     session_row["created_date"].strftime("%Y-%m-%d %H:%M:%S")
@@ -7605,6 +7673,8 @@ async def create_session(
         if locked_character_scope_key
         else str(req_body.session_kind or "").strip().lower() or "websochat"
     )
+    if session_kind == "character_chat":
+        _assert_websochat_character_chat_product_eligible(product_row)
     requested_active_character = locked_character_scope_key or req_body.active_character
     resolution = await _resolve_websochat_active_character_resolution(
         product_id=req_body.product_id,
@@ -8117,6 +8187,11 @@ async def post_character_chat_choices(
             choices=[],
             source_assistant_message_id=latest_assistant_id,
         )
+    if not is_character_chat_product_eligible(product_row):
+        return _build_websochat_character_chat_choices_payload(
+            choices=[],
+            source_assistant_message_id=latest_assistant_id,
+        )
     try:
         _assert_websochat_product_context_available(product_row)
     except CustomResponseException:
@@ -8337,6 +8412,8 @@ async def post_message(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=product_state.get("unavailableMessage") or WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE,
         )
+    if is_character_chat_session:
+        _assert_websochat_character_chat_product_eligible(product_row)
     _assert_websochat_product_context_available(product_row)
     synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_row)
     latest_episode_no = max(int(product_row.get("latestEpisodeNo") or 0), 0)

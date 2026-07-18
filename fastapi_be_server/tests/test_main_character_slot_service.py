@@ -287,9 +287,13 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "p.open_yn = 'Y'" in query
     assert "COALESCE(p.blind_yn, 'N') = 'N'" in query
     assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+    assert "p.status_code = 'ongoing'" in query
     assert ">= 15" in query
+    assert "MIN(COALESCE(" in query
+    assert "pe.open_changed_date" in query
+    assert ">= '2026-03-01 00:00:00'" in query
     assert "(:adult_yn = 'Y' OR p.ratings_code != 'adult')" in query
-    assert "SELECT COUNT(*)" in query
+    assert "HAVING COUNT(*)" in query
     assert "FROM tb_product_episode pe" in query
     assert "FROM tb_story_agent_context_summary inventory" in query
     assert "inventory.scope_key = mcs.character_scope_key" in query
@@ -375,7 +379,11 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "is_active = 'Y'" in query
         assert "JSON_VALID(sacs.summary_text)" in query
         assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+        assert "p.status_code = 'ongoing'" in query
         assert ">= 15" in query
+        assert "MIN(COALESCE(" in query
+        assert "pe.open_changed_date" in query
+        assert ">= '2026-03-01 00:00:00'" in query
         assert "summary_type = 'character_rp_profile'" in query
         assert "summary_type = 'character_rp_examples'" in query
         assert "JSON_LENGTH" in query
@@ -400,7 +408,9 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         query = str(db.execute.await_args.args[0])
         params = db.execute.await_args.args[1]
         assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+        assert "p.status_code = 'ongoing'" in query
         assert "episode_stats.open_episode_count >= :minimum_open_episode_count" in query
+        assert "episode_stats.first_public_episode_at >= :first_public_episode_at" in query
         assert "summary_type = 'character_inventory_v3'" in query
         assert "$.public_slot_eligible" in query
         assert "$.public_chat_eligible" not in query
@@ -409,6 +419,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "summary_type = 'character_rp_examples'" in query
         assert "{_chat_ready_rp_assets_predicate" not in query
         assert params["minimum_open_episode_count"] == 15
+        assert params["first_public_episode_at"] == "2026-03-01 00:00:00"
         assert response == {"data": []}
 
     async def test_product_picker_lists_only_chat_ready_products_with_search_and_pagination(self):
@@ -479,6 +490,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         params = db.execute.await_args_list[1].args[1]
         for query in (count_query, list_query):
             assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
+            assert "p.status_code = 'ongoing'" in query
             assert "summary_type = 'character_inventory_v3'" in query
             assert "$.public_slot_eligible" in query
             assert "$.public_chat_eligible" not in query
@@ -487,9 +499,11 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             assert "summary_type = 'character_rp_examples'" in query
             assert "JSON_LENGTH" in query
             assert ">= :minimum_open_episode_count" in query
+            assert ">= :first_public_episode_at" in query
         assert "p.author_name LIKE :search_word" in list_query
         assert params["search_word"] == "%테스트%"
         assert params["minimum_open_episode_count"] == 15
+        assert params["first_public_episode_at"] == "2026-03-01 00:00:00"
         assert params["limit_count"] == 20
         assert params["offset_count"] == 20
         candidate_query = str(db.execute.await_args_list[2].args[0])
