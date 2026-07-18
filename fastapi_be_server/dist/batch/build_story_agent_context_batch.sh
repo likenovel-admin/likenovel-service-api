@@ -190,7 +190,10 @@ FROM (
     sacp.last_built_at AS last_built_at,
     SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count,
     SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_character_signal_count,
-    SUM(CASE WHEN sacs_scene.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_scene_count,
+    SUM(CASE
+      WHEN collection_cohort.product_id IS NOT NULL AND sacs_scene.summary_id IS NULL THEN 1
+      ELSE 0
+    END) AS missing_open_scene_count,
     GREATEST(
       SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END),
       SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END)
@@ -209,7 +212,7 @@ FROM (
         AND civ3.summary_type = 'character_inventory_v3'
         AND civ3.is_active = 'Y'
     ) AS active_character_inventory_v3_count,
-    (
+    CASE WHEN collection_cohort.product_id IS NULL THEN 0 ELSE (
       SELECT COUNT(*)
       FROM tb_story_agent_context_summary repair_inventory
       WHERE repair_inventory.product_id = p.product_id
@@ -295,12 +298,26 @@ FROM (
               )
           )
         )
-    ) AS character_asset_repair_needed
+    ) END AS character_asset_repair_needed
   FROM tb_product p
   JOIN tb_product_episode pe
     ON pe.product_id = p.product_id
    AND pe.use_yn = 'Y'
    AND pe.open_yn = 'Y'
+  LEFT JOIN (
+    SELECT cohort_episode.product_id
+    FROM tb_product_episode cohort_episode
+    WHERE cohort_episode.use_yn = 'Y'
+      AND cohort_episode.open_yn = 'Y'
+    GROUP BY cohort_episode.product_id
+    HAVING COUNT(*) >= 15
+       AND MIN(COALESCE(
+         cohort_episode.open_changed_date,
+         cohort_episode.publish_reserve_date,
+         cohort_episode.created_date
+       )) >= '2026-03-01 00:00:00'
+  ) collection_cohort
+    ON collection_cohort.product_id = p.product_id
   LEFT JOIN tb_story_agent_context_product sacp
     ON sacp.product_id = p.product_id
   LEFT JOIN tb_story_agent_context_summary sacs
@@ -349,25 +366,16 @@ FROM (
     AND p.blind_yn = 'N'
     AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
     AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
-    AND EXISTS (
-      SELECT 1
-      FROM tb_product_episode cohort_episode
-      WHERE cohort_episode.product_id = p.product_id
-        AND cohort_episode.use_yn = 'Y'
-        AND cohort_episode.open_yn = 'Y'
-      GROUP BY cohort_episode.product_id
-      HAVING COUNT(*) >= 15
-         AND MIN(COALESCE(
-           cohort_episode.open_changed_date,
-           cohort_episode.publish_reserve_date,
-           cohort_episode.created_date
-         )) >= '2026-03-01 00:00:00'
+    AND (
+      collection_cohort.product_id IS NOT NULL
+      OR COALESCE(sacp.context_status, 'pending') = 'ready'
     )
   GROUP BY
     p.product_id,
     p.title,
     sacp.context_status,
-    sacp.last_built_at
+    sacp.last_built_at,
+    collection_cohort.product_id
   HAVING
     missing_foundation_episode_count > 0
     OR missing_open_scene_count > 0

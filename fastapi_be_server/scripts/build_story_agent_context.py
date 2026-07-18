@@ -38,6 +38,10 @@ if str(ROOT_DIR) not in sys.path:
 from app.const import settings  # noqa: E402
 from app.services.common import comm_service  # noqa: E402
 from app.services.product.episode_service import _extract_epub_payload_from_epub  # noqa: E402
+from app.services.websochat.character_chat_product_policy import (  # noqa: E402
+    CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
+    CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +84,12 @@ EPISODE_SUMMARY_TIMEOUT_SECONDS = 120.0
 EPISODE_SUMMARY_TEMPERATURE = float(os.getenv("STORY_AGENT_SUMMARY_TEMPERATURE", "0.0"))
 EPISODE_SUMMARY_MAX_OUTPUT_TOKENS = 1400
 EPISODE_SUMMARY_MAX_INPUT_CHARS = 10000
-STORY_AGENT_COLLECTION_MIN_PUBLIC_EPISODE_COUNT = 15
-STORY_AGENT_COLLECTION_FIRST_PUBLIC_EPISODE_AT = "2026-03-01 00:00:00"
+STORY_AGENT_COLLECTION_MIN_PUBLIC_EPISODE_COUNT = (
+    CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT
+)
+STORY_AGENT_COLLECTION_FIRST_PUBLIC_EPISODE_AT = (
+    CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT
+)
 
 TARGET_CHUNK_LEN = 1600
 MAX_CHUNK_LEN = 2500
@@ -1043,6 +1051,10 @@ def build_story_agent_collection_cohort_sql(
 
 
 def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tuple[str, list[object]]:
+    character_asset_collection_cohort_sql = build_story_agent_collection_cohort_sql(
+        product_alias="p",
+        episode_alias="cohort_episode",
+    )
     where = [
         "p.price_type IN ('free', 'paid')",
         "p.status_code = 'ongoing'",
@@ -1052,9 +1064,9 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
         "COALESCE(p.blind_yn, 'N') = 'N'",
         "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'",
         "COALESCE(sacp.context_status, 'pending') <> 'disabled'",
-        build_story_agent_collection_cohort_sql(
-            product_alias="p",
-            episode_alias="cohort_episode",
+        (
+            f"({character_asset_collection_cohort_sql} "
+            "OR COALESCE(sacp.context_status, 'pending') = 'ready')"
         ),
     ]
     params: list[object] = []
@@ -1101,6 +1113,10 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
             pe.episode_content,
             pe.episode_text_count,
             pe.epub_file_id,
+            CASE
+                WHEN {character_asset_collection_cohort_sql} THEN 1
+                ELSE 0
+            END AS character_asset_collection_eligible,
             {file_select_sql}
         FROM tb_product p
         JOIN tb_product_episode pe
@@ -1113,6 +1129,24 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
         {limit_sql}
     """
     return query, params
+
+
+def is_story_agent_character_asset_collection_eligible(
+    product_rows: Iterable[dict],
+) -> bool:
+    return any(
+        str(
+            row.get(
+                "_character_asset_collection_eligible",
+                row.get("character_asset_collection_eligible"),
+            )
+            or ""
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "y", "yes"}
+        for row in product_rows
+    )
 
 
 def normalize_episode_html(html_content: str) -> str:
@@ -2301,6 +2335,9 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
 
     filtered_rows: list[dict] = []
     for product_id, product_rows in rows_by_product.items():
+        character_asset_collection_eligible = (
+            is_story_agent_character_asset_collection_eligible(product_rows)
+        )
         open_add_episode_ids = build_open_add_episode_id_set(
             cur,
             product_id=product_id,
@@ -2316,10 +2353,14 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
             product_id=product_id,
             product_rows=product_rows,
         )
-        scene_repair_episode_ids = build_scene_repair_episode_id_set(
-            cur,
-            product_id=product_id,
-            product_rows=product_rows,
+        scene_repair_episode_ids = (
+            build_scene_repair_episode_id_set(
+                cur,
+                product_id=product_id,
+                product_rows=product_rows,
+            )
+            if character_asset_collection_eligible
+            else set()
         )
         product_filtered_rows: list[dict] = []
         for row in product_rows:
@@ -2327,18 +2368,30 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
             if episode_id in open_add_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "open_add"
+                next_row["_character_asset_collection_eligible"] = (
+                    character_asset_collection_eligible
+                )
                 product_filtered_rows.append(next_row)
             elif episode_id in repair_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "sync_repair"
+                next_row["_character_asset_collection_eligible"] = (
+                    character_asset_collection_eligible
+                )
                 product_filtered_rows.append(next_row)
             elif episode_id in signal_repair_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "signal_repair"
+                next_row["_character_asset_collection_eligible"] = (
+                    character_asset_collection_eligible
+                )
                 product_filtered_rows.append(next_row)
             elif episode_id in scene_repair_episode_ids:
                 next_row = dict(row)
                 next_row["_delta_reason"] = "scene_repair"
+                next_row["_character_asset_collection_eligible"] = (
+                    character_asset_collection_eligible
+                )
                 product_filtered_rows.append(next_row)
         reason_priority = {
             "open_add": 0,
@@ -14227,6 +14280,15 @@ async def repair_character_chat_assets(
     work_conn = db_connect()
     try:
         for product_id, product_rows in sorted(rows_by_product.items()):
+            if not is_story_agent_character_asset_collection_eligible(product_rows):
+                repair_records.append(
+                    {"product_id": product_id, "status": "skipped_cohort"}
+                )
+                logger.info(
+                    "story_agent_character_asset_repair_skipped_cohort product_id=%s",
+                    product_id,
+                )
+                continue
             results["character_asset_repair_attempted"] += 1
             repair_record: dict[str, object] = {"product_id": product_id}
             try:
@@ -14885,6 +14947,9 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
         for product_id, product_rows in rows_by_product.items():
             product_failed = False
             failed_ready_episode_count = 0
+            character_asset_collection_eligible = (
+                is_story_agent_character_asset_collection_eligible(product_rows)
+            )
             touched_episode_nos = sorted(
                 set(int(row.get("episode_no") or 0) for row in product_rows if int(row.get("episode_no") or 0) > 0)
             )
@@ -15098,80 +15163,95 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 product_id=product_id,
                             )
                         work_conn.commit()
-                        scene_counts = await build_episode_scene_extraction_summaries_nonblocking(
-                            conn=work_conn,
-                            product_id=product_id,
-                            product_title=str(product_rows[0].get("title") or ""),
-                            episode_rows=touched_episode_summary_rows,
-                            episode_texts_by_no=episode_texts_by_no,
-                            summary_client=summary_client,
-                            canonical_character_packet=build_episode_scene_canonical_character_packet(new_inventory_v3_map),
-                            cleanup_missing_scopes=False,
-                            verbose=args.verbose,
-                        )
-                        results["inserted_episode_scene_extractions"] += scene_counts[0]
-                        results["reused_episode_scene_extractions"] += scene_counts[1]
-                        with work_cursor(work_conn) as cur:
-                            touched_scene_rows = fetch_active_summary_rows_for_episode_nos(
-                                cur,
-                                product_id=product_id,
-                                summary_type="episode_scene_extraction",
-                                episode_nos=touched_episode_nos,
-                            )
-                        scene_affected_scope_keys = set(
-                            build_character_chat_scene_context_lines_by_scope(touched_scene_rows).keys()
-                        )
-                        rp_affected_scope_keys = compute_rp_affected_scope_keys(
-                            old_inventory_map=old_inventory_v3_map,
-                            new_inventory_map=new_inventory_v3_map,
-                            old_relation_map=old_relation_map,
-                            new_relation_map=new_relation_map,
-                            old_touched_signal_rows=old_touched_signal_rows,
-                            new_touched_signal_rows=new_touched_signal_rows,
-                            old_profile_map=old_profile_map,
-                            old_examples_map=old_examples_map,
-                            old_internal_prompt_map=old_internal_prompt_map,
-                            cleanup_scope_keys=set(character_cleanup.get("touched_scope_keys") or []),
-                        )
-                        rp_affected_scope_keys.update(scene_affected_scope_keys)
                         rp_counts = build_empty_delta_rp_counts()
                         opening_counts = (0, 0)
-                        rp_scope_keys_to_build = select_delta_rp_scope_keys(
-                            refresh_requested=should_refresh_delta_rp(args),
-                            affected_scope_keys=rp_affected_scope_keys,
-                            inventory_map=new_inventory_v3_map,
-                            profile_map=old_profile_map,
-                            examples_map=old_examples_map,
-                        )
-                        if rp_scope_keys_to_build:
-                            if args.verbose and not should_refresh_delta_rp(args):
-                                print(
-                                    f"[delta-rp-missing-build] product_id={product_id} "
-                                    f"scope_keys={','.join(sorted(rp_scope_keys_to_build))}"
-                                )
-                            with work_cursor(work_conn) as cur:
-                                historical_inventory_state_map = (
-                                    fetch_rp_ready_character_inventory_history_state_map(
-                                        cur,
-                                        product_id=product_id,
-                                    )
-                                )
-                            rp_counts = await build_rp_summaries_delta(
+                        rp_affected_scope_keys: set[str] = set()
+                        if character_asset_collection_eligible:
+                            scene_counts = await build_episode_scene_extraction_summaries_nonblocking(
                                 conn=work_conn,
                                 product_id=product_id,
-                                affected_scope_keys=rp_scope_keys_to_build,
-                                episode_rows=all_episode_summary_rows,
+                                product_title=str(product_rows[0].get("title") or ""),
+                                episode_rows=touched_episode_summary_rows,
                                 episode_texts_by_no=episode_texts_by_no,
                                 summary_client=summary_client,
-                                inventory_map=new_inventory_v3_map,
-                                relation_map=new_relation_scope_map,
-                                historical_inventory_state_map=historical_inventory_state_map,
+                                canonical_character_packet=build_episode_scene_canonical_character_packet(
+                                    new_inventory_v3_map
+                                ),
+                                cleanup_missing_scopes=False,
                                 verbose=args.verbose,
                             )
-                        elif args.verbose and rp_affected_scope_keys:
-                            print(
-                                f"[delta-rp-skip] product_id={product_id} "
-                                f"affected_scope_keys={len(rp_affected_scope_keys)}"
+                            results["inserted_episode_scene_extractions"] += scene_counts[0]
+                            results["reused_episode_scene_extractions"] += scene_counts[1]
+                            with work_cursor(work_conn) as cur:
+                                touched_scene_rows = fetch_active_summary_rows_for_episode_nos(
+                                    cur,
+                                    product_id=product_id,
+                                    summary_type="episode_scene_extraction",
+                                    episode_nos=touched_episode_nos,
+                                )
+                            scene_affected_scope_keys = set(
+                                build_character_chat_scene_context_lines_by_scope(
+                                    touched_scene_rows
+                                ).keys()
+                            )
+                            rp_affected_scope_keys = compute_rp_affected_scope_keys(
+                                old_inventory_map=old_inventory_v3_map,
+                                new_inventory_map=new_inventory_v3_map,
+                                old_relation_map=old_relation_map,
+                                new_relation_map=new_relation_map,
+                                old_touched_signal_rows=old_touched_signal_rows,
+                                new_touched_signal_rows=new_touched_signal_rows,
+                                old_profile_map=old_profile_map,
+                                old_examples_map=old_examples_map,
+                                old_internal_prompt_map=old_internal_prompt_map,
+                                cleanup_scope_keys=set(
+                                    character_cleanup.get("touched_scope_keys") or []
+                                ),
+                            )
+                            rp_affected_scope_keys.update(scene_affected_scope_keys)
+                            rp_scope_keys_to_build = select_delta_rp_scope_keys(
+                                refresh_requested=should_refresh_delta_rp(args),
+                                affected_scope_keys=rp_affected_scope_keys,
+                                inventory_map=new_inventory_v3_map,
+                                profile_map=old_profile_map,
+                                examples_map=old_examples_map,
+                            )
+                            if rp_scope_keys_to_build:
+                                if args.verbose and not should_refresh_delta_rp(args):
+                                    print(
+                                        f"[delta-rp-missing-build] product_id={product_id} "
+                                        f"scope_keys={','.join(sorted(rp_scope_keys_to_build))}"
+                                    )
+                                with work_cursor(work_conn) as cur:
+                                    historical_inventory_state_map = (
+                                        fetch_rp_ready_character_inventory_history_state_map(
+                                            cur,
+                                            product_id=product_id,
+                                        )
+                                    )
+                                rp_counts = await build_rp_summaries_delta(
+                                    conn=work_conn,
+                                    product_id=product_id,
+                                    affected_scope_keys=rp_scope_keys_to_build,
+                                    episode_rows=all_episode_summary_rows,
+                                    episode_texts_by_no=episode_texts_by_no,
+                                    summary_client=summary_client,
+                                    inventory_map=new_inventory_v3_map,
+                                    relation_map=new_relation_scope_map,
+                                    historical_inventory_state_map=historical_inventory_state_map,
+                                    verbose=args.verbose,
+                                )
+                            elif args.verbose and rp_affected_scope_keys:
+                                print(
+                                    f"[delta-rp-skip] product_id={product_id} "
+                                    f"affected_scope_keys={len(rp_affected_scope_keys)}"
+                                )
+                        else:
+                            logger.info(
+                                "story_agent_scene_collection_skipped_cohort "
+                                "product_id=%s episode_count=%s",
+                                product_id,
+                                len(touched_episode_summary_rows),
                             )
                         results["inserted_character_chat_openings"] += opening_counts[0]
                         results["reused_character_chat_openings"] += opening_counts[1]

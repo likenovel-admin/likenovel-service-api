@@ -55,6 +55,9 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         self.assertIn("p.status_code = 'ongoing'", query)
         self.assertIn("p.open_yn = 'Y'", query)
         self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", query)
+        self.assertIn("AS characterChatEligible", query)
+        self.assertIn("COUNT(*) >= 15", query)
+        self.assertIn(">= '2026-03-01 00:00:00'", query)
         self.assertIn("p.product_id IN (%s, %s)", query)
         self.assertIn("LIMIT %s", query)
         self.assertEqual(params, [100, 200, 10])
@@ -63,9 +66,10 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         module = load_module()
 
         query, params = module.build_product_query(product_ids=[], limit=0, open_only=False)
+        outer_where = query.rsplit("WHERE", 1)[-1]
 
         self.assertNotIn("p.price_type IN", query)
-        self.assertNotIn("p.status_code = 'ongoing'", query)
+        self.assertNotIn("p.status_code = 'ongoing'", outer_where)
         self.assertNotIn("p.ai_content_service_enabled_yn", query)
         self.assertNotIn("LIMIT %s", query)
         self.assertEqual(params, [])
@@ -75,6 +79,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         rows = [
             {
                 "product_id": 1,
+                "characterChatEligible": 1,
                 "context_status": "ready",
                 "character_chat_asset_readiness": {
                     "character_chat_status": "ready",
@@ -86,6 +91,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
             },
             {
                 "product_id": 2,
+                "characterChatEligible": 1,
                 "context_status": "ready",
                 "character_chat_asset_readiness": {
                     "character_chat_status": "hold",
@@ -99,6 +105,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
             },
             {
                 "product_id": 3,
+                "characterChatEligible": 1,
                 "context_status": "",
                 "character_chat_asset_readiness": {
                     "character_chat_status": "none_eligible",
@@ -148,6 +155,34 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         self.assertEqual(summary["readyWithoutMainProtagonistCount"], 1)
         self.assertEqual(summary["readyWithoutMainProtagonistProductIds"], [1])
         self.assertEqual(summary["holdProductIdsSample"], [2])
+
+    def test_out_of_cohort_hold_is_observed_without_actionable_alert(self):
+        module = load_module()
+        rows = [
+            {
+                "product_id": 787,
+                "characterChatEligible": 0,
+                "context_status": "ready",
+                "character_chat_asset_readiness": {
+                    "character_chat_status": "hold",
+                    "public_candidate_count": 1,
+                    "ready_public_candidate_count": 0,
+                    "public_slot_ready_count": 0,
+                    "block_reason_counts": {"missing_usable_scene": 1},
+                },
+            }
+        ]
+
+        summary = module.summarize_verifications(rows)
+
+        self.assertEqual(summary["outOfCohortHoldCount"], 1)
+        self.assertEqual(summary["outOfCohortHoldProductIds"], [787])
+        self.assertEqual(summary["actionPlanCounts"], {})
+        self.assertEqual(rows[0]["assetActionPlan"], ["out_of_cohort_hold"])
+        self.assertEqual(
+            module.build_audit_exit_code(summary, fail_on_actionable=True),
+            0,
+        )
 
     def test_load_env_file_reads_key_values_without_printing_or_sourcing(self):
         module = load_module()
