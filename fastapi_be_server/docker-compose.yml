@@ -117,6 +117,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env # 환경변수 파일 명시적으로 지정
+    environment:
+      LOCAL_BATCH_CRON_ENABLE: "${LOCAL_BATCH_CRON_ENABLE:-0}"
     # NOTE:
     # - 로컬 개발(특히 Windows)에서 nginx 인증서 마운트가 불가능한 경우가 많아,
     #   API 컨테이너 포트를 직접 호스트로 노출합니다.
