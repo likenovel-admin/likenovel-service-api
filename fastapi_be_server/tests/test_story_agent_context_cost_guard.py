@@ -2119,6 +2119,111 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             [current_scope_key, current_scope_key],
         )
 
+    def test_rp_example_episode_evidence_backfill_uses_unique_exact_source_match_only(self):
+        module = load_module()
+        payload = {
+            "character_key": "character:레이븐",
+            "examples": [
+                {"episode_no": 0, "text": "유일하게 남은 대사"},
+                {"episode_no": 0, "text": "두 번 나온 대사"},
+                {"episode_no": 7, "text": "이미 근거가 있는 대사"},
+            ],
+        }
+
+        repaired, recovered_count = module.backfill_rp_example_episode_evidence(
+            payload,
+            {
+                1: "두 번 나온 대사",
+                2: "유일하게 남은 대사와 두 번 나온 대사",
+                7: "이미 근거가 있는 대사",
+            },
+        )
+
+        self.assertEqual(recovered_count, 1)
+        self.assertEqual(
+            [item["episode_no"] for item in repaired["examples"]],
+            [2, 0, 7],
+        )
+        self.assertEqual(
+            [item["episode_no"] for item in payload["examples"]],
+            [0, 0, 7],
+        )
+
+    async def test_delta_rp_build_repairs_exact_key_examples_without_provider(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:레이븐:dup:faa369a2"
+        state_maps = {
+            "character_rp_profile": {
+                scope_key: {
+                    "scope_key": scope_key,
+                    "source_hash": "profile-hash",
+                    "payload": {
+                        "character_key": scope_key,
+                        "display_name": "레이븐",
+                    },
+                }
+            },
+            "character_rp_examples": {
+                scope_key: {
+                    "scope_key": scope_key,
+                    "source_hash": "examples-without-evidence-hash",
+                    "payload": {
+                        "character_key": scope_key,
+                        "examples": [
+                            {"episode_no": 0, "text": "유일하게 남은 대사"},
+                            {"episode_no": 0, "text": "두 번 나온 대사"},
+                        ],
+                    },
+                }
+            },
+        }
+        upserted = []
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return {"summary_id": 21}, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module, "RP_OPENROUTER_MODEL", ""), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1103,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no={
+                    1: "두 번 나온 대사",
+                    2: "유일하게 남은 대사와 두 번 나온 대사",
+                },
+                summary_client=None,
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "display_name": "레이븐",
+                        "aliases": ["레이븐"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 117,
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [0, 1])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual(len(upserted), 1)
+        self.assertEqual(upserted[0]["summary_type"], "character_rp_examples")
+        saved_payload = json.loads(upserted[0]["summary_text"])
+        self.assertEqual(
+            [item["episode_no"] for item in saved_payload["examples"]],
+            [2, 0],
+        )
+
     async def test_delta_rp_build_does_not_recover_history_by_name_only(self):
         module = load_module()
         conn = FakeConnection()
