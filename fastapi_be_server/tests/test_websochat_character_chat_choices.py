@@ -405,6 +405,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                     "title": "테스트 작품",
                     "latestEpisodeNo": 14,
                     "syncedLatestEpisodeNo": 14,
+                    "characterChatEligible": True,
                 },
             ),
             patch.object(websochat_service, "_assert_websochat_product_context_available"),
@@ -601,6 +602,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 "product_id": 123,
                 "title": "테스트 작품",
                 "synced_latest_episode_no": 10,
+                "characterChatEligible": True,
             }
             clamp_scope.return_value = (dict(session_memory), {"maxAuthorizedEpisodeTo": 10})
             resolve_character.return_value = {
@@ -758,6 +760,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 "product_id": 123,
                 "title": "테스트 작품",
                 "synced_latest_episode_no": 10,
+                "characterChatEligible": True,
             }
             clamp_scope.return_value = (dict(session_memory), {"maxAuthorizedEpisodeTo": 10})
             resolve_character.return_value = {
@@ -900,6 +903,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 "product_id": 123,
                 "title": "테스트 작품",
                 "synced_latest_episode_no": 10,
+                "characterChatEligible": True,
             }
             clamp_scope.return_value = (dict(session_memory), {"maxAuthorizedEpisodeTo": 10})
             resolve_character.return_value = {
