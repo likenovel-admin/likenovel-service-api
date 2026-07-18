@@ -973,6 +973,11 @@ def parse_args() -> argparse.Namespace:
         help="delta 모드에서 신규 회차가 없어도 캐릭터 scene/RP 결손을 제한적으로 복구.",
     )
     parser.add_argument(
+        "--reaggregate-character-inventory",
+        action="store_true",
+        help="delta 모드에서 신규 회차 없이 기존 신호로 캐릭터/관계 인벤토리를 재집계. provider 불요.",
+    )
+    parser.add_argument(
         "--verification-json-path",
         type=str,
         default="",
@@ -2159,6 +2164,8 @@ def validate_delta_args(args: argparse.Namespace) -> None:
     if args.build_mode != "delta":
         if bool(getattr(args, "repair_character_assets", False)):
             raise ValueError("--repair-character-assets는 --build-mode delta에서만 사용할 수 있습니다.")
+        if bool(getattr(args, "reaggregate_character_inventory", False)):
+            raise ValueError("--reaggregate-character-inventory는 --build-mode delta에서만 사용할 수 있습니다.")
         return
     if args.limit:
         raise ValueError("--build-mode delta 에서는 --limit를 지원하지 않습니다.")
@@ -2166,6 +2173,8 @@ def validate_delta_args(args: argparse.Namespace) -> None:
         raise ValueError("--build-mode delta 에서는 --product-id가 필수입니다.")
     if args.max_delta_episodes < 0:
         raise ValueError("--max-delta-episodes 는 0 이상이어야 합니다.")
+    if bool(getattr(args, "reaggregate_character_inventory", False)) and not args.apply:
+        raise ValueError("--reaggregate-character-inventory는 --apply와 함께 사용해야 합니다.")
 
 
 def should_refresh_delta_rp(args: argparse.Namespace) -> bool:
@@ -14610,13 +14619,121 @@ async def repair_character_chat_assets(
         work_conn.close()
 
 
+async def reaggregate_character_inventory_foundations(
+    *,
+    rows: Iterable[dict],
+    args: argparse.Namespace,
+    results: dict[str, object],
+) -> None:
+    reaggregation_records = results.setdefault("inventory_reaggregations", [])
+    if not isinstance(reaggregation_records, list):
+        raise TypeError("story-agent reaggregation results must contain list fields")
+    product_ids = sorted({int(row["product_id"]) for row in rows})
+    if not product_ids:
+        return
+
+    work_conn = db_connect()
+    try:
+        for product_id in product_ids:
+            results["inventory_reaggregation_attempted"] += 1
+            record: dict[str, object] = {"product_id": product_id}
+            try:
+                with product_lock_connection(product_id) if args.apply else nullcontext(None) as lock_conn:
+                    if args.apply and lock_conn is None:
+                        record["status"] = "locked"
+                        results["inventory_reaggregation_no_progress"] += 1
+                        reaggregation_records.append(record)
+                        continue
+
+                    with work_cursor(work_conn) as cur:
+                        inventory_counts = build_character_inventory_summaries(
+                            cur=cur,
+                            product_id=product_id,
+                        )
+                        inventory_v3_counts = build_character_inventory_v3_summaries(
+                            cur=cur,
+                            product_id=product_id,
+                            protagonist_resolution=None,
+                        )
+                        relation_counts = build_relation_inventory_summaries(
+                            cur=cur,
+                            product_id=product_id,
+                        )
+                        character_cleanup = cleanup_duplicate_character_inventory_rows(
+                            cur,
+                            product_id=product_id,
+                        )
+                        cleanup_duplicate_relation_inventory_rows(
+                            cur,
+                            product_id=product_id,
+                            canonical_character_key_by_display_name=dict(
+                                character_cleanup.get("canonical_character_key_by_display_name") or {}
+                            ),
+                        )
+                        assert_story_agent_foundation_invariants(
+                            cur=cur,
+                            product_id=product_id,
+                        )
+                        touch_product_context_build_attempt(
+                            cur,
+                            product_id=product_id,
+                        )
+                    work_conn.commit()
+
+                    changed = (
+                        int(inventory_counts[0])
+                        + int(inventory_v3_counts[0])
+                        + int(relation_counts[0])
+                    ) > 0
+                    results[
+                        "inventory_reaggregation_updated"
+                        if changed
+                        else "inventory_reaggregation_no_progress"
+                    ] += 1
+                    record.update(
+                        {
+                            "status": "updated" if changed else "no_progress",
+                            "inventory_counts": [int(inventory_counts[0]), int(inventory_counts[1])],
+                            "inventory_v3_counts": [int(inventory_v3_counts[0]), int(inventory_v3_counts[1])],
+                            "relation_counts": [int(relation_counts[0]), int(relation_counts[1])],
+                        }
+                    )
+                    reaggregation_records.append(record)
+                    logger.info(
+                        "story_agent_inventory_reaggregation product_id=%s status=%s inventory=%s inventory_v3=%s relation=%s",
+                        product_id,
+                        record["status"],
+                        record["inventory_counts"],
+                        record["inventory_v3_counts"],
+                        record["relation_counts"],
+                    )
+            except Exception as exc:
+                try:
+                    work_conn.rollback()
+                except Exception:
+                    pass
+                results["inventory_reaggregation_failed"] += 1
+                record.update({"status": "failed", "error": str(exc)[:240]})
+                reaggregation_records.append(record)
+                logger.exception(
+                    "story_agent_inventory_reaggregation_failed product_id=%s error=%s",
+                    product_id,
+                    str(exc)[:240],
+                )
+    finally:
+        work_conn.close()
+
+
 def build_delta_exit_code(results: dict[str, object], *, apply: bool) -> int:
     if not apply:
         return 0
     for product in list(results.get("products") or []):
         if str((product or {}).get("context_status") or "").strip() == "failed":
             return 1
-    return int(int(results.get("character_asset_repair_failed") or 0) > 0)
+    return int(
+        int(results.get("character_asset_repair_failed") or 0) > 0
+        or int(results.get("inventory_reaggregation_failed") or 0) > 0
+    )
 
 
 def build_empty_results() -> dict[str, object]:
@@ -14655,6 +14772,11 @@ def build_empty_results() -> dict[str, object]:
         "character_asset_repair_no_progress": 0,
         "character_asset_repair_failed": 0,
         "character_asset_repairs": [],
+        "inventory_reaggregation_attempted": 0,
+        "inventory_reaggregation_updated": 0,
+        "inventory_reaggregation_no_progress": 0,
+        "inventory_reaggregation_failed": 0,
+        "inventory_reaggregations": [],
         "skipped_rows": 0,
         "products": [],
         "delta_verifications": [],
@@ -15492,6 +15614,10 @@ def print_summary(results: dict[str, object], apply: bool) -> None:
         f"character_asset_repair_recovered={results['character_asset_repair_recovered']} "
         f"character_asset_repair_no_progress={results['character_asset_repair_no_progress']} "
         f"character_asset_repair_failed={results['character_asset_repair_failed']} "
+        f"inventory_reaggregation_attempted={results['inventory_reaggregation_attempted']} "
+        f"inventory_reaggregation_updated={results['inventory_reaggregation_updated']} "
+        f"inventory_reaggregation_no_progress={results['inventory_reaggregation_no_progress']} "
+        f"inventory_reaggregation_failed={results['inventory_reaggregation_failed']} "
         f"skipped_rows={results['skipped_rows']}"
     )
     for product in list(results.get("products") or [])[:20]:
@@ -15602,6 +15728,7 @@ async def main() -> int:
     query, params = build_target_query(args=args, use_epub_fallback=args.use_epub_fallback)
     rows: list[dict] = []
     character_asset_repair_rows: list[dict] = []
+    inventory_reaggregation_rows: list[dict] = []
     delta_status_repaired_products: list[dict[str, object]] = []
     conn = db_connect()
     try:
@@ -15611,6 +15738,8 @@ async def main() -> int:
             if args.build_mode == "delta":
                 if args.apply and bool(args.repair_character_assets):
                     character_asset_repair_rows = list(rows)
+                if args.apply and bool(args.reaggregate_character_inventory):
+                    inventory_reaggregation_rows = list(rows)
                 if args.apply:
                     delta_status_repaired_products = repair_failed_delta_context_statuses(cur, rows)
                     if delta_status_repaired_products:
@@ -15638,6 +15767,12 @@ async def main() -> int:
                 *delta_status_repaired_products,
                 *list(results.get("products") or []),
             ]
+        if inventory_reaggregation_rows:
+            await reaggregate_character_inventory_foundations(
+                rows=inventory_reaggregation_rows,
+                args=args,
+                results=results,
+            )
         if character_asset_repair_rows:
             await repair_character_chat_assets(
                 rows=character_asset_repair_rows,
