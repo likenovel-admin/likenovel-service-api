@@ -799,7 +799,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         activate_existing.assert_called_once_with(ANY, 123, 687, "episode_character_signals", "episode:1001")
         self.assertEqual(conn.commit_count, 1)
 
-    async def test_episode_character_signal_failure_deactivates_stale_scope_and_stops_product(self):
+    async def test_episode_character_signal_failure_preserves_last_good_scope_and_stops_product(self):
         module = load_module()
         conn = FakeConnection()
         rows = [{
@@ -834,13 +834,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 )
 
         request_mock.assert_awaited_once()
-        deactivate_scope.assert_called_once_with(
-            ANY,
-            product_id=687,
-            summary_type="episode_character_signals",
-            scope_key="episode:1001",
-        )
-        self.assertEqual(conn.commit_count, 1)
+        deactivate_scope.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
 
     async def test_episode_character_signals_429_honors_retry_after_before_retry(self):
         module = load_module()
@@ -4049,7 +4044,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(args.max_delta_episodes, 5)
 
-    def test_target_queries_include_paid_ongoing_products(self):
+    def test_target_queries_limit_future_collection_to_recent_ongoing_products(self):
         module = load_module()
 
         args = SimpleNamespace(product_ids=[], episode_ids=[], episode_nos=[], limit=0)
@@ -4059,6 +4054,15 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertIn("p.price_type IN ('free', 'paid')", query)
         self.assertIn("p.status_code = 'ongoing'", query)
         self.assertIn("pe.open_yn = 'Y'", query)
+        self.assertIn("FROM tb_product_episode cohort_episode", query)
+        self.assertIn("cohort_episode.use_yn = 'Y'", query)
+        self.assertIn("cohort_episode.open_yn = 'Y'", query)
+        self.assertIn("HAVING COUNT(*) >= 15", query)
+        self.assertIn("MIN(COALESCE(", query)
+        self.assertIn("cohort_episode.open_changed_date", query)
+        self.assertIn("cohort_episode.publish_reserve_date", query)
+        self.assertIn("cohort_episode.created_date", query)
+        self.assertIn(">= '2026-03-01 00:00:00'", query)
         self.assertIn("COALESCE(p.blind_yn, 'N') = 'N'", query)
         self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", query)
         self.assertIn("COALESCE(sacp.context_status, 'pending') <> 'disabled'", query)

@@ -80,6 +80,8 @@ EPISODE_SUMMARY_TIMEOUT_SECONDS = 120.0
 EPISODE_SUMMARY_TEMPERATURE = float(os.getenv("STORY_AGENT_SUMMARY_TEMPERATURE", "0.0"))
 EPISODE_SUMMARY_MAX_OUTPUT_TOKENS = 1400
 EPISODE_SUMMARY_MAX_INPUT_CHARS = 10000
+STORY_AGENT_COLLECTION_MIN_PUBLIC_EPISODE_COUNT = 15
+STORY_AGENT_COLLECTION_FIRST_PUBLIC_EPISODE_AT = "2026-03-01 00:00:00"
 
 TARGET_CHUNK_LEN = 1600
 MAX_CHUNK_LEN = 2500
@@ -1017,6 +1019,29 @@ def release_product_lock(cur, product_id: int) -> None:
     cur.execute("SELECT RELEASE_LOCK(%s)", (f"story-agent-context-product:{product_id}",))
 
 
+def build_story_agent_collection_cohort_sql(
+    *,
+    product_alias: str,
+    episode_alias: str,
+) -> str:
+    return f"""
+        EXISTS (
+            SELECT 1
+            FROM tb_product_episode {episode_alias}
+            WHERE {episode_alias}.product_id = {product_alias}.product_id
+              AND {episode_alias}.use_yn = 'Y'
+              AND {episode_alias}.open_yn = 'Y'
+            GROUP BY {episode_alias}.product_id
+            HAVING COUNT(*) >= {STORY_AGENT_COLLECTION_MIN_PUBLIC_EPISODE_COUNT}
+               AND MIN(COALESCE(
+                   {episode_alias}.open_changed_date,
+                   {episode_alias}.publish_reserve_date,
+                   {episode_alias}.created_date
+               )) >= '{STORY_AGENT_COLLECTION_FIRST_PUBLIC_EPISODE_AT}'
+        )
+    """
+
+
 def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tuple[str, list[object]]:
     where = [
         "p.price_type IN ('free', 'paid')",
@@ -1027,6 +1052,10 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
         "COALESCE(p.blind_yn, 'N') = 'N'",
         "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'",
         "COALESCE(sacp.context_status, 'pending') <> 'disabled'",
+        build_story_agent_collection_cohort_sql(
+            product_alias="p",
+            episode_alias="cohort_episode",
+        ),
     ]
     params: list[object] = []
 
@@ -7281,6 +7310,12 @@ async def build_episode_character_signals_summaries(
                 summary_text=summary_text,
             )
         except Exception as exc:
+            logger.warning(
+                "story_agent_character_signals_keep_old product_id=%s episode_no=%s error=%s",
+                product_id,
+                episode_no,
+                str(exc)[:240],
+            )
             if verbose:
                 if isinstance(exc, EpisodeCharacterSignalsParseError):
                     print(
@@ -7296,14 +7331,6 @@ async def build_episode_character_signals_summaries(
                         f"preview={json.dumps(exc.raw_preview, ensure_ascii=False)}"
                     )
                 print(f"[character-signals-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
-            with work_cursor(conn) as cur:
-                deactivate_active_scope(
-                    cur,
-                    product_id=product_id,
-                    summary_type="episode_character_signals",
-                    scope_key=scope_key,
-                )
-            conn.commit()
             raise
         normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
         with work_cursor(conn) as cur:
