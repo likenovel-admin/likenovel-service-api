@@ -286,6 +286,9 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                     ]
                 }
 
+            def raise_for_status(self):
+                return None
+
         class FakeAsyncClient:
             def __init__(self, *, timeout):
                 captured["timeout"] = timeout
@@ -295,6 +298,21 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
             async def __aexit__(self, exc_type, exc, tb):
                 return False
+
+            async def get(self, url, **kwargs):
+                class FakeCreditResponse:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self):
+                        return {
+                            "data": {
+                                "total_credits": 20.0,
+                                "total_usage": 10.0,
+                            }
+                        }
+
+                return FakeCreditResponse()
 
             async def post(self, url, *, headers, json):
                 captured["url"] = url
@@ -336,6 +354,57 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
         )
         self.assertNotIn("anthropic", json.dumps(captured["payload"]).lower())
 
+    def test_default_reader_llm_call_blocks_below_background_reserve(self):
+        from app.services.ai import reader_agent_decision_service as service
+        from app.services.common.openrouter_background_credit_guard import (
+            OpenRouterBackgroundCreditReserveError,
+        )
+
+        calls = {"post": 0}
+
+        class FakeCreditResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": {"total_credits": 20.0, "total_usage": 19.0}
+                }
+
+        class FakeAsyncClient:
+            def __init__(self, *, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, **kwargs):
+                return FakeCreditResponse()
+
+            async def post(self, url, **kwargs):
+                calls["post"] += 1
+                raise AssertionError("completion must not be sent")
+
+        with patch.object(service.settings, "OPENROUTER_API_KEY", "openrouter-key"):
+            with patch.object(service.settings, "OPENROUTER_BASE_URL", "https://openrouter.test/api/v1"):
+                with patch.object(service.settings, "AI_READER_OPENROUTER_MODEL", "deepseek/deepseek-v3.2"):
+                    with patch.object(service.httpx, "AsyncClient", FakeAsyncClient):
+                        with self.assertRaises(OpenRouterBackgroundCreditReserveError):
+                            asyncio.run(
+                                service._default_llm_call(
+                                    "system prompt",
+                                    "user prompt",
+                                    123,
+                                )
+                            )
+
+        self.assertEqual(calls["post"], 0)
+
     def test_default_reader_llm_call_retries_empty_openrouter_choices_once(self):
         from app.services.ai import reader_agent_decision_service as service
 
@@ -362,6 +431,9 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
             def json(self):
                 return self._payload
 
+            def raise_for_status(self):
+                return None
+
         class FakeAsyncClient:
             def __init__(self, *, timeout):
                 self.timeout = timeout
@@ -371,6 +443,11 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
             async def __aexit__(self, exc_type, exc, tb):
                 return False
+
+            async def get(self, url, **kwargs):
+                return FakeResponse(
+                    {"data": {"total_credits": 20.0, "total_usage": 10.0}}
+                )
 
             async def post(self, url, *, headers, json):
                 calls["count"] += 1

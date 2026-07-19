@@ -37,6 +37,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from app.const import settings  # noqa: E402
 from app.services.common import comm_service  # noqa: E402
+from app.services.common.openrouter_background_credit_guard import (  # noqa: E402
+    OpenRouterBackgroundCreditGuardError,
+    assert_openrouter_background_credit_available_async,
+    post_openrouter_background_chat_completion_async,
+)
 from app.services.product.episode_service import _extract_epub_payload_from_epub  # noqa: E402
 from app.services.websochat.character_chat_product_policy import (  # noqa: E402
     CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
@@ -1514,8 +1519,10 @@ async def request_rp_openrouter_json_payload(
 ) -> dict | None:
     request_timeout_seconds = timeout_seconds or RP_OPENROUTER_TIMEOUT_SECONDS
     response = await asyncio.wait_for(
-        client.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
+        post_openrouter_background_chat_completion_async(
+            client,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
@@ -1541,8 +1548,10 @@ async def request_episode_scene_extraction_openrouter_json_payload(
     user_prompt: str,
 ) -> dict | None:
     response = await asyncio.wait_for(
-        client.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
+        post_openrouter_background_chat_completion_async(
+            client,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
@@ -1742,8 +1751,10 @@ async def request_episode_summary_text(
     row: dict,
     normalized_text: str,
 ) -> str:
-    response = await client.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
+    response = await post_openrouter_background_chat_completion_async(
+        client,
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
@@ -1763,10 +1774,6 @@ async def request_episode_summary_text(
     return extract_openrouter_message_text(response.json())
 
 
-def is_openrouter_payment_required_error(exc: BaseException) -> bool:
-    return isinstance(exc, HTTPStatusError) and getattr(exc.response, "status_code", None) == 402
-
-
 def is_anthropic_billing_error(exc: BaseException) -> bool:
     if not isinstance(exc, HTTPStatusError):
         return False
@@ -1780,27 +1787,11 @@ def is_anthropic_billing_error(exc: BaseException) -> bool:
 async def assert_storyctx_openrouter_apply_ready(client: AsyncClient | None) -> None:
     if client is None or not OPENROUTER_API_KEY or not (EPISODE_SUMMARY_MODEL or RP_OPENROUTER_MODEL):
         return
-    model = EPISODE_SUMMARY_MODEL or RP_OPENROUTER_MODEL
-    try:
-        response = await client.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "X-Title": "LikeNovel Story Agent OpenRouter Preflight",
-            },
-            json={
-                "model": model,
-                "temperature": 0.0,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "ping"}],
-            },
-        )
-        response.raise_for_status()
-    except HTTPStatusError as exc:
-        if is_openrouter_payment_required_error(exc):
-            raise RuntimeError("OpenRouter preflight failed: 402 Payment Required") from exc
-        raise
+    await assert_openrouter_background_credit_available_async(
+        client,
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
+    )
 
 
 async def assert_storyctx_anthropic_apply_ready(client: AsyncClient | None) -> None:
@@ -1861,7 +1852,7 @@ async def generate_episode_summary_text(
                 row=row,
                 normalized_text=normalized_text,
             )
-        except (HTTPStatusError, RequestError, ValueError) as exc:
+        except (OpenRouterBackgroundCreditGuardError, HTTPStatusError, RequestError, ValueError) as exc:
             if verbose:
                 print(
                     f"[summary-llm-error] product_id={row['product_id']} episode_id={row['episode_id']} "
@@ -4899,8 +4890,10 @@ async def request_rp_dialogue_items(
     target: dict[str, object],
     normalized_text: str,
 ) -> list[dict[str, object]]:
-    response = await client.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
+    response = await post_openrouter_background_chat_completion_async(
+        client,
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
@@ -5043,8 +5036,10 @@ async def request_episode_character_signals_payload(
         for attempt in range(2):
             try:
                 response = await asyncio.wait_for(
-                    client.post(
-                        f"{OPENROUTER_BASE_URL}/chat/completions",
+                    post_openrouter_background_chat_completion_async(
+                        client,
+                        base_url=OPENROUTER_BASE_URL,
+                        api_key=OPENROUTER_API_KEY,
                         headers={
                             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                             "Content-Type": "application/json",
@@ -6525,7 +6520,13 @@ def build_empty_delta_rp_counts() -> dict[str, object]:
 def is_expected_story_asset_provider_error(exc: BaseException) -> bool:
     return isinstance(
         exc,
-        (asyncio.TimeoutError, HTTPStatusError, RequestError, json.JSONDecodeError),
+        (
+            OpenRouterBackgroundCreditGuardError,
+            asyncio.TimeoutError,
+            HTTPStatusError,
+            RequestError,
+            json.JSONDecodeError,
+        ),
     )
 
 
