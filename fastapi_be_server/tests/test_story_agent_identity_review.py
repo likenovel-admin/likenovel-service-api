@@ -422,6 +422,164 @@ class CharacterIdentityReviewTest(TestCase):
         self.assertFalse(protagonist["public_chat_eligible"])
         self.assertFalse(protagonist["public_slot_eligible"])
 
+    def test_materializer_allows_exact_anonymous_scope_merge(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        "protagonist:first_person",
+                        "나",
+                        protagonist=True,
+                        first_person=True,
+                        voice_mode="monologue",
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        "protagonist:first_person",
+                        "나",
+                        protagonist=True,
+                        first_person=True,
+                        voice_mode="monologue",
+                    )
+                ],
+            ),
+        ]
+        inventory_map = {
+            "character:anonymous-a": {
+                "source_observation_refs": ["summary:1:0"],
+                "public_chat_eligible": False,
+            },
+            "character:anonymous-b": {
+                "source_observation_refs": ["summary:2:0"],
+                "public_chat_eligible": False,
+            },
+        }
+        request = {
+            "schema_version": "character_identity_review_request_v1",
+            "product_id": 1109,
+            "operations": [
+                {
+                    "operation_id": "merge-anonymous-main",
+                    "kind": "merge_active_scopes",
+                    "member_scope_keys": [
+                        "character:anonymous-a",
+                        "character:anonymous-b",
+                    ],
+                    "target_scope_key": "character:anonymous-a",
+                    "force_main_protagonist": True,
+                    "anonymous_protagonist": True,
+                    "reason": "same unnamed first-person narrator",
+                }
+            ],
+        }
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=inventory_map,
+        ), patch.object(
+            module,
+            "fetch_active_summary_rows",
+            return_value=rows,
+        ):
+            document = module.materialize_character_identity_review_document(
+                object(),
+                product_id=1109,
+                request=request,
+                reviewer_id="codex.ops",
+            )
+        operation = document["operations"][0]
+        self.assertTrue(operation["force_main_protagonist"])
+        self.assertTrue(operation["anonymous_protagonist"])
+        self.assertEqual(
+            operation["authorized_observation_refs"],
+            ["summary:1:0", "summary:2:0"],
+        )
+
+    def test_reviewed_anonymous_main_demotes_old_serving_protagonist_lock(self):
+        module = load_module()
+        anonymous_scope_key = "character:anonymous-main"
+        old_main_scope_key = "character:wrong-main"
+        anonymous_row = {
+            "canonical_character_key": anonymous_scope_key,
+            "display_name": "나",
+            "work_role": "main_protagonist",
+            "public_chat_eligible": False,
+            "public_slot_eligible": False,
+            "chat_readiness_v1": {"character_chat_allowed": False},
+            "operator_reviewed_anonymous_protagonist": True,
+            "character_identity_review": {
+                "force_main_protagonist": True,
+                "anonymous_protagonist": True,
+            },
+            "superseded_protagonist_scope_keys": [old_main_scope_key],
+        }
+        generated_old_main = {
+            "canonical_character_key": old_main_scope_key,
+            "display_name": "당예린",
+            "work_role": "major_character",
+            "distinct_episode_count": 8,
+            "public_chat_eligible": False,
+            "public_slot_eligible": False,
+            "chat_readiness_v1": {"character_chat_allowed": False},
+        }
+        old_inventory_map = {
+            anonymous_scope_key: dict(anonymous_row),
+            old_main_scope_key: {
+                **generated_old_main,
+                "work_role": "main_protagonist",
+                "public_chat_eligible": True,
+                "public_slot_eligible": True,
+                "chat_readiness_v1": {"character_chat_allowed": True},
+            },
+        }
+        upserted = []
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=old_inventory_map,
+        ), patch.object(
+            module,
+            "aggregate_character_inventory_v3_rows",
+            return_value=[anonymous_row, generated_old_main],
+        ), patch.object(
+            module,
+            "reconcile_character_inventory_v3_scope_keys",
+            side_effect=lambda rows, **_kwargs: rows,
+        ), patch.object(
+            module,
+            "_refresh_character_inventory_v3_serving_fields",
+        ), patch.object(
+            module,
+            "upsert_character_inventory_v3_item",
+            side_effect=lambda _cur, *, product_id, item: upserted.append(dict(item)) or True,
+        ), patch.object(
+            module,
+            "deactivate_missing_active_scopes",
+        ):
+            module.build_character_inventory_v3_summaries_from_signal_rows(
+                object(),
+                product_id=1109,
+                signal_rows=[{"summary_text": "{}"}],
+                character_identity_review={"operations": []},
+            )
+
+        by_scope = {
+            row["canonical_character_key"]: row for row in upserted
+        }
+        self.assertEqual(
+            by_scope[old_main_scope_key]["work_role"],
+            "major_character",
+        )
+        self.assertFalse(by_scope[old_main_scope_key]["public_slot_eligible"])
+
     def test_display_and_competing_alias_cleanup_are_character_local(self):
         module = load_module()
         rows = [
