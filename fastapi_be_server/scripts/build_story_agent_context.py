@@ -10235,6 +10235,12 @@ def resolve_character_inventory_v3_clusters(
             "anonymous_protagonist": bool(
                 operation.get("anonymous_protagonist")
             ),
+            "canonical_display_name": str(
+                operation.get("canonical_display_name") or ""
+            ),
+            "blocked_aliases": list(
+                operation.get("blocked_aliases") or []
+            ),
             "reason": str(operation.get("reason") or ""),
             "schema_version": str(
                 dict(normalized_review or {}).get("schema_version") or ""

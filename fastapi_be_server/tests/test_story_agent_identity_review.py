@@ -743,6 +743,66 @@ class CharacterIdentityReviewTest(TestCase):
             "차태흠",
         )
 
+    def test_aggregate_preserves_reviewed_display_and_blocked_aliases(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    {
+                        **signal_character(
+                            "protagonist:named:차태흠",
+                            "차태흠 정령",
+                            aliases=["차태흠 정령", "차태흠"],
+                            protagonist=True,
+                        ),
+                        "narration_names": ["차태흠"],
+                        "persona_names": ["차태흠 정령"],
+                    }
+                ],
+            )
+        ]
+        review = review_document(
+            module,
+            1165,
+            [
+                {
+                    "operation_id": "confirm-cha-taeheum-surface",
+                    "kind": "confirm_protagonist",
+                    "member_scope_keys": ["character:차태흠"],
+                    "target_scope_key": "character:차태흠",
+                    "authorized_observation_refs": ["summary:1:0"],
+                    "signal_anchors": [
+                        {"summary_id": 1, "source_hash": "signal-1"}
+                    ],
+                    "force_main_protagonist": True,
+                    "anonymous_protagonist": False,
+                    "canonical_display_name": "차태흠",
+                    "blocked_aliases": ["차태흠 정령"],
+                    "reason": "reviewed protagonist identity surface",
+                }
+            ],
+        )
+
+        inventory_rows = module.aggregate_character_inventory_v3_rows(
+            rows,
+            character_identity_review=review,
+        )
+        target = next(
+            row
+            for row in inventory_rows
+            if row["canonical_character_key"] == "character:차태흠"
+        )
+
+        self.assertEqual(target["display_name"], "차태흠")
+        self.assertNotIn("차태흠 정령", target["aliases"])
+        self.assertNotIn("차태흠 정령", target["persona_names"])
+        self.assertEqual(
+            target["identity_surface_review_v1"]["canonical_display_name"],
+            "차태흠",
+        )
+
     def test_display_and_competing_alias_cleanup_are_character_local(self):
         module = load_module()
         rows = [
