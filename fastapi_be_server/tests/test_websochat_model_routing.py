@@ -57,10 +57,21 @@ def _character_chat_entry_context(read_episode_to=5):
 
 
 class _FakeRpContextDb:
-    def __init__(self, *, canonical_profile_ready=True, internal_prompt_ready=True):
+    def __init__(
+        self,
+        *,
+        canonical_profile_ready=True,
+        internal_prompt_ready=True,
+        inventory_display_name="아델리트",
+        profile_display_name="아델리트",
+        reviewed_identity_surface=False,
+    ):
         self.exact_summary_requests = []
         self.canonical_profile_ready = canonical_profile_ready
         self.internal_prompt_ready = internal_prompt_ready
+        self.inventory_display_name = inventory_display_name
+        self.profile_display_name = profile_display_name
+        self.reviewed_identity_surface = reviewed_identity_surface
         self.relation_inventory_requested = False
 
     async def execute(self, statement, params=None):
@@ -75,13 +86,22 @@ class _FakeRpContextDb:
                             {
                                 "canonical_character_key": "character:아델리트",
                                 "source_character_keys": ["protagonist:named:아델리트", "named:아델리트"],
-                                "display_name": "아델리트",
-                                "aliases": ["아델리트"],
+                                "display_name": self.inventory_display_name,
+                                "aliases": [self.inventory_display_name],
                                 "is_protagonist": True,
                                 "distinct_episode_count": 4,
                                 "public_chat_eligible": True,
                                 "public_slot_eligible": True,
                                 "display_safety": {"status": "pass"},
+                                **(
+                                    {
+                                        "identity_surface_review_v1": {
+                                            "canonical_display_name": self.inventory_display_name,
+                                        }
+                                    }
+                                    if self.reviewed_identity_surface
+                                    else {}
+                                ),
                             },
                             ensure_ascii=False,
                         ),
@@ -104,7 +124,7 @@ class _FakeRpContextDb:
                         "summaryText": json.dumps(
                             {
                                 "character_key": profile_scope_key,
-                                "display_name": "아델리트",
+                                "display_name": self.profile_display_name,
                                 "speech_style": {"tone": ["차분"]},
                                 "personality_core": ["상처를 숨김"],
                                 "baseline_attitude": "경계",
@@ -154,7 +174,7 @@ class _FakeRpContextDb:
                         "summaryText": json.dumps(
                             {
                                 "character_key": profile_scope_key,
-                                "internal_prompt": "[핵심 정체성] 아델리트는 경계심을 숨기지 않는 주인공이다.\n[현재 관계] 15화 이후에만 드러나는 정체를 알고 있다.\n[짧은 입력 처리] 사용자가 짧게 답해도 장면을 한 걸음 전진시킨다."
+                                "internal_prompt": f"[핵심 정체성] {self.profile_display_name}는 경계심을 숨기지 않는 주인공이다.\n[현재 관계] 15화 이후에만 드러나는 정체를 알고 있다.\n[짧은 입력 처리] 사용자가 짧게 답해도 장면을 한 걸음 전진시킨다."
                             },
                             ensure_ascii=False,
                         ),
@@ -452,6 +472,61 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[핵심 정체성]", context["internal_prompt"])
         self.assertIn(("character_rp_profile", "character:아델리트"), db.exact_summary_requests)
         self.assertEqual(db.exact_summary_requests[0], ("character_rp_profile", "character:아델리트"))
+
+    async def test_reviewed_inventory_display_overrides_stale_profile_and_prompt(self):
+        db = _FakeRpContextDb(
+            inventory_display_name="차태흠",
+            profile_display_name="차태흠 정령",
+            reviewed_identity_surface=True,
+        )
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 5},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "character:아델리트",
+                    "rp_mode": "free",
+                },
+                db=db,
+            )
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["display_name"], "차태흠")
+        self.assertEqual(context["internal_prompt"], "")
+        self.assertEqual(context["personality_core"], ["상처를 숨김"])
+
+    async def test_unreviewed_inventory_display_does_not_override_profile(self):
+        db = _FakeRpContextDb(
+            inventory_display_name="차태흠",
+            profile_display_name="차태흠 정령",
+            reviewed_identity_surface=False,
+        )
+
+        with patch.object(
+            websochat_service,
+            "_build_websochat_rp_trajectory_context",
+            new_callable=AsyncMock,
+        ) as build_trajectory:
+            build_trajectory.return_value = None
+            context = await websochat_service._load_websochat_rp_context(
+                product_row={"productId": 1182, "title": "테스트", "latestEpisodeNo": 5},
+                session_memory={
+                    "active_mode": "rp",
+                    "active_character": "character:아델리트",
+                    "rp_mode": "free",
+                },
+                db=db,
+            )
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["display_name"], "차태흠 정령")
+        self.assertIn("차태흠 정령", context["internal_prompt"])
 
     async def test_character_chat_context_does_not_load_global_internal_prompt(self):
         db = _FakeRpContextDb(internal_prompt_ready=False)

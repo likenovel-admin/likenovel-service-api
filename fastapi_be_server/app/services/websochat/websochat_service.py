@@ -5781,6 +5781,32 @@ async def _load_websochat_rp_context(
     if not profile or examples_payload is None:
         return None
 
+    profile_display_name = str(profile.get("display_name") or "").strip()
+    identity_surface_review = dict(
+        (inventory_payload or {}).get("identity_surface_review_v1") or {}
+    )
+    inventory_display_name = str(
+        (inventory_payload or {}).get("display_name") or ""
+    ).strip()
+    reviewed_display_name = str(
+        identity_surface_review.get("canonical_display_name") or ""
+    ).strip()
+    authoritative_display_name = ""
+    if (
+        identity_surface_review
+        and inventory_display_name
+        and reviewed_display_name
+        and _normalize_websochat_character_name(inventory_display_name)
+        == _normalize_websochat_character_name(reviewed_display_name)
+    ):
+        authoritative_display_name = inventory_display_name
+        if (
+            profile_display_name
+            and _normalize_websochat_character_name(profile_display_name)
+            != _normalize_websochat_character_name(authoritative_display_name)
+        ):
+            internal_prompt = ""
+
     logger.info(
         "websochat rp_resolution product_id=%s raw=%s resolved=%s resolution_source=%s protagonist_intent=%s cluster_size=%s inventory_seed_used=%s",
         product_id,
@@ -5800,7 +5826,11 @@ async def _load_websochat_rp_context(
     context: dict[str, Any] = {
         "active_character": resolved_active_character,
         "rp_mode": rp_mode,
-        "display_name": str(profile.get("display_name") or resolved_active_character).strip(),
+        "display_name": str(
+            authoritative_display_name
+            or profile_display_name
+            or resolved_active_character
+        ).strip(),
         "speech_style": safe_speech_style,
         "personality_core": [] if is_character_chat_session else profile.get("personality_core") or [],
         "baseline_attitude": "" if is_character_chat_session else str(profile.get("baseline_attitude") or "").strip(),
