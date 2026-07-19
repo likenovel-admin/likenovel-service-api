@@ -46,6 +46,20 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
             workflow,
         )
 
+    def test_dev_and_prod_packages_include_identity_review_cli(self):
+        expected_copy = (
+            "cp ../scripts/apply_story_agent_identity_review.py "
+            "./scripts/apply_story_agent_identity_review.py"
+        )
+        for workflow_name in (
+            "deploy_be_actions_dev.yml",
+            "deploy_be_actions.yml",
+        ):
+            workflow = (
+                BACKEND_ROOT / ".github" / "workflows" / workflow_name
+            ).read_text(encoding="utf-8")
+            self.assertIn(expected_copy, workflow)
+
     def test_build_product_query_defaults_to_open_ongoing_public_scope(self):
         module = load_module()
 

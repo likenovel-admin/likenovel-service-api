@@ -107,6 +107,8 @@ PRODUCT_SUMMARY_FORMAT_VERSION = "product_summary_v1"
 CHARACTER_SNAPSHOT_FORMAT_VERSION = "character_snapshot_v1"
 CHARACTER_INVENTORY_FORMAT_VERSION = "character_inventory_v2"
 CHARACTER_INVENTORY_V3_FORMAT_VERSION = "character_inventory_v3"
+CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION = "character_identity_review_v1"
+CHARACTER_IDENTITY_REVIEW_REQUEST_VERSION = "character_identity_review_request_v1"
 WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION = "work_protagonist_resolution_v1"
 WORK_PROTAGONIST_RESOLUTION_MAX_OUTPUT_TOKENS = 1200
 CHARACTER_INVENTORY_V3_PROTAGONIST_SCORE_THRESHOLD = 0.40
@@ -5787,6 +5789,19 @@ def build_inventory_scope_alias_key_candidates(scope_key: str, inventory_item: d
         append_key(payload.get(field_name))
     for source_key in list(payload.get("source_character_keys") or []):
         append_key(source_key)
+    for field_name in (
+        "legacy_scope_keys",
+        "superseded_identity_scope_keys",
+    ):
+        for alias_key in list(payload.get(field_name) or []):
+            append_key(alias_key)
+    for member_scope_key in list(
+        dict(payload.get("character_identity_review") or {}).get(
+            "member_scope_keys"
+        )
+        or []
+    ):
+        append_key(member_scope_key)
     return alias_keys
 
 
@@ -5991,6 +6006,27 @@ def build_inventory_source_scope_key_map(inventory_map: dict[str, dict[str, obje
             source_key = str(source_key_value or "").strip()
             if source_key:
                 source_claims.setdefault(source_key, set()).add(normalized_scope_key)
+        for field_name in (
+            "legacy_scope_keys",
+            "superseded_identity_scope_keys",
+        ):
+            for alias_key_value in list(payload.get(field_name) or []):
+                alias_key = str(alias_key_value or "").strip()
+                if alias_key:
+                    source_claims.setdefault(alias_key, set()).add(
+                        normalized_scope_key
+                    )
+        for member_scope_key_value in list(
+            dict(payload.get("character_identity_review") or {}).get(
+                "member_scope_keys"
+            )
+            or []
+        ):
+            member_scope_key = str(member_scope_key_value or "").strip()
+            if member_scope_key:
+                source_claims.setdefault(member_scope_key, set()).add(
+                    normalized_scope_key
+                )
     source_scope_key_map = {
         alias_key: next(iter(owner_scope_keys))
         for alias_key, owner_scope_keys in exact_claims.items()
@@ -7858,6 +7894,490 @@ def upsert_summary(
     return int(cur.lastrowid), True
 
 
+def _character_identity_review_digest(payload: dict[str, object]) -> str:
+    digest_payload = dict(payload)
+    digest_payload.pop("review_digest", None)
+    return sha256_text(
+        json.dumps(
+            digest_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def normalize_character_identity_review_document(
+    payload: dict[str, object],
+    *,
+    signal_rows: list[dict] | None = None,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("character identity review must be an object")
+    allowed_top_level_keys = {
+        "schema_version",
+        "product_id",
+        "review_origin",
+        "reviewer_id",
+        "operations",
+        "review_digest",
+    }
+    unknown_top_level_keys = set(payload) - allowed_top_level_keys
+    if unknown_top_level_keys:
+        raise ValueError(
+            "unknown character identity review fields: "
+            + ",".join(sorted(unknown_top_level_keys))
+        )
+    if str(payload.get("schema_version") or "").strip() != CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION:
+        raise ValueError("invalid character identity review schema")
+    product_id = int(payload.get("product_id") or 0)
+    if product_id <= 0:
+        raise ValueError("character identity review requires product_id")
+    review_origin = str(payload.get("review_origin") or "").strip()
+    if review_origin != "operator_cli":
+        raise ValueError("character identity review origin must be operator_cli")
+    reviewer_id = str(payload.get("reviewer_id") or "").strip()
+    if not reviewer_id or not re.fullmatch(r"[A-Za-z0-9@._:-]{1,120}", reviewer_id):
+        raise ValueError("invalid character identity reviewer id")
+
+    raw_operations = list(payload.get("operations") or [])
+    if not raw_operations or len(raw_operations) > 12:
+        raise ValueError("character identity review requires 1-12 operations")
+    normalized_operations: list[dict[str, object]] = []
+    seen_operation_ids: set[str] = set()
+    observation_owner: dict[str, str] = {}
+    for raw_operation in raw_operations:
+        if not isinstance(raw_operation, dict):
+            raise ValueError("character identity review operation must be an object")
+        allowed_operation_keys = {
+            "operation_id",
+            "kind",
+            "member_scope_keys",
+            "target_scope_key",
+            "authorized_observation_refs",
+            "signal_anchors",
+            "force_main_protagonist",
+            "anonymous_protagonist",
+            "reason",
+        }
+        unknown_operation_keys = set(raw_operation) - allowed_operation_keys
+        if unknown_operation_keys:
+            raise ValueError(
+                "unknown character identity review operation fields: "
+                + ",".join(sorted(unknown_operation_keys))
+            )
+        operation_id = str(raw_operation.get("operation_id") or "").strip()
+        if not operation_id or not re.fullmatch(r"[A-Za-z0-9:_-]{1,100}", operation_id):
+            raise ValueError("invalid character identity review operation id")
+        if operation_id in seen_operation_ids:
+            raise ValueError(
+                f"duplicate character identity review operation id: {operation_id}"
+            )
+        seen_operation_ids.add(operation_id)
+        kind = str(raw_operation.get("kind") or "").strip()
+        if kind not in {
+            "merge_active_scopes",
+            "confirm_protagonist",
+            "retire_active_scope",
+        }:
+            raise ValueError(f"invalid character identity review kind: {kind}")
+        member_scope_keys = list(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in list(raw_operation.get("member_scope_keys") or [])
+                if str(value or "").strip()
+            )
+        )
+        target_scope_key = str(raw_operation.get("target_scope_key") or "").strip()
+        if (
+            not member_scope_keys
+            or len(member_scope_keys) > 8
+            or any(not value.startswith("character:") for value in member_scope_keys)
+            or not target_scope_key.startswith("character:")
+        ):
+            raise ValueError(f"invalid character identity review scopes: {operation_id}")
+        if kind in {"merge_active_scopes", "confirm_protagonist"} and target_scope_key not in member_scope_keys:
+            raise ValueError(f"review target must be a member scope: {operation_id}")
+        if kind == "merge_active_scopes" and len(member_scope_keys) < 2:
+            raise ValueError(f"merge review requires at least two scopes: {operation_id}")
+        if kind in {"confirm_protagonist", "retire_active_scope"} and len(member_scope_keys) != 1:
+            raise ValueError(f"review operation requires one member scope: {operation_id}")
+        if kind == "retire_active_scope" and target_scope_key in member_scope_keys:
+            raise ValueError(f"retired scope cannot equal replacement scope: {operation_id}")
+        authorized_observation_refs = list(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in list(raw_operation.get("authorized_observation_refs") or [])
+                if str(value or "").strip()
+            )
+        )
+        if not authorized_observation_refs or len(authorized_observation_refs) > 4000:
+            raise ValueError(f"review requires pinned observation refs: {operation_id}")
+        if kind != "retire_active_scope":
+            for observation_ref in authorized_observation_refs:
+                old_owner = observation_owner.get(observation_ref)
+                if old_owner and old_owner != operation_id:
+                    raise ValueError(
+                        "observation belongs to multiple identity reviews: "
+                        f"{observation_ref}"
+                    )
+                observation_owner[observation_ref] = operation_id
+        signal_anchors: list[dict[str, object]] = []
+        for raw_anchor in list(raw_operation.get("signal_anchors") or []):
+            if not isinstance(raw_anchor, dict) or set(raw_anchor) != {
+                "summary_id",
+                "source_hash",
+            }:
+                raise ValueError(f"invalid identity review signal anchor: {operation_id}")
+            summary_id = int(raw_anchor.get("summary_id") or 0)
+            source_hash = str(raw_anchor.get("source_hash") or "").strip()
+            if summary_id <= 0 or not source_hash:
+                raise ValueError(f"invalid identity review signal anchor: {operation_id}")
+            signal_anchors.append(
+                {"summary_id": summary_id, "source_hash": source_hash}
+            )
+        signal_anchors = sorted(
+            signal_anchors,
+            key=lambda item: int(item["summary_id"]),
+        )
+        if not signal_anchors:
+            raise ValueError(f"review requires signal anchors: {operation_id}")
+        force_main_protagonist = raw_operation.get("force_main_protagonist") is True
+        anonymous_protagonist = raw_operation.get("anonymous_protagonist") is True
+        if anonymous_protagonist and (
+            kind != "confirm_protagonist" or not force_main_protagonist
+        ):
+            raise ValueError(
+                f"anonymous review must confirm protagonist role: {operation_id}"
+            )
+        reason = str(raw_operation.get("reason") or "").strip()[:240]
+        if not reason:
+            raise ValueError(f"identity review requires reason: {operation_id}")
+        normalized_operations.append(
+            {
+                "operation_id": operation_id,
+                "kind": kind,
+                "member_scope_keys": member_scope_keys,
+                "target_scope_key": target_scope_key,
+                "authorized_observation_refs": authorized_observation_refs,
+                "signal_anchors": signal_anchors,
+                "force_main_protagonist": force_main_protagonist,
+                "anonymous_protagonist": anonymous_protagonist,
+                "reason": reason,
+            }
+        )
+
+    normalized: dict[str, object] = {
+        "schema_version": CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION,
+        "product_id": product_id,
+        "review_origin": review_origin,
+        "reviewer_id": reviewer_id,
+        "operations": normalized_operations,
+    }
+    expected_digest = _character_identity_review_digest(normalized)
+    supplied_digest = str(payload.get("review_digest") or "").strip()
+    if supplied_digest and supplied_digest != expected_digest:
+        raise ValueError("character identity review digest mismatch")
+    normalized["review_digest"] = expected_digest
+
+    if signal_rows is not None:
+        observations = build_character_inventory_v3_observations(signal_rows)
+        observation_by_ref = {
+            str(item.get("observation_id") or ""): item
+            for item in observations
+            if str(item.get("observation_id") or "")
+        }
+        active_anchor_by_summary_id = {
+            int(row.get("summary_id") or 0): str(row.get("source_hash") or "").strip()
+            for row in signal_rows
+            if int(row.get("summary_id") or 0) > 0
+        }
+        for operation in normalized_operations:
+            operation_id = str(operation["operation_id"])
+            refs = list(operation["authorized_observation_refs"])
+            missing_refs = set(refs) - set(observation_by_ref)
+            if missing_refs:
+                raise ValueError(
+                    "stale character identity review observations: "
+                    f"{operation_id} count={len(missing_refs)}"
+                )
+            expected_anchor_map = {
+                int(item["summary_id"]): str(item["source_hash"])
+                for item in list(operation["signal_anchors"])
+            }
+            for summary_id, source_hash in expected_anchor_map.items():
+                if active_anchor_by_summary_id.get(summary_id) != source_hash:
+                    raise ValueError(
+                        "stale character identity review signal: "
+                        f"{operation_id} summary_id={summary_id}"
+                    )
+            selected_anchor_map = {
+                int(observation_by_ref[ref].get("summary_id") or 0): str(
+                    observation_by_ref[ref].get("source_hash") or ""
+                ).strip()
+                for ref in refs
+            }
+            if selected_anchor_map != expected_anchor_map:
+                raise ValueError(
+                    f"character identity review anchor coverage mismatch: {operation_id}"
+                )
+    return normalized
+
+
+def materialize_character_identity_review_document(
+    cur,
+    *,
+    product_id: int,
+    request: dict[str, object],
+    reviewer_id: str,
+) -> dict[str, object]:
+    if not isinstance(request, dict):
+        raise ValueError("character identity review request must be an object")
+    allowed_request_keys = {"schema_version", "product_id", "operations"}
+    unknown_request_keys = set(request) - allowed_request_keys
+    if unknown_request_keys:
+        raise ValueError(
+            "unknown identity review request fields: "
+            + ",".join(sorted(unknown_request_keys))
+        )
+    if str(request.get("schema_version") or "").strip() != CHARACTER_IDENTITY_REVIEW_REQUEST_VERSION:
+        raise ValueError("invalid character identity review request schema")
+    if int(request.get("product_id") or 0) != product_id:
+        raise ValueError("character identity review product mismatch")
+    inventory_map = fetch_active_character_inventory_map(
+        cur=cur,
+        product_id=product_id,
+        summary_type="character_inventory_v3",
+    )
+    signal_rows = fetch_active_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
+    observations = build_character_inventory_v3_observations(signal_rows)
+    observation_by_ref = {
+        str(item.get("observation_id") or ""): item
+        for item in observations
+        if str(item.get("observation_id") or "")
+    }
+    raw_operations = list(request.get("operations") or [])
+    if not raw_operations or len(raw_operations) > 12:
+        raise ValueError("character identity review request requires 1-12 operations")
+    materialized_operations: list[dict[str, object]] = []
+    for raw_operation in raw_operations:
+        if not isinstance(raw_operation, dict):
+            raise ValueError("character identity review request operation must be an object")
+        kind = str(raw_operation.get("kind") or "").strip()
+        allowed_keys_by_kind = {
+            "merge_active_scopes": {
+                "operation_id",
+                "kind",
+                "member_scope_keys",
+                "target_scope_key",
+                "force_main_protagonist",
+                "reason",
+            },
+            "confirm_protagonist": {
+                "operation_id",
+                "kind",
+                "scope_key",
+                "anonymous_protagonist",
+                "reason",
+            },
+            "retire_active_scope": {
+                "operation_id",
+                "kind",
+                "scope_key",
+                "replacement_scope_key",
+                "reason",
+            },
+        }
+        if kind not in allowed_keys_by_kind:
+            raise ValueError(f"invalid character identity review request kind: {kind}")
+        unknown_operation_keys = set(raw_operation) - allowed_keys_by_kind[kind]
+        if unknown_operation_keys:
+            raise ValueError(
+                "unknown identity review request operation fields: "
+                + ",".join(sorted(unknown_operation_keys))
+            )
+        operation_id = str(raw_operation.get("operation_id") or "").strip()
+        reason = str(raw_operation.get("reason") or "").strip()[:240]
+        if not operation_id or not reason:
+            raise ValueError("identity review request requires operation_id and reason")
+        if kind == "merge_active_scopes":
+            member_scope_keys = list(
+                dict.fromkeys(
+                    str(value or "").strip()
+                    for value in list(raw_operation.get("member_scope_keys") or [])
+                    if str(value or "").strip()
+                )
+            )
+            target_scope_key = str(raw_operation.get("target_scope_key") or "").strip()
+            if len(member_scope_keys) < 2 or target_scope_key not in member_scope_keys:
+                raise ValueError(f"invalid merge review scopes: {operation_id}")
+            force_main_protagonist = raw_operation.get("force_main_protagonist") is True
+            anonymous_protagonist = False
+        elif kind == "confirm_protagonist":
+            target_scope_key = str(raw_operation.get("scope_key") or "").strip()
+            member_scope_keys = [target_scope_key]
+            force_main_protagonist = True
+            anonymous_protagonist = raw_operation.get("anonymous_protagonist") is True
+        else:
+            retired_scope_key = str(raw_operation.get("scope_key") or "").strip()
+            target_scope_key = str(raw_operation.get("replacement_scope_key") or "").strip()
+            member_scope_keys = [retired_scope_key]
+            force_main_protagonist = False
+            anonymous_protagonist = False
+        required_scope_keys = set(member_scope_keys) | {target_scope_key}
+        missing_scope_keys = required_scope_keys - set(inventory_map)
+        if missing_scope_keys:
+            raise ValueError(
+                "identity review requires active inventory scopes: "
+                + ",".join(sorted(missing_scope_keys))
+            )
+        if kind == "merge_active_scopes":
+            serving_member_scope_keys = [
+                scope_key
+                for scope_key in member_scope_keys
+                if _has_character_serving_contract(inventory_map[scope_key])
+            ]
+            if len(serving_member_scope_keys) > 1:
+                raise ValueError(
+                    f"merge review has multiple serving members: {operation_id}"
+                )
+            if serving_member_scope_keys and serving_member_scope_keys[0] != target_scope_key:
+                raise ValueError(
+                    f"merge review target must preserve serving scope: {operation_id}"
+                )
+        if kind == "retire_active_scope" and not _has_character_serving_contract(
+            inventory_map[target_scope_key]
+        ):
+            raise ValueError(
+                f"retirement replacement must have serving contract: {operation_id}"
+            )
+        reviewed_scope_keys = (
+            required_scope_keys
+            if kind == "retire_active_scope"
+            else set(member_scope_keys)
+        )
+        authorized_observation_refs = sorted(
+            {
+                str(value or "").strip()
+                for scope_key in reviewed_scope_keys
+                for value in list(
+                    dict(inventory_map[scope_key]).get("source_observation_refs") or []
+                )
+                if str(value or "").strip()
+            }
+        )
+        if not authorized_observation_refs:
+            raise ValueError(f"active scope has no reviewable observations: {operation_id}")
+        missing_observation_refs = set(authorized_observation_refs) - set(
+            observation_by_ref
+        )
+        if missing_observation_refs:
+            raise ValueError(
+                f"active scope contains stale observation refs: {operation_id}"
+            )
+        anchor_map = {
+            int(observation_by_ref[ref].get("summary_id") or 0): str(
+                observation_by_ref[ref].get("source_hash") or ""
+            ).strip()
+            for ref in authorized_observation_refs
+        }
+        if any(summary_id <= 0 or not source_hash for summary_id, source_hash in anchor_map.items()):
+            raise ValueError(f"review observations require summary anchors: {operation_id}")
+        materialized_operations.append(
+            {
+                "operation_id": operation_id,
+                "kind": kind,
+                "member_scope_keys": member_scope_keys,
+                "target_scope_key": target_scope_key,
+                "authorized_observation_refs": authorized_observation_refs,
+                "signal_anchors": [
+                    {"summary_id": summary_id, "source_hash": source_hash}
+                    for summary_id, source_hash in sorted(anchor_map.items())
+                ],
+                "force_main_protagonist": force_main_protagonist,
+                "anonymous_protagonist": anonymous_protagonist,
+                "reason": reason,
+            }
+        )
+    document = {
+        "schema_version": CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION,
+        "product_id": product_id,
+        "review_origin": "operator_cli",
+        "reviewer_id": reviewer_id,
+        "operations": materialized_operations,
+    }
+    document["review_digest"] = _character_identity_review_digest(document)
+    return normalize_character_identity_review_document(
+        document,
+        signal_rows=signal_rows,
+    )
+
+
+def fetch_character_identity_review(
+    cur,
+    *,
+    product_id: int,
+    signal_rows: list[dict],
+) -> dict[str, object] | None:
+    rows = fetch_active_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type=CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION,
+    )
+    if not rows:
+        return None
+    if len(rows) != 1 or str(rows[0].get("scope_key") or "").strip() != "identity_review":
+        raise ValueError(
+            f"character identity review active row invariant failed: product_id={product_id}"
+        )
+    payload = extract_json_object(str(rows[0].get("summary_text") or ""))
+    return normalize_character_identity_review_document(
+        payload,
+        signal_rows=signal_rows,
+    )
+
+
+def upsert_character_identity_review(
+    cur,
+    *,
+    product_id: int,
+    request: dict[str, object],
+    reviewer_id: str,
+) -> tuple[int, bool, dict[str, object]]:
+    document = materialize_character_identity_review_document(
+        cur,
+        product_id=product_id,
+        request=request,
+        reviewer_id=reviewer_id,
+    )
+    serialized = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    summary_id, inserted = upsert_summary(
+        cur=cur,
+        product_id=product_id,
+        summary_type=CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION,
+        scope_key="identity_review",
+        source_hash=build_compound_summary_source_hash(
+            CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION,
+            [serialized],
+        ),
+        source_doc_count=sum(
+            len(list(operation.get("authorized_observation_refs") or []))
+            for operation in list(document.get("operations") or [])
+        ),
+        summary_text=serialized,
+    )
+    return summary_id, inserted, document
+
+
 def aggregate_character_inventory_rows(signal_rows: list[dict]) -> list[dict[str, object]]:
     inventory_map: dict[str, dict[str, object]] = {}
     for row in signal_rows:
@@ -9193,7 +9713,46 @@ def _prefer_frequent_base_label_for_contextual_display_variant(
     )[0]
 
 
-def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]]) -> list[dict[str, object]]:
+def resolve_character_inventory_v3_clusters(
+    observations: list[dict[str, object]],
+    *,
+    character_identity_review: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    normalized_review = (
+        normalize_character_identity_review_document(character_identity_review)
+        if character_identity_review
+        else None
+    )
+    review_operations = list(
+        dict(normalized_review or {}).get("operations") or []
+    )
+    merge_operation_id_by_observation_ref = {
+        str(observation_ref): str(operation["operation_id"])
+        for operation in review_operations
+        if str(operation.get("kind") or "") == "merge_active_scopes"
+        for observation_ref in list(operation.get("authorized_observation_refs") or [])
+    }
+    observation_index_by_ref = {
+        str(observation.get("observation_id") or ""): index
+        for index, observation in enumerate(observations)
+        if str(observation.get("observation_id") or "")
+    }
+
+    def observations_share_reviewed_merge(
+        left_index: int,
+        right_index: int,
+    ) -> bool:
+        left_operation_id = merge_operation_id_by_observation_ref.get(
+            str(observations[left_index].get("observation_id") or "")
+        )
+        right_operation_id = merge_operation_id_by_observation_ref.get(
+            str(observations[right_index].get("observation_id") or "")
+        )
+        return bool(
+            left_operation_id
+            and left_operation_id == right_operation_id
+        )
+
     parents = list(range(len(observations)))
     same_episode_cannot_link_pairs: set[tuple[int, int]] = set()
     relation_cannot_link_pairs: set[tuple[int, int]] = set()
@@ -9325,7 +9884,11 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
                         alias_bridge_label_match_index,
                     ):
                         continue
-                    same_episode_cannot_link_pairs.add((left_index, right_index))
+                    if not observations_share_reviewed_merge(
+                        left_index,
+                        right_index,
+                    ):
+                        same_episode_cannot_link_pairs.add((left_index, right_index))
 
     non_unique_identity_labels.update(
         _collect_non_unique_identity_labels(
@@ -9371,7 +9934,13 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
                         alias_bridge_persona_display_match_index,
                     ):
                         continue
-                    relation_cannot_link_pairs.add(tuple(sorted((source_index, target_index))))
+                    if not observations_share_reviewed_merge(
+                        source_index,
+                        target_index,
+                    ):
+                        relation_cannot_link_pairs.add(
+                            tuple(sorted((source_index, target_index)))
+                        )
             target_label = str(edge.get("normalized_target_label") or "")
             for target_index in label_to_indexes.get(target_label, []):
                 if source_index != target_index:
@@ -9383,7 +9952,13 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
                         alias_bridge_persona_display_match_index,
                     ):
                         continue
-                    relation_cannot_link_pairs.add(tuple(sorted((source_index, target_index))))
+                    if not observations_share_reviewed_merge(
+                        source_index,
+                        target_index,
+                    ):
+                        relation_cannot_link_pairs.add(
+                            tuple(sorted((source_index, target_index)))
+                        )
 
     cannot_link_pairs = set(relation_cannot_link_pairs)
     for left_index, right_index in same_episode_cannot_link_pairs:
@@ -9391,6 +9966,32 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
     cannot_link_parent_index = _build_cannot_link_parent_index(parents, cannot_link_pairs)
     relation_cannot_link_parent_index = _build_cannot_link_parent_index(parents, relation_cannot_link_pairs)
     cannot_link_parent_indexes = [cannot_link_parent_index, relation_cannot_link_parent_index]
+
+    for operation in review_operations:
+        if str(operation.get("kind") or "") != "merge_active_scopes":
+            continue
+        operation_id = str(operation.get("operation_id") or "")
+        operation_indexes = [
+            observation_index_by_ref[str(observation_ref)]
+            for observation_ref in list(
+                operation.get("authorized_observation_refs") or []
+            )
+            if str(observation_ref) in observation_index_by_ref
+        ]
+        if len(operation_indexes) != len(
+            list(operation.get("authorized_observation_refs") or [])
+        ):
+            raise ValueError(
+                f"reviewed merge observations are stale: {operation_id}"
+            )
+        base_index = operation_indexes[0]
+        for other_index in operation_indexes[1:]:
+            _union_observations_with_cannot_link_indexes(
+                parents,
+                base_index,
+                other_index,
+                cannot_link_parent_indexes,
+            )
 
     for indexes in source_key_to_indexes.values():
         base_index = indexes[0]
@@ -9488,18 +10089,81 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
             continue
         _union_observations_with_cannot_link_indexes(parents, left_index, right_index, cannot_link_parent_indexes)
 
+    reviewed_operation_by_parent: dict[int, dict[str, object]] = {}
+    for operation in review_operations:
+        if str(operation.get("kind") or "") not in {
+            "merge_active_scopes",
+            "confirm_protagonist",
+        }:
+            continue
+        operation_id = str(operation.get("operation_id") or "")
+        operation_indexes = [
+            observation_index_by_ref[str(observation_ref)]
+            for observation_ref in list(
+                operation.get("authorized_observation_refs") or []
+            )
+            if str(observation_ref) in observation_index_by_ref
+        ]
+        operation_parents = {
+            _find_union_parent(parents, index) for index in operation_indexes
+        }
+        if len(operation_indexes) != len(
+            list(operation.get("authorized_observation_refs") or [])
+        ) or len(operation_parents) != 1:
+            raise ValueError(
+                f"reviewed identity no longer resolves to one cluster: {operation_id}"
+            )
+        operation_parent = next(iter(operation_parents))
+        if operation_parent in reviewed_operation_by_parent:
+            raise ValueError(
+                "multiple identity reviews resolved to one cluster: "
+                f"{operation_id}"
+            )
+        reviewed_operation_by_parent[operation_parent] = {
+            "operation_id": operation_id,
+            "kind": str(operation.get("kind") or ""),
+            "member_scope_keys": list(
+                operation.get("member_scope_keys") or []
+            ),
+            "target_scope_key": str(
+                operation.get("target_scope_key") or ""
+            ),
+            "force_main_protagonist": bool(
+                operation.get("force_main_protagonist")
+            ),
+            "anonymous_protagonist": bool(
+                operation.get("anonymous_protagonist")
+            ),
+            "reason": str(operation.get("reason") or ""),
+            "schema_version": str(
+                dict(normalized_review or {}).get("schema_version") or ""
+            ),
+            "review_origin": str(
+                dict(normalized_review or {}).get("review_origin") or ""
+            ),
+            "reviewer_id": str(
+                dict(normalized_review or {}).get("reviewer_id") or ""
+            ),
+            "review_digest": str(
+                dict(normalized_review or {}).get("review_digest") or ""
+            ),
+        }
+
     clusters_by_parent: dict[int, list[dict[str, object]]] = {}
     for index, observation in enumerate(observations):
         clusters_by_parent.setdefault(_find_union_parent(parents, index), []).append(observation)
 
     clusters: list[dict[str, object]] = []
-    for cluster_observations in clusters_by_parent.values():
+    for cluster_parent, cluster_observations in clusters_by_parent.items():
         source_keys = sorted(
             {
                 str(observation.get("source_character_key") or "")
                 for observation in cluster_observations
                 if str(observation.get("source_character_key") or "")
             }
+        )
+        matched_review = dict(
+            reviewed_operation_by_parent.get(cluster_parent) or {}
         )
         labels = sorted(
             {
@@ -9630,7 +10294,21 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
                 display_name = identity_display_name
         else:
             display_name = str(cluster_observations[0].get("display_name") or "주인공").strip()
+        if (
+            str(matched_review.get("kind") or "") == "merge_active_scopes"
+            and display_name
+            and not is_generic_character_label(display_name)
+        ):
+            conflict_reasons = [
+                reason
+                for reason in conflict_reasons
+                if reason != "cannot_link_name_conflict"
+            ]
+            identity_status = "RESOLVED_NAMED"
         display_label = normalize_signal_entity_label(display_name)
+        durable_scope_key = str(
+            matched_review.get("target_scope_key") or ""
+        ).strip()
         seed = (
             identity_label
             if identity_label and identity_label not in GENERIC_CHARACTER_LABELS
@@ -9644,7 +10322,7 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
         )
         clusters.append(
             {
-                "canonical_character_key": f"character:{seed}",
+                "canonical_character_key": durable_scope_key or f"character:{seed}",
                 "display_name": display_name,
                 "display_name_source": display_name_source,
                 "source_character_keys": source_keys,
@@ -9654,6 +10332,7 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
                 "non_unique_identity_labels": sorted(
                     set(labels) & non_unique_identity_labels
                 ),
+                "character_identity_review": matched_review,
             }
         )
     canonical_key_counts = Counter(str(cluster.get("canonical_character_key") or "") for cluster in clusters)
@@ -9661,6 +10340,18 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
         canonical_key = str(cluster.get("canonical_character_key") or "")
         if canonical_key_counts.get(canonical_key, 0) <= 1:
             continue
+        verified_identity = dict(
+            cluster.get("character_identity_review") or {}
+        )
+        if (
+            verified_identity
+            and str(verified_identity.get("target_scope_key") or "").strip()
+            == canonical_key
+        ):
+            raise ValueError(
+                "reviewed durable scope collision: "
+                f"{canonical_key} operation_id={str(verified_identity.get('operation_id') or '')}"
+            )
         observations = list(cluster.get("observations") or [])
         duplicate_suffix = sha256_text(
             ",".join(
@@ -9677,6 +10368,254 @@ def resolve_character_inventory_v3_clusters(observations: list[dict[str, object]
             set(list(cluster.get("identity_conflict_reasons") or []) + ["duplicate_canonical_key"])
         )
     return clusters
+
+
+def _apply_character_identity_review_rows(
+    rows: list[dict[str, object]],
+) -> None:
+    selected_rows = [
+        row
+        for row in rows
+        if bool(
+            dict(row.get("character_identity_review") or {}).get(
+                "force_main_protagonist"
+            )
+        )
+    ]
+    if not selected_rows:
+        return
+    if len(selected_rows) > WORK_PROTAGONIST_CO_MAIN_MAX_COUNT:
+        raise ValueError("too many human-verified main protagonists")
+
+    selected_ids = {id(row) for row in selected_rows}
+    selected_keys = [
+        str(row.get("canonical_character_key") or "").strip()
+        for row in selected_rows
+        if str(row.get("canonical_character_key") or "").strip()
+    ]
+    superseded_scope_keys = sorted(
+        {
+            str(row.get("canonical_character_key") or "").strip()
+            for row in rows
+            if id(row) not in selected_ids
+            and str(row.get("work_role") or "") == "main_protagonist"
+            and str(row.get("canonical_character_key") or "").strip()
+        }
+    )
+    resolution = {
+        "schema_version": WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+        "decision": "RESOLVED",
+        "work_protagonist_key": selected_keys[0],
+        "work_protagonist_keys": selected_keys,
+        "confidence": "high",
+        "reason_code": "operator_reviewed_protagonist",
+        "rationale": "; ".join(
+            str(dict(row.get("character_identity_review") or {}).get("reason") or "")
+            for row in selected_rows
+        )[:240],
+        "rejected": [
+            {"key": scope_key, "reason": "superseded by human-verified protagonist"}
+            for scope_key in superseded_scope_keys[:8]
+        ],
+        "safety_flags": {
+            "requires_identity_merge": False,
+            "selected_candidate_eligible": True,
+            "multiple_plausible_main_candidates": False,
+        },
+    }
+    for row in rows:
+        if id(row) in selected_ids:
+            row["work_role"] = "main_protagonist"
+            row["role_confidence"] = "high"
+            row["classification_status"] = "AUTO_RESOLVED"
+            row["review_reasons"] = list(
+                row.get("identity_conflict_reasons") or []
+            )
+            row["work_protagonist_resolution"] = resolution
+            row["operator_reviewed_anonymous_protagonist"] = bool(
+                dict(row.get("character_identity_review") or {}).get(
+                    "anonymous_protagonist"
+                )
+            )
+            if superseded_scope_keys:
+                row["superseded_protagonist_scope_keys"] = superseded_scope_keys
+            continue
+        if str(row.get("work_role") or "") == "main_protagonist":
+            row["work_role"] = (
+                "major_character"
+                if int(row.get("distinct_episode_count") or 0) >= 1
+                else "unknown"
+            )
+            row["role_confidence"] = (
+                "medium" if row["work_role"] == "major_character" else "low"
+            )
+
+
+def _source_backed_display_candidates(row: dict[str, object]) -> list[str]:
+    source_keys = {
+        str(value or "").strip()
+        for value in list(row.get("source_character_keys") or [])
+        if str(value or "").strip()
+    }
+    candidates: list[str] = []
+    for value in [
+        row.get("display_name"),
+        *list(row.get("aliases") or []),
+        *list(row.get("narration_names") or []),
+        *list(row.get("social_call_names") or []),
+        *list(row.get("persona_names") or []),
+        *list(row.get("real_names") or []),
+    ]:
+        candidate = str(value or "").strip()
+        if not candidate or candidate in candidates:
+            continue
+        if (
+            build_named_character_scope_key(candidate) in source_keys
+            or build_protagonist_scope_key(candidate) in source_keys
+        ):
+            candidates.append(candidate)
+    return candidates
+
+
+def _prefer_source_backed_canonical_display_names(
+    rows: list[dict[str, object]],
+) -> None:
+    for row in rows:
+        canonical_scope_key = str(
+            row.get("canonical_character_key") or ""
+        ).strip()
+        canonical_label = normalize_signal_entity_label(
+            canonical_scope_key.removeprefix("character:").split(":dup:", 1)[0]
+        )
+        if not canonical_label:
+            continue
+        display_name = str(row.get("display_name") or "").strip()
+        display_label = normalize_signal_entity_label(display_name)
+        if str(row.get("display_name_source") or "") != "identity_label":
+            continue
+        matching_candidates = [
+            candidate
+            for candidate in _source_backed_display_candidates(row)
+            if normalize_signal_entity_label(candidate).lower()
+            == canonical_label.lower()
+        ]
+        if not matching_candidates or display_label.lower() == canonical_label.lower():
+            continue
+        preferred_display_name = sorted(
+            matching_candidates,
+            key=lambda value: (len(value), value),
+        )[0]
+        row["display_name"] = preferred_display_name
+        row["display_name_source"] = "canonical_named_source"
+        row["display_name_type"] = "named"
+        row["is_generic_display_name"] = False
+        row["alias_sanitization_v1"] = {
+            "version": 1,
+            "display_name_before": display_name,
+            "display_name_after": preferred_display_name,
+            "removed_by_field": {},
+            "reason": "canonical_named_source",
+        }
+
+
+def _remove_competing_character_aliases(
+    rows: list[dict[str, object]],
+) -> None:
+    display_owners: dict[str, set[int]] = {}
+    source_owners: dict[str, set[int]] = {}
+    for index, row in enumerate(rows):
+        display_label = normalize_signal_entity_label(
+            str(row.get("display_name") or "")
+        ).lower()
+        if display_label:
+            display_owners.setdefault(display_label, set()).add(index)
+        for source_key in list(row.get("source_character_keys") or []):
+            normalized_source_key = str(source_key or "").strip().lower()
+            source_label = ""
+            if normalized_source_key.startswith("named:"):
+                source_label = normalized_source_key.removeprefix("named:")
+            elif normalized_source_key.startswith("protagonist:named:"):
+                source_label = normalized_source_key.removeprefix(
+                    "protagonist:named:"
+                )
+            if source_label:
+                source_owners.setdefault(source_label, set()).add(index)
+
+    for index, row in enumerate(rows):
+        current_display_label = normalize_signal_entity_label(
+            str(row.get("display_name") or "")
+        ).lower()
+        removed_by_field: dict[str, list[str]] = {}
+        for field_name in (
+            "aliases",
+            "narration_names",
+            "social_call_names",
+            "persona_names",
+            "real_names",
+        ):
+            cleaned_values: list[str] = []
+            removed_values: list[str] = []
+            for value in list(row.get(field_name) or []):
+                value_text = str(value or "").strip()
+                normalized_value = normalize_signal_entity_label(
+                    value_text
+                ).lower()
+                competing_display_owners = display_owners.get(
+                    normalized_value, set()
+                ) - {index}
+                competing_source_owners = source_owners.get(
+                    normalized_value, set()
+                ) - {index}
+                owned_by_current = index in display_owners.get(
+                    normalized_value, set()
+                ) or index in source_owners.get(normalized_value, set())
+                should_remove = bool(
+                    normalized_value
+                    and normalized_value != current_display_label
+                    and competing_display_owners
+                    and (not owned_by_current or competing_source_owners)
+                )
+                if should_remove:
+                    removed_values.append(value_text)
+                    continue
+                if value_text and value_text not in cleaned_values:
+                    cleaned_values.append(value_text)
+            row[field_name] = cleaned_values[:8]
+            if removed_values:
+                removed_by_field[field_name] = removed_values
+        if not removed_by_field:
+            continue
+        metadata = dict(row.get("alias_sanitization_v1") or {})
+        metadata.update(
+            {
+                "version": 1,
+                "removed_by_field": removed_by_field,
+                "reason": "competing_character_display_owner",
+            }
+        )
+        row["alias_sanitization_v1"] = metadata
+
+
+def _refresh_character_inventory_v3_serving_fields(
+    row: dict[str, object],
+) -> None:
+    row["display_safety"] = build_inventory_display_safety(row)
+    row["public_chat_eligible"] = is_public_chat_inventory_candidate(row)
+    row["public_slot_eligible"] = is_public_slot_inventory_candidate(row)
+    row["identity_surface"] = build_inventory_identity_surface(row)
+    row["reveal_boundary"] = build_inventory_reveal_boundary(row)
+    row["read_range_state_snapshot"] = build_inventory_read_range_state_snapshot(
+        row
+    )
+    row["interaction_affordance_v1"] = build_inventory_interaction_affordance_v1(
+        row
+    )
+    row["adjacent_event_seed_v1"] = build_inventory_adjacent_event_seed_v1(row)
+    row["pov_and_protagonist_centrality_v1"] = (
+        build_inventory_pov_and_protagonist_centrality_v1(row)
+    )
+    row["voice_contract_v1"] = build_inventory_voice_contract_v1(row)
+    row["chat_readiness_v1"] = build_inventory_chat_readiness_v1(row)
 
 
 def _episode_count(observations: list[dict[str, object]], predicate=None) -> int:
@@ -9833,6 +10772,7 @@ def _classify_character_inventory_v3_rows(
         _apply_work_protagonist_resolution(rows, protagonist_resolution)
 
     _apply_locked_work_protagonist_rows(rows, list(locked_protagonist_rows or []))
+    _apply_character_identity_review_rows(rows)
     _apply_protagonist_identity_groups(rows)
 
     for row in rows:
@@ -9844,7 +10784,10 @@ def _classify_character_inventory_v3_rows(
         distinct_episode_count = int(row.get("distinct_episode_count") or 0)
         role_like_persona_ready = _has_strong_role_like_persona_evidence(row)
         if (
-            (identity_status in {"RESOLVED_NAMED", "CONFLICT"} or role_like_persona_ready)
+            (
+                identity_status in {"RESOLVED_NAMED", "CONFLICT"}
+                or role_like_persona_ready
+            )
             and not blocking_identity_conflict_reasons
             and speaking_episode_count >= 2
         ):
@@ -9862,18 +10805,7 @@ def _classify_character_inventory_v3_rows(
             "speaking_episode_count": speaking_episode_count,
             "needs_review": bool(row.get("review_reasons")) or str(row.get("classification_status") or "") != "AUTO_RESOLVED",
         }
-        display_safety = build_inventory_display_safety(row)
-        row["display_safety"] = display_safety
-        row["public_chat_eligible"] = is_public_chat_inventory_candidate(row)
-        row["public_slot_eligible"] = is_public_slot_inventory_candidate(row)
-        row["identity_surface"] = build_inventory_identity_surface(row)
-        row["reveal_boundary"] = build_inventory_reveal_boundary(row)
-        row["read_range_state_snapshot"] = build_inventory_read_range_state_snapshot(row)
-        row["interaction_affordance_v1"] = build_inventory_interaction_affordance_v1(row)
-        row["adjacent_event_seed_v1"] = build_inventory_adjacent_event_seed_v1(row)
-        row["pov_and_protagonist_centrality_v1"] = build_inventory_pov_and_protagonist_centrality_v1(row)
-        row["voice_contract_v1"] = build_inventory_voice_contract_v1(row)
-        row["chat_readiness_v1"] = build_inventory_chat_readiness_v1(row)
+        _refresh_character_inventory_v3_serving_fields(row)
 
 
 def build_inventory_display_safety(row: dict[str, object]) -> dict[str, object]:
@@ -9908,7 +10840,10 @@ def is_public_chat_inventory_candidate(row: dict[str, object]) -> bool:
     display_safety = dict(row.get("display_safety") or build_inventory_display_safety(row))
     if str(display_safety.get("status") or "") != "pass":
         return False
-    if not (_inventory_identity_is_public_resolved(row) or _has_strong_role_like_persona_evidence(row)):
+    if not (
+        _inventory_identity_is_public_resolved(row)
+        or _has_strong_role_like_persona_evidence(row)
+    ):
         return False
     work_role = str(row.get("work_role") or "")
     if work_role not in {"main_protagonist", "major_character"}:
@@ -9950,7 +10885,9 @@ def build_inventory_identity_surface(row: dict[str, object]) -> dict[str, object
     if not social_call_names and not persona_names:
         address_name_candidates.extend(list(row.get("narration_names") or []))
     for value in address_name_candidates:
-        if _identity_claim_label_is_blocked(str(value or "")):
+        if (
+            _identity_claim_label_is_blocked(str(value or ""))
+        ):
             continue
         _append_unique_text(addressable_names, str(value or ""), limit=6)
 
@@ -11482,6 +12419,8 @@ def _character_inventory_continuity_aliases(
         for field_name in (
             "source_character_keys",
             "protagonist_identity_scope_keys",
+            "legacy_scope_keys",
+            "superseded_identity_scope_keys",
         )
         for value in list(payload.get(field_name) or [])
         if str(value or "").strip()
@@ -11490,6 +12429,16 @@ def _character_inventory_continuity_aliases(
         value = str(payload.get(field_name) or "").strip()
         if value:
             aliases.add(value)
+    aliases.update(
+        str(value or "").strip()
+        for value in list(
+            dict(payload.get("character_identity_review") or {}).get(
+                "member_scope_keys"
+            )
+            or []
+        )
+        if str(value or "").strip()
+    )
     if scope_key:
         aliases.add(scope_key)
     return aliases
@@ -11577,6 +12526,30 @@ def reconcile_character_inventory_v3_scope_keys(
     scope_key_map: dict[str, str] = {}
     for row in reconciled_rows:
         generated_scope_key = str(row.get("canonical_character_key") or "").strip()
+        verified_identity = dict(
+            row.get("character_identity_review") or {}
+        )
+        if verified_identity:
+            verified_scope_key = str(
+                verified_identity.get("target_scope_key") or ""
+            ).strip()
+            if verified_scope_key and generated_scope_key != verified_scope_key:
+                raise ValueError(
+                    "reviewed durable scope changed before reconcile: "
+                    f"expected={verified_scope_key} actual={generated_scope_key}"
+                )
+            if generated_scope_key in claimed_old_scope_keys:
+                raise ValueError(
+                    "reviewed durable scope already claimed: "
+                    f"{generated_scope_key}"
+                )
+            if generated_scope_key in old_rows:
+                claimed_old_scope_keys.add(generated_scope_key)
+            row["durable_character_key"] = generated_scope_key
+            row["continuity_status"] = "operator_reviewed"
+            row["continuity_reason"] = "exact_observation_identity_review"
+            row["continuity_version"] = 1
+            continue
         candidates: set[str] = set()
         if generated_scope_key in old_rows:
             candidates.add(generated_scope_key)
@@ -11673,9 +12646,13 @@ def aggregate_character_inventory_v3_rows(
     *,
     protagonist_resolution: dict | None = None,
     locked_protagonist_rows: list[dict[str, object]] | None = None,
+    character_identity_review: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     observations = build_character_inventory_v3_observations(signal_rows)
-    clusters = resolve_character_inventory_v3_clusters(observations)
+    clusters = resolve_character_inventory_v3_clusters(
+        observations,
+        character_identity_review=character_identity_review,
+    )
     total_signal_episodes = len(
         {
             int((extract_json_object(str(row.get("summary_text") or "")) or {}).get("episode_no") or row.get("episode_from") or 0)
@@ -11767,6 +12744,9 @@ def aggregate_character_inventory_v3_rows(
                 "non_unique_identity_labels": list(
                     cluster.get("non_unique_identity_labels") or []
                 ),
+                "character_identity_review": dict(
+                    cluster.get("character_identity_review") or {}
+                ),
                 "first_seen_episode_no": episode_nos[0] if episode_nos else 0,
                 "latest_seen_episode_no": episode_nos[-1] if episode_nos else 0,
                 "evidence_episode_nos": episode_nos[:120],
@@ -11829,6 +12809,8 @@ def aggregate_character_inventory_v3_rows(
                 ],
             }
         )
+    _prefer_source_backed_canonical_display_names(rows)
+    _remove_competing_character_aliases(rows)
     _mark_unverified_first_person_identity_rows(rows)
     _classify_character_inventory_v3_rows(
         rows,
@@ -11895,6 +12877,22 @@ def build_character_inventory_v3_hash_payload(item: dict[str, object]) -> dict[s
         "identity_group_members": list(item.get("identity_group_members") or []),
         "is_protagonist_identity_member": bool(item.get("is_protagonist_identity_member")),
         "superseded_protagonist_scope_keys": list(item.get("superseded_protagonist_scope_keys") or []),
+        "superseded_identity_scope_keys": list(
+            item.get("superseded_identity_scope_keys") or []
+        ),
+        "character_identity_review": dict(
+            item.get("character_identity_review") or {}
+        ),
+        "operator_reviewed_anonymous_protagonist": bool(
+            item.get("operator_reviewed_anonymous_protagonist")
+        ),
+        "alias_sanitization_v1": dict(item.get("alias_sanitization_v1") or {}),
+        "legacy_scope_keys": list(item.get("legacy_scope_keys") or []),
+        "durable_character_key": str(item.get("durable_character_key") or ""),
+        "continuity_status": str(item.get("continuity_status") or ""),
+        "continuity_reason": str(item.get("continuity_reason") or ""),
+        "continuity_version": int(item.get("continuity_version") or 0),
+        "identity_retirement_v1": dict(item.get("identity_retirement_v1") or {}),
     }
     payload.update(
         {
@@ -11979,12 +12977,62 @@ def build_demoted_locked_protagonist_inventory_row(
     return demoted
 
 
+def build_review_superseded_character_inventory_row(
+    old_row: dict[str, object],
+    *,
+    replacement_scope_key: str,
+    reason: str,
+) -> dict[str, object]:
+    retired = dict(old_row)
+    retired["work_role"] = "unknown"
+    retired["role_confidence"] = "low"
+    retired["classification_status"] = "AUTO_RESOLVED"
+    retired["review_reasons"] = sorted(
+        set(
+            list(retired.get("review_reasons") or [])
+            + ["OPERATOR_REVIEWED_IDENTITY_SUPERSEDED"]
+        )
+    )
+    retired["is_protagonist"] = False
+    retired["protagonist_confidence"] = "low"
+    for field_name in (
+        "identity_group_key",
+        "identity_group_role",
+        "identity_linked_to_scope_key",
+        "identity_link_type",
+        "protagonist_identity_scope_keys",
+        "identity_group_members",
+        "is_protagonist_identity_member",
+        "superseded_protagonist_scope_keys",
+        "superseded_identity_scope_keys",
+        "work_protagonist_resolution",
+    ):
+        retired.pop(field_name, None)
+    retired["continuity_status"] = "superseded"
+    retired["continuity_reason"] = "exact_observation_identity_review"
+    retired["continuity_version"] = 1
+    retired["public_chat_eligible"] = False
+    retired["public_slot_eligible"] = False
+    chat_readiness = dict(retired.get("chat_readiness_v1") or {})
+    chat_readiness["exposure_decision"] = "reject"
+    chat_readiness["character_chat_allowed"] = False
+    chat_readiness["public_slot_allowed"] = False
+    retired["chat_readiness_v1"] = chat_readiness
+    retired["identity_retirement_v1"] = {
+        "status": "superseded",
+        "replacement_scope_key": replacement_scope_key,
+        "reason": reason,
+    }
+    return retired
+
+
 def build_character_inventory_v3_summaries_from_signal_rows(
     cur,
     *,
     product_id: int,
     signal_rows: list[dict],
     protagonist_resolution: dict | None = None,
+    character_identity_review: dict[str, object] | None = None,
 ) -> tuple[int, int]:
     old_inventory_map = fetch_active_character_inventory_map(
         cur=cur,
@@ -12008,11 +13056,18 @@ def build_character_inventory_v3_summaries_from_signal_rows(
         signal_rows,
         protagonist_resolution=protagonist_resolution,
         locked_protagonist_rows=locked_protagonist_rows,
+        character_identity_review=character_identity_review,
     )
     inventory_rows = reconcile_character_inventory_v3_scope_keys(
         inventory_rows,
         old_inventory_map=old_inventory_map,
     )
+    _prefer_source_backed_canonical_display_names(inventory_rows)
+    _remove_competing_character_aliases(inventory_rows)
+    for item in inventory_rows:
+        _refresh_character_inventory_v3_serving_fields(item)
+    _suppress_duplicate_public_display_rows(inventory_rows)
+    _suppress_main_alias_public_slot_rows(inventory_rows)
     if signal_rows and not inventory_rows and not locked_protagonist_rows:
         raise ValueError(f"character_inventory_v3 aggregation returned 0 rows despite active signals: product_id={product_id}")
 
@@ -12020,15 +13075,87 @@ def build_character_inventory_v3_summaries_from_signal_rows(
     reused_count = 0
     valid_scope_keys: set[str] = set()
     preserved_locked_scope_keys: set[str] = set()
+    current_inventory_by_scope = {
+        str(item.get("canonical_character_key") or "").strip(): item
+        for item in inventory_rows
+        if str(item.get("canonical_character_key") or "").strip()
+    }
+    retirement_replacements: dict[str, tuple[str, str]] = {}
+    for operation in list(
+        dict(character_identity_review or {}).get("operations") or []
+    ):
+        kind = str(operation.get("kind") or "")
+        if kind not in {"merge_active_scopes", "retire_active_scope"}:
+            continue
+        replacement_scope_key = str(
+            operation.get("target_scope_key") or ""
+        ).strip()
+        replacement_item = dict(
+            current_inventory_by_scope.get(replacement_scope_key) or {}
+        )
+        if not replacement_scope_key or not _has_character_serving_contract(
+            replacement_item
+        ):
+            continue
+        retire_scope_keys = {
+            str(value or "").strip()
+            for value in list(operation.get("member_scope_keys") or [])
+            if str(value or "").strip()
+        } - {replacement_scope_key}
+        missing_retire_scope_keys = retire_scope_keys - set(old_inventory_map)
+        if missing_retire_scope_keys:
+            raise ValueError(
+                "reviewed retired scope is not active: "
+                + ",".join(sorted(missing_retire_scope_keys))
+            )
+        if retire_scope_keys:
+            replacement_item["superseded_identity_scope_keys"] = sorted(
+                set(
+                    list(
+                        replacement_item.get("superseded_identity_scope_keys")
+                        or []
+                    )
+                )
+                | retire_scope_keys
+            )
+            current_inventory_by_scope[replacement_scope_key] = replacement_item
+            for item in inventory_rows:
+                if (
+                    str(item.get("canonical_character_key") or "").strip()
+                    == replacement_scope_key
+                ):
+                    item["superseded_identity_scope_keys"] = list(
+                        replacement_item["superseded_identity_scope_keys"]
+                    )
+                    break
+        reason = str(
+            operation.get("reason") or "operator reviewed identity"
+        )
+        for retire_scope_key in retire_scope_keys:
+            old_replacement = retirement_replacements.get(retire_scope_key)
+            replacement = (replacement_scope_key, reason)
+            if old_replacement and old_replacement[0] != replacement_scope_key:
+                raise ValueError(
+                    "character scope is retired by multiple identity reviews: "
+                    f"{retire_scope_key}"
+                )
+            retirement_replacements[retire_scope_key] = replacement
     superseded_locked_scope_keys = {
         str(scope_key or "").strip()
         for item in inventory_rows
         for scope_key in list(item.get("superseded_protagonist_scope_keys") or [])
         if str(scope_key or "").strip()
+        and (
+            not dict(item.get("character_identity_review") or {})
+            or _has_character_serving_contract(item)
+        )
     }
+    superseded_locked_scope_keys.update(retirement_replacements)
     for item in inventory_rows:
         scope_key = str(item.get("canonical_character_key") or "").strip()
         if not scope_key:
+            continue
+        if scope_key in retirement_replacements:
             continue
         old_item = dict(old_inventory_map.get(scope_key) or {})
         if (
@@ -12060,6 +13187,36 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             inserted_count += 1
         else:
             reused_count += 1
+
+    for retired_scope_key, (
+        replacement_scope_key,
+        retirement_reason,
+    ) in retirement_replacements.items():
+        old_row = dict(
+            current_inventory_by_scope.get(retired_scope_key)
+            or old_inventory_map[retired_scope_key]
+        )
+        old_row.setdefault("canonical_character_key", retired_scope_key)
+        retired_row = build_review_superseded_character_inventory_row(
+            old_row,
+            replacement_scope_key=replacement_scope_key,
+            reason=retirement_reason,
+        )
+        valid_scope_keys.add(retired_scope_key)
+        if upsert_character_inventory_v3_item(
+            cur,
+            product_id=product_id,
+            item=retired_row,
+        ):
+            inserted_count += 1
+        else:
+            reused_count += 1
+        logger.warning(
+            "story_agent_character_identity_superseded product_id=%s scope_key=%s replacement_scope_key=%s",
+            product_id,
+            retired_scope_key,
+            replacement_scope_key,
+        )
 
     for locked_row in locked_protagonist_rows:
         locked_scope_key = str(locked_row.get("canonical_character_key") or "").strip()
@@ -12127,11 +13284,17 @@ def build_character_inventory_v3_summaries(
     protagonist_resolution: dict | None = None,
 ) -> tuple[int, int]:
     signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    character_identity_review = fetch_character_identity_review(
+        cur,
+        product_id=product_id,
+        signal_rows=signal_rows,
+    )
     return build_character_inventory_v3_summaries_from_signal_rows(
         cur,
         product_id=product_id,
         signal_rows=signal_rows,
         protagonist_resolution=protagonist_resolution,
+        character_identity_review=character_identity_review,
     )
 
 
@@ -12145,19 +13308,32 @@ async def build_character_inventory_v3_summaries_resolved(
     verbose: bool = False,
 ) -> tuple[int, int]:
     signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
-    protagonist_resolution = await build_work_protagonist_resolution_for_inventory_v3(
+    character_identity_review = fetch_character_identity_review(
+        cur,
         product_id=product_id,
-        product_title=product_title,
         signal_rows=signal_rows,
-        summary_client=summary_client,
-        episode_summary_rows=list(episode_summary_rows or []),
-        verbose=verbose,
     )
+    protagonist_resolution = None
+    if not any(
+        bool(item.get("force_main_protagonist"))
+        for item in list(
+            dict(character_identity_review or {}).get("operations") or []
+        )
+    ):
+        protagonist_resolution = await build_work_protagonist_resolution_for_inventory_v3(
+            product_id=product_id,
+            product_title=product_title,
+            signal_rows=signal_rows,
+            summary_client=summary_client,
+            episode_summary_rows=list(episode_summary_rows or []),
+            verbose=verbose,
+        )
     return build_character_inventory_v3_summaries_from_signal_rows(
         cur,
         product_id=product_id,
         signal_rows=signal_rows,
         protagonist_resolution=protagonist_resolution,
+        character_identity_review=character_identity_review,
     )
 
 
