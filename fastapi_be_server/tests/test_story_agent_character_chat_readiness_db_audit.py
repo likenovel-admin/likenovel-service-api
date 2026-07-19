@@ -257,6 +257,27 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
 
         self.assertEqual(actions, ["rebuild_rp_assets_with_v3_scope"])
 
+    def test_ready_co_main_observed_ambiguity_is_not_actionable(self):
+        module = load_module()
+
+        actions = module.build_asset_action_plan(
+            {
+                "product_id": 1127,
+                "context_status": "ready",
+                "character_chat_asset_readiness": {
+                    "character_chat_status": "ready",
+                    "ready_main_protagonist_scope_keys": ["character:득구"],
+                    "continuity_ambiguous_scope_keys": ["character:설총"],
+                    "blocking_continuity_ambiguous_scope_keys": [],
+                    "block_reason_counts": {
+                        "identity_continuity_ambiguous": 1,
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(actions, ["ready"])
+
     def test_actionable_summary_is_nonzero_only_when_fail_flag_is_enabled(self):
         module = load_module()
         summary = {
