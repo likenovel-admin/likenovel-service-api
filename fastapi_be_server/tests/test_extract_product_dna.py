@@ -4,6 +4,10 @@ from pathlib import Path
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from app.services.common.openrouter_background_credit_guard import (
+    OpenRouterBackgroundCreditReserveError,
+)
+
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dist" / "batch" / "extract_product_dna.py"
 LEGACY_MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "extract_product_dna.py"
@@ -667,6 +671,11 @@ class AiDnaProductTargetQueryTest(TestCase):
             "error": {"code": 402, "message": "insufficient credits"}
         }
         client = MagicMock()
+        credit_response = MagicMock()
+        credit_response.json.return_value = {
+            "data": {"total_credits": 20.0, "total_usage": 10.0}
+        }
+        client.__enter__.return_value.get.return_value = credit_response
         client.__enter__.return_value.post.return_value = response
 
         with (
@@ -686,6 +695,11 @@ class AiDnaProductTargetQueryTest(TestCase):
             "error": {"code": 429, "message": "rate limited"}
         }
         client = MagicMock()
+        credit_response = MagicMock()
+        credit_response.json.return_value = {
+            "data": {"total_credits": 20.0, "total_usage": 10.0}
+        }
+        client.__enter__.return_value.get.return_value = credit_response
         client.__enter__.return_value.post.return_value = response
 
         with (
@@ -698,6 +712,33 @@ class AiDnaProductTargetQueryTest(TestCase):
                 module.call_openrouter("system", "user", {})
 
         self.assertNotIsInstance(ctx.exception, module.OpenRouterInsufficientCreditsError)
+
+    def test_main_reserve_block_does_not_mark_product_failed(self):
+        module = load_module()
+        conn = MagicMock()
+        products = [{"product_id": 1211, "title": "protected"}]
+
+        with (
+            patch.object(module, "load_allowed_labels", return_value={}),
+            patch.object(module, "_validate_runtime_config"),
+            patch.object(module, "db_connect", return_value=conn),
+            patch.object(module, "get_products", return_value=products),
+            patch.object(module, "get_episodes", return_value=[]),
+            patch.object(module, "_build_episode_context", return_value=("context", 10)),
+            patch.object(
+                module,
+                "analyze_product",
+                side_effect=OpenRouterBackgroundCreditReserveError("reserve blocked"),
+            ) as analyze,
+            patch.object(module, "save_failed") as save_failed,
+            patch.object(module.time, "sleep"),
+            patch("sys.argv", ["extract_product_dna.py", "--all"]),
+        ):
+            with self.assertRaisesRegex(SystemExit, "1"):
+                module.main()
+
+        self.assertEqual(analyze.call_count, 1)
+        save_failed.assert_not_called()
 
     def test_main_stops_after_first_openrouter_402(self):
         module = load_module()

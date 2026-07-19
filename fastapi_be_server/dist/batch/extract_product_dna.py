@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,22 @@ OPENROUTER_ALLOWED_FINISH_REASONS = {"stop"}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
+for api_root_candidate in (
+    SCRIPT_DIR.parent.parent,
+    SCRIPT_DIR.parent,
+    SCRIPT_DIR.parent / "api",
+    SCRIPT_DIR.parent / "api-dev",
+):
+    if (api_root_candidate / "app" / "services" / "common").is_dir():
+        if str(api_root_candidate) not in sys.path:
+            sys.path.insert(0, str(api_root_candidate))
+        break
+
+from app.services.common.openrouter_background_credit_guard import (  # noqa: E402
+    OpenRouterBackgroundCreditGuardError,
+    post_openrouter_background_chat_completion,
+)
+
 LABELS_JSON_CANDIDATES = [
     SCRIPT_DIR / "allowed-labels-by-axis.json",  # 서버 배치 디렉토리
     ROOT_DIR / "ai" / "allowed-labels-by-axis.json",  # 컨테이너: /app/dist/ai/
@@ -1181,8 +1198,10 @@ def call_openrouter(
         }
 
     with httpx.Client(timeout=AI_DNA_TIMEOUT_SECONDS) as client:
-        resp = client.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
+        resp = post_openrouter_background_chat_completion(
+            client,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
@@ -1528,6 +1547,7 @@ def main():
     success = 0
     fail = 0
     provider_circuit_open = False
+    reserve_circuit_open = False
     for i, product in enumerate(products, 1):
         pid = product["product_id"]
         title = product["title"]
@@ -1561,18 +1581,26 @@ def main():
                 last_error = _format_failure_message(e)
                 provider_circuit_open = True
                 break
+            except OpenRouterBackgroundCreditGuardError as e:
+                last_error = _format_failure_message(e)
+                provider_circuit_open = True
+                reserve_circuit_open = True
+                break
             except Exception as e:
                 last_error = _format_failure_message(e)
                 if attempt <= MAX_RETRY_COUNT:
                     time.sleep(1.0)
 
-        if not analyzed:
+        if not analyzed and not reserve_circuit_open:
             fail += 1
             save_failed(conn, pid, last_attempt or 1, last_error)
             print(f"FAIL: {last_error}")
+        elif not analyzed:
+            print(f"PAUSE: {last_error}")
 
         if provider_circuit_open:
-            print("[ABORT] OpenRouter insufficient credits; stopping AI DNA batch.")
+            reason = "background reserve" if reserve_circuit_open else "insufficient credits"
+            print(f"[ABORT] OpenRouter {reason}; stopping AI DNA batch.")
             break
 
         time.sleep(1)  # rate limit 방지

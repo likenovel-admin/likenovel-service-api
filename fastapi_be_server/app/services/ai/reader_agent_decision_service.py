@@ -9,6 +9,9 @@ import httpx
 
 from app.const import settings
 from app.exceptions import CustomResponseException
+from app.services.common.openrouter_background_credit_guard import (
+    post_openrouter_background_chat_completion_async,
+)
 
 
 READER_DECISION_PROMPT_VERSION = "ai-reader-decision-v1"
@@ -500,8 +503,10 @@ async def _post_openrouter_chat_completion(payload: dict[str, Any], max_tokens: 
     async with httpx.AsyncClient(
         timeout=settings.AI_READER_OPENROUTER_TIMEOUT_SECONDS
     ) as client:
-        resp = await client.post(
-            f"{settings.OPENROUTER_BASE_URL}/chat/completions",
+        resp = await post_openrouter_background_chat_completion_async(
+            client,
+            base_url=settings.OPENROUTER_BASE_URL,
+            api_key=settings.OPENROUTER_API_KEY,
             headers={
                 "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
