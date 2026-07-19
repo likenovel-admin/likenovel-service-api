@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from app.const import settings
 from app.rdb import likenovel_db_engine, likenovel_db_session
@@ -20,6 +21,15 @@ from app.services.ai.reader_agent_worker_service import (
 
 
 logger = logging.getLogger(__name__)
+RETRYABLE_WORKER_DB_ERROR_CODES = frozenset({1205, 1213})
+
+
+def is_retryable_worker_db_error(exc: OperationalError) -> bool:
+    original_args = getattr(getattr(exc, "orig", None), "args", ())
+    return bool(
+        original_args
+        and original_args[0] in RETRYABLE_WORKER_DB_ERROR_CODES
+    )
 
 
 async def set_ai_reader_worker_db_timezone(db) -> None:
@@ -73,23 +83,39 @@ async def run(args: argparse.Namespace) -> None:
 
         last_schedule_ensured_at: float | None = None
         while True:
-            async with likenovel_db_session() as db:
-                await set_ai_reader_worker_db_timezone(db)
-                now_monotonic = time.monotonic()
-                if should_ensure_reader_daily_schedules(
-                    last_ensured_at=last_schedule_ensured_at,
-                    now_monotonic=now_monotonic,
-                    interval_seconds=args.schedule_ensure_interval_seconds,
-                ):
-                    await ensure_reader_daily_schedules_for_worker(db)
+            schedule_ensured_this_cycle = False
+            try:
+                async with likenovel_db_session() as db:
+                    await set_ai_reader_worker_db_timezone(db)
+                    now_monotonic = time.monotonic()
+                    if should_ensure_reader_daily_schedules(
+                        last_ensured_at=last_schedule_ensured_at,
+                        now_monotonic=now_monotonic,
+                        interval_seconds=args.schedule_ensure_interval_seconds,
+                    ):
+                        await ensure_reader_daily_schedules_for_worker(db)
+                        schedule_ensured_this_cycle = True
+                    result = await run_reader_worker_cycle(
+                        db,
+                        worker_id=args.worker_id,
+                        session_limit=args.session_limit,
+                        action_limit=args.action_limit,
+                    )
+                    await db.commit()
+                if schedule_ensured_this_cycle:
                     last_schedule_ensured_at = now_monotonic
-                result = await run_reader_worker_cycle(
-                    db,
-                    worker_id=args.worker_id,
-                    session_limit=args.session_limit,
-                    action_limit=args.action_limit,
+            except OperationalError as exc:
+                if args.once or not is_retryable_worker_db_error(exc):
+                    raise
+                logger.warning(
+                    "ai reader worker database lock conflict; retrying",
+                    extra={
+                        "worker_id": args.worker_id,
+                        "mysql_error_code": exc.orig.args[0],
+                    },
                 )
-                await db.commit()
+                await asyncio.sleep(args.interval_seconds)
+                continue
             logger.info("ai reader worker cycle completed", extra={"result": result})
             if args.once:
                 return

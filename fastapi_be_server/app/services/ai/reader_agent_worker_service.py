@@ -443,6 +443,7 @@ async def run_reader_worker_cycle(
 
     await schema_guard(db)
     await expired_agent_pauser(db)
+    await _commit_active_transaction(db)
 
     sessions = await session_claimer(db, worker_id=worker_id, limit=session_limit)
     processed_session_count = 0

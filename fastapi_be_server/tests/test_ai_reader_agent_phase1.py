@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy.exc import InvalidRequestError
+from sqlalchemy.exc import InvalidRequestError, OperationalError
 
 
 class AiReaderAgentPhase1Test(unittest.TestCase):
@@ -6007,7 +6007,10 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(affected, 2)
         self.assertIn("select a.ai_reader_agent_id", executed_sql)
-        self.assertIn("for update", executed_sql)
+        self.assertIn("order by a.ai_reader_agent_id", executed_sql)
+        self.assertIn("limit :limit", executed_sql)
+        self.assertIn("for update skip locked", executed_sql)
+        self.assertEqual(db.execute.await_args_list[0].args[1]["limit"], 50)
         self.assertIn("update tb_ai_reader_agent a", executed_sql)
         self.assertIn("set a.status = 'paused'", executed_sql)
         self.assertIn("a.status = 'active'", executed_sql)
@@ -8735,6 +8738,120 @@ class AiReaderWorkerCycleTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_worker_script_retries_lock_timeout_then_runs_next_cycle(self):
+        from app.services.ai import reader_agent_worker_service as worker_service
+        from scripts import run_ai_reader_worker
+
+        class StopWorker(Exception):
+            pass
+
+        events = []
+        cycle_count = 0
+
+        class FakeDb:
+            async def commit(self):
+                events.append("commit")
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            events.append("open")
+            yield FakeDb()
+            events.append("close")
+
+        async def fake_schema_checker(db):
+            return None
+
+        async def fake_timezone_setter(db):
+            return None
+
+        async def fake_schedule_ensurer(db):
+            events.append("ensure_schedule")
+            return {"created_schedule_count": 0}
+
+        async def fake_cycle(db, *, worker_id, session_limit, action_limit):
+            nonlocal cycle_count
+            cycle_count += 1
+            events.append(f"cycle:{cycle_count}")
+            if cycle_count == 1:
+                raise OperationalError(
+                    "select for update",
+                    {},
+                    Exception(1205, "Lock wait timeout exceeded"),
+                )
+            return worker_service.ReaderWorkerCycleResult(
+                claimed_session_count=0,
+                processed_session_count=0,
+                failed_session_count=0,
+                claimed_action_count=0,
+                processed_action_count=0,
+                failed_action_count=0,
+            )
+
+        async def fake_sleep(seconds):
+            events.append(f"sleep:{seconds}")
+            if cycle_count >= 2:
+                raise StopWorker
+
+        class FakeEngine:
+            async def dispose(self):
+                events.append("dispose")
+
+        args = argparse.Namespace(
+            worker_id="reader-worker-a",
+            session_limit=3,
+            action_limit=5,
+            interval_seconds=5.0,
+            schedule_ensure_interval_seconds=300.0,
+            once=False,
+        )
+
+        with patch.dict(os.environ, {"AI_READER_WORKER_ENABLED": "Y"}), patch.object(
+            run_ai_reader_worker,
+            "likenovel_db_session",
+            fake_session_factory,
+        ), patch.object(
+            run_ai_reader_worker,
+            "ensure_reader_worker_schema_ready_once",
+            fake_schema_checker,
+        ), patch.object(
+            run_ai_reader_worker,
+            "likenovel_db_engine",
+            FakeEngine(),
+        ), patch.object(
+            run_ai_reader_worker,
+            "run_reader_worker_cycle",
+            fake_cycle,
+        ), patch.object(
+            run_ai_reader_worker,
+            "set_ai_reader_worker_db_timezone",
+            fake_timezone_setter,
+        ), patch.object(
+            run_ai_reader_worker,
+            "ensure_reader_daily_schedules_for_worker",
+            fake_schedule_ensurer,
+        ), patch.object(
+            run_ai_reader_worker.asyncio,
+            "sleep",
+            fake_sleep,
+        ):
+            with self.assertRaises(StopWorker):
+                await run_ai_reader_worker.run(args)
+
+        self.assertEqual(cycle_count, 2)
+        self.assertEqual(events.count("ensure_schedule"), 2)
+        self.assertIn("sleep:5.0", events)
+        self.assertEqual(events[-1], "dispose")
+
+    def test_worker_db_retry_classifier_only_accepts_lock_errors(self):
+        from scripts import run_ai_reader_worker
+
+        def error(code):
+            return OperationalError("statement", {}, Exception(code, "db error"))
+
+        self.assertTrue(run_ai_reader_worker.is_retryable_worker_db_error(error(1205)))
+        self.assertTrue(run_ai_reader_worker.is_retryable_worker_db_error(error(1213)))
+        self.assertFalse(run_ai_reader_worker.is_retryable_worker_db_error(error(2006)))
+
     def test_worker_schedule_ensure_throttle_runs_first_then_after_interval(self):
         from scripts import run_ai_reader_worker
 
@@ -8937,16 +9054,19 @@ class AiReaderWorkerCycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.processed_action_count, 1)
         self.assertEqual(result.failed_action_count, 0)
 
-    async def test_run_reader_worker_cycle_commits_action_claim_before_processing(self):
+    async def test_run_reader_worker_cycle_commits_pause_before_claiming_and_action_claim_before_processing(self):
         from app.services.ai import reader_agent_action_service as action_service
         from app.services.ai import reader_agent_worker_service as worker_service
 
         events = []
         db = AsyncMock()
-        db.in_transaction = lambda: True
+        transaction_active = True
+        db.in_transaction = lambda: transaction_active
 
         async def fake_commit():
+            nonlocal transaction_active
             events.append("commit")
+            transaction_active = False
 
         db.commit.side_effect = fake_commit
         claimed_actions = [
@@ -8962,7 +9082,9 @@ class AiReaderWorkerCycleTest(unittest.IsolatedAsyncioTestCase):
         ]
 
         async def fake_session_claimer(tx_db, *, worker_id, limit):
+            nonlocal transaction_active
             events.append("claim_sessions")
+            transaction_active = True
             return []
 
         async def fake_action_claimer(tx_db, *, worker_id, limit):
@@ -8982,6 +9104,7 @@ class AiReaderWorkerCycleTest(unittest.IsolatedAsyncioTestCase):
             events.append("schema")
 
         async def fake_expired_agent_pauser(tx_db):
+            events.append("pause_expired_agents")
             return 0
 
         with patch.dict(os.environ, {"AI_READER_WORKER_ENABLED": "Y"}):
@@ -8999,6 +9122,8 @@ class AiReaderWorkerCycleTest(unittest.IsolatedAsyncioTestCase):
             events,
             [
                 "schema",
+                "pause_expired_agents",
+                "commit",
                 "claim_sessions",
                 "claim_actions",
                 "commit",
