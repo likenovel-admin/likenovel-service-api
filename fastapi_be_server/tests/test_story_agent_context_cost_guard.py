@@ -3741,6 +3741,8 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 return rows
             if summary_type == "character_inventory_v3":
                 return []
+            if summary_type == "character_identity_review_v1":
+                return []
             self.fail(f"unexpected summary_type: {summary_type}")
 
         def fake_upsert(cur, *, product_id, item):
@@ -3801,6 +3803,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         inserted_items = []
 
         with patch.object(module, "fetch_active_summary_rows", return_value=rows), \
+             patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "OPENROUTER_API_KEY", ""), \
              patch.object(module, "request_work_protagonist_resolution_payload", AsyncMock()) as request_mock, \
              patch.object(module, "upsert_character_inventory_v3_item", side_effect=lambda cur, *, product_id, item: inserted_items.append(item) or True), \
