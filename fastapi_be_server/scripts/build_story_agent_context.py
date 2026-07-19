@@ -7958,6 +7958,8 @@ def normalize_character_identity_review_document(
             "signal_anchors",
             "force_main_protagonist",
             "anonymous_protagonist",
+            "canonical_display_name",
+            "blocked_aliases",
             "reason",
         }
         unknown_operation_keys = set(raw_operation) - allowed_operation_keys
@@ -8051,6 +8053,37 @@ def normalize_character_identity_review_document(
             raise ValueError(
                 f"anonymous review must confirm protagonist role: {operation_id}"
             )
+        canonical_display_name = str(
+            raw_operation.get("canonical_display_name") or ""
+        ).strip()
+        if len(canonical_display_name) > 80 or any(
+            character in canonical_display_name for character in "\r\n\t"
+        ):
+            raise ValueError(
+                f"invalid reviewed canonical display name: {operation_id}"
+            )
+        blocked_aliases = list(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in list(raw_operation.get("blocked_aliases") or [])
+                if str(value or "").strip()
+            )
+        )
+        if len(blocked_aliases) > 8 or any(
+            len(value) > 80 or any(character in value for character in "\r\n\t")
+            for value in blocked_aliases
+        ):
+            raise ValueError(f"invalid reviewed blocked aliases: {operation_id}")
+        canonical_display_label = normalize_signal_entity_label(
+            canonical_display_name
+        ).lower()
+        if canonical_display_label and canonical_display_label in {
+            normalize_signal_entity_label(value).lower()
+            for value in blocked_aliases
+        }:
+            raise ValueError(
+                f"reviewed canonical display cannot be blocked: {operation_id}"
+            )
         reason = str(raw_operation.get("reason") or "").strip()[:240]
         if not reason:
             raise ValueError(f"identity review requires reason: {operation_id}")
@@ -8064,6 +8097,8 @@ def normalize_character_identity_review_document(
                 "signal_anchors": signal_anchors,
                 "force_main_protagonist": force_main_protagonist,
                 "anonymous_protagonist": anonymous_protagonist,
+                "canonical_display_name": canonical_display_name,
+                "blocked_aliases": blocked_aliases,
                 "reason": reason,
             }
         )
@@ -8177,6 +8212,8 @@ def materialize_character_identity_review_document(
                 "target_scope_key",
                 "force_main_protagonist",
                 "anonymous_protagonist",
+                "canonical_display_name",
+                "blocked_aliases",
                 "reason",
             },
             "confirm_protagonist": {
@@ -8184,6 +8221,8 @@ def materialize_character_identity_review_document(
                 "kind",
                 "scope_key",
                 "anonymous_protagonist",
+                "canonical_display_name",
+                "blocked_aliases",
                 "reason",
             },
             "retire_active_scope": {
@@ -8257,6 +8296,64 @@ def materialize_character_identity_review_document(
             raise ValueError(
                 f"retirement replacement must have serving contract: {operation_id}"
             )
+        canonical_display_name = str(
+            raw_operation.get("canonical_display_name") or ""
+        ).strip()
+        blocked_aliases = list(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in list(raw_operation.get("blocked_aliases") or [])
+                if str(value or "").strip()
+            )
+        )
+        target_inventory = dict(inventory_map[target_scope_key])
+        identity_values = {
+            str(value or "").strip()
+            for value in [
+                target_inventory.get("display_name"),
+                *list(target_inventory.get("aliases") or []),
+                *list(target_inventory.get("narration_names") or []),
+                *list(target_inventory.get("social_call_names") or []),
+                *list(target_inventory.get("persona_names") or []),
+                *list(target_inventory.get("real_names") or []),
+            ]
+            if str(value or "").strip()
+        }
+        identity_labels = {
+            normalize_signal_entity_label(value).lower()
+            for value in identity_values
+            if normalize_signal_entity_label(value)
+        }
+        canonical_display_label = normalize_signal_entity_label(
+            canonical_display_name
+        ).lower()
+        if canonical_display_name and canonical_display_label not in identity_labels:
+            raise ValueError(
+                f"review requires source-backed display: {operation_id}"
+            )
+        missing_blocked_aliases = [
+            value
+            for value in blocked_aliases
+            if normalize_signal_entity_label(value).lower() not in identity_labels
+        ]
+        if missing_blocked_aliases:
+            raise ValueError(
+                f"review requires active identity alias: {operation_id}"
+            )
+        current_display_label = normalize_signal_entity_label(
+            str(target_inventory.get("display_name") or "")
+        ).lower()
+        blocked_alias_labels = {
+            normalize_signal_entity_label(value).lower()
+            for value in blocked_aliases
+        }
+        if current_display_label in blocked_alias_labels and (
+            not canonical_display_label
+            or canonical_display_label == current_display_label
+        ):
+            raise ValueError(
+                f"review cannot block active display without replacement: {operation_id}"
+            )
         reviewed_scope_keys = (
             required_scope_keys
             if kind == "retire_active_scope"
@@ -8302,6 +8399,8 @@ def materialize_character_identity_review_document(
                 ],
                 "force_main_protagonist": force_main_protagonist,
                 "anonymous_protagonist": anonymous_protagonist,
+                "canonical_display_name": canonical_display_name,
+                "blocked_aliases": blocked_aliases,
                 "reason": reason,
             }
         )
@@ -10375,6 +10474,70 @@ def resolve_character_inventory_v3_clusters(
 def _apply_character_identity_review_rows(
     rows: list[dict[str, object]],
 ) -> None:
+    for row in rows:
+        identity_review = dict(row.get("character_identity_review") or {})
+        canonical_display_name = str(
+            identity_review.get("canonical_display_name") or ""
+        ).strip()
+        blocked_aliases = [
+            str(value or "").strip()
+            for value in list(identity_review.get("blocked_aliases") or [])
+            if str(value or "").strip()
+        ]
+        if not canonical_display_name and not blocked_aliases:
+            continue
+        display_name_before = str(row.get("display_name") or "").strip()
+        blocked_alias_labels = {
+            normalize_signal_entity_label(value).lower()
+            for value in blocked_aliases
+            if normalize_signal_entity_label(value)
+        }
+        if canonical_display_name:
+            row["display_name"] = canonical_display_name
+            row["display_name_source"] = "operator_review"
+            row["display_name_type"] = (
+                "generic"
+                if is_generic_character_label(canonical_display_name)
+                else "named"
+            )
+            row["is_generic_display_name"] = is_generic_character_label(
+                canonical_display_name
+            )
+        for field_name in (
+            "aliases",
+            "narration_names",
+            "social_call_names",
+            "persona_names",
+            "real_names",
+        ):
+            values = [
+                str(value or "").strip()
+                for value in list(row.get(field_name) or [])
+                if str(value or "").strip()
+            ]
+            row[field_name] = list(
+                dict.fromkeys(
+                    value
+                    for value in values
+                    if normalize_signal_entity_label(value).lower()
+                    not in blocked_alias_labels
+                )
+            )[:8]
+        if canonical_display_name:
+            aliases = [
+                canonical_display_name,
+                *list(row.get("aliases") or []),
+            ]
+            row["aliases"] = list(dict.fromkeys(aliases))[:8]
+        row["identity_surface_review_v1"] = {
+            "version": 1,
+            "operation_id": str(identity_review.get("operation_id") or ""),
+            "canonical_display_name": str(row.get("display_name") or "").strip(),
+            "display_name_before": display_name_before,
+            "blocked_aliases": blocked_aliases,
+            "review_digest": str(identity_review.get("review_digest") or ""),
+        }
+
     selected_rows = [
         row
         for row in rows
@@ -12887,6 +13050,9 @@ def build_character_inventory_v3_hash_payload(item: dict[str, object]) -> dict[s
         ),
         "operator_reviewed_anonymous_protagonist": bool(
             item.get("operator_reviewed_anonymous_protagonist")
+        ),
+        "identity_surface_review_v1": dict(
+            item.get("identity_surface_review_v1") or {}
         ),
         "alias_sanitization_v1": dict(item.get("alias_sanitization_v1") or {}),
         "legacy_scope_keys": list(item.get("legacy_scope_keys") or []),
