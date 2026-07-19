@@ -2268,6 +2268,113 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertTrue(all(item["scope_key"] == scope_key for item in upserted))
         deactivate_scope.assert_not_called()
 
+    async def test_delta_rp_build_bridges_reviewed_matching_profile_from_ambiguous_alias(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:4ca88c0896bf"
+        other_scope_key = "character:당시우"
+        legacy_scope_key = "protagonist:first_person"
+        profile_payload = {
+            "character_key": legacy_scope_key,
+            "display_name": "백의",
+            "aliases": ["백의", "실눈 성자"],
+            "speech_style": {"tone": "담담"},
+            "personality_core": ["신중함"],
+            "baseline_attitude": "경계",
+        }
+        example_payload = {
+            "character_key": legacy_scope_key,
+            "examples": [
+                {"episode_no": 0, "source_kind": "dialogue", "text": "첫 번째 유일 대사", "confidence": 0.9},
+                {"episode_no": 0, "source_kind": "dialogue", "text": "두 번째 유일 대사", "confidence": 0.9},
+                {"episode_no": 0, "source_kind": "dialogue", "text": "세 번째 유일 대사", "confidence": 0.9},
+            ],
+        }
+        state_maps = {
+            "character_rp_profile": {
+                legacy_scope_key: {
+                    "summary_id": 11,
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-profile-hash",
+                    "payload": profile_payload,
+                }
+            },
+            "character_rp_examples": {
+                legacy_scope_key: {
+                    "summary_id": 12,
+                    "scope_key": legacy_scope_key,
+                    "source_hash": "legacy-examples-hash",
+                    "payload": example_payload,
+                }
+            },
+        }
+        inventory_map = {
+            scope_key: {
+                "canonical_character_key": scope_key,
+                "source_character_keys": [legacy_scope_key],
+                "display_name": "실눈 성자",
+                "aliases": ["실눈 성자", "나"],
+                "is_protagonist": True,
+                "distinct_episode_count": 8,
+                "identity_surface_review_v1": {
+                    "version": 1,
+                    "operation_id": "merge-squint-saint",
+                    "review_digest": "review-digest",
+                    "canonical_display_name": "실눈 성자",
+                },
+            },
+            other_scope_key: {
+                "canonical_character_key": other_scope_key,
+                "source_character_keys": [legacy_scope_key, "named:당시우"],
+                "display_name": "당시우",
+                "aliases": ["당시우"],
+                "distinct_episode_count": 2,
+            },
+        }
+        upserted = []
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        def fake_upsert(_cur, **kwargs):
+            upserted.append(kwargs)
+            return {"summary_id": len(upserted)}, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module, "RP_OPENROUTER_MODEL", ""), \
+             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1109,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no={
+                    4: "첫 번째 유일 대사",
+                    5: "두 번째 유일 대사와 세 번째 유일 대사",
+                },
+                summary_client=None,
+                inventory_map=inventory_map,
+                relation_map={},
+            )
+
+        self.assertNotIn(
+            legacy_scope_key,
+            module.build_inventory_source_scope_key_map(inventory_map),
+        )
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual(
+            [item["scope_key"] for item in upserted],
+            [scope_key, scope_key],
+        )
+        saved_examples = json.loads(upserted[1]["summary_text"])
+        self.assertEqual(
+            [item["episode_no"] for item in saved_examples["examples"]],
+            [4, 5, 5],
+        )
+
     async def test_delta_rp_build_recovers_inactive_inventory_scope_by_strong_history_alias(self):
         module = load_module()
         conn = FakeConnection()
