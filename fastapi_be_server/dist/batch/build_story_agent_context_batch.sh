@@ -181,7 +181,16 @@ if ! CANDIDATE_OUTPUT="$("${MYSQL_CMD[@]}" <<SQL
 SELECT
   candidates.product_id,
   candidates.title,
-  candidates.character_asset_repair_needed
+  candidates.character_asset_repair_needed,
+  CASE
+    WHEN candidates.missing_open_character_signal_count > 0 THEN 1
+    WHEN candidates.active_open_character_signal_count > 0
+      AND (
+        candidates.active_character_inventory_count = 0
+        OR candidates.active_character_inventory_v3_count = 0
+      ) THEN 1
+    ELSE 0
+  END AS inventory_reaggregation_needed
 FROM (
   SELECT
     p.product_id,
@@ -190,6 +199,7 @@ FROM (
     sacp.last_built_at AS last_built_at,
     SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count,
     SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_character_signal_count,
+    SUM(CASE WHEN sacs_signal.summary_id IS NOT NULL THEN 1 ELSE 0 END) AS active_open_character_signal_count,
     SUM(CASE
       WHEN collection_cohort.product_id IS NOT NULL AND sacs_scene.summary_id IS NULL THEN 1
       ELSE 0
@@ -381,6 +391,13 @@ FROM (
     OR missing_open_scene_count > 0
     OR character_asset_repair_needed > 0
     OR (
+      active_open_character_signal_count > 0
+      AND (
+        active_character_inventory_count = 0
+        OR active_character_inventory_v3_count = 0
+      )
+    )
+    OR (
       context_status = 'failed'
       AND missing_foundation_episode_count = 0
       AND active_character_inventory_count > 0
@@ -393,8 +410,13 @@ ORDER BY
     WHEN candidates.context_status = 'failed' THEN 0
     WHEN candidates.missing_foundation_episode_count >= ${BACKLOG_PRIORITY_THRESHOLD} THEN 1
     WHEN candidates.missing_foundation_episode_count > 0 OR candidates.missing_open_scene_count > 0 THEN 2
-    WHEN candidates.character_asset_repair_needed > 0 THEN 3
-    ELSE 4
+    WHEN candidates.active_open_character_signal_count > 0
+      AND (
+        candidates.active_character_inventory_count = 0
+        OR candidates.active_character_inventory_v3_count = 0
+      ) THEN 3
+    WHEN candidates.character_asset_repair_needed > 0 THEN 4
+    ELSE 5
   END ASC,
   CASE candidates.context_status
     WHEN 'processing' THEN 0
@@ -433,6 +455,7 @@ run_product() {
   local product_id="$1"
   local product_title="$2"
   local character_asset_repair_needed="${3:-0}"
+  local inventory_reaggregation_needed="${4:-0}"
 
   (
     export PYTHONUNBUFFERED=1
@@ -447,6 +470,9 @@ run_product() {
     if [ "${BUILD_MODE}" = "delta" ] && [ "${character_asset_repair_needed}" -gt 0 ]; then
       command+=(--repair-character-assets)
     fi
+    if [ "${BUILD_MODE}" = "delta" ] && [ "${inventory_reaggregation_needed}" -gt 0 ]; then
+      command+=(--reaggregate-character-inventory)
+    fi
     exec "${command[@]}"
   ) > >(append_timestamped_to_log) 2>&1 &
 
@@ -459,11 +485,15 @@ run_product() {
 }
 
 for row in "${CANDIDATE_ROWS[@]}"; do
-  IFS=$'\t' read -r product_id product_title character_asset_repair_needed <<< "${row}"
+  IFS=$'\t' read -r product_id product_title character_asset_repair_needed inventory_reaggregation_needed <<< "${row}"
   if [ -z "${product_id:-}" ] || [ -z "${product_title:-}" ]; then
     continue
   fi
-  run_product "${product_id}" "${product_title}" "${character_asset_repair_needed:-0}"
+  run_product \
+    "${product_id}" \
+    "${product_title}" \
+    "${character_asset_repair_needed:-0}" \
+    "${inventory_reaggregation_needed:-0}"
 done
 
 if [ "${#PIDS[@]}" -eq 0 ]; then

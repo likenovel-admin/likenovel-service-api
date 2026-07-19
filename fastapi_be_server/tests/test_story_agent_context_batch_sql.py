@@ -117,10 +117,12 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertNotIn("AS UNSIGNED", script)
         self.assertIn("missing_open_episode_count", script)
         self.assertIn("missing_open_character_signal_count", script)
+        self.assertIn("active_open_character_signal_count", script)
         self.assertIn("missing_open_scene_count", script)
         self.assertIn("missing_foundation_episode_count", script)
         self.assertIn("active_character_inventory_count", script)
         self.assertIn("active_character_inventory_v3_count", script)
+        self.assertIn("inventory_reaggregation_needed", script)
         self.assertIn("character_asset_repair_needed", script)
         self.assertIn("character_rp_profile", script)
         self.assertIn("character_rp_examples", script)
@@ -129,8 +131,82 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("repair_scene_actor.character_scope_key = repair_inventory.scope_key", script)
         self.assertIn("repair_example_item.example_text", script)
         self.assertIn("--repair-character-assets", script)
+        self.assertIn("--reaggregate-character-inventory", script)
         self.assertNotIn("MAX(pe.episode_no)", script)
         self.assertNotIn("p.price_type = 'free'", script)
+
+    def test_inventory_only_drift_is_selected_for_reaggregation(self):
+        script = _batch_sh()
+
+        self.assertIn(
+            "active_open_character_signal_count > 0\n"
+            "      AND (\n"
+            "        active_character_inventory_count = 0\n"
+            "        OR active_character_inventory_v3_count = 0\n"
+            "      )",
+            script,
+        )
+        self.assertIn("END AS inventory_reaggregation_needed", script)
+
+    def test_reaggregation_candidate_flag_reaches_delta_cli(self):
+        script = _batch_sh()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "dist" / "batch"
+            scripts_dir = root / "scripts"
+            venv_bin_dir = root / ".venv" / "bin"
+            bin_dir = root / "bin"
+            batch_dir.mkdir(parents=True)
+            scripts_dir.mkdir(parents=True)
+            venv_bin_dir.mkdir(parents=True)
+            bin_dir.mkdir()
+
+            batch_path = batch_dir / "build_story_agent_context_batch.sh"
+            batch_path.write_text(script, encoding="utf-8")
+            (scripts_dir / "build_story_agent_context.py").write_text("", encoding="utf-8")
+
+            mysql_path = bin_dir / "mysql"
+            mysql_path.write_text(
+                "#!/bin/sh\nprintf '1112\\tTest title\\t0\\t1\\n'\n",
+                encoding="utf-8",
+            )
+            mysql_path.chmod(0o755)
+
+            args_path = root / "python-args.txt"
+            python_path = venv_bin_dir / "python"
+            python_path.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n",
+                encoding="utf-8",
+            )
+            python_path.chmod(0o755)
+
+            log_path = root / "batch.log"
+            result = subprocess.run(
+                ["bash", str(batch_path)],
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "ARGS_FILE": str(args_path),
+                    "DB_HOST": "example.invalid",
+                    "DB_PORT": "3306",
+                    "DB_USER": "test-user",
+                    "DB_PW": "test-password",
+                    "DB_NAME": "likenovel",
+                    "OPENROUTER_API_KEY": "test-key",
+                    "STORYCTX_LOCK_DIR": str(root / "batch.lock"),
+                    "STORYCTX_LOG_FILE": str(log_path),
+                    "STORYCTX_MAX_PARALLEL": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = args_path.read_text(encoding="utf-8").splitlines()
+            self.assertIn("--reaggregate-character-inventory", args)
+            self.assertNotIn("--repair-character-assets", args)
 
     def test_shell_cohort_literals_match_character_chat_policy_ssot(self):
         script = _batch_sh()
@@ -168,6 +244,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("missing_foundation_episode_count = 0", script)
         self.assertIn("active_character_inventory_count > 0", script)
         self.assertIn("active_character_inventory_v3_count > 0", script)
+        self.assertIn("END AS inventory_reaggregation_needed", script)
         self.assertIn("character_asset_repair_needed > 0", script)
         self.assertIn("candidates.character_asset_repair_needed ASC", script)
         failed_priority = "WHEN candidates.context_status = 'failed' THEN 0"
