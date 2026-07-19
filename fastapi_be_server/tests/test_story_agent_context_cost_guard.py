@@ -466,7 +466,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "_character_asset_collection_eligible": False,
         }
         summary_builder = AsyncMock(return_value=(11, True, {"used_llm": True}))
-        signal_builder = AsyncMock(return_value=(1, 0))
+        signal_builder = AsyncMock(return_value=(1, 0, True))
         scene_builder = AsyncMock(return_value=(1, 0))
         rp_builder = AsyncMock(return_value={"profile": (1, 0), "examples": (1, 0)})
         compute_rp = MagicMock()
@@ -489,7 +489,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             patch.object(module, "fetch_existing_doc", return_value=None),
             patch.object(module, "insert_doc_and_chunks"),
             patch.object(module, "insert_episode_summary", summary_builder),
-            patch.object(module, "build_episode_character_signals_summaries", signal_builder),
+            patch.object(module, "build_episode_character_signals_summaries_nonblocking", signal_builder),
             patch.object(module, "fetch_active_summary_rows", return_value=[episode_summary_row]),
             patch.object(module, "build_work_protagonist_resolution_for_inventory_v3", AsyncMock(return_value={})),
             patch.object(module, "build_compound_summaries_delta", return_value={"range": (1, 0), "product": (1, 0)}),
@@ -531,6 +531,91 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         rp_builder.assert_not_awaited()
         self.assertEqual(results["inserted_summaries"], 1)
         self.assertEqual(results["inserted_episode_character_signals"], 1)
+        self.assertEqual(results["products"][0]["context_status"], "ready")
+
+    async def test_delta_signal_provider_failure_keeps_ready_product_and_lkg(self):
+        module = load_module()
+        conn = FakeConnection()
+        episode_summary_row = {
+            "summary_id": 11,
+            "scope_key": "episode:101",
+            "episode_from": 16,
+            "source_hash": "summary-hash",
+            "summary_text": "[16화] 요약",
+        }
+        row = {
+            "product_id": 1105,
+            "title": "테스트 작품",
+            "episode_id": 101,
+            "episode_no": 16,
+            "_character_asset_collection_eligible": True,
+        }
+        signal_builder = AsyncMock(return_value=(0, 0, False))
+        resolution_builder = AsyncMock()
+        inventory_builder = MagicMock()
+        rp_builder = AsyncMock()
+        invariants = MagicMock()
+        mark_failed = MagicMock()
+        patchers = [
+            patch.object(module, "OPENROUTER_API_KEY", ""),
+            patch.object(module.settings, "ANTHROPIC_API_KEY", ""),
+            patch.object(module, "db_connect", return_value=conn),
+            patch.object(module, "work_cursor", fake_work_cursor),
+            patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())),
+            patch.object(module, "touch_product_context_build_attempt"),
+            patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()),
+            patch.object(module, "fetch_total_episode_count", return_value=16),
+            patch.object(module, "fetch_active_character_inventory_map", return_value={}),
+            patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}),
+            patch.object(module, "fetch_active_summary_state_map", return_value={}),
+            patch.object(module, "fetch_active_summary_rows_for_episode_nos", return_value=[episode_summary_row]),
+            patch.object(module, "resolve_source_payload", AsyncMock(return_value={"html_content": "본문", "source_type": "db"})),
+            patch.object(module, "normalize_episode_html", return_value="정규화 본문"),
+            patch.object(module, "build_chunks", return_value=[{"chunk_text": "정규화 본문"}]),
+            patch.object(module, "fetch_existing_doc", return_value=None),
+            patch.object(module, "insert_doc_and_chunks"),
+            patch.object(module, "insert_episode_summary", AsyncMock(return_value=(11, True, {"used_llm": True}))),
+            patch.object(module, "build_episode_character_signals_summaries_nonblocking", signal_builder),
+            patch.object(module, "build_compound_summaries_delta", return_value={"range": (1, 0), "product": (1, 0)}),
+            patch.object(module, "build_work_protagonist_resolution_for_inventory_v3", resolution_builder),
+            patch.object(module, "build_character_inventory_v3_summaries", inventory_builder),
+            patch.object(module, "build_rp_summaries_delta", rp_builder),
+            patch.object(module, "assert_story_agent_foundation_invariants", invariants),
+            patch.object(
+                module,
+                "refresh_product_context_status",
+                return_value={
+                    "product_id": 1105,
+                    "context_status": "ready",
+                    "total_episode_count": 16,
+                    "ready_episode_count": 15,
+                },
+            ),
+            patch.object(module, "attach_character_chat_asset_readiness_to_status_row", side_effect=lambda _cur, status: status),
+            patch.object(module, "mark_product_context_failed", mark_failed),
+        ]
+
+        with ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
+            results = await module.build_context_rows_delta(
+                rows=[row],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    use_epub_fallback=False,
+                    refresh_rp=False,
+                ),
+            )
+
+        signal_builder.assert_awaited_once()
+        resolution_builder.assert_not_awaited()
+        inventory_builder.assert_not_called()
+        rp_builder.assert_not_awaited()
+        invariants.assert_not_called()
+        mark_failed.assert_not_called()
+        self.assertEqual(results["inserted_summaries"], 1)
+        self.assertEqual(results["inserted_range_summaries"], 1)
         self.assertEqual(results["products"][0]["context_status"], "ready")
 
     async def test_episode_scene_extraction_skips_when_openrouter_key_missing(self):
@@ -1036,6 +1121,115 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         request_mock.assert_not_awaited()
         deactivate_scope.assert_not_called()
         self.assertEqual(conn.commit_count, 0)
+
+    async def test_character_signal_expected_provider_error_is_deferred_without_product_failure(self):
+        module = load_module()
+        conn = MagicMock()
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        expected_error = httpx.HTTPStatusError(
+            "payment required",
+            request=request,
+            response=httpx.Response(402, request=request),
+        )
+
+        with patch.object(
+            module,
+            "build_episode_character_signals_summaries",
+            AsyncMock(side_effect=expected_error),
+        ):
+            inserted, reused, complete = await module.build_episode_character_signals_summaries_nonblocking(
+                conn=conn,
+                product_id=687,
+                episode_rows=[{"episode_from": 1}],
+                summary_client=object(),
+                cleanup_missing_scopes=False,
+            )
+
+        self.assertEqual((inserted, reused, complete), (0, 0, False))
+        conn.rollback.assert_called_once_with()
+
+    async def test_character_signal_unexpected_error_still_fails_loudly(self):
+        module = load_module()
+
+        with patch.object(
+            module,
+            "build_episode_character_signals_summaries",
+            AsyncMock(side_effect=RuntimeError("db write failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "db write failed"):
+                await module.build_episode_character_signals_summaries_nonblocking(
+                    conn=MagicMock(),
+                    product_id=687,
+                    episode_rows=[{"episode_from": 1}],
+                    summary_client=object(),
+                    cleanup_missing_scopes=False,
+                )
+
+    async def test_character_signal_auth_error_still_fails_loudly(self):
+        module = load_module()
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        auth_error = httpx.HTTPStatusError(
+            "unauthorized",
+            request=request,
+            response=httpx.Response(401, request=request),
+        )
+
+        with patch.object(
+            module,
+            "build_episode_character_signals_summaries",
+            AsyncMock(side_effect=auth_error),
+        ):
+            with self.assertRaises(httpx.HTTPStatusError):
+                await module.build_episode_character_signals_summaries_nonblocking(
+                    conn=MagicMock(),
+                    product_id=687,
+                    episode_rows=[{"episode_from": 1}],
+                    summary_client=object(),
+                    cleanup_missing_scopes=False,
+                )
+
+    def test_rp_target_excludes_alias_owned_by_another_character(self):
+        module = load_module()
+        raphael_scope_key = "character:라파엘"
+        andrei_scope_key = "character:안드레이카르마조프"
+        inventory_map = {
+            raphael_scope_key: {
+                "canonical_character_key": raphael_scope_key,
+                "display_name": "라파엘",
+                "aliases": ["라파엘", "안드레이 카르마조프"],
+                "is_protagonist": True,
+                "is_first_person": True,
+                "work_role": "main_protagonist",
+            },
+            andrei_scope_key: {
+                "canonical_character_key": andrei_scope_key,
+                "display_name": "안드레이 카르마조프",
+                "aliases": ["안드레이 카르마조프", "안드레이"],
+                "work_role": "major_character",
+            },
+        }
+
+        target = module.build_inventory_rp_target(
+            scope_key=raphael_scope_key,
+            inventory_item=inventory_map[raphael_scope_key],
+        )
+        assert target is not None
+        target = module.attach_competing_speaker_anchors(
+            target,
+            current_scope_key=raphael_scope_key,
+            inventory_map=inventory_map,
+        )
+
+        self.assertNotIn("안드레이 카르마조프", target["aliases"])
+        self.assertNotIn(
+            "안드레이 카르마조프",
+            target["collection_rules"]["speaker_anchors"],
+        )
+        self.assertIn(
+            "안드레이 카르마조프",
+            target["collection_rules"]["competing_speaker_anchors"],
+        )
+        self.assertIn("안드레이 카르마조프", inventory_map[raphael_scope_key]["aliases"])
 
     async def test_episode_character_signals_defaults_to_deepseek_direct(self):
         module = load_module()
@@ -3225,6 +3419,21 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(plan["blocked_scope_keys"], ["character:ambiguous"])
         self.assertTrue(plan["repairable"])
 
+    def test_character_asset_repair_plan_can_repair_nonblocking_co_main(self):
+        module = load_module()
+        plan = module.build_character_chat_asset_repair_plan(
+            {
+                "missing_profile_scope_keys": ["character:co-main"],
+                "missing_examples_scope_keys": ["character:co-main"],
+                "continuity_ambiguous_scope_keys": ["character:co-main"],
+                "blocking_continuity_ambiguous_scope_keys": [],
+            }
+        )
+
+        self.assertEqual(plan["blocked_scope_keys"], [])
+        self.assertEqual(plan["rp_scope_keys"], ["character:co-main"])
+        self.assertTrue(plan["repairable"])
+
     def test_scene_repair_selection_prioritizes_main_and_caps_rows(self):
         module = load_module()
         rows, required = module.select_character_chat_scene_repair_rows(
@@ -4672,6 +4881,54 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual([row["display_name"] for row in main_rows], ["란"])
         self.assertFalse(next(row for row in inventory if row["display_name"] == "카인")["is_protagonist"])
 
+    def test_explicit_resolver_rejection_can_replace_a_stale_main_lock(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:당신",
+            "display_name": "당신",
+            "source_character_keys": ["protagonist:first_person"],
+            "distinct_episode_count": 5,
+            "work_role": "main_protagonist",
+            "identity_conflict_reasons": [],
+        }
+        current_wrong = {
+            **locked_main,
+            "work_role": "major_character",
+        }
+        current_main = {
+            "canonical_character_key": "character:추종자",
+            "display_name": "추종자",
+            "source_character_keys": ["protagonist:named:추종자"],
+            "distinct_episode_count": 15,
+            "work_role": "main_protagonist",
+            "role_confidence": "high",
+            "classification_status": "AUTO_RESOLVED",
+            "review_reasons": [],
+            "identity_conflict_reasons": [],
+            "work_protagonist_resolution": {
+                "decision": "RESOLVED",
+                "work_protagonist_key": "character:추종자",
+                "work_protagonist_keys": ["character:추종자"],
+                "confidence": "high",
+                "rejected": [
+                    {"key": "character:당신", "reason": "호칭일 뿐 독립 인물이 아니다."}
+                ],
+            },
+        }
+
+        matched_scope_keys = module._apply_locked_work_protagonist_rows(
+            [current_wrong, current_main],
+            [locked_main],
+        )
+
+        self.assertEqual(matched_scope_keys, set())
+        self.assertEqual(current_wrong["work_role"], "major_character")
+        self.assertEqual(current_main["work_role"], "main_protagonist")
+        self.assertEqual(
+            current_main["superseded_protagonist_scope_keys"],
+            ["character:당신"],
+        )
+
     def test_locked_main_can_move_to_known_identity_group_surface(self):
         module = load_module()
         locked_main = {
@@ -4888,6 +5145,74 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             687,
             "character_inventory_v3",
             {"character:란"},
+        )
+
+    def test_inventory_v3_demotes_superseded_lock_without_deleting_old_character(self):
+        module = load_module()
+        cur = object()
+        old_main = {
+            "canonical_character_key": "character:당신",
+            "display_name": "당신",
+            "work_role": "main_protagonist",
+            "identity_status": "RESOLVED_NAMED",
+            "identity_conflict_reasons": [],
+            "entity_kind": "person",
+            "distinct_episode_count": 5,
+            "voice_mode_counts": {"dialogue": 2, "monologue": 0},
+            "rp_signal_quality": {"status": "summary_ready", "needs_review": False},
+            "display_safety": {"status": "pass", "reason": "resolved_named_identity"},
+            "public_chat_eligible": True,
+            "public_slot_eligible": True,
+        }
+        new_main = {
+            "canonical_character_key": "character:추종자",
+            "display_name": "추종자",
+            "work_role": "main_protagonist",
+            "identity_status": "RESOLVED_NAMED",
+            "identity_conflict_reasons": [],
+            "entity_kind": "person",
+            "distinct_episode_count": 15,
+            "voice_mode_counts": {"dialogue": 10, "monologue": 0},
+            "rp_signal_quality": {"status": "summary_ready", "needs_review": False},
+            "superseded_protagonist_scope_keys": ["character:당신"],
+        }
+        upserted_items: list[dict] = []
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value={"character:당신": old_main},
+        ), patch.object(
+            module,
+            "aggregate_character_inventory_v3_rows",
+            return_value=[new_main],
+        ), patch.object(
+            module,
+            "reconcile_character_inventory_v3_scope_keys",
+            side_effect=lambda rows, **_kwargs: rows,
+        ), patch.object(
+            module,
+            "upsert_character_inventory_v3_item",
+            side_effect=lambda _cur, *, product_id, item: upserted_items.append(dict(item)) or True,
+        ), patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
+            module.build_character_inventory_v3_summaries_from_signal_rows(
+                cur,
+                product_id=1105,
+                signal_rows=[{"summary_text": "{}"}],
+            )
+
+        by_scope = {
+            item["canonical_character_key"]: item
+            for item in upserted_items
+        }
+        self.assertEqual(by_scope["character:추종자"]["work_role"], "main_protagonist")
+        self.assertEqual(by_scope["character:당신"]["work_role"], "major_character")
+        self.assertFalse(by_scope["character:당신"]["is_protagonist"])
+        deactivate_missing.assert_called_once_with(
+            cur,
+            1105,
+            "character_inventory_v3",
+            {"character:당신", "character:추종자"},
         )
 
     def test_inventory_v3_does_not_overwrite_locked_main_with_conflicting_same_scope_row(self):
@@ -9815,6 +10140,93 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
             len([row for row in inventory if row["display_name"] == "레이븐"]),
             2,
         )
+
+    def test_shared_role_label_does_not_merge_distinct_ravens(self):
+        module = load_module()
+        locked_main = {
+            "canonical_character_key": "character:레이븐:durable",
+            "display_name": "레이븐",
+            "work_role": "main_protagonist",
+            "source_character_keys": ["protagonist:named:레이븐"],
+        }
+        rows = [
+            *[
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:레이븐",
+                            display_name="레이븐",
+                            aliases=["레이븐"],
+                            is_protagonist=True,
+                            is_work_protagonist=True,
+                            is_episode_focal=True,
+                            is_first_person=True,
+                            role_in_episode="lead",
+                            voice_mode="monologue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="named:수염난레이븐",
+                            display_name="수염 난 레이븐",
+                            aliases=["수염 난 레이븐", "레이븐"],
+                            is_episode_focal=True,
+                            role_in_episode="counterpart",
+                            voice_mode="dialogue",
+                            scene_weight="medium",
+                        ),
+                    ],
+                )
+                for episode_no in range(1, 3)
+            ],
+            *[
+                signal_row(
+                    episode_no,
+                    episode_no,
+                    [
+                        signal_character(
+                            character_key="protagonist:named:레이븐",
+                            display_name="레이븐",
+                            aliases=["레이븐"],
+                            is_protagonist=True,
+                            is_work_protagonist=True,
+                            is_episode_focal=True,
+                            is_first_person=True,
+                            role_in_episode="lead",
+                            voice_mode="monologue",
+                            scene_weight="high",
+                        ),
+                        signal_character(
+                            character_key="named:키큰레이븐",
+                            display_name="키 큰 레이븐",
+                            aliases=["키 큰 레이븐", "레이븐"],
+                            is_episode_focal=True,
+                            role_in_episode="counterpart",
+                            voice_mode="dialogue",
+                            scene_weight="medium",
+                        ),
+                    ],
+                )
+                for episode_no in range(3, 5)
+            ],
+        ]
+
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            locked_protagonist_rows=[locked_main],
+        )
+        source_sets = {
+            frozenset(row["source_character_keys"]): row
+            for row in inventory
+        }
+
+        self.assertIn(frozenset({"protagonist:named:레이븐"}), source_sets)
+        self.assertIn(frozenset({"named:수염난레이븐"}), source_sets)
+        self.assertIn(frozenset({"named:키큰레이븐"}), source_sets)
+        main = source_sets[frozenset({"protagonist:named:레이븐"})]
+        self.assertEqual(main["work_role"], "main_protagonist")
+        self.assertIn("레이븐", main["non_unique_identity_labels"])
 
     def test_same_episode_canonical_named_and_protagonist_sources_can_merge(self):
         module = load_module()

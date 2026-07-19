@@ -200,9 +200,13 @@ def build_asset_action_plan(row: dict[str, Any]) -> list[str]:
         or int(block_counts.get("legacy_profile_scope_key_mismatch") or 0) > 0
         or int(block_counts.get("legacy_examples_scope_key_mismatch") or 0) > 0
     )
-    has_identity_continuity_ambiguity = bool(
-        readiness.get("continuity_ambiguous_scope_keys")
-        or int(block_counts.get("identity_continuity_ambiguous") or 0) > 0
+    has_identity_continuity_ambiguity = (
+        bool(readiness.get("blocking_continuity_ambiguous_scope_keys"))
+        if "blocking_continuity_ambiguous_scope_keys" in readiness
+        else bool(
+            readiness.get("continuity_ambiguous_scope_keys")
+            or int(block_counts.get("identity_continuity_ambiguous") or 0) > 0
+        )
     )
     if status == "ready" and not (
         has_legacy_scope_mismatch or has_identity_continuity_ambiguity

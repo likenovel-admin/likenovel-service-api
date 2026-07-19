@@ -461,6 +461,111 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         )
         self.assertFalse(module.is_character_chat_asset_readiness_actionable(verification))
 
+    def test_ready_supporting_character_without_identified_main_stays_on_hold(self):
+        module = load_module()
+        supporting_scope_key = "character:소년"
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=1164,
+            story_context_status="ready",
+            total_episode_count=15,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row(
+                        "character_inventory_v3",
+                        supporting_scope_key,
+                        inventory_payload(
+                            supporting_scope_key,
+                            public_slot=False,
+                            work_role="major_character",
+                        ),
+                    )
+                ],
+                "character_rp_profile": [
+                    row(
+                        "character_rp_profile",
+                        supporting_scope_key,
+                        profile_payload(supporting_scope_key),
+                    )
+                ],
+                "character_rp_examples": [
+                    row(
+                        "character_rp_examples",
+                        supporting_scope_key,
+                        examples_payload(supporting_scope_key),
+                    )
+                ],
+                "episode_scene_extraction": [
+                    row(
+                        "episode_scene_extraction",
+                        "episode:3",
+                        scene_payload(supporting_scope_key),
+                        episode_from=3,
+                    )
+                ],
+            },
+        )
+
+        self.assertEqual(verification["character_chat_status"], "hold")
+        self.assertEqual(verification["main_protagonist_scope_keys"], [])
+        self.assertEqual(verification["block_reason_counts"]["main_protagonist_missing"], 1)
+        self.assertTrue(module.is_character_chat_asset_readiness_actionable(verification))
+
+    def test_one_ready_co_main_is_enough_for_product_readiness(self):
+        module = load_module()
+        ready_main_scope_key = "character:득구"
+        missing_main_scope_key = "character:설총"
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=1127,
+            story_context_status="ready",
+            total_episode_count=20,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row(
+                        "character_inventory_v3",
+                        ready_main_scope_key,
+                        inventory_payload(ready_main_scope_key),
+                    ),
+                    row(
+                        "character_inventory_v3",
+                        missing_main_scope_key,
+                        inventory_payload(missing_main_scope_key),
+                    ),
+                ],
+                "character_rp_profile": [
+                    row(
+                        "character_rp_profile",
+                        ready_main_scope_key,
+                        profile_payload(ready_main_scope_key),
+                    )
+                ],
+                "character_rp_examples": [
+                    row(
+                        "character_rp_examples",
+                        ready_main_scope_key,
+                        examples_payload(ready_main_scope_key),
+                    )
+                ],
+                "episode_scene_extraction": [
+                    row(
+                        "episode_scene_extraction",
+                        "episode:3",
+                        scene_payload(ready_main_scope_key),
+                        episode_from=3,
+                    )
+                ],
+            },
+        )
+
+        self.assertEqual(verification["character_chat_status"], "ready")
+        self.assertEqual(verification["ready_main_protagonist_scope_keys"], [ready_main_scope_key])
+        self.assertEqual(
+            verification["missing_main_protagonist_scope_keys"],
+            [missing_main_scope_key],
+        )
+        self.assertFalse(module.is_character_chat_asset_readiness_actionable(verification))
+
     def test_no_public_candidate_is_none_eligible_not_ready(self):
         module = load_module()
 
