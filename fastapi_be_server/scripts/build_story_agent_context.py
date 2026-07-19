@@ -8045,7 +8045,8 @@ def normalize_character_identity_review_document(
         force_main_protagonist = raw_operation.get("force_main_protagonist") is True
         anonymous_protagonist = raw_operation.get("anonymous_protagonist") is True
         if anonymous_protagonist and (
-            kind != "confirm_protagonist" or not force_main_protagonist
+            kind not in {"confirm_protagonist", "merge_active_scopes"}
+            or not force_main_protagonist
         ):
             raise ValueError(
                 f"anonymous review must confirm protagonist role: {operation_id}"
@@ -8175,6 +8176,7 @@ def materialize_character_identity_review_document(
                 "member_scope_keys",
                 "target_scope_key",
                 "force_main_protagonist",
+                "anonymous_protagonist",
                 "reason",
             },
             "confirm_protagonist": {
@@ -8216,7 +8218,7 @@ def materialize_character_identity_review_document(
             if len(member_scope_keys) < 2 or target_scope_key not in member_scope_keys:
                 raise ValueError(f"invalid merge review scopes: {operation_id}")
             force_main_protagonist = raw_operation.get("force_main_protagonist") is True
-            anonymous_protagonist = False
+            anonymous_protagonist = raw_operation.get("anonymous_protagonist") is True
         elif kind == "confirm_protagonist":
             target_scope_key = str(raw_operation.get("scope_key") or "").strip()
             member_scope_keys = [target_scope_key]
@@ -13148,6 +13150,7 @@ def build_character_inventory_v3_summaries_from_signal_rows(
         and (
             not dict(item.get("character_identity_review") or {})
             or _has_character_serving_contract(item)
+            or bool(item.get("operator_reviewed_anonymous_protagonist"))
         )
     }
     superseded_locked_scope_keys.update(retirement_replacements)
