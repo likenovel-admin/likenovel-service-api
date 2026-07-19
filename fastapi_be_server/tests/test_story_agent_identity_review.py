@@ -803,6 +803,100 @@ class CharacterIdentityReviewTest(TestCase):
             "차태흠",
         )
 
+    def test_reviewed_first_person_role_identity_is_publicly_resolved(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        "protagonist:named:주인공",
+                        "주인공",
+                        aliases=["주인공"],
+                        protagonist=True,
+                        voice_mode="narration_only",
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        "protagonist:first_person",
+                        "나",
+                        protagonist=True,
+                        first_person=True,
+                        voice_mode="narration_only",
+                    )
+                ],
+            ),
+            signal_row(
+                3,
+                3,
+                [
+                    signal_character(
+                        "protagonist:first_person",
+                        "나",
+                        protagonist=True,
+                        first_person=True,
+                        voice_mode="narration_only",
+                    )
+                ],
+            ),
+        ]
+        review = review_document(
+            module,
+            1109,
+            [
+                {
+                    "operation_id": "merge-squint-saint",
+                    "kind": "merge_active_scopes",
+                    "member_scope_keys": [
+                        "character:4ca88c0896bf",
+                        "character:generic-a",
+                        "character:generic-b",
+                    ],
+                    "target_scope_key": "character:4ca88c0896bf",
+                    "authorized_observation_refs": [
+                        "summary:1:0",
+                        "summary:2:0",
+                        "summary:3:0",
+                    ],
+                    "signal_anchors": [
+                        {"summary_id": 1, "source_hash": "signal-1"},
+                        {"summary_id": 2, "source_hash": "signal-2"},
+                        {"summary_id": 3, "source_hash": "signal-3"},
+                    ],
+                    "force_main_protagonist": True,
+                    "anonymous_protagonist": False,
+                    "canonical_display_name": "실눈 성자",
+                    "blocked_aliases": ["주인공"],
+                    "reason": "reviewed source-backed first-person role identity",
+                }
+            ],
+        )
+
+        inventory_rows = module.aggregate_character_inventory_v3_rows(
+            rows,
+            character_identity_review=review,
+        )
+        target = next(
+            row
+            for row in inventory_rows
+            if row["canonical_character_key"] == "character:4ca88c0896bf"
+        )
+
+        self.assertEqual(target["display_name"], "실눈 성자")
+        self.assertEqual(target["identity_status"], "RESOLVED_NAMED")
+        self.assertNotIn(
+            "unresolved_generic_first_person",
+            target["identity_conflict_reasons"],
+        )
+        self.assertEqual(target["work_role"], "main_protagonist")
+        self.assertTrue(target["public_chat_eligible"])
+
     def test_display_and_competing_alias_cleanup_are_character_local(self):
         module = load_module()
         rows = [
