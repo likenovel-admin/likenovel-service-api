@@ -5843,6 +5843,54 @@ def fetch_legacy_summary_state_for_inventory_alias(
     return {}
 
 
+def build_operator_reviewed_rp_asset_alias_keys(
+    *,
+    scope_key: str,
+    inventory_item: dict[str, object],
+    profile_rows_by_scope: dict[str, dict[str, object]],
+    example_rows_by_scope: dict[str, dict[str, object]],
+) -> set[str]:
+    if not _has_operator_reviewed_identity_surface(inventory_item):
+        return set()
+    reviewed_display_name = normalize_signal_entity_label(
+        str(inventory_item.get("display_name") or "")
+    ).lower()
+    if not reviewed_display_name:
+        return set()
+
+    allowed_alias_keys: set[str] = set()
+    for alias_key in build_inventory_scope_alias_key_candidates(
+        scope_key,
+        inventory_item,
+    ):
+        if alias_key == scope_key:
+            continue
+        profile_payload = dict(
+            dict(profile_rows_by_scope.get(alias_key) or {}).get("payload") or {}
+        )
+        example_payload = dict(
+            dict(example_rows_by_scope.get(alias_key) or {}).get("payload") or {}
+        )
+        if (
+            str(profile_payload.get("character_key") or "").strip() != alias_key
+            or str(example_payload.get("character_key") or "").strip()
+            != alias_key
+            or not build_rp_dialogue_items_from_example_payload(example_payload)
+        ):
+            continue
+        profile_identity_labels = {
+            normalize_signal_entity_label(str(value or "")).lower()
+            for value in [
+                profile_payload.get("display_name"),
+                *list(profile_payload.get("aliases") or []),
+            ]
+            if normalize_signal_entity_label(str(value or ""))
+        }
+        if reviewed_display_name in profile_identity_labels:
+            allowed_alias_keys.add(alias_key)
+    return allowed_alias_keys
+
+
 def canonicalize_character_chat_payload_scope(
     payload: dict[str, object],
     *,
@@ -6801,6 +6849,14 @@ async def build_rp_summaries_delta(
             for alias_key, owner_scope_key in source_scope_key_map.items()
             if owner_scope_key == scope_key
         }
+        allowed_alias_keys.update(
+            build_operator_reviewed_rp_asset_alias_keys(
+                scope_key=scope_key,
+                inventory_item=inventory_item,
+                profile_rows_by_scope=existing_profile_rows_by_scope,
+                example_rows_by_scope=existing_example_rows_by_scope,
+            )
+        )
         if not canonical_profile_ready and not canonical_examples_ready:
             for alias_key in build_inventory_scope_alias_key_candidates(
                 scope_key,
