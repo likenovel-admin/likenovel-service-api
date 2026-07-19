@@ -9167,7 +9167,26 @@ def _inventory_identity_blocking_conflict_reasons(row: dict[str, object]) -> lis
     ]
 
 
+def _has_operator_reviewed_identity_surface(row: dict[str, object]) -> bool:
+    review = dict(row.get("identity_surface_review_v1") or {})
+    canonical_display_name = normalize_signal_entity_label(
+        str(review.get("canonical_display_name") or "")
+    ).lower()
+    display_name = normalize_signal_entity_label(
+        str(row.get("display_name") or "")
+    ).lower()
+    return bool(
+        int(review.get("version") or 0) == 1
+        and str(review.get("operation_id") or "").strip()
+        and str(review.get("review_digest") or "").strip()
+        and canonical_display_name
+        and canonical_display_name == display_name
+    )
+
+
 def _inventory_identity_is_public_resolved(row: dict[str, object]) -> bool:
+    if _has_operator_reviewed_identity_surface(row):
+        return not _inventory_identity_blocking_conflict_reasons(row)
     identity_status = str(row.get("identity_status") or "")
     if identity_status == "RESOLVED_NAMED":
         return not _inventory_identity_blocking_conflict_reasons(row)
@@ -10535,6 +10554,29 @@ def _apply_character_identity_review_rows(
                 *list(row.get("aliases") or []),
             ]
             row["aliases"] = list(dict.fromkeys(aliases))[:8]
+            resolved_review_conflicts = {
+                "first_person_identity_unverified",
+                "unresolved_generic_first_person",
+            }
+            row["identity_conflict_reasons"] = [
+                reason
+                for reason in list(row.get("identity_conflict_reasons") or [])
+                if str(reason) not in resolved_review_conflicts
+            ]
+            row["review_reasons"] = [
+                reason
+                for reason in list(row.get("review_reasons") or [])
+                if str(reason) not in resolved_review_conflicts
+            ]
+            if not _inventory_identity_blocking_conflict_reasons(row):
+                row["identity_status"] = (
+                    "RESOLVED_STABLE_ROLE"
+                    if _is_role_like_persona_label_candidate(
+                        canonical_display_name
+                    )
+                    else "RESOLVED_NAMED"
+                )
+                row["identity_confidence"] = "high"
         row["identity_surface_review_v1"] = {
             "version": 1,
             "operation_id": str(identity_review.get("operation_id") or ""),
@@ -10990,6 +11032,14 @@ def build_inventory_display_safety(row: dict[str, object]) -> dict[str, object]:
         if role_like_persona_ready:
             return {"status": "pass", "reason": "stable_persona_identity"}
         return {"status": "fail", "reason": "generic_display_name"}
+    if (
+        _has_operator_reviewed_identity_surface(row)
+        and not _inventory_identity_blocking_conflict_reasons(row)
+    ):
+        return {
+            "status": "pass",
+            "reason": "operator_reviewed_identity_surface",
+        }
     if _identity_claim_label_is_blocked(display_name):
         if role_like_persona_ready:
             return {"status": "pass", "reason": "stable_persona_identity"}
