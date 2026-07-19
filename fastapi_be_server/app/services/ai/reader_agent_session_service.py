@@ -353,7 +353,14 @@ async def ensure_reader_daily_schedules(
     }
 
 
-async def pause_expired_active_reader_agents(db: AsyncSession) -> int:
+async def pause_expired_active_reader_agents(
+    db: AsyncSession,
+    *,
+    limit: int = 50,
+) -> int:
+    if limit < 1 or limit > 1000:
+        raise InvalidReaderSessionError("limit must be between 1 and 1000")
+
     expired_result = await db.execute(
         text("""
             select a.ai_reader_agent_id
@@ -370,8 +377,11 @@ async def pause_expired_active_reader_agents(db: AsyncSession) -> int:
                        and s.status in ('ready', 'running')
                        and s.active_end_at > current_timestamp
                )
-             for update
-        """)
+             order by a.ai_reader_agent_id
+             limit :limit
+             for update skip locked
+        """),
+        {"limit": limit},
     )
     ai_reader_agent_ids = [
         int(row["ai_reader_agent_id"])
