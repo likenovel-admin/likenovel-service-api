@@ -144,6 +144,13 @@ class FakeOpenRouterClient:
     def __init__(self, content):
         self.content = content
         self.calls = []
+        self.credit_calls = []
+
+    async def get(self, url, **kwargs):
+        self.credit_calls.append({"url": url, **kwargs})
+        return FakeResponse(
+            {"data": {"total_credits": 20.0, "total_usage": 10.0}}
+        )
 
     async def post(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
@@ -163,6 +170,11 @@ class FakeHangingOpenRouterClient:
     def __init__(self):
         self.calls = []
 
+    async def get(self, url, **kwargs):
+        return FakeResponse(
+            {"data": {"total_credits": 20.0, "total_usage": 10.0}}
+        )
+
     async def post(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
         await asyncio.sleep(3600)
@@ -173,6 +185,11 @@ class FakeRateLimitedOpenRouterClient:
         self.content = content
         self.retry_after = retry_after
         self.calls = []
+
+    async def get(self, url, **kwargs):
+        return FakeResponse(
+            {"data": {"total_credits": 20.0, "total_usage": 10.0}}
+        )
 
     async def post(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
@@ -207,6 +224,28 @@ class FakeStatusErrorAsyncClient:
         request = httpx.Request("POST", url)
         response = httpx.Response(self.status_code, text=self.body, request=request)
         raise httpx.HTTPStatusError(f"Client error '{self.status_code}'", request=request, response=response)
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeCreditAsyncClient:
+    def __init__(self, *, total_credits: float, total_usage: float):
+        self.total_credits = total_credits
+        self.total_usage = total_usage
+        self.calls = []
+        self.closed = False
+
+    async def get(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        return FakeResponse(
+            {
+                "data": {
+                    "total_credits": self.total_credits,
+                    "total_usage": self.total_usage,
+                }
+            }
+        )
 
     async def aclose(self):
         self.closed = True
@@ -335,9 +374,9 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertNotEqual(first_hash, confidence_hash)
         self.assertEqual(first_hash, repeated_hash)
 
-    async def test_apply_preflights_openrouter_payment_before_product_lock(self):
+    async def test_apply_preflights_openrouter_reserve_before_product_lock(self):
         module = load_module()
-        client = FakeStatusErrorAsyncClient(402)
+        client = FakeCreditAsyncClient(total_credits=20.0, total_usage=17.01)
         conn = FakeConnection()
         args = SimpleNamespace(apply=True, verbose=False)
 
@@ -347,13 +386,14 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "AsyncClient", return_value=client), \
              patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "product_lock_connection") as product_lock:
-            with self.assertRaisesRegex(RuntimeError, "OpenRouter preflight failed: 402 Payment Required"):
+            with self.assertRaisesRegex(RuntimeError, "background credit reserve blocked"):
                 await module.build_context_rows(
                     rows=[{"product_id": 687}],
                     args=args,
                 )
 
         self.assertEqual(len(client.calls), 1)
+        self.assertTrue(client.calls[0]["url"].endswith("/credits"))
         self.assertTrue(client.closed)
         self.assertEqual(conn.close_count, 1)
         product_lock.assert_not_called()
