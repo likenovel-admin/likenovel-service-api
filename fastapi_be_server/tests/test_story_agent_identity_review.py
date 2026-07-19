@@ -206,6 +206,128 @@ class CharacterIdentityReviewTest(TestCase):
         )
         self.assertTrue(document["review_digest"])
 
+    def test_materializer_accepts_source_backed_display_and_existing_blocked_aliases(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    {
+                        **signal_character(
+                            "protagonist:named:라파엘",
+                            "라파엘",
+                            protagonist=True,
+                        ),
+                        "persona_names": ["안드레이 카르마조프"],
+                    }
+                ],
+            )
+        ]
+        inventory_map = {
+            "character:라파엘더리퍼": {
+                "display_name": "라파엘",
+                "source_character_keys": ["protagonist:named:라파엘"],
+                "source_observation_refs": ["summary:1:0"],
+                "aliases": ["라파엘", "안드레이 카르마조프"],
+                "persona_names": ["안드레이 카르마조프"],
+                "public_chat_eligible": True,
+            }
+        }
+        request = {
+            "schema_version": "character_identity_review_request_v1",
+            "product_id": 1176,
+            "operations": [
+                {
+                    "operation_id": "confirm-raphael-surface",
+                    "kind": "confirm_protagonist",
+                    "scope_key": "character:라파엘더리퍼",
+                    "canonical_display_name": "라파엘",
+                    "blocked_aliases": ["안드레이 카르마조프"],
+                    "reason": "reviewed protagonist identity surface",
+                }
+            ],
+        }
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=inventory_map,
+        ), patch.object(
+            module,
+            "fetch_active_summary_rows",
+            return_value=rows,
+        ):
+            document = module.materialize_character_identity_review_document(
+                object(),
+                product_id=1176,
+                request=request,
+                reviewer_id="codex.ops",
+            )
+
+        operation = document["operations"][0]
+        self.assertEqual(operation["canonical_display_name"], "라파엘")
+        self.assertEqual(operation["blocked_aliases"], ["안드레이 카르마조프"])
+
+    def test_materializer_rejects_unbacked_display_and_missing_blocked_alias(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [signal_character("protagonist:named:한도윤", "한도윤", protagonist=True)],
+            )
+        ]
+        inventory_map = {
+            "character:한도윤": {
+                "display_name": "실패한 왕",
+                "source_character_keys": ["protagonist:named:한도윤"],
+                "source_observation_refs": ["summary:1:0"],
+                "aliases": ["실패한 왕", "한도윤"],
+                "public_chat_eligible": True,
+            }
+        }
+        base_operation = {
+            "operation_id": "confirm-han-doyun",
+            "kind": "confirm_protagonist",
+            "scope_key": "character:한도윤",
+            "reason": "reviewed protagonist identity surface",
+        }
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=inventory_map,
+        ), patch.object(
+            module,
+            "fetch_active_summary_rows",
+            return_value=rows,
+        ):
+            with self.assertRaisesRegex(ValueError, "source-backed display"):
+                module.materialize_character_identity_review_document(
+                    object(),
+                    product_id=1148,
+                    request={
+                        "schema_version": "character_identity_review_request_v1",
+                        "product_id": 1148,
+                        "operations": [
+                            {**base_operation, "canonical_display_name": "전혀 다른 이름"}
+                        ],
+                    },
+                    reviewer_id="codex.ops",
+                )
+            with self.assertRaisesRegex(ValueError, "active identity alias"):
+                module.materialize_character_identity_review_document(
+                    object(),
+                    product_id=1148,
+                    request={
+                        "schema_version": "character_identity_review_request_v1",
+                        "product_id": 1148,
+                        "operations": [
+                            {**base_operation, "blocked_aliases": ["없는 별칭"]}
+                        ],
+                    },
+                    reviewer_id="codex.ops",
+                )
+
     def test_stale_signal_hash_fails_closed(self):
         module = load_module()
         rows = [signal_row(1, 1, [signal_character("named:에릭", "에릭")])]
@@ -579,6 +701,47 @@ class CharacterIdentityReviewTest(TestCase):
             "major_character",
         )
         self.assertFalse(by_scope[old_main_scope_key]["public_slot_eligible"])
+
+    def test_review_applies_display_and_blocked_aliases_to_identity_surface(self):
+        module = load_module()
+        row = {
+            "canonical_character_key": "character:차태흠",
+            "display_name": "차태흠 정령",
+            "display_name_source": "persona_names",
+            "aliases": ["차태흠 정령", "차태흠", "대령"],
+            "narration_names": ["차태흠 정령", "차태흠"],
+            "social_call_names": ["대령"],
+            "persona_names": ["차태흠 정령"],
+            "real_names": ["차태흠"],
+            "work_role": "major_character",
+            "character_identity_review": {
+                "operation_id": "confirm-cha-taeheum-surface",
+                "kind": "confirm_protagonist",
+                "force_main_protagonist": True,
+                "canonical_display_name": "차태흠",
+                "blocked_aliases": ["차태흠 정령"],
+                "reason": "reviewed protagonist identity surface",
+            },
+        }
+
+        module._apply_character_identity_review_rows([row])
+
+        self.assertEqual(row["display_name"], "차태흠")
+        self.assertEqual(row["display_name_source"], "operator_review")
+        for field_name in (
+            "aliases",
+            "narration_names",
+            "social_call_names",
+            "persona_names",
+            "real_names",
+        ):
+            self.assertNotIn("차태흠 정령", row[field_name])
+        self.assertIn("차태흠", row["aliases"])
+        self.assertEqual(row["work_role"], "main_protagonist")
+        self.assertEqual(
+            row["identity_surface_review_v1"]["canonical_display_name"],
+            "차태흠",
+        )
 
     def test_display_and_competing_alias_cleanup_are_character_local(self):
         module = load_module()
