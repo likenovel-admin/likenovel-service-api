@@ -405,6 +405,26 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
         self.assertEqual(calls["post"], 0)
 
+    def test_reader_llm_call_classifies_openrouter_402_as_credit_reserve(self):
+        from app.services.ai import reader_agent_decision_service as service
+        from app.services.common.openrouter_background_credit_guard import (
+            OpenRouterBackgroundCreditReserveError,
+        )
+
+        class FakeResponse:
+            status_code = 402
+
+            def json(self):
+                return {"error": {"code": 402, "message": "payment required"}}
+
+        with patch.object(
+            service,
+            "post_openrouter_background_chat_completion_async",
+            AsyncMock(return_value=FakeResponse()),
+        ):
+            with self.assertRaises(OpenRouterBackgroundCreditReserveError):
+                asyncio.run(service._post_openrouter_chat_completion({}, 123))
+
     def test_default_reader_llm_call_retries_empty_openrouter_choices_once(self):
         from app.services.ai import reader_agent_decision_service as service
 
@@ -5794,8 +5814,6 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         db.begin = fake_begin
         db.execute.side_effect = [
             self._FakeMappingsResult([], rowcount=0),
-            self._FakeMappingsResult([], rowcount=0),
-            self._FakeMappingsResult([], rowcount=0),
             self._FakeMappingsResult([]),
             self._FakeMappingsResult(
                 [
@@ -5808,9 +5826,14 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                         "persona_json": "{}",
                         "taste_memory_json": "{}",
                         "activity_pattern_json": "{}",
-                        "claimed_session_no": 2,
+                        "status": "ready",
+                        "used_session_count": 1,
+                        "daily_llm_budget": 5,
                     }
                 ]
+            ),
+            self._FakeMappingsResult(
+                [{"ai_reader_agent_id": 7, "used_llm_count": 1}]
             ),
             self._FakeMappingsResult([], rowcount=1),
         ]
@@ -5837,7 +5860,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tb_user_social", executed_sql.lower())
         self.assertIn("active_start_at <= current_timestamp", executed_sql)
         self.assertIn("active_end_at > current_timestamp", executed_sql)
-        self.assertIn("tb_ai_reader_llm_decision", executed_sql)
+        self.assertIn("group by d.ai_reader_agent_id", executed_sql.lower())
         self.assertIn("a.daily_llm_budget", executed_sql)
         self.assertIn("d.created_date >= current_date()", executed_sql)
         self.assertIn("d.created_date < current_date() + interval 1 day", executed_sql)
@@ -5855,7 +5878,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("timestampdiff(second, s.locked_at, current_timestamp)", executed_sql.lower())
         self.assertIn("used_session_count = used_session_count + case", executed_sql.lower())
-        self.assertIn("as claimed_session_no", executed_sql.lower())
+        self.assertIn("s.used_session_count", executed_sql.lower())
         self.assertIn("lease_timeout_seconds", str(db.execute.await_args_list[0].args[1]))
 
     async def test_ensure_reader_daily_schedules_creates_missing_dates_without_cleaning_history(self):
@@ -5941,6 +5964,12 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
 
         db = AsyncMock()
         db.execute.side_effect = [
+            self._FakeMappingsResult(
+                [
+                    {"ai_reader_schedule_id": 9},
+                    {"ai_reader_schedule_id": 10},
+                ]
+            ),
             self._FakeMappingsResult([], rowcount=1),
             self._FakeMappingsResult([], rowcount=2),
         ]
@@ -5952,6 +5981,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         executed_sql = "\n".join(str(call.args[0]) for call in db.execute.await_args_list)
 
         self.assertEqual(affected, 2)
+        self.assertIn("limit :limit", executed_sql.lower())
+        self.assertIn("for update skip locked", executed_sql.lower())
         self.assertIn("update tb_ai_reader_llm_decision d", executed_sql.lower())
         self.assertIn("d.session_id like concat(s.ai_reader_schedule_id, ':%')", executed_sql.lower())
         self.assertNotIn("d.ai_reader_schedule_id", executed_sql.lower())
@@ -5960,32 +5991,9 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("active_end_at <= current_timestamp", executed_sql.lower())
         self.assertIn("locked_at <= timestampadd(second, -:lease_timeout_seconds, current_timestamp)", executed_sql.lower())
         self.assertIn("set status = 'failed'", executed_sql.lower())
-
-    async def test_cleanup_budget_exhausted_ready_reader_sessions_closes_due_ready_windows(self):
-        from app.services.ai import reader_agent_session_service as service
-
-        db = AsyncMock()
-        db.execute.return_value = self._FakeMappingsResult([], rowcount=3)
-
-        affected = await service.cleanup_budget_exhausted_ready_reader_sessions(db)
-        executed_sql = str(db.execute.await_args.args[0]).lower()
-
-        self.assertEqual(affected, 3)
-        self.assertIn("update tb_ai_reader_daily_schedule s", executed_sql)
-        self.assertIn("join tb_ai_reader_agent a", executed_sql)
-        self.assertIn("join tb_user u", executed_sql)
-        self.assertIn("substring_index(u.email, '@', -1)", executed_sql)
-        self.assertIn("tb_user_social", executed_sql)
-        self.assertIn("set s.status = 'done'", executed_sql)
-        self.assertIn("daily llm budget exhausted", executed_sql)
-        self.assertIn("s.status = 'ready'", executed_sql)
-        self.assertIn("s.used_session_count < s.session_budget", executed_sql)
-        self.assertIn("s.active_start_at <= current_timestamp", executed_sql)
-        self.assertIn("s.active_end_at > current_timestamp", executed_sql)
-        self.assertIn("a.status = 'active'", executed_sql)
-        self.assertIn(">= a.daily_llm_budget", executed_sql)
-        self.assertIn("tb_ai_reader_llm_decision", executed_sql)
-        self.assertIn("d.decision_status in ('pending', 'success', 'failed')", executed_sql)
+        self.assertEqual(db.execute.await_args_list[0].args[1]["limit"], 20)
+        self.assertEqual(db.execute.await_args_list[1].args[1]["schedule_ids"], [9, 10])
+        self.assertEqual(db.execute.await_args_list[2].args[1]["schedule_ids"], [9, 10])
 
     async def test_pause_expired_active_reader_agents_pauses_only_after_operation_end(self):
         from app.services.ai import reader_agent_session_service as service
@@ -6039,8 +6047,6 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         db.begin = fake_begin
         db.execute.side_effect = [
             self._FakeMappingsResult([], rowcount=0),
-            self._FakeMappingsResult([], rowcount=0),
-            self._FakeMappingsResult([], rowcount=0),
             self._FakeMappingsResult(
                 [
                     {
@@ -6052,10 +6058,17 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                         "persona_json": "{}",
                         "taste_memory_json": "{}",
                         "activity_pattern_json": "{}",
-                        "claimed_session_no": 1,
+                        "status": "running",
+                        "used_session_count": 1,
+                        "daily_llm_budget": 5,
                     }
                 ]
             ),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult(
+                [{"ai_reader_agent_id": 7, "used_llm_count": 0}]
+            ),
+            self._FakeMappingsResult([]),
             self._FakeMappingsResult([], rowcount=1),
         ]
 
@@ -6069,7 +6082,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([session.ai_reader_schedule_id for session in sessions], [9])
         self.assertIn("force index (idx_ai_reader_daily_schedule_stale)", executed_sql_joined)
-        self.assertNotIn("force index (idx_ai_reader_daily_schedule_due)", executed_sql_joined)
+        self.assertIn("force index (idx_ai_reader_daily_schedule_due)", executed_sql_joined)
         self.assertIn("used_session_count = used_session_count + case", executed_sql[-1])
 
     async def test_claim_due_reader_sessions_allows_stale_pending_decision_when_daily_budget_is_full(self):
@@ -6085,10 +6098,34 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         db.begin = fake_begin
         db.execute.side_effect = [
             self._FakeMappingsResult([], rowcount=0),
-            self._FakeMappingsResult([], rowcount=0),
-            self._FakeMappingsResult([], rowcount=0),
             self._FakeMappingsResult(
                 [
+                    {
+                        "ai_reader_schedule_id": 7,
+                        "ai_reader_agent_id": 5,
+                        "user_id": 98,
+                        "age_group": "20s",
+                        "gender": "M",
+                        "persona_json": "{}",
+                        "taste_memory_json": "{}",
+                        "activity_pattern_json": "{}",
+                        "status": "running",
+                        "used_session_count": 1,
+                        "daily_llm_budget": 1,
+                    },
+                    {
+                        "ai_reader_schedule_id": 8,
+                        "ai_reader_agent_id": 6,
+                        "user_id": 99,
+                        "age_group": "20s",
+                        "gender": "F",
+                        "persona_json": "{}",
+                        "taste_memory_json": "{}",
+                        "activity_pattern_json": "{}",
+                        "status": "running",
+                        "used_session_count": 1,
+                        "daily_llm_budget": 1,
+                    },
                     {
                         "ai_reader_schedule_id": 9,
                         "ai_reader_agent_id": 7,
@@ -6098,10 +6135,24 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                         "persona_json": "{}",
                         "taste_memory_json": "{}",
                         "activity_pattern_json": "{}",
-                        "claimed_session_no": 2,
+                        "status": "running",
+                        "used_session_count": 2,
+                        "daily_llm_budget": 5,
                     }
                 ]
             ),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult(
+                [
+                    {"ai_reader_agent_id": 5, "used_llm_count": 1},
+                    {"ai_reader_agent_id": 6, "used_llm_count": 1},
+                    {"ai_reader_agent_id": 7, "used_llm_count": 5},
+                ]
+            ),
+            self._FakeMappingsResult(
+                [{"ai_reader_agent_id": 7, "session_id": "9:2"}]
+            ),
+            self._FakeMappingsResult([], rowcount=2),
             self._FakeMappingsResult([], rowcount=1),
         ]
 
@@ -6111,19 +6162,185 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             limit=1,
         )
         executed_sql = "\n".join(str(call.args[0]).lower() for call in db.execute.await_args_list)
-        compact_sql = " ".join(executed_sql.split())
-        stale_params = db.execute.await_args_list[3].args[1]
+        candidate_sql = "\n".join(
+            str(call.args[0]).lower() for call in db.execute.await_args_list[1:3]
+        )
+        pending_sql = str(db.execute.await_args_list[4].args[0]).lower()
+        pending_params = db.execute.await_args_list[4].args[1]
+        stale_failure_call = db.execute.await_args_list[5]
 
         self.assertEqual([session.claimed_session_no for session in sessions], [2])
         self.assertIn("count(*)", executed_sql)
-        self.assertIn("< a.daily_llm_budget", executed_sql)
-        self.assertIn("or (", executed_sql)
-        self.assertIn("and exists", executed_sql)
-        self.assertIn("d_existing.decision_status = 'pending'", executed_sql)
-        self.assertIn("d_existing.session_id = concat(", compact_sql)
-        self.assertIn("s.ai_reader_schedule_id", compact_sql)
-        self.assertIn("greatest(s.used_session_count, 1)", compact_sql)
-        self.assertIn("prompt_version", stale_params)
+        self.assertNotIn("tb_ai_reader_llm_decision", candidate_sql)
+        self.assertIn("d.decision_status = 'pending'", pending_sql)
+        self.assertEqual(pending_params["session_ids"], ["7:1", "8:1", "9:2"])
+        self.assertIn("prompt_version", pending_params)
+        self.assertEqual(stale_failure_call.args[1]["schedule_ids"], [7, 8])
+        self.assertIn("set status = 'failed'", str(stale_failure_call.args[0]).lower())
+
+    async def test_claim_due_reader_sessions_bounds_candidates_claims_and_budget_updates(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        db = AsyncMock()
+        db.in_transaction = lambda: False
+
+        @asynccontextmanager
+        async def fake_begin():
+            yield
+
+        db.begin = fake_begin
+        ready_rows = [
+            {
+                "ai_reader_schedule_id": 1,
+                "ai_reader_agent_id": 7,
+                "user_id": 100,
+                "age_group": "30s",
+                "gender": "M",
+                "persona_json": "{}",
+                "taste_memory_json": "{}",
+                "activity_pattern_json": "{}",
+                "status": "ready",
+                "used_session_count": 0,
+                "daily_llm_budget": 2,
+            },
+            {
+                "ai_reader_schedule_id": 2,
+                "ai_reader_agent_id": 7,
+                "user_id": 100,
+                "age_group": "30s",
+                "gender": "M",
+                "persona_json": "{}",
+                "taste_memory_json": "{}",
+                "activity_pattern_json": "{}",
+                "status": "ready",
+                "used_session_count": 0,
+                "daily_llm_budget": 2,
+            },
+            {
+                "ai_reader_schedule_id": 3,
+                "ai_reader_agent_id": 9,
+                "user_id": 102,
+                "age_group": "20s",
+                "gender": "F",
+                "persona_json": "{}",
+                "taste_memory_json": None,
+                "activity_pattern_json": "{}",
+                "status": "ready",
+                "used_session_count": 0,
+                "daily_llm_budget": 2,
+            },
+            {
+                "ai_reader_schedule_id": 4,
+                "ai_reader_agent_id": 8,
+                "user_id": 101,
+                "age_group": "40s",
+                "gender": "F",
+                "persona_json": "{}",
+                "taste_memory_json": "{}",
+                "activity_pattern_json": "{}",
+                "status": "ready",
+                "used_session_count": 0,
+                "daily_llm_budget": 1,
+            },
+        ]
+        db.execute.side_effect = [
+            self._FakeMappingsResult([], rowcount=0),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult(ready_rows),
+            self._FakeMappingsResult(
+                [
+                    {"ai_reader_agent_id": 7, "used_llm_count": 0},
+                    {"ai_reader_agent_id": 8, "used_llm_count": 1},
+                    {"ai_reader_agent_id": 9, "used_llm_count": 0},
+                ]
+            ),
+            self._FakeMappingsResult([], rowcount=1),
+            self._FakeMappingsResult([], rowcount=1),
+            self._FakeMappingsResult([], rowcount=1),
+        ]
+
+        sessions = await service.claim_due_reader_sessions(
+            db,
+            worker_id="session-worker-a",
+            limit=99,
+        )
+
+        candidate_calls = db.execute.await_args_list[1:3]
+        candidate_sql = "\n".join(str(call.args[0]).lower() for call in candidate_calls)
+        done_call = db.execute.await_args_list[-3]
+        claim_calls = db.execute.await_args_list[-2:]
+
+        self.assertEqual(
+            [session.ai_reader_schedule_id for session in sessions],
+            [1, 3],
+        )
+        self.assertEqual(candidate_calls[0].args[1]["limit"], 20)
+        self.assertEqual(candidate_calls[1].args[1]["limit"], 20)
+        self.assertNotIn("tb_ai_reader_llm_decision", candidate_sql)
+        self.assertNotIn("for update", candidate_sql)
+        self.assertIn("timestampadd(day, -1, current_timestamp)", candidate_sql)
+        self.assertIn("straight_join tb_ai_reader_agent", candidate_sql)
+        self.assertIn("join tb_user", candidate_sql)
+        self.assertEqual(done_call.args[1]["schedule_ids"], [4])
+        self.assertEqual(
+            [call.args[1]["schedule_id"] for call in claim_calls],
+            [1, 3],
+        )
+        self.assertIn("set status = 'done'", str(done_call.args[0]).lower())
+        self.assertTrue(
+            all("set used_session_count" in str(call.args[0]).lower() for call in claim_calls)
+        )
+
+    async def test_claim_due_reader_sessions_skips_candidate_changed_before_update(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        db = AsyncMock()
+        db.in_transaction = lambda: False
+
+        @asynccontextmanager
+        async def fake_begin():
+            yield
+
+        db.begin = fake_begin
+        db.execute.side_effect = [
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult(
+                [
+                    {
+                        "ai_reader_schedule_id": 1,
+                        "ai_reader_agent_id": 7,
+                        "user_id": 100,
+                        "age_group": "30s",
+                        "gender": "M",
+                        "persona_json": "{}",
+                        "taste_memory_json": "{}",
+                        "activity_pattern_json": "{}",
+                        "status": "ready",
+                        "used_session_count": 0,
+                        "daily_llm_budget": 1,
+                    }
+                ]
+            ),
+            self._FakeMappingsResult([]),
+            self._FakeMappingsResult([], rowcount=0),
+        ]
+
+        with self.assertLogs(
+            "app.services.ai.reader_agent_session_service",
+            level="INFO",
+        ):
+            sessions = await service.claim_due_reader_sessions(
+                db,
+                worker_id="session-worker-a",
+                limit=2,
+            )
+
+        claim_call = db.execute.await_args_list[-1]
+        self.assertEqual(sessions, [])
+        self.assertEqual(claim_call.args[1]["schedule_id"], 1)
+        self.assertEqual(claim_call.args[1]["expected_status"], "ready")
+        self.assertEqual(claim_call.args[1]["expected_used_session_count"], 0)
 
     def test_build_reader_daily_schedule_windows_uses_activity_pattern_budget(self):
         from app.services.ai import reader_agent_session_service as service
@@ -9221,6 +9438,137 @@ class AiReaderWorkerCycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.claimed_action_count, 1)
         self.assertEqual(result.processed_action_count, 0)
         self.assertEqual(result.failed_action_count, 1)
+
+    async def test_run_reader_worker_cycle_credit_cooldown_skips_sessions_but_keeps_actions(self):
+        from app.services.ai import reader_agent_action_service as action_service
+        from app.services.ai import reader_agent_session_service as session_service
+        from app.services.ai import reader_agent_worker_service as worker_service
+        from app.services.common.openrouter_background_credit_guard import (
+            OpenRouterBackgroundCreditReserveError,
+        )
+
+        events = []
+        session_attempt_count = 0
+        db = AsyncMock()
+        claimed_session = session_service.ReaderClaimedSession(
+            ai_reader_schedule_id=1,
+            ai_reader_agent_id=7,
+            user_id=100,
+            age_group="30s",
+            gender="M",
+            persona_json="{}",
+            taste_memory_json="{}",
+            activity_pattern_json="{}",
+        )
+        claimed_action = action_service.ReaderQueuedAction(
+            ai_reader_action_id=10,
+            ai_reader_agent_id=7,
+            user_id=100,
+            product_id=200,
+            episode_id=300,
+            action_type="read",
+            target_value=None,
+        )
+
+        async def fake_session_claimer(tx_db, *, worker_id, limit):
+            events.append("claim_session")
+            return [claimed_session]
+
+        async def fake_session_processor(session, tx_db, *, worker_id):
+            nonlocal session_attempt_count
+            session_attempt_count += 1
+            events.append("process_session")
+            if session_attempt_count == 1:
+                raise OpenRouterBackgroundCreditReserveError("credit reserve blocked")
+            return session_service.ReaderSessionDecisionResult(
+                llm_decision_id=91,
+                actions=[],
+            )
+
+        async def fake_action_claimer(tx_db, *, worker_id, limit):
+            events.append("claim_action")
+            return [claimed_action]
+
+        async def fake_action_processor(action, tx_db, *, worker_id):
+            events.append("process_action")
+            return action_service.ReaderActionApplyResult(
+                ai_reader_action_id=action.ai_reader_action_id,
+                action_type=action.action_type,
+                applied=True,
+                reason="applied",
+            )
+
+        async def fake_schema_guard(tx_db):
+            return None
+
+        async def fake_expired_agent_pauser(tx_db):
+            return 0
+
+        worker_service.reset_reader_session_credit_cooldown_for_tests()
+        try:
+            with patch.object(worker_service.time, "monotonic", return_value=100.0):
+                with patch.dict(os.environ, {"AI_READER_WORKER_ENABLED": "Y"}):
+                    with self.assertLogs(
+                        "app.services.ai.reader_agent_worker_service",
+                        level="WARNING",
+                    ):
+                        first = await worker_service.run_reader_worker_cycle(
+                            db,
+                            worker_id="reader-worker-a",
+                            session_claimer=fake_session_claimer,
+                            session_processor=fake_session_processor,
+                            action_claimer=fake_action_claimer,
+                            action_processor=fake_action_processor,
+                            schema_guard=fake_schema_guard,
+                            expired_agent_pauser=fake_expired_agent_pauser,
+                        )
+                    second = await worker_service.run_reader_worker_cycle(
+                        db,
+                        worker_id="reader-worker-a",
+                        session_claimer=fake_session_claimer,
+                        session_processor=fake_session_processor,
+                        action_claimer=fake_action_claimer,
+                        action_processor=fake_action_processor,
+                        schema_guard=fake_schema_guard,
+                        expired_agent_pauser=fake_expired_agent_pauser,
+                    )
+            with patch.object(worker_service.time, "monotonic", return_value=401.0):
+                with patch.dict(os.environ, {"AI_READER_WORKER_ENABLED": "Y"}):
+                    third = await worker_service.run_reader_worker_cycle(
+                        db,
+                        worker_id="reader-worker-a",
+                        session_claimer=fake_session_claimer,
+                        session_processor=fake_session_processor,
+                        action_claimer=fake_action_claimer,
+                        action_processor=fake_action_processor,
+                        schema_guard=fake_schema_guard,
+                        expired_agent_pauser=fake_expired_agent_pauser,
+                    )
+        finally:
+            worker_service.reset_reader_session_credit_cooldown_for_tests()
+
+        self.assertEqual(
+            events,
+            [
+                "claim_session",
+                "process_session",
+                "claim_action",
+                "process_action",
+                "claim_action",
+                "process_action",
+                "claim_session",
+                "process_session",
+                "claim_action",
+                "process_action",
+            ],
+        )
+        self.assertEqual(first.failed_session_count, 1)
+        self.assertEqual(first.processed_action_count, 1)
+        self.assertEqual(second.claimed_session_count, 0)
+        self.assertEqual(second.processed_action_count, 1)
+        self.assertEqual(third.claimed_session_count, 1)
+        self.assertEqual(third.processed_session_count, 1)
+        self.assertEqual(third.processed_action_count, 1)
 
 
 class AiReaderPersonaFactoryTest(unittest.TestCase):

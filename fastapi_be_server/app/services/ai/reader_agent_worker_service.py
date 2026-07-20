@@ -1,6 +1,7 @@
 import logging
 import os
 import inspect
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -9,10 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.ai import reader_agent_action_service as action_service
 from app.services.ai import reader_agent_session_service as session_service
+from app.services.common.openrouter_background_credit_guard import (
+    OpenRouterBackgroundCreditReserveError,
+)
 
 
 logger = logging.getLogger(__name__)
 AI_READER_WORKER_ENABLED_ENV = "AI_READER_WORKER_ENABLED"
+READER_SESSION_CREDIT_COOLDOWN_SECONDS = 300.0
 REQUIRED_READER_WORKER_TABLES = (
     "tb_ai_reader_agent",
     "tb_ai_reader_daily_schedule",
@@ -229,6 +234,7 @@ ActionProcessor = Callable[..., Awaitable[action_service.ReaderActionApplyResult
 SchemaGuard = Callable[[AsyncSession], Awaitable[None]]
 ExpiredAgentPauser = Callable[[AsyncSession], Awaitable[int]]
 _reader_worker_schema_ready_checked = False
+_reader_session_credit_blocked_until_monotonic = 0.0
 
 
 def is_reader_worker_enabled() -> bool:
@@ -246,6 +252,26 @@ async def ensure_reader_worker_schema_ready_once(db: AsyncSession) -> None:
 def reset_reader_worker_schema_ready_cache_for_tests() -> None:
     global _reader_worker_schema_ready_checked
     _reader_worker_schema_ready_checked = False
+
+
+def reset_reader_session_credit_cooldown_for_tests() -> None:
+    global _reader_session_credit_blocked_until_monotonic
+    _reader_session_credit_blocked_until_monotonic = 0.0
+
+
+def _reader_session_credit_cooldown_active() -> bool:
+    return time.monotonic() < _reader_session_credit_blocked_until_monotonic
+
+
+def _activate_reader_session_credit_cooldown() -> bool:
+    global _reader_session_credit_blocked_until_monotonic
+    now_monotonic = time.monotonic()
+    was_active = now_monotonic < _reader_session_credit_blocked_until_monotonic
+    _reader_session_credit_blocked_until_monotonic = max(
+        _reader_session_credit_blocked_until_monotonic,
+        now_monotonic + READER_SESSION_CREDIT_COOLDOWN_SECONDS,
+    )
+    return not was_active
 
 
 async def assert_reader_worker_schema_ready(db: AsyncSession) -> None:
@@ -445,13 +471,29 @@ async def run_reader_worker_cycle(
     await expired_agent_pauser(db)
     await _commit_active_transaction(db)
 
-    sessions = await session_claimer(db, worker_id=worker_id, limit=session_limit)
+    sessions = (
+        []
+        if _reader_session_credit_cooldown_active()
+        else await session_claimer(db, worker_id=worker_id, limit=session_limit)
+    )
     processed_session_count = 0
     failed_session_count = 0
     for session in sessions:
         try:
             await session_processor(session, db, worker_id=worker_id)
             processed_session_count += 1
+        except OpenRouterBackgroundCreditReserveError:
+            failed_session_count += 1
+            if _activate_reader_session_credit_cooldown():
+                logger.warning(
+                    "ai reader session claim paused by credit reserve",
+                    extra={
+                        "worker_id": worker_id,
+                        "cooldown_seconds": READER_SESSION_CREDIT_COOLDOWN_SECONDS,
+                        "ai_reader_schedule_id": session.ai_reader_schedule_id,
+                        "ai_reader_agent_id": session.ai_reader_agent_id,
+                    },
+                )
         except Exception:
             failed_session_count += 1
             logger.exception(
