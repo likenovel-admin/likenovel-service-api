@@ -296,6 +296,10 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "HAVING COUNT(*)" in query
     assert "FROM tb_product_episode pe" in query
     assert "FROM tb_story_agent_context_summary inventory" in query
+    assert "LEFT JOIN tb_story_agent_context_product sacp" in query
+    assert "COALESCE(sacp.ready_episode_count, 0)" in query
+    assert "AS syncedLatestEpisodeNo" in query
+    assert "SELECT MAX(public_episode.episode_no)" in query
     assert "inventory.scope_key = mcs.character_scope_key" in query
     assert "inventory.summary_type = 'character_inventory_v3'" in query
     assert "profile.scope_key" in query
