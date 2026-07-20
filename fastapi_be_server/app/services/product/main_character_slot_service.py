@@ -277,12 +277,24 @@ def build_public_main_character_slots_query() -> str:
             mcs.card_order AS cardOrder,
             p.title AS productTitle,
             p.author_name AS authorNickname,
+            LEAST(
+                COALESCE(sacp.ready_episode_count, 0),
+                COALESCE((
+                    SELECT MAX(public_episode.episode_no)
+                    FROM tb_product_episode public_episode
+                    WHERE public_episode.product_id = mcs.product_id
+                      AND public_episode.use_yn = 'Y'
+                      AND public_episode.open_yn = 'Y'
+                ), 0)
+            ) AS syncedLatestEpisodeNo,
             mcs.publish_start_date AS publishStartAt,
             mcs.publish_end_date AS publishEndAt,
             mcs.created_date AS createdDate,
             mcs.updated_date AS updatedDate
         FROM tb_main_character_slot mcs
         INNER JOIN tb_product p ON p.product_id = mcs.product_id
+        LEFT JOIN tb_story_agent_context_product sacp
+            ON sacp.product_id = mcs.product_id
         WHERE mcs.use_yn = 'Y'
           AND mcs.deleted_yn = 'N'
           AND mcs.publish_start_date <= NOW()
