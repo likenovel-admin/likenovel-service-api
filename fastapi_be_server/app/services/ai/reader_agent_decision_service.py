@@ -10,6 +10,7 @@ import httpx
 from app.const import settings
 from app.exceptions import CustomResponseException
 from app.services.common.openrouter_background_credit_guard import (
+    OpenRouterBackgroundCreditReserveError,
     post_openrouter_background_chat_completion_async,
 )
 
@@ -513,6 +514,10 @@ async def _post_openrouter_chat_completion(payload: dict[str, Any], max_tokens: 
                 "X-Title": "LikeNovel AI Reader Agent",
             },
             json=payload,
+        )
+    if resp.status_code == status.HTTP_402_PAYMENT_REQUIRED:
+        raise OpenRouterBackgroundCreditReserveError(
+            "OpenRouter background credit reserve blocked: provider returned status=402"
         )
     if resp.status_code != 200:
         logger.error("OpenRouter API error: %s", _sanitize_openrouter_error(resp))

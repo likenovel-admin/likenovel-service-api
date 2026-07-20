@@ -290,7 +290,7 @@ restore_previous_env() {
 start_ai_reader_worker() {
   AI_READER_WORKER_ENABLED=Y nohup ./.venv/bin/python -u scripts/run_ai_reader_worker.py \
     --worker-id "ai-reader-prod-$(hostname)" \
-    --session-limit 10 \
+    --session-limit 2 \
     --action-limit 50 \
     --interval-seconds 5 \
     >> "$AI_READER_WORKER_LOG" 2>&1 &

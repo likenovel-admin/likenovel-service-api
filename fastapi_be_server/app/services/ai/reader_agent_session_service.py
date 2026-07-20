@@ -18,6 +18,8 @@ from app.services.ai import reader_agent_decision_service as decision_service
 logger = logging.getLogger(__name__)
 
 BAYESIAN_LOOSE_STOP_EVIDENCE_WEIGHT = 0.1
+MAX_READER_SESSION_CANDIDATE_COUNT = 20
+MAX_READER_SESSION_CLAIM_COUNT = 2
 
 
 class InvalidReaderSessionError(ValueError):
@@ -453,9 +455,38 @@ async def cleanup_expired_stale_reader_sessions(
     db: AsyncSession,
     *,
     lease_timeout_seconds: int,
+    limit: int = MAX_READER_SESSION_CANDIDATE_COUNT,
 ) -> int:
     if lease_timeout_seconds < 1 or lease_timeout_seconds > 86400:
         raise InvalidReaderSessionError("lease_timeout_seconds must be between 1 and 86400")
+    if limit < 1 or limit > MAX_READER_SESSION_CANDIDATE_COUNT:
+        raise InvalidReaderSessionError(
+            f"limit must be between 1 and {MAX_READER_SESSION_CANDIDATE_COUNT}"
+        )
+
+    stale_result = await db.execute(
+        text("""
+            select ai_reader_schedule_id
+              from tb_ai_reader_daily_schedule force index (idx_ai_reader_daily_schedule_stale)
+             where status = 'running'
+               and locked_at is not null
+               and locked_at <= timestampadd(second, -:lease_timeout_seconds, current_timestamp)
+               and active_end_at <= current_timestamp
+             order by locked_at, active_start_at, active_end_at, ai_reader_schedule_id
+             limit :limit
+             for update skip locked
+        """),
+        {
+            "lease_timeout_seconds": lease_timeout_seconds,
+            "limit": limit,
+        },
+    )
+    schedule_ids = [
+        int(row.get("ai_reader_schedule_id"))
+        for row in stale_result.mappings().all()
+    ]
+    if not schedule_ids:
+        return 0
 
     await db.execute(
         text("""
@@ -466,13 +497,10 @@ async def cleanup_expired_stale_reader_sessions(
                set d.decision_status = 'failed'
                  , d.error_message = 'expired stale schedule lease'
                  , d.updated_date = current_timestamp
-             where s.status = 'running'
-               and s.locked_at is not null
-               and s.locked_at <= timestampadd(second, -:lease_timeout_seconds, current_timestamp)
-               and s.active_end_at <= current_timestamp
+             where s.ai_reader_schedule_id in :schedule_ids
                and d.decision_status = 'pending'
-        """),
-        {"lease_timeout_seconds": lease_timeout_seconds},
+        """).bindparams(bindparam("schedule_ids", expanding=True)),
+        {"schedule_ids": schedule_ids},
     )
     result = await db.execute(
         text("""
@@ -482,53 +510,23 @@ async def cleanup_expired_stale_reader_sessions(
                  , locked_at = null
                  , error_message = 'expired stale schedule lease'
                  , updated_date = current_timestamp
-             where status = 'running'
+             where ai_reader_schedule_id in :schedule_ids
+               and status = 'running'
                and locked_at is not null
                and locked_at <= timestampadd(second, -:lease_timeout_seconds, current_timestamp)
                and active_end_at <= current_timestamp
-        """),
-        {"lease_timeout_seconds": lease_timeout_seconds},
+        """).bindparams(bindparam("schedule_ids", expanding=True)),
+        {
+            "schedule_ids": schedule_ids,
+            "lease_timeout_seconds": lease_timeout_seconds,
+        },
     )
-    return int(getattr(result, "rowcount", 0) or 0)
-
-
-async def cleanup_budget_exhausted_ready_reader_sessions(db: AsyncSession) -> int:
-    result = await db.execute(
-        text("""
-            update tb_ai_reader_daily_schedule s
-              join tb_ai_reader_agent a
-                on a.ai_reader_agent_id = s.ai_reader_agent_id
-              join tb_user u
-                on u.user_id = a.user_id
-               set s.status = 'done'
-                 , s.locked_by = null
-                 , s.locked_at = null
-                 , s.error_message = 'daily llm budget exhausted'
-                 , s.updated_date = current_timestamp
-             where s.status = 'ready'
-               and s.used_session_count < s.session_budget
-               and s.active_start_at <= current_timestamp
-               and s.active_end_at > current_timestamp
-               and a.status = 'active'
-               and u.use_yn = 'Y'
-               and lower(substring_index(u.email, '@', -1)) in :allowed_domains
-               and not exists (
-                    select 1
-                      from tb_user_social us
-                     where us.user_id = u.user_id
-               )
-               and (
-                    select count(*)
-                      from tb_ai_reader_llm_decision d
-                     where d.ai_reader_agent_id = a.ai_reader_agent_id
-                       and d.created_date >= current_date()
-                       and d.created_date < current_date() + interval 1 day
-                       and d.decision_status in ('pending', 'success', 'failed')
-               ) >= a.daily_llm_budget
-        """).bindparams(bindparam("allowed_domains", expanding=True)),
-        {"allowed_domains": _allowed_ai_reader_account_domains()},
+    _ensure_rows_changed(
+        result,
+        "cleanup_expired_stale_reader_sessions",
+        len(schedule_ids),
     )
-    return int(getattr(result, "rowcount", 0) or 0)
+    return len(schedule_ids)
 
 
 async def _claim_due_reader_sessions(
@@ -545,11 +543,11 @@ async def _claim_due_reader_sessions(
     if lease_timeout_seconds < 1 or lease_timeout_seconds > 86400:
         raise InvalidReaderSessionError("lease_timeout_seconds must be between 1 and 86400")
 
+    claim_limit = min(limit, MAX_READER_SESSION_CLAIM_COUNT)
     await cleanup_expired_stale_reader_sessions(
         db,
         lease_timeout_seconds=lease_timeout_seconds,
     )
-    await cleanup_budget_exhausted_ready_reader_sessions(db)
 
     stale_rows = await _select_claimable_reader_session_rows(
         db,
@@ -559,12 +557,12 @@ async def _claim_due_reader_sessions(
             and s.locked_at is not null
             and s.locked_at <= timestampadd(second, -:lease_timeout_seconds, current_timestamp)
         """,
-        limit=limit,
+        limit=MAX_READER_SESSION_CANDIDATE_COUNT,
         lease_timeout_seconds=lease_timeout_seconds,
     )
-    rows = stale_rows
-    remaining_limit = limit - len(rows)
-    if remaining_limit > 0:
+    rows = list(stale_rows)
+    remaining_candidate_count = MAX_READER_SESSION_CANDIDATE_COUNT - len(rows)
+    if remaining_candidate_count > 0:
         rows.extend(
             await _select_claimable_reader_session_rows(
                 db,
@@ -573,30 +571,203 @@ async def _claim_due_reader_sessions(
                     s.status = 'ready'
                     and s.used_session_count < s.session_budget
                 """,
-                limit=remaining_limit,
+                limit=remaining_candidate_count,
                 lease_timeout_seconds=lease_timeout_seconds,
             )
         )
     if not rows:
         return []
 
-    schedule_ids = [row.get("ai_reader_schedule_id") for row in rows]
-    result = await db.execute(
-        text("""
-            update tb_ai_reader_daily_schedule
-               set used_session_count = used_session_count + case
-                    when status = 'ready' then 1
-                    else 0
-                   end
-                 , status = 'running'
-                 , locked_by = :worker_id
-                 , locked_at = current_timestamp
-             where ai_reader_schedule_id in :schedule_ids
-               and status in ('ready', 'running')
-        """).bindparams(bindparam("schedule_ids", expanding=True)),
-        {"worker_id": worker_id[:100], "schedule_ids": schedule_ids},
+    agent_ids = sorted({int(row.get("ai_reader_agent_id")) for row in rows})
+    used_count_by_agent = await _read_reader_daily_decision_counts(
+        db,
+        ai_reader_agent_ids=agent_ids,
     )
-    _ensure_rows_changed(result, "claim_due_reader_sessions", len(schedule_ids))
+    pending_session_keys = await _read_pending_stale_reader_session_keys(
+        db,
+        stale_rows=stale_rows,
+    )
+    remaining_budget_by_agent = {
+        agent_id: max(
+            0,
+            int(
+                next(
+                    row.get("daily_llm_budget")
+                    for row in rows
+                    if int(row.get("ai_reader_agent_id")) == agent_id
+                )
+                or 0
+            )
+            - used_count_by_agent.get(agent_id, 0),
+        )
+        for agent_id in agent_ids
+    }
+
+    claimed_rows: list[tuple[Any, int]] = []
+    claimed_agent_ids: set[int] = set()
+    budget_exhausted_ready_ids: list[int] = []
+    budget_exhausted_stale_ids: list[int] = []
+    for row in rows:
+        schedule_id = int(row.get("ai_reader_schedule_id"))
+        agent_id = int(row.get("ai_reader_agent_id"))
+        status = str(row.get("status") or "")
+        used_session_count = int(row.get("used_session_count") or 0)
+        claimed_session_no = (
+            used_session_count + 1
+            if status == "ready"
+            else max(used_session_count, 1)
+        )
+        has_pending_decision = (
+            agent_id,
+            f"{schedule_id}:{claimed_session_no}",
+        ) in pending_session_keys
+
+        if status == "running" and has_pending_decision:
+            if (
+                len(claimed_rows) < claim_limit
+                and agent_id not in claimed_agent_ids
+            ):
+                claimed_rows.append((row, claimed_session_no))
+                claimed_agent_ids.add(agent_id)
+            continue
+
+        if remaining_budget_by_agent[agent_id] > 0:
+            if (
+                len(claimed_rows) < claim_limit
+                and agent_id not in claimed_agent_ids
+            ):
+                claimed_rows.append((row, claimed_session_no))
+                claimed_agent_ids.add(agent_id)
+                remaining_budget_by_agent[agent_id] -= 1
+            continue
+
+        if (
+            status == "ready"
+            and used_count_by_agent.get(agent_id, 0)
+            >= int(row.get("daily_llm_budget") or 0)
+        ):
+            budget_exhausted_ready_ids.append(schedule_id)
+        elif (
+            status == "running"
+            and used_count_by_agent.get(agent_id, 0)
+            >= int(row.get("daily_llm_budget") or 0)
+        ):
+            budget_exhausted_stale_ids.append(schedule_id)
+
+    if budget_exhausted_ready_ids:
+        result = await db.execute(
+            text("""
+                update tb_ai_reader_daily_schedule
+                   set status = 'done'
+                     , locked_by = null
+                     , locked_at = null
+                     , error_message = 'daily llm budget exhausted'
+                     , updated_date = current_timestamp
+                 where ai_reader_schedule_id in :schedule_ids
+                   and status = 'ready'
+            """).bindparams(bindparam("schedule_ids", expanding=True)),
+            {"schedule_ids": budget_exhausted_ready_ids},
+        )
+        affected_count = int(getattr(result, "rowcount", 0) or 0)
+        if affected_count != len(budget_exhausted_ready_ids):
+            logger.info(
+                "ai reader budget-exhausted schedules changed concurrently",
+                extra={
+                    "candidate_count": len(budget_exhausted_ready_ids),
+                    "updated_count": affected_count,
+                },
+            )
+
+    if budget_exhausted_stale_ids:
+        result = await db.execute(
+            text("""
+                update tb_ai_reader_daily_schedule
+                   set status = 'failed'
+                     , locked_by = null
+                     , locked_at = null
+                     , error_message = 'daily llm budget exhausted before stale retry'
+                     , updated_date = current_timestamp
+                 where ai_reader_schedule_id in :schedule_ids
+                   and status = 'running'
+                   and locked_at is not null
+                   and locked_at <= timestampadd(
+                        second,
+                        -:lease_timeout_seconds,
+                        current_timestamp
+                   )
+            """).bindparams(bindparam("schedule_ids", expanding=True)),
+            {
+                "schedule_ids": budget_exhausted_stale_ids,
+                "lease_timeout_seconds": lease_timeout_seconds,
+            },
+        )
+        affected_count = int(getattr(result, "rowcount", 0) or 0)
+        if affected_count != len(budget_exhausted_stale_ids):
+            logger.info(
+                "ai reader budget-exhausted stale schedules changed concurrently",
+                extra={
+                    "candidate_count": len(budget_exhausted_stale_ids),
+                    "updated_count": affected_count,
+                },
+            )
+
+    if not claimed_rows:
+        return []
+
+    successfully_claimed_rows: list[tuple[Any, int]] = []
+    for row, claimed_session_no in claimed_rows:
+        result = await db.execute(
+            text("""
+                update tb_ai_reader_daily_schedule
+                   set used_session_count = used_session_count + case
+                        when status = 'ready' then 1
+                        else 0
+                       end
+                     , status = 'running'
+                     , locked_by = :worker_id
+                     , locked_at = current_timestamp
+                 where ai_reader_schedule_id = :schedule_id
+                   and used_session_count = :expected_used_session_count
+                   and active_start_at <= current_timestamp
+                   and active_end_at > current_timestamp
+                   and (
+                        (
+                            :expected_status = 'ready'
+                            and status = 'ready'
+                            and used_session_count < session_budget
+                        )
+                        or (
+                            :expected_status = 'running'
+                            and status = 'running'
+                            and locked_at is not null
+                            and locked_at <= timestampadd(
+                                second,
+                                -:lease_timeout_seconds,
+                                current_timestamp
+                            )
+                        )
+                   )
+            """),
+            {
+                "worker_id": worker_id[:100],
+                "schedule_id": int(row.get("ai_reader_schedule_id")),
+                "expected_status": str(row.get("status") or ""),
+                "expected_used_session_count": int(
+                    row.get("used_session_count") or 0
+                ),
+                "lease_timeout_seconds": lease_timeout_seconds,
+            },
+        )
+        if int(getattr(result, "rowcount", 0) or 0) == 1:
+            successfully_claimed_rows.append((row, claimed_session_no))
+            continue
+        logger.info(
+            "ai reader session candidate changed before claim",
+            extra={
+                "ai_reader_schedule_id": int(row.get("ai_reader_schedule_id")),
+                "ai_reader_agent_id": int(row.get("ai_reader_agent_id")),
+            },
+        )
 
     return [
         ReaderClaimedSession(
@@ -608,9 +779,9 @@ async def _claim_due_reader_sessions(
             persona_json=row.get("persona_json"),
             taste_memory_json=row.get("taste_memory_json"),
             activity_pattern_json=row.get("activity_pattern_json"),
-            claimed_session_no=int(row.get("claimed_session_no") or 1),
+            claimed_session_no=claimed_session_no,
         )
-        for row in rows
+        for row, claimed_session_no in successfully_claimed_rows
     ]
 
 
@@ -632,10 +803,9 @@ async def _select_claimable_reader_session_rows(
                  , a.persona_json
                  , a.taste_memory_json
                  , a.activity_pattern_json
-                 , s.used_session_count + case
-                    when s.status = 'ready' then 1
-                    else 0
-                   end as claimed_session_no
+                 , a.daily_llm_budget
+                 , s.status
+                 , s.used_session_count
               from tb_ai_reader_daily_schedule s force index ({index_name})
               straight_join tb_ai_reader_agent a
                 on a.ai_reader_agent_id = s.ai_reader_agent_id
@@ -643,6 +813,7 @@ async def _select_claimable_reader_session_rows(
                 on u.user_id = a.user_id
              where {condition_sql}
                and s.active_start_at <= current_timestamp
+               and s.active_start_at >= timestampadd(day, -1, current_timestamp)
                and s.active_end_at > current_timestamp
                and a.status = 'active'
                and u.use_yn = 'Y'
@@ -652,44 +823,82 @@ async def _select_claimable_reader_session_rows(
                       from tb_user_social us
                      where us.user_id = u.user_id
                )
-               and (
-                    (
-                        select count(*)
-                          from tb_ai_reader_llm_decision d
-                         where d.ai_reader_agent_id = a.ai_reader_agent_id
-                           and d.created_date >= current_date()
-                           and d.created_date < current_date() + interval 1 day
-                           and d.decision_status in ('pending', 'success', 'failed')
-                    ) < a.daily_llm_budget
-                    or (
-                        s.status = 'running'
-                        and exists (
-                            select 1
-                              from tb_ai_reader_llm_decision d_existing
-                             where d_existing.ai_reader_agent_id = a.ai_reader_agent_id
-                               and d_existing.user_id = a.user_id
-                               and d_existing.session_id = concat(
-                                    s.ai_reader_schedule_id,
-                                    ':',
-                                    greatest(s.used_session_count, 1)
-                               )
-                               and d_existing.prompt_version = :prompt_version
-                               and d_existing.decision_status = 'pending'
-                        )
-                    )
-               )
              order by s.active_start_at, s.ai_reader_schedule_id
              limit :limit
-             for update skip locked
         """).bindparams(bindparam("allowed_domains", expanding=True)),
         {
             "limit": limit,
             "lease_timeout_seconds": lease_timeout_seconds,
-            "prompt_version": decision_service.READER_DECISION_PROMPT_VERSION,
             "allowed_domains": _allowed_ai_reader_account_domains(),
         },
     )
     return result.mappings().all()
+
+
+async def _read_reader_daily_decision_counts(
+    db: AsyncSession,
+    *,
+    ai_reader_agent_ids: list[int],
+) -> dict[int, int]:
+    if not ai_reader_agent_ids:
+        return {}
+    result = await db.execute(
+        text("""
+            select d.ai_reader_agent_id
+                 , count(*) as used_llm_count
+              from tb_ai_reader_llm_decision d
+             where d.ai_reader_agent_id in :ai_reader_agent_ids
+               and d.created_date >= current_date()
+               and d.created_date < current_date() + interval 1 day
+               and d.decision_status in ('pending', 'success', 'failed')
+             group by d.ai_reader_agent_id
+        """).bindparams(bindparam("ai_reader_agent_ids", expanding=True)),
+        {"ai_reader_agent_ids": ai_reader_agent_ids},
+    )
+    return {
+        int(row.get("ai_reader_agent_id")): int(row.get("used_llm_count") or 0)
+        for row in result.mappings().all()
+    }
+
+
+async def _read_pending_stale_reader_session_keys(
+    db: AsyncSession,
+    *,
+    stale_rows,
+) -> set[tuple[int, str]]:
+    if not stale_rows:
+        return set()
+    ai_reader_agent_ids = sorted(
+        {int(row.get("ai_reader_agent_id")) for row in stale_rows}
+    )
+    session_ids = [
+        f"{int(row.get('ai_reader_schedule_id'))}:"
+        f"{max(int(row.get('used_session_count') or 0), 1)}"
+        for row in stale_rows
+    ]
+    result = await db.execute(
+        text("""
+            select d.ai_reader_agent_id
+                 , d.session_id
+              from tb_ai_reader_llm_decision d
+             where d.ai_reader_agent_id in :ai_reader_agent_ids
+               and d.session_id in :session_ids
+               and d.prompt_version = :prompt_version
+               and d.decision_status = 'pending'
+        """).bindparams(
+            bindparam("ai_reader_agent_ids", expanding=True),
+            bindparam("session_ids", expanding=True),
+        ),
+        {
+            "ai_reader_agent_ids": ai_reader_agent_ids,
+            "session_ids": session_ids,
+            "prompt_version": decision_service.READER_DECISION_PROMPT_VERSION,
+        },
+    )
+    return {
+        (int(row.get("ai_reader_agent_id")), str(row.get("session_id")))
+        for row in result.mappings().all()
+    }
 
 
 async def process_claimed_reader_session(
