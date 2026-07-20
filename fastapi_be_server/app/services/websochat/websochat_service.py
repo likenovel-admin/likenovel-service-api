@@ -1044,6 +1044,40 @@ async def _get_websochat_authorized_read_scope(
     }
 
 
+async def _get_websochat_latest_read_episode_no(
+    *,
+    product_id: int,
+    user_id: int | None,
+    db: AsyncSession,
+) -> int | None:
+    if user_id is None:
+        return None
+    result = await db.execute(
+        text(
+            """
+            SELECT pe.episode_no AS episodeNo
+            FROM tb_user_product_usage u
+            INNER JOIN tb_product_episode pe ON pe.episode_id = u.episode_id
+            WHERE u.user_id = :user_id
+              AND u.product_id = :product_id
+              AND u.use_yn = 'Y'
+              AND pe.use_yn = 'Y'
+              AND pe.open_yn = 'Y'
+            ORDER BY pe.episode_no DESC, pe.episode_id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "product_id": int(product_id),
+            "user_id": int(user_id),
+        },
+    )
+    row = result.mappings().first()
+    return _resolve_websochat_requested_episode_to(
+        int(row.get("episodeNo") or 0) if row else None
+    )
+
+
 async def _apply_websochat_account_read_scope(
     session_memory: dict[str, Any],
     account_read_episode_to: int | None,
@@ -1081,14 +1115,13 @@ def _resolve_websochat_initial_account_read_episode_to(
     *,
     session_kind: str,
     requested_episode_to: int | None,
-    max_authorized_episode_to: int | None,
 ) -> int | None:
     requested = _resolve_websochat_requested_episode_to(requested_episode_to)
     if requested is not None:
         return requested
     if session_kind != "character_chat":
         return None
-    return _resolve_websochat_requested_episode_to(max_authorized_episode_to)
+    return 1
 
 
 async def _clamp_websochat_session_read_scope_to_authorized(
@@ -7758,10 +7791,16 @@ async def create_session(
         session_memory["pending_rp_character_selection"] = False
     else:
         session_memory["allowed_modes"] = ["qa", "rp", "ideal_worldcup"]
+    requested_initial_episode_to = req_body.account_read_episode_to
+    if session_kind == "character_chat":
+        requested_initial_episode_to = await _get_websochat_latest_read_episode_no(
+            product_id=req_body.product_id,
+            user_id=user_id,
+            db=db,
+        )
     initial_account_read_episode_to = _resolve_websochat_initial_account_read_episode_to(
         session_kind=session_kind,
-        requested_episode_to=req_body.account_read_episode_to,
-        max_authorized_episode_to=authorized_scope.get("maxAuthorizedEpisodeTo"),
+        requested_episode_to=requested_initial_episode_to,
     )
     session_memory = await _apply_websochat_account_read_scope(
         session_memory,

@@ -755,10 +755,10 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
     async def test_character_chat_session_creation_persists_generated_opening(self):
         req_body = PostWebsochatSessionReqBody(
             product_id=1182,
-            guest_key="guest-1",
             session_kind="character_chat",
             entry_source="home_character_slot",
             locked_character_scope_key="character:아델리트",
+            account_read_episode_to=14,
         )
         product_row = {
             "productId": 1182,
@@ -777,9 +777,9 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             "active_mode": "rp",
             "active_character": "character:아델리트",
             "rp_mode": "free",
-            "read_episode_to": 14,
+            "read_episode_to": 7,
             "read_scope_state": "known",
-            "character_chat_entry_context": _entry_context(14),
+            "character_chat_entry_context": _entry_context(7),
         }
         opening = {"opening_text": "아델리트가 먼저 움직였다.\n\n\"이제 시작하지.\""}
         db = AsyncMock()
@@ -803,6 +803,11 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
                 "_get_websochat_authorized_read_scope",
                 new_callable=AsyncMock,
             ) as get_authorized_scope,
+            patch.object(
+                websochat_service,
+                "_get_websochat_latest_read_episode_no",
+                new_callable=AsyncMock,
+            ) as get_latest_read_episode_no,
             patch.object(
                 websochat_service,
                 "_resolve_websochat_active_character_resolution",
@@ -834,13 +839,14 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
                 new_callable=AsyncMock,
             ) as insert_opening,
         ):
-            resolve_actor.return_value = (None, "guest-1")
+            resolve_actor.return_value = (200, None)
             resolve_adult.return_value = "N"
             get_product.return_value = product_row
             get_authorized_scope.return_value = {
                 "maxAuthorizedEpisodeTo": 14,
                 "authorizedReadEpisodeTo": 14,
             }
+            get_latest_read_episode_no.return_value = 7
             resolve_character.return_value = {
                 "scopeKey": "character:아델리트",
                 "displayName": "아델리트",
@@ -849,13 +855,13 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             ensure_entry_context.return_value = session_memory
             load_rp_context.return_value = {
                 "active_character": "character:아델리트",
-                "character_chat_entry_context": _entry_context(14),
+                "character_chat_entry_context": _entry_context(7),
             }
             generate_opening.return_value = opening
 
             result = await websochat_service.create_session(
                 req_body=req_body,
-                kc_user_id=None,
+                kc_user_id="kc-user",
                 adult_yn="N",
                 db=db,
             )
@@ -863,10 +869,15 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
         self.assertEqual(result["data"]["sessionId"], 77)
         apply_read_scope.assert_awaited_once_with(
             ANY,
-            14,
+            7,
             product_id=1182,
-            user_id=None,
+            user_id=200,
             synced_latest_episode_no=14,
+            db=db,
+        )
+        get_latest_read_episode_no.assert_awaited_once_with(
+            product_id=1182,
+            user_id=200,
             db=db,
         )
         generate_opening.assert_awaited_once_with(
@@ -879,38 +890,32 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             db=db,
         )
 
-    def test_character_chat_missing_boundary_uses_authorized_scope_without_affecting_websochat(self):
+    def test_character_chat_missing_boundary_uses_episode_one_without_affecting_websochat(self):
         resolver = websochat_service._resolve_websochat_initial_account_read_episode_to
 
         assert resolver(
             session_kind="character_chat",
             requested_episode_to=None,
-            max_authorized_episode_to=14,
-        ) == 14
+        ) == 1
         assert resolver(
             session_kind="character_chat",
             requested_episode_to=None,
-            max_authorized_episode_to=30,
-        ) == 30
+        ) == 1
         assert resolver(
             session_kind="character_chat",
             requested_episode_to=5,
-            max_authorized_episode_to=30,
         ) == 5
         assert resolver(
             session_kind="websochat",
             requested_episode_to=None,
-            max_authorized_episode_to=30,
         ) is None
         assert resolver(
             session_kind="websochat",
             requested_episode_to=5,
-            max_authorized_episode_to=30,
         ) == 5
         assert resolver(
             session_kind="character_chat",
             requested_episode_to=5,
-            max_authorized_episode_to=30,
         ) == 5
 
     async def test_character_chat_patch_rejects_requested_lower_read_boundary(self):
