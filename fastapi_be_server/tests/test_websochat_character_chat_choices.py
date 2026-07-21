@@ -422,7 +422,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
             ) as ensure_entry,
             patch.object(
                 websochat_service,
-                "call_websochat_gemini",
+                "call_websochat_model",
                 new_callable=AsyncMock,
             ) as call_model,
         ):
@@ -471,7 +471,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
             ) as get_recent_messages,
             patch.object(
                 websochat_service,
-                "call_websochat_gemini",
+                "call_websochat_model",
                 new_callable=AsyncMock,
             ) as call_model,
         ):
@@ -579,7 +579,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
             ) as load_rp_context,
             patch.object(
                 websochat_service,
-                "call_websochat_gemini",
+                "call_websochat_model",
                 new_callable=AsyncMock,
             ) as call_model,
         ):
@@ -737,7 +737,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
             ) as load_rp_context,
             patch.object(
                 websochat_service,
-                "call_websochat_gemini",
+                "call_websochat_model",
                 new_callable=AsyncMock,
             ) as call_model,
         ):
@@ -880,7 +880,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
             ) as load_rp_context,
             patch.object(
                 websochat_service,
-                "call_websochat_gemini",
+                "call_websochat_model",
                 new_callable=AsyncMock,
             ) as call_model,
         ):

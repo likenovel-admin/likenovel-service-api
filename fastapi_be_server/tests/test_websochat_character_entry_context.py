@@ -675,7 +675,7 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             ),
         }
         with patch(
-            "app.services.websochat.websochat_rp_renderer.call_websochat_gemini",
+            "app.services.websochat.websochat_rp_renderer.call_websochat_model",
             new_callable=AsyncMock,
             return_value=payload["opening_text"],
         ) as call_model:
@@ -736,7 +736,7 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             ),
         }
         with patch(
-            "app.services.websochat.websochat_rp_renderer.call_websochat_gemini",
+            "app.services.websochat.websochat_rp_renderer.call_websochat_model",
             new_callable=AsyncMock,
             side_effect=["not-json", json.dumps(payload, ensure_ascii=False)],
         ) as call_model:
@@ -759,6 +759,7 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             entry_source="home_character_slot",
             locked_character_scope_key="character:아델리트",
             account_read_episode_to=14,
+            model_key="deep",
         )
         product_row = {
             "productId": 1182,
@@ -780,6 +781,7 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             "read_episode_to": 7,
             "read_scope_state": "known",
             "character_chat_entry_context": _entry_context(7),
+            "selected_model_key": "deep",
         }
         opening = {"opening_text": "아델리트가 먼저 움직였다.\n\n\"이제 시작하지.\""}
         db = AsyncMock()
@@ -867,6 +869,12 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
             )
 
         self.assertEqual(result["data"]["sessionId"], 77)
+        self.assertEqual(result["data"]["selectedModelKey"], "deep")
+        create_params = db.execute.await_args_list[0].args[1]
+        self.assertEqual(
+            json.loads(create_params["session_memory_json"])["selected_model_key"],
+            "deep",
+        )
         apply_read_scope.assert_awaited_once_with(
             ANY,
             7,
@@ -883,6 +891,7 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
         generate_opening.assert_awaited_once_with(
             product_row=product_row,
             rp_context=load_rp_context.return_value,
+            model_key="speed",
         )
         insert_opening.assert_awaited_once_with(
             session_id=77,
