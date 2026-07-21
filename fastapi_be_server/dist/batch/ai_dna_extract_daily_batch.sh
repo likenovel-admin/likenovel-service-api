@@ -68,6 +68,21 @@ DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-}"
 DB_PW="${DB_PW:-}"
 DB_NAME="${DB_NAME:-likenovel}"
+APP_DIR="${SCRIPT_DIR}/../api"
+if [[ "$SCRIPT_DIR" == *"batch-dev"* ]]; then
+  APP_DIR="${SCRIPT_DIR}/../api-dev"
+elif [ ! -d "$APP_DIR" ]; then
+  APP_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+fi
+PYTHON_BIN="${APP_DIR}/.venv/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3 || command -v python || true)"
+fi
+
+if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
+  echo "[ERROR] Missing Python executable for AI DNA batch." 1>&2
+  exit 1
+fi
 
 # DB 환경변수를 Python 스크립트용으로 매핑
 export BATCH_DB_HOST="$DB_HOST"
@@ -191,7 +206,7 @@ echo "[INFO] ${BATCH_NAME} started"
 ensure_job_started
 JOB_MARKED_RUNNING=1
 
-python3 "${SCRIPT_DIR}/extract_product_dna.py" --all
+"$PYTHON_BIN" "${SCRIPT_DIR}/extract_product_dna.py" --all
 rc=$?
 if [ $rc -ne 0 ]; then
   echo "[ERROR] AI DNA extract batch failed (exit=$rc)." 1>&2
