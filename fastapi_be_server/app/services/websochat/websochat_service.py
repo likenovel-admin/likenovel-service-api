@@ -7039,11 +7039,12 @@ async def _get_websochat_daily_user_message_count(
     if is_character_chat:
         normalized_model_key = normalize_websochat_model_key(model_key)
         params["model_used"] = build_websochat_model_used(normalized_model_key)
-        legacy_speed_clause = (
-            "OR l.model_used = 'gemini'"
-            if normalized_model_key == WEBSOCHAT_DEFAULT_MODEL_KEY
-            else ""
-        )
+        if normalized_model_key == WEBSOCHAT_DEFAULT_MODEL_KEY:
+            legacy_model_clause = "OR l.model_used = 'gemini'"
+        elif normalized_model_key == "balance":
+            legacy_model_clause = "OR l.model_used = 'openrouter:balance'"
+        else:
+            legacy_model_clause = ""
         result = await db.execute(
             text(
                 f"""
@@ -7052,7 +7053,7 @@ async def _get_websochat_daily_user_message_count(
                 JOIN tb_story_agent_session s ON s.session_id = l.session_id
                 WHERE {owner_where}
                   AND {session_kind_expression} = 'character_chat'
-                  AND (l.model_used = :model_used {legacy_speed_clause})
+                  AND (l.model_used = :model_used {legacy_model_clause})
                   AND DATE(l.created_date) = CURDATE()
                 """
             ),
@@ -7100,7 +7101,7 @@ async def _get_websochat_character_chat_daily_counts_by_model(
                 CASE
                     WHEN l.model_used = 'gemini' THEN 'speed'
                     WHEN l.model_used = 'gemini:speed' THEN 'speed'
-                    WHEN l.model_used = 'openrouter:balance' THEN 'balance'
+                    WHEN l.model_used IN ('openrouter:balance', 'gemini:balance') THEN 'balance'
                     WHEN l.model_used = 'gemini:deep' THEN 'deep'
                     ELSE NULL
                 END AS modelKey,
@@ -7116,6 +7117,7 @@ async def _get_websochat_character_chat_daily_counts_by_model(
                     'gemini',
                     'gemini:speed',
                     'openrouter:balance',
+                    'gemini:balance',
                     'gemini:deep'
                   )
               AND DATE(l.created_date) = CURDATE()

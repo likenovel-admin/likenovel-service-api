@@ -59,11 +59,11 @@ class WebsochatModelCatalogTests(unittest.TestCase):
                 (
                     "balance",
                     "밸런스",
-                    "openrouter",
-                    "google/gemma-4-31b-it",
+                    "gemini",
+                    websochat_service.settings.WEBSOCHAT_GEMINI_MODEL,
                     25,
                     5,
-                    None,
+                    "medium",
                 ),
                 (
                     "deep",
@@ -121,7 +121,7 @@ class WebsochatModelCatalogTests(unittest.TestCase):
 
     def test_usage_log_value_identifies_the_selected_tier(self):
         self.assertEqual(build_websochat_model_used("speed"), "gemini:speed")
-        self.assertEqual(build_websochat_model_used("balance"), "openrouter:balance")
+        self.assertEqual(build_websochat_model_used("balance"), "gemini:balance")
         self.assertEqual(build_websochat_model_used("deep"), "gemini:deep")
 
     def test_next_episode_keeps_fixed_default_model_and_price(self):
@@ -360,7 +360,7 @@ class WebsochatModelExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result[0], "주인공의 답변")
-        self.assertEqual(result[1], "openrouter:balance")
+        self.assertEqual(result[1], "gemini:balance")
         self.assertEqual(generate_reply.await_args.kwargs["model_key"], "balance")
 
     async def test_game_to_qa_recursion_preserves_selected_model(self):
@@ -469,7 +469,7 @@ class WebsochatModelExecutionTests(unittest.IsolatedAsyncioTestCase):
         for model_used in (
             "gemini",
             "gemini:speed",
-            "openrouter:balance",
+            "gemini:balance",
             "gemini:deep",
         ):
             with self.subTest(model_used=model_used):

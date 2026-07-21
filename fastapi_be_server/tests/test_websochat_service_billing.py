@@ -44,6 +44,31 @@ class _ScopedCountDb:
         return _Result({"cnt": count})
 
 
+class _RowsMappings:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _RowsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return _RowsMappings(self._rows)
+
+
+class _CharacterModelCountsDb:
+    def __init__(self):
+        self.statements = []
+
+    async def execute(self, statement, params=None):
+        self.statements.append(str(statement))
+        return _RowsResult([])
+
+
 class WebsochatBillingTests(unittest.IsolatedAsyncioTestCase):
     def test_character_chat_has_separate_daily_free_limit(self):
         regular = websochat_service._build_websochat_billing_status_payload(
@@ -87,6 +112,33 @@ class WebsochatBillingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tb_story_agent_usage_log", db.statements[0])
         self.assertIn("l.model_used", db.statements[0])
         self.assertNotIn("m.role = 'user'", db.statements[0])
+
+    async def test_balance_count_keeps_legacy_openrouter_usage(self):
+        db = _ScopedCountDb()
+
+        await websochat_service._get_websochat_daily_user_message_count(
+            user_id=321,
+            guest_key=None,
+            db=db,
+            is_character_chat=True,
+            model_key="balance",
+        )
+
+        self.assertEqual(db.params[0]["model_used"], "gemini:balance")
+        self.assertIn("l.model_used = 'openrouter:balance'", db.statements[0])
+
+    async def test_daily_model_summary_keeps_legacy_openrouter_usage(self):
+        db = _CharacterModelCountsDb()
+
+        counts = await websochat_service._get_websochat_character_chat_daily_counts_by_model(
+            user_id=321,
+            guest_key=None,
+            db=db,
+        )
+
+        self.assertEqual(counts, {"speed": 0, "balance": 0, "deep": 0})
+        self.assertIn("'openrouter:balance'", db.statements[0])
+        self.assertIn("'gemini:balance'", db.statements[0])
 
     async def test_billing_status_resolves_character_chat_from_owned_session(self):
         db = AsyncMock()
