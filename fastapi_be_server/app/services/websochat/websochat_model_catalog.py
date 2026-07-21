@@ -10,9 +10,6 @@ WebsochatModelKey = Literal["speed", "balance", "deep"]
 WebsochatThinkingLevel = Literal["minimal", "medium", "high"]
 WebsochatModelProvider = Literal["gemini", "openrouter"]
 
-WEBSOCHAT_BALANCE_OPENROUTER_MODEL = "google/gemma-4-31b-it"
-
-
 @dataclass(frozen=True)
 class WebsochatModelSpec:
     model_key: WebsochatModelKey
@@ -38,11 +35,11 @@ WEBSOCHAT_MODEL_CATALOG: tuple[WebsochatModelSpec, ...] = (
     WebsochatModelSpec(
         "balance",
         "밸런스",
-        "openrouter",
-        WEBSOCHAT_BALANCE_OPENROUTER_MODEL,
+        "gemini",
+        settings.WEBSOCHAT_GEMINI_MODEL,
         25,
         5,
-        None,
+        "medium",
     ),
     WebsochatModelSpec(
         "deep",
