@@ -10,7 +10,8 @@ from app.services.websochat.websochat_compare import (
     _is_websochat_valid_game_candidate,
 )
 from app.services.websochat.websochat_game_memory import _normalize_websochat_string_list
-from app.services.websochat.websochat_llm import call_websochat_gemini, to_websochat_gemini_contents
+from app.services.websochat.websochat_llm import call_websochat_model
+from app.services.websochat.websochat_model_catalog import WEBSOCHAT_DEFAULT_MODEL_KEY
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
 
 
@@ -202,6 +203,7 @@ async def select_websochat_game_candidates(
     gender_scope: str,
     category: str,
     desired_count: int,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> list[dict[str, Any]]:
     if not candidates:
         return []
@@ -235,11 +237,10 @@ async def select_websochat_game_candidates(
     )
     selected_scope_keys: list[str] = []
     try:
-        response = await call_websochat_gemini(
+        response = await call_websochat_model(
+            model_key=model_key,
             system_prompt=system_prompt,
-            messages=to_websochat_gemini_contents(
-                [{"role": "user", "content": user_prompt}]
-            ),
+            messages=[{"role": "user", "content": user_prompt}],
             max_tokens=240,
         )
         payload = _extract_websochat_json_object(response) or {}

@@ -21,8 +21,11 @@ from app.services.websochat.websochat_llm import (
     WEBSOCHAT_LONG_GENERATION_TIMEOUT_SECONDS,
     WEBSOCHAT_QA_TEMPERATURE,
     WEBSOCHAT_REPLY_MAX_TOKENS,
-    call_websochat_gemini,
-    to_websochat_gemini_contents,
+    call_websochat_model,
+)
+from app.services.websochat.websochat_model_catalog import (
+    WEBSOCHAT_DEFAULT_MODEL_KEY,
+    build_websochat_model_used,
 )
 from app.services.websochat.websochat_qa_renderer import (
     build_websochat_gemini_context_block,
@@ -1219,6 +1222,7 @@ async def _retry_websochat_next_episode_write_with_gemini(
     *,
     system_prompt: str,
     messages: list[dict[str, str]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> str:
     retry_messages = list(messages)
     retry_messages.append(
@@ -1230,9 +1234,10 @@ async def _retry_websochat_next_episode_write_with_gemini(
             ),
         }
     )
-    return await call_websochat_gemini(
+    return await call_websochat_model(
+        model_key=model_key,
         system_prompt=system_prompt,
-        messages=to_websochat_gemini_contents(retry_messages),
+        messages=retry_messages,
         max_tokens=WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS,
         temperature=WEBSOCHAT_CREATIVE_TEMPERATURE,
         timeout_seconds=WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS,
@@ -1271,6 +1276,7 @@ async def _generate_websochat_reply_with_gemini(
     hooks: WebsochatQaExecutionHooks,
     gemini_context_episode_limit: int,
     prefetch_context_chars: int,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> tuple[str, list[int]]:
     scope_read_episode_to = evidence_bundle["resolved_scope"]["read_episode_to"]
     scope_context = evidence_bundle["scope_context"]
@@ -1358,6 +1364,7 @@ async def _generate_websochat_reply_with_gemini(
         user_prompt=user_prompt,
         recent_messages=recent_messages,
         summary_rows=summary_rows,
+        model_key=model_key,
     )
     logger.info(
         "websochat qa_reference_resolution ambiguous_query=%s resolved=%s status=%s confidence=%s summary_ranges=%s prompt_preview=%r",
@@ -1537,9 +1544,10 @@ async def _generate_websochat_reply_with_gemini(
     if is_next_episode_write_query:
         await db.rollback()
 
-    reply = await call_websochat_gemini(
+    reply = await call_websochat_model(
+        model_key=model_key,
         system_prompt=system_prompt,
-        messages=to_websochat_gemini_contents(messages),
+        messages=messages,
         max_tokens=WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS if is_next_episode_write_query else WEBSOCHAT_REPLY_MAX_TOKENS,
         temperature=WEBSOCHAT_CREATIVE_TEMPERATURE if (is_predict_query or is_next_episode_write_query) else WEBSOCHAT_QA_TEMPERATURE,
         timeout_seconds=WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS if is_next_episode_write_query else WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
@@ -1562,9 +1570,10 @@ async def _generate_websochat_reply_with_gemini(
             }
         )
         clarify_retry_count += 1
-        reply = await call_websochat_gemini(
+        reply = await call_websochat_model(
+            model_key=model_key,
             system_prompt=system_prompt,
-            messages=to_websochat_gemini_contents(messages),
+            messages=messages,
             max_tokens=WEBSOCHAT_REPLY_MAX_TOKENS,
             temperature=WEBSOCHAT_QA_TEMPERATURE,
         )
@@ -1594,9 +1603,10 @@ async def _generate_websochat_reply_with_gemini(
             qa_subtype,
             " ".join(str(user_prompt or "").split())[:120],
         )
-        reply = await call_websochat_gemini(
+        reply = await call_websochat_model(
+            model_key=model_key,
             system_prompt=system_prompt,
-            messages=to_websochat_gemini_contents(messages),
+            messages=messages,
             max_tokens=WEBSOCHAT_REPLY_MAX_TOKENS,
             temperature=WEBSOCHAT_QA_TEMPERATURE,
         )
@@ -1618,6 +1628,7 @@ async def _generate_websochat_reply_with_gemini(
         retry_reply = await _retry_websochat_next_episode_write_with_gemini(
             system_prompt=system_prompt,
             messages=messages,
+            model_key=model_key,
         )
         if len(retry_reply) >= len(reply):
             return retry_reply, referenced_episode_nos
@@ -1757,6 +1768,7 @@ async def _generate_websochat_reply_with_claude(
         user_prompt=user_prompt,
         recent_messages=recent_messages,
         summary_rows=prefetched_summary_rows,
+        model_key=model_key,
     )
     if hooks["is_ambiguous_reference_query"](user_prompt):
         reference_message = hooks["build_reference_resolution_message"](reference_resolution or {})
@@ -2031,6 +2043,7 @@ async def execute_websochat_qa(
     gemini_context_episode_limit: int,
     prefetch_context_chars: int,
     tools: list[dict[str, Any]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> WebsochatQaExecutionResult:
     skip_tools = _should_websochat_skip_tools(
         user_prompt=user_prompt,
@@ -2057,10 +2070,11 @@ async def execute_websochat_qa(
         hooks=hooks,
         gemini_context_episode_limit=gemini_context_episode_limit,
         prefetch_context_chars=prefetch_context_chars,
+        model_key=model_key,
     )
     return {
         "reply": reply,
-        "model_used": "gemini",
+        "model_used": build_websochat_model_used(model_key),
         "fallback_used": False,
         "route_mode": qa_plan["route_mode"],
         "intent": qa_plan["intent"],

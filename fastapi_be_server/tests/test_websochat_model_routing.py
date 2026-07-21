@@ -952,11 +952,11 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_internal_json_call_does_not_use_user_visible_stream(self):
         with patch.object(
             websochat_service,
-            "call_websochat_gemini",
+            "call_websochat_model",
             new_callable=AsyncMock,
             return_value='{"ok": true}',
         ) as call_gemini:
-            result = await websochat_service._call_websochat_gemini_json(
+            result = await websochat_service._call_websochat_model_json(
                 system_prompt="system",
                 user_prompt="JSON만 반환해.",
                 max_tokens=128,
@@ -978,7 +978,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
         qa_result = {
             "reply": "QA로 새면 안 됩니다.",
-            "model_used": "gemini",
+            "model_used": "gemini:speed",
             "route_mode": "qa",
             "fallback_used": False,
             "intent": "factual",
@@ -1055,7 +1055,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         product_row = {"productId": 1, "title": "테스트", "latestEpisodeNo": 5}
         qa_result = {
             "reply": "기존 RP 세션도 QA로 새면 안 됩니다.",
-            "model_used": "gemini",
+            "model_used": "gemini:speed",
             "route_mode": "qa",
             "fallback_used": False,
             "intent": "factual",
@@ -1113,7 +1113,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         product_row = {"productId": 1, "title": "테스트", "latestEpisodeNo": 5}
         qa_result = {
             "reply": "rp_mode 누락 세션도 QA로 새면 안 됩니다.",
-            "model_used": "gemini",
+            "model_used": "gemini:speed",
             "route_mode": "qa",
             "fallback_used": False,
             "intent": "factual",
@@ -1242,7 +1242,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
         qa_result = {
             "reply": "1화 기준 답변입니다.",
-            "model_used": "gemini",
+            "model_used": "gemini:speed",
             "route_mode": "qa",
             "fallback_used": False,
             "intent": "factual",
@@ -1290,6 +1290,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
                 user_prompt="주요 인물 관계는?",
                 user_id=None,
                 db=AsyncMock(),
+                model_key="balance",
             )
 
         self.assertIn("1화 기준으로 시작할게요", reply)
@@ -1302,6 +1303,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         assemble_context.assert_awaited_once()
         context_memory = assemble_context.await_args.kwargs["session_memory"]
         self.assertEqual(context_memory["read_episode_to"], 1)
+        self.assertEqual(execute_qa.await_args.kwargs["model_key"], "speed")
 
     async def test_read_scope_episode_one_fallback_survives_gemini_routing_failure(self):
         product_row = {"productId": 1, "title": "테스트", "latestEpisodeNo": 5}
@@ -1316,7 +1318,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
         qa_result = {
             "reply": "기본 QA 답변입니다.",
-            "model_used": "gemini",
+            "model_used": "gemini:speed",
             "route_mode": "qa",
             "fallback_used": False,
             "intent": "factual",

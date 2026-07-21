@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -23,6 +23,7 @@ class WebsochatSessionItem(BaseModel):
     entrySource: str | None = None
     lockedCharacterScopeKey: str | None = None
     allowedModes: list[str] | None = None
+    selectedModelKey: Literal["speed", "balance", "deep"] = "speed"
     updatedDate: str
     createdDate: str
     productTitle: str | None = None
@@ -99,6 +100,7 @@ class PostWebsochatSessionReqBody(BaseModel):
     game_match_mode: Optional[str] = Field(default=None, max_length=30)
     game_read_episode_to: Optional[int] = Field(default=None, gt=0)
     account_read_episode_to: Optional[int] = Field(default=None, gt=0)
+    model_key: Optional[Literal["speed", "balance", "deep"]] = None
 
     @field_validator("title")
     @classmethod
@@ -270,6 +272,11 @@ class PatchWebsochatSessionModeReqBody(BaseModel):
         return normalized
 
 
+class PatchWebsochatSessionModelReqBody(BaseModel):
+    guest_key: Optional[str] = Field(default=None, max_length=64)
+    model_key: Literal["speed", "balance", "deep"]
+
+
 class DeleteWebsochatSessionReqBody(BaseModel):
     guest_key: Optional[str] = Field(default=None, max_length=64)
 
@@ -294,6 +301,7 @@ class PostWebsochatMessageReqBody(BaseModel):
     game_match_mode: Optional[str] = Field(default=None, max_length=30)
     game_read_episode_to: Optional[int] = Field(default=None, gt=0)
     account_read_episode_to: Optional[int] = Field(default=None, gt=0)
+    model_key: Optional[Literal["speed", "balance", "deep"]] = None
 
     @field_validator("client_message_id")
     @classmethod

@@ -11,7 +11,7 @@ class WebsochatQaExecutorTimeoutTest(unittest.IsolatedAsyncioTestCase):
     async def test_next_episode_retry_uses_long_gemini_timeout(self):
         with patch.object(
             websochat_qa_executor,
-            "call_websochat_gemini",
+            "call_websochat_model",
             new_callable=AsyncMock,
         ) as call_gemini:
             call_gemini.return_value = "다음 회차 초안"

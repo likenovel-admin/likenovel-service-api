@@ -23,6 +23,7 @@ from app.schemas.websochat import (
     PostWebsochatCharacterChoicesReqBody,
     PostWebsochatSessionReqBody,
     PatchWebsochatSessionModeReqBody,
+    PatchWebsochatSessionModelReqBody,
     PatchWebsochatSessionReadScopeReqBody,
     PatchWebsochatSessionReqBody,
 )
@@ -97,6 +98,14 @@ from app.services.websochat.websochat_planner import (
     _build_websochat_rp_plan,
     _resolve_websochat_response_route,
 )
+from app.services.websochat.websochat_model_catalog import (
+    WEBSOCHAT_DEFAULT_MODEL_KEY,
+    WEBSOCHAT_MODEL_CATALOG,
+    WebsochatModelKey,
+    build_websochat_model_used,
+    get_websochat_model_spec,
+    normalize_websochat_model_key,
+)
 from app.services.websochat.websochat_qa_executor import (
     _is_websochat_next_episode_write_query,
     WebsochatQaExecutionHooks,
@@ -122,11 +131,17 @@ from app.services.websochat.websochat_scope_resolver import (
     _resolve_websochat_prompt_read_scope_decision,
     _resolve_websochat_scope_read_episode_to,
 )
-from app.services.websochat.websochat_stream import emit_websochat_stream_text_if_needed
+from app.services.websochat.websochat_stream import (
+    defer_websochat_stream_output,
+    emit_websochat_stream_text_if_needed,
+    flush_deferred_websochat_stream_output,
+    is_websochat_stream_enabled,
+    replace_deferred_websochat_stream_output,
+    reset_websochat_stream_output,
+)
 from app.services.websochat.websochat_llm import (
-    call_websochat_gemini,
+    call_websochat_model,
     sanitize_websochat_model_text,
-    to_websochat_gemini_contents,
 )
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
 from app.services.common.comm_service import get_user_from_kc
@@ -138,9 +153,13 @@ WEBSOCHAT_DEFAULT_TITLE = "새 대화"
 WEBSOCHAT_SESSION_LOCK_TIMEOUT_SECONDS = 0
 WEBSOCHAT_SESSION_TTL_DAYS = 30
 WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT = 3
-WEBSOCHAT_CHARACTER_CHAT_DAILY_FREE_MESSAGE_LIMIT = 10
+WEBSOCHAT_CHARACTER_CHAT_DAILY_FREE_MESSAGE_LIMIT = get_websochat_model_spec(
+    WEBSOCHAT_DEFAULT_MODEL_KEY
+).character_chat_daily_free_limit
 WEBSOCHAT_NONCANONICAL_NEXT_EPISODE_MARKER = "[[websochat:noncanonical:next_episode_write]]\n"
-WEBSOCHAT_MESSAGE_CASH_COST = 20
+WEBSOCHAT_MESSAGE_CASH_COST = get_websochat_model_spec(
+    WEBSOCHAT_DEFAULT_MODEL_KEY
+).cash_cost
 WEBSOCHAT_NEXT_EPISODE_WRITE_CASH_COST = 30
 WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_CANDIDATE_LIMIT = 12
 WEBSOCHAT_ACTIVE_CHARACTER_FUZZY_MIN_RATIO = 0.34
@@ -166,11 +185,17 @@ _WEBSOCHAT_CHARACTER_CHAT_CHOICES_RATE_BUCKETS: dict[str, list[float]] = {}
 
 def _build_websochat_session_contract_payload(session_memory: dict[str, Any]) -> dict[str, Any]:
     normalized = _normalize_websochat_session_memory(session_memory)
+    is_character_chat = _is_websochat_character_chat_session(normalized)
     return {
         "sessionKind": str(normalized.get("session_kind") or "websochat"),
         "entrySource": normalized.get("entry_source"),
         "lockedCharacterScopeKey": normalized.get("locked_character_scope_key"),
         "allowedModes": list(normalized.get("allowed_modes") or []),
+        "selectedModelKey": normalize_websochat_model_key(
+            normalized.get("selected_model_key")
+            if is_character_chat
+            else WEBSOCHAT_DEFAULT_MODEL_KEY
+        ),
     }
 
 
@@ -214,17 +239,17 @@ def _assert_websochat_session_allows_mode(
     )
 
 
-async def _call_websochat_gemini_json(
+async def _call_websochat_model_json(
     *,
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> dict[str, Any]:
-    raw_reply = await call_websochat_gemini(
+    raw_reply = await call_websochat_model(
+        model_key=model_key,
         system_prompt=system_prompt,
-        messages=to_websochat_gemini_contents(
-            [{"role": "user", "content": user_prompt}]
-        ),
+        messages=[{"role": "user", "content": user_prompt}],
         max_tokens=max_tokens,
         temperature=0.1,
         stream=False,
@@ -657,17 +682,41 @@ def _build_websochat_character_chat_choice_prompt(
 
 def _resolve_websochat_message_cash_cost(
     qa_action_key: str | None,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> int:
     if str(qa_action_key or "").strip().lower() == "next_episode_write":
         return WEBSOCHAT_NEXT_EPISODE_WRITE_CASH_COST
-    return WEBSOCHAT_MESSAGE_CASH_COST
+    return get_websochat_model_spec(model_key).cash_cost
 
 
-def _resolve_websochat_daily_free_message_limit(is_character_chat: bool) -> int:
-    return (
-        WEBSOCHAT_CHARACTER_CHAT_DAILY_FREE_MESSAGE_LIMIT
-        if is_character_chat
-        else WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT
+def _resolve_websochat_daily_free_message_limit(
+    is_character_chat: bool,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
+) -> int:
+    if not is_character_chat:
+        return WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT
+    return get_websochat_model_spec(model_key).character_chat_daily_free_limit
+
+
+def _resolve_websochat_effective_model_key(
+    model_key: object,
+    qa_action_key: str | None,
+    *,
+    is_character_chat: bool = False,
+) -> WebsochatModelKey:
+    if (
+        not is_character_chat
+        or str(qa_action_key or "").strip().lower() == "next_episode_write"
+    ):
+        return WEBSOCHAT_DEFAULT_MODEL_KEY
+    return normalize_websochat_model_key(model_key)
+
+
+def _is_websochat_billable_model_used(model_used: object) -> bool:
+    normalized = str(model_used or "").strip().lower()
+    return normalized == "gemini" or any(
+        normalized == build_websochat_model_used(spec.model_key)
+        for spec in WEBSOCHAT_MODEL_CATALOG
     )
 
 
@@ -678,14 +727,62 @@ def _build_websochat_billing_status_payload(
     cash_balance: int | None,
     qa_action_key: str | None = None,
     is_character_chat: bool = False,
+    selected_model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
+    used_counts_by_model: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    daily_free_message_limit = _resolve_websochat_daily_free_message_limit(
-        is_character_chat
+    normalized_selected_model_key = (
+        normalize_websochat_model_key(selected_model_key)
+        if is_character_chat
+        else WEBSOCHAT_DEFAULT_MODEL_KEY
     )
+    effective_model_key = _resolve_websochat_effective_model_key(
+        selected_model_key,
+        qa_action_key,
+        is_character_chat=is_character_chat,
+    )
+    daily_free_message_limit = _resolve_websochat_daily_free_message_limit(
+        is_character_chat,
+        effective_model_key,
+    )
+    if is_character_chat and used_counts_by_model is not None:
+        used_count = int(used_counts_by_model.get(effective_model_key, 0))
     free_remaining = max(daily_free_message_limit - int(used_count), 0)
     requires_cash = free_remaining <= 0
-    cash_cost = _resolve_websochat_message_cash_cost(qa_action_key)
+    cash_cost = _resolve_websochat_message_cash_cost(
+        qa_action_key,
+        effective_model_key,
+    )
+    model_options = []
+    available_model_specs = (
+        WEBSOCHAT_MODEL_CATALOG
+        if is_character_chat
+        else (get_websochat_model_spec(WEBSOCHAT_DEFAULT_MODEL_KEY),)
+    )
+    for spec in available_model_specs:
+        option_used_count = (
+            int((used_counts_by_model or {}).get(spec.model_key, 0))
+            if is_character_chat
+            else int(used_count)
+        )
+        option_free_limit = _resolve_websochat_daily_free_message_limit(
+            is_character_chat,
+            spec.model_key,
+        )
+        model_options.append(
+            {
+                "modelKey": spec.model_key,
+                "displayName": spec.display_name,
+                "cashCostPerMessage": spec.cash_cost,
+                "dailyFreeMessageLimit": option_free_limit,
+                "freeRemainingMessages": max(
+                    option_free_limit - option_used_count,
+                    0,
+                ),
+            }
+        )
     return {
+        "selectedModelKey": normalized_selected_model_key,
+        "modelOptions": model_options,
         "freeRemainingMessages": free_remaining,
         "dailyFreeMessageLimit": daily_free_message_limit,
         "cashCostPerMessage": cash_cost,
@@ -1564,8 +1661,15 @@ async def _resolve_websochat_active_character_with_model(
     *,
     raw_value: str,
     candidates: list[dict[str, Any]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> dict[str, Any] | None:
-    if not settings.GEMINI_API_KEY or not candidates:
+    model_spec = get_websochat_model_spec(model_key)
+    provider_configured = (
+        bool(settings.OPENROUTER_API_KEY)
+        if model_spec.provider == "openrouter"
+        else bool(settings.GEMINI_API_KEY)
+    )
+    if not provider_configured or not candidates:
         return None
 
     candidate_payload = [
@@ -1582,7 +1686,7 @@ async def _resolve_websochat_active_character_with_model(
         return None
 
     try:
-        tool_input = await _call_websochat_gemini_json(
+        tool_input = await _call_websochat_model_json(
             system_prompt="\n\n".join(
                 [
                     "너는 웹소챗 인물명 해석기다.",
@@ -1600,6 +1704,7 @@ async def _resolve_websochat_active_character_with_model(
                 "JSON만 반환해."
             ),
             max_tokens=WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS,
+            model_key=model_spec.model_key,
         )
         raw_scope_key = str(tool_input.get("scope_key") or "").strip()
         try:
@@ -3768,8 +3873,10 @@ async def _generate_websochat_vs_reply(
     product_row: dict[str, Any],
     user_prompt: str,
     db: AsyncSession,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> tuple[str, dict[str, Any]]:
     normalized = _normalize_websochat_session_memory(session_memory)
+    model_spec = get_websochat_model_spec(model_key)
     game_context = normalized.get("game_context") or {}
     gender_scope = str(game_context.get("gender_scope") or "").strip().lower()
     category = str(game_context.get("category") or "").strip().lower()
@@ -3875,6 +3982,7 @@ async def _generate_websochat_vs_reply(
             product_row=product_row,
             category=effective_category or state_category,
             match_pair=[left, right],
+            model_key=model_spec.model_key,
         )
         match_key = _build_websochat_pair_key(left["display_name"], right["display_name"])
         state["used_match_keys"] = _normalize_websochat_string_list([*(state.get("used_match_keys") or []), match_key], limit=128)
@@ -3924,6 +4032,7 @@ async def _generate_websochat_vs_reply(
         gender_scope=gender_scope,
         category=effective_category,
         desired_count=4,
+        model_key=model_spec.model_key,
     )
     selected_pair = _pick_websochat_unused_pair(
         selected_candidates,
@@ -3945,6 +4054,7 @@ async def _generate_websochat_vs_reply(
         product_row=product_row,
         category=effective_category,
         match_pair=selected_pair,
+        model_key=model_spec.model_key,
     )
     match_key = _build_websochat_pair_key(
         selected_pair[0]["display_name"],
@@ -3969,8 +4079,10 @@ async def _generate_websochat_game_reply(
     product_row: dict[str, Any],
     user_prompt: str,
     db: AsyncSession,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> tuple[str, str, str, bool, str, dict[str, Any]]:
     normalized = _normalize_websochat_session_memory(session_memory)
+    model_spec = get_websochat_model_spec(model_key)
     dispatch_plan = build_websochat_game_dispatch_plan(normalized)
     if dispatch_plan["route"] == "guide":
         game_context = normalized.get("game_context") or {}
@@ -4019,6 +4131,7 @@ async def _generate_websochat_game_reply(
                     user_prompt=user_prompt,
                     user_id=None,
                     db=db,
+                    model_key=model_spec.model_key,
                 )
         guide = (
             build_websochat_game_guide_reply(
@@ -4077,6 +4190,7 @@ async def _generate_websochat_game_reply(
                     user_prompt=user_prompt,
                     user_id=None,
                     db=db,
+                    model_key=model_spec.model_key,
                 )
         reply, next_memory = await _generate_websochat_worldcup_reply(
             session_memory=normalized,
@@ -5354,6 +5468,7 @@ async def _resolve_websochat_active_character_resolution(
     product_id: int,
     active_character: str | None,
     db: AsyncSession,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> dict[str, Any]:
     raw_value = str(active_character or "").strip()
     if not raw_value:
@@ -5545,6 +5660,7 @@ async def _resolve_websochat_active_character_resolution(
         fuzzy_resolution = await _resolve_websochat_active_character_with_model(
             raw_value=raw_value,
             candidates=ranked_fuzzy_candidates,
+            model_key=model_key,
         )
         if fuzzy_resolution:
             matched_candidate = next(
@@ -6001,6 +6117,7 @@ async def _resolve_websochat_reference(
     user_prompt: str,
     recent_messages: list[dict[str, str]],
     summary_rows: list[dict[str, Any]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> dict[str, Any] | None:
     if not _is_websochat_ambiguous_reference_query(user_prompt):
         return None
@@ -6024,10 +6141,11 @@ async def _resolve_websochat_reference(
         context_parts.append(summary_context_message)
     context_parts.append(f"현재 질문: {user_prompt}")
 
-    parsed = await _call_websochat_gemini_json(
+    parsed = await _call_websochat_model_json(
         system_prompt="\n\n".join(context_parts),
         user_prompt="JSON만 반환해.",
         max_tokens=WEBSOCHAT_REFERENCE_RESOLUTION_MAX_TOKENS,
+        model_key=model_key,
     )
     if not parsed:
         return None
@@ -6154,6 +6272,7 @@ async def _resolve_websochat_qa_corrections(
     recent_messages: list[dict[str, str]],
     qa_recent_notes: list[str],
     qa_corrections: list[dict[str, str]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> list[dict[str, str]]:
     recent_context_message = build_websochat_recent_context_message(
         recent_messages,
@@ -6176,10 +6295,11 @@ async def _resolve_websochat_qa_corrections(
     if recent_context_message:
         system_prompt_parts.append(recent_context_message)
 
-    parsed = await _call_websochat_gemini_json(
+    parsed = await _call_websochat_model_json(
         system_prompt="\n\n".join(system_prompt_parts),
         user_prompt=f"현재 사용자 발화: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_QA_CORRECTION_MAX_TOKENS,
+        model_key=model_key,
     )
     raw_has_corrections = parsed.get("has_corrections")
     if isinstance(raw_has_corrections, bool):
@@ -6203,6 +6323,7 @@ async def _resolve_websochat_intent(
     *,
     user_prompt: str,
     recent_messages: list[dict[str, str]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> tuple[str, bool, str]:
     recent_context_message = build_websochat_recent_context_message(recent_messages)
     system_prompt_parts = [
@@ -6241,10 +6362,11 @@ async def _resolve_websochat_intent(
     if recent_context_message:
         system_prompt_parts.append(recent_context_message)
 
-    parsed = await _call_websochat_gemini_json(
+    parsed = await _call_websochat_model_json(
         system_prompt="\n\n".join(system_prompt_parts),
         user_prompt=f"질문: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_INTENT_MAX_TOKENS,
+        model_key=model_key,
     )
     intent = str(parsed.get("intent") or "").strip().lower()
     if intent not in WEBSOCHAT_ALLOWED_INTENTS:
@@ -6265,6 +6387,7 @@ async def _resolve_websochat_rp_recall_need(
     user_prompt: str,
     recent_messages: list[dict[str, str]],
     rp_context: dict[str, Any],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> tuple[bool, str]:
     recent_context_message = build_websochat_recent_context_message(recent_messages)
     anchor_episode_no = int(rp_context.get("anchor_episode_no") or 0)
@@ -6287,10 +6410,11 @@ async def _resolve_websochat_rp_recall_need(
     if recent_context_message:
         system_prompt_parts.append(recent_context_message)
 
-    parsed = await _call_websochat_gemini_json(
+    parsed = await _call_websochat_model_json(
         system_prompt="\n\n".join(system_prompt_parts),
         user_prompt=f"질문: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_RP_RECALL_DECISION_MAX_TOKENS,
+        model_key=model_key,
     )
     raw_needs_exact_recall = parsed.get("needs_exact_recall")
     if isinstance(raw_needs_exact_recall, bool):
@@ -6310,11 +6434,13 @@ async def _build_websochat_rp_exact_recall_context(
     recent_messages: list[dict[str, str]],
     rp_context: dict[str, Any],
     db: AsyncSession,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> dict[str, Any]:
     needs_exact_recall, search_query = await _resolve_websochat_rp_recall_need(
         user_prompt=user_prompt,
         recent_messages=recent_messages,
         rp_context=rp_context,
+        model_key=model_key,
     )
     if not needs_exact_recall:
         return {}
@@ -6453,8 +6579,13 @@ async def _generate_websochat_reply(
     user_id: int | None,
     db: AsyncSession,
     forced_route: str | None = None,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> tuple[str, str, str, bool, str, dict[str, Any] | None]:
     normalized_memory = _normalize_websochat_session_memory(session_memory)
+    is_character_chat = _is_websochat_character_chat_session(normalized_memory)
+    model_spec = get_websochat_model_spec(
+        model_key if is_character_chat else WEBSOCHAT_DEFAULT_MODEL_KEY
+    )
     gemini_enabled = bool(settings.GEMINI_API_KEY)
     scope_state = _resolve_websochat_read_scope_state(normalized_memory)
     normalized_forced_route = str(forced_route or "").strip().lower() or None
@@ -6470,6 +6601,7 @@ async def _generate_websochat_reply(
             product_row=product_row,
             user_prompt=user_prompt,
             db=db,
+            model_key=model_spec.model_key,
         )
 
     if scope_state == "none":
@@ -6557,6 +6689,7 @@ async def _generate_websochat_reply(
             recent_messages=recent_messages,
             rp_context=rp_context,
             db=db,
+            model_key=model_spec.model_key,
         )
         if exact_recall_context:
             rp_context = {
@@ -6573,8 +6706,20 @@ async def _generate_websochat_reply(
                 user_prompt=user_prompt,
                 rp_context=rp_context,
                 recent_messages=recent_messages,
+                model_key=model_spec.model_key,
             )
-            return reply, "gemini", rp_plan["route_mode"], False, rp_plan["intent"], None
+            return (
+                reply,
+                (
+                    build_websochat_model_used(model_spec.model_key)
+                    if is_character_chat
+                    else "gemini"
+                ),
+                rp_plan["route_mode"],
+                False,
+                rp_plan["intent"],
+                None,
+            )
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             code="AI_PROVIDER_NOT_CONFIGURED",
@@ -6585,12 +6730,14 @@ async def _generate_websochat_reply(
         _resolve_websochat_intent(
             user_prompt=user_prompt,
             recent_messages=recent_messages,
+            model_key=model_spec.model_key,
         ),
         _resolve_websochat_qa_corrections(
             user_prompt=user_prompt,
             recent_messages=recent_messages,
             qa_recent_notes=list(normalized_memory.get("qa_recent_notes") or []),
             qa_corrections=list(normalized_memory.get("qa_corrections") or []),
+            model_key=model_spec.model_key,
         ),
         return_exceptions=True,
     )
@@ -6680,10 +6827,16 @@ async def _generate_websochat_reply(
         gemini_context_episode_limit=WEBSOCHAT_GEMINI_CONTEXT_EPISODE_LIMIT,
         prefetch_context_chars=WEBSOCHAT_PREFETCH_CONTEXT_CHARS,
         tools=WEBSOCHAT_TOOLS,
+        model_key=model_spec.model_key,
     )
+    reported_model_used = str(result["model_used"])
+    if not is_character_chat and reported_model_used == build_websochat_model_used(
+        WEBSOCHAT_DEFAULT_MODEL_KEY
+    ):
+        reported_model_used = "gemini"
     logger.info(
         "websochat route_selected model_used=%s intent=%s qa_subtype=%s needs_creative=%s route_mode=%s fallback_used=%s product_id=%s session_id=%s latest_episode_no=%s prompt_preview=%r",
-        result["model_used"],
+        reported_model_used,
         result["intent"],
         qa_subtype,
         "true" if needs_creative else "false",
@@ -6700,7 +6853,7 @@ async def _generate_websochat_reply(
     reply = result["reply"]
     if scope_fallback_notice:
         reply = f"{_build_websochat_read_scope_fallback_prefix()}{reply}"
-    return reply, result["model_used"], result["route_mode"], result["fallback_used"], result["intent"], route_session_memory
+    return reply, reported_model_used, result["route_mode"], result["fallback_used"], result["intent"], route_session_memory
 
 
 
@@ -6863,6 +7016,7 @@ async def _get_websochat_daily_user_message_count(
     db: AsyncSession,
     *,
     is_character_chat: bool = False,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> int:
     owner_where = "s.user_id = :user_id" if user_id is not None else "s.guest_key = :guest_key"
     params: dict[str, Any] = {}
@@ -6881,6 +7035,31 @@ async def _get_websochat_daily_user_message_count(
         END
     """
     params["is_character_chat"] = 1 if is_character_chat else 0
+
+    if is_character_chat:
+        normalized_model_key = normalize_websochat_model_key(model_key)
+        params["model_used"] = build_websochat_model_used(normalized_model_key)
+        legacy_speed_clause = (
+            "OR l.model_used = 'gemini'"
+            if normalized_model_key == WEBSOCHAT_DEFAULT_MODEL_KEY
+            else ""
+        )
+        result = await db.execute(
+            text(
+                f"""
+                SELECT COUNT(*) AS cnt
+                FROM tb_story_agent_usage_log l
+                JOIN tb_story_agent_session s ON s.session_id = l.session_id
+                WHERE {owner_where}
+                  AND {session_kind_expression} = 'character_chat'
+                  AND (l.model_used = :model_used {legacy_speed_clause})
+                  AND DATE(l.created_date) = CURDATE()
+                """
+            ),
+            params,
+        )
+        row = result.mappings().one()
+        return int(row.get("cnt") or 0)
 
     result = await db.execute(
         text(
@@ -6902,6 +7081,55 @@ async def _get_websochat_daily_user_message_count(
     )
     row = result.mappings().one()
     return int(row.get("cnt") or 0)
+
+
+async def _get_websochat_character_chat_daily_counts_by_model(
+    user_id: int | None,
+    guest_key: str | None,
+    db: AsyncSession,
+) -> dict[str, int]:
+    owner_where = "s.user_id = :user_id" if user_id is not None else "s.guest_key = :guest_key"
+    params: dict[str, Any] = {
+        "user_id": user_id,
+        "guest_key": guest_key,
+    }
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                CASE
+                    WHEN l.model_used = 'gemini' THEN 'speed'
+                    WHEN l.model_used = 'gemini:speed' THEN 'speed'
+                    WHEN l.model_used = 'openrouter:balance' THEN 'balance'
+                    WHEN l.model_used = 'gemini:deep' THEN 'deep'
+                    ELSE NULL
+                END AS modelKey,
+                COUNT(*) AS cnt
+            FROM tb_story_agent_usage_log l
+            JOIN tb_story_agent_session s ON s.session_id = l.session_id
+            WHERE {owner_where}
+              AND JSON_VALID(s.session_memory_json) = 1
+              AND JSON_UNQUOTE(
+                    JSON_EXTRACT(s.session_memory_json, '$.session_kind')
+                  ) = 'character_chat'
+              AND l.model_used IN (
+                    'gemini',
+                    'gemini:speed',
+                    'openrouter:balance',
+                    'gemini:deep'
+                  )
+              AND DATE(l.created_date) = CURDATE()
+            GROUP BY modelKey
+            """
+        ),
+        params,
+    )
+    counts = {spec.model_key: 0 for spec in WEBSOCHAT_MODEL_CATALOG}
+    for row in result.mappings().all():
+        model_key = str(row.get("modelKey") or "").strip().lower()
+        if model_key in counts:
+            counts[model_key] = int(row.get("cnt") or 0)
+    return counts
 
 
 async def _get_user_cash_balance_for_websochat(user_id: int, db: AsyncSession) -> int:
@@ -7061,15 +7289,18 @@ async def _enforce_websochat_message_usage(
     db: AsyncSession,
     qa_action_key: str | None = None,
     is_character_chat: bool = False,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> None:
     used_count = await _get_websochat_daily_user_message_count(
         user_id,
         guest_key,
         db,
         is_character_chat=is_character_chat,
+        model_key=model_key,
     )
     daily_free_message_limit = _resolve_websochat_daily_free_message_limit(
-        is_character_chat
+        is_character_chat,
+        model_key,
     )
     if used_count < daily_free_message_limit:
         return
@@ -7080,7 +7311,7 @@ async def _enforce_websochat_message_usage(
             message=ErrorMessages.LOGIN_REQUIRED,
         )
 
-    cash_cost = _resolve_websochat_message_cash_cost(qa_action_key)
+    cash_cost = _resolve_websochat_message_cash_cost(qa_action_key, model_key)
     balance = await _get_user_cash_balance_for_websochat(user_id=user_id, db=db)
     if balance < cash_cost:
         raise CustomResponseException(
@@ -7103,15 +7334,18 @@ async def _resolve_websochat_message_charge_required(
     db: AsyncSession,
     qa_action_key: str | None = None,
     is_character_chat: bool = False,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> bool:
     used_count = await _get_websochat_daily_user_message_count(
         user_id,
         guest_key,
         db,
         is_character_chat=is_character_chat,
+        model_key=model_key,
     )
     daily_free_message_limit = _resolve_websochat_daily_free_message_limit(
-        is_character_chat
+        is_character_chat,
+        model_key,
     )
     if used_count < daily_free_message_limit:
         return False
@@ -7122,7 +7356,7 @@ async def _resolve_websochat_message_charge_required(
             message=ErrorMessages.LOGIN_REQUIRED,
         )
 
-    cash_cost = _resolve_websochat_message_cash_cost(qa_action_key)
+    cash_cost = _resolve_websochat_message_cash_cost(qa_action_key, model_key)
     balance = await _get_user_cash_balance_for_websochat(user_id=user_id, db=db)
     if balance < cash_cost:
         raise CustomResponseException(
@@ -7719,9 +7953,11 @@ async def get_billing_status(
     qa_action_key: str | None,
     session_id: int | None,
     db: AsyncSession,
+    model_key: str | None = None,
 ):
     user_id, resolved_guest_key = await _resolve_actor(kc_user_id, guest_key, db)
     is_character_chat = False
+    selected_model_key = normalize_websochat_model_key(model_key)
     if session_id is not None:
         session_row = await _get_session_row(
             session_id,
@@ -7729,15 +7965,33 @@ async def get_billing_status(
             resolved_guest_key,
             db,
         )
-        is_character_chat = _is_websochat_character_chat_session(
-            _normalize_websochat_session_memory(session_row.get("session_memory_json"))
+        session_memory = _normalize_websochat_session_memory(
+            session_row.get("session_memory_json")
         )
-    used_count = await _get_websochat_daily_user_message_count(
-        user_id,
-        resolved_guest_key,
-        db,
-        is_character_chat=is_character_chat,
-    )
+        is_character_chat = _is_websochat_character_chat_session(session_memory)
+        if model_key is None:
+            selected_model_key = normalize_websochat_model_key(
+                session_memory.get("selected_model_key")
+            )
+    if not is_character_chat:
+        selected_model_key = WEBSOCHAT_DEFAULT_MODEL_KEY
+    used_counts_by_model = None
+    if is_character_chat:
+        used_counts_by_model = (
+            await _get_websochat_character_chat_daily_counts_by_model(
+                user_id,
+                resolved_guest_key,
+                db,
+            )
+        )
+        used_count = int(used_counts_by_model.get(selected_model_key, 0))
+    else:
+        used_count = await _get_websochat_daily_user_message_count(
+            user_id,
+            resolved_guest_key,
+            db,
+            is_character_chat=False,
+        )
     cash_balance = None
     if user_id is not None:
         cash_balance = await _get_user_cash_balance_for_websochat(user_id=user_id, db=db)
@@ -7749,6 +8003,8 @@ async def get_billing_status(
             cash_balance=cash_balance,
             qa_action_key=qa_action_key,
             is_character_chat=is_character_chat,
+            selected_model_key=selected_model_key,
+            used_counts_by_model=used_counts_by_model,
         )
     }
 
@@ -7851,6 +8107,11 @@ async def create_session(
     )
     session_memory["session_kind"] = session_kind
     session_memory["entry_source"] = req_body.entry_source
+    session_memory["selected_model_key"] = _resolve_websochat_effective_model_key(
+        req_body.model_key,
+        None,
+        is_character_chat=session_kind == "character_chat",
+    )
     if session_kind == "character_chat":
         session_memory["locked_character_scope_key"] = locked_character_scope_key
         session_memory["allowed_modes"] = ["rp"]
@@ -7902,6 +8163,7 @@ async def create_session(
         opening_payload = await generate_character_chat_adjacent_opening_with_gemini(
             product_row=product_row,
             rp_context=rp_context,
+            model_key=WEBSOCHAT_DEFAULT_MODEL_KEY,
         )
         opening_text = str(opening_payload.get("opening_text") or "").strip()
 
@@ -7985,6 +8247,86 @@ async def patch_session(
     )
 
     return {"data": {"sessionId": session_id, "title": req_body.title}}
+
+
+@handle_exceptions
+async def patch_session_model(
+    session_id: int,
+    req_body: PatchWebsochatSessionModelReqBody,
+    kc_user_id: str | None,
+    db: AsyncSession,
+):
+    user_id, resolved_guest_key = await _resolve_actor(
+        kc_user_id,
+        req_body.guest_key,
+        db,
+    )
+    session_lock_conn: AsyncConnection | None = None
+    try:
+        session_lock_conn = await _acquire_websochat_session_lock(
+            session_id=session_id
+        )
+        if session_lock_conn is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_409_CONFLICT,
+                message="같은 세션에서 다른 요청을 처리 중입니다. 잠시 후 다시 시도해주세요.",
+            )
+        await db.rollback()
+        session_row = await _get_session_row(
+            session_id,
+            user_id,
+            resolved_guest_key,
+            db,
+        )
+        session_memory = _normalize_websochat_session_memory(
+            session_row.get("session_memory_json")
+        )
+        if not _is_websochat_character_chat_session(session_memory):
+            raise CustomResponseException(
+                status_code=status.HTTP_409_CONFLICT,
+                message="모델 선택은 주인공챗 세션에서만 변경할 수 있습니다.",
+            )
+        selected_model_key = normalize_websochat_model_key(req_body.model_key)
+        session_memory["selected_model_key"] = selected_model_key
+        await db.execute(
+            text(
+                f"""
+                UPDATE tb_story_agent_session
+                SET session_memory_json = :session_memory_json,
+                    expires_at = DATE_ADD(NOW(), INTERVAL {WEBSOCHAT_SESSION_TTL_DAYS} DAY),
+                    updated_id = :updated_id,
+                    updated_date = NOW()
+                WHERE session_id = :session_id
+                """
+            ),
+            {
+                "session_memory_json": _serialize_websochat_session_memory(
+                    session_memory
+                ),
+                "updated_id": (
+                    user_id
+                    if user_id is not None
+                    else settings.DB_DML_DEFAULT_ID
+                ),
+                "session_id": session_id,
+            },
+        )
+        await db.commit()
+        return {
+            "data": {
+                "sessionId": session_id,
+                "selectedModelKey": selected_model_key,
+            }
+        }
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        if session_lock_conn is not None:
+            await _release_websochat_session_lock(
+                session_id=session_id,
+                conn=session_lock_conn,
+            )
 
 
 @handle_exceptions
@@ -8434,11 +8776,10 @@ async def post_character_chat_choices(
             )
         parsed: dict[str, Any] = {}
         try:
-            raw_reply = await call_websochat_gemini(
+            raw_reply = await call_websochat_model(
+                model_key=WEBSOCHAT_DEFAULT_MODEL_KEY,
                 system_prompt=prompt["system"],
-                messages=to_websochat_gemini_contents(
-                    [{"role": "user", "content": attempt_user_prompt}]
-                ),
+                messages=[{"role": "user", "content": attempt_user_prompt}],
                 max_tokens=WEBSOCHAT_CHARACTER_CHAT_CHOICES_MAX_TOKENS,
                 temperature=0.5 if attempt == 0 else 0.65,
             )
@@ -8504,6 +8845,11 @@ async def post_message(
     starter_mode_key = str(req_body.starter_mode_key or "").strip().lower() or None
     qa_action_key = str(req_body.qa_action_key or "").strip().lower() or None
     is_character_chat_session = _is_websochat_character_chat_session(current_session_memory)
+    requested_model_key = (
+        normalize_websochat_model_key(req_body.model_key)
+        if is_character_chat_session and req_body.model_key is not None
+        else None
+    )
     requested_mode_key = _resolve_websochat_requested_mode_key(
         starter_mode_key=starter_mode_key,
         qa_action_key=qa_action_key,
@@ -8569,6 +8915,11 @@ async def post_message(
         product_id=int(session_row["product_id"]),
         active_character=request_active_character,
         db=db,
+        model_key=(
+            requested_model_key or current_session_memory.get("selected_model_key")
+            if is_character_chat_session
+            else WEBSOCHAT_DEFAULT_MODEL_KEY
+        ),
     )
     resolved_active_character = str(resolution.get("scopeKey") or "").strip() or None
     resolved_active_character_label = (
@@ -8719,6 +9070,7 @@ async def post_message(
 
     session_lock_conn: AsyncConnection | None = None
     actor_lock_acquired = False
+    deferred_stream_token = None
     try:
         session_lock_conn = await _acquire_websochat_session_lock(session_id=session_id)
         if session_lock_conn is None:
@@ -8726,6 +9078,43 @@ async def post_message(
                 status_code=status.HTTP_409_CONFLICT,
                 message="같은 세션에서 다른 메시지를 처리 중입니다. 잠시 후 다시 시도해주세요.",
             )
+        actor_lock_acquired = await _acquire_websochat_actor_lock_on_connection(
+            user_id=user_id,
+            guest_key=resolved_guest_key,
+            conn=session_lock_conn,
+        )
+        if not actor_lock_acquired:
+            raise CustomResponseException(
+                status_code=status.HTTP_409_CONFLICT,
+                message="같은 계정 또는 기기에서 다른 메시지를 처리 중입니다. 잠시 후 다시 시도해주세요.",
+            )
+
+        # The actor lock serializes the daily quota boundary across sessions.
+        # Refresh the REPEATABLE READ snapshot only after both named locks exist.
+        await db.rollback()
+        locked_session_row = await _get_session_row(
+            session_id,
+            user_id,
+            resolved_guest_key,
+            db,
+        )
+        locked_session_memory = _normalize_websochat_session_memory(
+            locked_session_row.get("session_memory_json")
+        )
+        selected_model_key = (
+            requested_model_key
+            or normalize_websochat_model_key(
+                locked_session_memory.get("selected_model_key")
+            )
+            if is_character_chat_session
+            else WEBSOCHAT_DEFAULT_MODEL_KEY
+        )
+        next_session_memory["selected_model_key"] = selected_model_key
+        effective_model_key = _resolve_websochat_effective_model_key(
+            selected_model_key,
+            effective_qa_action_key,
+            is_character_chat=is_character_chat_session,
+        )
 
         concierge_payload = None
         if _resolve_websochat_read_scope_state(next_session_memory) == "none":
@@ -8755,17 +9144,6 @@ async def post_message(
                     "messages": existing_messages,
                 }
             }
-
-        actor_lock_acquired = await _acquire_websochat_actor_lock_on_connection(
-            user_id=user_id,
-            guest_key=resolved_guest_key,
-            conn=session_lock_conn,
-        )
-        if not actor_lock_acquired:
-            raise CustomResponseException(
-                status_code=status.HTTP_409_CONFLICT,
-                message="같은 계정 또는 기기에서 다른 메시지를 처리 중입니다. 잠시 후 다시 시도해주세요.",
-            )
 
         if character_resolution_clarify_reply:
             user_content = str(req_body.content or request_active_character or "").strip()
@@ -8874,7 +9252,10 @@ async def post_message(
             db=db,
             qa_action_key=effective_qa_action_key,
             is_character_chat=is_character_chat_session,
+            model_key=effective_model_key,
         )
+        if should_charge_cash and is_websochat_stream_enabled():
+            deferred_stream_token = defer_websochat_stream_output()
 
         if read_scope_decision["is_scope_only"]:
             requested_read_episode_to = int(read_scope_decision["read_episode_to"] or 0) or None
@@ -8921,6 +9302,7 @@ async def post_message(
                     user_id=user_id,
                     db=db,
                     forced_route="qa",
+                    model_key=effective_model_key,
                 )
             elif active_mode in WEBSOCHAT_ALLOWED_GAME_MODES:
                 assistant_reply = (
@@ -9025,9 +9407,13 @@ async def post_message(
                 user_id=user_id,
                 db=db,
                 forced_route=forced_route,
+                model_key=effective_model_key,
             )
         assistant_reply = _sanitize_websochat_assistant_reply_text(assistant_reply)
-        await emit_websochat_stream_text_if_needed(assistant_reply)
+        if should_charge_cash and not _is_websochat_billable_model_used(model_used):
+            should_charge_cash = False
+        if not replace_deferred_websochat_stream_output(assistant_reply):
+            await emit_websochat_stream_text_if_needed(assistant_reply)
         route_referenced_episode_nos: list[int] = []
         if route_session_memory is not None:
             route_referenced_episode_nos = [
@@ -9090,7 +9476,10 @@ async def post_message(
         if route_mode == "rp:unavailable":
             should_charge_cash = False
         charged_cash = (
-            _resolve_websochat_message_cash_cost(effective_qa_action_key)
+            _resolve_websochat_message_cash_cost(
+                effective_qa_action_key,
+                effective_model_key,
+            )
             if should_charge_cash
             else 0
         )
@@ -9150,6 +9539,8 @@ async def post_message(
         )
 
         await db.commit()
+        if deferred_stream_token is not None:
+            await flush_deferred_websochat_stream_output()
         logger.info(
             "websochat reply_completed model_used=%s intent=%s route_mode=%s fallback_used=%s product_id=%s session_id=%s charged_cash=%s prompt_preview=%r",
             model_used,
@@ -9224,6 +9615,8 @@ async def post_message(
         await db.rollback()
         raise
     finally:
+        if deferred_stream_token is not None:
+            reset_websochat_stream_output(deferred_stream_token)
         if actor_lock_acquired:
             await _release_websochat_actor_lock_on_connection(
                 user_id=user_id,

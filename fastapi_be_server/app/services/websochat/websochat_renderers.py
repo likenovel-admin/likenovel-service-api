@@ -6,17 +6,20 @@ from app.services.websochat.websochat_game_memory import (
     WEBSOCHAT_ALLOWED_GAME_MODES,
     _normalize_websochat_session_memory,
 )
-from app.services.websochat.websochat_llm import call_websochat_gemini, to_websochat_gemini_contents
+from app.services.websochat.websochat_llm import call_websochat_model
+from app.services.websochat.websochat_model_catalog import WEBSOCHAT_DEFAULT_MODEL_KEY
 
 
 async def call_websochat_game_host_model(
     *,
     system_prompt: str,
     user_prompt: str,
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> str:
-    return await call_websochat_gemini(
+    return await call_websochat_model(
+        model_key=model_key,
         system_prompt=system_prompt,
-        messages=to_websochat_gemini_contents([{"role": "user", "content": user_prompt}]),
+        messages=[{"role": "user", "content": user_prompt}],
         max_tokens=640,
     )
 
@@ -26,6 +29,7 @@ async def generate_websochat_vs_comparison(
     product_row: dict[str, Any],
     category: str,
     match_pair: list[dict[str, Any]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> str:
     left = match_pair[0]
     right = match_pair[1]
@@ -64,6 +68,7 @@ async def generate_websochat_vs_comparison(
     return await call_websochat_game_host_model(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
+        model_key=model_key,
     )
 
 

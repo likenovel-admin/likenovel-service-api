@@ -8,6 +8,10 @@ from typing import Any
 from app.services.websochat.websochat_context_loader import (
     _is_websochat_character_entry_context_v2,
 )
+from app.services.websochat.websochat_model_catalog import (
+    WEBSOCHAT_DEFAULT_MODEL_KEY,
+    normalize_websochat_model_key,
+)
 
 WEBSOCHAT_ALLOWED_RP_MODES = {"free", "scene"}
 WEBSOCHAT_ALLOWED_GAME_MODES = {"ideal_worldcup", "vs_game"}
@@ -253,6 +257,9 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
     session_kind = str(parsed.get("session_kind") or "").strip().lower() or "websochat"
     if session_kind not in WEBSOCHAT_ALLOWED_SESSION_KINDS:
         session_kind = "websochat"
+    selected_model_key = normalize_websochat_model_key(
+        parsed.get("selected_model_key")
+    )
     entry_source = str(parsed.get("entry_source") or "").strip().lower() or None
     if entry_source not in WEBSOCHAT_ALLOWED_SESSION_ENTRY_SOURCES:
         entry_source = None
@@ -362,6 +369,7 @@ def _normalize_websochat_session_memory(raw_value: Any) -> dict[str, Any]:
         active_character_label = None
     return {
         "session_kind": session_kind,
+        "selected_model_key": selected_model_key,
         "entry_source": entry_source,
         "locked_character_scope_key": locked_character_scope_key,
         "allowed_modes": allowed_modes,
@@ -574,6 +582,9 @@ def _serialize_websochat_session_memory(session_memory: dict[str, Any]) -> str |
         or normalized.get("locked_character_scope_key")
         or normalized.get("allowed_modes") != WEBSOCHAT_DEFAULT_ALLOWED_MODE_KEYS
     )
+    has_non_default_model = (
+        normalized.get("selected_model_key") != WEBSOCHAT_DEFAULT_MODEL_KEY
+    )
     has_rp_state = bool(normalized.get("active_character") and normalized.get("rp_mode"))
     has_pending_rp_state = bool(normalized.get("pending_rp_character_selection"))
     has_game_state = bool(normalized.get("game_context", {}).get("mode"))
@@ -583,6 +594,6 @@ def _serialize_websochat_session_memory(session_memory: dict[str, Any]) -> str |
     has_pending_qa_action = bool(normalized.get("pending_qa_action_key"))
     has_qa_memory = bool(normalized.get("qa_recent_notes"))
     has_qa_corrections = bool(normalized.get("qa_corrections"))
-    if not has_session_contract and not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_scope_prompted and not has_non_read_scope_state and not has_pending_qa_action and not has_qa_memory and not has_qa_corrections:
+    if not has_session_contract and not has_non_default_model and not has_rp_state and not has_pending_rp_state and not has_game_state and not has_scope_state and not has_scope_prompted and not has_non_read_scope_state and not has_pending_qa_action and not has_qa_memory and not has_qa_corrections:
         return None
     return json.dumps(normalized, ensure_ascii=False)
