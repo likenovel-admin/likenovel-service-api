@@ -12,10 +12,10 @@ from app.services.websochat.websochat_context_loader import (
     _is_websochat_character_entry_context_v2,
 )
 from app.services.websochat.websochat_game_memory import _normalize_websochat_session_memory
+from app.services.websochat.websochat_model_catalog import WEBSOCHAT_DEFAULT_MODEL_KEY
 from app.services.websochat.websochat_llm import (
     WEBSOCHAT_RP_TEMPERATURE,
-    call_websochat_gemini,
-    to_websochat_gemini_contents,
+    call_websochat_model,
 )
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
 
@@ -504,6 +504,7 @@ async def generate_character_chat_adjacent_opening_with_gemini(
     *,
     product_row: dict[str, Any],
     rp_context: dict[str, Any],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> dict[str, Any]:
     prompt = _build_character_chat_adjacent_opening_prompt(
         product_row=product_row,
@@ -523,11 +524,10 @@ async def generate_character_chat_adjacent_opening_with_gemini(
                 "이전 응답은 채팅 표시 형식을 맞추지 못했습니다. "
                 "설명 없이 3인칭 지문, 빈 줄, 큰따옴표 대사로만 다시 써 주세요."
             )
-        raw_reply = await call_websochat_gemini(
+        raw_reply = await call_websochat_model(
+            model_key=model_key,
             system_prompt=prompt,
-            messages=to_websochat_gemini_contents(
-                [{"role": "user", "content": user_instruction}]
-            ),
+            messages=[{"role": "user", "content": user_instruction}],
             max_tokens=WEBSOCHAT_CHARACTER_OPENING_MAX_TOKENS,
             temperature=0.7,
             stream=False,
@@ -1122,17 +1122,19 @@ async def generate_websochat_rp_reply_with_gemini(
     user_prompt: str,
     rp_context: dict[str, Any],
     recent_messages: list[dict[str, str]],
+    model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> str:
     messages = list(recent_messages)
     messages.append({"role": "user", "content": user_prompt})
-    return await call_websochat_gemini(
+    return await call_websochat_model(
+        model_key=model_key,
         system_prompt=build_websochat_rp_system_prompt(
             product_row=product_row,
             rp_context=rp_context,
             recent_messages=recent_messages,
             current_user_prompt=user_prompt,
         ),
-        messages=to_websochat_gemini_contents(messages),
+        messages=messages,
         max_tokens=WEBSOCHAT_RP_REPLY_MAX_TOKENS,
         temperature=WEBSOCHAT_RP_TEMPERATURE,
     )

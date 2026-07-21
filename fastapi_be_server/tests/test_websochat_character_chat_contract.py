@@ -245,6 +245,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
                 "entrySource": "home_character_slot",
                 "lockedCharacterScopeKey": "protagonist:named:데시",
                 "allowedModes": ["rp"],
+                "selectedModelKey": "speed",
             },
         )
 

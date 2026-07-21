@@ -55,6 +55,25 @@ async def patch_websochat_session(
     )
 
 
+@router.patch(
+    "/sessions/{session_id}/model",
+    tags=["웹소챗"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def patch_websochat_session_model(
+    session_id: int,
+    req_body: websochat_schema.PatchWebsochatSessionModelReqBody,
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await websochat_service.patch_session_model(
+        session_id=session_id,
+        req_body=req_body,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
 @router.delete(
     "/sessions/{session_id}",
     tags=["웹소챗"],

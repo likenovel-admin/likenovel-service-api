@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -73,6 +74,7 @@ class _FakeGeminiResponse:
 class _FakeGeminiAsyncClient:
     timeouts: list[float] = []
     urls: list[str] = []
+    payloads: list[dict] = []
 
     def __init__(self, *, timeout: float):
         self.__class__.timeouts.append(timeout)
@@ -85,6 +87,7 @@ class _FakeGeminiAsyncClient:
 
     async def post(self, url, *args, **kwargs):
         self.__class__.urls.append(url)
+        self.__class__.payloads.append(kwargs["json"])
         return _FakeGeminiResponse()
 
 
@@ -92,6 +95,7 @@ class WebsochatLlmTimeoutTest(unittest.IsolatedAsyncioTestCase):
     async def test_call_websochat_gemini_uses_requested_timeout(self):
         _FakeGeminiAsyncClient.timeouts = []
         _FakeGeminiAsyncClient.urls = []
+        _FakeGeminiAsyncClient.payloads = []
 
         with (
             patch.object(websochat_llm.settings, "GEMINI_API_KEY", "test-key"),
@@ -103,11 +107,16 @@ class WebsochatLlmTimeoutTest(unittest.IsolatedAsyncioTestCase):
                 system_prompt="system",
                 messages=[{"role": "user", "parts": [{"text": "질문"}]}],
                 timeout_seconds=180.0,
+                thinking_level="medium",
             )
 
         self.assertEqual(reply, "응답")
         self.assertEqual(_FakeGeminiAsyncClient.timeouts, [180.0])
         self.assertIn("/models/test-model:generateContent", _FakeGeminiAsyncClient.urls[0])
+        self.assertEqual(
+            _FakeGeminiAsyncClient.payloads[0]["generationConfig"]["thinkingConfig"],
+            {"thinkingLevel": "medium"},
+        )
 
     async def test_call_websochat_gemini_can_disable_inherited_stream(self):
         _FakeGeminiAsyncClient.urls = []
@@ -132,6 +141,234 @@ class WebsochatLlmTimeoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply, "응답")
         call_stream.assert_not_awaited()
         self.assertIn("/models/default-model:generateContent", _FakeGeminiAsyncClient.urls[0])
+
+
+class _FakeOpenRouterResponse:
+    def __init__(self, *, status_code=200, payload=None, lines=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self._lines = list(lines or [])
+        self.text = json.dumps(self._payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aread(self):
+        return self.text.encode()
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    def json(self):
+        return self._payload
+
+
+class _FakeOpenRouterAsyncClient:
+    stream_response = _FakeOpenRouterResponse()
+    post_response = _FakeOpenRouterResponse()
+    calls: list[dict] = []
+
+    def __init__(self, *, timeout: float):
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, method, url, **kwargs):
+        self.__class__.calls.append(
+            {"kind": "stream", "method": method, "url": url, **kwargs}
+        )
+        return self.__class__.stream_response
+
+    async def post(self, url, **kwargs):
+        self.__class__.calls.append({"kind": "post", "url": url, **kwargs})
+        return self.__class__.post_response
+
+
+class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        _FakeOpenRouterAsyncClient.calls = []
+        _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse()
+        _FakeOpenRouterAsyncClient.post_response = _FakeOpenRouterResponse()
+
+    async def test_balance_dispatches_paid_gemma_without_reasoning_payload(self):
+        _FakeOpenRouterAsyncClient.post_response = _FakeOpenRouterResponse(
+            payload={
+                "choices": [{"message": {"content": "밸런스 응답"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14,
+                },
+            }
+        )
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
+            patch.object(
+                websochat_llm.settings,
+                "OPENROUTER_BASE_URL",
+                "https://openrouter.test/api/v1",
+            ),
+            patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+        ):
+            reply = await websochat_llm.call_websochat_model(
+                model_key="balance",
+                system_prompt="system",
+                messages=[
+                    {"role": "user", "content": "질문"},
+                    {"role": "assistant", "content": "이전 답"},
+                ],
+                stream=False,
+            )
+
+        self.assertEqual(reply, "밸런스 응답")
+        call = _FakeOpenRouterAsyncClient.calls[0]
+        self.assertEqual(call["url"], "https://openrouter.test/api/v1/chat/completions")
+        self.assertEqual(call["headers"]["X-Title"], "LikeNovel Websochat")
+        self.assertEqual(call["json"]["model"], "google/gemma-4-31b-it")
+        self.assertNotIn("reasoning", call["json"])
+        self.assertNotIn("thinking", call["json"])
+        self.assertEqual(
+            call["json"]["messages"],
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "질문"},
+                {"role": "assistant", "content": "이전 답"},
+            ],
+        )
+
+    async def test_balance_stream_parses_delta_and_done(self):
+        _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(
+            lines=[
+                'data: {"choices":[{"delta":{"content":"안녕"}}]}',
+                'data: {"choices":[{"delta":{"content":" 하세요"}}]}',
+                'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}',
+                "data: [DONE]",
+            ]
+        )
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
+            patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+        ):
+            reply = await websochat_llm.call_websochat_model(
+                model_key="balance",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+                stream=True,
+            )
+
+        self.assertEqual(reply, "안녕 하세요")
+        self.assertEqual(
+            _FakeOpenRouterAsyncClient.calls[0]["json"]["stream_options"],
+            {"include_usage": True},
+        )
+
+    async def test_balance_partial_stream_error_does_not_retry(self):
+        _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(
+            lines=[
+                'data: {"choices":[{"delta":{"content":"일부"}}]}',
+                'data: {"error":{"code":429,"message":"rate limited"}}',
+            ]
+        )
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
+            patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+        ):
+            with self.assertRaises(CustomResponseException) as exc:
+                await websochat_llm.call_websochat_model(
+                    model_key="balance",
+                    system_prompt="system",
+                    messages=[{"role": "user", "content": "질문"}],
+                    stream=True,
+                )
+
+        self.assertEqual(exc.exception.code, "AI_PROVIDER_LIMITED")
+        self.assertEqual(
+            [call["kind"] for call in _FakeOpenRouterAsyncClient.calls],
+            ["stream"],
+        )
+
+    async def test_balance_empty_stream_retries_same_provider_nonstream(self):
+        _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(
+            lines=["data: [DONE]"]
+        )
+        _FakeOpenRouterAsyncClient.post_response = _FakeOpenRouterResponse(
+            payload={"choices": [{"message": {"content": "재시도 응답"}}]}
+        )
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
+            patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+        ):
+            reply = await websochat_llm.call_websochat_model(
+                model_key="balance",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+                stream=True,
+            )
+
+        self.assertEqual(reply, "재시도 응답")
+        self.assertEqual(
+            [call["kind"] for call in _FakeOpenRouterAsyncClient.calls],
+            ["stream", "post"],
+        )
+
+    async def test_balance_without_key_does_not_fallback_to_gemini(self):
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", ""),
+            patch.object(
+                websochat_llm,
+                "call_websochat_gemini",
+                new_callable=AsyncMock,
+            ) as gemini,
+        ):
+            with self.assertRaises(CustomResponseException) as exc:
+                await websochat_llm.call_websochat_model(
+                    model_key="balance",
+                    system_prompt="system",
+                    messages=[{"role": "user", "content": "질문"}],
+                    stream=False,
+                )
+
+        self.assertEqual(exc.exception.code, "AI_PROVIDER_NOT_CONFIGURED")
+        gemini.assert_not_awaited()
+
+    async def test_speed_and_deep_use_gemini_catalog_thinking(self):
+        with (
+            patch.object(
+                websochat_llm,
+                "call_websochat_gemini",
+                new_callable=AsyncMock,
+                return_value="응답",
+            ) as gemini,
+            patch.object(
+                websochat_llm,
+                "call_websochat_openrouter",
+                new_callable=AsyncMock,
+            ) as openrouter,
+        ):
+            await websochat_llm.call_websochat_model(
+                model_key="speed",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+            )
+            await websochat_llm.call_websochat_model(
+                model_key="deep",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+            )
+
+        self.assertEqual(
+            [call.kwargs["thinking_level"] for call in gemini.await_args_list],
+            ["minimal", "high"],
+        )
+        openrouter.assert_not_awaited()
 
 
 if __name__ == "__main__":

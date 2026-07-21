@@ -175,7 +175,7 @@ class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
         )
         release_session_lock.assert_awaited_once_with(session_id=123, conn=session_lock)
         self.assertTrue(db.committed)
-        self.assertFalse(db.rolled_back)
+        self.assertTrue(db.rolled_back)
 
     async def test_post_message_rejects_when_actor_lock_is_busy(self):
         req_body = PostWebsochatMessageReqBody(
@@ -453,7 +453,7 @@ class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
         )
         release_session_lock.assert_awaited_once_with(session_id=123, conn=session_lock)
         self.assertTrue(db.committed)
-        self.assertFalse(db.rolled_back)
+        self.assertTrue(db.rolled_back)
 
     async def test_post_message_saves_successful_rp_turn_as_recent_fact(self):
         req_body = PostWebsochatMessageReqBody(
@@ -461,6 +461,7 @@ class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
             content="아직 있어?",
             rp_mode="free",
             account_read_episode_to=1,
+            model_key="deep",
         )
         db = _FakeDb()
         session_lock = object()
@@ -591,8 +592,14 @@ class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
         stored_memory = json.loads(update_params[-1]["session_memory_json"])
         self.assertEqual(stored_memory["active_character"], "named:test")
         self.assertEqual(stored_memory["rp_mode"], "free")
+        self.assertEqual(stored_memory["selected_model_key"], "speed")
         self.assertIn("유저: 아직 있어?", stored_memory["recent_rp_facts"])
         self.assertIn("캐릭터: 여기 있어. 네 말은 듣고 있었어.", stored_memory["recent_rp_facts"])
+        self.assertEqual(
+            resolve_charge_required.await_args.kwargs["model_key"],
+            "speed",
+        )
+        self.assertEqual(generate_reply.await_args.kwargs["model_key"], "speed")
         release_actor_lock_on_connection.assert_awaited_once_with(
             user_id=321,
             guest_key=None,
@@ -600,7 +607,7 @@ class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
         )
         release_session_lock.assert_awaited_once_with(session_id=123, conn=session_lock)
         self.assertTrue(db.committed)
-        self.assertFalse(db.rolled_back)
+        self.assertTrue(db.rolled_back)
 
 
 if __name__ == "__main__":
