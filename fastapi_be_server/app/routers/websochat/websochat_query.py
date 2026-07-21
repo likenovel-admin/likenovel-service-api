@@ -64,6 +64,7 @@ async def get_websochat_sessions(
 )
 async def get_websochat_billing_status(
     qa_action_key: str | None = Query(default=None),
+    session_id: int | None = Query(default=None),
     guest_key: str | None = Depends(get_websochat_guest_key),
     user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
@@ -72,6 +73,7 @@ async def get_websochat_billing_status(
         kc_user_id=user.get("sub"),
         guest_key=guest_key,
         qa_action_key=qa_action_key,
+        session_id=session_id,
         db=db,
     )
 

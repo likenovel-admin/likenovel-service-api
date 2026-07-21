@@ -138,6 +138,7 @@ WEBSOCHAT_DEFAULT_TITLE = "새 대화"
 WEBSOCHAT_SESSION_LOCK_TIMEOUT_SECONDS = 0
 WEBSOCHAT_SESSION_TTL_DAYS = 30
 WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT = 3
+WEBSOCHAT_CHARACTER_CHAT_DAILY_FREE_MESSAGE_LIMIT = 10
 WEBSOCHAT_NONCANONICAL_NEXT_EPISODE_MARKER = "[[websochat:noncanonical:next_episode_write]]\n"
 WEBSOCHAT_MESSAGE_CASH_COST = 20
 WEBSOCHAT_NEXT_EPISODE_WRITE_CASH_COST = 30
@@ -662,19 +663,31 @@ def _resolve_websochat_message_cash_cost(
     return WEBSOCHAT_MESSAGE_CASH_COST
 
 
+def _resolve_websochat_daily_free_message_limit(is_character_chat: bool) -> int:
+    return (
+        WEBSOCHAT_CHARACTER_CHAT_DAILY_FREE_MESSAGE_LIMIT
+        if is_character_chat
+        else WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT
+    )
+
+
 def _build_websochat_billing_status_payload(
     *,
     used_count: int,
     user_id: int | None,
     cash_balance: int | None,
     qa_action_key: str | None = None,
+    is_character_chat: bool = False,
 ) -> dict[str, Any]:
-    free_remaining = max(WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT - int(used_count), 0)
+    daily_free_message_limit = _resolve_websochat_daily_free_message_limit(
+        is_character_chat
+    )
+    free_remaining = max(daily_free_message_limit - int(used_count), 0)
     requires_cash = free_remaining <= 0
     cash_cost = _resolve_websochat_message_cash_cost(qa_action_key)
     return {
         "freeRemainingMessages": free_remaining,
-        "dailyFreeMessageLimit": WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT,
+        "dailyFreeMessageLimit": daily_free_message_limit,
         "cashCostPerMessage": cash_cost,
         "requiresCashForNextMessage": requires_cash,
         "requiresLoginForNextMessage": bool(requires_cash and user_id is None),
@@ -1044,6 +1057,40 @@ async def _get_websochat_authorized_read_scope(
     }
 
 
+async def _get_websochat_latest_read_episode_no(
+    *,
+    product_id: int,
+    user_id: int | None,
+    db: AsyncSession,
+) -> int | None:
+    if user_id is None:
+        return None
+    result = await db.execute(
+        text(
+            """
+            SELECT pe.episode_no AS episodeNo
+            FROM tb_user_product_usage u
+            INNER JOIN tb_product_episode pe ON pe.episode_id = u.episode_id
+            WHERE u.user_id = :user_id
+              AND u.product_id = :product_id
+              AND u.use_yn = 'Y'
+              AND pe.use_yn = 'Y'
+              AND pe.open_yn = 'Y'
+            ORDER BY pe.episode_no DESC, pe.episode_id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "product_id": int(product_id),
+            "user_id": int(user_id),
+        },
+    )
+    row = result.mappings().first()
+    return _resolve_websochat_requested_episode_to(
+        int(row.get("episodeNo") or 0) if row else None
+    )
+
+
 async def _apply_websochat_account_read_scope(
     session_memory: dict[str, Any],
     account_read_episode_to: int | None,
@@ -1081,14 +1128,13 @@ def _resolve_websochat_initial_account_read_episode_to(
     *,
     session_kind: str,
     requested_episode_to: int | None,
-    max_authorized_episode_to: int | None,
 ) -> int | None:
     requested = _resolve_websochat_requested_episode_to(requested_episode_to)
     if requested is not None:
         return requested
     if session_kind != "character_chat":
         return None
-    return _resolve_websochat_requested_episode_to(max_authorized_episode_to)
+    return 1
 
 
 async def _clamp_websochat_session_read_scope_to_authorized(
@@ -6815,6 +6861,8 @@ async def _get_websochat_daily_user_message_count(
     user_id: int | None,
     guest_key: str | None,
     db: AsyncSession,
+    *,
+    is_character_chat: bool = False,
 ) -> int:
     owner_where = "s.user_id = :user_id" if user_id is not None else "s.guest_key = :guest_key"
     params: dict[str, Any] = {}
@@ -6822,6 +6870,17 @@ async def _get_websochat_daily_user_message_count(
         params["user_id"] = user_id
     else:
         params["guest_key"] = guest_key
+    session_kind_expression = """
+        CASE
+            WHEN JSON_VALID(s.session_memory_json) = 1
+            THEN COALESCE(
+                JSON_UNQUOTE(JSON_EXTRACT(s.session_memory_json, '$.session_kind')),
+                'websochat'
+            )
+            ELSE 'websochat'
+        END
+    """
+    params["is_character_chat"] = 1 if is_character_chat else 0
 
     result = await db.execute(
         text(
@@ -6831,6 +6890,11 @@ async def _get_websochat_daily_user_message_count(
             JOIN tb_story_agent_session s ON s.session_id = m.session_id
             WHERE m.role = 'user'
               AND {owner_where}
+              AND (
+                  (:is_character_chat = 1 AND {session_kind_expression} = 'character_chat')
+                  OR
+                  (:is_character_chat = 0 AND {session_kind_expression} <> 'character_chat')
+              )
               AND DATE(m.created_date) = CURDATE()
             """
         ),
@@ -6996,9 +7060,18 @@ async def _enforce_websochat_message_usage(
     product_id: int,
     db: AsyncSession,
     qa_action_key: str | None = None,
+    is_character_chat: bool = False,
 ) -> None:
-    used_count = await _get_websochat_daily_user_message_count(user_id, guest_key, db)
-    if used_count < WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT:
+    used_count = await _get_websochat_daily_user_message_count(
+        user_id,
+        guest_key,
+        db,
+        is_character_chat=is_character_chat,
+    )
+    daily_free_message_limit = _resolve_websochat_daily_free_message_limit(
+        is_character_chat
+    )
+    if used_count < daily_free_message_limit:
         return
 
     if user_id is None:
@@ -7029,9 +7102,18 @@ async def _resolve_websochat_message_charge_required(
     guest_key: str | None,
     db: AsyncSession,
     qa_action_key: str | None = None,
+    is_character_chat: bool = False,
 ) -> bool:
-    used_count = await _get_websochat_daily_user_message_count(user_id, guest_key, db)
-    if used_count < WEBSOCHAT_DAILY_FREE_MESSAGE_LIMIT:
+    used_count = await _get_websochat_daily_user_message_count(
+        user_id,
+        guest_key,
+        db,
+        is_character_chat=is_character_chat,
+    )
+    daily_free_message_limit = _resolve_websochat_daily_free_message_limit(
+        is_character_chat
+    )
+    if used_count < daily_free_message_limit:
         return False
 
     if user_id is None:
@@ -7635,10 +7717,27 @@ async def get_billing_status(
     kc_user_id: str | None,
     guest_key: str | None,
     qa_action_key: str | None,
+    session_id: int | None,
     db: AsyncSession,
 ):
     user_id, resolved_guest_key = await _resolve_actor(kc_user_id, guest_key, db)
-    used_count = await _get_websochat_daily_user_message_count(user_id, resolved_guest_key, db)
+    is_character_chat = False
+    if session_id is not None:
+        session_row = await _get_session_row(
+            session_id,
+            user_id,
+            resolved_guest_key,
+            db,
+        )
+        is_character_chat = _is_websochat_character_chat_session(
+            _normalize_websochat_session_memory(session_row.get("session_memory_json"))
+        )
+    used_count = await _get_websochat_daily_user_message_count(
+        user_id,
+        resolved_guest_key,
+        db,
+        is_character_chat=is_character_chat,
+    )
     cash_balance = None
     if user_id is not None:
         cash_balance = await _get_user_cash_balance_for_websochat(user_id=user_id, db=db)
@@ -7649,6 +7748,7 @@ async def get_billing_status(
             user_id=user_id,
             cash_balance=cash_balance,
             qa_action_key=qa_action_key,
+            is_character_chat=is_character_chat,
         )
     }
 
@@ -7758,10 +7858,16 @@ async def create_session(
         session_memory["pending_rp_character_selection"] = False
     else:
         session_memory["allowed_modes"] = ["qa", "rp", "ideal_worldcup"]
+    requested_initial_episode_to = req_body.account_read_episode_to
+    if session_kind == "character_chat":
+        requested_initial_episode_to = await _get_websochat_latest_read_episode_no(
+            product_id=req_body.product_id,
+            user_id=user_id,
+            db=db,
+        )
     initial_account_read_episode_to = _resolve_websochat_initial_account_read_episode_to(
         session_kind=session_kind,
-        requested_episode_to=req_body.account_read_episode_to,
-        max_authorized_episode_to=authorized_scope.get("maxAuthorizedEpisodeTo"),
+        requested_episode_to=requested_initial_episode_to,
     )
     session_memory = await _apply_websochat_account_read_scope(
         session_memory,
@@ -8767,6 +8873,7 @@ async def post_message(
             guest_key=resolved_guest_key,
             db=db,
             qa_action_key=effective_qa_action_key,
+            is_character_chat=is_character_chat_session,
         )
 
         if read_scope_decision["is_scope_only"]:
