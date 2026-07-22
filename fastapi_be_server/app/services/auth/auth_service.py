@@ -1,6 +1,8 @@
 import base64
+import hashlib
 import secrets
 import time
+from contextlib import asynccontextmanager
 from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +13,8 @@ import re
 import jwt
 import logging
 
-from app.const import settings, CommonConstants, ErrorMessages
+from app.const import settings, CommonConstants, ErrorMessages, LOGGER_TYPE
+from app.config.log_config import service_error_logger
 from app.exceptions import CustomResponseException
 from app.utils.auth import get_kc_signing_key
 from app.utils.time import get_cur_time
@@ -24,6 +27,7 @@ from httpx import AsyncClient
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
+error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
 
 """
 auth 도메인 개별 서비스 함수 모음
@@ -52,11 +56,182 @@ def _active_signup_method(rows: list[dict]) -> Optional[str]:
     return None
 
 
-async def post_auth_signup(req_body: auth_schema.SignupReqBody, db: AsyncSession):
+@asynccontextmanager
+async def _join_or_begin_transaction(db: AsyncSession):
+    if db.in_transaction():
+        yield
+        return
+    async with db.begin():
+        yield
+
+
+async def create_social_signup_session(
+    pending_data: dict, db: AsyncSession
+) -> tuple[str, str]:
+    token = secrets.token_urlsafe(32)
+    binding_secret = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    binding_hash = hashlib.sha256(binding_secret.encode("utf-8")).hexdigest()
+    async with db.begin():
+        await db.execute(
+            text("""
+                INSERT INTO tb_social_signup_session (
+                    token_hash,
+                    binding_hash,
+                    provider,
+                    sns_link_id,
+                    email,
+                    birthdate,
+                    gender,
+                    keep_signin_yn,
+                    expired_date,
+                    use_yn
+                ) VALUES (
+                    :token_hash,
+                    :binding_hash,
+                    :provider,
+                    :sns_link_id,
+                    :email,
+                    :birthdate,
+                    :gender,
+                    :keep_signin_yn,
+                    DATE_ADD(NOW(), INTERVAL 10 MINUTE),
+                    'Y'
+                )
+            """),
+            {
+                "token_hash": token_hash,
+                "binding_hash": binding_hash,
+                "provider": pending_data["sns_signup_type"],
+                "sns_link_id": pending_data["sns_link_id"],
+                "email": pending_data["email"],
+                "birthdate": pending_data["birthdate"],
+                "gender": pending_data["gender"],
+                "keep_signin_yn": pending_data.get("keep_signin_yn") or "Y",
+            },
+        )
+    return token, binding_secret
+
+
+async def post_auth_social_signup_complete(
+    req_body: auth_schema.SocialSignupCompleteReqBody,
+    binding_secret: Optional[str],
+    db: AsyncSession,
+):
+    token_hash = hashlib.sha256(req_body.token.encode("utf-8")).hexdigest()
+    keycloak_compensation = {}
+    try:
+        async with db.begin():
+            result = await db.execute(
+                text("""
+                    SELECT social_signup_session_id,
+                           provider,
+                           sns_link_id,
+                           email,
+                           birthdate,
+                           gender,
+                           keep_signin_yn,
+                           binding_hash
+                      FROM tb_social_signup_session
+                     WHERE token_hash = :token_hash
+                       AND use_yn = 'Y'
+                       AND expired_date > NOW()
+                     FOR UPDATE
+                """),
+                {"token_hash": token_hash},
+            )
+            session_row = result.mappings().one_or_none()
+            if not session_row:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message=ErrorMessages.SOCIAL_SIGNUP_SESSION_EXPIRED,
+                )
+
+            stored_binding_hash = session_row.get("binding_hash") or ""
+            request_binding_hash = (
+                hashlib.sha256(binding_secret.encode("utf-8")).hexdigest()
+                if binding_secret
+                else ""
+            )
+            if not binding_secret or not secrets.compare_digest(
+                stored_binding_hash, request_binding_hash
+            ):
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message=ErrorMessages.SOCIAL_SIGNUP_SESSION_EXPIRED,
+                )
+
+            provider = session_row.get("provider")
+            password_by_provider = {
+                "naver": settings.NAVER_PASSWORD,
+                "kakao": settings.KAKAO_PASSWORD,
+                "google": settings.GOOGLE_PASSWORD,
+                "apple": settings.APPLE_PASSWORD,
+            }
+            password = password_by_provider.get(provider)
+            if not password:
+                raise CustomResponseException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message=ErrorMessages.SOCIAL_SIGNUP_SESSION_EXPIRED,
+                )
+
+            signup_req = auth_schema.SignupReqBody(
+                email=session_row.get("email"),
+                password=password,
+                birthdate=session_row.get("birthdate"),
+                gender=session_row.get("gender"),
+                ad_info_agree_yn=req_body.ad_info_agree_yn,
+                sns_signup_type=provider,
+                sns_link_id=session_row.get("sns_link_id"),
+                sns_keep_signin_yn=session_row.get("keep_signin_yn"),
+            )
+            signin_data = await post_auth_signup(
+                req_body=signup_req,
+                db=db,
+                keycloak_compensation=keycloak_compensation,
+            )
+            signin_req = auth_schema.SigninReqBody(**signin_data)
+            response = await post_auth_signin(req_body=signin_req, db=db)
+
+            await db.execute(
+                text("""
+                    UPDATE tb_social_signup_session
+                       SET use_yn = 'N'
+                     WHERE social_signup_session_id = :session_id
+                """),
+                {"session_id": session_row.get("social_signup_session_id")},
+            )
+    except Exception:
+        admin_acc_token = keycloak_compensation.get("admin_acc_token")
+        keycloak_user_id = keycloak_compensation.get("user_id")
+        if admin_acc_token and keycloak_user_id:
+            try:
+                await comm_service.kc_users_id_endpoint(
+                    method="DELETE",
+                    admin_acc_token=admin_acc_token,
+                    id=keycloak_user_id,
+                )
+            except Exception as compensation_error:
+                error_logger.error(
+                    "Keycloak compensation failed after social signup: %s",
+                    compensation_error,
+                    exc_info=True,
+                )
+        raise
+
+    response["keep_signin_yn"] = session_row.get("keep_signin_yn") or "Y"
+    return response
+
+
+async def post_auth_signup(
+    req_body: auth_schema.SignupReqBody,
+    db: AsyncSession,
+    keycloak_compensation: Optional[dict] = None,
+):
     admin_acc_token = None
     id = None
     try:
-        async with db.begin():
+        async with _join_or_begin_transaction(db):
             if req_body.sns_signup_type in ("naver", "google", "kakao", "apple"):
                 keep_signin_yn = req_body.sns_keep_signin_yn
             else:
@@ -547,6 +722,12 @@ async def post_auth_signup(req_body: auth_schema.SignupReqBody, db: AsyncSession
             "keep_signin_yn": keep_signin_yn,
         }
 
+    if keycloak_compensation is not None:
+        keycloak_compensation.update(
+            admin_acc_token=admin_acc_token,
+            user_id=id,
+        )
+
     return res_body
 
 
@@ -847,9 +1028,9 @@ async def get_auth_signup_google_callback(
             chk_flag = "Y"
         elif state[0] not in ("N", "Y"):
             chk_flag = "Y"
-        elif re.match(pattern, state[2:12]) is None:
+        elif re.match(pattern, state[2:12]) is None and state[2:12] != "9999-12-31":
             chk_flag = "Y"
-        elif state[13] not in ("M", "F"):
+        elif state[13] not in ("M", "F", "U"):
             chk_flag = "Y"
         elif state[14:] != "-likenovel":
             chk_flag = "Y"
@@ -888,7 +1069,7 @@ async def get_auth_signup_google_callback(
     google_gender_raw = state[13]
 
     # gender 값을 M 또는 F로 변환 (1=남성, 0=여성)
-    google_gender = None
+    google_gender = "U"
     if google_gender_raw:
         if google_gender_raw == "1" or google_gender_raw.upper() == "M":
             google_gender = "M"
@@ -1418,7 +1599,7 @@ async def post_auth_signin(
     req_body: auth_schema.SigninReqBody, db: AsyncSession, call_from: str = "user"
 ):
     try:
-        async with db.begin():
+        async with _join_or_begin_transaction(db):
             if req_body.sns_signup_type in ("naver", "google", "kakao", "apple"):
                 username = req_body.sns_link_id
                 latest_signed_type = req_body.sns_signup_type
@@ -1774,6 +1955,20 @@ async def get_auth_signin_naver_callback(
     naver_email = (
         tmp_res_json.get("email") if tmp_res_json.get("email") else "none@naver.com"
     )
+    naver_birthyear = (
+        tmp_res_json.get("birthyear") if tmp_res_json.get("birthyear") else "9999"
+    )
+    naver_birthday = (
+        tmp_res_json.get("birthday") if tmp_res_json.get("birthday") else "12-31"
+    )
+    naver_gender_raw = tmp_res_json.get("gender") if tmp_res_json.get("gender") else "U"
+
+    naver_gender = "U"
+    if naver_gender_raw and naver_gender_raw != "U":
+        if naver_gender_raw == "1" or naver_gender_raw.upper() == "M":
+            naver_gender = "M"
+        elif naver_gender_raw == "0" or naver_gender_raw.upper() == "F":
+            naver_gender = "F"
 
     try:
         async with db.begin():
@@ -1913,11 +2108,15 @@ async def get_auth_signin_naver_callback(
                     else:
                         raise
             else:
-                # 미등록 계정 - 에러 반환
-                raise CustomResponseException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
-                )
+                res_body = {
+                    "social_signup_pending": True,
+                    "email": naver_email,
+                    "keep_signin_yn": state[0],
+                    "sns_signup_type": "naver",
+                    "sns_link_id": naver_link_id,
+                    "birthdate": f"{naver_birthyear}-{naver_birthday}",
+                    "gender": naver_gender,
+                }
     except CustomResponseException:
         raise
     except OperationalError:
@@ -1965,9 +2164,9 @@ async def get_auth_signin_google_callback(
             chk_flag = "Y"
         elif state[0] not in ("N", "Y"):
             chk_flag = "Y"
-        elif re.match(pattern, state[2:12]) is None:
+        elif re.match(pattern, state[2:12]) is None and state[2:12] != "9999-12-31":
             chk_flag = "Y"
-        elif state[13] not in ("M", "F"):
+        elif state[13] not in ("M", "F", "U"):
             chk_flag = "Y"
         elif state[14:] != "-likenovel":
             chk_flag = "Y"
@@ -2002,6 +2201,15 @@ async def get_auth_signin_google_callback(
     )
     google_link_id = res_json.get("id")
     google_email = res_json.get("email") if res_json.get("email") else "none@gmail.com"
+    google_birthdate = state[2:12]
+    google_gender_raw = state[13]
+
+    google_gender = "U"
+    if google_gender_raw:
+        if google_gender_raw == "1" or google_gender_raw.upper() == "M":
+            google_gender = "M"
+        elif google_gender_raw == "0" or google_gender_raw.upper() == "F":
+            google_gender = "F"
 
     try:
         async with db.begin():
@@ -2141,11 +2349,15 @@ async def get_auth_signin_google_callback(
                     else:
                         raise
             else:
-                # 미등록 계정 - 에러 반환
-                raise CustomResponseException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
-                )
+                res_body = {
+                    "social_signup_pending": True,
+                    "email": google_email,
+                    "keep_signin_yn": state[0],
+                    "sns_signup_type": "google",
+                    "sns_link_id": google_link_id,
+                    "birthdate": google_birthdate,
+                    "gender": google_gender,
+                }
     except CustomResponseException:
         raise
     except OperationalError:
@@ -2229,8 +2441,27 @@ async def get_auth_signin_kakao_callback(
             if res_json.get("kakao_account").get("email")
             else "none@kakao.com"
         )
+        kakao_birthyear = (
+            res_json.get("kakao_account").get("birthyear")
+            if res_json.get("kakao_account").get("birthyear")
+            else "9999"
+        )
+        kakao_birthday = (
+            res_json.get("kakao_account").get("birthday")
+            if res_json.get("kakao_account").get("birthday")
+            else "12-31"
+        )
+        if res_json.get("kakao_account").get("gender"):
+            kakao_gender = (
+                "M" if res_json.get("kakao_account").get("gender") == "male" else "F"
+            )
+        else:
+            kakao_gender = "U"
     else:
         kakao_email = "none@kakao.com"
+        kakao_birthyear = "9999"
+        kakao_birthday = "12-31"
+        kakao_gender = "U"
 
     try:
         async with db.begin():
@@ -2377,11 +2608,15 @@ async def get_auth_signin_kakao_callback(
                     else:
                         raise
             else:
-                # 미등록 계정 - 에러 반환
-                raise CustomResponseException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
-                )
+                res_body = {
+                    "social_signup_pending": True,
+                    "email": kakao_email,
+                    "keep_signin_yn": state[0],
+                    "sns_signup_type": "kakao",
+                    "sns_link_id": kakao_link_id,
+                    "birthdate": f"{kakao_birthyear}-{kakao_birthday}",
+                    "gender": kakao_gender,
+                }
     except CustomResponseException:
         raise
     except OperationalError as e:
@@ -2468,6 +2703,15 @@ async def get_auth_signin_apple_callback(
     # @privaterelay.appleid.com 형식 필터링 필요
     if apple_email != "" and apple_email[0] == "@":
         apple_email = "none@apple.com"
+    apple_birthdate = state[2:12]
+    apple_gender_raw = state[13]
+
+    apple_gender = None
+    if apple_gender_raw:
+        if apple_gender_raw == "1" or apple_gender_raw.upper() == "M":
+            apple_gender = "M"
+        elif apple_gender_raw == "0" or apple_gender_raw.upper() == "F":
+            apple_gender = "F"
 
     try:
         async with db.begin():
@@ -2516,11 +2760,15 @@ async def get_auth_signin_apple_callback(
                     "sns_link_id": username,
                 }
             else:
-                # 미등록 계정 - 에러 반환
-                raise CustomResponseException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    message=ErrorMessages.NOT_REGISTERED_ACCOUNT,
-                )
+                res_body = {
+                    "social_signup_pending": True,
+                    "email": apple_email,
+                    "keep_signin_yn": state[0],
+                    "sns_signup_type": "apple",
+                    "sns_link_id": apple_link_id,
+                    "birthdate": apple_birthdate,
+                    "gender": apple_gender,
+                }
     except CustomResponseException:
         raise
     except OperationalError:

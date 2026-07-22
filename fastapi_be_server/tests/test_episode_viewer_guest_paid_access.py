@@ -2,6 +2,7 @@ import unittest
 from fastapi import status
 
 from app.exceptions import CustomResponseException
+from app.const import settings
 from app.services.product import episode_service
 
 
@@ -25,8 +26,16 @@ class _FakeResult:
 
 
 class _GuestPaidEpisodeDb:
-    def __init__(self):
+    def __init__(
+        self,
+        episode_no: int = 3,
+        price_type: str = "paid",
+        product_price_type: str = "paid",
+    ):
         self.execute_count = 0
+        self.episode_no = episode_no
+        self.price_type = price_type
+        self.product_price_type = product_price_type
 
     async def execute(self, *_args, **_kwargs):
         self.execute_count += 1
@@ -47,7 +56,7 @@ class _GuestPaidEpisodeDb:
             [
                 {
                     "product_id": 2011,
-                    "episode_no": 3,
+                    "episode_no": self.episode_no,
                     "title": "유료 테스트",
                     "cover_image_path": None,
                     "episode_title": "3화",
@@ -60,8 +69,8 @@ class _GuestPaidEpisodeDb:
                     "evaluation_open_yn": "Y",
                     "prev_episode_id": 27361,
                     "next_episode_id": 27676,
-                    "price_type": "paid",
-                    "product_price_type": "paid",
+                    "price_type": self.price_type,
+                    "product_price_type": self.product_price_type,
                     "websochat_context_status": "pending",
                     "websochat_published_latest_episode_no": 5,
                     "websochat_synced_latest_episode_no": 0,
@@ -96,3 +105,23 @@ class EpisodeViewerGuestPaidAccessTest(unittest.IsolatedAsyncioTestCase):
             exc.exception.status_code,
             status.HTTP_401_UNAUTHORIZED,
         )
+        self.assertIsNone(exc.exception.code)
+
+    async def test_guest_viewer_returns_dedicated_code_after_fifth_free_episode(self):
+        with self.assertRaises(CustomResponseException) as exc:
+            await episode_service.get_episodes_episode_id(
+                episode_id="27365",
+                kc_user_id="",
+                db=_GuestPaidEpisodeDb(
+                    episode_no=6,
+                    price_type="free",
+                    product_price_type="free",
+                ),
+            )
+
+        self.assertEqual(exc.exception.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(
+            exc.exception.code,
+            settings.CustomStatusCode.GUEST_EPISODE_LIMIT.value,
+        )
+

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, EmailStr, field_validator
-from typing import Optional
+from typing import Literal, Optional
 
 import re
 
@@ -54,6 +54,13 @@ class SignupReqBody(AuthBase):
             raise ValueError("특문 포함")
 
         return value
+
+
+class SocialSignupCompleteReqBody(AuthBase):
+    token: str = Field(min_length=20, max_length=200, description="소셜 가입 단기 세션 토큰")
+    ad_info_agree_yn: Literal["Y", "N"] = Field(
+        examples=["N"], description="광고성정보 수신동의 여부"
+    )
 
 
 class EmailDuplicateCheckReqBody(AuthBase):

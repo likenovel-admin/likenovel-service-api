@@ -1165,10 +1165,16 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
             if db_rst:
                 episode_no = int(db_rst[0].get("episode_no") or 0)
                 episode_price_type = db_rst[0].get("price_type")
-                if episode_price_type == "paid" or episode_no > 5:
+                if episode_price_type == "paid":
                     raise CustomResponseException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         message=ErrorMessages.LOGIN_REQUIRED,
+                    )
+                if episode_no > 5:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        code=settings.CustomStatusCode.GUEST_EPISODE_LIMIT.value,
+                        message=ErrorMessages.GUEST_EPISODE_LIMIT,
                     )
 
                 product_price_type = db_rst[0].get("product_price_type")

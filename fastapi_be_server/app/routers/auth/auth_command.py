@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Cookie, Depends, status
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Union, Dict, Any
 from urllib.parse import quote
@@ -15,6 +15,36 @@ import app.services.auth.auth_service as auth_service
 router = APIRouter(prefix="/auth")
 
 error_logger = service_error_logger(LOGGER_TYPE.LOGGER_FILE_NAME_FOR_SERVICE_ERROR)
+
+
+async def _social_signup_pending_redirect(
+    res_body: Dict[str, Any], db: AsyncSession
+):
+    if not res_body.get("social_signup_pending"):
+        return None
+
+    token, binding_secret = await auth_service.create_social_signup_session(
+        res_body, db
+    )
+    provider = res_body.get("sns_signup_type") or ""
+    redirect_url = (
+        f"{settings.FE_DOMAIN}/sign-up"
+        f"?social_pending={quote(token)}&provider={quote(provider)}"
+    )
+    response = RedirectResponse(url=redirect_url, status_code=302)
+    cookie_options = {
+        "key": "ln_social_signup_binding",
+        "value": binding_secret,
+        "max_age": 600,
+        "path": "/",
+        "httponly": True,
+        "secure": settings.FE_DOMAIN.startswith("https"),
+        "samesite": "lax",
+    }
+    if settings.SOCIAL_SIGNUP_COOKIE_DOMAIN:
+        cookie_options["domain"] = settings.SOCIAL_SIGNUP_COOKIE_DOMAIN
+    response.set_cookie(**cookie_options)
+    return response
 
 # TODO: 본인인증, 통합아이디 연동 (tb_user의 identity_yn과 tb_user_social의 integrated_user_id, default_yn 활용)
 
@@ -97,6 +127,52 @@ async def post_auth_signup(
     req_body = auth_schema.SigninReqBody(**res_body)
 
     return await post_auth_signin(req_body=req_body, db=db)
+
+
+@router.post(
+    "/signup/social/complete",
+    tags=["인증 - sns 로그인 연동"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_auth_social_signup_complete(
+    req_body: auth_schema.SocialSignupCompleteReqBody,
+    binding_secret: Union[str, None] = Cookie(
+        default=None, alias="ln_social_signup_binding"
+    ),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    try:
+        content = await auth_service.post_auth_social_signup_complete(
+            req_body=req_body,
+            binding_secret=binding_secret,
+            db=db,
+        )
+        response = JSONResponse(content=content)
+    except CustomResponseException as exc:
+        content = {}
+        if exc.code:
+            content["code"] = exc.code
+        if exc.message:
+            content["message"] = exc.message
+        response = JSONResponse(content=content, status_code=exc.status_code)
+    except Exception as exc:
+        error_logger.error(
+            "Social signup completion failed: %s", exc, exc_info=True
+        )
+        response = JSONResponse(
+            content={"message": ErrorMessages.INTERNAL_SERVER_ERROR},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    if settings.SOCIAL_SIGNUP_COOKIE_DOMAIN:
+        response.delete_cookie(
+            key="ln_social_signup_binding",
+            path="/",
+            domain=settings.SOCIAL_SIGNUP_COOKIE_DOMAIN,
+        )
+    else:
+        response.delete_cookie(key="ln_social_signup_binding", path="/")
+    return response
 
 
 @router.get(
@@ -631,6 +707,9 @@ async def get_auth_signin_naver_callback(
         res_body = await auth_service.get_auth_signin_naver_callback(
             db=db, code=code, state=state, error=error
         )
+        pending_redirect = await _social_signup_pending_redirect(res_body, db)
+        if pending_redirect:
+            return pending_redirect
         keep_signin_yn = (
             res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
         )
@@ -713,6 +792,9 @@ async def get_auth_signin_google_callback(
         res_body = await auth_service.get_auth_signin_google_callback(
             db=db, code=code, state=state, error=error
         )
+        pending_redirect = await _social_signup_pending_redirect(res_body, db)
+        if pending_redirect:
+            return pending_redirect
         keep_signin_yn = (
             res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
         )
@@ -795,6 +877,9 @@ async def get_auth_signin_kakao_callback(
         res_body = await auth_service.get_auth_signin_kakao_callback(
             db=db, code=code, state=state, error=error
         )
+        pending_redirect = await _social_signup_pending_redirect(res_body, db)
+        if pending_redirect:
+            return pending_redirect
         keep_signin_yn = (
             res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
         )
@@ -910,6 +995,9 @@ async def get_auth_signin_apple_callback(
         res_body = await auth_service.get_auth_signin_apple_callback(
             db=db, code=code, state=state, error=error
         )
+        pending_redirect = await _social_signup_pending_redirect(res_body, db)
+        if pending_redirect:
+            return pending_redirect
         keep_signin_yn = (
             res_body.get("sns_keep_signin_yn") or res_body.get("keep_signin_yn") or "Y"
         )

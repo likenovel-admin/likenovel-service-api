@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     FE_DOMAIN: str = os.getenv("FE_DOMAIN", "")
     FE_WWW_DOMAIN: str = os.getenv("FE_WWW_DOMAIN", "")
     FE_REDIRECT_URL: str = f"{FE_WWW_DOMAIN}/storage-relay"
+    SOCIAL_SIGNUP_COOKIE_DOMAIN: str = os.getenv(
+        "SOCIAL_SIGNUP_COOKIE_DOMAIN", ""
+    )
 
     # 데이터 분석용 파일 로그
     LOGGER_NAME: str = "analysis"
@@ -171,6 +174,7 @@ class Settings(BaseSettings):
         EXPIRED_ACCESS_TOKEN: str = "E4010"
         EXPIRED_REFRESH_TOKEN: str = "E4011"
         NEED_IDENTITY: str = "E4012"
+        GUEST_EPISODE_LIMIT: str = "E4013"
         INVALID_EMAIL: str = "E4220"
         INVALID_PASSWORD: str = "E4221"
         INVALID_STATE: str = "E4222"
@@ -325,12 +329,14 @@ class CommonConstants:
 class ErrorMessages:
     # 인증/권한 관련
     LOGIN_REQUIRED = "로그인이 필요합니다."
+    GUEST_EPISODE_LIMIT = "게스트는 5화까지 열람할 수 있습니다."
     LOGIN_PLEASE = "로그인 해주세요."
     ADMIN_ACCOUNT_REQUIRED = "관리자 계정이 아닙니다."
     ADMIN_LOGIN_REQUIRED = "관리자 계정으로 로그인 해주세요."
     EXPIRED_ACCESS_TOKEN = "액세스 토큰이 만료되었습니다."
     EXPIRED_REFRESH_TOKEN = "리프레시 토큰이 만료되었습니다."
     INVALID_TOKEN = "유효하지 않은 토큰입니다."
+    SOCIAL_SIGNUP_SESSION_EXPIRED = "소셜 가입 인증 세션이 만료되었거나 유효하지 않습니다."
     INVALID_LOGIN_INFO = "올바르지 않은 로그인 정보입니다."
     INVALID_EMAIL_FORMAT = "유효하지 않은 이메일 형식입니다."
     INVALID_PASSWORD_FORMAT = "유효하지 않은 비밀번호 형식입니다."
