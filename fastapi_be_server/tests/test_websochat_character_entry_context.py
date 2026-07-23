@@ -18,11 +18,13 @@ from app.services.websochat.websochat_game_memory import _normalize_websochat_se
 from app.services.websochat.websochat_service import (
     _assert_websochat_character_chat_read_scope_not_decreased,
     _ensure_websochat_character_chat_entry_context,
+    _filter_websochat_character_chat_examples_by_read_scope,
 )
 from app.services.websochat.websochat_rp_renderer import (
     _build_character_chat_adjacent_opening_prompt,
     _build_character_chat_safe_scene_material,
     _normalize_character_chat_adjacent_opening_payload,
+    _select_rp_examples,
     build_websochat_rp_system_prompt,
     generate_character_chat_adjacent_opening_with_gemini,
 )
@@ -111,6 +113,35 @@ def _entry_context(
 
 
 class WebsochatCharacterEntryContextTests(unittest.TestCase):
+    def test_prologue_rp_example_is_usable_at_first_read_scope(self):
+        examples = [
+            {"episode_no": 0, "text": "프롤로그 대사"},
+            {"episode_no": 1, "text": "첫 등록 회차 대사"},
+            {"episode_no": -1, "text": "잘못된 대사"},
+            {"text": "회차 근거 없는 대사"},
+            {"episode_no": 2, "text": "아직 읽지 않은 대사"},
+        ]
+
+        bounded = _filter_websochat_character_chat_examples_by_read_scope(
+            examples,
+            read_episode_to=1,
+        )
+        self.assertEqual(
+            [item["episode_no"] for item in bounded],
+            [0, 1],
+        )
+        self.assertEqual(
+            _select_rp_examples(
+                examples_payload=bounded,
+                anchor_episode_no=1,
+                recent_messages=[],
+                scene_summary_text="",
+                relationship_stage="",
+                read_episode_to=1,
+            ),
+            ["- 첫 등록 회차 대사", "- 프롤로그 대사"],
+        )
+
     def test_character_catalog_is_an_allowed_character_chat_entry_source(self):
         req = PostWebsochatSessionReqBody(
             product_id=1182,

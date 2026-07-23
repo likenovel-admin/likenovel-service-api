@@ -600,8 +600,15 @@ def _select_rp_examples(
     seen_texts: set[str] = set()
     for item in examples_payload:
         example_text = str(item.get("text") or "").strip()
-        episode_no = int(item.get("episode_no") or 0)
-        if read_episode_to > 0 and (episode_no <= 0 or episode_no > read_episode_to):
+        if "episode_no" not in item:
+            continue
+        try:
+            episode_no = int(item.get("episode_no"))
+        except (TypeError, ValueError):
+            continue
+        if episode_no < 0:
+            continue
+        if read_episode_to > 0 and episode_no > read_episode_to:
             continue
         if not example_text or example_text in seen_texts:
             continue

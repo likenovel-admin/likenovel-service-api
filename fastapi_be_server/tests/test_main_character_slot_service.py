@@ -44,7 +44,7 @@ def _row(
     }
 
 
-def test_main_character_slot_roster_accepts_only_slot_eligible_characters():
+def test_main_character_slot_roster_accepts_only_chat_and_slot_eligible_characters():
     from app.services.product.main_character_slot_service import (
         extract_eligible_main_character_roster,
     )
@@ -78,16 +78,6 @@ def test_main_character_slot_roster_accepts_only_slot_eligible_characters():
             "scopeKey": "character:adelite",
             "displayName": "아델리트",
             "aliases": ["아델리트", "공녀"],
-            "distinctEpisodeCount": 10,
-            "exampleCount": 5,
-            "sceneCount": 5,
-            "chatQuality": "good",
-            "qualityReason": "회차·RP 예시·장면 데이터 충분",
-        },
-        {
-            "scopeKey": "character:ally",
-            "displayName": "동료",
-            "aliases": ["동료"],
             "distinctEpisodeCount": 10,
             "exampleCount": 5,
             "sceneCount": 5,
@@ -298,6 +288,7 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     )
 
     query = build_public_main_character_slots_query()
+    normalized_query = " ".join(query.split())
 
     assert "mcs.use_yn = 'Y'" in query
     assert "mcs.deleted_yn = 'N'" in query
@@ -323,15 +314,25 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "inventory.summary_type = 'character_inventory_v3'" in query
     assert "profile.scope_key" in query
     assert "examples.scope_key" in query
-    assert "JSON_QUOTE(mcs.character_scope_key)" in query
     assert "summary_type = 'episode_scene_extraction'" in query
     assert "eligible_scene.episode_to = 1" in query
     assert "JSON_VALID(eligible_scene.summary_text)" in query
+    assert "NESTED PATH '$.participants[*]'" in query
+    assert "NESTED PATH '$.action_ownership[*]'" in query
+    assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
+    assert "eligible_scene_row.action_scope_key = mcs.character_scope_key" in normalized_query
     assert "eligible_episode.use_yn = 'Y'" in query
     assert "eligible_episode.open_yn = 'Y'" in query
     assert "COALESCE(eligible_episode.price_type, 'free') = 'free'" in query
     assert "eligible_doc.is_active = 'Y'" in query
     assert "FROM tb_story_agent_context_chunk eligible_chunk" in query
+    assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
+    assert "eligible_episode_summary.episode_to = 1" in query
+    assert "eligible_episode_summary.scope_key" in query
+    assert "CONCAT('episode:', eligible_episode.episode_id)" in query
+    assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
+    assert "AS fullReady" not in query
+    assert "AS readinessCoverageRatio" not in query
     assert "q.group_type = 'character'" in query
     assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
     assert query.rstrip().endswith("LIMIT 12")
@@ -344,9 +345,18 @@ def test_public_character_catalog_query_uses_same_quality_gate_without_home_limi
     )
 
     query = build_public_character_catalog_query()
+    normalized_query = " ".join(query.split())
 
-    assert "JSON_QUOTE(mcs.character_scope_key)" in query
     assert "summary_type = 'episode_scene_extraction'" in query
+    assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
+    assert "eligible_scene_row.action_scope_key = mcs.character_scope_key" in normalized_query
+    assert "AS _chatReadyEpisodeCount" in query
+    assert "AS _chatTotalEpisodeCount" in query
+    assert "readiness_episode.use_yn = 'Y'" in query
+    assert "readiness_episode.open_yn = 'Y'" in query
+    assert "readiness_summary.scope_key" in query
+    assert "CONCAT('episode:', readiness_episode.episode_id)" in query
+    assert "readiness_summary.episode_to = readiness_episode.episode_no" in query
     assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
     assert "LIMIT 12" not in query
 
@@ -416,6 +426,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "characterSlotId": 1,
                 "productId": 1182,
                 "characterScopeKey": "character:adelite",
+                "_chatReadyEpisodeCount": 3,
+                "_chatTotalEpisodeCount": 4,
             }
         ]
         db = AsyncMock()
@@ -434,6 +446,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "characterSlotId": 1,
                     "productId": 1182,
                     "characterScopeKey": "character:adelite",
+                    "fullReady": False,
+                    "readinessCoverageRatio": 0.75,
                     "lastViewedEpisodeNo": None,
                     "lastViewedAt": None,
                 }
@@ -445,8 +459,18 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
 
         catalog_result = MagicMock()
         catalog_result.mappings.return_value.all.return_value = [
-            {"characterSlotId": 1, "productId": 1182},
-            {"characterSlotId": 2, "productId": 1192},
+            {
+                "characterSlotId": 1,
+                "productId": 1182,
+                "_chatReadyEpisodeCount": 12,
+                "_chatTotalEpisodeCount": 12,
+            },
+            {
+                "characterSlotId": 2,
+                "productId": 1192,
+                "_chatReadyEpisodeCount": 6,
+                "_chatTotalEpisodeCount": 12,
+            },
         ]
         progress_result = MagicMock()
         progress_result.mappings.return_value.all.return_value = [
@@ -490,12 +514,16 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 {
                     "characterSlotId": 1,
                     "productId": 1182,
+                    "fullReady": True,
+                    "readinessCoverageRatio": 1.0,
                     "lastViewedEpisodeNo": 17,
                     "lastViewedAt": "2026-07-22 12:34:56",
                 },
                 {
                     "characterSlotId": 2,
                     "productId": 1192,
+                    "fullReady": False,
+                    "readinessCoverageRatio": 0.5,
                     "lastViewedEpisodeNo": None,
                     "lastViewedAt": None,
                 },
@@ -613,6 +641,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
         assert "p.status_code = 'ongoing'" in query
         assert "$.public_slot_eligible" in query
+        assert "$.public_chat_eligible" in query
         assert "$.display_safety.status" in query
         assert "summary_type = 'character_rp_profile'" in query
         assert "summary_type = 'character_rp_examples'" in query
@@ -628,6 +657,41 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "COALESCE(eligible_episode.price_type, 'free') = 'free'" in query
         assert "eligible_doc.is_active = 'Y'" in query
         assert "FROM tb_story_agent_context_chunk eligible_chunk" in query
+        assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
+        assert "eligible_episode_summary.episode_to = 1" in query
+        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
+        assert "NESTED PATH '$.participants[*]'" in query
+        assert "NESTED PATH '$.action_ownership[*]'" in query
+        assert "eligible_scene_row.participant_scope_key" in query
+        assert "eligible_scene_row.action_scope_key" in query
+        assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
+
+    async def test_character_preview_looks_up_episode_summary_by_episode_number(self):
+        from app.exceptions import CustomResponseException
+        from app.services.product import main_character_slot_service
+
+        profile_result = MagicMock()
+        profile_result.mappings.return_value.one_or_none.return_value = {
+            "inventorySummaryText": "{}",
+            "profileSummaryText": "{}",
+        }
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = []
+        db = AsyncMock()
+        db.execute.side_effect = [profile_result, scene_result]
+
+        with self.assertRaises(CustomResponseException):
+            await main_character_slot_service.get_public_character_chat_preview(
+                product_id=1182,
+                character_scope_key="character:adelite",
+                episode_no=5,
+                db=db,
+            )
+
+        query = str(db.execute.await_args_list[1].args[0])
+        assert "episode_summary.episode_to = pe.episode_no" in query
+        assert "CONCAT('episode:', pe.episode_id)" in query
+        assert "episode_summary.scope_key = CONCAT('episode:', pe.episode_no)" not in query
 
     async def test_roster_query_reads_only_active_character_inventory_v3(self):
         from app.services.product import main_character_slot_service
@@ -654,6 +718,14 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert ">= '2026-03-01 00:00:00'" in query
         assert "summary_type = 'character_rp_profile'" in query
         assert "summary_type = 'character_rp_examples'" in query
+        assert "$.public_chat_eligible" in query
+        assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
+        assert "eligible_episode_summary.episode_to = 1" in query
+        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
+        assert "NESTED PATH '$.participants[*]'" in query
+        assert "NESTED PATH '$.action_ownership[*]'" in query
+        assert "eligible_scene_row.participant_scope_key" in query
+        assert "eligible_scene_row.action_scope_key" in query
         assert "JSON_LENGTH" in query
         assert "AS exampleCount" in query
         assert "AS sceneCount" in query
@@ -679,9 +751,14 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         )
 
         query = str(db.execute.await_args_list[1].args[0])
+        normalized_query = " ".join(query.split())
         assert "AS publicEligible" in query
         assert "summary_type = 'episode_scene_extraction'" in query
-        assert "JSON_QUOTE(mcs.character_scope_key)" in query
+        assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
+        assert "eligible_scene_row.action_scope_key = mcs.character_scope_key" in normalized_query
+        assert "$.public_chat_eligible" in query
+        assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
+        assert "eligible_episode_summary.episode_to = 1" in query
         assert response["results"] == []
 
     async def test_product_search_only_returns_consented_products_with_fifteen_public_episodes(self):
@@ -706,10 +783,12 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "episode_stats.first_public_episode_at >= :first_public_episode_at" in query
         assert "summary_type = 'character_inventory_v3'" in query
         assert "$.public_slot_eligible" in query
-        assert "$.public_chat_eligible" not in query
+        assert "$.public_chat_eligible" in query
         assert "$.display_safety.status" in query
         assert "summary_type = 'character_rp_profile'" in query
         assert "summary_type = 'character_rp_examples'" in query
+        assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
+        assert "eligible_episode_summary.episode_to = 1" in query
         assert "{_chat_ready_rp_assets_predicate" not in query
         assert params["minimum_open_episode_count"] == 15
         assert params["first_public_episode_at"] == "2026-03-01 00:00:00"
@@ -786,10 +865,12 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             assert "p.status_code = 'ongoing'" in query
             assert "summary_type = 'character_inventory_v3'" in query
             assert "$.public_slot_eligible" in query
-            assert "$.public_chat_eligible" not in query
+            assert "$.public_chat_eligible" in query
             assert "$.display_safety.status" in query
             assert "summary_type = 'character_rp_profile'" in query
             assert "summary_type = 'character_rp_examples'" in query
+            assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
+            assert "eligible_episode_summary.episode_to = 1" in query
             assert "JSON_LENGTH" in query
             assert ">= :minimum_open_episode_count" in query
             assert ">= :first_public_episode_at" in query
