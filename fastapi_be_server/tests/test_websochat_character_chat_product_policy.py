@@ -48,7 +48,33 @@ def _product_row(*, character_chat_eligible: int) -> dict:
 
 
 class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
-    async def test_product_lookup_computes_policy_without_filtering_general_websochat(self):
+    def test_character_chat_rp_lookup_includes_inventory_source_aliases(self):
+        scope_keys = websochat_service._build_websochat_rp_lookup_scope_keys(
+            normalized_memory={"session_kind": "character_chat"},
+            resolved_active_character="character:조렌테이머",
+            resolution={
+                "aliasScopeKeys": ["unrelated:alias"],
+                "inventoryPayload": {
+                    "protagonist_identity_scope_keys": ["character:방호영"],
+                    "source_character_keys": [
+                        "protagonist:named:방호영",
+                        "named:방호영",
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(
+            scope_keys,
+            [
+                "character:조렌테이머",
+                "character:방호영",
+                "protagonist:named:방호영",
+                "named:방호영",
+            ],
+        )
+
+    async def test_product_lookup_uses_only_public_episode_count_for_character_chat(self):
         db = _Db(_product_row(character_chat_eligible=0))
 
         product = await websochat_service._get_websochat_product(1182, "N", db)
@@ -56,11 +82,105 @@ class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(product)
         self.assertFalse(product["characterChatEligible"])
         query = db.statements[0]
-        self.assertIn("p.status_code = 'ongoing'", query)
         self.assertIn("COUNT(e.episode_id) >= 15", query)
-        self.assertIn("MIN(COALESCE(", query)
-        self.assertIn("e.open_changed_date", query)
-        self.assertIn(">= '2026-03-01 00:00:00'", query)
+        self.assertNotIn("p.status_code = 'ongoing'", query)
+        self.assertNotIn("e.open_changed_date", query)
+        self.assertNotIn("2026-03-01", query)
+
+    async def test_product_session_state_uses_same_public_episode_count_policy(self):
+        db = _Db(
+            {
+                **_product_row(character_chat_eligible=1),
+                "openYn": "Y",
+                "blindYn": "N",
+                "aiContentServiceEnabledYn": "Y",
+                "ratingsCode": "all",
+            }
+        )
+
+        product = await websochat_service._get_websochat_product_session_state(
+            1182,
+            "N",
+            db,
+        )
+
+        self.assertTrue(product["characterChatEligible"])
+        query = db.statements[0]
+        self.assertIn("COUNT(e.episode_id) >= 15", query)
+        self.assertNotIn("p.status_code = 'ongoing'", query)
+        self.assertNotIn("e.open_changed_date", query)
+        self.assertNotIn("2026-03-01", query)
+
+    async def test_character_chat_rp_examples_fall_back_only_when_filter_is_empty(self):
+        async def load_context(examples):
+            async def get_summary_row(*, summary_type, **_kwargs):
+                payloads = {
+                    "character_rp_profile": {
+                        "scope_key": "character:adelite",
+                        "display_name": "아델리트",
+                        "speech_style": {"tone": "차분함"},
+                    },
+                    "character_rp_examples": {
+                        "scope_key": "character:adelite",
+                        "examples": examples,
+                    },
+                }
+                payload = payloads.get(summary_type)
+                return (
+                    {"summaryText": json.dumps(payload, ensure_ascii=False)}
+                    if payload is not None
+                    else None
+                )
+
+            with (
+                patch.object(
+                    websochat_service,
+                    "_resolve_websochat_active_character_resolution",
+                    new_callable=AsyncMock,
+                    return_value={"scopeKey": "character:adelite"},
+                ),
+                patch.object(
+                    websochat_service,
+                    "_get_websochat_first_available_summary_row",
+                    new_callable=AsyncMock,
+                    side_effect=get_summary_row,
+                ),
+                patch.object(
+                    websochat_service,
+                    "_is_websochat_character_chat_rp_context_ready",
+                    return_value=True,
+                ),
+                patch.object(
+                    websochat_service,
+                    "_build_websochat_rp_trajectory_context",
+                    new_callable=AsyncMock,
+                    return_value={},
+                ),
+            ):
+                return await websochat_service._load_websochat_rp_context(
+                    product_row={
+                        "productId": 1182,
+                        "latestEpisodeNo": 15,
+                    },
+                    session_memory={
+                        "session_kind": "character_chat",
+                        "locked_character_scope_key": "character:adelite",
+                        "allowed_modes": ["rp"],
+                        "active_mode": "rp",
+                        "active_character": "character:adelite",
+                        "rp_mode": "free",
+                        "read_episode_to": 1,
+                    },
+                    db=AsyncMock(),
+                )
+
+        out_of_scope_example = {"episode_no": 7, "text": "후반부 말투 예시"}
+        fallback_context = await load_context([out_of_scope_example])
+        self.assertEqual(fallback_context["examples"], [out_of_scope_example])
+
+        in_scope_example = {"episode_no": 1, "text": "첫 화 말투 예시"}
+        bounded_context = await load_context([in_scope_example, out_of_scope_example])
+        self.assertEqual(bounded_context["examples"], [in_scope_example])
 
     def test_only_character_chat_uses_product_policy_for_send_permission(self):
         product = {"canSendMessage": True, "characterChatEligible": 0}

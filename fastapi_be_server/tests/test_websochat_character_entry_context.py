@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from fastapi import status
 
@@ -13,6 +13,7 @@ from app.services.websochat import websochat_service
 from app.services.websochat.websochat_context_loader import (
     _build_websochat_character_entry_context_v2,
     _is_websochat_character_entry_context_v2,
+    load_websochat_character_entry_context_v2,
 )
 from app.services.websochat.websochat_game_memory import _normalize_websochat_session_memory
 from app.services.websochat.websochat_service import (
@@ -22,6 +23,7 @@ from app.services.websochat.websochat_service import (
 )
 from app.services.websochat.websochat_rp_renderer import (
     _build_character_chat_adjacent_opening_prompt,
+    _build_character_chat_entry_context_lines,
     _build_character_chat_safe_scene_material,
     _normalize_character_chat_adjacent_opening_payload,
     _select_rp_examples,
@@ -440,9 +442,12 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
         incomplete["recent_plot_rows"] = incomplete["recent_plot_rows"][:1]
         future = _entry_context(14)
         future["character_anchor_episode_no"] = 15
+        invalid_source = _entry_context(14)
+        invalid_source["character_scene_source"] = "unknown"
 
         self.assertFalse(_is_websochat_character_entry_context_v2(incomplete))
         self.assertFalse(_is_websochat_character_entry_context_v2(future))
+        self.assertFalse(_is_websochat_character_entry_context_v2(invalid_source))
         self.assertFalse(
             _is_websochat_character_entry_context_v2(
                 _entry_context(14),
@@ -511,6 +516,7 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
             [13, 14],
         )
         self.assertEqual(context["character_anchor_episode_no"], 14)
+        self.assertEqual(context["character_scene_source"], "matched_character")
         self.assertEqual(context["character_scene"]["scene_gist"], "14화 현재 장면")
         self.assertEqual(
             context["character_scene"]["turn_continuation_contract"]["scene_exit_condition"],
@@ -546,6 +552,7 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
         )
 
         self.assertEqual(context["character_anchor_episode_no"], 9)
+        self.assertEqual(context["character_scene_source"], "matched_character")
         self.assertEqual(context["character_scene"]["scene_gist"], "아델리트의 마지막 등장")
         self.assertEqual(
             [row["episode_no"] for row in context["recent_plot_rows"]],
@@ -563,16 +570,56 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
 
         self.assertEqual(context, {})
 
-    def test_missing_character_scene_is_not_ready(self):
+    def test_missing_character_scene_uses_latest_read_scope_scene(self):
         context = _build_websochat_character_entry_context_v2(
             product_id=1182,
             read_episode_to=14,
             character_scope_keys=["character:아델리트"],
             plot_rows=[_plot_row(14, "14화"), _plot_row(13, "13화")],
-            scene_rows=[_scene_row(14, [_character_scene("경비병")])],
+            scene_rows=[
+                _scene_row(15, [_character_scene("상인", gist="15화 미래 장면")]),
+                _scene_row(14, [_character_scene("경비병", gist="14화 작품 장면")]),
+                _scene_row(13, [_character_scene("상인", gist="13화 작품 장면")]),
+            ],
         )
 
-        self.assertEqual(context, {})
+        self.assertEqual(context["character_scene_source"], "read_scope_fallback")
+        self.assertEqual(context["character_anchor_episode_no"], 14)
+        self.assertEqual(context["character_scene"]["scene_gist"], "14화 작품 장면")
+        self.assertNotIn("15화 미래 장면", json.dumps(context, ensure_ascii=False))
+
+    def test_fallback_renderer_marks_work_scene_and_requires_if_character_join(self):
+        context = _build_websochat_character_entry_context_v2(
+            product_id=1182,
+            read_episode_to=14,
+            character_scope_keys=["character:아델리트"],
+            plot_rows=[_plot_row(14, "14화"), _plot_row(13, "13화")],
+            scene_rows=[_scene_row(14, [_character_scene("경비병", gist="경비병의 순찰 장면")])],
+        )
+
+        lines = _build_character_chat_entry_context_lines(context)
+        rendered = "\n".join(lines)
+        material = _build_character_chat_safe_scene_material(context)
+        opening_prompt = _build_character_chat_adjacent_opening_prompt(
+            product_row={"productId": 1182, "title": "테스트 작품"},
+            rp_context={
+                "active_character": "character:아델리트",
+                "display_name": "아델리트",
+                "speech_style": {},
+                "examples": [],
+                "character_chat_entry_context": context,
+            },
+        )
+
+        self.assertIn("읽은 범위의 작품 장면 근거: 14화", rendered)
+        self.assertIn("IF 곁가지로 새롭게 합류", rendered)
+        self.assertIn("원래 있었다고 만들지 마라", rendered)
+        self.assertNotIn("선택 캐릭터의 마지막 장면 근거", rendered)
+        self.assertEqual(material["entry_strategy"], "read_scope_fallback_if_entry")
+        self.assertIn("read_scope_fallback_scene", material)
+        self.assertNotIn("selected_character_last_completed_scene", material)
+        self.assertIn("선택 캐릭터가 원래 참여했다고 만들지 않는다", opening_prompt)
+        self.assertIn("선택 캐릭터가 새로 합류하는 후보", opening_prompt)
 
     def test_entry_context_compacts_long_material_before_session_storage(self):
         long_scene = _character_scene("아델리트", gist="장" * 10000)
@@ -651,6 +698,7 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
         self.assertIn("[읽은 범위 진입점]", prompt)
         self.assertIn("13~14화", prompt)
         self.assertIn("14화가 끝난 상태", prompt)
+        self.assertIn("선택 캐릭터의 마지막 장면 근거: 14화", prompt)
         self.assertNotIn("[캐릭터챗 오프닝 자산]", prompt)
         self.assertNotIn("FORMULA_RESOURCE_BOOTSTRAP", prompt)
         self.assertNotIn("1화 도입부를 반복한다", prompt)
@@ -686,6 +734,63 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
 
 
 class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loader_skips_fallback_query_when_exact_scene_is_ready(self):
+        def result_for(rows: list[dict]) -> MagicMock:
+            result = MagicMock()
+            result.mappings.return_value.all.return_value = rows
+            return result
+
+        db = AsyncMock()
+        db.execute.side_effect = [
+            result_for([_plot_row(14, "14화"), _plot_row(13, "13화")]),
+            result_for(
+                [_scene_row(9, [_character_scene("아델리트", gist="정확 매칭 장면")])]
+            ),
+        ]
+
+        context = await load_websochat_character_entry_context_v2(
+            product_id=1182,
+            read_episode_to=14,
+            latest_episode_no=20,
+            character_scope_keys=["character:아델리트"],
+            db=db,
+        )
+
+        self.assertEqual(db.execute.await_count, 2)
+        self.assertEqual(context["character_scene_source"], "matched_character")
+        self.assertEqual(context["character_scene"]["scene_gist"], "정확 매칭 장면")
+
+    async def test_loader_fetches_bounded_read_scope_scene_for_fallback(self):
+        def result_for(rows: list[dict]) -> MagicMock:
+            result = MagicMock()
+            result.mappings.return_value.all.return_value = rows
+            return result
+
+        db = AsyncMock()
+        db.execute.side_effect = [
+            result_for([_plot_row(14, "14화"), _plot_row(13, "13화")]),
+            result_for([]),
+            result_for([_scene_row(14, [_character_scene("경비병", gist="14화 작품 장면")])]),
+        ]
+
+        context = await load_websochat_character_entry_context_v2(
+            product_id=1182,
+            read_episode_to=14,
+            latest_episode_no=20,
+            character_scope_keys=["character:아델리트"],
+            db=db,
+        )
+
+        self.assertEqual(db.execute.await_count, 3)
+        fallback_sql = str(db.execute.await_args_list[2].args[0])
+        fallback_params = db.execute.await_args_list[2].args[1]
+        self.assertIn("episode_to <= :read_episode_to", fallback_sql)
+        self.assertIn("LIMIT :limit", fallback_sql)
+        self.assertNotIn("INSTR(summary_text", fallback_sql)
+        self.assertEqual(fallback_params["read_episode_to"], 14)
+        self.assertEqual(context["character_scene_source"], "read_scope_fallback")
+        self.assertEqual(context["character_scene"]["scene_gist"], "14화 작품 장면")
+
     async def test_adjacent_opening_generator_accepts_plain_text_response(self):
         entry_context = _entry_context(14)
         payload = {
