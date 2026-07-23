@@ -1,8 +1,10 @@
 import json
+import logging
 from collections import defaultdict
 
 from fastapi import status
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.schemas.admin as admin_schema
@@ -26,6 +28,8 @@ MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES = 10
 MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES = 4
 MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES = 5
 CHARACTER_CHAT_PREVIEW_EXCERPT_MAX_CHARS = 900
+
+logger = logging.getLogger(__name__)
 
 
 def _main_character_product_policy_sql(
@@ -638,7 +642,18 @@ def _build_public_character_slots_query(
             mcs.publish_start_date AS publishStartAt,
             mcs.publish_end_date AS publishEndAt,
             mcs.created_date AS createdDate,
-            mcs.updated_date AS updatedDate
+            mcs.updated_date AS updatedDate,
+            (
+                SELECT latest_inventory.summary_text
+                FROM tb_story_agent_context_summary latest_inventory
+                WHERE latest_inventory.product_id = mcs.product_id
+                  AND latest_inventory.scope_key = mcs.character_scope_key
+                  AND latest_inventory.summary_type = 'character_inventory_v3'
+                  AND latest_inventory.is_active = 'Y'
+                  AND JSON_VALID(latest_inventory.summary_text)
+                ORDER BY latest_inventory.summary_id DESC
+                LIMIT 1
+            ) AS _inventorySummaryText
             {catalog_readiness_columns}
         FROM tb_main_character_slot mcs
         INNER JOIN tb_product p ON p.product_id = mcs.product_id
@@ -972,18 +987,45 @@ def merge_public_character_catalog_candidates(
     return candidates
 
 
+def build_public_character_catalog_scene_candidates(candidate_items) -> list[dict]:
+    scene_candidates: list[dict] = []
+    for item in candidate_items:
+        inventory = _extract_summary_payload(item.get("_inventorySummaryText"))
+        compatible_scope_keys: list[str] = []
+        for scope_key in [
+            item.get("characterScopeKey"),
+            inventory.get("canonical_character_key"),
+            *_normalize_aliases(inventory.get("protagonist_identity_scope_keys")),
+            *_normalize_aliases(inventory.get("source_character_keys")),
+        ]:
+            normalized_scope_key = str(scope_key or "").strip()
+            if (
+                normalized_scope_key
+                and normalized_scope_key not in compatible_scope_keys
+            ):
+                compatible_scope_keys.append(normalized_scope_key)
+        scene_candidates.append(
+            {
+                "characterSlotId": int(item["characterSlotId"]),
+                "productId": int(item["productId"]),
+                "compatibleScopeKeys": compatible_scope_keys,
+            }
+        )
+    return scene_candidates
+
 
 def build_public_character_catalog_scene_query() -> str:
     return """
         SELECT
             candidate.character_slot_id AS characterSlotId,
-            COUNT(DISTINCT scene.summary_id) AS sceneCount
+            COUNT(DISTINCT scene.summary_id) AS sceneCount,
+            MIN(scene_episode.episode_no) AS entryEpisodeNo
         FROM JSON_TABLE(
             :candidate_json,
             '$[*]' COLUMNS (
                 character_slot_id BIGINT PATH '$.characterSlotId',
                 product_id BIGINT PATH '$.productId',
-                character_scope_key VARCHAR(80) PATH '$.characterScopeKey'
+                compatible_scope_keys JSON PATH '$.compatibleScopeKeys'
             )
         ) AS candidate
         INNER JOIN tb_story_agent_context_summary scene
@@ -993,8 +1035,21 @@ def build_public_character_catalog_scene_query() -> str:
         INNER JOIN tb_product_episode scene_episode
             ON scene_episode.product_id = scene.product_id
            AND scene_episode.episode_no = scene.episode_to
+           AND scene_episode.episode_no >= 1
            AND scene_episode.use_yn = 'Y'
            AND scene_episode.open_yn = 'Y'
+        CROSS JOIN JSON_TABLE(
+            IF(
+                JSON_VALID(scene.summary_text),
+                scene.summary_text,
+                JSON_OBJECT()
+            ),
+            '$.scenes[*]' COLUMNS (
+                scene_gist VARCHAR(4096) PATH '$.scene_gist',
+                participants JSON PATH '$.participants',
+                action_ownership JSON PATH '$.action_ownership'
+            )
+        ) AS catalog_scene_row
         WHERE JSON_VALID(scene.summary_text)
           AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
               scene.summary_text, '$.status'
@@ -1002,61 +1057,49 @@ def build_public_character_catalog_scene_query() -> str:
           AND JSON_TYPE(JSON_EXTRACT(
               scene.summary_text, '$.scenes'
           )) = 'ARRAY'
-          AND LOCATE(
-              JSON_QUOTE(candidate.character_scope_key),
-              scene.summary_text
-          ) > 0
-          AND JSON_SEARCH(
-              IF(
-                  JSON_VALID(scene.summary_text),
-                  scene.summary_text,
-                  JSON_OBJECT()
-              ),
-              'one',
-              '_%',
-              NULL,
-              '$.scenes[*].scene_gist'
-          ) IS NOT NULL
-          AND EXISTS (
-              SELECT 1
-              FROM tb_story_agent_context_summary opening_scene
-              INNER JOIN tb_product_episode opening_episode
-                  ON opening_episode.product_id = opening_scene.product_id
-                 AND opening_episode.episode_no = opening_scene.episode_to
-                 AND opening_episode.use_yn = 'Y'
-                 AND opening_episode.open_yn = 'Y'
-              WHERE opening_scene.product_id = candidate.product_id
-                AND opening_scene.summary_type = 'episode_scene_extraction'
-                AND opening_scene.is_active = 'Y'
-                AND opening_scene.episode_to BETWEEN 0 AND 1
-                AND JSON_VALID(opening_scene.summary_text)
-                AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
-                    IF(
-                        JSON_VALID(opening_scene.summary_text),
-                        opening_scene.summary_text,
-                        JSON_OBJECT()
-                    ),
-                    '$.status'
-                )))) IN ('ok', 'partial')
-                AND JSON_TYPE(JSON_EXTRACT(
-                    IF(
-                        JSON_VALID(opening_scene.summary_text),
-                        opening_scene.summary_text,
-                        JSON_OBJECT()
-                    ),
-                    '$.scenes'
-                )) = 'ARRAY'
-                AND JSON_SEARCH(
-                    IF(
-                        JSON_VALID(opening_scene.summary_text),
-                        opening_scene.summary_text,
-                        JSON_OBJECT()
-                    ),
-                    'one',
-                    '_%',
-                    NULL,
-                    '$.scenes[*].scene_gist'
-                ) IS NOT NULL
+          AND TRIM(COALESCE(catalog_scene_row.scene_gist, '')) <> ''
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM JSON_TABLE(
+                      IF(
+                          JSON_TYPE(catalog_scene_row.participants) = 'ARRAY',
+                          catalog_scene_row.participants,
+                          JSON_ARRAY()
+                      ),
+                      '$[*]' COLUMNS (
+                          participant_scope_key VARCHAR(80)
+                              PATH '$.scope_key'
+                      )
+                  ) AS catalog_participant
+                  WHERE JSON_CONTAINS(
+                      candidate.compatible_scope_keys,
+                      JSON_QUOTE(
+                          catalog_participant.participant_scope_key
+                      )
+                  )
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM JSON_TABLE(
+                      IF(
+                          JSON_TYPE(catalog_scene_row.action_ownership) =
+                              'ARRAY',
+                          catalog_scene_row.action_ownership,
+                          JSON_ARRAY()
+                      ),
+                      '$[*]' COLUMNS (
+                          action_scope_key VARCHAR(80)
+                              PATH '$.actor_scope_key'
+                      )
+                  ) AS catalog_action_owner
+                  WHERE JSON_CONTAINS(
+                      candidate.compatible_scope_keys,
+                      JSON_QUOTE(
+                          catalog_action_owner.action_scope_key
+                      )
+                  )
+              )
           )
         GROUP BY candidate.character_slot_id
     """
@@ -1112,25 +1155,33 @@ def build_public_character_catalog_image_query() -> str:
 def filter_and_rank_public_character_catalog(
     candidate_rows, scene_rows
 ) -> list[dict]:
-    scene_count_by_character_slot: dict[int, int] = {}
+    scene_data_by_character_slot: dict[int, tuple[int, int | None]] = {}
     for row in scene_rows:
         row_data = dict(row)
         character_slot_id = int(row_data.get("characterSlotId") or 0)
         if character_slot_id > 0:
-            scene_count_by_character_slot[character_slot_id] = int(
-                row_data.get("sceneCount") or 0
+            scene_data_by_character_slot[character_slot_id] = (
+                int(row_data.get("sceneCount") or 0),
+                _parse_int(row_data.get("entryEpisodeNo")),
             )
 
     candidates_by_product: dict[int, list[dict]] = defaultdict(list)
     for row in candidate_rows:
         item = dict(row)
         product_id = int(item.get("productId") or 0)
-        scene_count = scene_count_by_character_slot.get(
-            int(item.get("characterSlotId") or 0), 0
+        scene_count, entry_episode_no = scene_data_by_character_slot.get(
+            int(item.get("characterSlotId") or 0), (0, None)
         )
-        if scene_count <= 0:
+        synced_latest_episode_no = int(item.get("syncedLatestEpisodeNo") or 0)
+        if (
+            scene_count <= 0
+            or entry_episode_no is None
+            or entry_episode_no < 1
+            or entry_episode_no > synced_latest_episode_no
+        ):
             continue
         item["_sceneCount"] = scene_count
+        item["entryEpisodeNo"] = entry_episode_no
         candidates_by_product[product_id].append(item)
 
     selected: list[dict] = []
@@ -1179,7 +1230,47 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
         text(build_public_main_character_slots_query()),
         {"adult_yn": adult_yn},
     )
-    return {"data": [dict(row) for row in result.mappings().all()]}
+    slot_items = [dict(row) for row in result.mappings().all()]
+    if not slot_items:
+        return {"data": []}
+
+    entry_episode_by_character_slot: dict[int, int | None] = {}
+    try:
+        scene_result = await db.execute(
+            text(build_public_character_catalog_scene_query()),
+            {
+                "candidate_json": json.dumps(
+                    build_public_character_catalog_scene_candidates(slot_items),
+                    ensure_ascii=False,
+                )
+            },
+        )
+        entry_episode_by_character_slot = {
+            int(row_data["characterSlotId"]): _parse_int(
+                row_data.get("entryEpisodeNo")
+            )
+            for row in scene_result.mappings().all()
+            if (row_data := dict(row)).get("characterSlotId") is not None
+        }
+    except SQLAlchemyError:
+        logger.exception(
+            "main character home entry episode enrichment failed; "
+            "preserving existing slots with episode 1 fallback"
+        )
+    for item in slot_items:
+        character_slot_id = int(item.get("characterSlotId") or 0)
+        entry_episode_no = entry_episode_by_character_slot.get(character_slot_id)
+        synced_latest_episode_no = int(item.get("syncedLatestEpisodeNo") or 0)
+        item["entryEpisodeNo"] = (
+            entry_episode_no
+            if (
+                entry_episode_no is not None
+                and 1 <= entry_episode_no <= synced_latest_episode_no
+            )
+            else 1
+        )
+        item.pop("_inventorySummaryText", None)
+    return {"data": slot_items}
 
 
 async def get_public_character_catalog(
@@ -1228,14 +1319,7 @@ async def get_public_character_catalog(
         text(build_public_character_catalog_scene_query()),
         {
             "candidate_json": json.dumps(
-                [
-                    {
-                        "characterSlotId": int(item["characterSlotId"]),
-                        "productId": int(item["productId"]),
-                        "characterScopeKey": str(item["characterScopeKey"]),
-                    }
-                    for item in candidate_items
-                ],
+                build_public_character_catalog_scene_candidates(candidate_items),
                 ensure_ascii=False,
             )
         },
