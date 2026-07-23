@@ -318,6 +318,7 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
         "FROM JSON_TABLE( IF( JSON_VALID(examples.summary_text),"
         in normalized_query
     )
+    assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
     assert "summary_type = 'episode_scene_extraction'" in query
     assert "eligible_scene.episode_to = 1" in query
     assert "JSON_VALID(eligible_scene.summary_text)" in query
@@ -330,16 +331,14 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "NESTED PATH '$.action_ownership[*]'" in query
     assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
     assert "eligible_scene_row.action_scope_key = mcs.character_scope_key" in normalized_query
-    assert "eligible_episode.use_yn = 'Y'" in query
-    assert "eligible_episode.open_yn = 'Y'" in query
-    assert "COALESCE(eligible_episode.price_type, 'free') = 'free'" in query
-    assert "eligible_doc.is_active = 'Y'" in query
-    assert "FROM tb_story_agent_context_chunk eligible_chunk" in query
     assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
     assert "eligible_episode_summary.episode_to = 1" in query
-    assert "eligible_episode_summary.scope_key" in query
-    assert "CONCAT('episode:', eligible_episode.episode_id)" in query
     assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
+    assert "INNER JOIN tb_product_episode eligible_episode" not in query
+    assert "tb_story_agent_context_doc eligible_doc" not in query
+    assert "tb_story_agent_context_chunk eligible_chunk" not in query
+    assert "eligible_episode_summary.scope_key" not in query
+    assert "episode_title" not in query
     assert "AS fullReady" not in query
     assert "AS readinessCoverageRatio" not in query
     assert "q.group_type = 'character'" in query
@@ -366,6 +365,10 @@ def test_public_character_catalog_query_uses_same_quality_gate_without_home_limi
     assert "readiness_summary.scope_key" in query
     assert "CONCAT('episode:', readiness_episode.episode_id)" in query
     assert "readiness_summary.episode_to = readiness_episode.episode_no" in query
+    assert "INNER JOIN tb_product_episode eligible_episode" not in query
+    assert "tb_story_agent_context_doc eligible_doc" not in query
+    assert "tb_story_agent_context_chunk eligible_chunk" not in query
+    assert "episode_title" not in query
     assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
     assert "LIMIT 12" not in query
 
@@ -661,11 +664,6 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "inventory.summary_text, '$.canonical_character_key'" in profile_join
         assert "eligible_scene.episode_to = 1" in query
         assert "JSON_VALID(eligible_scene.summary_text)" in query
-        assert "eligible_episode.use_yn = 'Y'" in query
-        assert "eligible_episode.open_yn = 'Y'" in query
-        assert "COALESCE(eligible_episode.price_type, 'free') = 'free'" in query
-        assert "eligible_doc.is_active = 'Y'" in query
-        assert "FROM tb_story_agent_context_chunk eligible_chunk" in query
         assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
         assert "eligible_episode_summary.episode_to = 1" in query
         assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
@@ -674,6 +672,10 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "eligible_scene_row.participant_scope_key" in query
         assert "eligible_scene_row.action_scope_key" in query
         assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
+        assert "INNER JOIN tb_product_episode eligible_episode" not in query
+        assert "tb_story_agent_context_doc eligible_doc" not in query
+        assert "tb_story_agent_context_chunk eligible_chunk" not in query
+        assert "episode_title" not in query
 
     async def test_character_preview_looks_up_episode_summary_by_episode_number(self):
         from app.exceptions import CustomResponseException

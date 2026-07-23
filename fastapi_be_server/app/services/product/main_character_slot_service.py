@@ -305,14 +305,6 @@ def _character_chat_first_episode_readiness_predicate(
         AND EXISTS (
             SELECT 1
             FROM tb_story_agent_context_summary eligible_scene
-            INNER JOIN tb_product_episode eligible_episode
-                ON eligible_episode.product_id = eligible_scene.product_id
-               AND eligible_episode.episode_no = eligible_scene.episode_to
-            INNER JOIN tb_story_agent_context_doc eligible_doc
-                ON eligible_doc.product_id = eligible_scene.product_id
-               AND eligible_doc.episode_id = eligible_episode.episode_id
-               AND eligible_doc.episode_no = eligible_scene.episode_to
-               AND eligible_doc.is_active = 'Y'
             WHERE eligible_scene.product_id = {product_id_sql}
               AND eligible_scene.summary_type = 'episode_scene_extraction'
               AND eligible_scene.is_active = 'Y'
@@ -350,14 +342,6 @@ def _character_chat_first_episode_readiness_predicate(
                             {character_scope_key_sql}
                     )
               )
-              AND eligible_episode.use_yn = 'Y'
-              AND eligible_episode.open_yn = 'Y'
-              AND COALESCE(eligible_episode.price_type, 'free') = 'free'
-              AND EXISTS (
-                  SELECT 1
-                  FROM tb_story_agent_context_chunk eligible_chunk
-                  WHERE eligible_chunk.context_doc_id = eligible_doc.context_doc_id
-              )
               AND EXISTS (
                   SELECT 1
                   FROM tb_story_agent_context_summary eligible_episode_summary
@@ -365,8 +349,6 @@ def _character_chat_first_episode_readiness_predicate(
                     AND eligible_episode_summary.summary_type = 'episode_summary'
                     AND eligible_episode_summary.is_active = 'Y'
                     AND eligible_episode_summary.episode_to = 1
-                    AND eligible_episode_summary.scope_key =
-                        CONCAT('episode:', eligible_episode.episode_id)
                     AND TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''
               )
         )
