@@ -1522,148 +1522,6 @@ async def get_public_character_chat_preview(
                         eligible_episode_summary.summary_text, ''
                     )) <> ''
               )
-              AND EXISTS (
-                  SELECT 1
-                  FROM tb_story_agent_context_summary eligible_scene
-                  INNER JOIN tb_product_episode scene_episode
-                      ON scene_episode.product_id = eligible_scene.product_id
-                     AND scene_episode.episode_no = eligible_scene.episode_to
-                     AND scene_episode.use_yn = 'Y'
-                     AND scene_episode.open_yn = 'Y'
-                  WHERE eligible_scene.product_id = inventory.product_id
-                    AND eligible_scene.summary_type =
-                        'episode_scene_extraction'
-                    AND eligible_scene.is_active = 'Y'
-                    AND JSON_VALID(eligible_scene.summary_text)
-                    AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
-                        eligible_scene.summary_text, '$.status'
-                    )))) IN ('ok', 'partial')
-                    AND JSON_TYPE(JSON_EXTRACT(
-                        eligible_scene.summary_text, '$.scenes'
-                    )) = 'ARRAY'
-                    AND EXISTS (
-                        SELECT 1
-                        FROM JSON_TABLE(
-                            IF(
-                                JSON_VALID(eligible_scene.summary_text),
-                                eligible_scene.summary_text,
-                                JSON_OBJECT()
-                            ),
-                            '$.scenes[*]' COLUMNS (
-                                scene_gist VARCHAR(160) PATH '$.scene_gist',
-                                participants JSON PATH '$.participants',
-                                action_ownership JSON PATH '$.action_ownership'
-                            )
-                        ) AS eligible_scene_row
-                        WHERE TRIM(COALESCE(
-                            eligible_scene_row.scene_gist, ''
-                        )) <> ''
-                          AND (
-                              EXISTS (
-                                  SELECT 1
-                                  FROM JSON_TABLE(
-                                      IF(
-                                          JSON_TYPE(
-                                              eligible_scene_row.participants
-                                          ) = 'ARRAY',
-                                          eligible_scene_row.participants,
-                                          JSON_ARRAY()
-                                      ),
-                                      '$[*]' COLUMNS (
-                                          participant_scope_key VARCHAR(80)
-                                              PATH '$.scope_key'
-                                      )
-                                  ) AS eligible_participant
-                                  WHERE
-                                      eligible_participant.participant_scope_key =
-                                          {canonical_scope_key}
-                                      OR JSON_CONTAINS(
-                                          IF(
-                                              JSON_TYPE(JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.protagonist_identity_scope_keys'
-                                              )) = 'ARRAY',
-                                              JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.protagonist_identity_scope_keys'
-                                              ),
-                                              JSON_ARRAY()
-                                          ),
-                                          JSON_QUOTE(
-                                              eligible_participant.participant_scope_key
-                                          )
-                                      )
-                                      OR JSON_CONTAINS(
-                                          IF(
-                                              JSON_TYPE(JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.source_character_keys'
-                                              )) = 'ARRAY',
-                                              JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.source_character_keys'
-                                              ),
-                                              JSON_ARRAY()
-                                          ),
-                                          JSON_QUOTE(
-                                              eligible_participant.participant_scope_key
-                                          )
-                                      )
-                              )
-                              OR EXISTS (
-                                  SELECT 1
-                                  FROM JSON_TABLE(
-                                      IF(
-                                          JSON_TYPE(
-                                              eligible_scene_row.action_ownership
-                                          ) = 'ARRAY',
-                                          eligible_scene_row.action_ownership,
-                                          JSON_ARRAY()
-                                      ),
-                                      '$[*]' COLUMNS (
-                                          action_scope_key VARCHAR(80)
-                                              PATH '$.actor_scope_key'
-                                      )
-                                  ) AS eligible_action_owner
-                                  WHERE
-                                      eligible_action_owner.action_scope_key =
-                                          {canonical_scope_key}
-                                      OR JSON_CONTAINS(
-                                          IF(
-                                              JSON_TYPE(JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.protagonist_identity_scope_keys'
-                                              )) = 'ARRAY',
-                                              JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.protagonist_identity_scope_keys'
-                                              ),
-                                              JSON_ARRAY()
-                                          ),
-                                          JSON_QUOTE(
-                                              eligible_action_owner.action_scope_key
-                                          )
-                                      )
-                                      OR JSON_CONTAINS(
-                                          IF(
-                                              JSON_TYPE(JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.source_character_keys'
-                                              )) = 'ARRAY',
-                                              JSON_EXTRACT(
-                                                  inventory.summary_text,
-                                                  '$.source_character_keys'
-                                              ),
-                                              JSON_ARRAY()
-                                          ),
-                                          JSON_QUOTE(
-                                              eligible_action_owner.action_scope_key
-                                          )
-                                      )
-                              )
-                          )
-                    )
-              )
             ORDER BY inventory.summary_id DESC, profile.summary_id DESC
             LIMIT 1
         """),
@@ -1698,6 +1556,90 @@ async def get_public_character_chat_preview(
     )
     scene_result = await db.execute(
         text("""
+            WITH matched_scene AS (
+                SELECT
+                    scene.summary_id AS summaryId,
+                    scene.product_id AS productId,
+                    scene.episode_to AS episodeNo,
+                    MIN(pe.episode_id) AS episodeId
+                FROM tb_story_agent_context_summary scene
+                INNER JOIN tb_product_episode pe
+                    ON pe.product_id = scene.product_id
+                   AND pe.episode_no = scene.episode_to
+                CROSS JOIN JSON_TABLE(
+                    IF(
+                        JSON_VALID(scene.summary_text),
+                        scene.summary_text,
+                        JSON_OBJECT()
+                    ),
+                    '$.scenes[*]' COLUMNS (
+                        scene_gist VARCHAR(4096) PATH '$.scene_gist',
+                        participants JSON PATH '$.participants',
+                        action_ownership JSON PATH '$.action_ownership'
+                    )
+                ) AS preview_scene_row
+                WHERE scene.product_id = :product_id
+                  AND scene.summary_type = 'episode_scene_extraction'
+                  AND scene.is_active = 'Y'
+                  AND scene.episode_to <= :episode_no
+                  AND JSON_VALID(scene.summary_text)
+                  AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                      scene.summary_text, '$.status'
+                  )))) IN ('ok', 'partial')
+                  AND JSON_TYPE(JSON_EXTRACT(
+                      scene.summary_text, '$.scenes'
+                  )) = 'ARRAY'
+                  AND TRIM(COALESCE(
+                      preview_scene_row.scene_gist, ''
+                  )) <> ''
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM JSON_TABLE(
+                              IF(
+                                  JSON_TYPE(
+                                      preview_scene_row.participants
+                                  ) = 'ARRAY',
+                                  preview_scene_row.participants,
+                                  JSON_ARRAY()
+                              ),
+                              '$[*]' COLUMNS (
+                                  participant_scope_key VARCHAR(80)
+                                      PATH '$.scope_key'
+                              )
+                          ) AS preview_participant
+                          WHERE preview_participant.participant_scope_key
+                              IN :character_scope_keys
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM JSON_TABLE(
+                              IF(
+                                  JSON_TYPE(
+                                      preview_scene_row.action_ownership
+                                  ) = 'ARRAY',
+                                  preview_scene_row.action_ownership,
+                                  JSON_ARRAY()
+                              ),
+                              '$[*]' COLUMNS (
+                                  action_scope_key VARCHAR(80)
+                                      PATH '$.actor_scope_key'
+                              )
+                          ) AS preview_action_owner
+                          WHERE preview_action_owner.action_scope_key
+                              IN :character_scope_keys
+                      )
+                  )
+                  AND pe.use_yn = 'Y'
+                  AND pe.open_yn = 'Y'
+                  AND COALESCE(pe.price_type, 'free') = 'free'
+                GROUP BY
+                    scene.summary_id,
+                    scene.product_id,
+                    scene.episode_to
+                ORDER BY scene.episode_to DESC, scene.summary_id DESC
+                LIMIT 5
+            )
             SELECT
                 pe.episode_id AS episodeId,
                 pe.episode_no AS episodeNo,
@@ -1715,70 +1657,12 @@ async def get_public_character_chat_preview(
                     ORDER BY episode_summary.summary_id DESC
                     LIMIT 1
                 ), '') AS episodeSummaryText
-            FROM tb_story_agent_context_summary scene
+            FROM matched_scene
+            INNER JOIN tb_story_agent_context_summary scene
+                ON scene.summary_id = matched_scene.summaryId
             INNER JOIN tb_product_episode pe
-                ON pe.product_id = scene.product_id
-               AND pe.episode_no = scene.episode_to
-            WHERE scene.product_id = :product_id
-              AND scene.summary_type = 'episode_scene_extraction'
-              AND scene.is_active = 'Y'
-              AND scene.episode_to <= :episode_no
-              AND JSON_VALID(scene.summary_text)
-              AND JSON_TYPE(JSON_EXTRACT(
-                  scene.summary_text, '$.scenes'
-              )) = 'ARRAY'
-              AND EXISTS (
-                  SELECT 1
-                  FROM JSON_TABLE(
-                      IF(
-                          JSON_VALID(scene.summary_text),
-                          scene.summary_text,
-                          JSON_OBJECT()
-                      ),
-                      '$.scenes[*]' COLUMNS (
-                          participants JSON PATH '$.participants',
-                          action_ownership JSON PATH '$.action_ownership'
-                      )
-                  ) AS preview_scene_row
-                  WHERE EXISTS (
-                      SELECT 1
-                      FROM JSON_TABLE(
-                          IF(
-                              JSON_TYPE(preview_scene_row.participants) = 'ARRAY',
-                              preview_scene_row.participants,
-                              JSON_ARRAY()
-                          ),
-                          '$[*]' COLUMNS (
-                              participant_scope_key VARCHAR(80)
-                                  PATH '$.scope_key'
-                          )
-                      ) AS preview_participant
-                      WHERE preview_participant.participant_scope_key
-                          IN :character_scope_keys
-                  )
-                  OR EXISTS (
-                      SELECT 1
-                      FROM JSON_TABLE(
-                          IF(
-                              JSON_TYPE(preview_scene_row.action_ownership) =
-                                  'ARRAY',
-                              preview_scene_row.action_ownership,
-                              JSON_ARRAY()
-                          ),
-                          '$[*]' COLUMNS (
-                              action_scope_key VARCHAR(80)
-                                  PATH '$.actor_scope_key'
-                          )
-                      ) AS preview_action_owner
-                      WHERE preview_action_owner.action_scope_key
-                          IN :character_scope_keys
-                  )
-              )
-              AND pe.use_yn = 'Y'
-              AND pe.open_yn = 'Y'
-              AND COALESCE(pe.price_type, 'free') = 'free'
-            ORDER BY scene.episode_to DESC, scene.summary_id DESC
-            LIMIT 5
+                ON pe.episode_id = matched_scene.episodeId
+            ORDER BY matched_scene.episodeNo DESC, matched_scene.summaryId DESC
         """).bindparams(bindparam("character_scope_keys", expanding=True)),
         {
             "product_id": product_id,

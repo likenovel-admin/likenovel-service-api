@@ -1386,20 +1386,13 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         )[1].split("WHERE", 1)[0]
         assert "profile.scope_key = COALESCE(" in profile_join
         assert "inventory.summary_text, '$.canonical_character_key'" in profile_join
-        assert "eligible_scene.episode_to = 1" not in query
-        assert "JSON_VALID(eligible_scene.summary_text)" in query
+        assert "eligible_scene" not in query
         assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
         assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
-        assert "NESTED PATH '$.participants[*]'" not in query
-        assert "NESTED PATH '$.action_ownership[*]'" not in query
-        assert "eligible_participant.participant_scope_key" in query
-        assert "eligible_action_owner.action_scope_key" in query
         assert (
             "TRIM(COALESCE( eligible_episode_summary.summary_text, '' )) <> ''"
             in normalized_query
         )
-        assert "$.protagonist_identity_scope_keys" in query
-        assert "$.source_character_keys" in query
 
     async def test_character_preview_looks_up_episode_summary_by_episode_number(self):
         from app.exceptions import CustomResponseException
@@ -1428,7 +1421,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "CONCAT('episode:', pe.episode_id)" in query
         assert "episode_summary.scope_key = CONCAT('episode:', pe.episode_no)" not in query
 
-    async def test_character_preview_guards_top_level_json_table_inputs(self):
+    async def test_character_preview_defers_scene_eligibility_to_scene_query(self):
         from app.exceptions import CustomResponseException
         from app.services.product import main_character_slot_service
 
@@ -1452,16 +1445,60 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
 
         profile_query = "".join(str(db.execute.await_args_list[0].args[0]).split())
         scene_query = "".join(str(db.execute.await_args_list[1].args[0]).split())
+        assert "eligible_scene" not in profile_query
+        assert "eligible_episode_summary" in profile_query
         assert (
-            "FROMJSON_TABLE(IF(JSON_VALID(eligible_scene.summary_text),"
-            "eligible_scene.summary_text,JSON_OBJECT()),'$.scenes[*]'"
-            in profile_query
+            "WITHmatched_sceneAS(" in scene_query
         )
         assert (
-            "FROMJSON_TABLE(IF(JSON_VALID(scene.summary_text),"
+            "CROSSJOINJSON_TABLE(IF(JSON_VALID(scene.summary_text),"
             "scene.summary_text,JSON_OBJECT()),'$.scenes[*]'"
             in scene_query
         )
+        assert "scene_gistVARCHAR(4096)PATH'$.scene_gist'" in scene_query
+        assert (
+            "LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT("
+            "scene.summary_text,'$.status'))))IN('ok','partial')"
+            in scene_query
+        )
+        assert (
+            "TRIM(COALESCE(preview_scene_row.scene_gist,''))<>''"
+            in scene_query
+        )
+        assert "MIN(pe.episode_id)ASepisodeId" in scene_query
+        assert (
+            "GROUPBYscene.summary_id,scene.product_id,scene.episode_to"
+            in scene_query
+        )
+        assert (
+            scene_query.index(
+                "GROUPBYscene.summary_id,scene.product_id,scene.episode_to"
+            )
+            < scene_query.index(
+                "ORDERBYscene.episode_toDESC,scene.summary_idDESCLIMIT5"
+            )
+            < scene_query.index("FROMmatched_scene")
+        )
+        assert (
+            "ANDEXISTS(SELECT1FROMJSON_TABLE("
+            "IF(JSON_VALID(scene.summary_text),"
+            not in scene_query
+        )
+        assert "scene.episode_to<=:episode_no" in scene_query
+        assert "pe.use_yn='Y'" in scene_query
+        assert "pe.open_yn='Y'" in scene_query
+        assert "COALESCE(pe.price_type,'free')='free'" in scene_query
+        assert (
+            "preview_participant.participant_scope_key"
+            "IN(__[POSTCOMPILE_character_scope_keys])"
+            in scene_query
+        )
+        assert (
+            "preview_action_owner.action_scope_key"
+            "IN(__[POSTCOMPILE_character_scope_keys])"
+            in scene_query
+        )
+        assert "SELECTDISTINCTscene.summary_text" not in scene_query
 
     async def test_roster_query_reads_only_active_character_inventory_v3(self):
         from app.services.product import main_character_slot_service
