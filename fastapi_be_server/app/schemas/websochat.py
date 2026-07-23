@@ -132,6 +132,7 @@ class PostWebsochatSessionReqBody(BaseModel):
             return None
         if normalized not in {
             "home_character_slot",
+            "character_catalog",
             "websochat_rp_mode",
             "product_detail_websochat",
             "viewer_websochat",

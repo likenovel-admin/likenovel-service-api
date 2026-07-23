@@ -25,6 +25,26 @@ MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT = 2
 MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES = 10
 MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES = 4
 MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES = 5
+CHARACTER_CHAT_PREVIEW_EXCERPT_MAX_CHARS = 900
+
+
+def classify_main_character_chat_quality(
+    *,
+    distinct_episode_count: int,
+    example_count: int,
+    scene_count: int,
+) -> tuple[str, str]:
+    if example_count <= 0:
+        return "insufficient", "RP 예시 데이터 없음"
+    if scene_count <= 0:
+        return "insufficient", "캐릭터 장면 데이터 없음"
+    if (
+        distinct_episode_count >= MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES
+        and example_count >= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
+        and scene_count >= MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES
+    ):
+        return "good", "회차·RP 예시·장면 데이터 충분"
+    return "normal", "대화 가능, 추가 재료 수집 중"
 
 
 def _normalize_aliases(raw_aliases) -> list[str]:
@@ -38,13 +58,155 @@ def _normalize_aliases(raw_aliases) -> list[str]:
     return aliases
 
 
-def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
-    canonical_scope_key = f"""COALESCE(
+def _extract_summary_payload(raw_summary) -> dict:
+    if isinstance(raw_summary, dict):
+        return raw_summary
+    return _extract_websochat_json_object(str(raw_summary or "")) or {}
+
+
+def _normalize_text_list(value) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    normalized: list[str] = []
+    for item in values:
+        text_value = str(item or "").strip()
+        if text_value and text_value not in normalized:
+            normalized.append(text_value)
+    return normalized
+
+
+def _parse_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scene_contains_character(scene: dict, character_scope_key: str) -> bool:
+    participants = scene.get("participants") or scene.get("characters") or []
+    if not isinstance(participants, list):
+        return False
+    for participant in participants:
+        if isinstance(participant, dict):
+            scope_key = participant.get("scope_key") or participant.get("character_key")
+        else:
+            scope_key = participant
+        if str(scope_key or "").strip() == character_scope_key:
+            return True
+    return False
+
+
+def _extract_scene_excerpt(
+    *,
+    chunk_rows,
+    char_start: int,
+    char_end: int,
+) -> str:
+    if char_end <= char_start:
+        return ""
+
+    excerpt_parts: list[str] = []
+    for row in sorted(chunk_rows, key=lambda item: int(dict(item).get("charStart") or 0)):
+        row_data = dict(row)
+        chunk_start = int(row_data.get("charStart") or 0)
+        chunk_text = str(row_data.get("text") or "")
+        chunk_end = int(row_data.get("charEnd") or (chunk_start + len(chunk_text)))
+        overlap_start = max(char_start, chunk_start)
+        overlap_end = min(char_end, chunk_end)
+        if overlap_end <= overlap_start:
+            continue
+        excerpt_parts.append(
+            chunk_text[overlap_start - chunk_start : overlap_end - chunk_start]
+        )
+
+    return "".join(excerpt_parts).strip()[:CHARACTER_CHAT_PREVIEW_EXCERPT_MAX_CHARS]
+
+
+def build_character_chat_preview_payload(
+    *,
+    character_scope_key: str,
+    profile_row,
+    scene_row,
+    chunk_rows,
+) -> dict | None:
+    profile_data = dict(profile_row)
+    scene_data = dict(scene_row)
+    inventory = _extract_summary_payload(profile_data.get("inventorySummaryText"))
+    profile = _extract_summary_payload(profile_data.get("profileSummaryText"))
+    scene_payload = _extract_summary_payload(scene_data.get("sceneSummaryText"))
+    scenes = scene_payload.get("scenes")
+    if not isinstance(scenes, list):
+        return None
+
+    matching_scenes: list[tuple[int, int, int, dict]] = []
+    for scene in scenes:
+        if not isinstance(scene, dict) or not _scene_contains_character(
+            scene, character_scope_key
+        ):
+            continue
+        scene_index = _parse_int(scene.get("scene_index") or 0)
+        char_start = _parse_int(scene.get("char_start") or 0)
+        char_end = _parse_int(scene.get("char_end") or 0)
+        if scene_index is None or char_start is None or char_end is None:
+            continue
+        matching_scenes.append((scene_index, char_start, char_end, scene))
+    if not matching_scenes:
+        return None
+    _, char_start, char_end, selected_scene = max(
+        matching_scenes,
+        key=lambda scene_data: scene_data[0],
+    )
+    scene_excerpt = _extract_scene_excerpt(
+        chunk_rows=chunk_rows,
+        char_start=char_start,
+        char_end=char_end,
+    )
+    if not scene_excerpt:
+        return None
+
+    episode_summary_raw = scene_data.get("episodeSummaryText")
+    episode_summary_payload = _extract_summary_payload(episode_summary_raw)
+    episode_summary = str(
+        episode_summary_payload.get("summary")
+        or episode_summary_payload.get("episode_summary")
+        or episode_summary_raw
+        or ""
+    ).strip()
+    speech_style = profile.get("speech_style")
+    if not isinstance(speech_style, dict):
+        speech_style = {}
+
+    return {
+        "episodeNo": int(scene_data.get("episodeNo") or 0),
+        "episodeTitle": str(scene_data.get("episodeTitle") or "").strip(),
+        "episodeSummary": episode_summary,
+        "roleLabel": str(
+            profile.get("role_label") or inventory.get("work_role") or ""
+        ).strip(),
+        "aliases": _normalize_aliases(inventory.get("aliases")),
+        "personalityCore": _normalize_text_list(profile.get("personality_core")),
+        "speechStyle": {
+            "tone": _normalize_text_list(speech_style.get("tone")),
+            "formality": str(speech_style.get("formality") or "").strip(),
+            "sentenceLength": str(
+                speech_style.get("sentence_length") or ""
+            ).strip(),
+        },
+        "sceneSummary": str(selected_scene.get("scene_gist") or "").strip(),
+        "sceneExcerpt": scene_excerpt,
+    }
+
+
+def _canonical_character_scope_key_sql(inventory_alias: str) -> str:
+    return f"""COALESCE(
         NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
             {inventory_alias}.summary_text, '$.canonical_character_key'
         ))), ''),
         {inventory_alias}.scope_key
     )"""
+
+
+def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
+    canonical_scope_key = _canonical_character_scope_key_sql(inventory_alias)
     return f"""
         AND EXISTS (
             SELECT 1
@@ -70,6 +232,78 @@ def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
                   examples.summary_text, '$.examples'
               )) > 0
         )
+    """
+
+
+def _public_first_episode_scene_predicate(slot_alias: str) -> str:
+    return f"""
+        AND EXISTS (
+            SELECT 1
+            FROM tb_story_agent_context_summary eligible_scene
+            INNER JOIN tb_product_episode eligible_episode
+                ON eligible_episode.product_id = eligible_scene.product_id
+               AND eligible_episode.episode_no = eligible_scene.episode_to
+            INNER JOIN tb_story_agent_context_doc eligible_doc
+                ON eligible_doc.product_id = eligible_scene.product_id
+               AND eligible_doc.episode_id = eligible_episode.episode_id
+               AND eligible_doc.episode_no = eligible_scene.episode_to
+               AND eligible_doc.is_active = 'Y'
+            WHERE eligible_scene.product_id = {slot_alias}.product_id
+              AND eligible_scene.summary_type = 'episode_scene_extraction'
+              AND eligible_scene.is_active = 'Y'
+              AND eligible_scene.episode_to = 1
+              AND JSON_VALID(eligible_scene.summary_text)
+              AND LOCATE(
+                  JSON_QUOTE({slot_alias}.character_scope_key),
+                  eligible_scene.summary_text
+              ) > 0
+              AND eligible_episode.use_yn = 'Y'
+              AND eligible_episode.open_yn = 'Y'
+              AND COALESCE(eligible_episode.price_type, 'free') = 'free'
+              AND EXISTS (
+                  SELECT 1
+                  FROM tb_story_agent_context_chunk eligible_chunk
+                  WHERE eligible_chunk.context_doc_id = eligible_doc.context_doc_id
+              )
+        )
+    """
+
+
+def _public_character_slot_eligibility_predicate(
+    *, slot_alias: str, product_alias: str
+) -> str:
+    return f"""
+        AND {slot_alias}.use_yn = 'Y'
+        AND {slot_alias}.deleted_yn = 'N'
+        AND {slot_alias}.publish_start_date <= NOW()
+        AND ({slot_alias}.publish_end_date IS NULL OR {slot_alias}.publish_end_date > NOW())
+        AND {product_alias}.open_yn = 'Y'
+        AND COALESCE({product_alias}.blind_yn, 'N') = 'N'
+        AND COALESCE({product_alias}.ai_content_service_enabled_yn, 'N') = 'Y'
+        {build_correlated_character_chat_product_policy_sql(product_alias=product_alias, episode_alias="pe")}
+        AND EXISTS (
+            SELECT 1
+            FROM tb_story_agent_context_summary inventory
+            WHERE inventory.product_id = {slot_alias}.product_id
+              AND inventory.scope_key = {slot_alias}.character_scope_key
+              AND inventory.summary_type = 'character_inventory_v3'
+              AND inventory.is_active = 'Y'
+              AND JSON_VALID(inventory.summary_text)
+              AND JSON_UNQUOTE(
+                  JSON_EXTRACT(
+                      inventory.summary_text,
+                      '$.public_slot_eligible'
+                  )
+              ) = 'true'
+              AND JSON_UNQUOTE(
+                  JSON_EXTRACT(
+                      inventory.summary_text,
+                      '$.display_safety.status'
+                  )
+              ) = 'pass'
+              {_chat_ready_rp_assets_predicate("inventory")}
+        )
+        {_public_first_episode_scene_predicate(slot_alias)}
     """
 
 
@@ -107,7 +341,8 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
     roster: list[tuple[tuple[object, ...], dict]] = []
     seen_scope_keys: set[str] = set()
     for row in rows:
-        payload = _extract_eligible_character_payload(row)
+        row_data = dict(row)
+        payload = _extract_eligible_character_payload(row_data)
         if not payload:
             continue
 
@@ -116,6 +351,14 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
         if not scope_key or not display_name or scope_key in seen_scope_keys:
             continue
         seen_scope_keys.add(scope_key)
+        distinct_episode_count = int(payload.get("distinct_episode_count") or 0)
+        example_count = int(row_data.get("exampleCount") or 0)
+        scene_count = int(row_data.get("sceneCount") or 0)
+        chat_quality, quality_reason = classify_main_character_chat_quality(
+            distinct_episode_count=distinct_episode_count,
+            example_count=example_count,
+            scene_count=scene_count,
+        )
         roster.append(
             (
                 _character_priority(payload),
@@ -123,6 +366,11 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
                     "scopeKey": scope_key,
                     "displayName": display_name,
                     "aliases": _normalize_aliases(payload.get("aliases")),
+                    "distinctEpisodeCount": distinct_episode_count,
+                    "exampleCount": example_count,
+                    "sceneCount": scene_count,
+                    "chatQuality": chat_quality,
+                    "qualityReason": quality_reason,
                 },
             )
         )
@@ -175,18 +423,12 @@ def build_main_character_chat_quality_by_product(candidate_rows) -> dict[int, st
         for _, candidate in sorted(candidates, key=lambda item: item[0])[
             :MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT
         ]:
-            scene_count = candidate["sceneCount"]
-            if scene_count == 0:
-                candidate_qualities.append("insufficient")
-            elif (
-                candidate["distinctEpisodeCount"]
-                >= MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES
-                and candidate["exampleCount"] >= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
-                and scene_count >= MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES
-            ):
-                candidate_qualities.append("good")
-            else:
-                candidate_qualities.append("normal")
+            quality, _ = classify_main_character_chat_quality(
+                distinct_episode_count=int(candidate["distinctEpisodeCount"]),
+                example_count=int(candidate["exampleCount"]),
+                scene_count=int(candidate["sceneCount"]),
+            )
+            candidate_qualities.append(quality)
 
         if candidate_qualities:
             quality_by_product[product_id] = max(
@@ -200,7 +442,44 @@ async def _load_eligible_main_character_roster(
 ) -> list[dict]:
     result = await db.execute(
         text(f"""
-            SELECT sacs.scope_key AS scopeKey, sacs.summary_text AS summaryText
+            SELECT
+                sacs.scope_key AS scopeKey,
+                sacs.summary_text AS summaryText,
+                COALESCE((
+                    SELECT MAX(JSON_LENGTH(JSON_EXTRACT(
+                        examples.summary_text, '$.examples'
+                    )))
+                    FROM tb_story_agent_context_summary examples
+                    WHERE examples.product_id = sacs.product_id
+                      AND examples.scope_key = COALESCE(
+                          NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                              sacs.summary_text, '$.canonical_character_key'
+                          ))), ''),
+                          sacs.scope_key
+                      )
+                      AND examples.summary_type = 'character_rp_examples'
+                      AND examples.is_active = 'Y'
+                      AND JSON_VALID(examples.summary_text)
+                      AND JSON_TYPE(JSON_EXTRACT(
+                          examples.summary_text, '$.examples'
+                      )) = 'ARRAY'
+                ), 0) AS exampleCount,
+                (
+                    SELECT COUNT(*)
+                    FROM tb_story_agent_context_summary scene
+                    WHERE scene.product_id = sacs.product_id
+                      AND scene.summary_type = 'episode_scene_extraction'
+                      AND scene.is_active = 'Y'
+                      AND LOCATE(
+                          JSON_QUOTE(COALESCE(
+                              NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                                  sacs.summary_text, '$.canonical_character_key'
+                              ))), ''),
+                              sacs.scope_key
+                          )),
+                          scene.summary_text
+                      ) > 0
+                ) AS sceneCount
             FROM tb_story_agent_context_summary sacs
             INNER JOIN tb_product p ON p.product_id = sacs.product_id
             WHERE sacs.product_id = :product_id
@@ -239,6 +518,11 @@ async def _ensure_character_slot_selection_eligible(
             status_code=status.HTTP_400_BAD_REQUEST,
             message="메인 캐릭터 카드에 사용할 수 없는 인물입니다.",
         )
+    if selected["chatQuality"] == "insufficient":
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=f"품질 미달 캐릭터는 공개할 수 없습니다. ({selected['qualityReason']})",
+        )
     return selected["displayName"]
 
 
@@ -266,7 +550,7 @@ async def _ensure_character_image_file(
         )
 
 
-def build_public_main_character_slots_query() -> str:
+def _build_public_character_slots_query() -> str:
     return f"""
         SELECT
             mcs.main_character_slot_id AS characterSlotId,
@@ -295,33 +579,19 @@ def build_public_main_character_slots_query() -> str:
         INNER JOIN tb_product p ON p.product_id = mcs.product_id
         LEFT JOIN tb_story_agent_context_product sacp
             ON sacp.product_id = mcs.product_id
-        WHERE mcs.use_yn = 'Y'
-          AND mcs.deleted_yn = 'N'
-          AND mcs.publish_start_date <= NOW()
-          AND (mcs.publish_end_date IS NULL OR mcs.publish_end_date > NOW())
-          AND p.open_yn = 'Y'
-          AND COALESCE(p.blind_yn, 'N') = 'N'
-          AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
+        WHERE 1 = 1
+          {_public_character_slot_eligibility_predicate(slot_alias="mcs", product_alias="p")}
           AND (:adult_yn = 'Y' OR p.ratings_code != 'adult')
-          {build_correlated_character_chat_product_policy_sql(product_alias="p", episode_alias="pe")}
-          AND EXISTS (
-              SELECT 1
-              FROM tb_story_agent_context_summary inventory
-              WHERE inventory.product_id = mcs.product_id
-                AND inventory.scope_key = mcs.character_scope_key
-                AND inventory.summary_type = 'character_inventory_v3'
-                AND inventory.is_active = 'Y'
-                AND JSON_VALID(inventory.summary_text)
-                AND JSON_UNQUOTE(
-                    JSON_EXTRACT(inventory.summary_text, '$.public_slot_eligible')
-                ) = 'true'
-                AND JSON_UNQUOTE(
-                    JSON_EXTRACT(inventory.summary_text, '$.display_safety.status')
-                ) = 'pass'
-                {_chat_ready_rp_assets_predicate("inventory")}
-          )
         ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC
     """
+
+
+def build_public_main_character_slots_query() -> str:
+    return f"{_build_public_character_slots_query().rstrip()}\n        LIMIT 12\n"
+
+
+def build_public_character_catalog_query() -> str:
+    return _build_public_character_slots_query()
 
 
 async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
@@ -330,6 +600,188 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
         {"adult_yn": adult_yn},
     )
     return {"data": [dict(row) for row in result.mappings().all()]}
+
+
+async def get_public_character_catalog(
+    *,
+    adult_yn: str,
+    kc_user_id: str | None,
+    db: AsyncSession,
+):
+    result = await db.execute(
+        text(build_public_character_catalog_query()),
+        {"adult_yn": adult_yn},
+    )
+    catalog_items = [dict(row) for row in result.mappings().all()]
+    for item in catalog_items:
+        item["lastViewedEpisodeNo"] = None
+        item["lastViewedAt"] = None
+
+    product_ids = sorted(
+        {
+            int(item["productId"])
+            for item in catalog_items
+            if int(item.get("productId") or 0) > 0
+        }
+    )
+    if not kc_user_id or not product_ids:
+        return {"data": catalog_items}
+
+    progress_result = await db.execute(
+        text("""
+            SELECT
+                usage_row.product_id AS productId,
+                MAX(pe.episode_no) AS lastViewedEpisodeNo,
+                MAX(usage_row.updated_date) AS lastViewedAt
+            FROM tb_user_product_usage usage_row
+            INNER JOIN tb_product_episode pe
+                ON pe.episode_id = usage_row.episode_id
+               AND pe.product_id = usage_row.product_id
+            INNER JOIN tb_user u ON u.user_id = usage_row.user_id
+            WHERE u.kc_user_id = :kc_user_id
+              AND u.use_yn = 'Y'
+              AND usage_row.use_yn = 'Y'
+              AND pe.use_yn = 'Y'
+              AND pe.open_yn = 'Y'
+              AND usage_row.product_id IN :product_ids
+            GROUP BY usage_row.product_id
+        """).bindparams(bindparam("product_ids", expanding=True)),
+        {
+            "kc_user_id": kc_user_id,
+            "product_ids": product_ids,
+        },
+    )
+    progress_by_product: dict[int, dict] = {}
+    for row in progress_result.mappings().all():
+        row_data = dict(row)
+        if row_data.get("productId") is not None:
+            progress_by_product[int(row_data["productId"])] = row_data
+    for item in catalog_items:
+        progress = progress_by_product.get(int(item.get("productId") or 0))
+        if progress:
+            item["lastViewedEpisodeNo"] = progress.get("lastViewedEpisodeNo")
+            item["lastViewedAt"] = progress.get("lastViewedAt")
+
+    return {"data": catalog_items}
+
+
+async def get_public_character_chat_preview(
+    *,
+    product_id: int,
+    character_scope_key: str,
+    episode_no: int,
+    db: AsyncSession,
+):
+    profile_result = await db.execute(
+        text(f"""
+            SELECT
+                inventory.summary_text AS inventorySummaryText,
+                profile.summary_text AS profileSummaryText
+            FROM tb_main_character_slot mcs
+            INNER JOIN tb_product p ON p.product_id = mcs.product_id
+            INNER JOIN tb_story_agent_context_summary inventory
+                ON inventory.product_id = mcs.product_id
+               AND inventory.scope_key = mcs.character_scope_key
+               AND inventory.summary_type = 'character_inventory_v3'
+               AND inventory.is_active = 'Y'
+               AND JSON_VALID(inventory.summary_text)
+            INNER JOIN tb_story_agent_context_summary profile
+                ON profile.product_id = mcs.product_id
+               AND profile.scope_key = {_canonical_character_scope_key_sql("inventory")}
+               AND profile.summary_type = 'character_rp_profile'
+               AND profile.is_active = 'Y'
+               AND JSON_VALID(profile.summary_text)
+            WHERE mcs.product_id = :product_id
+              AND mcs.character_scope_key = :character_scope_key
+              {_public_character_slot_eligibility_predicate(slot_alias="mcs", product_alias="p")}
+            ORDER BY inventory.summary_id DESC, profile.summary_id DESC
+            LIMIT 1
+        """),
+        {
+            "product_id": product_id,
+            "character_scope_key": character_scope_key,
+        },
+    )
+    profile_row = profile_result.mappings().one_or_none()
+    if profile_row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="공개 가능한 캐릭터 정보를 찾을 수 없습니다.",
+        )
+
+    scene_result = await db.execute(
+        text("""
+            SELECT
+                pe.episode_id AS episodeId,
+                pe.episode_no AS episodeNo,
+                COALESCE(pe.episode_title, '') AS episodeTitle,
+                scene.summary_text AS sceneSummaryText,
+                COALESCE((
+                    SELECT episode_summary.summary_text
+                    FROM tb_story_agent_context_summary episode_summary
+                    WHERE episode_summary.product_id = scene.product_id
+                      AND episode_summary.scope_key = CONCAT('episode:', pe.episode_no)
+                      AND episode_summary.summary_type = 'episode_summary'
+                      AND episode_summary.is_active = 'Y'
+                    ORDER BY episode_summary.summary_id DESC
+                    LIMIT 1
+                ), '') AS episodeSummaryText
+            FROM tb_story_agent_context_summary scene
+            INNER JOIN tb_product_episode pe
+                ON pe.product_id = scene.product_id
+               AND pe.episode_no = scene.episode_to
+            WHERE scene.product_id = :product_id
+              AND scene.summary_type = 'episode_scene_extraction'
+              AND scene.is_active = 'Y'
+              AND scene.episode_to <= :episode_no
+              AND LOCATE(JSON_QUOTE(:character_scope_key), scene.summary_text) > 0
+              AND pe.use_yn = 'Y'
+              AND pe.open_yn = 'Y'
+              AND COALESCE(pe.price_type, 'free') = 'free'
+            ORDER BY scene.episode_to DESC, scene.summary_id DESC
+            LIMIT 5
+        """),
+        {
+            "product_id": product_id,
+            "character_scope_key": character_scope_key,
+            "episode_no": episode_no,
+        },
+    )
+
+    for scene_row in scene_result.mappings().all():
+        scene_data = dict(scene_row)
+        chunk_result = await db.execute(
+            text("""
+                SELECT
+                    chunk.char_start AS charStart,
+                    chunk.char_end AS charEnd,
+                    chunk.text AS text
+                FROM tb_story_agent_context_chunk chunk
+                INNER JOIN tb_story_agent_context_doc doc
+                    ON doc.context_doc_id = chunk.context_doc_id
+                   AND doc.is_active = 'Y'
+                WHERE chunk.product_id = :product_id
+                  AND chunk.episode_id = :episode_id
+                ORDER BY chunk.char_start ASC, chunk.chunk_no ASC
+            """),
+            {
+                "product_id": product_id,
+                "episode_id": int(scene_data.get("episodeId") or 0),
+            },
+        )
+        payload = build_character_chat_preview_payload(
+            character_scope_key=character_scope_key,
+            profile_row=profile_row,
+            scene_row=scene_data,
+            chunk_rows=chunk_result.mappings().all(),
+        )
+        if payload:
+            return {"data": payload}
+
+    raise CustomResponseException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        message="선택한 회차 범위에서 공개 가능한 장면을 찾을 수 없습니다.",
+    )
 
 
 async def get_admin_main_character_slots(
@@ -360,7 +812,40 @@ async def get_admin_main_character_slots(
                 mcs.publish_start_date AS publishStartAt,
                 mcs.publish_end_date AS publishEndAt,
                 mcs.created_date AS createdDate,
-                mcs.updated_date AS updatedDate
+                mcs.updated_date AS updatedDate,
+                CASE WHEN
+                    p.open_yn = 'Y'
+                    AND COALESCE(p.blind_yn, 'N') = 'N'
+                    AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
+                    {build_correlated_character_chat_product_policy_sql(product_alias="p", episode_alias="pe")}
+                    AND EXISTS (
+                        SELECT 1
+                        FROM tb_story_agent_context_summary inventory
+                        WHERE inventory.product_id = mcs.product_id
+                          AND inventory.scope_key = mcs.character_scope_key
+                          AND inventory.summary_type = 'character_inventory_v3'
+                          AND inventory.is_active = 'Y'
+                          AND JSON_VALID(inventory.summary_text)
+                          AND JSON_UNQUOTE(JSON_EXTRACT(
+                              inventory.summary_text, '$.public_slot_eligible'
+                          )) = 'true'
+                          AND JSON_UNQUOTE(JSON_EXTRACT(
+                              inventory.summary_text, '$.display_safety.status'
+                          )) = 'pass'
+                          {_chat_ready_rp_assets_predicate("inventory")}
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM tb_story_agent_context_summary scene
+                        WHERE scene.product_id = mcs.product_id
+                          AND scene.summary_type = 'episode_scene_extraction'
+                          AND scene.is_active = 'Y'
+                          AND LOCATE(
+                              JSON_QUOTE(mcs.character_scope_key),
+                              scene.summary_text
+                          ) > 0
+                    )
+                THEN 1 ELSE 0 END AS publicEligible
             FROM tb_main_character_slot mcs
             INNER JOIN tb_product p ON p.product_id = mcs.product_id
             WHERE mcs.deleted_yn = 'N'
