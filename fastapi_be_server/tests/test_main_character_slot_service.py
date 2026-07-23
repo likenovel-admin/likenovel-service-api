@@ -314,9 +314,18 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "inventory.summary_type = 'character_inventory_v3'" in query
     assert "profile.scope_key" in query
     assert "examples.scope_key" in query
+    assert (
+        "FROM JSON_TABLE( IF( JSON_VALID(examples.summary_text),"
+        in normalized_query
+    )
     assert "summary_type = 'episode_scene_extraction'" in query
     assert "eligible_scene.episode_to = 1" in query
     assert "JSON_VALID(eligible_scene.summary_text)" in query
+    assert (
+        "FROM JSON_TABLE( IF( JSON_VALID(eligible_scene.summary_text),"
+        in normalized_query
+    )
+    assert "JSON_OBJECT()" in query
     assert "NESTED PATH '$.participants[*]'" in query
     assert "NESTED PATH '$.action_ownership[*]'" in query
     assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
