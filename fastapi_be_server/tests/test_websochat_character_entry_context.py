@@ -111,6 +111,27 @@ def _entry_context(
 
 
 class WebsochatCharacterEntryContextTests(unittest.TestCase):
+    def test_character_catalog_is_an_allowed_character_chat_entry_source(self):
+        req = PostWebsochatSessionReqBody(
+            product_id=1182,
+            session_kind="character_chat",
+            entry_source="character_catalog",
+            locked_character_scope_key="character:아델리트",
+            rp_mode="free",
+        )
+
+        self.assertEqual(req.entry_source, "character_catalog")
+        self.assertEqual(
+            _normalize_websochat_session_memory(
+                {
+                    "session_kind": "character_chat",
+                    "entry_source": req.entry_source,
+                    "locked_character_scope_key": req.locked_character_scope_key,
+                }
+            )["entry_source"],
+            "character_catalog",
+        )
+
     def test_adjacent_opening_material_excludes_canon_user_role_and_replay_engine(self):
         entry_context = _entry_context(14)
         entry_context["character_scene"] = {
@@ -752,7 +773,9 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
         self.assertEqual(result["opening_text"], payload["opening_text"])
         self.assertEqual(call_model.await_count, 2)
 
-    async def test_character_chat_session_creation_persists_generated_opening(self):
+    async def test_character_chat_session_creation_preserves_requested_read_boundary_and_falls_back_when_missing(
+        self,
+    ):
         req_body = PostWebsochatSessionReqBody(
             product_id=1182,
             session_kind="character_chat",
@@ -863,6 +886,29 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
 
             result = await websochat_service.create_session(
                 req_body=req_body,
+                kc_user_id="kc-user",
+                adult_yn="N",
+                db=db,
+            )
+
+            apply_read_scope.assert_awaited_once_with(
+                ANY,
+                14,
+                product_id=1182,
+                user_id=200,
+                synced_latest_episode_no=14,
+                db=db,
+            )
+            get_latest_read_episode_no.assert_not_awaited()
+
+            apply_read_scope.reset_mock()
+            get_latest_read_episode_no.reset_mock()
+            generate_opening.reset_mock()
+            insert_opening.reset_mock()
+            await websochat_service.create_session(
+                req_body=req_body.model_copy(
+                    update={"account_read_episode_to": None},
+                ),
                 kc_user_id="kc-user",
                 adult_yn="N",
                 db=db,
