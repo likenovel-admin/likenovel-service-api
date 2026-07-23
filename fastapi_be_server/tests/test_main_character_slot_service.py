@@ -327,6 +327,9 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "SELECT MAX(public_episode.episode_no)" in query
     assert "inventory.scope_key = mcs.character_scope_key" in query
     assert "inventory.summary_type = 'character_inventory_v3'" in query
+    assert "latest_inventory.summary_text" in query
+    assert "AS _inventorySummaryText" in query
+    assert "ORDER BY latest_inventory.summary_id DESC" in query
     assert "profile.scope_key" in query
     assert "examples.scope_key" in query
     assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
@@ -578,45 +581,70 @@ def test_public_character_catalog_scene_query_is_one_bulk_product_query():
     assert "FROM JSON_TABLE(" in query
     assert ":candidate_json" in query
     assert "character_slot_id BIGINT" in query
+    assert "compatible_scope_keys JSON" in query
     assert "summary_type = 'episode_scene_extraction'" in query
+    assert "scene_episode.episode_no >= 1" in query
     assert "scene_episode.use_yn = 'Y'" in query
     assert "scene_episode.open_yn = 'Y'" in query
-    assert "LOCATE(" in query
-    assert "JSON_QUOTE(candidate.character_scope_key)" in query
+    assert "scene_episode.price_type" not in query
+    assert "COUNT(DISTINCT scene.summary_id) AS sceneCount" in query
+    assert "MIN(scene_episode.episode_no) AS entryEpisodeNo" in query
+    assert "catalog_participant.participant_scope_key" in query
+    assert "catalog_action_owner.action_scope_key" in query
     compact_query = "".join(query.split())
     assert (
-        "JSON_SEARCH("
-        "IF(JSON_VALID(scene.summary_text),scene.summary_text,JSON_OBJECT()),"
-        "'one','_%',NULL,'$.scenes[*].scene_gist'"
-        ")ISNOTNULL"
+        "JSON_CONTAINS(candidate.compatible_scope_keys,"
+        "JSON_QUOTE(catalog_participant.participant_scope_key))"
         in compact_query
     )
-    assert "ASusable_scene" not in compact_query
-    assert "opening_scene.product_id = candidate.product_id" in query
-    assert "opening_scene.episode_to BETWEEN 0 AND 1" in query
-    assert "opening_episode.use_yn = 'Y'" in query
-    assert "opening_episode.open_yn = 'Y'" in query
-    assert (
-        "JSON_SEARCH("
-        "IF(JSON_VALID(opening_scene.summary_text),"
-        "opening_scene.summary_text,JSON_OBJECT()),"
-        "'one','_%',NULL,'$.scenes[*].scene_gist'"
-        ")ISNOTNULL"
-        in compact_query
-    )
+    assert "opening_scene" not in query
+    assert "episode_to BETWEEN 0 AND 1" not in query
     assert "GROUP BY candidate.character_slot_id" in query
 
 
+def test_catalog_scene_query_binds_nonempty_gist_and_scope_to_same_scene():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_scene_query,
+    )
+
+    query = build_public_character_catalog_scene_query()
+    compact_query = "".join(query.split())
+
+    assert "CROSS JOIN JSON_TABLE(" in query
+    assert (
+        "JSON_TABLE(IF(JSON_VALID(scene.summary_text),"
+        "scene.summary_text,JSON_OBJECT()),'$.scenes[*]'COLUMNS("
+        "scene_gistVARCHAR(4096)PATH'$.scene_gist',"
+        "participantsJSONPATH'$.participants',"
+        "action_ownershipJSONPATH'$.action_ownership'))AScatalog_scene_row"
+        in compact_query
+    )
+    assert (
+        "ANDEXISTS(SELECT1FROMJSON_TABLE("
+        "IF(JSON_VALID(scene.summary_text),scene.summary_text,JSON_OBJECT()),"
+        "'$.scenes[*]'"
+        not in compact_query
+    )
+    assert (
+        "TRIM(COALESCE(catalog_scene_row.scene_gist,''))<>''"
+        in compact_query
+    )
+    assert "JSON_TYPE(catalog_scene_row.participants)='ARRAY'" in compact_query
+    assert "JSON_TYPE(catalog_scene_row.action_ownership)='ARRAY'" in compact_query
+    assert "$.scenes[*].scene_gist" not in query
+
+
 @pytest.mark.parametrize(
-    ("scene_rows", "expected_character_slot_ids"),
+    ("scene_rows", "expected_entry_episode_no"),
     [
-        ([], []),
-        ([{"characterSlotId": 1, "sceneCount": 1}], [1]),
+        ({"characterSlotId": 1, "sceneCount": 1, "entryEpisodeNo": 1}, 1),
+        ({"characterSlotId": 1, "sceneCount": 2, "entryEpisodeNo": 2}, 2),
+        ({"characterSlotId": 1, "sceneCount": 3, "entryEpisodeNo": 3}, 3),
+        ({"characterSlotId": 1, "sceneCount": 4, "entryEpisodeNo": 4}, 4),
     ],
 )
-def test_catalog_scene_requires_product_opening_scene_even_with_later_character_scene(
-    scene_rows,
-    expected_character_slot_ids,
+def test_catalog_uses_first_character_scene_as_entry_episode(
+    scene_rows, expected_entry_episode_no,
 ):
     from app.services.product.main_character_slot_service import (
         filter_and_rank_public_character_catalog,
@@ -628,15 +656,81 @@ def test_catalog_scene_requires_product_opening_scene_even_with_later_character_
             "productId": 1154,
             "characterScopeKey": "character:later-scene",
             "_inventorySummaryText": "{}",
+            "syncedLatestEpisodeNo": 4,
         }
     ]
 
-    result = filter_and_rank_public_character_catalog(candidates, scene_rows)
+    result = filter_and_rank_public_character_catalog(candidates, [scene_rows])
 
-    assert [
-        item["characterSlotId"]
-        for item in result
-    ] == expected_character_slot_ids
+    assert result[0]["entryEpisodeNo"] == expected_entry_episode_no
+
+
+@pytest.mark.parametrize(
+    "scene_rows",
+    [
+        [],
+        [{"characterSlotId": 1, "sceneCount": 1, "entryEpisodeNo": 0}],
+        [{"characterSlotId": 1, "sceneCount": 1, "entryEpisodeNo": None}],
+        [{"characterSlotId": 1, "sceneCount": 1, "entryEpisodeNo": 5}],
+    ],
+)
+def test_catalog_rejects_missing_or_unsynced_entry_episode(scene_rows):
+    from app.services.product.main_character_slot_service import (
+        filter_and_rank_public_character_catalog,
+    )
+
+    candidates = [
+        {
+            "characterSlotId": 1,
+            "productId": 1154,
+            "characterScopeKey": "character:later-scene",
+            "_inventorySummaryText": "{}",
+            "syncedLatestEpisodeNo": 4,
+        }
+    ]
+
+    assert filter_and_rank_public_character_catalog(candidates, scene_rows) == []
+
+
+def test_catalog_scene_candidates_include_runtime_compatible_inventory_aliases():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_scene_candidates,
+    )
+
+    candidates = build_public_character_catalog_scene_candidates(
+        [
+            {
+                "characterSlotId": 1,
+                "productId": 1154,
+                "characterScopeKey": "character:canonical",
+                "_inventorySummaryText": json.dumps(
+                    {
+                        "canonical_character_key": "character:canonical",
+                        "protagonist_identity_scope_keys": [
+                            "character:identity",
+                            "character:canonical",
+                        ],
+                        "source_character_keys": [
+                            "protagonist:named:source",
+                            "",
+                        ],
+                    }
+                ),
+            }
+        ]
+    )
+
+    assert candidates == [
+        {
+            "characterSlotId": 1,
+            "productId": 1154,
+            "compatibleScopeKeys": [
+                "character:canonical",
+                "character:identity",
+                "protagonist:named:source",
+            ],
+        }
+    ]
 
 
 def test_public_character_catalog_image_query_uses_selected_cards_only():
@@ -670,6 +764,7 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
             "_distinctEpisodeCount": 1,
             "_exampleCount": 1,
             "_inventorySummaryText": "{}",
+            "syncedLatestEpisodeNo": 10,
         },
         {
             "characterSlotId": 2,
@@ -680,6 +775,7 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
             "_distinctEpisodeCount": 20,
             "_exampleCount": 10,
             "_inventorySummaryText": "{}",
+            "syncedLatestEpisodeNo": 10,
         },
         {
             "characterSlotId": 3,
@@ -690,12 +786,13 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
             "_distinctEpisodeCount": 5,
             "_exampleCount": 2,
             "_inventorySummaryText": "{}",
+            "syncedLatestEpisodeNo": 10,
         },
     ]
     scenes = [
-        {"characterSlotId": 1, "sceneCount": 1},
-        {"characterSlotId": 2, "sceneCount": 5},
-        {"characterSlotId": 3, "sceneCount": 2},
+        {"characterSlotId": 1, "sceneCount": 1, "entryEpisodeNo": 1},
+        {"characterSlotId": 2, "sceneCount": 5, "entryEpisodeNo": 2},
+        {"characterSlotId": 3, "sceneCount": 2, "entryEpisodeNo": 3},
     ]
 
     result = filter_and_rank_public_character_catalog(candidates, scenes)
@@ -761,6 +858,108 @@ def test_storage_upload_accepts_character_group_type_through_existing_validator(
 
 
 class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_public_home_slots_survive_entry_episode_query_failure(self):
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from app.services.product import main_character_slot_service
+
+        slot_result = MagicMock()
+        slot_result.mappings.return_value.all.return_value = [
+            {
+                "characterSlotId": 1,
+                "productId": 1101,
+                "characterScopeKey": "character:1",
+                "syncedLatestEpisodeNo": 4,
+                "_inventorySummaryText": "{}",
+            }
+        ]
+        db = AsyncMock()
+        db.execute.side_effect = [
+            slot_result,
+            SQLAlchemyError("entry episode lookup failed"),
+        ]
+
+        with self.assertLogs(
+            main_character_slot_service.logger.name,
+            level="ERROR",
+        ):
+            response = (
+                await main_character_slot_service.get_public_main_character_slots(
+                    adult_yn="N",
+                    db=db,
+                )
+            )
+
+        assert response == {
+            "data": [
+                {
+                    "characterSlotId": 1,
+                    "productId": 1101,
+                    "characterScopeKey": "character:1",
+                    "syncedLatestEpisodeNo": 4,
+                    "entryEpisodeNo": 1,
+                }
+            ]
+        }
+
+    async def test_public_home_slots_enrich_entry_episode_without_filtering(self):
+        from app.services.product import main_character_slot_service
+
+        slot_result = MagicMock()
+        slot_result.mappings.return_value.all.return_value = [
+            {
+                "characterSlotId": slot_id,
+                "productId": 1100 + slot_id,
+                "characterScopeKey": f"character:{slot_id}",
+                "syncedLatestEpisodeNo": synced_episode_no,
+                "_inventorySummaryText": "{}",
+            }
+            for slot_id, synced_episode_no in [
+                (1, 4),
+                (2, 4),
+                (3, 4),
+                (4, 4),
+                (5, 2),
+            ]
+        ]
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = [
+            {"characterSlotId": 1, "sceneCount": 1, "entryEpisodeNo": 2},
+            {"characterSlotId": 2, "sceneCount": 1, "entryEpisodeNo": 3},
+            {"characterSlotId": 3, "sceneCount": 1, "entryEpisodeNo": 4},
+            {"characterSlotId": 5, "sceneCount": 1, "entryEpisodeNo": 3},
+        ]
+        db = AsyncMock()
+        db.execute.side_effect = [slot_result, scene_result]
+
+        response = await main_character_slot_service.get_public_main_character_slots(
+            adult_yn="N",
+            db=db,
+        )
+
+        assert db.execute.await_count == 2
+        assert json.loads(db.execute.await_args_list[1].args[1]["candidate_json"]) == [
+            {
+                "characterSlotId": slot_id,
+                "productId": 1100 + slot_id,
+                "compatibleScopeKeys": [f"character:{slot_id}"],
+            }
+            for slot_id in range(1, 6)
+        ]
+        assert [
+            item["entryEpisodeNo"] for item in response["data"]
+        ] == [2, 3, 4, 1, 1]
+        assert all(
+            "_inventorySummaryText" not in item for item in response["data"]
+        )
+        assert [item["characterSlotId"] for item in response["data"]] == [
+            1,
+            2,
+            3,
+            4,
+            5,
+        ]
+
     async def test_character_catalog_guest_bulk_loads_scenes_with_two_queries(self):
         from app.services.product import main_character_slot_service
 
@@ -801,6 +1000,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             {
                 "characterSlotId": 1,
                 "sceneCount": 5,
+                "entryEpisodeNo": 2,
             }
         ]
         image_result = MagicMock()
@@ -834,7 +1034,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             {
                 "characterSlotId": 1,
                 "productId": 1182,
-                "characterScopeKey": "character:adelite",
+                "compatibleScopeKeys": ["character:adelite"],
             }
         ]
         assert response == {
@@ -846,6 +1046,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "productTitle": "테스트 작품",
                     "authorNickname": "테스트 작가",
                     "syncedLatestEpisodeNo": 3,
+                    "entryEpisodeNo": 2,
                     "publishStartAt": None,
                     "publishEndAt": None,
                     "cardOrder": 1,
@@ -918,8 +1119,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         ]
         scene_result = MagicMock()
         scene_result.mappings.return_value.all.return_value = [
-            {"characterSlotId": 1, "sceneCount": 2},
-            {"characterSlotId": 2, "sceneCount": 5},
+            {"characterSlotId": 1, "sceneCount": 2, "entryEpisodeNo": 2},
+            {"characterSlotId": 2, "sceneCount": 5, "entryEpisodeNo": 3},
         ]
         image_result = MagicMock()
         image_result.mappings.return_value.all.return_value = [
@@ -979,6 +1180,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "productTitle": None,
                     "authorNickname": None,
                     "syncedLatestEpisodeNo": 6,
+                    "entryEpisodeNo": 3,
                     "publishStartAt": None,
                     "publishEndAt": None,
                     "cardOrder": 1,
@@ -999,6 +1201,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "productTitle": None,
                     "authorNickname": None,
                     "syncedLatestEpisodeNo": 12,
+                    "entryEpisodeNo": 2,
                     "publishStartAt": None,
                     "publishEndAt": None,
                     "cardOrder": 2,
@@ -1052,8 +1255,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         ]
         scene_result = MagicMock()
         scene_result.mappings.return_value.all.return_value = [
-            {"characterSlotId": 1, "sceneCount": 1},
-            {"characterSlotId": 2, "sceneCount": 1},
+            {"characterSlotId": 1, "sceneCount": 1, "entryEpisodeNo": 1},
+            {"characterSlotId": 2, "sceneCount": 1, "entryEpisodeNo": 1},
         ]
         image_result = MagicMock()
         image_result.mappings.return_value.all.return_value = [
