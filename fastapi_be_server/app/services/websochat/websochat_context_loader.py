@@ -256,6 +256,11 @@ def _is_websochat_character_entry_context_v2(
         return False
 
     anchor_episode_no = _coerce_int(payload.get("character_anchor_episode_no"))
+    character_scene_source = str(
+        payload.get("character_scene_source") or "matched_character"
+    ).strip()
+    if character_scene_source not in {"matched_character", "read_scope_fallback"}:
+        return False
     character_scene = payload.get("character_scene")
     if not bool(
         0 < anchor_episode_no <= read_episode_to
@@ -305,6 +310,7 @@ def _build_websochat_character_entry_context_v2(
         return {}
 
     character_scene_candidates: list[tuple[int, int, dict[str, Any]]] = []
+    read_scope_scene_candidates: list[tuple[int, int, dict[str, Any]]] = []
     for row in scene_rows:
         payload = _extract_json_object(str(row.get("summary_text") or row.get("summaryText") or "")) or {}
         episode_no = _coerce_int(
@@ -319,15 +325,24 @@ def _build_websochat_character_entry_context_v2(
         if str(payload.get("status") or "ok").strip().lower() not in {"ok", "partial"}:
             continue
         for scene in payload.get("scenes") or []:
-            if not isinstance(scene, dict) or not _scene_matches_character_scope(scene, scope_keys):
+            if not isinstance(scene, dict) or not str(scene.get("scene_gist") or "").strip():
                 continue
             scene_index = _coerce_int(scene.get("scene_index"))
-            character_scene_candidates.append((episode_no, scene_index, scene))
+            candidate = (episode_no, scene_index, scene)
+            read_scope_scene_candidates.append(candidate)
+            if _scene_matches_character_scope(scene, scope_keys):
+                character_scene_candidates.append(candidate)
 
-    if not character_scene_candidates:
+    selected_candidates = character_scene_candidates or read_scope_scene_candidates
+    if not selected_candidates:
         return {}
+    character_scene_source = (
+        "matched_character"
+        if character_scene_candidates
+        else "read_scope_fallback"
+    )
     anchor_episode_no, _, selected_scene = max(
-        character_scene_candidates,
+        selected_candidates,
         key=lambda item: (item[0], item[1]),
     )
     compact_scene = _compact_character_entry_scene(
@@ -349,6 +364,7 @@ def _build_websochat_character_entry_context_v2(
             for episode_no in sorted(recent_plot_by_episode)
         ],
         "character_anchor_episode_no": anchor_episode_no,
+        "character_scene_source": character_scene_source,
         "character_scene": compact_scene,
     }
     if not _is_websochat_character_entry_context_v2(
@@ -442,13 +458,46 @@ async def load_websochat_character_entry_context_v2(
         plot_rows=plot_rows,
         scene_rows=scene_rows,
     )
+    if not context:
+        fallback_scene_result = await db.execute(
+            text(
+                """
+                SELECT episode_from AS episodeFrom,
+                       episode_to AS episodeTo,
+                       summary_text AS summaryText
+                FROM tb_story_agent_context_summary
+                WHERE product_id = :product_id
+                  AND summary_type = 'episode_scene_extraction'
+                  AND is_active = 'Y'
+                  AND episode_to <= :read_episode_to
+                ORDER BY episode_to DESC, summary_id DESC
+                LIMIT :limit
+                """
+            ),
+            {
+                "product_id": product_id,
+                "read_episode_to": safe_scope,
+                "limit": WEBSOCHAT_CHARACTER_ENTRY_SCENE_LIMIT,
+            },
+        )
+        fallback_scene_rows = [
+            dict(row) for row in fallback_scene_result.mappings().all()
+        ]
+        context = _build_websochat_character_entry_context_v2(
+            product_id=product_id,
+            read_episode_to=safe_scope,
+            character_scope_keys=normalized_scope_keys,
+            plot_rows=plot_rows,
+            scene_rows=fallback_scene_rows,
+        )
     logger.info(
-        "websochat character_entry_context product_id=%s read_episode_to=%s character_scope_keys=%s ready=%s anchor_episode_no=%s",
+        "websochat character_entry_context product_id=%s read_episode_to=%s character_scope_keys=%s ready=%s anchor_episode_no=%s scene_source=%s",
         product_id,
         safe_scope,
         normalized_scope_keys,
         bool(context),
         int(context.get("character_anchor_episode_no") or 0),
+        str(context.get("character_scene_source") or ""),
     )
     return context
 

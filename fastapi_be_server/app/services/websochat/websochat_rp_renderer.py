@@ -102,6 +102,9 @@ def _build_character_chat_safe_scene_material(entry_context: dict[str, Any]) -> 
     read_episode_to = int(entry_context.get("read_episode_to") or 0)
     recent_episode_from = int(entry_context.get("recent_episode_from") or 0)
     anchor_episode_no = int(entry_context.get("character_anchor_episode_no") or 0)
+    character_scene_source = str(
+        entry_context.get("character_scene_source") or "matched_character"
+    ).strip()
     scene_is_recent = bool(
         read_episode_to > 0
         and recent_episode_from > 0
@@ -110,7 +113,7 @@ def _build_character_chat_safe_scene_material(entry_context: dict[str, Any]) -> 
     if not scene_is_recent:
         safe_scene.pop("creative_grounding", None)
 
-    return {
+    material = {
         "product_id": int(entry_context.get("product_id") or 0),
         "character_scope_key": character_scope_key,
         "read_episode_to": read_episode_to,
@@ -128,8 +131,14 @@ def _build_character_chat_safe_scene_material(entry_context: dict[str, Any]) -> 
             and str(row.get("summary_text") or "").strip()
         ],
         "character_anchor_episode_no": anchor_episode_no,
-        "selected_character_last_completed_scene": safe_scene,
     }
+    if character_scene_source == "read_scope_fallback":
+        material["entry_strategy"] = "read_scope_fallback_if_entry"
+        material["character_scene_source"] = character_scene_source
+        material["read_scope_fallback_scene"] = safe_scene
+    else:
+        material["selected_character_last_completed_scene"] = safe_scene
+    return material
 
 
 def _build_character_chat_entry_context_lines(payload: dict[str, Any]) -> list[str]:
@@ -157,8 +166,29 @@ def _build_character_chat_entry_context_lines(payload: dict[str, Any]) -> list[s
         lines.append(f"- {episode_no}화 상태: {summary_text}")
 
     anchor_episode_no = int(payload.get("character_anchor_episode_no") or 0)
+    character_scene_source = str(
+        payload.get("character_scene_source") or "matched_character"
+    ).strip()
     character_scene = payload.get("character_scene") if isinstance(payload.get("character_scene"), dict) else {}
     if anchor_episode_no > 0 and character_scene:
+        if character_scene_source == "read_scope_fallback":
+            lines.append(f"- 읽은 범위의 작품 장면 근거: {anchor_episode_no}화")
+            lines.append(
+                json.dumps(
+                    _build_character_chat_safe_scene_material(payload).get(
+                        "read_scope_fallback_scene", {}
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            lines.append(
+                "- 이 장면에 선택 캐릭터가 원래 있었다고 만들지 마라. 장면의 기존 인물 행동을 선택 캐릭터의 과거 행동으로 바꾸지 말고, 현재 작품 상태에서 선택 캐릭터가 IF 곁가지로 새롭게 합류하게 하라."
+            )
+            lines.append(
+                "- scene_identity_boundary와 knowledge_boundary는 공개 한계다. must_not_address_as와 must_not_reveal에 든 정보는 직접 말하거나 암시하지 마라."
+            )
+            return lines
         lines.append(f"- 선택 캐릭터의 마지막 장면 근거: {anchor_episode_no}화")
         lines.append(
             json.dumps(
@@ -451,13 +481,29 @@ def _build_character_chat_adjacent_opening_prompt(
         },
         "reader_boundary": _build_character_chat_safe_scene_material(entry_context),
     }
+    entry_strategy_rules = (
+        "- reader_boundary.entry_strategy가 recent_scene_branch이면 최근 R-1/R 장면의 장소·감각·소품을 장면 프레임으로 유지하고, 완료된 마지막 행동 바로 다음의 새 갈림점에서 시작한다. 원작 대사와 행동은 반복하지 않는다.\n"
+        "- reader_boundary.entry_strategy가 current_boundary_reentry이면 오래된 캐릭터 장면의 장소와 사건으로 돌아가지 않는다. R-1/R recent_episode_state가 현재 시공간과 문제의 유일한 근거다."
+    )
+    selection_rule = (
+        "2. recent_scene_branch이면 원문 감각을 가장 잘 살리면서 완료 행동을 반복하지 않는 후보를, "
+        "current_boundary_reentry이면 오래된 장소를 버리고 최근 회차 상태에 가장 잘 맞는 후보를 고른다."
+    )
+    if str(entry_context.get("character_scene_source") or "matched_character").strip() == "read_scope_fallback":
+        entry_strategy_rules += (
+            "\n- reader_boundary.entry_strategy가 read_scope_fallback_if_entry이면 fallback 장면에 선택 캐릭터가 원래 참여했다고 만들지 않는다. "
+            "그 장면은 읽은 범위의 작품 상태 근거로만 쓰고, 선택 캐릭터가 새 IF 곁가지로 합류해 먼저 행동하게 한다."
+        )
+        selection_rule += (
+            " read_scope_fallback_if_entry이면 기존 등장 인물의 행동을 선택 캐릭터에게 옮기지 말고, "
+            "같은 작품 상태에 선택 캐릭터가 새로 합류하는 후보를 고른다."
+        )
     return f"""당신은 원작 웹소설 캐릭터챗의 첫 장면을 설계하는 편집자다.
 
 [목표]
 - 독자는 {read_episode_to}화까지 읽었다. 정확히 {read_episode_to}화 종료 상태에서 선택 캐릭터가 먼저 움직이고 말하는 새 곁가지 사건을 연다.
 - 원작 세계관과 캐릭터의 동기·말투는 유지하되, 입력의 마지막 장면은 이미 끝난 사건이다. 그 장면의 대화 상대·행동 순서·핵심 사건을 재연하지 않는다.
-- reader_boundary.entry_strategy가 recent_scene_branch이면 최근 R-1/R 장면의 장소·감각·소품을 장면 프레임으로 유지하고, 완료된 마지막 행동 바로 다음의 새 갈림점에서 시작한다. 원작 대사와 행동은 반복하지 않는다.
-- reader_boundary.entry_strategy가 current_boundary_reentry이면 오래된 캐릭터 장면의 장소와 사건으로 돌아가지 않는다. R-1/R recent_episode_state가 현재 시공간과 문제의 유일한 근거다.
+{entry_strategy_rules}
 - 새 사건은 원작의 미공개 진실이나 핵심 플롯 증거가 아니라, 같은 세계의 현재 활동에서 생긴 독립적인 마찰이다. 입력에 없는 사물의 정체나 과거를 원작 사실처럼 확정하지 않는다.
 - 장르와 현재 목표에 맞춰 일정 충돌, 관계 협상, 자원 배분, 기술 시험, 규칙의 예외, 예상 밖의 작은 결과, 방해받은 일상 중 가장 자연스러운 event_shape을 고른다.
 - recent_scene_branch의 creative_grounding은 원문 기반 감각·소품을 유지하기 위한 재료다. 1~2개를 사용해 같은 프레임의 새 갈림점을 만들되 완료된 행동은 반복하지 않는다.
@@ -492,7 +538,7 @@ def _build_character_chat_adjacent_opening_prompt(
 
 [출력 직전 편집]
 1. 서로 다른 event_shape 후보를 내부에서 세 개 만든 뒤 출력하지 말고 비교하라.
-2. recent_scene_branch이면 원문 감각을 가장 잘 살리면서 완료 행동을 반복하지 않는 후보를, current_boundary_reentry이면 오래된 장소를 버리고 최근 회차 상태에 가장 잘 맞는 후보를 고른다.
+{selection_rule}
 3. 새 사건의 원인을 특정 인물·세력의 공작으로 돌리거나 원작 핵심 단서와 연결한 문장이 허용된 원고 근거에 없다면, 현재 업무에서 생긴 평범하지만 의미 있는 마찰로 다시 쓴다.
 4. decision_branch 두 갈래에서 선택 캐릭터가 직접 수행할 행동과 즉시 결과가 서로 다른지 확인한다. 사용자가 직접 운반·수리·감시·보관해야 진행되는 설계라면 판단만 맡도록 다시 쓴다.
 5. 사용자의 위치나 몸짓을 지문에 넣지 않고, stakes가 국지적이고 되돌릴 수 있는지 실제 scene_plan과 opening_text를 다시 읽어 확인한다.
@@ -863,6 +909,16 @@ def build_websochat_rp_system_prompt(
     character_chat_entry_lines = _build_character_chat_entry_context_lines(
         character_chat_entry_context
     )
+    character_chat_first_scene_grounding_line = (
+        "- 읽은 범위 진입점이 있으면 그 회차 종료 상태와 읽은 범위의 작품 장면을 첫 응답의 유일한 사건 근거로 사용하라. "
+        "선택 캐릭터가 그 원작 장면에 있었다고 만들지 말고 IF 곁가지로 새롭게 합류시켜라."
+        if str(
+            character_chat_entry_context.get("character_scene_source")
+            or "matched_character"
+        ).strip()
+        == "read_scope_fallback"
+        else "- 읽은 범위 진입점이 있으면 그 회차 종료 상태와 캐릭터 장면을 첫 응답의 유일한 사건 근거로 사용하라."
+    )
     character_chat_opening = (
         {}
         if is_character_chat_session
@@ -992,7 +1048,7 @@ def build_websochat_rp_system_prompt(
                 "캐릭터챗 첫인사 오프닝",
                 [
                     "- 이번 답변은 세션의 첫 assistant 응답이다. 일반 인사나 자기소개가 아니라 사용자가 작품 속 한 장면에 이미 엮인 순간처럼 시작하라.",
-                    "- 읽은 범위 진입점이 있으면 그 회차 종료 상태와 캐릭터 장면을 첫 응답의 유일한 사건 근거로 사용하라.",
+                    character_chat_first_scene_grounding_line,
                     "- 첫 문단은 300~500자 안팎의 서술형 지문으로 작성하라. 장소의 공기, 소리나 빛 같은 감각, 캐릭터의 자세/시선/거리, 지금 말을 걸 수밖에 없는 긴장을 모두 포함하라.",
                     "- 첫 장면은 원작 장면을 그대로 재연하지 말고, 읽은 범위의 갈등/설정/인물 관계에서 파생된 새 곁가지 사건이나 돌발상황으로 열어라.",
                     "- 첫 대사는 2~3문장으로 작성하라. 캐릭터의 말투로 사용자를 장면에 끌어들이고, 마지막에는 사용자가 답하고 싶어지는 상황 질문/협력 요청/선택 여지를 남겨라.",
