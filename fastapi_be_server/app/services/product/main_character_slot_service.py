@@ -1544,7 +1544,11 @@ async def get_public_character_chat_preview(
                     AND EXISTS (
                         SELECT 1
                         FROM JSON_TABLE(
-                            eligible_scene.summary_text,
+                            IF(
+                                JSON_VALID(eligible_scene.summary_text),
+                                eligible_scene.summary_text,
+                                JSON_OBJECT()
+                            ),
                             '$.scenes[*]' COLUMNS (
                                 scene_gist VARCHAR(160) PATH '$.scene_gist',
                                 participants JSON PATH '$.participants',
@@ -1726,7 +1730,11 @@ async def get_public_character_chat_preview(
               AND EXISTS (
                   SELECT 1
                   FROM JSON_TABLE(
-                      scene.summary_text,
+                      IF(
+                          JSON_VALID(scene.summary_text),
+                          scene.summary_text,
+                          JSON_OBJECT()
+                      ),
                       '$.scenes[*]' COLUMNS (
                           participants JSON PATH '$.participants',
                           action_ownership JSON PATH '$.action_ownership'

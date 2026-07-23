@@ -1428,6 +1428,41 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "CONCAT('episode:', pe.episode_id)" in query
         assert "episode_summary.scope_key = CONCAT('episode:', pe.episode_no)" not in query
 
+    async def test_character_preview_guards_top_level_json_table_inputs(self):
+        from app.exceptions import CustomResponseException
+        from app.services.product import main_character_slot_service
+
+        profile_result = MagicMock()
+        profile_result.mappings.return_value.one_or_none.return_value = {
+            "inventorySummaryText": "{}",
+            "profileSummaryText": "{}",
+        }
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = []
+        db = AsyncMock()
+        db.execute.side_effect = [profile_result, scene_result]
+
+        with self.assertRaises(CustomResponseException):
+            await main_character_slot_service.get_public_character_chat_preview(
+                product_id=1182,
+                character_scope_key="character:adelite",
+                episode_no=5,
+                db=db,
+            )
+
+        profile_query = "".join(str(db.execute.await_args_list[0].args[0]).split())
+        scene_query = "".join(str(db.execute.await_args_list[1].args[0]).split())
+        assert (
+            "FROMJSON_TABLE(IF(JSON_VALID(eligible_scene.summary_text),"
+            "eligible_scene.summary_text,JSON_OBJECT()),'$.scenes[*]'"
+            in profile_query
+        )
+        assert (
+            "FROMJSON_TABLE(IF(JSON_VALID(scene.summary_text),"
+            "scene.summary_text,JSON_OBJECT()),'$.scenes[*]'"
+            in scene_query
+        )
+
     async def test_roster_query_reads_only_active_character_inventory_v3(self):
         from app.services.product import main_character_slot_service
 
