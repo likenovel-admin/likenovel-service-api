@@ -21,8 +21,9 @@ RUN poetry config virtualenvs.create false
 # 의존성 파일 복사
 COPY pyproject.toml poetry.lock* ./
 
-# 의존성 설치 (프로젝트 패키지 포함 설치)
-RUN poetry install --only=main --no-interaction --no-ansi --no-root
+# 기본 이미지는 런타임 의존성만 설치하고, 로컬 Compose에서 test 그룹을 추가합니다.
+ARG POETRY_INSTALL_GROUPS=main
+RUN poetry install --only="$POETRY_INSTALL_GROUPS" --no-interaction --no-ansi --no-root
 
 # secrets 폴더 복사 (컨테이너 /app/secrets 로 복사됨)
 COPY ./secrets ./secrets
