@@ -326,20 +326,44 @@ def _character_chat_first_episode_readiness_predicate(
                       ),
                       '$.scenes[*]' COLUMNS (
                           scene_gist VARCHAR(160) PATH '$.scene_gist',
-                          NESTED PATH '$.participants[*]' COLUMNS (
-                              participant_scope_key VARCHAR(80) PATH '$.scope_key'
-                          ),
-                          NESTED PATH '$.action_ownership[*]' COLUMNS (
-                              action_scope_key VARCHAR(80) PATH '$.actor_scope_key'
-                          )
+                          participants JSON PATH '$.participants',
+                          action_ownership JSON PATH '$.action_ownership'
                       )
                   ) AS eligible_scene_row
                   WHERE TRIM(COALESCE(eligible_scene_row.scene_gist, '')) <> ''
                     AND (
-                        eligible_scene_row.participant_scope_key =
-                            {character_scope_key_sql}
-                        OR eligible_scene_row.action_scope_key =
-                            {character_scope_key_sql}
+                        EXISTS (
+                            SELECT 1
+                            FROM JSON_TABLE(
+                                IF(
+                                    JSON_TYPE(eligible_scene_row.participants) = 'ARRAY',
+                                    eligible_scene_row.participants,
+                                    JSON_ARRAY()
+                                ),
+                                '$[*]' COLUMNS (
+                                    participant_scope_key VARCHAR(80)
+                                        PATH '$.scope_key'
+                                )
+                            ) AS eligible_participant
+                            WHERE eligible_participant.participant_scope_key =
+                                {character_scope_key_sql}
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM JSON_TABLE(
+                                IF(
+                                    JSON_TYPE(eligible_scene_row.action_ownership) = 'ARRAY',
+                                    eligible_scene_row.action_ownership,
+                                    JSON_ARRAY()
+                                ),
+                                '$[*]' COLUMNS (
+                                    action_scope_key VARCHAR(80)
+                                        PATH '$.actor_scope_key'
+                                )
+                            ) AS eligible_action_owner
+                            WHERE eligible_action_owner.action_scope_key =
+                                {character_scope_key_sql}
+                        )
                     )
               )
               AND EXISTS (

@@ -282,6 +282,33 @@ def test_main_character_slot_migration_and_model_follow_project_conventions():
     assert MainCharacterSlot.__tablename__ == "tb_main_character_slot"
 
 
+def test_first_episode_readiness_checks_scene_scope_arrays_separately():
+    from app.services.product.main_character_slot_service import (
+        _character_chat_first_episode_readiness_predicate,
+    )
+
+    query = _character_chat_first_episode_readiness_predicate(
+        product_id_sql="mcs.product_id",
+        character_scope_key_sql="mcs.character_scope_key",
+    )
+    normalized_query = " ".join(query.split())
+
+    assert "NESTED PATH '$.participants[*]'" not in query
+    assert "NESTED PATH '$.action_ownership[*]'" not in query
+    assert "participants JSON PATH '$.participants'" in query
+    assert "action_ownership JSON PATH '$.action_ownership'" in query
+    assert "JSON_TYPE(eligible_scene_row.participants) = 'ARRAY'" in normalized_query
+    assert "JSON_TYPE(eligible_scene_row.action_ownership) = 'ARRAY'" in normalized_query
+    assert (
+        "eligible_participant.participant_scope_key = mcs.character_scope_key"
+        in normalized_query
+    )
+    assert (
+        "eligible_action_owner.action_scope_key = mcs.character_scope_key"
+        in normalized_query
+    )
+
+
 def test_public_main_character_slot_query_filters_current_cards_and_stably_orders_all():
     from app.services.product.main_character_slot_service import (
         build_public_main_character_slots_query,
@@ -327,10 +354,18 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
         in normalized_query
     )
     assert "JSON_OBJECT()" in query
-    assert "NESTED PATH '$.participants[*]'" in query
-    assert "NESTED PATH '$.action_ownership[*]'" in query
-    assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
-    assert "eligible_scene_row.action_scope_key = mcs.character_scope_key" in normalized_query
+    assert "NESTED PATH '$.participants[*]'" not in query
+    assert "NESTED PATH '$.action_ownership[*]'" not in query
+    assert "participants JSON PATH '$.participants'" in query
+    assert "action_ownership JSON PATH '$.action_ownership'" in query
+    assert (
+        "eligible_participant.participant_scope_key = mcs.character_scope_key"
+        in normalized_query
+    )
+    assert (
+        "eligible_action_owner.action_scope_key = mcs.character_scope_key"
+        in normalized_query
+    )
     assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
     assert "eligible_episode_summary.episode_to = 1" in query
     assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
@@ -356,8 +391,14 @@ def test_public_character_catalog_query_uses_same_quality_gate_without_home_limi
     normalized_query = " ".join(query.split())
 
     assert "summary_type = 'episode_scene_extraction'" in query
-    assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
-    assert "eligible_scene_row.action_scope_key = mcs.character_scope_key" in normalized_query
+    assert (
+        "eligible_participant.participant_scope_key = mcs.character_scope_key"
+        in normalized_query
+    )
+    assert (
+        "eligible_action_owner.action_scope_key = mcs.character_scope_key"
+        in normalized_query
+    )
     assert "AS _chatReadyEpisodeCount" in query
     assert "AS _chatTotalEpisodeCount" in query
     assert "readiness_episode.use_yn = 'Y'" in query
@@ -667,10 +708,10 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
         assert "eligible_episode_summary.episode_to = 1" in query
         assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
-        assert "NESTED PATH '$.participants[*]'" in query
-        assert "NESTED PATH '$.action_ownership[*]'" in query
-        assert "eligible_scene_row.participant_scope_key" in query
-        assert "eligible_scene_row.action_scope_key" in query
+        assert "NESTED PATH '$.participants[*]'" not in query
+        assert "NESTED PATH '$.action_ownership[*]'" not in query
+        assert "eligible_participant.participant_scope_key" in query
+        assert "eligible_action_owner.action_scope_key" in query
         assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
         assert "INNER JOIN tb_product_episode eligible_episode" not in query
         assert "tb_story_agent_context_doc eligible_doc" not in query
@@ -733,10 +774,10 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
         assert "eligible_episode_summary.episode_to = 1" in query
         assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
-        assert "NESTED PATH '$.participants[*]'" in query
-        assert "NESTED PATH '$.action_ownership[*]'" in query
-        assert "eligible_scene_row.participant_scope_key" in query
-        assert "eligible_scene_row.action_scope_key" in query
+        assert "NESTED PATH '$.participants[*]'" not in query
+        assert "NESTED PATH '$.action_ownership[*]'" not in query
+        assert "eligible_participant.participant_scope_key" in query
+        assert "eligible_action_owner.action_scope_key" in query
         assert "JSON_LENGTH" in query
         assert "AS exampleCount" in query
         assert "AS sceneCount" in query
@@ -765,8 +806,14 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         normalized_query = " ".join(query.split())
         assert "AS publicEligible" in query
         assert "summary_type = 'episode_scene_extraction'" in query
-        assert "eligible_scene_row.participant_scope_key = mcs.character_scope_key" in normalized_query
-        assert "eligible_scene_row.action_scope_key = mcs.character_scope_key" in normalized_query
+        assert (
+            "eligible_participant.participant_scope_key = mcs.character_scope_key"
+            in normalized_query
+        )
+        assert (
+            "eligible_action_owner.action_scope_key = mcs.character_scope_key"
+            in normalized_query
+        )
         assert "$.public_chat_eligible" in query
         assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
         assert "eligible_episode_summary.episode_to = 1" in query
