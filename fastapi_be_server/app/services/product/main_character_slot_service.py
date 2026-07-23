@@ -283,7 +283,11 @@ def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
               AND EXISTS (
                   SELECT 1
                   FROM JSON_TABLE(
-                      examples.summary_text,
+                      IF(
+                          JSON_VALID(examples.summary_text),
+                          examples.summary_text,
+                          JSON_OBJECT()
+                      ),
                       '$.examples[*]' COLUMNS (
                           episode_no INT PATH '$.episode_no'
                       )
@@ -323,7 +327,11 @@ def _character_chat_first_episode_readiness_predicate(
               AND EXISTS (
                   SELECT 1
                   FROM JSON_TABLE(
-                      eligible_scene.summary_text,
+                      IF(
+                          JSON_VALID(eligible_scene.summary_text),
+                          eligible_scene.summary_text,
+                          JSON_OBJECT()
+                      ),
                       '$.scenes[*]' COLUMNS (
                           scene_gist VARCHAR(160) PATH '$.scene_gist',
                           NESTED PATH '$.participants[*]' COLUMNS (
