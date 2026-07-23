@@ -282,54 +282,19 @@ def test_main_character_slot_migration_and_model_follow_project_conventions():
     assert MainCharacterSlot.__tablename__ == "tb_main_character_slot"
 
 
-def test_first_episode_readiness_requires_public_free_internal_episode_one():
+def test_practical_rp_assets_require_nonempty_examples_without_episode_window():
     from app.services.product.main_character_slot_service import (
-        _character_chat_first_episode_readiness_predicate,
+        _chat_ready_rp_assets_predicate,
     )
 
-    query = _character_chat_first_episode_readiness_predicate(
-        product_id_sql="mcs.product_id",
-        character_scope_key_sql="mcs.character_scope_key",
-    )
-    normalized_query = " ".join(query.split())
+    query = _chat_ready_rp_assets_predicate("inventory")
 
-    assert "FROM tb_product_episode eligible_episode" in query
-    assert "eligible_episode.product_id = mcs.product_id" in normalized_query
-    assert "eligible_episode.episode_no = 1" in normalized_query
-    assert "eligible_episode.use_yn = 'Y'" in normalized_query
-    assert "eligible_episode.open_yn = 'Y'" in normalized_query
-    assert (
-        "COALESCE(eligible_episode.price_type, 'free') = 'free'"
-        in normalized_query
-    )
-    assert "episode_title" not in query
-
-
-def test_first_episode_readiness_checks_scene_scope_arrays_separately():
-    from app.services.product.main_character_slot_service import (
-        _character_chat_first_episode_readiness_predicate,
-    )
-
-    query = _character_chat_first_episode_readiness_predicate(
-        product_id_sql="mcs.product_id",
-        character_scope_key_sql="mcs.character_scope_key",
-    )
-    normalized_query = " ".join(query.split())
-
-    assert "NESTED PATH '$.participants[*]'" not in query
-    assert "NESTED PATH '$.action_ownership[*]'" not in query
-    assert "participants JSON PATH '$.participants'" in query
-    assert "action_ownership JSON PATH '$.action_ownership'" in query
-    assert "JSON_TYPE(eligible_scene_row.participants) = 'ARRAY'" in normalized_query
-    assert "JSON_TYPE(eligible_scene_row.action_ownership) = 'ARRAY'" in normalized_query
-    assert (
-        "eligible_participant.participant_scope_key = mcs.character_scope_key"
-        in normalized_query
-    )
-    assert (
-        "eligible_action_owner.action_scope_key = mcs.character_scope_key"
-        in normalized_query
-    )
+    assert "summary_type = 'character_rp_profile'" in query
+    assert "summary_type = 'character_rp_examples'" in query
+    assert "JSON_LENGTH(JSON_EXTRACT(" in query
+    assert ")) > 0" in query
+    assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
+    assert "FROM JSON_TABLE" not in query
 
 
 def test_public_main_character_slot_query_filters_current_cards_and_stably_orders_all():
@@ -348,7 +313,7 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "COALESCE(p.blind_yn, 'N') = 'N'" in query
     assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
     assert "p.status_code = 'ongoing'" in query
-    assert ">= 15" in query
+    assert ">= 15" in normalized_query
     assert "MIN(COALESCE(" in query
     assert "pe.open_changed_date" in query
     assert ">= '2026-03-01 00:00:00'" in query
@@ -364,35 +329,11 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "inventory.summary_type = 'character_inventory_v3'" in query
     assert "profile.scope_key" in query
     assert "examples.scope_key" in query
-    assert (
-        "FROM JSON_TABLE( IF( JSON_VALID(examples.summary_text),"
-        in normalized_query
-    )
-    assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
-    assert "summary_type = 'episode_scene_extraction'" in query
-    assert "eligible_scene.episode_to = 1" in query
-    assert "JSON_VALID(eligible_scene.summary_text)" in query
-    assert (
-        "FROM JSON_TABLE( IF( JSON_VALID(eligible_scene.summary_text),"
-        in normalized_query
-    )
-    assert "JSON_OBJECT()" in query
-    assert "NESTED PATH '$.participants[*]'" not in query
-    assert "NESTED PATH '$.action_ownership[*]'" not in query
-    assert "participants JSON PATH '$.participants'" in query
-    assert "action_ownership JSON PATH '$.action_ownership'" in query
-    assert (
-        "eligible_participant.participant_scope_key = mcs.character_scope_key"
-        in normalized_query
-    )
-    assert (
-        "eligible_action_owner.action_scope_key = mcs.character_scope_key"
-        in normalized_query
-    )
-    assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
-    assert "eligible_episode_summary.episode_to = 1" in query
-    assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
-    assert "FROM tb_product_episode eligible_episode" in query
+    assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
+    assert "summary_type = 'episode_scene_extraction'" not in query
+    assert "eligible_scene.episode_to = 1" not in query
+    assert "eligible_episode_summary.episode_to = 1" not in query
+    assert "FROM tb_product_episode eligible_episode" not in query
     assert "tb_story_agent_context_doc eligible_doc" not in query
     assert "tb_story_agent_context_chunk eligible_chunk" not in query
     assert "eligible_episode_summary.scope_key" not in query
@@ -405,7 +346,7 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "ROW_NUMBER()" not in query
 
 
-def test_public_character_catalog_query_uses_same_quality_gate_without_home_limit():
+def test_public_character_catalog_product_query_only_applies_product_gate():
     from app.services.product.main_character_slot_service import (
         build_public_character_catalog_query,
     )
@@ -413,28 +354,355 @@ def test_public_character_catalog_query_uses_same_quality_gate_without_home_limi
     query = build_public_character_catalog_query()
     normalized_query = " ".join(query.split())
 
-    assert "summary_type = 'episode_scene_extraction'" in query
-    assert (
-        "eligible_participant.participant_scope_key = mcs.character_scope_key"
-        in normalized_query
-    )
-    assert (
-        "eligible_action_owner.action_scope_key = mcs.character_scope_key"
-        in normalized_query
-    )
-    assert "AS _chatReadyEpisodeCount" in query
+    assert "FROM tb_product p" in query
+    assert "COUNT(DISTINCT public_episode.episode_id)" in query
+    assert ">= 15" in normalized_query
+    assert "status_code = 'ongoing'" not in query
+    assert "2026-03-01" not in query
     assert "AS _chatTotalEpisodeCount" in query
-    assert "readiness_episode.use_yn = 'Y'" in query
-    assert "readiness_episode.open_yn = 'Y'" in query
-    assert "readiness_summary.scope_key" in query
-    assert "CONCAT('episode:', readiness_episode.episode_id)" in query
-    assert "readiness_summary.episode_to = readiness_episode.episode_no" in query
-    assert "FROM tb_product_episode eligible_episode" in query
-    assert "tb_story_agent_context_doc eligible_doc" not in query
-    assert "tb_story_agent_context_chunk eligible_chunk" not in query
-    assert "episode_title" not in query
-    assert "ORDER BY mcs.card_order ASC, mcs.main_character_slot_id ASC" in query
-    assert "LIMIT 12" not in query
+    assert "tb_story_agent_context_summary" not in query
+    assert "tb_main_character_slot" not in query
+
+
+def test_public_character_catalog_readiness_query_is_product_bounded():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_readiness_query,
+    )
+
+    query = build_public_character_catalog_readiness_query()
+
+    assert "public_episode.product_id IN :product_ids" in query
+    assert "AS _chatReadyEpisodeCount" in query
+    assert "AS _contextReadyEpisodeCount" in query
+    assert "AS _continuousReadyEpisodeNo" in query
+    assert "readiness_summary.summary_type = 'episode_summary'" in query
+    assert "readiness_summary.episode_to = public_episode.episode_no" in query
+    assert "ready_episode.episode_no >= 1" in query
+    normalized_query = " ".join(query.split())
+    assert (
+        "SELECT DISTINCT ready_episode.product_id, ready_episode.episode_no"
+        " FROM ready_episode"
+        in normalized_query
+    )
+    assert "FROM ready_episode_no" in query
+    assert "ROW_NUMBER() OVER" in query
+    assert (
+        "numbered_ready_episode.episode_no !="
+        " numbered_ready_episode.ready_ordinal"
+        in normalized_query
+    )
+    assert "GROUP BY public_episode.product_id" in query
+
+
+def test_catalog_merge_uses_only_contiguous_ready_episode_upper_bound():
+    from app.services.product.main_character_slot_service import (
+        merge_public_character_catalog_candidates,
+    )
+
+    product_rows = [
+        {
+            "productId": product_id,
+            "_latestPublicEpisodeNo": latest_episode_no,
+            "_chatTotalEpisodeCount": total_episode_count,
+        }
+        for product_id, latest_episode_no, total_episode_count in [
+            (1137, 64, 64),
+            (2000, 1, 2),
+            (3000, 5, 6),
+        ]
+    ]
+    readiness_rows = [
+        {
+            "productId": 1137,
+            "_chatReadyEpisodeCount": 63,
+            "_contextReadyEpisodeCount": 64,
+            "_continuousReadyEpisodeNo": 26,
+        },
+        {
+            "productId": 2000,
+            "_chatReadyEpisodeCount": 2,
+            "_contextReadyEpisodeCount": 2,
+            "_continuousReadyEpisodeNo": 1,
+        },
+        {
+            "productId": 3000,
+            "_chatReadyEpisodeCount": 5,
+            "_contextReadyEpisodeCount": 5,
+            "_continuousReadyEpisodeNo": 0,
+        },
+    ]
+    asset_rows = [
+        {
+            "characterSlotId": product_id,
+            "productId": product_id,
+            "characterScopeKey": f"character:{product_id}",
+        }
+        for product_id in [1137, 2000, 3000]
+    ]
+
+    result = merge_public_character_catalog_candidates(
+        product_rows,
+        readiness_rows,
+        asset_rows,
+    )
+
+    assert [
+        (item["productId"], item["syncedLatestEpisodeNo"])
+        for item in result
+    ] == [
+        (1137, 26),
+        (2000, 1),
+    ]
+
+
+def test_public_character_catalog_assets_query_filters_before_returning_payload():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_assets_query,
+    )
+
+    query = build_public_character_catalog_assets_query()
+    normalized_query = " ".join(query.split())
+
+    assert "inventory.product_id IN :product_ids" in query
+    assert "inventory.summary_type = 'character_inventory_v3'" in query
+    assert "inventory.is_active = 'Y'" in query
+    assert "$.public_chat_eligible" in query
+    assert "$.public_slot_eligible" not in query
+    assert "$.display_safety.status" not in query
+    assert "summary_type = 'character_rp_profile'" in query
+    assert "summary_type = 'character_rp_examples'" in query
+    assert "JSON_CONTAINS(" in query
+    assert "$.protagonist_identity_scope_keys" in query
+    assert "$.source_character_keys" in query
+    assert "JSON_QUOTE(profile.scope_key)" in query
+    assert "JSON_QUOTE(examples.scope_key)" in query
+    assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
+    assert "ROW_NUMBER() OVER" in query
+    assert "PARTITION BY inventory.product_id" in normalized_query
+    assert "inventory.updated_date" not in query
+    assert "inventory.created_date AS updatedDate" in query
+    assert "_inventorySummaryText" in query
+
+
+def test_catalog_assets_checks_rp_assets_only_after_latest_public_inventory():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_assets_query,
+    )
+
+    query = build_public_character_catalog_assets_query()
+    normalized_query = " ".join(query.split())
+
+    assert "latest_inventory AS (" in normalized_query
+    assert "inventory_assets AS (" in normalized_query
+    ranking_stage, remaining_query = normalized_query.split(
+        "latest_inventory AS (",
+        maxsplit=1,
+    )
+    latest_stage, asset_stage = remaining_query.split(
+        "inventory_assets AS (",
+        maxsplit=1,
+    )
+    assert "inventory.summary_text AS" not in ranking_stage
+    assert "character_rp_profile" not in ranking_stage
+    assert "character_rp_examples" not in ranking_stage
+    assert (
+        "FROM inventory_ranked ranked"
+        " INNER JOIN tb_story_agent_context_summary inventory"
+        " ON inventory.summary_id = ranked.summaryId"
+        in latest_stage
+    )
+    assert "WHERE ranked.inventoryVersionRank = 1" in latest_stage
+    assert "$.public_chat_eligible" in latest_stage
+    assert "character_rp_profile" not in latest_stage
+    assert "character_rp_examples" not in latest_stage
+    assert (
+        "FROM latest_inventory inventory"
+        in asset_stage
+    )
+    assert "character_rp_profile" in asset_stage
+    assert "character_rp_examples" in asset_stage
+    assert "inventory.characterScopeKey" in asset_stage
+    assert "inventory.scope_key" not in asset_stage
+    assert query.count("examples.summary_type = 'character_rp_examples'") == 1
+    assert "JSON_CONTAINS(" in asset_stage
+    assert "$.protagonist_identity_scope_keys" in asset_stage
+    assert "$.source_character_keys" in asset_stage
+
+    inventory_versions = [
+        {"summaryId": 1, "hasProfile": True, "hasExamples": True},
+        {"summaryId": 2, "hasProfile": False, "hasExamples": False},
+    ]
+    latest_inventory = max(
+        inventory_versions,
+        key=lambda item: item["summaryId"],
+    )
+    assert latest_inventory == {
+        "summaryId": 2,
+        "hasProfile": False,
+        "hasExamples": False,
+    }
+
+
+def test_catalog_assets_latest_false_does_not_fall_back_to_older_true():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_assets_query,
+    )
+
+    inventory_versions = [
+        {"summaryId": 1, "publicChatEligible": True},
+        {"summaryId": 2, "publicChatEligible": False},
+    ]
+    latest_inventory = max(
+        inventory_versions,
+        key=lambda item: item["summaryId"],
+    )
+    query = build_public_character_catalog_assets_query()
+    normalized_query = " ".join(query.split())
+
+    assert latest_inventory["publicChatEligible"] is False
+    assert "WHERE ranked.inventoryVersionRank = 1" in normalized_query
+    assert (
+        normalized_query.index("ROW_NUMBER() OVER")
+        < normalized_query.index("WHERE ranked.inventoryVersionRank = 1")
+        < normalized_query.index("$.public_chat_eligible")
+    )
+
+
+def test_public_character_catalog_scene_query_is_one_bulk_product_query():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_scene_query,
+    )
+
+    query = build_public_character_catalog_scene_query()
+
+    assert "FROM JSON_TABLE(" in query
+    assert ":candidate_json" in query
+    assert "character_slot_id BIGINT" in query
+    assert "summary_type = 'episode_scene_extraction'" in query
+    assert "scene_episode.use_yn = 'Y'" in query
+    assert "scene_episode.open_yn = 'Y'" in query
+    assert "LOCATE(" in query
+    assert "JSON_QUOTE(candidate.character_scope_key)" in query
+    compact_query = "".join(query.split())
+    assert (
+        "JSON_SEARCH("
+        "IF(JSON_VALID(scene.summary_text),scene.summary_text,JSON_OBJECT()),"
+        "'one','_%',NULL,'$.scenes[*].scene_gist'"
+        ")ISNOTNULL"
+        in compact_query
+    )
+    assert "ASusable_scene" not in compact_query
+    assert "opening_scene.product_id = candidate.product_id" in query
+    assert "opening_scene.episode_to BETWEEN 0 AND 1" in query
+    assert "opening_episode.use_yn = 'Y'" in query
+    assert "opening_episode.open_yn = 'Y'" in query
+    assert (
+        "JSON_SEARCH("
+        "IF(JSON_VALID(opening_scene.summary_text),"
+        "opening_scene.summary_text,JSON_OBJECT()),"
+        "'one','_%',NULL,'$.scenes[*].scene_gist'"
+        ")ISNOTNULL"
+        in compact_query
+    )
+    assert "GROUP BY candidate.character_slot_id" in query
+
+
+@pytest.mark.parametrize(
+    ("scene_rows", "expected_character_slot_ids"),
+    [
+        ([], []),
+        ([{"characterSlotId": 1, "sceneCount": 1}], [1]),
+    ],
+)
+def test_catalog_scene_requires_product_opening_scene_even_with_later_character_scene(
+    scene_rows,
+    expected_character_slot_ids,
+):
+    from app.services.product.main_character_slot_service import (
+        filter_and_rank_public_character_catalog,
+    )
+
+    candidates = [
+        {
+            "characterSlotId": 1,
+            "productId": 1154,
+            "characterScopeKey": "character:later-scene",
+            "_inventorySummaryText": "{}",
+        }
+    ]
+
+    result = filter_and_rank_public_character_catalog(candidates, scene_rows)
+
+    assert [
+        item["characterSlotId"]
+        for item in result
+    ] == expected_character_slot_ids
+
+
+def test_public_character_catalog_image_query_uses_selected_cards_only():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_image_query,
+    )
+
+    query = build_public_character_catalog_image_query()
+
+    assert ":selected_json" in query
+    assert "active_slot.character_scope_key" in query
+    assert "selected.character_scope_key" in query
+    assert "slot_group.group_type = 'character'" in query
+    assert "cover_group.group_type = 'cover'" in query
+    assert "COALESCE(" in query
+    assert "GROUP BY selected.character_slot_id" in query
+
+
+def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
+    from app.services.product.main_character_slot_service import (
+        filter_and_rank_public_character_catalog,
+    )
+
+    candidates = [
+        {
+            "characterSlotId": 1,
+            "productId": 10,
+            "characterScopeKey": "character:protagonist",
+            "characterName": "주인공",
+            "_isProtagonist": 1,
+            "_distinctEpisodeCount": 1,
+            "_exampleCount": 1,
+            "_inventorySummaryText": "{}",
+        },
+        {
+            "characterSlotId": 2,
+            "productId": 10,
+            "characterScopeKey": "character:major",
+            "characterName": "주요 인물",
+            "_isProtagonist": 0,
+            "_distinctEpisodeCount": 20,
+            "_exampleCount": 10,
+            "_inventorySummaryText": "{}",
+        },
+        {
+            "characterSlotId": 3,
+            "productId": 10,
+            "characterScopeKey": "character:minor",
+            "characterName": "조연",
+            "_isProtagonist": 0,
+            "_distinctEpisodeCount": 5,
+            "_exampleCount": 2,
+            "_inventorySummaryText": "{}",
+        },
+    ]
+    scenes = [
+        {"characterSlotId": 1, "sceneCount": 1},
+        {"characterSlotId": 2, "sceneCount": 5},
+        {"characterSlotId": 3, "sceneCount": 2},
+    ]
+
+    result = filter_and_rank_public_character_catalog(candidates, scenes)
+
+    assert {item["characterSlotId"] for item in result} == {1, 2}
+    assert all("_inventorySummaryText" not in item for item in result)
+    assert all("_isProtagonist" not in item for item in result)
 
 
 def test_main_character_slot_request_schema_enforces_optional_period_contract():
@@ -493,21 +761,60 @@ def test_storage_upload_accepts_character_group_type_through_existing_validator(
 
 
 class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
-    async def test_character_catalog_guest_adds_null_progress_with_one_query(self):
+    async def test_character_catalog_guest_bulk_loads_scenes_with_two_queries(self):
         from app.services.product import main_character_slot_service
 
+        product_result = MagicMock()
+        product_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "productTitle": "테스트 작품",
+                "authorNickname": "테스트 작가",
+                "_chatTotalEpisodeCount": 4,
+                "_latestPublicEpisodeNo": 4,
+            }
+        ]
+        readiness_result = MagicMock()
+        readiness_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "_chatReadyEpisodeCount": 3,
+                "_contextReadyEpisodeCount": 3,
+                "_continuousReadyEpisodeNo": 3,
+            }
+        ]
         catalog_result = MagicMock()
         catalog_result.mappings.return_value.all.return_value = [
             {
                 "characterSlotId": 1,
                 "productId": 1182,
                 "characterScopeKey": "character:adelite",
-                "_chatReadyEpisodeCount": 3,
-                "_chatTotalEpisodeCount": 4,
+                "_distinctEpisodeCount": 12,
+                "_exampleCount": 4,
+                "_sceneCount": 0,
+                "_inventorySummaryText": "{}",
+                "_isProtagonist": 1,
             }
         ]
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = [
+            {
+                "characterSlotId": 1,
+                "sceneCount": 5,
+            }
+        ]
+        image_result = MagicMock()
+        image_result.mappings.return_value.all.return_value = [
+            {"characterSlotId": 1, "characterImagePath": "/cover.webp"}
+        ]
         db = AsyncMock()
-        db.execute.return_value = catalog_result
+        db.execute.side_effect = [
+            product_result,
+            readiness_result,
+            catalog_result,
+            scene_result,
+            image_result,
+        ]
 
         response = await main_character_slot_service.get_public_character_catalog(
             adult_yn="N",
@@ -515,15 +822,40 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             db=db,
         )
 
-        assert db.execute.await_count == 1
+        assert db.execute.await_count == 5
+        assert db.execute.await_args_list[1].args[0]._bindparams[
+            "product_ids"
+        ].expanding
+        assert db.execute.await_args_list[2].args[0]._bindparams[
+            "product_ids"
+        ].expanding
+        scene_params = db.execute.await_args_list[3].args[1]
+        assert json.loads(scene_params["candidate_json"]) == [
+            {
+                "characterSlotId": 1,
+                "productId": 1182,
+                "characterScopeKey": "character:adelite",
+            }
+        ]
         assert response == {
             "data": [
                 {
                     "characterSlotId": 1,
                     "productId": 1182,
                     "characterScopeKey": "character:adelite",
+                    "productTitle": "테스트 작품",
+                    "authorNickname": "테스트 작가",
+                    "syncedLatestEpisodeNo": 3,
+                    "publishStartAt": None,
+                    "publishEndAt": None,
+                    "cardOrder": 1,
+                    "characterImagePath": "/cover.webp",
                     "fullReady": False,
                     "readinessCoverageRatio": 0.75,
+                    "distinctEpisodeCount": 12,
+                    "exampleCount": 4,
+                    "sceneCount": 5,
+                    "chatQuality": "good",
                     "lastViewedEpisodeNo": None,
                     "lastViewedAt": None,
                 }
@@ -533,20 +865,66 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
     async def test_character_catalog_auth_bulk_loads_and_merges_progress(self):
         from app.services.product import main_character_slot_service
 
+        product_result = MagicMock()
+        product_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "_chatTotalEpisodeCount": 12,
+                "_latestPublicEpisodeNo": 12,
+            },
+            {
+                "productId": 1192,
+                "_chatTotalEpisodeCount": 12,
+                "_latestPublicEpisodeNo": 12,
+            },
+        ]
+        readiness_result = MagicMock()
+        readiness_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "_chatReadyEpisodeCount": 12,
+                "_contextReadyEpisodeCount": 12,
+                "_continuousReadyEpisodeNo": 12,
+            },
+            {
+                "productId": 1192,
+                "_chatReadyEpisodeCount": 6,
+                "_contextReadyEpisodeCount": 6,
+                "_continuousReadyEpisodeNo": 6,
+            },
+        ]
         catalog_result = MagicMock()
         catalog_result.mappings.return_value.all.return_value = [
             {
                 "characterSlotId": 1,
                 "productId": 1182,
-                "_chatReadyEpisodeCount": 12,
-                "_chatTotalEpisodeCount": 12,
+                "characterScopeKey": "character:adelite",
+                "_distinctEpisodeCount": 8,
+                "_exampleCount": 2,
+                "_sceneCount": 0,
+                "_inventorySummaryText": "{}",
+                "_isProtagonist": 1,
             },
             {
                 "characterSlotId": 2,
                 "productId": 1192,
-                "_chatReadyEpisodeCount": 6,
-                "_chatTotalEpisodeCount": 12,
+                "characterScopeKey": "character:other",
+                "_distinctEpisodeCount": 10,
+                "_exampleCount": 4,
+                "_sceneCount": 0,
+                "_inventorySummaryText": "{}",
+                "_isProtagonist": 1,
             },
+        ]
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = [
+            {"characterSlotId": 1, "sceneCount": 2},
+            {"characterSlotId": 2, "sceneCount": 5},
+        ]
+        image_result = MagicMock()
+        image_result.mappings.return_value.all.return_value = [
+            {"characterSlotId": 1, "characterImagePath": "/one.webp"},
+            {"characterSlotId": 2, "characterImagePath": "/two.webp"},
         ]
         progress_result = MagicMock()
         progress_result.mappings.return_value.all.return_value = [
@@ -557,7 +935,14 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             }
         ]
         db = AsyncMock()
-        db.execute.side_effect = [catalog_result, progress_result]
+        db.execute.side_effect = [
+            product_result,
+            readiness_result,
+            catalog_result,
+            scene_result,
+            image_result,
+            progress_result,
+        ]
 
         response = await main_character_slot_service.get_public_character_catalog(
             adult_yn="N",
@@ -565,10 +950,10 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             db=db,
         )
 
-        assert db.execute.await_count == 2
-        progress_query = db.execute.await_args_list[1].args[0]
+        assert db.execute.await_count == 6
+        progress_query = db.execute.await_args_list[5].args[0]
         progress_sql = str(progress_query)
-        progress_params = db.execute.await_args_list[1].args[1]
+        progress_params = db.execute.await_args_list[5].args[1]
         assert "FROM tb_user_product_usage" in progress_sql
         assert "INNER JOIN tb_product_episode" in progress_sql
         assert "INNER JOIN tb_user" in progress_sql
@@ -588,20 +973,44 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert response == {
             "data": [
                 {
-                    "characterSlotId": 1,
-                    "productId": 1182,
-                    "fullReady": True,
-                    "readinessCoverageRatio": 1.0,
-                    "lastViewedEpisodeNo": 17,
-                    "lastViewedAt": "2026-07-22 12:34:56",
-                },
-                {
                     "characterSlotId": 2,
                     "productId": 1192,
+                    "characterScopeKey": "character:other",
+                    "productTitle": None,
+                    "authorNickname": None,
+                    "syncedLatestEpisodeNo": 6,
+                    "publishStartAt": None,
+                    "publishEndAt": None,
+                    "cardOrder": 1,
+                    "characterImagePath": "/two.webp",
                     "fullReady": False,
                     "readinessCoverageRatio": 0.5,
+                    "distinctEpisodeCount": 10,
+                    "exampleCount": 4,
+                    "sceneCount": 5,
+                    "chatQuality": "good",
                     "lastViewedEpisodeNo": None,
                     "lastViewedAt": None,
+                },
+                {
+                    "characterSlotId": 1,
+                    "productId": 1182,
+                    "characterScopeKey": "character:adelite",
+                    "productTitle": None,
+                    "authorNickname": None,
+                    "syncedLatestEpisodeNo": 12,
+                    "publishStartAt": None,
+                    "publishEndAt": None,
+                    "cardOrder": 2,
+                    "characterImagePath": "/one.webp",
+                    "fullReady": True,
+                    "readinessCoverageRatio": 1.0,
+                    "distinctEpisodeCount": 8,
+                    "exampleCount": 2,
+                    "sceneCount": 2,
+                    "chatQuality": "normal",
+                    "lastViewedEpisodeNo": 17,
+                    "lastViewedAt": "2026-07-22 12:34:56",
                 },
             ]
         }
@@ -609,10 +1018,47 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
     async def test_character_catalog_enriches_duplicate_characters_for_same_product(self):
         from app.services.product import main_character_slot_service
 
+        product_result = MagicMock()
+        product_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "_chatTotalEpisodeCount": 15,
+                "_latestPublicEpisodeNo": 15,
+            }
+        ]
+        readiness_result = MagicMock()
+        readiness_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "_chatReadyEpisodeCount": 1,
+                "_contextReadyEpisodeCount": 1,
+                "_continuousReadyEpisodeNo": 1,
+            }
+        ]
         catalog_result = MagicMock()
         catalog_result.mappings.return_value.all.return_value = [
-            {"characterSlotId": 1, "productId": 1182},
-            {"characterSlotId": 2, "productId": 1182},
+            {
+                "characterSlotId": 1,
+                "productId": 1182,
+                "characterScopeKey": "character:a",
+                "_inventorySummaryText": "{}",
+            },
+            {
+                "characterSlotId": 2,
+                "productId": 1182,
+                "characterScopeKey": "character:b",
+                "_inventorySummaryText": "{}",
+            },
+        ]
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = [
+            {"characterSlotId": 1, "sceneCount": 1},
+            {"characterSlotId": 2, "sceneCount": 1},
+        ]
+        image_result = MagicMock()
+        image_result.mappings.return_value.all.return_value = [
+            {"characterSlotId": 1, "characterImagePath": None},
+            {"characterSlotId": 2, "characterImagePath": None},
         ]
         progress_result = MagicMock()
         progress_result.mappings.return_value.all.return_value = [
@@ -623,7 +1069,14 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             }
         ]
         db = AsyncMock()
-        db.execute.side_effect = [catalog_result, progress_result]
+        db.execute.side_effect = [
+            product_result,
+            readiness_result,
+            catalog_result,
+            scene_result,
+            image_result,
+            progress_result,
+        ]
 
         response = await main_character_slot_service.get_public_character_catalog(
             adult_yn="Y",
@@ -631,8 +1084,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             db=db,
         )
 
-        assert db.execute.await_count == 2
-        assert db.execute.await_args_list[1].args[1]["product_ids"] == [1182]
+        assert db.execute.await_count == 6
+        assert db.execute.await_args_list[5].args[1]["product_ids"] == [1182]
         assert [
             (item["lastViewedEpisodeNo"], item["lastViewedAt"])
             for item in response["data"]
@@ -692,7 +1145,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         )
         assert response == {"data": []}
 
-    async def test_character_preview_profile_uses_public_slot_eligibility_gate(self):
+    async def test_character_preview_profile_uses_automatic_catalog_asset_gate(self):
         from app.exceptions import CustomResponseException
         from app.services.product import main_character_slot_service
 
@@ -710,15 +1163,19 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             )
 
         query = str(db.execute.await_args.args[0])
-        assert "mcs.use_yn = 'Y'" in query
-        assert "mcs.deleted_yn = 'N'" in query
+        normalized_query = " ".join(query.split())
+        assert "FROM tb_main_character_slot" not in query
+        assert "FROM tb_story_agent_context_summary inventory" in query
         assert "p.open_yn = 'Y'" in query
         assert "COALESCE(p.blind_yn, 'N') = 'N'" in query
         assert "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'" in query
-        assert "p.status_code = 'ongoing'" in query
-        assert "$.public_slot_eligible" in query
+        assert "p.status_code = 'ongoing'" not in query
+        assert "2026-03-01" not in query
+        assert "COUNT(DISTINCT public_episode.episode_id)" in query
+        assert ">= 15" in query
+        assert "$.public_slot_eligible" not in query
         assert "$.public_chat_eligible" in query
-        assert "$.display_safety.status" in query
+        assert "$.display_safety.status" not in query
         assert "summary_type = 'character_rp_profile'" in query
         assert "summary_type = 'character_rp_examples'" in query
         profile_join = query.split(
@@ -726,20 +1183,20 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         )[1].split("WHERE", 1)[0]
         assert "profile.scope_key = COALESCE(" in profile_join
         assert "inventory.summary_text, '$.canonical_character_key'" in profile_join
-        assert "eligible_scene.episode_to = 1" in query
+        assert "eligible_scene.episode_to = 1" not in query
         assert "JSON_VALID(eligible_scene.summary_text)" in query
         assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
-        assert "eligible_episode_summary.episode_to = 1" in query
-        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
+        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
         assert "NESTED PATH '$.participants[*]'" not in query
         assert "NESTED PATH '$.action_ownership[*]'" not in query
         assert "eligible_participant.participant_scope_key" in query
         assert "eligible_action_owner.action_scope_key" in query
-        assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
-        assert "FROM tb_product_episode eligible_episode" in query
-        assert "tb_story_agent_context_doc eligible_doc" not in query
-        assert "tb_story_agent_context_chunk eligible_chunk" not in query
-        assert "episode_title" not in query
+        assert (
+            "TRIM(COALESCE( eligible_episode_summary.summary_text, '' )) <> ''"
+            in normalized_query
+        )
+        assert "$.protagonist_identity_scope_keys" in query
+        assert "$.source_character_keys" in query
 
     async def test_character_preview_looks_up_episode_summary_by_episode_number(self):
         from app.exceptions import CustomResponseException
@@ -794,13 +1251,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "summary_type = 'character_rp_profile'" in query
         assert "summary_type = 'character_rp_examples'" in query
         assert "$.public_chat_eligible" in query
-        assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
-        assert "eligible_episode_summary.episode_to = 1" in query
-        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" in query
-        assert "NESTED PATH '$.participants[*]'" not in query
-        assert "NESTED PATH '$.action_ownership[*]'" not in query
-        assert "eligible_participant.participant_scope_key" in query
-        assert "eligible_action_owner.action_scope_key" in query
+        assert "eligible_episode_summary.episode_to = 1" not in query
+        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
         assert "JSON_LENGTH" in query
         assert "AS exampleCount" in query
         assert "AS sceneCount" in query
@@ -826,20 +1278,11 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         )
 
         query = str(db.execute.await_args_list[1].args[0])
-        normalized_query = " ".join(query.split())
         assert "AS publicEligible" in query
-        assert "summary_type = 'episode_scene_extraction'" in query
-        assert (
-            "eligible_participant.participant_scope_key = mcs.character_scope_key"
-            in normalized_query
-        )
-        assert (
-            "eligible_action_owner.action_scope_key = mcs.character_scope_key"
-            in normalized_query
-        )
+        assert "summary_type = 'episode_scene_extraction'" not in query
         assert "$.public_chat_eligible" in query
-        assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
-        assert "eligible_episode_summary.episode_to = 1" in query
+        assert "eligible_episode_summary.episode_to = 1" not in query
+        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
         assert response["results"] == []
 
     async def test_product_search_only_returns_consented_products_with_fifteen_public_episodes(self):
@@ -868,8 +1311,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "$.display_safety.status" in query
         assert "summary_type = 'character_rp_profile'" in query
         assert "summary_type = 'character_rp_examples'" in query
-        assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
-        assert "eligible_episode_summary.episode_to = 1" in query
+        assert "eligible_episode_summary.episode_to = 1" not in query
+        assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
         assert "{_chat_ready_rp_assets_predicate" not in query
         assert params["minimum_open_episode_count"] == 15
         assert params["first_public_episode_at"] == "2026-03-01 00:00:00"
@@ -950,8 +1393,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             assert "$.display_safety.status" in query
             assert "summary_type = 'character_rp_profile'" in query
             assert "summary_type = 'character_rp_examples'" in query
-            assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
-            assert "eligible_episode_summary.episode_to = 1" in query
+            assert "eligible_episode_summary.episode_to = 1" not in query
+            assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
             assert "JSON_LENGTH" in query
             assert ">= :minimum_open_episode_count" in query
             assert ">= :first_public_episode_at" in query
@@ -1213,6 +1656,66 @@ def test_build_character_chat_preview_uses_matching_scene_and_source_chunk():
         "sceneSummary": "윤서하가 열쇠를 들고 동행자의 선택을 기다린다.",
         "sceneExcerpt": source_text,
     }
+
+
+def test_build_character_chat_preview_matches_action_owner_inventory_alias():
+    from app.services.product.main_character_slot_service import (
+        build_character_chat_preview_payload,
+    )
+
+    source_text = "방호영은 검을 뽑아 문 앞을 막았다."
+    payload = build_character_chat_preview_payload(
+        character_scope_key="character:조렌테이머",
+        profile_row={
+            "inventorySummaryText": json.dumps(
+                {
+                    "canonical_character_key": "character:조렌테이머",
+                    "display_name": "조렌테이머",
+                    "protagonist_identity_scope_keys": ["character:방호영"],
+                    "source_character_keys": ["protagonist:named:방호영"],
+                },
+                ensure_ascii=False,
+            ),
+            "profileSummaryText": "{}",
+        },
+        scene_row={
+            "episodeId": 1,
+            "episodeNo": 1,
+            "episodeTitle": "문 앞에서",
+            "episodeSummaryText": "방호영이 문을 지킨다.",
+            "sceneSummaryText": json.dumps(
+                {
+                    "scenes": [
+                        {
+                            "scene_index": 1,
+                            "scene_gist": "방호영이 검을 뽑아 적을 막는다.",
+                            "char_start": 0,
+                            "char_end": len(source_text),
+                            "participants": [],
+                            "action_ownership": [
+                                {
+                                    "actor_scope_key": "character:방호영",
+                                    "action": "검을 뽑는다.",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        },
+        chunk_rows=[
+            {
+                "charStart": 0,
+                "charEnd": len(source_text),
+                "text": source_text,
+            }
+        ],
+    )
+
+    assert payload is not None
+    assert payload["sceneSummary"] == "방호영이 검을 뽑아 적을 막는다."
+    assert payload["sceneExcerpt"] == source_text
 
 
 @pytest.mark.parametrize(

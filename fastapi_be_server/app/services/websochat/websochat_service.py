@@ -28,7 +28,7 @@ from app.schemas.websochat import (
     PatchWebsochatSessionReqBody,
 )
 from app.services.websochat.character_chat_product_policy import (
-    build_aggregate_character_chat_product_eligibility_sql,
+    CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
     is_character_chat_product_eligible,
 )
 from app.services.websochat.websochat_compare import (
@@ -1826,6 +1826,16 @@ async def _resolve_effective_adult_yn(
     return "Y" if get_full_age(date=birthdate) >= 19 else "N"
 
 
+def _build_websochat_character_chat_eligibility_sql(*, episode_alias: str) -> str:
+    return f"""
+        CASE
+            WHEN COUNT({episode_alias}.episode_id) >= {CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT}
+            THEN 1
+            ELSE 0
+        END
+    """
+
+
 async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSession) -> dict[str, Any] | None:
     ratings_filter = "" if adult_yn == "Y" else "AND p.ratings_code = 'all'"
     query = text(
@@ -1841,7 +1851,7 @@ async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSessio
             COALESCE(sacp.context_status, 'pending') AS contextStatus,
             COALESCE(MAX(e.episode_no), 0) AS latestEpisodeNo,
             LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo,
-            {build_aggregate_character_chat_product_eligibility_sql(product_alias="p", episode_alias="e")} AS characterChatEligible
+            {_build_websochat_character_chat_eligibility_sql(episode_alias="e")} AS characterChatEligible
         FROM tb_product p
         LEFT JOIN tb_story_agent_context_product sacp
           ON sacp.product_id = p.product_id
@@ -1890,7 +1900,7 @@ async def _get_websochat_product_session_state(
             COALESCE(sacp.context_status, 'pending') AS contextStatus,
             COALESCE(MAX(e.episode_no), 0) AS latestEpisodeNo,
             LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) AS syncedLatestEpisodeNo,
-            {build_aggregate_character_chat_product_eligibility_sql(product_alias="p", episode_alias="e")} AS characterChatEligible
+            {_build_websochat_character_chat_eligibility_sql(episode_alias="e")} AS characterChatEligible
         FROM tb_product p
         LEFT JOIN tb_story_agent_context_product sacp
           ON sacp.product_id = p.product_id
@@ -5021,14 +5031,28 @@ def _build_websochat_rp_lookup_scope_keys(
         for scope_key in list(inventory_payload.get("protagonist_identity_scope_keys") or [])
         if str(scope_key or "").strip()
     ]
+    source_scope_keys = [
+        str(scope_key or "").strip()
+        for scope_key in list(inventory_payload.get("source_character_keys") or [])
+        if str(scope_key or "").strip()
+    ]
     if _is_websochat_character_chat_session(normalized_memory):
-        return _merge_websochat_ordered_texts([resolved_scope_key], identity_scope_keys)
+        return _merge_websochat_ordered_texts(
+            [resolved_scope_key],
+            identity_scope_keys,
+            source_scope_keys,
+        )
     alias_scope_keys = [
         str(scope_key or "").strip()
         for scope_key in list(resolution.get("aliasScopeKeys") or [])
         if str(scope_key or "").strip()
     ]
-    return _merge_websochat_ordered_texts(alias_scope_keys, [resolved_scope_key], identity_scope_keys)
+    return _merge_websochat_ordered_texts(
+        alias_scope_keys,
+        [resolved_scope_key],
+        identity_scope_keys,
+        source_scope_keys,
+    )
 
 
 def _is_websochat_summary_payload_scope_compatible(
@@ -5871,12 +5895,18 @@ async def _load_websochat_rp_context(
     )
     if is_character_chat_session and examples_payload is not None:
         read_episode_to = int(normalized_memory.get("read_episode_to") or 0)
+        original_examples = [
+            item
+            for item in list(examples_payload.get("examples") or [])
+            if isinstance(item, dict)
+        ]
+        bounded_examples = _filter_websochat_character_chat_examples_by_read_scope(
+            original_examples,
+            read_episode_to=read_episode_to,
+        )
         examples_payload = {
             **examples_payload,
-            "examples": _filter_websochat_character_chat_examples_by_read_scope(
-                examples_payload.get("examples"),
-                read_episode_to=read_episode_to,
-            ),
+            "examples": bounded_examples or original_examples,
         }
     canonical_inventory_payload = dict(resolution.get("inventoryPayload") or {})
     canonical_inventory_has_public_gate = _has_websochat_inventory_public_gate(canonical_inventory_payload)
