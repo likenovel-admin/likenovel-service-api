@@ -1038,6 +1038,7 @@ def build_public_character_catalog_scene_query() -> str:
            AND scene_episode.episode_no >= 1
            AND scene_episode.use_yn = 'Y'
            AND scene_episode.open_yn = 'Y'
+           AND COALESCE(scene_episode.price_type, 'free') = 'free'
         CROSS JOIN JSON_TABLE(
             IF(
                 JSON_VALID(scene.summary_text),
@@ -1437,6 +1438,44 @@ async def get_public_character_chat_preview(
     db: AsyncSession,
 ):
     canonical_scope_key = _canonical_character_scope_key_sql("inventory")
+    identity_scope_keys = """IF(
+        JSON_TYPE(JSON_EXTRACT(
+            inventory.summary_text, '$.protagonist_identity_scope_keys'
+        )) = 'ARRAY',
+        JSON_EXTRACT(
+            inventory.summary_text, '$.protagonist_identity_scope_keys'
+        ),
+        JSON_ARRAY()
+    )"""
+    source_scope_keys = """IF(
+        JSON_TYPE(JSON_EXTRACT(
+            inventory.summary_text, '$.source_character_keys'
+        )) = 'ARRAY',
+        JSON_EXTRACT(
+            inventory.summary_text, '$.source_character_keys'
+        ),
+        JSON_ARRAY()
+    )"""
+
+    def compatible_scope_key(value_sql: str) -> str:
+        return f"""(
+            {value_sql} = {canonical_scope_key}
+            OR JSON_CONTAINS(
+                {identity_scope_keys}, JSON_QUOTE({value_sql})
+            )
+            OR JSON_CONTAINS(
+                {source_scope_keys}, JSON_QUOTE({value_sql})
+            )
+        )"""
+
+    profile_scope_key = compatible_scope_key("profile.scope_key")
+    profile_payload_key = compatible_scope_key(
+        "JSON_UNQUOTE(JSON_EXTRACT(profile.summary_text, '$.character_key'))"
+    )
+    example_scope_key = compatible_scope_key("examples.scope_key")
+    example_payload_key = compatible_scope_key(
+        "JSON_UNQUOTE(JSON_EXTRACT(examples.summary_text, '$.character_key'))"
+    )
     profile_result = await db.execute(
         text(f"""
             SELECT
@@ -1446,13 +1485,11 @@ async def get_public_character_chat_preview(
             INNER JOIN tb_product p ON p.product_id = inventory.product_id
             INNER JOIN tb_story_agent_context_summary profile
                 ON profile.product_id = inventory.product_id
-               AND profile.scope_key = {canonical_scope_key}
+               AND {profile_scope_key}
                AND profile.summary_type = 'character_rp_profile'
                AND profile.is_active = 'Y'
                AND JSON_VALID(profile.summary_text)
-               AND JSON_UNQUOTE(JSON_EXTRACT(
-                   profile.summary_text, '$.character_key'
-               )) = {canonical_scope_key}
+               AND {profile_payload_key}
             WHERE inventory.product_id = :product_id
               AND inventory.summary_type = 'character_inventory_v3'
               AND inventory.is_active = 'Y'
@@ -1490,7 +1527,7 @@ async def get_public_character_chat_preview(
                   SELECT 1
                   FROM tb_story_agent_context_summary examples
                   WHERE examples.product_id = inventory.product_id
-                    AND examples.scope_key = {canonical_scope_key}
+                    AND {example_scope_key}
                     AND examples.summary_type = 'character_rp_examples'
                     AND examples.is_active = 'Y'
                     AND JSON_VALID(examples.summary_text)
@@ -1500,9 +1537,7 @@ async def get_public_character_chat_preview(
                     AND JSON_LENGTH(JSON_EXTRACT(
                         examples.summary_text, '$.examples'
                     )) > 0
-                    AND JSON_UNQUOTE(JSON_EXTRACT(
-                        examples.summary_text, '$.character_key'
-                    )) = {canonical_scope_key}
+                    AND {example_payload_key}
               )
               AND EXISTS (
                   SELECT 1
