@@ -282,6 +282,29 @@ def test_main_character_slot_migration_and_model_follow_project_conventions():
     assert MainCharacterSlot.__tablename__ == "tb_main_character_slot"
 
 
+def test_first_episode_readiness_requires_public_free_internal_episode_one():
+    from app.services.product.main_character_slot_service import (
+        _character_chat_first_episode_readiness_predicate,
+    )
+
+    query = _character_chat_first_episode_readiness_predicate(
+        product_id_sql="mcs.product_id",
+        character_scope_key_sql="mcs.character_scope_key",
+    )
+    normalized_query = " ".join(query.split())
+
+    assert "FROM tb_product_episode eligible_episode" in query
+    assert "eligible_episode.product_id = mcs.product_id" in normalized_query
+    assert "eligible_episode.episode_no = 1" in normalized_query
+    assert "eligible_episode.use_yn = 'Y'" in normalized_query
+    assert "eligible_episode.open_yn = 'Y'" in normalized_query
+    assert (
+        "COALESCE(eligible_episode.price_type, 'free') = 'free'"
+        in normalized_query
+    )
+    assert "episode_title" not in query
+
+
 def test_first_episode_readiness_checks_scene_scope_arrays_separately():
     from app.services.product.main_character_slot_service import (
         _character_chat_first_episode_readiness_predicate,
@@ -369,7 +392,7 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
     assert "eligible_episode_summary.episode_to = 1" in query
     assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
-    assert "INNER JOIN tb_product_episode eligible_episode" not in query
+    assert "FROM tb_product_episode eligible_episode" in query
     assert "tb_story_agent_context_doc eligible_doc" not in query
     assert "tb_story_agent_context_chunk eligible_chunk" not in query
     assert "eligible_episode_summary.scope_key" not in query
@@ -406,7 +429,7 @@ def test_public_character_catalog_query_uses_same_quality_gate_without_home_limi
     assert "readiness_summary.scope_key" in query
     assert "CONCAT('episode:', readiness_episode.episode_id)" in query
     assert "readiness_summary.episode_to = readiness_episode.episode_no" in query
-    assert "INNER JOIN tb_product_episode eligible_episode" not in query
+    assert "FROM tb_product_episode eligible_episode" in query
     assert "tb_story_agent_context_doc eligible_doc" not in query
     assert "tb_story_agent_context_chunk eligible_chunk" not in query
     assert "episode_title" not in query
@@ -713,7 +736,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert "eligible_participant.participant_scope_key" in query
         assert "eligible_action_owner.action_scope_key" in query
         assert "TRIM(COALESCE(eligible_episode_summary.summary_text, '')) <> ''" in query
-        assert "INNER JOIN tb_product_episode eligible_episode" not in query
+        assert "FROM tb_product_episode eligible_episode" in query
         assert "tb_story_agent_context_doc eligible_doc" not in query
         assert "tb_story_agent_context_chunk eligible_chunk" not in query
         assert "episode_title" not in query

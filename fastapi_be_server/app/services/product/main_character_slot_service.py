@@ -304,6 +304,15 @@ def _character_chat_first_episode_readiness_predicate(
     return f"""
         AND EXISTS (
             SELECT 1
+            FROM tb_product_episode eligible_episode
+            WHERE eligible_episode.product_id = {product_id_sql}
+              AND eligible_episode.episode_no = 1
+              AND eligible_episode.use_yn = 'Y'
+              AND eligible_episode.open_yn = 'Y'
+              AND COALESCE(eligible_episode.price_type, 'free') = 'free'
+        )
+        AND EXISTS (
+            SELECT 1
             FROM tb_story_agent_context_summary eligible_scene
             WHERE eligible_scene.product_id = {product_id_sql}
               AND eligible_scene.summary_type = 'episode_scene_extraction'
