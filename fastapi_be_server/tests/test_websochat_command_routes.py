@@ -1,15 +1,38 @@
+import inspect
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from fastapi.routing import APIRoute
+
 from app.exceptions import CustomResponseException
-from app.routers.websochat import websochat_command
+from app.routers.websochat import websochat_command, websochat_query
 from app.schemas.websochat import (
     PostWebsochatCharacterChoicesReqBody,
     PostWebsochatMessageReqBody,
 )
+from app.utils.auth import chk_cur_user, chk_optional_cur_user_strict
 
 
 class WebsochatCommandRouteTests(unittest.IsolatedAsyncioTestCase):
+    def test_websochat_optional_user_routes_reject_invalid_authorization_headers(self):
+        authenticated_optional_routes = []
+        for router in (websochat_command.router, websochat_query.router):
+            authenticated_optional_routes.extend(
+                route
+                for route in router.routes
+                if isinstance(route, APIRoute)
+                and "user" in inspect.signature(route.endpoint).parameters
+            )
+
+        self.assertTrue(authenticated_optional_routes)
+        for route in authenticated_optional_routes:
+            dependency_calls = {
+                dependency.call for dependency in route.dependant.dependencies
+            }
+            with self.subTest(path=route.path, methods=route.methods):
+                self.assertIn(chk_optional_cur_user_strict, dependency_calls)
+                self.assertNotIn(chk_cur_user, dependency_calls)
+
     def test_stream_error_payload_preserves_custom_safe_message(self):
         exc = CustomResponseException(
             status_code=502,
