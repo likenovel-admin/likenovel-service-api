@@ -5219,13 +5219,13 @@ def _filter_websochat_character_chat_examples_by_read_scope(
 ) -> list[dict[str, Any]]:
     bounded_examples: list[dict[str, Any]] = []
     for item in examples or []:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or "episode_no" not in item:
             continue
         try:
-            episode_no = int(item.get("episode_no") or 0)
+            episode_no = int(item.get("episode_no"))
         except (TypeError, ValueError):
             continue
-        if 0 < episode_no <= int(read_episode_to or 0):
+        if 0 <= episode_no <= int(read_episode_to or 0):
             bounded_examples.append(item)
     return bounded_examples
 
