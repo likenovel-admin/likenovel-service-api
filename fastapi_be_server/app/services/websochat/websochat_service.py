@@ -8122,7 +8122,7 @@ async def create_session(
     else:
         session_memory["allowed_modes"] = ["qa", "rp", "ideal_worldcup"]
     requested_initial_episode_to = req_body.account_read_episode_to
-    if session_kind == "character_chat":
+    if session_kind == "character_chat" and requested_initial_episode_to is None:
         requested_initial_episode_to = await _get_websochat_latest_read_episode_no(
             product_id=req_body.product_id,
             user_id=user_id,

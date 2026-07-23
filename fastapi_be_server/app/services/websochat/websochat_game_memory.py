@@ -20,6 +20,7 @@ WEBSOCHAT_DEFAULT_ALLOWED_MODE_KEYS = ["qa", "rp", "ideal_worldcup"]
 WEBSOCHAT_ALLOWED_SESSION_KINDS = {"websochat", "character_chat"}
 WEBSOCHAT_ALLOWED_SESSION_ENTRY_SOURCES = {
     "home_character_slot",
+    "character_catalog",
     "websochat_rp_mode",
     "product_detail_websochat",
     "viewer_websochat",
