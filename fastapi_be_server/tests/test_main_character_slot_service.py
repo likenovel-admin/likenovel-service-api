@@ -586,7 +586,7 @@ def test_public_character_catalog_scene_query_is_one_bulk_product_query():
     assert "scene_episode.episode_no >= 1" in query
     assert "scene_episode.use_yn = 'Y'" in query
     assert "scene_episode.open_yn = 'Y'" in query
-    assert "scene_episode.price_type" not in query
+    assert "COALESCE(scene_episode.price_type, 'free') = 'free'" in query
     assert "COUNT(DISTINCT scene.summary_id) AS sceneCount" in query
     assert "MIN(scene_episode.episode_no) AS entryEpisodeNo" in query
     assert "catalog_participant.participant_scope_key" in query
@@ -1386,12 +1386,20 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         )[1].split("WHERE", 1)[0]
         assert "profile.scope_key = COALESCE(" in profile_join
         assert "inventory.summary_text, '$.canonical_character_key'" in profile_join
+        assert "$.protagonist_identity_scope_keys" in profile_join
+        assert "$.source_character_keys" in profile_join
+        assert "JSON_CONTAINS(" in profile_join
         assert "eligible_scene" not in query
         assert "eligible_episode_summary.summary_type = 'episode_summary'" in query
         assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
         assert (
             "TRIM(COALESCE( eligible_episode_summary.summary_text, '' )) <> ''"
             in normalized_query
+        )
+        assert "examples.scope_key = COALESCE(" in query
+        assert (
+            "JSON_UNQUOTE(JSON_EXTRACT(examples.summary_text, '$.character_key'))"
+            in query
         )
 
     async def test_character_preview_looks_up_episode_summary_by_episode_number(self):
