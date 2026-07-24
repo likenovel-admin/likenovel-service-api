@@ -1276,6 +1276,22 @@ async def public_product_detail_shell_by_product_id(
     return {"data": convert_home_card_product_data(row)}
 
 
+async def product_sitemap_entries(db: AsyncSession):
+    """Return side-effect-free public product entries for search sitemaps."""
+    query = text("""
+        SELECT
+            p.product_id AS productId,
+            DATE(p.last_episode_date) AS lastModified
+        FROM tb_product p
+        WHERE p.open_yn = 'Y'
+          AND COALESCE(p.blind_yn, 'N') = 'N'
+          AND p.ratings_code = 'all'
+        ORDER BY p.product_id ASC
+    """)
+    result = await db.execute(query)
+    return {"data": [dict(row) for row in result.mappings().all()]}
+
+
 async def products_all(
     price_type: str,
     product_type: str,

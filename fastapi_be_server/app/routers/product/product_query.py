@@ -290,6 +290,17 @@ async def products_all(
 
 
 @router.get(
+    "/sitemap",
+    tags=["작품"],
+    responses={200: {"description": "검색 사이트맵용 공개 작품 목록 조회"}},
+)
+async def get_product_sitemap_entries(
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await product_service.product_sitemap_entries(db=db)
+
+
+@router.get(
     "/{product_id}/episodes",
     tags=["작품 - 에피소드"],
     responses={
