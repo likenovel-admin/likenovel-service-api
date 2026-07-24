@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from pathlib import Path
@@ -297,6 +298,30 @@ def test_practical_rp_assets_require_nonempty_examples_without_episode_window():
     assert "FROM JSON_TABLE" not in query
 
 
+def test_public_character_role_normalization_is_strict_and_fail_closed():
+    from app.services.product.main_character_slot_service import (
+        _extract_public_character_role,
+    )
+
+    assert (
+        _extract_public_character_role('{"work_role":"main_protagonist"}')
+        == "main_protagonist"
+    )
+    assert (
+        _extract_public_character_role('{"work_role":"major_character"}')
+        == "major_character"
+    )
+    assert (
+        _extract_public_character_role(
+            '{"work_role":"unknown","is_protagonist":true}'
+        )
+        == "main_protagonist"
+    )
+    assert _extract_public_character_role('{"work_role":"unknown"}') is None
+    assert _extract_public_character_role('{"work_role":"supporting"}') is None
+    assert _extract_public_character_role("{}") is None
+
+
 def test_public_main_character_slot_query_filters_current_cards_and_stably_orders_all():
     from app.services.product.main_character_slot_service import (
         build_public_main_character_slots_query,
@@ -327,6 +352,10 @@ def test_public_main_character_slot_query_filters_current_cards_and_stably_order
     assert "SELECT MAX(public_episode.episode_no)" in query
     assert "inventory.scope_key = mcs.character_scope_key" in query
     assert "inventory.summary_type = 'character_inventory_v3'" in query
+    assert "$.work_role" in query
+    assert "'main_protagonist', 'major_character'" in query
+    assert "$.is_protagonist" in query
+    assert query.index("$.work_role") < query.index("LIMIT 12")
     assert "latest_inventory.summary_text" in query
     assert "AS _inventorySummaryText" in query
     assert "ORDER BY latest_inventory.summary_id DESC" in query
@@ -365,6 +394,10 @@ def test_public_character_catalog_product_query_only_applies_product_gate():
     assert "AS _chatTotalEpisodeCount" in query
     assert "tb_story_agent_context_summary" not in query
     assert "tb_main_character_slot" not in query
+    bounded_query = build_public_character_catalog_query(
+        restrict_to_product_ids=True
+    )
+    assert "p.product_id IN :product_ids" in bounded_query
 
 
 def test_public_character_catalog_readiness_query_is_product_bounded():
@@ -439,6 +472,7 @@ def test_catalog_merge_uses_only_contiguous_ready_episode_upper_bound():
             "characterSlotId": product_id,
             "productId": product_id,
             "characterScopeKey": f"character:{product_id}",
+            "_inventorySummaryText": '{"work_role":"main_protagonist"}',
         }
         for product_id in [1137, 2000, 3000]
     ]
@@ -655,7 +689,7 @@ def test_catalog_uses_first_character_scene_as_entry_episode(
             "characterSlotId": 1,
             "productId": 1154,
             "characterScopeKey": "character:later-scene",
-            "_inventorySummaryText": "{}",
+            "_inventorySummaryText": '{"work_role":"main_protagonist"}',
             "syncedLatestEpisodeNo": 4,
         }
     ]
@@ -684,7 +718,7 @@ def test_catalog_rejects_missing_or_unsynced_entry_episode(scene_rows):
             "characterSlotId": 1,
             "productId": 1154,
             "characterScopeKey": "character:later-scene",
-            "_inventorySummaryText": "{}",
+            "_inventorySummaryText": '{"work_role":"main_protagonist"}',
             "syncedLatestEpisodeNo": 4,
         }
     ]
@@ -763,7 +797,7 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
             "_isProtagonist": 1,
             "_distinctEpisodeCount": 1,
             "_exampleCount": 1,
-            "_inventorySummaryText": "{}",
+            "_inventorySummaryText": '{"work_role":"main_protagonist"}',
             "syncedLatestEpisodeNo": 10,
         },
         {
@@ -774,7 +808,7 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
             "_isProtagonist": 0,
             "_distinctEpisodeCount": 20,
             "_exampleCount": 10,
-            "_inventorySummaryText": "{}",
+            "_inventorySummaryText": '{"work_role":"major_character"}',
             "syncedLatestEpisodeNo": 10,
         },
         {
@@ -785,7 +819,7 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
             "_isProtagonist": 0,
             "_distinctEpisodeCount": 5,
             "_exampleCount": 2,
-            "_inventorySummaryText": "{}",
+            "_inventorySummaryText": '{"work_role":"supporting"}',
             "syncedLatestEpisodeNo": 10,
         },
     ]
@@ -798,6 +832,9 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
     result = filter_and_rank_public_character_catalog(candidates, scenes)
 
     assert {item["characterSlotId"] for item in result} == {1, 2}
+    assert {
+        item["characterRole"] for item in result
+    } == {"main_protagonist", "major_character"}
     assert all("_inventorySummaryText" not in item for item in result)
     assert all("_isProtagonist" not in item for item in result)
 
@@ -858,6 +895,295 @@ def test_storage_upload_accepts_character_group_type_through_existing_validator(
 
 
 class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from app.services.product import main_character_slot_service
+
+        main_character_slot_service._reset_public_character_catalog_cache()
+
+    @staticmethod
+    def _catalog_base_db():
+        product_result = MagicMock()
+        product_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "productTitle": "테스트 작품",
+                "authorNickname": "테스트 작가",
+                "_chatTotalEpisodeCount": 4,
+                "_latestPublicEpisodeNo": 4,
+            }
+        ]
+        readiness_result = MagicMock()
+        readiness_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "_chatReadyEpisodeCount": 3,
+                "_contextReadyEpisodeCount": 3,
+                "_continuousReadyEpisodeNo": 3,
+            }
+        ]
+        catalog_result = MagicMock()
+        catalog_result.mappings.return_value.all.return_value = [
+            {
+                "characterSlotId": 1,
+                "productId": 1182,
+                "characterScopeKey": "character:adelite",
+                "_distinctEpisodeCount": 12,
+                "_exampleCount": 4,
+                "_sceneCount": 0,
+                "_inventorySummaryText": '{"work_role":"main_protagonist"}',
+                "_isProtagonist": 1,
+            }
+        ]
+        scene_result = MagicMock()
+        scene_result.mappings.return_value.all.return_value = [
+            {
+                "characterSlotId": 1,
+                "sceneCount": 5,
+                "entryEpisodeNo": 2,
+            }
+        ]
+        image_result = MagicMock()
+        image_result.mappings.return_value.all.return_value = [
+            {"characterSlotId": 1, "characterImagePath": "/cover.webp"}
+        ]
+        db = AsyncMock()
+        db.execute.side_effect = [
+            product_result,
+            readiness_result,
+            catalog_result,
+            scene_result,
+            image_result,
+        ]
+        return db
+
+    @staticmethod
+    def _catalog_visibility_result(*product_ids):
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = [
+            {"productId": product_id} for product_id in product_ids
+        ]
+        return result
+
+    async def test_character_catalog_reuses_adult_scoped_base_with_deep_copies(self):
+        from app.services.product import main_character_slot_service
+
+        miss_db = self._catalog_base_db()
+        hit_db = AsyncMock()
+        hit_db.execute.return_value = self._catalog_visibility_result(1182)
+        second_hit_db = AsyncMock()
+        second_hit_db.execute.return_value = self._catalog_visibility_result(1182)
+        invalid_adult_db = AsyncMock()
+        invalid_adult_db.execute.return_value = self._catalog_visibility_result(1182)
+        adult_db = self._catalog_base_db()
+        expired_db = self._catalog_base_db()
+
+        with patch.object(main_character_slot_service, "monotonic") as clock:
+            clock.return_value = 0
+            miss_response = (
+                await main_character_slot_service.get_public_character_catalog(
+                    adult_yn="N",
+                    kc_user_id=None,
+                    db=miss_db,
+                )
+            )
+            miss_response["data"][0]["productTitle"] = "호출자 변경"
+            clock.return_value = 299
+            hit_response = (
+                await main_character_slot_service.get_public_character_catalog(
+                    adult_yn="N",
+                    kc_user_id=None,
+                    db=hit_db,
+                )
+            )
+            hit_response["data"][0]["productTitle"] = "두 번째 호출자 변경"
+            second_hit_response = (
+                await main_character_slot_service.get_public_character_catalog(
+                    adult_yn="N",
+                    kc_user_id=None,
+                    db=second_hit_db,
+                )
+            )
+            invalid_adult_response = (
+                await main_character_slot_service.get_public_character_catalog(
+                    adult_yn="invalid",
+                    kc_user_id=None,
+                    db=invalid_adult_db,
+                )
+            )
+            adult_response = (
+                await main_character_slot_service.get_public_character_catalog(
+                    adult_yn="Y",
+                    kc_user_id=None,
+                    db=adult_db,
+                )
+            )
+            clock.return_value = 301
+            await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N",
+                kc_user_id=None,
+                db=expired_db,
+            )
+
+        assert miss_db.execute.await_count == 5
+        assert hit_db.execute.await_count == 1
+        assert second_hit_db.execute.await_count == 1
+        assert invalid_adult_db.execute.await_count == 1
+        assert invalid_adult_db.execute.await_args.args[1]["adult_yn"] == "N"
+        assert adult_db.execute.await_count == 5
+        assert expired_db.execute.await_count == 5
+        assert hit_response["data"][0]["productTitle"] == "두 번째 호출자 변경"
+        assert second_hit_response["data"][0]["productTitle"] == "테스트 작품"
+        assert invalid_adult_response["data"][0]["productTitle"] == "테스트 작품"
+        assert adult_response["data"][0]["productTitle"] == "테스트 작품"
+
+    async def test_character_catalog_keeps_authenticated_progress_fresh_and_private(self):
+        from app.services.product import main_character_slot_service
+
+        first_progress_result = MagicMock()
+        first_progress_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "lastViewedEpisodeNo": 17,
+                "lastViewedAt": "2026-07-22 12:34:56",
+            }
+        ]
+        first_db = self._catalog_base_db()
+        first_db.execute.side_effect = [
+            *first_db.execute.side_effect,
+            first_progress_result,
+        ]
+
+        second_progress_result = MagicMock()
+        second_progress_result.mappings.return_value.all.return_value = [
+            {
+                "productId": 1182,
+                "lastViewedEpisodeNo": 3,
+                "lastViewedAt": "2026-07-24 09:00:00",
+            }
+        ]
+        second_db = AsyncMock()
+        second_db.execute.side_effect = [
+            self._catalog_visibility_result(1182),
+            second_progress_result,
+        ]
+
+        first_response = (
+            await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N",
+                kc_user_id="kc-user-1",
+                db=first_db,
+            )
+        )
+        second_response = (
+            await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N",
+                kc_user_id="kc-user-2",
+                db=second_db,
+            )
+        )
+
+        assert first_db.execute.await_count == 6
+        assert second_db.execute.await_count == 2
+        assert second_db.execute.await_args_list[1].args[1]["kc_user_id"] == "kc-user-2"
+        assert (
+            first_response["data"][0]["lastViewedEpisodeNo"],
+            first_response["data"][0]["lastViewedAt"],
+        ) == (17, "2026-07-22 12:34:56")
+        assert (
+            second_response["data"][0]["lastViewedEpisodeNo"],
+            second_response["data"][0]["lastViewedAt"],
+        ) == (3, "2026-07-24 09:00:00")
+
+    async def test_character_catalog_cache_hit_rechecks_live_product_visibility(self):
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from app.services.product import main_character_slot_service
+
+        warm_db = self._catalog_base_db()
+        await main_character_slot_service.get_public_character_catalog(
+            adult_yn="N",
+            kc_user_id=None,
+            db=warm_db,
+        )
+
+        hidden_result = self._catalog_visibility_result()
+        hidden_db = AsyncMock()
+        hidden_db.execute.return_value = hidden_result
+        hidden_response = (
+            await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N",
+                kc_user_id="kc-user-1",
+                db=hidden_db,
+            )
+        )
+
+        assert hidden_response == {"data": []}
+        assert hidden_db.execute.await_count == 1
+
+        failing_db = AsyncMock()
+        failing_db.execute.side_effect = SQLAlchemyError("live gate failed")
+        with self.assertRaises(SQLAlchemyError):
+            await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N",
+                kc_user_id=None,
+                db=failing_db,
+            )
+        assert failing_db.execute.await_count == 1
+
+    async def test_character_catalog_serializes_concurrent_misses_per_adult_scope(self):
+        from app.services.product import main_character_slot_service
+
+        load_started = asyncio.Event()
+        release_load = asyncio.Event()
+        first_db = AsyncMock()
+        second_db = AsyncMock()
+        second_db.execute.return_value = self._catalog_visibility_result(1182)
+
+        async def load_base(*, adult_yn, db):
+            load_started.set()
+            await release_load.wait()
+            return [
+                {
+                    "productId": 1182,
+                    "lastViewedEpisodeNo": None,
+                    "lastViewedAt": None,
+                }
+            ]
+
+        with patch.object(
+            main_character_slot_service,
+            "_load_public_character_catalog_base",
+            side_effect=load_base,
+        ) as load_mock:
+            first_task = asyncio.create_task(
+                main_character_slot_service.get_public_character_catalog(
+                    adult_yn="Y",
+                    kc_user_id=None,
+                    db=first_db,
+                )
+            )
+            await load_started.wait()
+            second_task = asyncio.create_task(
+                main_character_slot_service.get_public_character_catalog(
+                    adult_yn="Y",
+                    kc_user_id=None,
+                    db=second_db,
+                )
+            )
+            await asyncio.sleep(0)
+            release_load.set()
+            first_response, second_response = await asyncio.gather(
+                first_task,
+                second_task,
+            )
+
+        assert load_mock.await_count == 1
+        assert first_db.execute.await_count == 0
+        assert second_db.execute.await_count == 1
+        assert first_response == second_response
+        assert first_response is not second_response
+        assert first_response["data"] is not second_response["data"]
+
     async def test_public_home_slots_survive_entry_episode_query_failure(self):
         from sqlalchemy.exc import SQLAlchemyError
 
@@ -870,7 +1196,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "productId": 1101,
                 "characterScopeKey": "character:1",
                 "syncedLatestEpisodeNo": 4,
-                "_inventorySummaryText": "{}",
+                "_inventorySummaryText": '{"work_role":"main_protagonist"}',
             }
         ]
         db = AsyncMock()
@@ -896,6 +1222,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "characterSlotId": 1,
                     "productId": 1101,
                     "characterScopeKey": "character:1",
+                    "characterRole": "main_protagonist",
                     "syncedLatestEpisodeNo": 4,
                     "entryEpisodeNo": 1,
                 }
@@ -912,7 +1239,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "productId": 1100 + slot_id,
                 "characterScopeKey": f"character:{slot_id}",
                 "syncedLatestEpisodeNo": synced_episode_no,
-                "_inventorySummaryText": "{}",
+                "_inventorySummaryText": '{"work_role":"main_protagonist"}',
             }
             for slot_id, synced_episode_no in [
                 (1, 4),
@@ -991,7 +1318,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "_distinctEpisodeCount": 12,
                 "_exampleCount": 4,
                 "_sceneCount": 0,
-                "_inventorySummaryText": "{}",
+                "_inventorySummaryText": '{"work_role":"main_protagonist"}',
                 "_isProtagonist": 1,
             }
         ]
@@ -1043,6 +1370,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "characterSlotId": 1,
                     "productId": 1182,
                     "characterScopeKey": "character:adelite",
+                    "characterRole": "main_protagonist",
                     "productTitle": "테스트 작품",
                     "authorNickname": "테스트 작가",
                     "syncedLatestEpisodeNo": 3,
@@ -1103,7 +1431,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "_distinctEpisodeCount": 8,
                 "_exampleCount": 2,
                 "_sceneCount": 0,
-                "_inventorySummaryText": "{}",
+                "_inventorySummaryText": '{"work_role":"main_protagonist"}',
                 "_isProtagonist": 1,
             },
             {
@@ -1113,7 +1441,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "_distinctEpisodeCount": 10,
                 "_exampleCount": 4,
                 "_sceneCount": 0,
-                "_inventorySummaryText": "{}",
+                "_inventorySummaryText": '{"work_role":"main_protagonist"}',
                 "_isProtagonist": 1,
             },
         ]
@@ -1177,6 +1505,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "characterSlotId": 2,
                     "productId": 1192,
                     "characterScopeKey": "character:other",
+                    "characterRole": "main_protagonist",
                     "productTitle": None,
                     "authorNickname": None,
                     "syncedLatestEpisodeNo": 6,
@@ -1198,6 +1527,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "characterSlotId": 1,
                     "productId": 1182,
                     "characterScopeKey": "character:adelite",
+                    "characterRole": "main_protagonist",
                     "productTitle": None,
                     "authorNickname": None,
                     "syncedLatestEpisodeNo": 12,
@@ -1244,13 +1574,13 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "characterSlotId": 1,
                 "productId": 1182,
                 "characterScopeKey": "character:a",
-                "_inventorySummaryText": "{}",
+                "_inventorySummaryText": '{"work_role":"main_protagonist"}',
             },
             {
                 "characterSlotId": 2,
                 "productId": 1182,
                 "characterScopeKey": "character:b",
-                "_inventorySummaryText": "{}",
+                "_inventorySummaryText": '{"work_role":"major_character"}',
             },
         ]
         scene_result = MagicMock()

@@ -1,6 +1,9 @@
+import asyncio
 import json
 import logging
 from collections import defaultdict
+from copy import deepcopy
+from time import monotonic
 
 from fastapi import status
 from sqlalchemy import bindparam, text
@@ -30,6 +33,21 @@ MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES = 5
 CHARACTER_CHAT_PREVIEW_EXCERPT_MAX_CHARS = 900
 
 logger = logging.getLogger(__name__)
+
+PUBLIC_CHARACTER_CATALOG_CACHE_TTL_SECONDS = 300
+_public_character_catalog_cache: dict[str, tuple[float, list[dict]]] = {}
+_public_character_catalog_cache_locks: defaultdict[str, asyncio.Lock] = defaultdict(
+    asyncio.Lock
+)
+
+
+def _reset_public_character_catalog_cache() -> None:
+    _public_character_catalog_cache.clear()
+    _public_character_catalog_cache_locks.clear()
+
+
+def _normalize_public_character_catalog_adult_yn(adult_yn: str | None) -> str:
+    return "Y" if adult_yn == "Y" else "N"
 
 
 def _main_character_product_policy_sql(
@@ -109,6 +127,16 @@ def _extract_summary_payload(raw_summary) -> dict:
     if isinstance(raw_summary, dict):
         return raw_summary
     return _extract_websochat_json_object(str(raw_summary or "")) or {}
+
+
+def _extract_public_character_role(raw_summary) -> str | None:
+    payload = _extract_summary_payload(raw_summary)
+    work_role = str(payload.get("work_role") or "").strip().lower()
+    if work_role == "main_protagonist" or payload.get("is_protagonist") is True:
+        return "main_protagonist"
+    if work_role == "major_character":
+        return "major_character"
+    return None
 
 
 def _normalize_text_list(value) -> list[str]:
@@ -350,6 +378,16 @@ def _public_character_slot_eligibility_predicate(
                       '$.display_safety.status'
                   )
               ) = 'pass'
+              AND (
+                  LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                      inventory.summary_text,
+                      '$.work_role'
+                  )))) IN ('main_protagonist', 'major_character')
+                  OR JSON_UNQUOTE(JSON_EXTRACT(
+                      inventory.summary_text,
+                      '$.is_protagonist'
+                  )) = 'true'
+              )
               {_chat_ready_rp_assets_predicate("inventory")}
         )
     """
@@ -670,7 +708,12 @@ def build_public_main_character_slots_query() -> str:
     return f"{_build_public_character_slots_query().rstrip()}\n        LIMIT 12\n"
 
 
-def build_public_character_catalog_query() -> str:
+def build_public_character_catalog_query(
+    *, restrict_to_product_ids: bool = False
+) -> str:
+    product_id_filter = (
+        "AND p.product_id IN :product_ids" if restrict_to_product_ids else ""
+    )
     return f"""
         SELECT
             p.product_id AS productId,
@@ -689,6 +732,7 @@ def build_public_character_catalog_query() -> str:
           AND COALESCE(p.blind_yn, 'N') = 'N'
           AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
           AND (:adult_yn = 'Y' OR p.ratings_code != 'adult')
+          {product_id_filter}
         GROUP BY
             p.product_id,
             p.thumbnail_file_id,
@@ -948,6 +992,9 @@ def merge_public_character_catalog_candidates(
         product_id = int(item.get("productId") or 0)
         product = products.get(product_id)
         product_readiness = readiness.get(product_id)
+        character_role = _extract_public_character_role(
+            item.get("_inventorySummaryText")
+        )
         ready_episode_count = int(
             (product_readiness or {}).get("_chatReadyEpisodeCount") or 0
         )
@@ -957,6 +1004,7 @@ def merge_public_character_catalog_candidates(
         if (
             not product
             or not product_readiness
+            or character_role is None
             or ready_episode_count <= 0
             or continuous_ready_episode_no <= 0
         ):
@@ -974,6 +1022,7 @@ def merge_public_character_catalog_candidates(
                 ),
                 "publishStartAt": item.get("createdDate"),
                 "publishEndAt": None,
+                "characterRole": character_role,
                 "characterImagePath": None,
                 "cardOrder": 0,
                 "_chatReadyEpisodeCount": ready_episode_count,
@@ -1170,6 +1219,12 @@ def filter_and_rank_public_character_catalog(
     for row in candidate_rows:
         item = dict(row)
         product_id = int(item.get("productId") or 0)
+        character_role = item.get("characterRole") or _extract_public_character_role(
+            item.get("_inventorySummaryText")
+        )
+        if character_role is None:
+            continue
+        item["characterRole"] = character_role
         scene_count, entry_episode_no = scene_data_by_character_slot.get(
             int(item.get("characterSlotId") or 0), (0, None)
         )
@@ -1189,7 +1244,7 @@ def filter_and_rank_public_character_catalog(
     for product_candidates in candidates_by_product.values():
         product_candidates.sort(
             key=lambda item: (
-                0 if int(item.get("_isProtagonist") or 0) == 1 else 1,
+                0 if item.get("characterRole") == "main_protagonist" else 1,
                 -int(item.get("_distinctEpisodeCount") or 0),
                 -int(item.get("_exampleCount") or 0),
                 -int(item.get("_sceneCount") or 0),
@@ -1231,7 +1286,22 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
         text(build_public_main_character_slots_query()),
         {"adult_yn": adult_yn},
     )
-    slot_items = [dict(row) for row in result.mappings().all()]
+    raw_slot_items = [dict(row) for row in result.mappings().all()]
+    slot_items: list[dict] = []
+    for item in raw_slot_items:
+        character_role = _extract_public_character_role(
+            item.get("_inventorySummaryText")
+        )
+        if character_role is None:
+            continue
+        item["characterRole"] = character_role
+        slot_items.append(item)
+    invalid_role_count = len(raw_slot_items) - len(slot_items)
+    if invalid_role_count > 0:
+        logger.warning(
+            "excluded %s public main-character slots with unsupported role",
+            invalid_role_count,
+        )
     if not slot_items:
         return {"data": []}
 
@@ -1274,12 +1344,11 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
     return {"data": slot_items}
 
 
-async def get_public_character_catalog(
+async def _load_public_character_catalog_base(
     *,
     adult_yn: str,
-    kc_user_id: str | None,
     db: AsyncSession,
-):
+) -> list[dict]:
     result = await db.execute(
         text(build_public_character_catalog_query()),
         {"adult_yn": adult_yn},
@@ -1293,7 +1362,7 @@ async def get_public_character_catalog(
         }
     )
     if not product_ids:
-        return {"data": []}
+        return []
 
     expanding_product_ids = bindparam("product_ids", expanding=True)
     readiness_result = await db.execute(
@@ -1314,7 +1383,7 @@ async def get_public_character_catalog(
         assets_result.mappings().all(),
     )
     if not candidate_items:
-        return {"data": []}
+        return []
 
     scene_result = await db.execute(
         text(build_public_character_catalog_scene_query()),
@@ -1330,7 +1399,7 @@ async def get_public_character_catalog(
         scene_result.mappings().all(),
     )
     if not catalog_items:
-        return {"data": []}
+        return []
 
     image_result = await db.execute(
         text(build_public_character_catalog_image_query()),
@@ -1381,6 +1450,96 @@ async def get_public_character_catalog(
         item["chatQuality"] = chat_quality
         item["lastViewedEpisodeNo"] = None
         item["lastViewedAt"] = None
+
+    return catalog_items
+
+
+async def _get_cached_public_character_catalog_base(
+    *,
+    adult_yn: str,
+    db: AsyncSession,
+) -> tuple[list[dict], bool]:
+    cached = _public_character_catalog_cache.get(adult_yn)
+    now = monotonic()
+    if cached and cached[0] > now:
+        return deepcopy(cached[1]), True
+
+    async with _public_character_catalog_cache_locks[adult_yn]:
+        cached = _public_character_catalog_cache.get(adult_yn)
+        now = monotonic()
+        if cached and cached[0] > now:
+            return deepcopy(cached[1]), True
+
+        catalog_items = await _load_public_character_catalog_base(
+            adult_yn=adult_yn,
+            db=db,
+        )
+        _public_character_catalog_cache[adult_yn] = (
+            monotonic() + PUBLIC_CHARACTER_CATALOG_CACHE_TTL_SECONDS,
+            catalog_items,
+        )
+        return deepcopy(catalog_items), False
+
+
+async def _filter_currently_public_character_catalog_items(
+    *,
+    catalog_items: list[dict],
+    adult_yn: str,
+    db: AsyncSession,
+) -> list[dict]:
+    product_ids = sorted(
+        {
+            int(item["productId"])
+            for item in catalog_items
+            if int(item.get("productId") or 0) > 0
+        }
+    )
+    if not product_ids:
+        return []
+    result = await db.execute(
+        text(
+            build_public_character_catalog_query(
+                restrict_to_product_ids=True
+            )
+        ).bindparams(bindparam("product_ids", expanding=True)),
+        {
+            "adult_yn": adult_yn,
+            "product_ids": product_ids,
+        },
+    )
+    current_product_ids = {
+        int(row_data["productId"])
+        for row in result.mappings().all()
+        if (row_data := dict(row)).get("productId") is not None
+    }
+    return [
+        item
+        for item in catalog_items
+        if int(item.get("productId") or 0) in current_product_ids
+    ]
+
+
+async def get_public_character_catalog(
+    *,
+    adult_yn: str,
+    kc_user_id: str | None,
+    db: AsyncSession,
+):
+    normalized_adult_yn = _normalize_public_character_catalog_adult_yn(adult_yn)
+    catalog_items, cache_hit = await _get_cached_public_character_catalog_base(
+        adult_yn=normalized_adult_yn,
+        db=db,
+    )
+    if not catalog_items:
+        return {"data": []}
+    if cache_hit:
+        catalog_items = await _filter_currently_public_character_catalog_items(
+            catalog_items=catalog_items,
+            adult_yn=normalized_adult_yn,
+            db=db,
+        )
+        if not catalog_items:
+            return {"data": []}
 
     product_ids = sorted(
         {
