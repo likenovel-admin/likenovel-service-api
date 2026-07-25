@@ -19,6 +19,7 @@ permissions:
 # 내부 동작은 github 내 가상환경에서 실행되는 형태
 jobs:
   BuildAndRunBeServer:
+    if: github.ref == 'refs/heads/prod'
     runs-on: ubuntu-latest
 
     steps:
@@ -45,6 +46,7 @@ jobs:
           poetry version patch
           poetry install
           poetry run python tests/test_ai_reader_worker_deploy.py
+          poetry run python tests/test_backend_prod_workflow_contract.py
           bash -n dist/run_be.sh
           bash -n dist/boot-start-api.sh
           bash -n dist/verify_backend_prod_deploy.sh
