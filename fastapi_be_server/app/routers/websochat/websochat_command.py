@@ -14,7 +14,7 @@ from app.services.websochat.websochat_stream import (
     reset_websochat_stream_emitter,
     set_websochat_stream_emitter,
 )
-from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.auth import analysis_logger, chk_optional_cur_user_strict
 import app.schemas.websochat as websochat_schema
 import app.services.websochat.websochat_service as websochat_service
 
@@ -43,7 +43,7 @@ def _build_websochat_stream_error_payload(exc: Exception) -> dict[str, Any]:
 async def post_websochat_session(
     req_body: websochat_schema.PostWebsochatSessionReqBody,
     adult_yn: str = "N",
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.create_session(
@@ -62,7 +62,7 @@ async def post_websochat_session(
 async def patch_websochat_session(
     session_id: int,
     req_body: websochat_schema.PatchWebsochatSessionReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.patch_session(
@@ -81,7 +81,7 @@ async def patch_websochat_session(
 async def patch_websochat_session_read_scope(
     session_id: int,
     req_body: websochat_schema.PatchWebsochatSessionReadScopeReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.patch_session_read_scope(
@@ -100,7 +100,7 @@ async def patch_websochat_session_read_scope(
 async def patch_websochat_session_mode(
     session_id: int,
     req_body: websochat_schema.PatchWebsochatSessionModeReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.patch_session_mode(
@@ -119,7 +119,7 @@ async def patch_websochat_session_mode(
 async def patch_websochat_session_model(
     session_id: int,
     req_body: websochat_schema.PatchWebsochatSessionModelReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.patch_session_model(
@@ -138,7 +138,7 @@ async def patch_websochat_session_model(
 async def delete_websochat_session(
     session_id: int,
     req_body: websochat_schema.DeleteWebsochatSessionReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.delete_session(
@@ -157,7 +157,7 @@ async def delete_websochat_session(
 async def post_websochat_character_chat_choices(
     session_id: int,
     req_body: websochat_schema.PostWebsochatCharacterChoicesReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.post_character_chat_choices(
@@ -176,7 +176,7 @@ async def post_websochat_character_chat_choices(
 async def post_websochat_message(
     session_id: int,
     req_body: websochat_schema.PostWebsochatMessageReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.post_message(
@@ -195,7 +195,7 @@ async def post_websochat_message(
 async def post_websochat_next_episode_message(
     session_id: int,
     req_body: websochat_schema.PostWebsochatMessageReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     next_episode_req_body = req_body.model_copy(
@@ -231,7 +231,7 @@ async def post_websochat_message_stream(
     session_id: int,
     req_body: websochat_schema.PostWebsochatMessageReqBody,
     http_request: Request,
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
 ):
     queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
     done = asyncio.Event()

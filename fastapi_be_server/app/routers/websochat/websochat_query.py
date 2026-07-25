@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db
-from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.auth import analysis_logger, chk_optional_cur_user_strict
 import app.services.websochat.websochat_service as websochat_service
 
 router = APIRouter(prefix="/websochat")
@@ -25,7 +25,7 @@ def get_websochat_guest_key(
 async def get_websochat_products(
     keyword: str = Query(..., description="작품명/작가명 검색어"),
     adult_yn: str = Query("N", description="성인 작품 포함 여부"),
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.search_products(
@@ -45,7 +45,7 @@ async def get_websochat_sessions(
     product_id: int | None = Query(default=None),
     guest_key: str | None = Depends(get_websochat_guest_key),
     adult_yn: str = Query("N"),
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.get_sessions(
@@ -67,7 +67,7 @@ async def get_websochat_billing_status(
     session_id: int | None = Query(default=None),
     model_key: Literal["speed", "balance", "deep"] | None = Query(default=None),
     guest_key: str | None = Depends(get_websochat_guest_key),
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.get_billing_status(
@@ -88,7 +88,7 @@ async def get_websochat_billing_status(
 async def get_websochat_messages(
     session_id: int,
     guest_key: str | None = Depends(get_websochat_guest_key),
-    user: Dict[str, Any] = Depends(chk_cur_user),
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     return await websochat_service.get_messages(

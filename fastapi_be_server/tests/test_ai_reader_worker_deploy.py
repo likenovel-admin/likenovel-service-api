@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -287,11 +288,67 @@ def test_dev_workflow_bundles_versioned_boot_start_script():
 
     assert "cp before_install.dev.sh before_install.sh" in content
     assert "chmod +x before_install.sh run_be.sh boot-start-api-dev.sh" in content
-    assert "zip -r $GITHUB_SHA.zip" in content
+    assert 'zip -r "$GITHUB_SHA.zip"' in content
     assert "before_install.sh" in content
     assert "boot-start-api-dev.sh" in content
     assert (PROJECT_ROOT / "dist" / "before_install.dev.sh").is_file()
     assert (PROJECT_ROOT / "dist" / "boot-start-api-dev.sh").is_file()
+
+
+def test_dev_workflow_waits_for_codedeploy_and_verifies_runtime():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions_dev.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    assert "poetry run python tests/test_ai_reader_worker_deploy.py" in content
+    assert "bash -n dist/verify_backend_dev_deploy.sh" in content
+    assert "shellcheck --severity=warning" in content
+    assert "DEPLOY_ID=$(aws deploy create-deployment" in content
+    assert 'aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"' in content
+    assert 'aws deploy get-deployment --deployment-id "$DEPLOY_ID"' in content
+    assert 'echo "deployment_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"' in content
+    assert "SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}" in content
+    assert "bash -s -- '$EXPECTED_DEPLOYMENT_ID'" in content
+    assert "https://api.likenovel.dev/health" in content
+    assert "BACKEND_ENV_DEV: ${{ secrets.BACKEND_ENV_DEV }}" in content
+    assert 'printf \'%s\' "$BACKEND_ENV_DEV"' in content
+    assert 'printf \'%s\' "${{ secrets.BACKEND_ENV_DEV }}"' not in content
+
+
+def test_dev_verify_script_checks_exact_release_process_port_and_health():
+    verify_script = PROJECT_ROOT / "dist" / "verify_backend_dev_deploy.sh"
+    content = verify_script.read_text(encoding="utf-8")
+
+    assert "EXPECTED_DEPLOYMENT_ID=" in content
+    assert "SERVICE_NAME=likenovel-api-dev.service" in content
+    assert "CURRENT_LINK=/home/ln-admin/likenovel/api-dev" in content
+    assert "RELEASE_BASE=/home/ln-admin/likenovel/releases/api-dev" in content
+    assert "PID_FILE=/home/ln-admin/likenovel/api-dev/gunicorn.pid" in content
+    assert "readlink -f" in content
+    assert 'fail "active release does not match deployment' in content
+    assert "systemctl show" in content
+    assert "MainPID" in content
+    assert 'readlink -f "/proc/$main_pid/cwd"' in content
+    assert "does not match active release" in content
+    assert "ss -ltnp" in content
+    assert "listener is not owned by MainPID" in content
+    assert "10.0.100.110:3011" in content
+    assert "http://10.0.100.110:3011/health" in content
+    assert '[[ "$health_status" != 2* ]]' in content
+    assert "exit 1" in content
+
+
+def test_dev_verify_script_rejects_invalid_deployment_id_before_runtime_checks():
+    verify_script = PROJECT_ROOT / "dist" / "verify_backend_dev_deploy.sh"
+    result = subprocess.run(
+        ["bash", str(verify_script), "invalid-id"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "invalid deployment id: invalid-id" in result.stderr
+    assert "checking active release" not in result.stdout
 
 
 def test_dev_run_script_prepares_release_before_service_stop_and_retains_five():
