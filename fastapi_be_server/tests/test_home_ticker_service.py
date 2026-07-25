@@ -104,19 +104,36 @@ def test_reader_facing_term_is_accepted():
     }
 
 
+def test_visibility_filter_requires_public_product_with_published_episode():
+    visibility_filter = service._visibility_filter("N")
+
+    assert "p.open_yn = 'Y'" in visibility_filter
+    assert "COALESCE(p.blind_yn, 'N') = 'N'" in visibility_filter
+    assert "EXISTS (" in visibility_filter
+    assert "visible_episode.product_id = p.product_id" in visibility_filter
+    assert "visible_episode.open_yn = 'Y'" in visibility_filter
+    assert "visible_episode.use_yn = 'Y'" in visibility_filter
+    assert "visible_episode.publish_reserve_date IS NULL" in visibility_filter
+    assert "visible_episode.publish_reserve_date <= NOW()" in visibility_filter
+
+
 def test_recent_episode_query_contract():
     query, params = service.build_recent_episode_query("Y")
 
+    assert service.HOME_TICKER_LIMIT == 15
     assert "tb_product_episode e" in query
+    assert "MAX(e.publish_reserve_date) AS latest_publish_reserve_date" in query
+    assert "GROUP BY e.product_id" in query
     assert "ELSE CONCAT(p.author_name, ' 작가님이 <" in query
     assert ">의 신규 회차를 업로드했습니다." in query
     assert "THEN CONCAT('작가님이 <" in query
     assert "e.open_yn = 'Y'" in query
     assert "e.use_yn = 'Y'" in query
     assert "e.publish_reserve_date <= NOW()" in query
-    assert "DATE_SUB(NOW(), INTERVAL 2 HOUR)" in query
+    assert "DATE_SUB(NOW(), INTERVAL 6 HOUR)" in query
+    assert "p.status_code = 'ongoing'" in query
     assert "'near_real_time' AS freshness" in query
-    assert "LIMIT 5" in query
+    assert "LIMIT 10" in query
     assert "p.ratings_code = 'all'" not in query
     _assert_public_copy_has_no_internal_metric_terms(query)
     assert params == {}
