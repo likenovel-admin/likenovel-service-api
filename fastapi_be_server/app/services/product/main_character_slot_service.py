@@ -821,6 +821,87 @@ def build_public_character_catalog_readiness_query() -> str:
 
 
 def build_public_character_catalog_assets_query() -> str:
+    return """
+        WITH inventory_assets AS (
+            SELECT
+                inventory.summary_id AS characterSlotId,
+                inventory.product_id AS productId,
+                inventory.scope_key AS characterScopeKey,
+                TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                    inventory.summary_text, '$.display_name'
+                ))) AS characterName,
+                inventory.summary_text AS _inventorySummaryText,
+                inventory.created_date AS createdDate,
+                inventory.created_date AS updatedDate,
+                inventory.source_doc_count AS _distinctEpisodeCount,
+                examples.source_doc_count AS _exampleCount,
+                CASE
+                    WHEN JSON_UNQUOTE(JSON_EXTRACT(
+                        inventory.summary_text, '$.is_protagonist'
+                    )) = 'true'
+                      OR LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                          inventory.summary_text, '$.work_role'
+                      )))) = 'main_protagonist'
+                    THEN 1 ELSE 0
+                END AS _isProtagonist
+            FROM tb_story_agent_context_summary inventory
+            INNER JOIN tb_story_agent_context_summary profile
+                ON profile.product_id = inventory.product_id
+               AND profile.summary_type = 'character_rp_profile'
+               AND profile.scope_key = inventory.scope_key
+               AND profile.is_active = 'Y'
+               AND JSON_VALID(profile.summary_text)
+               AND JSON_UNQUOTE(JSON_EXTRACT(
+                   profile.summary_text, '$.character_key'
+               )) = inventory.scope_key
+            INNER JOIN tb_story_agent_context_summary examples
+                ON examples.product_id = inventory.product_id
+               AND examples.summary_type = 'character_rp_examples'
+               AND examples.scope_key = inventory.scope_key
+               AND examples.is_active = 'Y'
+               AND JSON_VALID(examples.summary_text)
+               AND JSON_TYPE(JSON_EXTRACT(
+                   examples.summary_text, '$.examples'
+               )) = 'ARRAY'
+               AND JSON_LENGTH(JSON_EXTRACT(
+                   examples.summary_text, '$.examples'
+               )) > 0
+               AND JSON_UNQUOTE(JSON_EXTRACT(
+                   examples.summary_text, '$.character_key'
+               )) = inventory.scope_key
+            WHERE inventory.product_id IN :product_ids
+              AND inventory.summary_type = 'character_inventory_v3'
+              AND inventory.is_active = 'Y'
+              AND JSON_VALID(inventory.summary_text)
+              AND TRIM(COALESCE(inventory.scope_key, '')) <> ''
+              AND JSON_UNQUOTE(JSON_EXTRACT(
+                  inventory.summary_text, '$.canonical_character_key'
+              )) = inventory.scope_key
+              AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                  inventory.summary_text, '$.display_name'
+              )), '')) <> ''
+              AND JSON_UNQUOTE(JSON_EXTRACT(
+                  inventory.summary_text, '$.public_chat_eligible'
+              )) = 'true'
+        )
+        SELECT
+            characterSlotId,
+            productId,
+            characterScopeKey,
+            characterName,
+            _inventorySummaryText,
+            createdDate,
+            updatedDate,
+            _distinctEpisodeCount,
+            _exampleCount,
+            _isProtagonist
+        FROM inventory_assets
+        WHERE _exampleCount > 0
+        ORDER BY productId ASC, characterSlotId DESC
+    """
+
+
+def build_public_character_catalog_alias_fallback_query() -> str:
     canonical_scope_key = _canonical_character_scope_key_sql("inventory")
     asset_canonical_scope_key = "inventory.characterScopeKey"
     identity_scope_keys = """IF(
@@ -1036,6 +1117,93 @@ def merge_public_character_catalog_candidates(
     return candidates
 
 
+def select_public_character_catalog_alias_fallback_product_ids(
+    product_rows, readiness_rows, exact_candidate_items
+) -> list[int]:
+    exact_candidates_by_product: defaultdict[int, list[dict]] = defaultdict(list)
+    for item in exact_candidate_items:
+        product_id = int(item.get("productId") or 0)
+        if product_id > 0:
+            exact_candidates_by_product[product_id].append(item)
+
+    ready_product_ids = {
+        int(item.get("productId") or 0)
+        for item in readiness_rows
+        if (
+            int(item.get("productId") or 0) > 0
+            and int(item.get("_chatReadyEpisodeCount") or 0) > 0
+            and int(item.get("_continuousReadyEpisodeNo") or 0) > 0
+        )
+    }
+    product_ids = sorted(
+        {
+            int(item.get("productId") or 0)
+            for item in product_rows
+            if int(item.get("productId") or 0) in ready_product_ids
+        }
+    )
+    return [
+        product_id
+        for product_id in product_ids
+        if (
+            len(exact_candidates_by_product[product_id])
+            < MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT
+            or min(
+                (
+                    int(item.get("_exampleCount") or 0)
+                    for item in exact_candidates_by_product[product_id]
+                ),
+                default=0,
+            )
+            <= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
+        )
+    ]
+
+
+def merge_public_character_catalog_asset_candidates(
+    exact_candidate_items,
+    fallback_candidate_items,
+    *,
+    fallback_product_ids,
+) -> list[dict]:
+    fallback_product_id_set = {
+        int(product_id)
+        for product_id in fallback_product_ids
+        if int(product_id) > 0
+    }
+    exact_by_product: defaultdict[int, list[dict]] = defaultdict(list)
+    fallback_by_product: defaultdict[int, list[dict]] = defaultdict(list)
+    for item in exact_candidate_items:
+        exact_by_product[int(item.get("productId") or 0)].append(item)
+    for item in fallback_candidate_items:
+        fallback_by_product[int(item.get("productId") or 0)].append(item)
+
+    selected: list[dict] = []
+    product_ids = sorted(
+        {
+            *exact_by_product.keys(),
+            *fallback_product_id_set,
+        }
+    )
+    for product_id in product_ids:
+        product_candidates = (
+            fallback_by_product[product_id]
+            if product_id in fallback_product_id_set
+            else exact_by_product[product_id]
+        )
+        seen_character_slot_ids: set[int] = set()
+        for item in product_candidates:
+            character_slot_id = int(item.get("characterSlotId") or 0)
+            if (
+                character_slot_id <= 0
+                or character_slot_id in seen_character_slot_ids
+            ):
+                continue
+            seen_character_slot_ids.add(character_slot_id)
+            selected.append(item)
+    return selected
+
+
 def build_public_character_catalog_scene_candidates(candidate_items) -> list[dict]:
     scene_candidates: list[dict] = []
     for item in candidate_items:
@@ -1065,93 +1233,124 @@ def build_public_character_catalog_scene_candidates(candidate_items) -> list[dic
 
 def build_public_character_catalog_scene_query() -> str:
     return """
+        WITH candidate_product AS (
+            SELECT DISTINCT c.product_id
+            FROM JSON_TABLE(
+                :candidate_json,
+                '$[*]' COLUMNS (
+                    product_id BIGINT PATH '$.productId'
+                )
+            ) AS c
+            WHERE c.product_id IS NOT NULL
+        ),
+        candidate_scope AS (
+            SELECT DISTINCT
+                c.character_slot_id,
+                c.product_id,
+                c.scope_key
+            FROM JSON_TABLE(
+                :candidate_json,
+                '$[*]' COLUMNS (
+                    character_slot_id BIGINT PATH '$.characterSlotId',
+                    product_id BIGINT PATH '$.productId',
+                    NESTED PATH '$.compatibleScopeKeys[*]' COLUMNS (
+                        scope_key VARCHAR(80)
+                            CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_0900_bin
+                            PATH '$'
+                    )
+                )
+            ) AS c
+            WHERE c.product_id IS NOT NULL
+              AND TRIM(COALESCE(c.scope_key, '')) <> ''
+        ),
+        scene_scope AS (
+            SELECT DISTINCT
+                scene.summary_id,
+                scene.product_id,
+                scene_episode.episode_no,
+                COALESCE(
+                    IF(
+                        JSON_TYPE(flat.participants) = 'ARRAY',
+                        flat.participant_scope_key,
+                        NULL
+                    ),
+                    IF(
+                        JSON_TYPE(flat.action_ownership) = 'ARRAY',
+                        flat.action_scope_key,
+                        NULL
+                    )
+                ) AS scope_key
+            FROM candidate_product
+            INNER JOIN tb_story_agent_context_summary scene
+                ON scene.product_id = candidate_product.product_id
+               AND scene.summary_type = 'episode_scene_extraction'
+               AND scene.is_active = 'Y'
+            INNER JOIN tb_product_episode scene_episode
+                ON scene_episode.product_id = scene.product_id
+               AND scene_episode.episode_no = scene.episode_to
+               AND scene_episode.episode_no >= 1
+               AND scene_episode.use_yn = 'Y'
+               AND scene_episode.open_yn = 'Y'
+               AND COALESCE(scene_episode.price_type, 'free') = 'free'
+            CROSS JOIN JSON_TABLE(
+                IF(
+                    JSON_VALID(scene.summary_text),
+                    scene.summary_text,
+                    JSON_OBJECT()
+                ),
+                '$.scenes[*]' COLUMNS (
+                    scene_gist VARCHAR(4096) PATH '$.scene_gist',
+                    participants JSON PATH '$.participants',
+                    action_ownership JSON PATH '$.action_ownership',
+                    NESTED PATH '$.participants[*]' COLUMNS (
+                        participant_scope_key VARCHAR(80)
+                            CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_0900_bin
+                            PATH '$.scope_key'
+                    ),
+                    NESTED PATH '$.action_ownership[*]' COLUMNS (
+                        action_scope_key VARCHAR(80)
+                            CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_0900_bin
+                            PATH '$.actor_scope_key'
+                    )
+                )
+            ) AS flat
+            WHERE JSON_VALID(scene.summary_text)
+              AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
+                  scene.summary_text, '$.status'
+              )))) IN ('ok', 'partial')
+              AND JSON_TYPE(JSON_EXTRACT(
+                  scene.summary_text, '$.scenes'
+              )) = 'ARRAY'
+              AND TRIM(COALESCE(flat.scene_gist, '')) <> ''
+              AND TRIM(COALESCE(
+                  COALESCE(
+                      IF(
+                          JSON_TYPE(flat.participants) = 'ARRAY',
+                          flat.participant_scope_key,
+                          NULL
+                      ),
+                      IF(
+                          JSON_TYPE(flat.action_ownership) = 'ARRAY',
+                          flat.action_scope_key,
+                          NULL
+                      )
+                  ),
+                  ''
+              )) <> ''
+        )
         SELECT
-            candidate.character_slot_id AS characterSlotId,
-            COUNT(DISTINCT scene.summary_id) AS sceneCount,
-            MIN(scene_episode.episode_no) AS entryEpisodeNo
-        FROM JSON_TABLE(
-            :candidate_json,
-            '$[*]' COLUMNS (
-                character_slot_id BIGINT PATH '$.characterSlotId',
-                product_id BIGINT PATH '$.productId',
-                compatible_scope_keys JSON PATH '$.compatibleScopeKeys'
-            )
-        ) AS candidate
-        INNER JOIN tb_story_agent_context_summary scene
-            ON scene.product_id = candidate.product_id
-           AND scene.summary_type = 'episode_scene_extraction'
-           AND scene.is_active = 'Y'
-        INNER JOIN tb_product_episode scene_episode
-            ON scene_episode.product_id = scene.product_id
-           AND scene_episode.episode_no = scene.episode_to
-           AND scene_episode.episode_no >= 1
-           AND scene_episode.use_yn = 'Y'
-           AND scene_episode.open_yn = 'Y'
-           AND COALESCE(scene_episode.price_type, 'free') = 'free'
-        CROSS JOIN JSON_TABLE(
-            IF(
-                JSON_VALID(scene.summary_text),
-                scene.summary_text,
-                JSON_OBJECT()
-            ),
-            '$.scenes[*]' COLUMNS (
-                scene_gist VARCHAR(4096) PATH '$.scene_gist',
-                participants JSON PATH '$.participants',
-                action_ownership JSON PATH '$.action_ownership'
-            )
-        ) AS catalog_scene_row
-        WHERE JSON_VALID(scene.summary_text)
-          AND LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
-              scene.summary_text, '$.status'
-          )))) IN ('ok', 'partial')
-          AND JSON_TYPE(JSON_EXTRACT(
-              scene.summary_text, '$.scenes'
-          )) = 'ARRAY'
-          AND TRIM(COALESCE(catalog_scene_row.scene_gist, '')) <> ''
-          AND (
-              EXISTS (
-                  SELECT 1
-                  FROM JSON_TABLE(
-                      IF(
-                          JSON_TYPE(catalog_scene_row.participants) = 'ARRAY',
-                          catalog_scene_row.participants,
-                          JSON_ARRAY()
-                      ),
-                      '$[*]' COLUMNS (
-                          participant_scope_key VARCHAR(80)
-                              PATH '$.scope_key'
-                      )
-                  ) AS catalog_participant
-                  WHERE JSON_CONTAINS(
-                      candidate.compatible_scope_keys,
-                      JSON_QUOTE(
-                          catalog_participant.participant_scope_key
-                      )
-                  )
-              )
-              OR EXISTS (
-                  SELECT 1
-                  FROM JSON_TABLE(
-                      IF(
-                          JSON_TYPE(catalog_scene_row.action_ownership) =
-                              'ARRAY',
-                          catalog_scene_row.action_ownership,
-                          JSON_ARRAY()
-                      ),
-                      '$[*]' COLUMNS (
-                          action_scope_key VARCHAR(80)
-                              PATH '$.actor_scope_key'
-                      )
-                  ) AS catalog_action_owner
-                  WHERE JSON_CONTAINS(
-                      candidate.compatible_scope_keys,
-                      JSON_QUOTE(
-                          catalog_action_owner.action_scope_key
-                      )
-                  )
-              )
-          )
-        GROUP BY candidate.character_slot_id
+            candidate_scope.character_slot_id AS characterSlotId,
+            COUNT(DISTINCT scene_scope.summary_id) AS sceneCount,
+            MIN(scene_scope.episode_no) AS entryEpisodeNo
+        FROM candidate_scope
+        INNER JOIN scene_scope
+            ON scene_scope.product_id = candidate_scope.product_id
+           AND scene_scope.scope_key COLLATE utf8mb4_0900_bin =
+                candidate_scope.scope_key COLLATE utf8mb4_0900_bin
+        GROUP BY candidate_scope.character_slot_id
     """
 
 
@@ -1377,10 +1576,36 @@ async def _load_public_character_catalog_base(
         ),
         {"product_ids": product_ids},
     )
-    candidate_items = merge_public_character_catalog_candidates(
+    readiness_rows = readiness_result.mappings().all()
+    exact_candidate_items = merge_public_character_catalog_candidates(
         product_rows,
-        readiness_result.mappings().all(),
+        readiness_rows,
         assets_result.mappings().all(),
+    )
+    fallback_product_ids = (
+        select_public_character_catalog_alias_fallback_product_ids(
+            product_rows,
+            readiness_rows,
+            exact_candidate_items,
+        )
+    )
+    fallback_candidate_items: list[dict] = []
+    if fallback_product_ids:
+        fallback_assets_result = await db.execute(
+            text(
+                build_public_character_catalog_alias_fallback_query()
+            ).bindparams(expanding_product_ids),
+            {"product_ids": fallback_product_ids},
+        )
+        fallback_candidate_items = merge_public_character_catalog_candidates(
+            product_rows,
+            readiness_rows,
+            fallback_assets_result.mappings().all(),
+        )
+    candidate_items = merge_public_character_catalog_asset_candidates(
+        exact_candidate_items,
+        fallback_candidate_items,
+        fallback_product_ids=fallback_product_ids,
     )
     if not candidate_items:
         return []
