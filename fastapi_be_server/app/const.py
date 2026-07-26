@@ -444,6 +444,7 @@ class ErrorMessages:
     ALREADY_APPLIED_PROMOTION = "이미 신청 중인 프로모션이 있습니다."
     ALREADY_IN_PROGRESS_PROMOTION = "이미 진행 중인 프로모션이 있습니다."
     ALREADY_USED_PRODUCTBOOK = "이미 사용한 대여권입니다."
+    EXPIRED_PRODUCTBOOK = "만료된 대여권입니다."
     ALREADY_USED_TICKETBOOK = "이미 사용한 이용권입니다."
     ALREADY_OWNED_EPISODE = "이미 소장한 에피소드입니다."
     ALREADY_RECEIVED_GIFT = "이미 받은 선물입니다."

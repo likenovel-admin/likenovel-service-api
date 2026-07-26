@@ -18,6 +18,15 @@ user_giftbook 선물함 개별 서비스 함수 모음
 """
 
 
+def _require_positive_amount(amount: int | None) -> int:
+    if amount is None or amount < 1:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.INVALID_REQUEST_DATA,
+        )
+    return amount
+
+
 def _build_giftbook_query_with_joins(
     where_clause: str = "", order_by_clause: str = ""
 ) -> str:
@@ -59,7 +68,7 @@ def _build_giftbook_query_with_joins(
             aib.file_path AS author_interest_level_badge_image_path,
             (SELECT DATE_ADD(MAX(upu2.updated_date), INTERVAL 3 DAY) FROM tb_user_product_usage upu2 WHERE upu2.product_id = p.product_id AND upu2.user_id = ug.user_id AND upu2.use_yn = 'Y') AS interest_end_date,
             pe.episode_id, pe.product_id AS episode_product_id, pe.price_type AS episode_price_type,
-            pe.episode_no, pe.episode_title, pe.episode_text_count, pe.episode_content,
+            pe.episode_no, pe.episode_title, pe.episode_text_count,
             pe.epub_file_id, pe.author_comment, pe.comment_open_yn, pe.evaluation_open_yn,
             pe.publish_reserve_date, pe.open_yn AS episode_open_yn,
             pe.count_hit AS episode_count_hit, pe.count_recommend AS episode_count_recommend,
@@ -265,7 +274,6 @@ def _transform_giftbook_row_to_nested_structure(row_dict: dict) -> dict:
             "episode_no": row_dict.pop("episode_no", None),
             "episode_title": row_dict.pop("episode_title", None),
             "episode_text_count": row_dict.pop("episode_text_count", None),
-            "episode_content": row_dict.pop("episode_content", None),
             "epub_file_id": row_dict.pop("epub_file_id", None),
             "author_comment": row_dict.pop("author_comment", None),
             "comment_open_yn": row_dict.pop("comment_open_yn", None),
@@ -282,6 +290,7 @@ def _transform_giftbook_row_to_nested_structure(row_dict: dict) -> dict:
             "updated_id": row_dict.pop("episode_updated_id", None),
             "updated_date": row_dict.pop("episode_updated_date", None),
         }
+        row_dict.pop("episode_content", None)
     else:
         # episode가 없으면 pop만 처리
         row_dict.pop("episode_id", None)
@@ -704,24 +713,35 @@ async def user_giftbook_list(kc_user_id: str, db: AsyncSession):
     return res_body
 
 
-async def user_giftbook_detail_by_id(id, db: AsyncSession):
+async def user_giftbook_detail_by_id(
+    id: int, kc_user_id: str, db: AsyncSession
+):
     """
     선물함(user_giftbook) 상세 조회
     """
-    query_str = _build_giftbook_query_with_joins(where_clause="ug.id = :id")
+    user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
+    query_str = _build_giftbook_query_with_joins(
+        where_clause="ug.id = :id AND ug.user_id = :user_id"
+    )
     query = text(query_str)
-    result = await db.execute(query, {"id": id})
+    result = await db.execute(query, {"id": id, "user_id": user_id})
     row = result.mappings().one_or_none()
 
-    res_body = dict()
-    if row is not None:
-        row_dict = dict(row)
-        transformed = _transform_giftbook_row_to_nested_structure(row_dict)
-        res_body["data"] = transformed
-    else:
-        res_body["data"] = None
+    if row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND,
+        )
 
-    return res_body
+    row_dict = dict(row)
+    transformed = _transform_giftbook_row_to_nested_structure(row_dict)
+    return {"data": transformed}
 
 
 async def post_user_giftbook(
@@ -730,13 +750,12 @@ async def post_user_giftbook(
     db: AsyncSession,
     user_id: int | None = None,
 ):
-    if user_id is None:
-        user_id = await comm_service.get_user_from_kc(kc_user_id, db)
-        if user_id == -1:
-            raise CustomResponseException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                message=ErrorMessages.LOGIN_REQUIRED,
-            )
+    if user_id is None or req_body.user_id != user_id:
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.FORBIDDEN,
+        )
+    _require_positive_amount(req_body.amount)
 
     if req_body is not None:
         logger.info(f"post_user_giftbook: {req_body}")
@@ -845,59 +864,59 @@ async def post_user_giftbook(
 
             if profile:
                 profile_id = profile.get("profile_id")
+                async with db.begin_nested():
+                    # 대여권 유효기간 계산 (수령 시점 기준)
+                    rental_expired_date = None
+                    ticket_exp_type = getattr(req_body, "ticket_expiration_type", None)
+                    ticket_exp_value = getattr(req_body, "ticket_expiration_value", None)
+                    if ticket_exp_type == "on_receive_days" and ticket_exp_value:
+                        rental_expired_date = datetime.now() + timedelta(days=ticket_exp_value)
+                    elif ticket_exp_type == "days" and ticket_exp_value:
+                        rental_expired_date = datetime.now() + timedelta(days=ticket_exp_value)
+                    elif ticket_exp_type == "hours" and ticket_exp_value:
+                        rental_expired_date = datetime.now() + timedelta(hours=ticket_exp_value)
 
-                # 대여권 유효기간 계산 (수령 시점 기준)
-                rental_expired_date = None
-                ticket_exp_type = getattr(req_body, "ticket_expiration_type", None)
-                ticket_exp_value = getattr(req_body, "ticket_expiration_value", None)
-                if ticket_exp_type == "on_receive_days" and ticket_exp_value:
-                    rental_expired_date = datetime.now() + timedelta(days=ticket_exp_value)
-                elif ticket_exp_type == "days" and ticket_exp_value:
-                    rental_expired_date = datetime.now() + timedelta(days=ticket_exp_value)
-                elif ticket_exp_type == "hours" and ticket_exp_value:
-                    rental_expired_date = datetime.now() + timedelta(hours=ticket_exp_value)
+                    # 대여권 발급 (amount 개수만큼)
+                    insert_pb_query = text("""
+                        INSERT INTO tb_user_productbook
+                        (user_id, profile_id, product_id, episode_id, own_type, ticket_type,
+                         acquisition_type, acquisition_id, rental_expired_date, use_yn, created_id, created_date)
+                        VALUES (:user_id, :profile_id, :product_id, :episode_id, :own_type, :ticket_type,
+                                'gift', :acquisition_id, :rental_expired_date, 'N', -1, NOW())
+                    """)
+                    for _ in range(req_body.amount):
+                        await db.execute(
+                            insert_pb_query,
+                            {
+                                "user_id": req_body.user_id,
+                                "profile_id": profile_id,
+                                "product_id": req_body.product_id,
+                                "episode_id": getattr(req_body, "episode_id", None),
+                                "own_type": req_body.own_type,
+                                "ticket_type": req_body.ticket_type,
+                                "acquisition_id": giftbook_id,
+                                "rental_expired_date": rental_expired_date,
+                            },
+                        )
 
-                # 대여권 발급 (amount 개수만큼)
-                insert_pb_query = text("""
-                    INSERT INTO tb_user_productbook
-                    (user_id, profile_id, product_id, episode_id, own_type, ticket_type,
-                     acquisition_type, acquisition_id, rental_expired_date, use_yn, created_id, created_date)
-                    VALUES (:user_id, :profile_id, :product_id, :episode_id, :own_type, :ticket_type,
-                            'gift', :acquisition_id, :rental_expired_date, 'N', -1, NOW())
-                """)
-                for _ in range(req_body.amount):
-                    await db.execute(
-                        insert_pb_query,
-                        {
-                            "user_id": req_body.user_id,
-                            "profile_id": profile_id,
-                            "product_id": req_body.product_id,
-                            "episode_id": getattr(req_body, "episode_id", None),
-                            "own_type": req_body.own_type,
-                            "ticket_type": req_body.ticket_type,
-                            "acquisition_id": giftbook_id,
-                            "rental_expired_date": rental_expired_date,
-                        },
+                    # 선물함 받음 처리
+                    update_gb_query = text("""
+                        UPDATE tb_user_giftbook
+                        SET received_yn = 'Y', received_date = NOW(),
+                            updated_id = -1, updated_date = NOW()
+                        WHERE id = :giftbook_id
+                    """)
+                    await db.execute(update_gb_query, {"giftbook_id": giftbook_id})
+
+                    # 거래 내역 기록
+                    await insert_gift_transaction(
+                        type="received",
+                        user_id=req_body.user_id,
+                        amount=req_body.amount,
+                        reason=f"자동 받기 (giftbook_id: {giftbook_id})",
+                        giftbook_id=giftbook_id,
+                        db=db,
                     )
-
-                # 선물함 받음 처리
-                update_gb_query = text("""
-                    UPDATE tb_user_giftbook
-                    SET received_yn = 'Y', received_date = NOW(),
-                        updated_id = -1, updated_date = NOW()
-                    WHERE id = :giftbook_id
-                """)
-                await db.execute(update_gb_query, {"giftbook_id": giftbook_id})
-
-                # 거래 내역 기록
-                await insert_gift_transaction(
-                    type="received",
-                    user_id=req_body.user_id,
-                    amount=req_body.amount,
-                    reason=f"자동 받기 (giftbook_id: {giftbook_id})",
-                    giftbook_id=giftbook_id,
-                    db=db,
-                )
         except Exception as e:
             logger.error(f"Failed to auto-receive giftbook: {e}")
 
@@ -1014,6 +1033,7 @@ async def receive_user_giftbook(
                ticket_expiration_type, ticket_expiration_value
         FROM tb_user_giftbook
         WHERE id = :giftbook_id
+        FOR UPDATE
     """)
     giftbook_result = await db.execute(giftbook_query, {"giftbook_id": giftbook_id})
     giftbook = giftbook_result.mappings().one_or_none()
@@ -1069,6 +1089,8 @@ async def receive_user_giftbook(
             message=ErrorMessages.EXPIRED_GIFT_VALIDITY,
         )
 
+    amount = _require_positive_amount(giftbook.get("amount"))
+
     # 2. 사용자의 기본 프로필 조회
     profile_query = text("""
         SELECT profile_id
@@ -1092,7 +1114,6 @@ async def receive_user_giftbook(
     episode_id = giftbook.get("episode_id")
     ticket_type = giftbook.get("ticket_type")
     own_type = giftbook.get("own_type")
-    amount = giftbook.get("amount", 1)
     ticket_expiration_type = giftbook.get("ticket_expiration_type")
     ticket_expiration_value = giftbook.get("ticket_expiration_value")
 
@@ -1116,51 +1137,58 @@ async def receive_user_giftbook(
         (user_id, profile_id, product_id, episode_id, own_type, ticket_type, acquisition_type, acquisition_id, rental_expired_date, use_yn, created_id, created_date)
         VALUES (:user_id, :profile_id, :product_id, :episode_id, :own_type, :ticket_type, 'gift', :acquisition_id, :rental_expired_date, 'N', :created_id, :created_date)
     """)
-    for _ in range(amount):
-        await db.execute(
-            insert_query,
+    async with db.begin_nested():
+        for _ in range(amount):
+            await db.execute(
+                insert_query,
+                {
+                    "user_id": user_id,
+                    "profile_id": profile_id,
+                    "product_id": product_id,
+                    "episode_id": episode_id,
+                    "own_type": own_type,
+                    "ticket_type": ticket_type,
+                    "acquisition_id": giftbook_id,
+                    "rental_expired_date": rental_expired_date,
+                    "created_id": -1,
+                    "created_date": datetime.now(),
+                },
+            )
+
+        # 4. 선물함 업데이트 (받음 처리)
+        update_query = text("""
+            UPDATE tb_user_giftbook
+            SET received_yn = 'Y',
+                received_date = :received_date,
+                updated_id = :updated_id,
+                updated_date = :updated_date
+            WHERE id = :giftbook_id
+              AND received_yn = 'N'
+        """)
+        update_result = await db.execute(
+            update_query,
             {
-                "user_id": user_id,
-                "profile_id": profile_id,
-                "product_id": product_id,
-                "episode_id": episode_id,
-                "own_type": own_type,
-                "ticket_type": ticket_type,
-                "acquisition_id": giftbook_id,
-                "rental_expired_date": rental_expired_date,
-                "created_id": -1,
-                "created_date": datetime.now(),
+                "received_date": datetime.now(),
+                "updated_id": -1,
+                "updated_date": datetime.now(),
+                "giftbook_id": giftbook_id,
             },
         )
+        if update_result.rowcount != 1:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.ALREADY_RECEIVED_GIFT,
+            )
 
-    # 4. 선물함 업데이트 (받음 처리)
-    update_query = text("""
-        UPDATE tb_user_giftbook
-        SET received_yn = 'Y',
-            received_date = :received_date,
-            updated_id = :updated_id,
-            updated_date = :updated_date
-        WHERE id = :giftbook_id
-    """)
-    await db.execute(
-        update_query,
-        {
-            "received_date": datetime.now(),
-            "updated_id": -1,
-            "updated_date": datetime.now(),
-            "giftbook_id": giftbook_id,
-        },
-    )
-
-    # 5. 거래 내역 기록 (받은 내역 - 대여권 받기 버튼 클릭 시)
-    await insert_gift_transaction(
-        type="received",
-        user_id=user_id,
-        amount=amount,
-        reason=f"선물함에서 받기 (giftbook_id: {giftbook_id})",
-        giftbook_id=giftbook_id,
-        db=db,
-    )
+        # 5. 거래 내역 기록 (받은 내역 - 대여권 받기 버튼 클릭 시)
+        await insert_gift_transaction(
+            type="received",
+            user_id=user_id,
+            amount=amount,
+            reason=f"선물함에서 받기 (giftbook_id: {giftbook_id})",
+            giftbook_id=giftbook_id,
+            db=db,
+        )
 
     await statistics_service.insert_site_statistics_log(
         db=db, type="active", user_id=user_id
@@ -1290,7 +1318,7 @@ async def user_gift_transaction_list(kc_user_id: str, type: str, db: AsyncSessio
             aib.file_path AS author_interest_level_badge_image_path,
             (SELECT DATE_ADD(MAX(upu2.updated_date), INTERVAL 3 DAY) FROM tb_user_product_usage upu2 WHERE upu2.product_id = p.product_id AND upu2.user_id = ugt.user_id AND upu2.use_yn = 'Y') AS interest_end_date,
             pe.episode_id, pe.product_id AS episode_product_id, pe.price_type AS episode_price_type,
-            pe.episode_no, pe.episode_title, pe.episode_text_count, pe.episode_content,
+            pe.episode_no, pe.episode_title, pe.episode_text_count,
             pe.epub_file_id, pe.author_comment, pe.comment_open_yn, pe.evaluation_open_yn,
             pe.publish_reserve_date, pe.open_yn AS episode_open_yn,
             pe.count_hit AS episode_count_hit, pe.count_recommend AS episode_count_recommend,

@@ -89,6 +89,20 @@ async def _resolve_episode_sale_actor(
     }
 
 
+def _can_manage_episode(
+    episode_row: dict, user_id: int, actor_flags: dict[str, bool]
+) -> bool:
+    is_owner = (
+        episode_row.get("product_author_id") == user_id
+        or episode_row.get("product_user_id") == user_id
+    )
+    is_assigned_cp = (
+        actor_flags.get("is_cp") is True
+        and episode_row.get("cp_user_id") == user_id
+    )
+    return is_owner or actor_flags.get("is_admin") is True or is_assigned_cp
+
+
 def _to_kst_naive(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
         return None
@@ -673,25 +687,12 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
 
     if kc_user_id:
         try:
-            liked = await check_like_product_episode(
-                episode_id=episode_id_to_int, kc_user_id=kc_user_id, db=db
-            )
-
-            query = text("""
-                                select user_id
-                                from tb_user
-                                where kc_user_id = :kc_user_id
-                                and use_yn = 'Y'
-                                """)
-
-            result = await db.execute(query, {"kc_user_id": kc_user_id})
-            db_rst = result.mappings().all()
-            if not db_rst:
+            user_id, actor_flags = await _resolve_episode_sale_actor(kc_user_id, db)
+            if user_id == -1:
                 raise CustomResponseException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     message=ErrorMessages.LOGIN_REQUIRED,
                 )
-            user_id = db_rst[0].get("user_id")
 
             query = text("""
                                 with tmp_get_episodes_episode_id_1 as (                                     
@@ -800,9 +801,15 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                         limit 1
                                     ), 0) as websochat_synced_latest_episode_no
                                     , a.open_yn
+                                    , case when a.publish_reserve_date is not null
+                                                and a.publish_reserve_date > NOW()
+                                            then 'Y'
+                                            else 'N'
+                                      end as publish_reserve_yn
                                     , (select p.open_yn from tb_product p where p.product_id = a.product_id) as product_open_yn
                                     , (select p.author_id from tb_product p where p.product_id = a.product_id) as product_author_id
                                     , (select p.user_id from tb_product p where p.product_id = a.product_id) as product_user_id
+                                    , (select p.cp_user_id from tb_product p where p.product_id = a.product_id) as cp_user_id
                                     , (select own_type from tb_user_productbook where (
                                         episode_id = a.episode_id -- note: cleaned garbled comment (encoding issue)
                                         or
@@ -869,23 +876,41 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
             db_rst = result.mappings().all()
 
             if db_rst:
-                # 비공개 에피소드: 소유/대여 중이 아니면 접근 차단 (작품 소유자는 예외)
-                episode_open_yn = db_rst[0].get("open_yn", "Y")
-                episode_own_type = db_rst[0].get("own_type")
-                product_open_yn = db_rst[0].get("product_open_yn", "Y")
-                product_author_id = db_rst[0].get("product_author_id")
-                product_user_id = db_rst[0].get("product_user_id")
-                is_owner = (product_author_id is not None and product_author_id == user_id) or \
-                           (product_user_id is not None and product_user_id == user_id)
-                if not is_owner and (product_open_yn == "N" or (episode_open_yn == "N" and not episode_own_type)):
+                episode_row = db_rst[0]
+                episode_open_yn = episode_row.get("open_yn", "Y")
+                product_open_yn = episode_row.get("product_open_yn", "Y")
+                is_reserved = episode_row.get("publish_reserve_yn") == "Y"
+                can_manage_episode = _can_manage_episode(
+                    episode_row, user_id, actor_flags
+                )
+                if not can_manage_episode and (
+                    product_open_yn != "Y"
+                    or episode_open_yn != "Y"
+                    or is_reserved
+                ):
                     res_data = {
-                        "product_id": db_rst[0].get("product_id"),
-                        "title": db_rst[0].get("title"),
-                        "episodeTitle": db_rst[0].get("episode_title"),
+                        "product_id": episode_row.get("product_id"),
+                        "title": episode_row.get("title"),
+                        "episodeTitle": episode_row.get("episode_title"),
                         "privateYn": "Y",
                         "productPrivateYn": "Y" if product_open_yn == "N" else "N",
                     }
                 else:
+                    if (
+                        episode_row.get("price_type") == "paid"
+                        and not episode_row.get("own_type")
+                        and not can_manage_episode
+                    ):
+                        raise CustomResponseException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            code="PURCHASE_REQUIRED",
+                        )
+
+                    liked = await check_like_product_episode(
+                        episode_id=episode_id_to_int,
+                        kc_user_id=kc_user_id,
+                        db=db,
+                    )
                     epub_file_path = comm_service.make_r2_presigned_url(
                         type="download",
                         bucket_name=settings.R2_SC_EPUB_BUCKET,
@@ -1444,129 +1469,29 @@ async def get_episodes_episode_id_info(
 
     if kc_user_id:
         try:
-            liked = await check_like_product_episode(
-                episode_id=episode_id_to_int, kc_user_id=kc_user_id, db=db
-            )
-
-            user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+            user_id, actor_flags = await _resolve_episode_sale_actor(kc_user_id, db)
             if user_id == -1:
                 raise CustomResponseException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     message=ErrorMessages.LOGIN_REQUIRED,
                 )
 
-            # TODO: cleaned garbled comment (encoding issue).
             check_query = text("""
                                 select a.episode_id
                                     , a.use_yn
                                 from tb_product_episode a
                                 where a.episode_id = :episode_id
                                 """)
-
             check_result = await db.execute(
                 check_query, {"episode_id": episode_id_to_int}
             )
             check_row = check_result.mappings().one_or_none()
-
             if not check_row:
-                # TODO: cleaned garbled comment (encoding issue).
                 raise CustomResponseException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     message=ErrorMessages.NOT_FOUND_EPISODE,
                 )
-
             if check_row["use_yn"] == "N":
-                # TODO: cleaned garbled comment (encoding issue).
-                raise CustomResponseException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    message=ErrorMessages.DELETED_EPISODE,
-                )
-
-            query = text("""
-                                select a.episode_id
-                                    , a.episode_title as title
-                                    , a.episode_content as content
-                                    , a.author_comment
-                                    , a.evaluation_open_yn
-                                    , a.comment_open_yn
-                                    , a.open_yn as episode_open_yn
-                                    , case when a.publish_reserve_date is null then 'N'
-                                            else 'Y'
-                                    end as reserve_yn
-                                    , a.publish_reserve_date
-                                    , a.price_type
-                                    , (select count(*) from tb_product_episode_like where episode_id = a.episode_id) as count_like
-                                from tb_product_episode a
-                                inner join tb_product b on a.product_id = b.product_id
-                                and b.user_id = :user_id
-                                where a.episode_id = :episode_id
-                                and use_yn = 'Y'
-                                """)
-
-            result = await db.execute(
-                query, {"user_id": user_id, "episode_id": episode_id_to_int}
-            )
-            db_rst = result.mappings().all()
-
-            if db_rst:
-                res_data = {
-                    "episodeId": episode_id_to_int,
-                    "title": db_rst[0].get("title"),
-                    "content": db_rst[0].get("content"),
-                    "authorComment": db_rst[0].get("author_comment"),
-                    "evaluationOpenYn": db_rst[0].get("evaluation_open_yn"),
-                    "commentOpenYn": db_rst[0].get("comment_open_yn"),
-                    "episodeOpenYn": db_rst[0].get("episode_open_yn"),
-                    "publishReserveYn": db_rst[0].get("reserve_yn"),
-                    "publishReserveDate": db_rst[0].get("publish_reserve_date"),
-                    "priceType": db_rst[0].get("price_type"),
-                    "likeCount": db_rst[0].get("count_like"),
-                    "liked": "Y" if liked else "N",
-                }
-        except CustomResponseException as e:
-            logger.error(e, exc_info=True)
-            raise
-        except OperationalError as e:
-            logger.error(e, exc_info=True)
-            raise CustomResponseException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                message=ErrorMessages.DB_CONNECTION_ERROR,
-            )
-        except SQLAlchemyError as e:
-            logger.error(e, exc_info=True)
-            raise CustomResponseException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                message=ErrorMessages.DB_OPERATION_ERROR,
-            )
-        except Exception as e:
-            logger.error(e, exc_info=True)
-            raise CustomResponseException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    else:
-        try:
-            # TODO: cleaned garbled comment (encoding issue).
-            check_query = text("""
-                                select a.episode_id
-                                    , a.use_yn
-                                from tb_product_episode a
-                                where a.episode_id = :episode_id
-                                """)
-
-            check_result = await db.execute(
-                check_query, {"episode_id": episode_id_to_int}
-            )
-            check_row = check_result.mappings().one_or_none()
-
-            if not check_row:
-                # TODO: cleaned garbled comment (encoding issue).
-                raise CustomResponseException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    message=ErrorMessages.NOT_FOUND_EPISODE,
-                )
-
-            if check_row["use_yn"] == "N":
-                # TODO: cleaned garbled comment (encoding issue).
                 raise CustomResponseException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     message=ErrorMessages.DELETED_EPISODE,
@@ -1590,10 +1515,30 @@ async def get_episodes_episode_id_info(
                                 inner join tb_product b on a.product_id = b.product_id
                                 where a.episode_id = :episode_id
                                 and a.use_yn = 'Y'
+                                and (
+                                    b.user_id = :user_id
+                                    or b.author_id = :user_id
+                                    or :is_admin = 1
+                                    or (:is_cp = 1 and b.cp_user_id = :user_id)
+                                )
                                 """)
-            result = await db.execute(query, {"episode_id": episode_id_to_int})
+            result = await db.execute(
+                query,
+                {
+                    "user_id": user_id,
+                    "episode_id": episode_id_to_int,
+                    "is_admin": int(actor_flags["is_admin"]),
+                    "is_cp": int(actor_flags["is_cp"]),
+                },
+            )
             db_rst = result.mappings().all()
+
             if db_rst:
+                liked = await check_like_product_episode(
+                    episode_id=episode_id_to_int,
+                    kc_user_id=kc_user_id,
+                    db=db,
+                )
                 res_data = {
                     "episodeId": episode_id_to_int,
                     "title": db_rst[0].get("title"),
@@ -1606,8 +1551,102 @@ async def get_episodes_episode_id_info(
                     "publishReserveDate": db_rst[0].get("publish_reserve_date"),
                     "priceType": db_rst[0].get("price_type"),
                     "likeCount": db_rst[0].get("count_like"),
-                    "liked": "N",
+                    "liked": "Y" if liked else "N",
                 }
+            else:
+                query = text("""
+                                    select a.episode_id
+                                        , a.episode_title as title
+                                    from tb_product_episode a
+                                    inner join tb_product b on a.product_id = b.product_id
+                                    where a.episode_id = :episode_id
+                                    and a.use_yn = 'Y'
+                                    and a.open_yn = 'Y'
+                                    and b.open_yn = 'Y'
+                                    and (a.publish_reserve_date is null
+                                         or a.publish_reserve_date <= NOW())
+                                    """)
+                result = await db.execute(
+                    query, {"episode_id": episode_id_to_int}
+                )
+                db_rst = result.mappings().all()
+                if not db_rst:
+                    raise CustomResponseException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        message=ErrorMessages.NOT_FOUND_EPISODE,
+                    )
+                res_data = {
+                    "episodeId": episode_id_to_int,
+                    "title": db_rst[0].get("title"),
+                }
+        except CustomResponseException as e:
+            logger.error(e, exc_info=True)
+            raise
+        except OperationalError as e:
+            logger.error(e, exc_info=True)
+            raise CustomResponseException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                message=ErrorMessages.DB_CONNECTION_ERROR,
+            )
+        except SQLAlchemyError as e:
+            logger.error(e, exc_info=True)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message=ErrorMessages.DB_OPERATION_ERROR,
+            )
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise CustomResponseException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    else:
+        try:
+            check_query = text("""
+                                select a.episode_id
+                                    , a.use_yn
+                                from tb_product_episode a
+                                where a.episode_id = :episode_id
+                                """)
+            check_result = await db.execute(
+                check_query, {"episode_id": episode_id_to_int}
+            )
+            check_row = check_result.mappings().one_or_none()
+            if not check_row:
+                raise CustomResponseException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    message=ErrorMessages.NOT_FOUND_EPISODE,
+                )
+            if check_row["use_yn"] == "N":
+                raise CustomResponseException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    message=ErrorMessages.DELETED_EPISODE,
+                )
+
+            query = text("""
+                                select a.episode_id
+                                    , a.episode_title as title
+                                from tb_product_episode a
+                                inner join tb_product b on a.product_id = b.product_id
+                                where a.episode_id = :episode_id
+                                and a.use_yn = 'Y'
+                                and a.open_yn = 'Y'
+                                and b.open_yn = 'Y'
+                                and (a.publish_reserve_date is null
+                                     or a.publish_reserve_date <= NOW())
+                                """)
+            result = await db.execute(query, {"episode_id": episode_id_to_int})
+            db_rst = result.mappings().all()
+            if not db_rst:
+                raise CustomResponseException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    message=ErrorMessages.NOT_FOUND_EPISODE,
+                )
+            res_data = {
+                "episodeId": episode_id_to_int,
+                "title": db_rst[0].get("title"),
+            }
+        except CustomResponseException:
+            raise
         except OperationalError as e:
             logger.error(e)
             raise CustomResponseException(
@@ -1624,9 +1663,7 @@ async def get_episodes_episode_id_info(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-    res_body = {"data": res_data}
-
-    return res_body
+    return {"data": res_data}
 
 
 async def get_episodes_products_product_id_info(

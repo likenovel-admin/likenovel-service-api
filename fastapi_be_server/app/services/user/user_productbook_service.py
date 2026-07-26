@@ -40,15 +40,30 @@ async def user_productbook_list(kc_user_id: str, db: AsyncSession):
     return build_list_response(rows)
 
 
-async def user_productbook_detail_by_id(id, db: AsyncSession):
+async def user_productbook_detail_by_id(
+    id: int, kc_user_id: str, db: AsyncSession
+):
     """
     사용자 대여권(user_productbook) 상세 조회
     """
+    user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
     query = text("""
-                 SELECT * FROM tb_user_productbook WHERE id = :id
+                 SELECT * FROM tb_user_productbook
+                 WHERE id = :id AND user_id = :user_id
                  """)
-    result = await db.execute(query, {"id": id})
+    result = await db.execute(query, {"id": id, "user_id": user_id})
     row = result.mappings().one_or_none()
+    if row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_PRODUCTBOOK,
+        )
     return build_detail_response(row)
 
 
@@ -196,11 +211,13 @@ async def use_user_productbook(
     episode_no = episode_row["episode_no"]
     product_title = episode_row["product_title"]
 
-    # 대여권 조회 (product_id, episode_id, use_yn, own_type, ticket_type 포함)
+    # 대여권 조회 및 잠금
     productbook_query = text("""
-                              SELECT user_id, product_id, episode_id, use_yn, own_type, ticket_type
+                              SELECT user_id, product_id, episode_id, use_yn, own_type, ticket_type,
+                                     rental_expired_date
                               FROM tb_user_productbook
                               WHERE id = :id
+                              FOR UPDATE
                               """)
     productbook_result = await db.execute(productbook_query, {"id": id})
     productbook_row = productbook_result.mappings().one_or_none()
@@ -230,6 +247,13 @@ async def use_user_productbook(
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.ALREADY_USED_PRODUCTBOOK,
+        )
+
+    rental_expired_date = productbook_row["rental_expired_date"]
+    if rental_expired_date is not None and rental_expired_date <= datetime.now():
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.EXPIRED_PRODUCTBOOK,
         )
 
     # 대여권 사용 가능 여부 체크
@@ -272,6 +296,7 @@ async def use_user_productbook(
         "updated_id": -1,
         "updated_date": datetime.now(),
         "id": id,
+        "user_id": user_id,
         "product_id": target_product_id,
         "episode_id": episode_id,
     }
@@ -282,9 +307,18 @@ async def use_user_productbook(
                         update tb_user_productbook
                         set {update_filed_query}
                         where id = :id
+                        and user_id = :user_id
+                        and own_type = 'rental'
+                        and use_yn = 'N'
+                        and (rental_expired_date IS NULL OR rental_expired_date > NOW())
                     """)
 
-    await db.execute(query, db_execute_params)
+    update_result = await db.execute(query, db_execute_params)
+    if update_result.rowcount != 1:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.ALREADY_USED_PRODUCTBOOK,
+        )
 
     # 정산용 일별 판매 데이터 기록 (유료 대여권만)
     ticket_type = productbook_row["ticket_type"]

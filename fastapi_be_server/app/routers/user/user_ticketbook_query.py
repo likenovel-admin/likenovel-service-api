@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any
 
 from app.rdb import get_likenovel_db
-from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.auth import analysis_logger, chk_cur_user, login_required
 import app.services.user.user_ticketbook_service as user_ticketbook_service
 
 router = APIRouter(prefix="/user-ticketbook")
@@ -138,10 +138,13 @@ async def user_ticketbook_list(
 )
 async def user_ticketbook_detail_by_id(
     id: int = Path(..., description="사용자 이용권 번호"),
+    kc_user_id: str = Depends(login_required),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     """
     사용자 이용권 상세
     """
 
-    return await user_ticketbook_service.user_ticketbook_detail_by_id(id=id, db=db)
+    return await user_ticketbook_service.user_ticketbook_detail_by_id(
+        id=id, kc_user_id=kc_user_id, db=db
+    )

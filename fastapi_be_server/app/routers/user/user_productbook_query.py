@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any, Optional
 
 from app.rdb import get_likenovel_db
-from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.auth import analysis_logger, chk_cur_user, login_required
 import app.services.user.user_productbook_service as user_productbook_service
 
 router = APIRouter(prefix="/user-productbook")
@@ -282,10 +282,13 @@ async def get_available_rental_tickets(
 )
 async def user_productbook_detail_by_id(
     id: int = Path(..., description="사용자 대여권 번호"),
+    kc_user_id: str = Depends(login_required),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     """
     사용자 대여권 상세
     """
 
-    return await user_productbook_service.user_productbook_detail_by_id(id=id, db=db)
+    return await user_productbook_service.user_productbook_detail_by_id(
+        id=id, kc_user_id=kc_user_id, db=db
+    )
