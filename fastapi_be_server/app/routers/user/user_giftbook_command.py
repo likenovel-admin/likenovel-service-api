@@ -4,53 +4,9 @@ from typing import Dict, Any
 
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger, chk_cur_user
-import app.schemas.user_giftbook as user_giftbook_schema
 import app.services.user.user_giftbook_service as user_giftbook_service
 
 router = APIRouter(prefix="/user-giftbook")
-
-
-@router.post("", tags=["선물함"], dependencies=[Depends(analysis_logger)])
-async def post_user_giftbook(
-    req_body: user_giftbook_schema.PostUserGiftbookReqBody,
-    user: Dict[str, Any] = Depends(chk_cur_user),
-    db: AsyncSession = Depends(get_likenovel_db),
-):
-    """
-    선물함 등록
-    """
-
-    return await user_giftbook_service.post_user_giftbook(
-        req_body, kc_user_id=user.get("sub"), db=db
-    )
-
-
-@router.put("/{id}", tags=["선물함"], dependencies=[Depends(analysis_logger)])
-async def put_user_giftbook(
-    req_body: user_giftbook_schema.PutUserGiftbookReqBody,
-    id: int = Path(..., description="선물함 번호"),
-    db: AsyncSession = Depends(get_likenovel_db),
-):
-    """
-    선물함 수정
-    """
-
-    return await user_giftbook_service.put_user_giftbook(id, req_body, db=db)
-
-
-@router.delete("/{id}", tags=["선물함"], dependencies=[Depends(analysis_logger)])
-async def delete_user_giftbook(
-    id: int = Path(..., description="선물함 번호"),
-    user: Dict[str, Any] = Depends(chk_cur_user),
-    db: AsyncSession = Depends(get_likenovel_db),
-):
-    """
-    선물함 삭제
-    """
-
-    return await user_giftbook_service.delete_user_giftbook(
-        id, kc_user_id=user.get("sub"), db=db
-    )
 
 
 @router.post(

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db
-from app.utils.auth import analysis_logger, chk_cur_user
+from app.utils.auth import analysis_logger, chk_cur_user, login_required
 import app.services.user.user_giftbook_service as user_giftbook_service
 
 router = APIRouter(prefix="/user-giftbook")
@@ -408,6 +408,7 @@ async def user_giftbook_list(
 )
 async def user_giftbook_detail_by_id(
     id: int = Path(..., description="선물함 번호"),
+    kc_user_id: str = Depends(login_required),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
     """
@@ -417,7 +418,9 @@ async def user_giftbook_detail_by_id(
     - 획득 정보 포함 (이벤트, 퀘스트, 신청 프로모션, 직접 프로모션 등)
     """
 
-    return await user_giftbook_service.user_giftbook_detail_by_id(id=id, db=db)
+    return await user_giftbook_service.user_giftbook_detail_by_id(
+        id=id, kc_user_id=kc_user_id, db=db
+    )
 
 
 @router.get(
