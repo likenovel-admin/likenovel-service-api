@@ -508,14 +508,15 @@ def test_public_character_catalog_assets_query_filters_before_returning_payload(
     assert "$.display_safety.status" not in query
     assert "summary_type = 'character_rp_profile'" in query
     assert "summary_type = 'character_rp_examples'" in query
-    assert "JSON_CONTAINS(" in query
-    assert "$.protagonist_identity_scope_keys" in query
-    assert "$.source_character_keys" in query
-    assert "JSON_QUOTE(profile.scope_key)" in query
-    assert "JSON_QUOTE(examples.scope_key)" in query
+    assert "profile.scope_key = inventory.scope_key" in normalized_query
+    assert "examples.scope_key = inventory.scope_key" in normalized_query
+    assert "inventory.source_doc_count AS _distinctEpisodeCount" in query
+    assert "examples.source_doc_count AS _exampleCount" in query
     assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
-    assert "ROW_NUMBER() OVER" in query
-    assert "PARTITION BY inventory.product_id" in normalized_query
+    assert "ROW_NUMBER() OVER" not in query
+    assert "JSON_CONTAINS(" not in query
+    assert "$.protagonist_identity_scope_keys" not in query
+    assert "$.source_character_keys" not in query
     assert "inventory.updated_date" not in query
     assert "inventory.created_date AS updatedDate" in query
     assert "_inventorySummaryText" in query
@@ -529,55 +530,27 @@ def test_catalog_assets_checks_rp_assets_only_after_latest_public_inventory():
     query = build_public_character_catalog_assets_query()
     normalized_query = " ".join(query.split())
 
-    assert "latest_inventory AS (" in normalized_query
-    assert "inventory_assets AS (" in normalized_query
-    ranking_stage, remaining_query = normalized_query.split(
-        "latest_inventory AS (",
-        maxsplit=1,
-    )
-    latest_stage, asset_stage = remaining_query.split(
-        "inventory_assets AS (",
-        maxsplit=1,
-    )
-    assert "inventory.summary_text AS" not in ranking_stage
-    assert "character_rp_profile" not in ranking_stage
-    assert "character_rp_examples" not in ranking_stage
+    assert "WITH inventory_assets AS (" in normalized_query
+    assert "latest_inventory AS (" not in normalized_query
+    assert "inventory_ranked AS (" not in normalized_query
     assert (
-        "FROM inventory_ranked ranked"
-        " INNER JOIN tb_story_agent_context_summary inventory"
-        " ON inventory.summary_id = ranked.summaryId"
-        in latest_stage
+        "FROM tb_story_agent_context_summary inventory"
+        in normalized_query
     )
-    assert "WHERE ranked.inventoryVersionRank = 1" in latest_stage
-    assert "$.public_chat_eligible" in latest_stage
-    assert "character_rp_profile" not in latest_stage
-    assert "character_rp_examples" not in latest_stage
     assert (
-        "FROM latest_inventory inventory"
-        in asset_stage
+        "INNER JOIN tb_story_agent_context_summary profile"
+        in normalized_query
     )
-    assert "character_rp_profile" in asset_stage
-    assert "character_rp_examples" in asset_stage
-    assert "inventory.characterScopeKey" in asset_stage
-    assert "inventory.scope_key" not in asset_stage
+    assert (
+        "INNER JOIN tb_story_agent_context_summary examples"
+        in normalized_query
+    )
+    assert "inventory.scope_key AS characterScopeKey" in normalized_query
     assert query.count("examples.summary_type = 'character_rp_examples'") == 1
-    assert "JSON_CONTAINS(" in asset_stage
-    assert "$.protagonist_identity_scope_keys" in asset_stage
-    assert "$.source_character_keys" in asset_stage
-
-    inventory_versions = [
-        {"summaryId": 1, "hasProfile": True, "hasExamples": True},
-        {"summaryId": 2, "hasProfile": False, "hasExamples": False},
-    ]
-    latest_inventory = max(
-        inventory_versions,
-        key=lambda item: item["summaryId"],
-    )
-    assert latest_inventory == {
-        "summaryId": 2,
-        "hasProfile": False,
-        "hasExamples": False,
-    }
+    assert "profile.is_active = 'Y'" in normalized_query
+    assert "examples.is_active = 'Y'" in normalized_query
+    assert "profile.scope_key = inventory.scope_key" in normalized_query
+    assert "examples.scope_key = inventory.scope_key" in normalized_query
 
 
 def test_catalog_assets_latest_false_does_not_fall_back_to_older_true():
@@ -597,12 +570,122 @@ def test_catalog_assets_latest_false_does_not_fall_back_to_older_true():
     normalized_query = " ".join(query.split())
 
     assert latest_inventory["publicChatEligible"] is False
-    assert "WHERE ranked.inventoryVersionRank = 1" in normalized_query
-    assert (
-        normalized_query.index("ROW_NUMBER() OVER")
-        < normalized_query.index("WHERE ranked.inventoryVersionRank = 1")
-        < normalized_query.index("$.public_chat_eligible")
+    assert "inventory.is_active = 'Y'" in normalized_query
+    assert "ROW_NUMBER() OVER" not in normalized_query
+    assert "$.public_chat_eligible" in normalized_query
+
+
+def test_catalog_alias_fallback_query_preserves_compatible_scope_contract():
+    from app.services.product.main_character_slot_service import (
+        build_public_character_catalog_alias_fallback_query,
     )
+
+    query = build_public_character_catalog_alias_fallback_query()
+    normalized_query = " ".join(query.split())
+
+    assert "inventory.product_id IN :product_ids" in query
+    assert "ROW_NUMBER() OVER" in query
+    assert "WHERE ranked.inventoryVersionRank = 1" in normalized_query
+    assert "JSON_CONTAINS(" in query
+    assert "$.protagonist_identity_scope_keys" in query
+    assert "$.source_character_keys" in query
+    assert "JSON_QUOTE(profile.scope_key)" in query
+    assert "JSON_QUOTE(examples.scope_key)" in query
+    assert "$.public_chat_eligible" in query
+
+
+def test_catalog_alias_fallback_targets_only_incomplete_or_weak_exact_products():
+    from app.services.product.main_character_slot_service import (
+        MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES,
+        select_public_character_catalog_alias_fallback_product_ids,
+    )
+
+    threshold = MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
+    product_rows = [{"productId": product_id} for product_id in [1, 2, 3, 4]]
+    readiness_rows = [
+        {
+            "productId": product_id,
+            "_chatReadyEpisodeCount": 1,
+            "_continuousReadyEpisodeNo": 1,
+        }
+        for product_id in [1, 2, 3, 4]
+    ]
+    exact_candidate_items = [
+        {"productId": 1, "_exampleCount": threshold + 1},
+        {"productId": 1, "_exampleCount": threshold + 2},
+        {"productId": 2, "_exampleCount": threshold},
+        {"productId": 3, "_exampleCount": threshold},
+        {"productId": 3, "_exampleCount": threshold},
+    ]
+
+    assert select_public_character_catalog_alias_fallback_product_ids(
+        product_rows,
+        readiness_rows,
+        exact_candidate_items,
+    ) == [2, 3, 4]
+
+
+def test_catalog_alias_fallback_excludes_unready_or_missing_products():
+    from app.services.product.main_character_slot_service import (
+        select_public_character_catalog_alias_fallback_product_ids,
+    )
+
+    product_rows = [{"productId": product_id} for product_id in [1, 2, 3, 4]]
+    readiness_rows = [
+        {
+            "productId": 1,
+            "_chatReadyEpisodeCount": 1,
+            "_continuousReadyEpisodeNo": 1,
+        },
+        {
+            "productId": 2,
+            "_chatReadyEpisodeCount": 0,
+            "_continuousReadyEpisodeNo": 1,
+        },
+        {
+            "productId": 4,
+            "_chatReadyEpisodeCount": 1,
+            "_continuousReadyEpisodeNo": 0,
+        },
+    ]
+
+    assert select_public_character_catalog_alias_fallback_product_ids(
+        product_rows,
+        readiness_rows,
+        exact_candidate_items=[],
+    ) == [1]
+
+
+def test_catalog_alias_fallback_is_authoritative_for_target_products():
+    from app.services.product.main_character_slot_service import (
+        merge_public_character_catalog_asset_candidates,
+    )
+
+    exact_candidate_items = [
+        {"characterSlotId": 10, "productId": 1, "_exampleCount": 5},
+        {"characterSlotId": 20, "productId": 2, "_exampleCount": 1},
+        {"characterSlotId": 30, "productId": 3, "_exampleCount": 5},
+    ]
+    fallback_candidate_items = [
+        {"characterSlotId": 20, "productId": 2, "_exampleCount": 9},
+        {"characterSlotId": 21, "productId": 2, "_exampleCount": 7},
+        {"characterSlotId": 90, "productId": 9, "_exampleCount": 8},
+    ]
+
+    result = merge_public_character_catalog_asset_candidates(
+        exact_candidate_items,
+        fallback_candidate_items,
+        fallback_product_ids=[2, 3],
+    )
+
+    assert [
+        (item["characterSlotId"], item["productId"], item["_exampleCount"])
+        for item in result
+    ] == [
+        (10, 1, 5),
+        (20, 2, 9),
+        (21, 2, 7),
+    ]
 
 
 def test_public_character_catalog_scene_query_is_one_bulk_product_query():
@@ -611,29 +694,34 @@ def test_public_character_catalog_scene_query_is_one_bulk_product_query():
     )
 
     query = build_public_character_catalog_scene_query()
+    compact_query = "".join(query.split())
 
-    assert "FROM JSON_TABLE(" in query
+    assert "WITH candidate_product AS (" in query
+    assert "candidate_scope AS (" in query
+    assert "scene_scope AS (" in query
     assert ":candidate_json" in query
+    assert "SELECT DISTINCT c.product_id" in query
     assert "character_slot_id BIGINT" in query
-    assert "compatible_scope_keys JSON" in query
+    assert "NESTED PATH '$.compatibleScopeKeys[*]'" in query
+    assert "SELECTDISTINCTscene.summary_id" in compact_query
     assert "summary_type = 'episode_scene_extraction'" in query
     assert "scene_episode.episode_no >= 1" in query
     assert "scene_episode.use_yn = 'Y'" in query
     assert "scene_episode.open_yn = 'Y'" in query
     assert "COALESCE(scene_episode.price_type, 'free') = 'free'" in query
-    assert "COUNT(DISTINCT scene.summary_id) AS sceneCount" in query
-    assert "MIN(scene_episode.episode_no) AS entryEpisodeNo" in query
-    assert "catalog_participant.participant_scope_key" in query
-    assert "catalog_action_owner.action_scope_key" in query
-    compact_query = "".join(query.split())
+    assert "COUNT(DISTINCT scene_scope.summary_id) AS sceneCount" in query
+    assert "MIN(scene_scope.episode_no) AS entryEpisodeNo" in query
+    assert query.count("'$.scenes[*]'") == 1
+    assert "JSON_CONTAINS(" not in query
     assert (
-        "JSON_CONTAINS(candidate.compatible_scope_keys,"
-        "JSON_QUOTE(catalog_participant.participant_scope_key))"
+        "scene_scope.product_id=candidate_scope.product_id"
         in compact_query
     )
+    assert compact_query.count("COLLATEutf8mb4_0900_bin") == 5
+    assert "utf8mb4_bin" not in query
     assert "opening_scene" not in query
     assert "episode_to BETWEEN 0 AND 1" not in query
-    assert "GROUP BY candidate.character_slot_id" in query
+    assert "GROUP BY candidate_scope.character_slot_id" in query
 
 
 def test_catalog_scene_query_binds_nonempty_gist_and_scope_to_same_scene():
@@ -645,26 +733,16 @@ def test_catalog_scene_query_binds_nonempty_gist_and_scope_to_same_scene():
     compact_query = "".join(query.split())
 
     assert "CROSS JOIN JSON_TABLE(" in query
-    assert (
-        "JSON_TABLE(IF(JSON_VALID(scene.summary_text),"
-        "scene.summary_text,JSON_OBJECT()),'$.scenes[*]'COLUMNS("
-        "scene_gistVARCHAR(4096)PATH'$.scene_gist',"
-        "participantsJSONPATH'$.participants',"
-        "action_ownershipJSONPATH'$.action_ownership'))AScatalog_scene_row"
-        in compact_query
-    )
-    assert (
-        "ANDEXISTS(SELECT1FROMJSON_TABLE("
-        "IF(JSON_VALID(scene.summary_text),scene.summary_text,JSON_OBJECT()),"
-        "'$.scenes[*]'"
-        not in compact_query
-    )
-    assert (
-        "TRIM(COALESCE(catalog_scene_row.scene_gist,''))<>''"
-        in compact_query
-    )
-    assert "JSON_TYPE(catalog_scene_row.participants)='ARRAY'" in compact_query
-    assert "JSON_TYPE(catalog_scene_row.action_ownership)='ARRAY'" in compact_query
+    assert "participantsJSONPATH'$.participants'" in compact_query
+    assert "action_ownershipJSONPATH'$.action_ownership'" in compact_query
+    assert "NESTEDPATH'$.participants[*]'" in compact_query
+    assert "NESTEDPATH'$.action_ownership[*]'" in compact_query
+    assert "participant_scope_keyVARCHAR(80)" in compact_query
+    assert "action_scope_keyVARCHAR(80)" in compact_query
+    assert "COALESCE(IF(JSON_TYPE(flat.participants)='ARRAY'" in compact_query
+    assert "IF(JSON_TYPE(flat.action_ownership)='ARRAY'" in compact_query
+    assert "TRIM(COALESCE(flat.scene_gist,''))<>''" in compact_query
+    assert query.count("'$.scenes[*]'") == 1
     assert "$.scenes[*].scene_gist" not in query
 
 
@@ -928,11 +1006,21 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "productId": 1182,
                 "characterScopeKey": "character:adelite",
                 "_distinctEpisodeCount": 12,
-                "_exampleCount": 4,
+                "_exampleCount": 5,
                 "_sceneCount": 0,
                 "_inventorySummaryText": '{"work_role":"main_protagonist"}',
                 "_isProtagonist": 1,
-            }
+            },
+            {
+                "characterSlotId": 99,
+                "productId": 1182,
+                "characterScopeKey": "character:support",
+                "_distinctEpisodeCount": 12,
+                "_exampleCount": 5,
+                "_sceneCount": 0,
+                "_inventorySummaryText": '{"work_role":"major_character"}',
+                "_isProtagonist": 0,
+            },
         ]
         scene_result = MagicMock()
         scene_result.mappings.return_value.all.return_value = [
@@ -963,6 +1051,128 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             {"productId": product_id} for product_id in product_ids
         ]
         return result
+
+    async def test_catalog_load_queries_fallback_only_for_target_products(self):
+        from app.services.product import main_character_slot_service
+
+        threshold = (
+            main_character_slot_service.MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
+        )
+
+        def result(rows):
+            query_result = MagicMock()
+            query_result.mappings.return_value.all.return_value = rows
+            return query_result
+
+        product_result = result(
+            [
+                {
+                    "productId": product_id,
+                    "productTitle": f"작품 {product_id}",
+                    "authorNickname": "작가",
+                    "_chatTotalEpisodeCount": 10,
+                    "_latestPublicEpisodeNo": 10,
+                }
+                for product_id in [1, 2]
+            ]
+        )
+        readiness_result = result(
+            [
+                {
+                    "productId": product_id,
+                    "_chatReadyEpisodeCount": 10,
+                    "_contextReadyEpisodeCount": 10,
+                    "_continuousReadyEpisodeNo": 10,
+                }
+                for product_id in [1, 2]
+            ]
+        )
+        exact_assets_result = result(
+            [
+                {
+                    "characterSlotId": slot_id,
+                    "productId": product_id,
+                    "characterScopeKey": f"character:{slot_id}",
+                    "_distinctEpisodeCount": 10,
+                    "_exampleCount": example_count,
+                    "_inventorySummaryText": (
+                        '{"work_role":"main_protagonist"}'
+                    ),
+                    "_isProtagonist": 1,
+                }
+                for slot_id, product_id, example_count in [
+                    (11, 1, threshold + 1),
+                    (12, 1, threshold + 1),
+                    (21, 2, threshold - 1),
+                ]
+            ]
+        )
+        fallback_assets_result = result(
+            [
+                {
+                    "characterSlotId": slot_id,
+                    "productId": 2,
+                    "characterScopeKey": f"character:{slot_id}",
+                    "_distinctEpisodeCount": distinct_count,
+                    "_exampleCount": example_count,
+                    "_inventorySummaryText": (
+                        '{"work_role":"main_protagonist"}'
+                    ),
+                    "_isProtagonist": 1,
+                }
+                for slot_id, distinct_count, example_count in [
+                    (21, 91, 9),
+                    (22, 70, 7),
+                ]
+            ]
+        )
+        scene_result = result(
+            [
+                {
+                    "characterSlotId": slot_id,
+                    "sceneCount": 5,
+                    "entryEpisodeNo": 1,
+                }
+                for slot_id in [11, 12, 21, 22]
+            ]
+        )
+        image_result = result(
+            [
+                {
+                    "characterSlotId": slot_id,
+                    "characterImagePath": f"/{slot_id}.webp",
+                }
+                for slot_id in [11, 12, 21, 22]
+            ]
+        )
+        db = AsyncMock()
+        db.execute.side_effect = [
+            product_result,
+            readiness_result,
+            exact_assets_result,
+            fallback_assets_result,
+            scene_result,
+            image_result,
+        ]
+
+        catalog_items = (
+            await main_character_slot_service._load_public_character_catalog_base(
+                adult_yn="N",
+                db=db,
+            )
+        )
+
+        assert db.execute.await_count == 6
+        assert db.execute.await_args_list[3].args[1]["product_ids"] == [2]
+        assert {
+            (item["characterSlotId"], item["productId"], item["exampleCount"])
+            for item in catalog_items
+        } == {
+            (11, 1, threshold + 1),
+            (12, 1, threshold + 1),
+            (21, 2, 9),
+            (22, 2, 7),
+        }
 
     async def test_character_catalog_reuses_adult_scoped_base_with_deep_copies(self):
         from app.services.product import main_character_slot_service
@@ -1316,11 +1526,21 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "productId": 1182,
                 "characterScopeKey": "character:adelite",
                 "_distinctEpisodeCount": 12,
-                "_exampleCount": 4,
+                "_exampleCount": 5,
                 "_sceneCount": 0,
                 "_inventorySummaryText": '{"work_role":"main_protagonist"}',
                 "_isProtagonist": 1,
-            }
+            },
+            {
+                "characterSlotId": 99,
+                "productId": 1182,
+                "characterScopeKey": "character:support",
+                "_distinctEpisodeCount": 12,
+                "_exampleCount": 5,
+                "_sceneCount": 0,
+                "_inventorySummaryText": '{"work_role":"major_character"}',
+                "_isProtagonist": 0,
+            },
         ]
         scene_result = MagicMock()
         scene_result.mappings.return_value.all.return_value = [
@@ -1362,7 +1582,12 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "characterSlotId": 1,
                 "productId": 1182,
                 "compatibleScopeKeys": ["character:adelite"],
-            }
+            },
+            {
+                "characterSlotId": 99,
+                "productId": 1182,
+                "compatibleScopeKeys": ["character:support"],
+            },
         ]
         assert response == {
             "data": [
@@ -1382,7 +1607,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "fullReady": False,
                     "readinessCoverageRatio": 0.75,
                     "distinctEpisodeCount": 12,
-                    "exampleCount": 4,
+                    "exampleCount": 5,
                     "sceneCount": 5,
                     "chatQuality": "good",
                     "lastViewedEpisodeNo": None,
@@ -1468,6 +1693,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             product_result,
             readiness_result,
             catalog_result,
+            catalog_result,
             scene_result,
             image_result,
             progress_result,
@@ -1479,10 +1705,10 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             db=db,
         )
 
-        assert db.execute.await_count == 6
-        progress_query = db.execute.await_args_list[5].args[0]
+        assert db.execute.await_count == 7
+        progress_query = db.execute.await_args_list[6].args[0]
         progress_sql = str(progress_query)
-        progress_params = db.execute.await_args_list[5].args[1]
+        progress_params = db.execute.await_args_list[6].args[1]
         assert "FROM tb_user_product_usage" in progress_sql
         assert "INNER JOIN tb_product_episode" in progress_sql
         assert "INNER JOIN tb_user" in progress_sql
@@ -1574,12 +1800,14 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "characterSlotId": 1,
                 "productId": 1182,
                 "characterScopeKey": "character:a",
+                "_exampleCount": 5,
                 "_inventorySummaryText": '{"work_role":"main_protagonist"}',
             },
             {
                 "characterSlotId": 2,
                 "productId": 1182,
                 "characterScopeKey": "character:b",
+                "_exampleCount": 5,
                 "_inventorySummaryText": '{"work_role":"major_character"}',
             },
         ]
