@@ -41,15 +41,30 @@ async def user_productbook_list(kc_user_id: str, db: AsyncSession):
     return build_list_response(rows)
 
 
-async def user_productbook_detail_by_id(id, db: AsyncSession):
+async def user_productbook_detail_by_id(
+    id: int, kc_user_id: str, db: AsyncSession
+):
     """
     사용자 대여권(user_productbook) 상세 조회
     """
+    user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
     query = text("""
-                 SELECT * FROM tb_user_productbook WHERE id = :id
+                 SELECT * FROM tb_user_productbook
+                 WHERE id = :id AND user_id = :user_id
                  """)
-    result = await db.execute(query, {"id": id})
+    result = await db.execute(query, {"id": id, "user_id": user_id})
     row = result.mappings().one_or_none()
+    if row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_PRODUCTBOOK,
+        )
     return build_detail_response(row)
 
 
@@ -307,10 +322,10 @@ async def use_user_productbook(
         )
 
     rental_expired_date = productbook_row["rental_expired_date"]
-    if rental_expired_date and rental_expired_date <= datetime.now():
+    if rental_expired_date is not None and rental_expired_date <= datetime.now():
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            message=ErrorMessages.EXPIRED_GIFT_VALIDITY,
+            message=ErrorMessages.EXPIRED_PRODUCTBOOK,
         )
 
     is_applied_wff = (
@@ -375,6 +390,7 @@ async def use_user_productbook(
         "updated_id": -1,
         "updated_date": datetime.now(),
         "id": id,
+        "user_id": user_id,
         "product_id": target_product_id,
         "episode_id": episode_id,
     }
@@ -385,11 +401,12 @@ async def use_user_productbook(
                         update tb_user_productbook
                         set {update_filed_query}
                         where id = :id
-                          and user_id = :user_id
-                          and use_yn = 'N'
+                        and user_id = :user_id
+                        and own_type = 'rental'
+                        and use_yn = 'N'
+                        and (rental_expired_date IS NULL OR rental_expired_date > NOW())
                     """)
 
-    db_execute_params["user_id"] = user_id
     update_result = await db.execute(query, db_execute_params)
     if update_result.rowcount != 1:
         raise CustomResponseException(

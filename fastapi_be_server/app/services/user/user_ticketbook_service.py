@@ -39,15 +39,30 @@ async def user_ticketbook_list(kc_user_id: str, db: AsyncSession):
     return build_list_response(rows)
 
 
-async def user_ticketbook_detail_by_id(id, db: AsyncSession):
+async def user_ticketbook_detail_by_id(
+    id: int, kc_user_id: str, db: AsyncSession
+):
     """
     사용자 이용권(user_ticketbook) 상세 조회
     """
+    user_id = await comm_service.get_user_from_kc(kc_user_id, db)
+    if user_id == -1:
+        raise CustomResponseException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message=ErrorMessages.LOGIN_REQUIRED,
+        )
+
     query = text("""
-                 SELECT * FROM tb_user_ticketbook WHERE id = :id
+                 SELECT * FROM tb_user_ticketbook
+                 WHERE id = :id AND user_id = :user_id
                  """)
-    result = await db.execute(query, {})
+    result = await db.execute(query, {"id": id, "user_id": user_id})
     row = result.mappings().one_or_none()
+    if row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_TICKETBOOK,
+        )
     return build_detail_response(row)
 
 

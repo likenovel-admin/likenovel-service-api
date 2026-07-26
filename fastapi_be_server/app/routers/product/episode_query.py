@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Path
+from fastapi import APIRouter, Depends, Path, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any
 
@@ -279,12 +279,21 @@ async def get_episodes_episode_download_episode_image_file_id(
     tags=["회차 - 회차 관리"],
     responses={
         200: {
-            "description": "저장된 회차 정보 내용 조회",
+            "description": "공개 회차 메타데이터 또는 권한자용 회차 편집 정보 조회",
             "content": {
                 "application/json": {
                     "examples": {
-                        "success_1": {
-                            "summary": "저장된 회차 정보",
+                        "public_metadata": {
+                            "summary": "공개/비권한자용 회차 메타데이터",
+                            "value": {
+                                "data": {
+                                    "episodeId": 1,
+                                    "title": "제목",
+                                }
+                            },
+                        },
+                        "privileged_full": {
+                            "summary": "작가/admin/담당 승인 CP용 회차 편집 정보",
                             "value": {
                                 "data": {
                                     "episodeId": 1,
@@ -353,6 +362,7 @@ async def get_episodes_episode_download_episode_image_file_id(
     dependencies=[Depends(analysis_logger)],
 )
 async def get_episodes_episode_id_info(
+    response: Response,
     episode_id: str = Path(..., description="회차 id"),
     user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
@@ -362,9 +372,11 @@ async def get_episodes_episode_id_info(
     저장된 회차 정보 내용 조회
     """
 
-    return await episode_service.get_episodes_episode_id_info(
+    res_body = await episode_service.get_episodes_episode_id_info(
         episode_id=episode_id, kc_user_id=user.get("sub"), db=db
     )
+    response.headers["Cache-Control"] = "private, no-store"
+    return res_body
 
 
 @router.get(

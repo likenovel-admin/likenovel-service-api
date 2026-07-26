@@ -87,8 +87,8 @@ def test_waiting_for_free_sources_cannot_be_physically_deleted():
 
     assert "upb.user_id = :user_id" in productbook_delete
     assert "waiting-for-free" in productbook_delete
-    assert "user: Dict[str, Any] = Depends(chk_cur_user)" in giftbook_router
-    assert "kc_user_id=user.get(\"sub\")" in giftbook_router
+    assert '@router.delete("/{id}"' not in giftbook_router
+    assert '"/{id}/receive"' in giftbook_router
     assert "ug.user_id = :user_id" in giftbook_delete
     assert "waiting-for-free" in giftbook_delete
 
