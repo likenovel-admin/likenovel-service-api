@@ -76,6 +76,56 @@ def test_auto_normal_promotion_runs_when_existing_product_becomes_public():
     assert "await promote_product_to_normal_if_eligible(" in update_product
 
 
+def test_scheduled_episode_release_promotes_only_newly_eligible_products_once():
+    batch = _read(
+        ROOT / "dist/batch/episode_state_transition_minute_batch.sql"
+    )
+    release_transaction = batch.split("START TRANSACTION;", 1)[1].split(
+        "COMMIT;", 1
+    )[0]
+
+    assert "tmp_episode_state_transition_normal_promotions" in batch
+    assert (
+        "INNER JOIN tmp_episode_state_transition_release_products r"
+        in release_transaction
+    )
+    assert "FOR UPDATE" in release_transaction
+
+    for condition in [
+        "p.price_type = 'free'",
+        "p.open_yn = 'Y'",
+        "COALESCE(p.blind_yn, 'N') = 'N'",
+        "COALESCE(p.product_type, 'free') = 'free'",
+        "e.use_yn = 'Y'",
+        "e.open_yn = 'Y'",
+        "COUNT(*) >= 5",
+        "COALESCE(SUM(e.episode_text_count), 0) >= 20000",
+    ]:
+        assert condition in release_transaction
+
+    assert "SET p.product_type = 'normal'" in release_transaction
+    assert "p.apply_date = COALESCE(p.apply_date, @batch_now)" in release_transaction
+    assert "INSERT INTO tb_user_notification_item" in release_transaction
+    assert "일반연재로 자동승급되었습니다" in release_transaction
+    assert "NOT EXISTS" in release_transaction
+
+    assert release_transaction.index(
+        "SET e.open_yn = 'Y'"
+    ) < release_transaction.index(
+        "INSERT INTO tmp_episode_state_transition_normal_promotions"
+    )
+    assert release_transaction.index(
+        "INSERT INTO tmp_episode_state_transition_normal_promotions"
+    ) < release_transaction.index(
+        "SET p.product_type = 'normal'"
+    )
+    assert release_transaction.index(
+        "SET p.product_type = 'normal'"
+    ) < release_transaction.index(
+        "INSERT INTO tb_user_notification_item"
+    )
+
+
 def test_can_apply_normal_state_uses_same_public_episode_gate():
     source = _read(ROOT / "app/services/product/product_service.py")
 

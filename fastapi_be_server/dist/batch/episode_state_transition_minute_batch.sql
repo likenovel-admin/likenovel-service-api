@@ -64,6 +64,13 @@ CREATE TEMPORARY TABLE tmp_episode_state_transition_release_products AS
 SELECT DISTINCT r.product_id
   FROM tmp_episode_state_transition_release_episodes r;
 
+DROP TEMPORARY TABLE IF EXISTS tmp_episode_state_transition_normal_promotions;
+CREATE TEMPORARY TABLE tmp_episode_state_transition_normal_promotions (
+    product_id INT NOT NULL PRIMARY KEY,
+    user_id INT NOT NULL,
+    title VARCHAR(100) NOT NULL
+) ENGINE=InnoDB;
+
 START TRANSACTION;
 
 UPDATE tb_product_episode e
@@ -91,7 +98,77 @@ UPDATE tb_product p
      , p.updated_date = @batch_now
  WHERE p.open_yn = 'Y';
 
+SELECT p.product_id
+  FROM tb_product p
+ INNER JOIN tmp_episode_state_transition_release_products r
+    ON r.product_id = p.product_id
+ ORDER BY p.product_id
+ FOR UPDATE;
+
+INSERT INTO tmp_episode_state_transition_normal_promotions
+    (product_id, user_id, title)
+SELECT p.product_id,
+       p.user_id,
+       p.title
+  FROM tb_product p
+ INNER JOIN tmp_episode_state_transition_release_products r
+    ON r.product_id = p.product_id
+ WHERE p.price_type = 'free'
+   AND p.open_yn = 'Y'
+   AND COALESCE(p.blind_yn, 'N') = 'N'
+   AND COALESCE(p.product_type, 'free') = 'free'
+   AND EXISTS (
+       SELECT 1
+         FROM tb_product_episode e
+        WHERE e.product_id = p.product_id
+          AND e.use_yn = 'Y'
+          AND e.open_yn = 'Y'
+        GROUP BY e.product_id
+       HAVING COUNT(*) >= 5
+          AND COALESCE(SUM(e.episode_text_count), 0) >= 20000
+   );
+
+UPDATE tb_product p
+ INNER JOIN tmp_episode_state_transition_normal_promotions target
+    ON target.product_id = p.product_id
+   SET p.product_type = 'normal'
+     , p.apply_date = COALESCE(p.apply_date, @batch_now)
+     , p.updated_id = target.user_id
+     , p.updated_date = @batch_now
+ WHERE COALESCE(p.product_type, 'free') = 'free';
+
+INSERT INTO tb_user_notification_item (
+    user_id,
+    noti_type,
+    title,
+    content,
+    read_yn,
+    created_id,
+    created_date
+)
+SELECT target.user_id,
+       'system',
+       CONCAT('[', target.title, '] 일반연재로 자동승급되었습니다.'),
+       '일반연재 조건을 충족했습니다.',
+       'N',
+       target.user_id,
+       @batch_now
+  FROM tmp_episode_state_transition_normal_promotions target
+ INNER JOIN tb_product p
+    ON p.product_id = target.product_id
+ WHERE p.product_type = 'normal'
+   AND NOT EXISTS (
+       SELECT 1
+         FROM tb_user_notification_item n
+        WHERE n.user_id = target.user_id
+          AND n.noti_type = 'system'
+          AND n.title = CONCAT('[', target.title, '] 일반연재로 자동승급되었습니다.')
+          AND n.content = '일반연재 조건을 충족했습니다.'
+   );
+
 COMMIT;
+
+DROP TEMPORARY TABLE IF EXISTS tmp_episode_state_transition_normal_promotions;
 
 DROP TEMPORARY TABLE IF EXISTS tmp_episode_state_transition_paid_episodes;
 CREATE TEMPORARY TABLE tmp_episode_state_transition_paid_episodes AS
