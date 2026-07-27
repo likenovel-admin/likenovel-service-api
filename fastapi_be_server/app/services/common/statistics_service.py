@@ -6,8 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from app.const import CommonConstants, settings
+from app.const import CommonConstants, ErrorMessages, settings
 from app.exceptions import CustomResponseException
+from app.services.product.episode_access_policy import guest_episode_login_required
 from app.utils.query import get_nickname_sub_query
 from app.utils.response import build_paginated_response
 
@@ -103,6 +104,15 @@ SITE_PAGE_REFERRER_SORT_KEYS = {
     "session_count",
     "page_view_count",
 }
+SITE_READER_FUNNEL_EVENT_TYPES = {
+    "episode_start",
+    "episode_exit",
+    "episode_complete",
+    "next_episode_click",
+    "product_detail_exit",
+}
+SITE_READER_FUNNEL_MAX_PAST_AGE = timedelta(days=1)
+SITE_READER_FUNNEL_MAX_FUTURE_SKEW = timedelta(minutes=5)
 PRODUCT_ENTRY_SOURCE_GROUPS = {
     "social",
     "recommend_slot",
@@ -539,6 +549,281 @@ async def insert_site_page_dwell_event(
             "active_ms": _normalize_site_page_dwell_active_ms(active_ms),
             "source": _normalize_site_page_view_source(source),
             "taxonomy_version": taxonomy_version or 1,
+        },
+    )
+    await db.commit()
+
+
+async def insert_site_reader_funnel_event(
+    db: AsyncSession,
+    kc_user_id: str | None,
+    event_id: str,
+    occurred_at: datetime,
+    event_type: str,
+    visitor_id: str,
+    browser_session_id: str,
+    viewer_session_id: str | None,
+    product_id: int,
+    episode_id: int | None,
+    next_episode_id: int | None,
+    destination_group: str,
+    active_ms: int,
+    progress_ratio: float,
+):
+    if event_type not in SITE_READER_FUNNEL_EVENT_TYPES:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="허용되지 않은 독자 퍼널 이벤트 타입입니다.",
+        )
+    if event_type != "product_detail_exit" and not viewer_session_id:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="회차 이벤트에는 viewerSessionId가 필요합니다.",
+        )
+    if event_type == "product_detail_exit" and episode_id is not None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="product_detail_exit에는 episodeId를 저장할 수 없습니다.",
+        )
+
+    normalized_occurred_at = _normalize_page_view_occurred_at(occurred_at)
+    server_now = datetime.now(ZoneInfo(settings.KOREA_TIMEZONE)).replace(
+        tzinfo=None
+    )
+    if (
+        normalized_occurred_at
+        < server_now - SITE_READER_FUNNEL_MAX_PAST_AGE
+        or normalized_occurred_at
+        > server_now + SITE_READER_FUNNEL_MAX_FUTURE_SKEW
+    ):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="독자 퍼널 이벤트 시각이 허용 범위를 벗어났습니다.",
+        )
+
+    user_id = None
+    if kc_user_id:
+        user_result = await db.execute(
+            text("""
+                SELECT user_id
+                FROM tb_user
+                WHERE kc_user_id = :kc_user_id
+                  AND use_yn = 'Y'
+                LIMIT 1
+            """),
+            {"kc_user_id": kc_user_id},
+        )
+        user_row = user_result.mappings().one_or_none()
+        if user_row is not None:
+            user_id = user_row.get("user_id")
+
+    product_result = await db.execute(
+        text("""
+            SELECT p.product_id
+            FROM tb_product p
+            WHERE p.product_id = :product_id
+              AND p.open_yn = 'Y'
+              AND COALESCE(p.blind_yn, 'N') = 'N'
+            LIMIT 1
+        """),
+        {"product_id": product_id},
+    )
+    if product_result.mappings().one_or_none() is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="공개된 작품의 독자 퍼널 이벤트만 저장할 수 있습니다.",
+        )
+
+    episode_row = None
+    if episode_id is not None:
+        episode_result = await db.execute(
+            text("""
+                SELECT e.episode_id, e.episode_no, e.price_type
+                FROM tb_product_episode e
+                WHERE e.episode_id = :episode_id
+                  AND e.product_id = :product_id
+                  AND e.open_yn = 'Y'
+                  AND e.use_yn = 'Y'
+                LIMIT 1
+            """),
+            {
+                "episode_id": episode_id,
+                "product_id": product_id,
+            },
+        )
+        episode_row = episode_result.mappings().one_or_none()
+        if episode_row is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="작품에 속한 공개 회차의 이벤트만 저장할 수 있습니다.",
+            )
+
+        if user_id is None and guest_episode_login_required(
+            episode_price_type=episode_row.get("price_type"),
+            episode_no=int(episode_row.get("episode_no") or 0),
+        ):
+            raise CustomResponseException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                message=ErrorMessages.LOGIN_REQUIRED,
+            )
+
+    if event_type != "product_detail_exit" and episode_row is None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="회차 이벤트에는 공개 회차 ID가 필요합니다.",
+        )
+
+    if event_type == "next_episode_click":
+        next_episode_result = await db.execute(
+            text("""
+                SELECT n.episode_id, n.episode_no, n.price_type
+                FROM tb_product_episode e
+                JOIN tb_product_episode n
+                  ON n.product_id = e.product_id
+                 AND (
+                     n.episode_no > e.episode_no
+                     OR (
+                         n.episode_no = e.episode_no
+                         AND n.episode_id > e.episode_id
+                     )
+                 )
+                WHERE e.episode_id = :episode_id
+                  AND e.product_id = :product_id
+                  AND e.open_yn = 'Y'
+                  AND e.use_yn = 'Y'
+                  AND n.open_yn = 'Y'
+                  AND n.use_yn = 'Y'
+                ORDER BY n.episode_no, n.episode_id
+                LIMIT 1
+            """),
+            {
+                "episode_id": episode_id,
+                "product_id": product_id,
+            },
+        )
+        next_episode_row = next_episode_result.mappings().one_or_none()
+        if (
+            next_episode_row is None
+            or next_episode_row.get("episode_id") != next_episode_id
+        ):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="nextEpisodeId가 실제 다음 공개 회차와 일치하지 않습니다.",
+            )
+
+    elif next_episode_id is not None:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="next_episode_click 외 이벤트에는 nextEpisodeId를 저장할 수 없습니다.",
+        )
+
+    audience_type_at_start = "member" if user_id is not None else "guest"
+    if event_type not in {"episode_start", "product_detail_exit"}:
+        start_result = await db.execute(
+            text("""
+                SELECT audience_type_at_start
+                FROM tb_site_reader_funnel_event
+                WHERE viewer_session_id = :viewer_session_id
+                  AND event_type = 'episode_start'
+                LIMIT 1
+            """),
+            {"viewer_session_id": viewer_session_id},
+        )
+        start_row = start_result.mappings().one_or_none()
+        if start_row is not None and start_row.get(
+            "audience_type_at_start"
+        ) in {"guest", "member"}:
+            audience_type_at_start = start_row["audience_type_at_start"]
+
+    if event_type == "episode_start" and audience_type_at_start == "guest":
+        cutover_result = await db.execute(
+            text("""
+                SELECT cutover_date
+                FROM tb_site_reader_funnel_config
+                WHERE config_key = 'author_guest_funnel_v2'
+                LIMIT 1
+            """)
+        )
+        if cutover_result.mappings().one_or_none() is None:
+            await db.execute(
+                text("""
+                    INSERT INTO tb_site_reader_funnel_config (
+                        config_key,
+                        cutover_date
+                    )
+                    VALUES (
+                        'author_guest_funnel_v2',
+                        :cutover_date
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        cutover_date = LEAST(cutover_date, VALUES(cutover_date))
+                """),
+                {"cutover_date": (server_now + timedelta(days=1)).date()},
+            )
+
+    await db.execute(
+        text("""
+            INSERT INTO tb_site_reader_funnel_event (
+                event_id,
+                occurred_at,
+                user_id,
+                audience_type_at_start,
+                visitor_id,
+                browser_session_id,
+                viewer_session_id,
+                event_type,
+                product_id,
+                episode_id,
+                next_episode_id,
+                destination_group,
+                active_ms,
+                progress_ratio,
+                tracking_version,
+                source,
+                created_date,
+                updated_date
+            )
+            VALUES (
+                :event_id,
+                :occurred_at,
+                :user_id,
+                :audience_type_at_start,
+                :visitor_id,
+                :browser_session_id,
+                :viewer_session_id,
+                :event_type,
+                :product_id,
+                :episode_id,
+                :next_episode_id,
+                :destination_group,
+                :active_ms,
+                :progress_ratio,
+                2,
+                'service-web',
+                NOW(),
+                NOW()
+            )
+            ON DUPLICATE KEY UPDATE
+                occurred_at = GREATEST(occurred_at, VALUES(occurred_at)),
+                active_ms = GREATEST(active_ms, VALUES(active_ms)),
+                progress_ratio = GREATEST(progress_ratio, VALUES(progress_ratio)),
+                user_id = COALESCE(user_id, VALUES(user_id))
+        """),
+        {
+            "event_id": event_id,
+            "occurred_at": normalized_occurred_at,
+            "user_id": user_id,
+            "audience_type_at_start": audience_type_at_start,
+            "visitor_id": _limit_text(visitor_id, 80),
+            "browser_session_id": _limit_text(browser_session_id, 80),
+            "viewer_session_id": _limit_text(viewer_session_id, 80),
+            "event_type": event_type,
+            "product_id": product_id,
+            "episode_id": episode_id,
+            "next_episode_id": next_episode_id,
+            "destination_group": destination_group,
+            "active_ms": active_ms,
+            "progress_ratio": progress_ratio,
         },
     )
     await db.commit()

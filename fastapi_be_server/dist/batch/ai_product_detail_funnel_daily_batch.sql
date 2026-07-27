@@ -2,6 +2,7 @@ USE likenovel;
 
 START TRANSACTION;
 
+SET time_zone = '+09:00';
 SET @job_lock_name = 'lk_ai_product_detail_funnel_daily_batch';
 SET @job_lock_acquired = GET_LOCK(@job_lock_name, 30);
 SET @job_lock_guard_sql = IF(
@@ -65,30 +66,25 @@ UPDATE tb_cms_batch_job_process a
        a.updated_id = 0
  WHERE a.id = @job_id;
 
-SET @target_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY);
+SET @target_date = COALESCE(@target_date, DATE_SUB(CURDATE(), INTERVAL 1 DAY));
 SET @window_start = DATE_SUB(@target_date, INTERVAL 60 MINUTE);
 SET @window_end = DATE_ADD(DATE_ADD(@target_date, INTERVAL 1 DAY), INTERVAL 60 MINUTE);
+SET @guest_reader_cutover_date = (
+    SELECT c.cutover_date
+      FROM tb_site_reader_funnel_config c
+     WHERE c.config_key = 'author_guest_funnel_v2'
+     LIMIT 1
+);
+SET @metric_version = IF(
+    @guest_reader_cutover_date IS NOT NULL
+    AND @target_date >= @guest_reader_cutover_date,
+    2,
+    1
+);
 
-INSERT INTO tb_product_detail_funnel_daily (
-    computed_date,
-    product_id,
-    entry_source,
-    entry_source_norm,
-    detail_view_raw_count,
-    detail_view_session_count,
-    detail_view_user_count,
-    detail_to_view_session_count,
-    detail_to_view_user_count,
-    detail_exit_session_count,
-    exit_home_session_count,
-    exit_search_session_count,
-    exit_other_product_detail_session_count,
-    exit_other_route_session_count,
-    episode_exit_event_count,
-    avg_episode_exit_progress_ratio,
-    created_date,
-    updated_date
-)
+DROP TEMPORARY TABLE IF EXISTS tmp_product_detail_funnel_daily;
+
+CREATE TEMPORARY TABLE tmp_product_detail_funnel_daily AS
 WITH
 product_detail_view_events AS (
     SELECT
@@ -376,7 +372,7 @@ session_rollup AS (
         s.context_session_seq,
         s.detail_funnel_seq
 ),
-qualifying_sessions AS (
+member_qualifying_sessions AS (
     SELECT
         DATE(s.session_started_at) AS computed_date,
         s.user_id,
@@ -394,6 +390,191 @@ qualifying_sessions AS (
         s.episode_exit_progress_ratio_sum
     FROM session_rollup s
     WHERE DATE(s.session_started_at) = @target_date
+),
+guest_product_detail_views AS (
+    SELECT
+        pv.id,
+        pv.visitor_id,
+        pv.session_id AS browser_session_id,
+        COALESCE(
+            pv.product_id,
+            CASE
+                WHEN pv.path REGEXP '^/product/[0-9]+$'
+                THEN CAST(SUBSTRING(pv.path, LENGTH('/product/') + 1) AS UNSIGNED)
+                ELSE NULL
+            END
+        ) AS product_id,
+        pv.occurred_at AS event_at,
+        pv.entry_source
+    FROM tb_site_page_view_event pv
+    WHERE @metric_version = 2
+      AND pv.user_id IS NULL
+      AND pv.route_group = 'product_detail'
+      AND pv.occurred_at >= @window_start
+      AND pv.occurred_at < @window_end
+),
+guest_episode_sessions AS (
+    SELECT
+        e.visitor_id,
+        e.browser_session_id,
+        e.viewer_session_id,
+        e.product_id,
+        e.episode_id,
+        MIN(CASE WHEN e.event_type = 'episode_start' THEN e.occurred_at END) AS started_at,
+        MAX(CASE WHEN e.event_type = 'episode_exit' THEN e.active_ms END) AS exit_active_ms,
+        MAX(CASE WHEN e.event_type = 'episode_exit' THEN e.progress_ratio END) AS exit_progress_ratio,
+        MAX(CASE WHEN e.event_type = 'episode_complete' THEN 1 ELSE 0 END) AS completed_yn
+    FROM tb_site_reader_funnel_event e
+    INNER JOIN tb_site_reader_funnel_event start_event
+        ON start_event.viewer_session_id = e.viewer_session_id
+       AND start_event.event_type = 'episode_start'
+       AND start_event.audience_type_at_start = 'guest'
+    WHERE @metric_version = 2
+      AND e.event_type IN ('episode_start', 'episode_exit', 'episode_complete')
+      AND e.occurred_at >= @window_start
+      AND e.occurred_at < @window_end
+      AND e.viewer_session_id IS NOT NULL
+      AND e.product_id > 0
+      AND e.episode_id IS NOT NULL
+    GROUP BY
+        e.visitor_id,
+        e.browser_session_id,
+        e.viewer_session_id,
+        e.product_id,
+        e.episode_id
+    HAVING started_at IS NOT NULL
+),
+guest_episode_session_link_candidates AS (
+    SELECT
+        s.*,
+        pv.id AS detail_view_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                s.visitor_id,
+                s.browser_session_id,
+                s.viewer_session_id,
+                s.product_id,
+                s.episode_id
+            ORDER BY pv.event_at DESC, pv.id DESC
+        ) AS link_rank
+    FROM guest_episode_sessions s
+    INNER JOIN guest_product_detail_views pv
+        ON pv.visitor_id = s.visitor_id
+       AND pv.browser_session_id = s.browser_session_id
+       AND pv.product_id = s.product_id
+       AND pv.event_at <= s.started_at
+       AND s.started_at <= DATE_ADD(pv.event_at, INTERVAL 60 MINUTE)
+),
+guest_episode_by_detail AS (
+    SELECT
+        e.detail_view_id,
+        COUNT(*) AS episode_session_count,
+        SUM(
+            CASE
+                WHEN e.exit_progress_ratio IS NOT NULL
+                THEN 1 ELSE 0
+            END
+        ) AS episode_exit_event_count,
+        SUM(
+            CASE
+                WHEN e.exit_progress_ratio IS NOT NULL
+                THEN e.exit_progress_ratio ELSE 0
+            END
+        ) AS episode_exit_progress_ratio_sum
+    FROM guest_episode_session_link_candidates e
+    WHERE e.link_rank = 1
+    GROUP BY e.detail_view_id
+),
+guest_product_detail_exit_events AS (
+    SELECT
+        e.event_id,
+        e.visitor_id,
+        e.browser_session_id,
+        e.product_id,
+        e.occurred_at AS event_at,
+        e.destination_group
+    FROM tb_site_reader_funnel_event e
+    WHERE @metric_version = 2
+      AND e.audience_type_at_start = 'guest'
+      AND e.event_type = 'product_detail_exit'
+      AND e.occurred_at >= @window_start
+      AND e.occurred_at < @window_end
+      AND e.product_id > 0
+),
+guest_detail_exit_link_candidates AS (
+    SELECT
+        e.*,
+        pv.id AS detail_view_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.event_id
+            ORDER BY pv.event_at DESC, pv.id DESC
+        ) AS link_rank
+    FROM guest_product_detail_exit_events e
+    INNER JOIN guest_product_detail_views pv
+        ON pv.visitor_id = e.visitor_id
+       AND pv.browser_session_id = e.browser_session_id
+       AND pv.product_id = e.product_id
+       AND pv.event_at <= e.event_at
+       AND e.event_at <= DATE_ADD(pv.event_at, INTERVAL 60 MINUTE)
+),
+guest_exit_by_detail AS (
+    SELECT
+        e.detail_view_id,
+        1 AS has_detail_exit,
+        MAX(CASE WHEN e.destination_group = 'home' THEN 1 ELSE 0 END) AS has_exit_home,
+        MAX(CASE WHEN e.destination_group = 'search' THEN 1 ELSE 0 END) AS has_exit_search,
+        MAX(CASE WHEN e.destination_group = 'other_product' THEN 1 ELSE 0 END) AS has_exit_other_product_detail,
+        MAX(CASE WHEN e.destination_group = 'other_route' THEN 1 ELSE 0 END) AS has_exit_other_route
+    FROM guest_detail_exit_link_candidates e
+    WHERE e.link_rank = 1
+    GROUP BY e.detail_view_id
+),
+guest_qualifying_sessions AS (
+    SELECT
+        DATE(pv.event_at) AS computed_date,
+        NULL AS user_id,
+        pv.product_id,
+        pv.entry_source,
+        COALESCE(pv.entry_source, '__null__') AS entry_source_norm,
+        COUNT(*) AS detail_view_raw_count,
+        CASE
+            WHEN SUM(COALESCE(ep.episode_session_count, 0)) > 0
+            THEN 1 ELSE 0
+        END AS has_episode_view,
+        MAX(COALESCE(dx.has_detail_exit, 0)) AS has_detail_exit,
+        MAX(COALESCE(dx.has_exit_home, 0)) AS has_exit_home,
+        MAX(COALESCE(dx.has_exit_search, 0)) AS has_exit_search,
+        MAX(COALESCE(dx.has_exit_other_product_detail, 0)) AS has_exit_other_product_detail,
+        MAX(COALESCE(dx.has_exit_other_route, 0)) AS has_exit_other_route,
+        SUM(COALESCE(ep.episode_exit_event_count, 0)) AS episode_exit_event_count,
+        SUM(COALESCE(ep.episode_exit_progress_ratio_sum, 0)) AS episode_exit_progress_ratio_sum
+    FROM guest_product_detail_views pv
+    LEFT JOIN guest_episode_by_detail ep
+        ON ep.detail_view_id = pv.id
+    LEFT JOIN guest_exit_by_detail dx
+        ON dx.detail_view_id = pv.id
+    WHERE pv.product_id IS NOT NULL
+      AND DATE(pv.event_at) = @target_date
+    GROUP BY
+        DATE(pv.event_at),
+        pv.visitor_id,
+        pv.browser_session_id,
+        pv.product_id,
+        pv.entry_source,
+        COALESCE(pv.entry_source, '__null__')
+),
+qualifying_sessions AS (
+    SELECT
+        m.*,
+        0 AS is_guest
+    FROM member_qualifying_sessions m
+
+    UNION ALL
+
+    SELECT
+        g.*,
+        1 AS is_guest
+    FROM guest_qualifying_sessions g
 )
 SELECT
     @target_date AS computed_date,
@@ -415,27 +596,74 @@ SELECT
         WHEN SUM(q.episode_exit_event_count) = 0 THEN NULL
         ELSE SUM(q.episode_exit_progress_ratio_sum) / SUM(q.episode_exit_event_count)
     END AS avg_episode_exit_progress_ratio,
+    @metric_version AS metric_version,
+    SUM(CASE WHEN q.is_guest = 1 THEN 1 ELSE 0 END) AS guest_detail_view_session_count,
+    SUM(CASE WHEN q.is_guest = 1 THEN q.has_episode_view ELSE 0 END) AS guest_detail_to_view_session_count,
+    SUM(CASE WHEN q.is_guest = 1 THEN q.has_detail_exit ELSE 0 END) AS guest_detail_exit_session_count,
+    SUM(CASE WHEN q.is_guest = 1 THEN q.episode_exit_event_count ELSE 0 END) AS guest_episode_exit_event_count,
     NOW() AS created_date,
     NOW() AS updated_date
 FROM qualifying_sessions q
 GROUP BY
     q.product_id,
     q.entry_source,
-    q.entry_source_norm
-ON DUPLICATE KEY UPDATE
-    detail_view_raw_count = VALUES(detail_view_raw_count),
-    detail_view_session_count = VALUES(detail_view_session_count),
-    detail_view_user_count = VALUES(detail_view_user_count),
-    detail_to_view_session_count = VALUES(detail_to_view_session_count),
-    detail_to_view_user_count = VALUES(detail_to_view_user_count),
-    detail_exit_session_count = VALUES(detail_exit_session_count),
-    exit_home_session_count = VALUES(exit_home_session_count),
-    exit_search_session_count = VALUES(exit_search_session_count),
-    exit_other_product_detail_session_count = VALUES(exit_other_product_detail_session_count),
-    exit_other_route_session_count = VALUES(exit_other_route_session_count),
-    episode_exit_event_count = VALUES(episode_exit_event_count),
-    avg_episode_exit_progress_ratio = VALUES(avg_episode_exit_progress_ratio),
-    updated_date = NOW();
+    q.entry_source_norm;
+
+DELETE FROM tb_product_detail_funnel_daily
+ WHERE computed_date = @target_date;
+
+INSERT INTO tb_product_detail_funnel_daily (
+    computed_date,
+    product_id,
+    entry_source,
+    entry_source_norm,
+    detail_view_raw_count,
+    detail_view_session_count,
+    detail_view_user_count,
+    detail_to_view_session_count,
+    detail_to_view_user_count,
+    detail_exit_session_count,
+    exit_home_session_count,
+    exit_search_session_count,
+    exit_other_product_detail_session_count,
+    exit_other_route_session_count,
+    episode_exit_event_count,
+    avg_episode_exit_progress_ratio,
+    metric_version,
+    guest_detail_view_session_count,
+    guest_detail_to_view_session_count,
+    guest_detail_exit_session_count,
+    guest_episode_exit_event_count,
+    created_date,
+    updated_date
+)
+SELECT
+    computed_date,
+    product_id,
+    entry_source,
+    entry_source_norm,
+    detail_view_raw_count,
+    detail_view_session_count,
+    detail_view_user_count,
+    detail_to_view_session_count,
+    detail_to_view_user_count,
+    detail_exit_session_count,
+    exit_home_session_count,
+    exit_search_session_count,
+    exit_other_product_detail_session_count,
+    exit_other_route_session_count,
+    episode_exit_event_count,
+    avg_episode_exit_progress_ratio,
+    metric_version,
+    guest_detail_view_session_count,
+    guest_detail_to_view_session_count,
+    guest_detail_exit_session_count,
+    guest_episode_exit_event_count,
+    created_date,
+    updated_date
+FROM tmp_product_detail_funnel_daily;
+
+DROP TEMPORARY TABLE tmp_product_detail_funnel_daily;
 
 UPDATE tb_cms_batch_job_process a
    SET a.completed_yn = 'Y',
