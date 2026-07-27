@@ -4,10 +4,14 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db
-from app.schemas.statistics import PostSitePageDwellReqBody, PostSitePageViewReqBody
-from app.utils.auth import analysis_logger, chk_cur_user
-from app.utils.common import check_user
+from app.schemas.statistics import (
+    PostSitePageDwellReqBody,
+    PostSitePageViewReqBody,
+    PostSiteReaderFunnelEventReqBody,
+)
 from app.services.common import ai_provider_health_service
+from app.utils.auth import analysis_logger, chk_cur_user, chk_optional_cur_user_strict
+from app.utils.common import check_user
 import app.services.common.statistics_service as statistics_service
 
 router = APIRouter(prefix="/statistics")
@@ -88,5 +92,34 @@ async def post_site_page_dwell(
         active_ms=req_body.active_ms,
         source=req_body.source,
         taxonomy_version=req_body.taxonomy_version,
+    )
+    return {"data": {"ok": True}}
+
+
+@router.post(
+    "/reader-funnel-event",
+    tags=["site 통계"],
+    responses={200: {"description": "유저웹 독자 퍼널 raw 이벤트 적재"}},
+)
+async def post_site_reader_funnel_event(
+    req_body: PostSiteReaderFunnelEventReqBody,
+    user: Dict[str, Any] = Depends(chk_optional_cur_user_strict),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    await statistics_service.insert_site_reader_funnel_event(
+        db=db,
+        kc_user_id=user.get("sub") or None,
+        event_id=req_body.event_id,
+        occurred_at=req_body.occurred_at,
+        event_type=req_body.event_type,
+        visitor_id=req_body.visitor_id,
+        browser_session_id=req_body.browser_session_id,
+        viewer_session_id=req_body.viewer_session_id,
+        product_id=req_body.product_id,
+        episode_id=req_body.episode_id,
+        next_episode_id=req_body.next_episode_id,
+        destination_group=req_body.destination_group,
+        active_ms=req_body.active_ms,
+        progress_ratio=req_body.progress_ratio,
     )
     return {"data": {"ok": True}}

@@ -6,6 +6,18 @@ SET time_zone = '+09:00';
 SET @author_product_entry_target_date = COALESCE(@author_product_entry_target_date, DATE_SUB(CURDATE(), INTERVAL 1 DAY));
 SET @author_product_entry_target_start = TIMESTAMP(@author_product_entry_target_date);
 SET @author_product_entry_target_end = DATE_ADD(@author_product_entry_target_start, INTERVAL 1 DAY);
+SET @guest_reader_cutover_date = (
+    SELECT c.cutover_date
+      FROM tb_site_reader_funnel_config c
+     WHERE c.config_key = 'author_guest_funnel_v2'
+     LIMIT 1
+);
+SET @author_product_entry_metric_version = IF(
+    @guest_reader_cutover_date IS NOT NULL
+    AND @author_product_entry_target_date >= @guest_reader_cutover_date,
+    2,
+    1
+);
 
 INSERT IGNORE INTO tb_cms_batch_job_process (
     job_file_id,
@@ -59,21 +71,9 @@ UPDATE tb_cms_batch_job_process a
        a.updated_id = 0
  WHERE a.id = @job_id;
 
-DELETE FROM tb_author_product_entry_daily
- WHERE stat_date = @author_product_entry_target_date;
+DROP TEMPORARY TABLE IF EXISTS tmp_author_product_entry_daily;
 
-INSERT INTO tb_author_product_entry_daily (
-    stat_date,
-    product_id,
-    entry_source_group,
-    entry_source_norm,
-    detail_view_count,
-    detail_session_count,
-    detail_visitor_count,
-    login_user_count,
-    created_date,
-    updated_date
-)
+CREATE TEMPORARY TABLE tmp_author_product_entry_daily AS
 SELECT
     @author_product_entry_target_date AS stat_date,
     resolved_pv.product_id,
@@ -83,6 +83,10 @@ SELECT
     COUNT(DISTINCT resolved_pv.session_id) AS detail_session_count,
     COUNT(DISTINCT resolved_pv.visitor_id) AS detail_visitor_count,
     COUNT(DISTINCT resolved_pv.user_id) AS login_user_count,
+    @author_product_entry_metric_version AS metric_version,
+    SUM(CASE WHEN resolved_pv.user_id IS NULL THEN 1 ELSE 0 END) AS guest_detail_view_count,
+    COUNT(DISTINCT CASE WHEN resolved_pv.user_id IS NULL THEN resolved_pv.session_id END) AS guest_detail_session_count,
+    COUNT(DISTINCT CASE WHEN resolved_pv.user_id IS NULL THEN resolved_pv.visitor_id END) AS guest_detail_visitor_count,
     NOW() AS created_date,
     NOW() AS updated_date
 FROM (
@@ -162,6 +166,44 @@ GROUP BY
     resolved_pv.product_id,
     resolved_pv.entry_source_group,
     resolved_pv.entry_source_norm;
+
+DELETE FROM tb_author_product_entry_daily
+ WHERE stat_date = @author_product_entry_target_date;
+
+INSERT INTO tb_author_product_entry_daily (
+    stat_date,
+    product_id,
+    entry_source_group,
+    entry_source_norm,
+    detail_view_count,
+    detail_session_count,
+    detail_visitor_count,
+    login_user_count,
+    metric_version,
+    guest_detail_view_count,
+    guest_detail_session_count,
+    guest_detail_visitor_count,
+    created_date,
+    updated_date
+)
+SELECT
+    stat_date,
+    product_id,
+    entry_source_group,
+    entry_source_norm,
+    detail_view_count,
+    detail_session_count,
+    detail_visitor_count,
+    login_user_count,
+    metric_version,
+    guest_detail_view_count,
+    guest_detail_session_count,
+    guest_detail_visitor_count,
+    created_date,
+    updated_date
+FROM tmp_author_product_entry_daily;
+
+DROP TEMPORARY TABLE tmp_author_product_entry_daily;
 
 UPDATE tb_cms_batch_job_process a
    SET a.completed_yn = 'Y',

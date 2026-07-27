@@ -1638,6 +1638,33 @@ class ProductDetailFunnelDaily(Base):
     avg_episode_exit_progress_ratio: Mapped[float | None] = mapped_column(
         Double, nullable=True, comment="세션 내 회차 exit 평균 진행률"
     )
+    metric_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="집계 기준 버전"
+    )
+    guest_detail_view_session_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 상세 퍼널 세션 수",
+    )
+    guest_detail_to_view_session_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 상세에서 viewer 전환 세션 수",
+    )
+    guest_detail_exit_session_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 작품 상세 이탈 세션 수",
+    )
+    guest_episode_exit_event_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 viewer 세션 explicit exit 수",
+    )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
@@ -1713,6 +1740,27 @@ class ProductEpisodeDropoffDaily(Base):
         nullable=False,
         server_default="0",
         comment="90% 이상 이탈 수(95% 미만)",
+    )
+    metric_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="집계 기준 버전"
+    )
+    guest_read_start_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 viewer 세션 읽기 시작 수",
+    )
+    guest_episode_dropoff_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 explicit exit 이탈 수",
+    )
+    guest_near_complete_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 거의 다 읽음 수",
     )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")

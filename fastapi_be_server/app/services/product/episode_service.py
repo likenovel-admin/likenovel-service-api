@@ -30,6 +30,7 @@ import app.schemas.episode as episode_schema
 import app.services.common.statistics_service as statistics_service
 import app.services.product.product_service as product_service
 import app.services.event.event_reward_service as event_reward_service
+from app.services.product.episode_access_policy import guest_episode_login_required
 
 logger = logging.getLogger(__name__)
 
@@ -777,9 +778,12 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                     , case when d.eval_code is null then 'N'
                                             else 'Y'
                                     end as evaluation_yn
-                                    , case when a.episode_no = e.max_episode then null
-                                            else a.episode_no + 1
-                                    end as next_episode
+                                    , (select q.episode_no
+                                         from tb_product_episode q
+                                        where q.episode_id = f.next_episode_id
+                                          and q.use_yn = 'Y'
+                                          and q.open_yn = 'Y'
+                                        limit 1) as next_episode
                                     , a.comment_open_yn
                                     , a.evaluation_open_yn
                                     , (select count(*) from tb_product_episode_like where episode_id = a.episode_id) as count_like
@@ -1154,9 +1158,12 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                         and a.epub_file_id = z.file_group_id) as epub_file_name
                                     , a.count_comment
                                     , a.author_comment
-                                    , case when a.episode_no = b.max_episode then null
-                                            else a.episode_no + 1
-                                    end as next_episode
+                                    , (select q.episode_no
+                                         from tb_product_episode q
+                                        where q.episode_id = c.next_episode_id
+                                          and q.use_yn = 'Y'
+                                          and q.open_yn = 'Y'
+                                        limit 1) as next_episode
                                     , (select count(*) from tb_product_episode_like where episode_id = a.episode_id) as count_like
                                     , a.comment_open_yn
                                     , a.evaluation_open_yn
@@ -1192,7 +1199,10 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
             if db_rst:
                 episode_no = int(db_rst[0].get("episode_no") or 0)
                 episode_price_type = db_rst[0].get("price_type") or "free"
-                if episode_price_type == "paid" or episode_no > 5:
+                if guest_episode_login_required(
+                    episode_price_type=episode_price_type,
+                    episode_no=episode_no,
+                ):
                     raise CustomResponseException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         message=ErrorMessages.LOGIN_REQUIRED,

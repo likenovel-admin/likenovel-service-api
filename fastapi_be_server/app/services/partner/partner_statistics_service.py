@@ -598,6 +598,7 @@ async def product_inflow_dropoff_statistics(
     start_date, end_date = _parse_author_statistics_date_range(
         search_start_date, search_end_date
     )
+    requested_start_date = start_date
     params = {
         "author_id": user_data["user_id"],
         "start_date": start_date.isoformat(),
@@ -608,16 +609,54 @@ async def product_inflow_dropoff_statistics(
         product_condition = "AND product_id = :product_id"
         params["product_id"] = product_id
 
+    measurement_query = text("""
+        SELECT
+            cutover.cutover_date AS guest_cutover_date
+        FROM tb_site_reader_funnel_config cutover
+        WHERE cutover.config_key = 'author_guest_funnel_v2'
+        LIMIT 1
+    """)
+    measurement_result = await db.execute(measurement_query, params)
+    measurement_rows = measurement_result.mappings().all()
+    measurement_row = dict(measurement_rows[0]) if measurement_rows else {}
+    guest_cutover_date = measurement_row.get("guest_cutover_date")
+    if isinstance(guest_cutover_date, datetime):
+        guest_cutover_date = guest_cutover_date.date()
+    elif isinstance(guest_cutover_date, str):
+        guest_cutover_date = datetime.strptime(
+            guest_cutover_date, "%Y-%m-%d"
+        ).date()
+
+    metric_version = (
+        2
+        if guest_cutover_date is not None and end_date >= guest_cutover_date
+        else 1
+    )
+    if (
+        metric_version == 2
+        and guest_cutover_date is not None
+        and start_date < guest_cutover_date <= end_date
+    ):
+        start_date = guest_cutover_date
+
+    params["start_date"] = start_date.isoformat()
+    params["metric_version"] = metric_version
+
     entry_query = text(f"""
         SELECT
             product_id,
             entry_source_group,
+            MAX(metric_version) AS metric_version,
             SUM(detail_view_count) AS detail_view_count,
             SUM(detail_session_count) AS detail_session_count,
             SUM(detail_visitor_count) AS detail_visitor_count,
-            SUM(login_user_count) AS login_user_count
+            SUM(login_user_count) AS login_user_count,
+            SUM(guest_detail_view_count) AS guest_detail_view_count,
+            SUM(guest_detail_session_count) AS guest_detail_session_count,
+            SUM(guest_detail_visitor_count) AS guest_detail_visitor_count
         FROM tb_author_product_entry_daily
         WHERE stat_date BETWEEN :start_date AND :end_date
+          AND metric_version = :metric_version
           AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)
           {product_condition}
         GROUP BY product_id, entry_source_group
@@ -633,13 +672,18 @@ async def product_inflow_dropoff_statistics(
                 WHEN entry_source IN ('social', 'instagram', 'x', 'twitter', 'threads') THEN 'social'
                 WHEN entry_source LIKE 'search_%' THEN 'search'
                 WHEN entry_source LIKE 'top50_%' THEN 'ranking'
-                WHEN entry_source IS NULL THEN 'direct'
+                WHEN entry_source IS NULL OR entry_source = 'direct' THEN 'direct'
+                WHEN entry_source = 'other' THEN 'other'
                 ELSE 'recommend_slot'
             END AS entry_source_group,
+            MAX(metric_version) AS metric_version,
             SUM(detail_to_view_session_count) AS reader_session_count,
-            SUM(detail_exit_session_count) AS detail_exit_session_count
+            SUM(detail_exit_session_count) AS detail_exit_session_count,
+            SUM(guest_detail_to_view_session_count) AS guest_reader_session_count,
+            SUM(guest_detail_exit_session_count) AS guest_detail_exit_session_count
         FROM tb_product_detail_funnel_daily
         WHERE computed_date BETWEEN :start_date AND :end_date
+          AND metric_version = :metric_version
           AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)
           {product_condition}
         GROUP BY product_id, entry_source_group
@@ -653,21 +697,71 @@ async def product_inflow_dropoff_statistics(
             episode_id,
             episode_no,
             episode_title,
+            MAX(metric_version) AS metric_version,
             SUM(read_start_count) AS read_start_count,
             SUM(episode_dropoff_count) AS episode_dropoff_count,
+            SUM(near_complete_count) AS near_complete_count,
+            SUM(guest_read_start_count) AS guest_read_start_count,
+            SUM(guest_episode_dropoff_count) AS guest_episode_dropoff_count,
+            SUM(guest_near_complete_count) AS guest_near_complete_count,
             CASE
                 WHEN SUM(read_start_count) = 0 THEN 0
                 ELSE SUM(episode_dropoff_count) / SUM(read_start_count)
             END AS episode_dropoff_rate
         FROM tb_product_episode_dropoff_daily
         WHERE computed_date BETWEEN :start_date AND :end_date
+          AND metric_version = :metric_version
           AND product_id IN (SELECT product_id FROM tb_product WHERE author_id = :author_id)
           {product_condition}
         GROUP BY product_id, episode_id, episode_no, episode_title
         ORDER BY episode_no ASC, episode_id ASC
     """)
     dropoff_result = await db.execute(dropoff_query, params)
-    episode_dropoffs = [dict(row) for row in dropoff_result.mappings().all()]
+    episode_dropoffs = []
+    for raw_row in dropoff_result.mappings().all():
+        row = dict(raw_row)
+        read_start_count = int(row.get("read_start_count") or 0)
+        episode_dropoff_count = int(row.get("episode_dropoff_count") or 0)
+        near_complete_count = int(row.get("near_complete_count") or 0)
+        guest_read_start_count = int(row.get("guest_read_start_count") or 0)
+        guest_episode_dropoff_count = int(
+            row.get("guest_episode_dropoff_count") or 0
+        )
+        guest_near_complete_count = int(
+            row.get("guest_near_complete_count") or 0
+        )
+        episode_row = {
+            **row,
+            "metric_version": int(row.get("metric_version") or metric_version),
+            "read_start_count": read_start_count,
+            "episode_dropoff_count": episode_dropoff_count,
+            "near_complete_count": near_complete_count,
+        }
+        if metric_version == 2:
+            episode_row.update(
+                {
+                    "guest_read_start_count": guest_read_start_count,
+                    "guest_episode_dropoff_count": guest_episode_dropoff_count,
+                    "guest_near_complete_count": guest_near_complete_count,
+                    "member_read_start_count": max(
+                        read_start_count - guest_read_start_count, 0
+                    ),
+                    "member_episode_dropoff_count": max(
+                        episode_dropoff_count - guest_episode_dropoff_count, 0
+                    ),
+                    "member_near_complete_count": max(
+                        near_complete_count - guest_near_complete_count, 0
+                    ),
+                }
+            )
+        else:
+            for split_key in (
+                "guest_read_start_count",
+                "guest_episode_dropoff_count",
+                "guest_near_complete_count",
+            ):
+                episode_row.pop(split_key, None)
+        episode_dropoffs.append(episode_row)
 
     grouped: dict[tuple[int, str], dict] = {}
     for row in entry_rows:
@@ -676,12 +770,24 @@ async def product_inflow_dropoff_statistics(
             "product_id": row["product_id"],
             "entry_source_group": key[1],
             "source_label": _source_group_label(key[1]),
+            "metric_version": int(row.get("metric_version") or metric_version),
             "detail_view_count": int(row.get("detail_view_count") or 0),
             "detail_session_count": int(row.get("detail_session_count") or 0),
             "detail_visitor_count": int(row.get("detail_visitor_count") or 0),
             "login_user_count": int(row.get("login_user_count") or 0),
+            "guest_detail_view_count": int(
+                row.get("guest_detail_view_count") or 0
+            ),
+            "guest_detail_session_count": int(
+                row.get("guest_detail_session_count") or 0
+            ),
+            "guest_detail_visitor_count": int(
+                row.get("guest_detail_visitor_count") or 0
+            ),
             "reader_session_count": 0,
             "detail_exit_session_count": 0,
+            "guest_reader_session_count": 0,
+            "guest_detail_exit_session_count": 0,
         }
 
     for row in funnel_rows:
@@ -692,13 +798,25 @@ async def product_inflow_dropoff_statistics(
                 "product_id": row["product_id"],
                 "entry_source_group": key[1],
                 "source_label": _source_group_label(key[1]),
+                "metric_version": int(
+                    row.get("metric_version") or metric_version
+                ),
                 "detail_view_count": 0,
                 "detail_session_count": 0,
                 "detail_visitor_count": 0,
                 "login_user_count": 0,
+                "guest_detail_view_count": 0,
+                "guest_detail_session_count": 0,
+                "guest_detail_visitor_count": 0,
                 "reader_session_count": 0,
                 "detail_exit_session_count": 0,
+                "guest_reader_session_count": 0,
+                "guest_detail_exit_session_count": 0,
             },
+        )
+        grouped[key]["metric_version"] = max(
+            int(grouped[key].get("metric_version") or 1),
+            int(row.get("metric_version") or metric_version),
         )
         grouped[key]["reader_session_count"] = int(
             row.get("reader_session_count") or 0
@@ -706,19 +824,63 @@ async def product_inflow_dropoff_statistics(
         grouped[key]["detail_exit_session_count"] = int(
             row.get("detail_exit_session_count") or 0
         )
+        grouped[key]["guest_reader_session_count"] = int(
+            row.get("guest_reader_session_count") or 0
+        )
+        grouped[key]["guest_detail_exit_session_count"] = int(
+            row.get("guest_detail_exit_session_count") or 0
+        )
 
     source_groups = []
     for row in grouped.values():
         detail_sessions = int(row["detail_session_count"] or 0)
         reader_sessions = int(row["reader_session_count"] or 0)
         exit_sessions = int(row["detail_exit_session_count"] or 0)
-        source_groups.append(
-            {
-                **row,
-                "read_conversion_rate": _rate(reader_sessions, detail_sessions),
-                "detail_exit_rate": _rate(exit_sessions, detail_sessions),
-            }
+        guest_detail_views = int(row["guest_detail_view_count"] or 0)
+        guest_detail_sessions = int(row["guest_detail_session_count"] or 0)
+        guest_detail_visitors = int(row["guest_detail_visitor_count"] or 0)
+        guest_reader_sessions = int(row["guest_reader_session_count"] or 0)
+        guest_exit_sessions = int(
+            row["guest_detail_exit_session_count"] or 0
         )
+        source_row = {
+            **row,
+            "read_conversion_rate": _rate(reader_sessions, detail_sessions),
+            "detail_exit_rate": _rate(exit_sessions, detail_sessions),
+        }
+        if metric_version == 2:
+            source_row.update(
+                {
+                    "member_detail_view_count": max(
+                        int(row["detail_view_count"] or 0) - guest_detail_views,
+                        0,
+                    ),
+                    "member_detail_session_count": max(
+                        detail_sessions - guest_detail_sessions, 0
+                    ),
+                    "member_detail_visitor_count": max(
+                        int(row["detail_visitor_count"] or 0)
+                        - guest_detail_visitors,
+                        0,
+                    ),
+                    "member_reader_session_count": max(
+                        reader_sessions - guest_reader_sessions, 0
+                    ),
+                    "member_detail_exit_session_count": max(
+                        exit_sessions - guest_exit_sessions, 0
+                    ),
+                }
+            )
+        else:
+            for split_key in (
+                "guest_detail_view_count",
+                "guest_detail_session_count",
+                "guest_detail_visitor_count",
+                "guest_reader_session_count",
+                "guest_detail_exit_session_count",
+            ):
+                source_row.pop(split_key, None)
+        source_groups.append(source_row)
 
     source_groups.sort(
         key=lambda item: (
@@ -730,6 +892,12 @@ async def product_inflow_dropoff_statistics(
 
     return {
         "product_id": product_id,
+        "metric_version": metric_version,
+        "measurement_basis": (
+            "guest_inclusive" if metric_version == 2 else "legacy_mixed"
+        ),
+        "requested_start_date": requested_start_date.isoformat(),
+        "effective_start_date": start_date.isoformat(),
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "source_groups": source_groups,
