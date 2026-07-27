@@ -1,4 +1,4 @@
-from sqlalchemy import Date, DateTime, Index, Integer, String, TIMESTAMP, text
+from sqlalchemy import Date, DateTime, Index, Integer, Numeric, String, TIMESTAMP, text
 from sqlalchemy.dialects.mysql import BIGINT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -166,6 +166,113 @@ class SitePageDwellEvent(Base):
     )
 
 
+class SiteReaderFunnelEvent(Base):
+    __tablename__ = "tb_site_reader_funnel_event"
+    __table_args__ = (
+        Index("uq_site_reader_funnel_event_event_id", "event_id", unique=True),
+        Index(
+            "uq_site_reader_funnel_viewer_event_type",
+            "viewer_session_id",
+            "event_type",
+            unique=True,
+        ),
+        Index(
+            "idx_site_reader_funnel_source_created",
+            "source",
+            "created_date",
+        ),
+        Index(
+            "idx_site_reader_funnel_audience_event_occurred",
+            "audience_type_at_start",
+            "event_type",
+            "occurred_at",
+        ),
+        Index(
+            "idx_site_reader_funnel_audience_event_created",
+            "audience_type_at_start",
+            "event_type",
+            "created_date",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True), primary_key=True, autoincrement=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, comment="클라이언트 생성 이벤트 UUID"
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, comment="브라우저 이벤트 발생 시각"
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="로그인 유저 ID, 게스트는 NULL"
+    )
+    audience_type_at_start: Mapped[str] = mapped_column(
+        String(10), nullable=False, comment="열람 시작 시점 guest/member"
+    )
+    visitor_id: Mapped[str] = mapped_column(
+        String(80), nullable=False, comment="브라우저 단위 익명 방문자 ID"
+    )
+    browser_session_id: Mapped[str] = mapped_column(
+        String(80), nullable=False, comment="브라우저 세션 ID"
+    )
+    viewer_session_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, comment="회차 뷰어 세션 ID"
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, comment="독자 퍼널 이벤트 타입"
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="작품 ID"
+    )
+    episode_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="현재 회차 ID"
+    )
+    next_episode_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="다음 공개 회차 ID"
+    )
+    destination_group: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="unknown", comment="이탈 목적지 그룹"
+    )
+    active_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="활성 체류 시간(ms)"
+    )
+    progress_ratio: Mapped[float] = mapped_column(
+        Numeric(6, 5), nullable=False, server_default="0", comment="열람 진행률"
+    )
+    tracking_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="2", comment="추적 계약 버전"
+    )
+    source: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        server_default="service-web",
+        comment="이벤트 소스",
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class SiteReaderFunnelConfig(Base):
+    __tablename__ = "tb_site_reader_funnel_config"
+
+    config_key: Mapped[str] = mapped_column(
+        String(50), primary_key=True, comment="독자 퍼널 설정 키"
+    )
+    cutover_date: Mapped[date] = mapped_column(
+        Date, nullable=False, comment="해당 지표의 v2 집계 시작일(KST)"
+    )
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
 class SitePageRouteDaily(Base):
     __tablename__ = "tb_site_page_route_daily"
     __table_args__ = (
@@ -280,6 +387,24 @@ class AuthorProductEntryDaily(Base):
     )
     login_user_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0", comment="로그인 유저 수"
+    )
+    metric_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="집계 기준 버전"
+    )
+    guest_detail_view_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="게스트 작품 상세 PV 수"
+    )
+    guest_detail_session_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 작품 상세 진입 세션 수",
+    )
+    guest_detail_visitor_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="게스트 작품 상세 진입 방문자 수",
     )
     created_date: Mapped[datetime] = mapped_column(
         TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")

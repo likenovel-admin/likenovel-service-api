@@ -23,6 +23,15 @@ def _migration_sql() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _audience_migration_sql() -> str:
+    return (
+        ROOT
+        / "dist"
+        / "init"
+        / "106-add-author-funnel-audience-columns.sql"
+    ).read_text(encoding="utf-8")
+
+
 def _cron_job() -> str:
     return (ROOT / "dist" / "batch" / "cron_job.sh").read_text(encoding="utf-8")
 
@@ -45,6 +54,11 @@ class AuthorProductEntryDailyBatchSqlTest(unittest.TestCase):
         self.assertIn("delete from tb_author_product_entry_daily", sql)
         self.assertIn("stat_date = @author_product_entry_target_date", sql)
         self.assertEqual(sql.count("insert into tb_author_product_entry_daily"), 1)
+        self.assertIn("create temporary table tmp_author_product_entry_daily", sql)
+        self.assertLess(
+            sql.index("create temporary table tmp_author_product_entry_daily"),
+            sql.index("delete from tb_author_product_entry_daily"),
+        )
 
     def test_author_product_entry_batch_rebuild_is_transactional(self):
         sql = _batch_sql().lower()
@@ -80,6 +94,18 @@ class AuthorProductEntryDailyBatchSqlTest(unittest.TestCase):
         self.assertIn("pv.referrer_path like '/product/search%'", sql)
         self.assertIn("pv.referrer_path like '/product/top50%'", sql)
 
+    def test_author_product_entry_batch_preserves_guest_subtotals_and_version(self):
+        sql = _batch_sql().lower()
+
+        self.assertIn("tb_site_reader_funnel_config", sql)
+        self.assertIn("config_key = 'author_guest_funnel_v2'", sql)
+        self.assertNotIn("date(min(e.created_date))", sql)
+        self.assertIn("metric_version", sql)
+        self.assertIn("guest_detail_view_count", sql)
+        self.assertIn("guest_detail_session_count", sql)
+        self.assertIn("guest_detail_visitor_count", sql)
+        self.assertIn("resolved_pv.user_id is null", sql)
+
     def test_author_product_entry_shell_uses_advisory_lock_and_manual_date(self):
         script = _batch_sh()
 
@@ -87,6 +113,13 @@ class AuthorProductEntryDailyBatchSqlTest(unittest.TestCase):
         self.assertIn("lk_author_product_entry_daily_batch", script)
         self.assertIn("BATCH_DATE", script)
         self.assertIn("author_product_entry_daily_batch.sql", script)
+        self.assertIn("READER_FUNNEL_RETENTION_DAYS:-120", script)
+        self.assertIn("DELETE FROM tb_site_reader_funnel_event", script)
+        self.assertIn("LIMIT ${READER_FUNNEL_PURGE_CHUNK_SIZE}", script)
+        self.assertLess(
+            script.index("run_sql_with_advisory_lock"),
+            script.index("purge_reader_funnel_events || exit 1"),
+        )
 
     def test_author_product_entry_migration_creates_mart(self):
         sql = _migration_sql().lower()
@@ -98,6 +131,18 @@ class AuthorProductEntryDailyBatchSqlTest(unittest.TestCase):
         self.assertIn("detail_session_count", sql)
         self.assertIn("detail_visitor_count", sql)
         self.assertIn("unique key uk_author_product_entry_daily", sql)
+
+    def test_audience_migration_only_adds_guarded_columns(self):
+        sql = _audience_migration_sql().lower()
+
+        self.assertIn("information_schema.columns", sql)
+        self.assertIn("metric_version", sql)
+        self.assertIn("guest_detail_view_count", sql)
+        self.assertIn("guest_detail_session_count", sql)
+        self.assertIn("guest_detail_visitor_count", sql)
+        self.assertNotIn("add unique", sql)
+        self.assertNotIn("drop column", sql)
+        self.assertNotIn("modify column", sql)
 
     def test_author_product_entry_batch_is_registered_after_dropoff_batch(self):
         cron = _cron_job()

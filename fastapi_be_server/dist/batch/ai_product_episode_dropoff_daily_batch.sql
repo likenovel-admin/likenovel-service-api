@@ -2,6 +2,7 @@ USE likenovel;
 
 START TRANSACTION;
 
+SET time_zone = '+09:00';
 SET @job_lock_name = 'lk_ai_product_episode_dropoff_daily_batch';
 SET @job_lock_acquired = GET_LOCK(@job_lock_name, 30);
 SET @job_lock_guard_sql = IF(
@@ -65,29 +66,25 @@ UPDATE tb_cms_batch_job_process a
        a.updated_id = 0
  WHERE a.id = @job_id;
 
-SET @target_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY);
+SET @target_date = COALESCE(@target_date, DATE_SUB(CURDATE(), INTERVAL 1 DAY));
 SET @window_start = DATE_SUB(@target_date, INTERVAL 60 MINUTE);
 SET @window_end = DATE_ADD(DATE_ADD(@target_date, INTERVAL 1 DAY), INTERVAL 60 MINUTE);
+SET @guest_reader_cutover_date = (
+    SELECT c.cutover_date
+      FROM tb_site_reader_funnel_config c
+     WHERE c.config_key = 'author_guest_funnel_v2'
+     LIMIT 1
+);
+SET @metric_version = IF(
+    @guest_reader_cutover_date IS NOT NULL
+    AND @target_date >= @guest_reader_cutover_date,
+    2,
+    1
+);
 
-INSERT INTO tb_product_episode_dropoff_daily (
-    computed_date,
-    product_id,
-    episode_id,
-    episode_no,
-    episode_title,
-    read_start_count,
-    episode_dropoff_count,
-    episode_dropoff_rate,
-    avg_dropoff_progress_ratio,
-    near_complete_count,
-    dropoff_0_10_count,
-    dropoff_10_30_count,
-    dropoff_30_60_count,
-    dropoff_60_90_count,
-    dropoff_90_plus_count,
-    created_date,
-    updated_date
-)
+DROP TEMPORARY TABLE IF EXISTS tmp_product_episode_dropoff_daily;
+
+CREATE TEMPORARY TABLE tmp_product_episode_dropoff_daily AS
 WITH
 episode_view_start_events AS (
     SELECT
@@ -205,7 +202,7 @@ near_complete_sessions AS (
         x.episode_id,
         x.session_key
 ),
-qualifying_sessions AS (
+member_qualifying_sessions AS (
     SELECT
         DATE(s.started_at) AS computed_date,
         s.user_id,
@@ -238,6 +235,78 @@ qualifying_sessions AS (
        AND n.episode_id = s.episode_id
        AND n.session_key = s.session_key
     WHERE DATE(s.started_at) = @target_date
+),
+guest_episode_sessions AS (
+    SELECT
+        e.visitor_id,
+        e.browser_session_id,
+        e.viewer_session_id AS session_key,
+        e.product_id,
+        e.episode_id,
+        MIN(CASE WHEN e.event_type = 'episode_start' THEN e.occurred_at END) AS started_at,
+        MAX(CASE WHEN e.event_type = 'episode_exit' THEN e.active_ms END) AS exit_active_ms,
+        MAX(CASE WHEN e.event_type = 'episode_exit' THEN e.progress_ratio END) AS exit_progress_ratio,
+        MAX(CASE WHEN e.event_type = 'episode_complete' THEN 1 ELSE 0 END) AS completed_yn
+    FROM tb_site_reader_funnel_event e
+    INNER JOIN tb_site_reader_funnel_event start_event
+        ON start_event.viewer_session_id = e.viewer_session_id
+       AND start_event.event_type = 'episode_start'
+       AND start_event.audience_type_at_start = 'guest'
+    WHERE @metric_version = 2
+      AND e.event_type IN ('episode_start', 'episode_exit', 'episode_complete')
+      AND e.occurred_at >= @window_start
+      AND e.occurred_at < @window_end
+      AND e.viewer_session_id IS NOT NULL
+      AND e.product_id > 0
+      AND e.episode_id IS NOT NULL
+    GROUP BY
+        e.visitor_id,
+        e.browser_session_id,
+        e.viewer_session_id,
+        e.product_id,
+        e.episode_id
+    HAVING started_at IS NOT NULL
+),
+guest_qualifying_sessions AS (
+    SELECT
+        DATE(s.started_at) AS computed_date,
+        NULL AS user_id,
+        s.product_id,
+        s.episode_id,
+        s.session_key,
+        s.started_at,
+        CASE
+            WHEN s.completed_yn = 0
+             AND s.exit_active_ms >= 3000
+             AND s.exit_progress_ratio < 0.95
+            THEN 1 ELSE 0
+        END AS has_dropoff,
+        CASE
+            WHEN s.completed_yn = 0
+             AND s.exit_active_ms >= 3000
+             AND s.exit_progress_ratio < 0.95
+            THEN s.exit_progress_ratio
+            ELSE NULL
+        END AS dropoff_progress_ratio,
+        CASE
+            WHEN s.completed_yn = 1 OR s.exit_progress_ratio >= 0.95
+            THEN 1 ELSE 0
+        END AS near_complete_yn
+    FROM guest_episode_sessions s
+    WHERE DATE(s.started_at) = @target_date
+),
+qualifying_sessions AS (
+    SELECT
+        m.*,
+        0 AS is_guest
+    FROM member_qualifying_sessions m
+
+    UNION ALL
+
+    SELECT
+        g.*,
+        1 AS is_guest
+    FROM guest_qualifying_sessions g
 )
 SELECT
     @target_date AS computed_date,
@@ -261,6 +330,10 @@ SELECT
     SUM(CASE WHEN q.has_dropoff = 1 AND q.dropoff_progress_ratio >= 0.30 AND q.dropoff_progress_ratio < 0.60 THEN 1 ELSE 0 END) AS dropoff_30_60_count,
     SUM(CASE WHEN q.has_dropoff = 1 AND q.dropoff_progress_ratio >= 0.60 AND q.dropoff_progress_ratio < 0.90 THEN 1 ELSE 0 END) AS dropoff_60_90_count,
     SUM(CASE WHEN q.has_dropoff = 1 AND q.dropoff_progress_ratio >= 0.90 THEN 1 ELSE 0 END) AS dropoff_90_plus_count,
+    @metric_version AS metric_version,
+    SUM(CASE WHEN q.is_guest = 1 THEN 1 ELSE 0 END) AS guest_read_start_count,
+    SUM(CASE WHEN q.is_guest = 1 THEN q.has_dropoff ELSE 0 END) AS guest_episode_dropoff_count,
+    SUM(CASE WHEN q.is_guest = 1 THEN q.near_complete_yn ELSE 0 END) AS guest_near_complete_count,
     NOW() AS created_date,
     NOW() AS updated_date
 FROM qualifying_sessions q
@@ -269,21 +342,59 @@ LEFT JOIN tb_product_episode pe
    AND pe.product_id = q.product_id
 GROUP BY
     q.product_id,
-    q.episode_id
-ON DUPLICATE KEY UPDATE
-    episode_no = VALUES(episode_no),
-    episode_title = VALUES(episode_title),
-    read_start_count = VALUES(read_start_count),
-    episode_dropoff_count = VALUES(episode_dropoff_count),
-    episode_dropoff_rate = VALUES(episode_dropoff_rate),
-    avg_dropoff_progress_ratio = VALUES(avg_dropoff_progress_ratio),
-    near_complete_count = VALUES(near_complete_count),
-    dropoff_0_10_count = VALUES(dropoff_0_10_count),
-    dropoff_10_30_count = VALUES(dropoff_10_30_count),
-    dropoff_30_60_count = VALUES(dropoff_30_60_count),
-    dropoff_60_90_count = VALUES(dropoff_60_90_count),
-    dropoff_90_plus_count = VALUES(dropoff_90_plus_count),
-    updated_date = NOW();
+    q.episode_id;
+
+DELETE FROM tb_product_episode_dropoff_daily
+ WHERE computed_date = @target_date;
+
+INSERT INTO tb_product_episode_dropoff_daily (
+    computed_date,
+    product_id,
+    episode_id,
+    episode_no,
+    episode_title,
+    read_start_count,
+    episode_dropoff_count,
+    episode_dropoff_rate,
+    avg_dropoff_progress_ratio,
+    near_complete_count,
+    dropoff_0_10_count,
+    dropoff_10_30_count,
+    dropoff_30_60_count,
+    dropoff_60_90_count,
+    dropoff_90_plus_count,
+    metric_version,
+    guest_read_start_count,
+    guest_episode_dropoff_count,
+    guest_near_complete_count,
+    created_date,
+    updated_date
+)
+SELECT
+    computed_date,
+    product_id,
+    episode_id,
+    episode_no,
+    episode_title,
+    read_start_count,
+    episode_dropoff_count,
+    episode_dropoff_rate,
+    avg_dropoff_progress_ratio,
+    near_complete_count,
+    dropoff_0_10_count,
+    dropoff_10_30_count,
+    dropoff_30_60_count,
+    dropoff_60_90_count,
+    dropoff_90_plus_count,
+    metric_version,
+    guest_read_start_count,
+    guest_episode_dropoff_count,
+    guest_near_complete_count,
+    created_date,
+    updated_date
+FROM tmp_product_episode_dropoff_daily;
+
+DROP TEMPORARY TABLE tmp_product_episode_dropoff_daily;
 
 UPDATE tb_cms_batch_job_process a
    SET a.completed_yn = 'Y',

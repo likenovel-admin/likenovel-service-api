@@ -1,7 +1,8 @@
 from datetime import datetime
 import re
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _normalize_marketing_token(value: str | None, max_length: int) -> str | None:
@@ -92,3 +93,67 @@ class PostSitePageDwellReqBody(BaseModel):
     taxonomy_version: int = Field(1, alias="taxonomyVersion", ge=1, le=20)
 
     model_config = {"populate_by_name": True}
+
+
+class PostSiteReaderFunnelEventReqBody(BaseModel):
+    event_id: str = Field(..., alias="eventId", min_length=8, max_length=36)
+    occurred_at: datetime = Field(..., alias="occurredAt")
+    event_type: Literal[
+        "episode_start",
+        "episode_exit",
+        "episode_complete",
+        "next_episode_click",
+        "product_detail_exit",
+    ] = Field(..., alias="eventType")
+    visitor_id: str = Field(..., alias="visitorId", min_length=1, max_length=80)
+    browser_session_id: str = Field(
+        ..., alias="browserSessionId", min_length=1, max_length=80
+    )
+    viewer_session_id: str | None = Field(
+        None, alias="viewerSessionId", min_length=1, max_length=80
+    )
+    product_id: int = Field(..., alias="productId", ge=1)
+    episode_id: int | None = Field(None, alias="episodeId", ge=1)
+    next_episode_id: int | None = Field(None, alias="nextEpisodeId", ge=1)
+    destination_group: Literal[
+        "home",
+        "search",
+        "other_product",
+        "other_route",
+        "unknown",
+    ] = Field("unknown", alias="destinationGroup")
+    active_ms: int = Field(0, alias="activeMs", ge=0, le=86400000)
+    progress_ratio: float = Field(
+        0.0, alias="progressRatio", ge=0.0, le=1.0
+    )
+
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid",
+        "str_strip_whitespace": True,
+    }
+
+    @model_validator(mode="after")
+    def validate_event_identity(self):
+        if self.event_type == "product_detail_exit":
+            if self.episode_id is not None:
+                raise ValueError(
+                    "product_detail_exit에는 episodeId를 보낼 수 없습니다."
+                )
+        else:
+            if self.viewer_session_id is None or self.episode_id is None:
+                raise ValueError(
+                    "회차 이벤트에는 viewerSessionId와 episodeId가 필요합니다."
+                )
+
+        if self.event_type == "next_episode_click":
+            if self.next_episode_id is None:
+                raise ValueError(
+                    "next_episode_click에는 nextEpisodeId가 필요합니다."
+                )
+        elif self.next_episode_id is not None:
+            raise ValueError(
+                "next_episode_click 외 이벤트에는 nextEpisodeId를 보낼 수 없습니다."
+            )
+
+        return self
