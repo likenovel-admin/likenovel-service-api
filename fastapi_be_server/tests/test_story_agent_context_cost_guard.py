@@ -374,7 +374,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertNotEqual(first_hash, confidence_hash)
         self.assertEqual(first_hash, repeated_hash)
 
-    async def test_apply_preflights_openrouter_reserve_before_product_lock(self):
+    async def test_full_apply_preflight_reserve_is_deferred_before_product_lock(self):
         module = load_module()
         client = FakeCreditAsyncClient(total_credits=20.0, total_usage=17.01)
         conn = FakeConnection()
@@ -385,18 +385,24 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "AsyncClient", return_value=client), \
              patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_total_episode_count", return_value=30), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=12), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
              patch.object(module, "product_lock_connection") as product_lock:
-            with self.assertRaisesRegex(RuntimeError, "background credit reserve blocked"):
-                await module.build_context_rows(
-                    rows=[{"product_id": 687}],
-                    args=args,
-                )
+            results = await module.build_context_rows(
+                rows=[{"product_id": 687}],
+                args=args,
+            )
 
         self.assertEqual(len(client.calls), 1)
         self.assertTrue(client.calls[0]["url"].endswith("/credits"))
         self.assertTrue(client.closed)
         self.assertEqual(conn.close_count, 1)
         product_lock.assert_not_called()
+        self.assertEqual(results["deferred_budget"], 1)
+        self.assertEqual(results["products"][0]["context_status"], "deferred_budget")
+        self.assertEqual(results["products"][0]["persisted_context_status"], "ready")
 
     async def test_apply_preflights_anthropic_billing_before_product_lock(self):
         module = load_module()
@@ -447,6 +453,130 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(conn.commit_count, 1)
         self.assertEqual(conn.close_count, 1)
         product_lock.assert_not_called()
+
+    async def test_delta_reserve_exhaustion_is_deferred_without_marking_product_failed(self):
+        module = load_module()
+        conn = FakeConnection()
+        preflight = AsyncMock(
+            side_effect=module.OpenRouterBackgroundCreditReserveError(
+                "background credit reserve blocked"
+            )
+        )
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "touch_product_context_build_attempt"), \
+             patch.object(module, "assert_storyctx_apply_providers_ready", preflight), \
+             patch.object(module, "fetch_total_episode_count", return_value=30), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=12), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "mark_product_context_failed") as mark_failed, \
+             patch.object(module, "product_lock_connection") as product_lock:
+            results = await module.build_context_rows_delta(
+                rows=[{"product_id": 687, "_character_asset_collection_eligible": True}],
+                args=SimpleNamespace(apply=True, verbose=False),
+            )
+
+        self.assertEqual(results["deferred_budget"], 1)
+        self.assertEqual(
+            results["products"],
+            [
+                {
+                    "product_id": 687,
+                    "context_status": "deferred_budget",
+                    "persisted_context_status": "ready",
+                    "total_episode_count": 30,
+                    "ready_episode_count": 12,
+                }
+            ],
+        )
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_DEFERRED_BUDGET_EXIT_CODE,
+        )
+        mark_failed.assert_not_called()
+        product_lock.assert_not_called()
+
+    async def test_delta_midrun_reserve_exhaustion_is_deferred_without_marking_failed(self):
+        module = load_module()
+        conn = FakeConnection()
+        reserve_error = module.OpenRouterBackgroundCreditReserveError(
+            "background credit reserve blocked"
+        )
+        mark_failed = MagicMock()
+        row = {
+            "product_id": 687,
+            "title": "테스트 작품",
+            "episode_id": 101,
+            "episode_no": 16,
+            "_character_asset_collection_eligible": True,
+        }
+
+        patchers = [
+            patch.object(module, "OPENROUTER_API_KEY", ""),
+            patch.object(module.settings, "ANTHROPIC_API_KEY", ""),
+            patch.object(module, "db_connect", return_value=conn),
+            patch.object(module, "work_cursor", fake_work_cursor),
+            patch.object(
+                module,
+                "product_lock_connection",
+                return_value=module.nullcontext(object()),
+            ),
+            patch.object(module, "touch_product_context_build_attempt"),
+            patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()),
+            patch.object(module, "fetch_total_episode_count", return_value=30),
+            patch.object(module, "fetch_product_ready_episode_count", return_value=12),
+            patch.object(module, "fetch_product_context_status", return_value="ready"),
+            patch.object(module, "fetch_active_character_inventory_map", return_value={}),
+            patch.object(
+                module,
+                "fetch_active_relation_inventory_by_relation_key_map",
+                return_value={},
+            ),
+            patch.object(module, "fetch_active_summary_state_map", return_value={}),
+            patch.object(
+                module,
+                "fetch_active_summary_rows_for_episode_nos",
+                return_value=[],
+            ),
+            patch.object(
+                module,
+                "resolve_source_payload",
+                AsyncMock(return_value={"html_content": "본문", "source_type": "db"}),
+            ),
+            patch.object(module, "normalize_episode_html", return_value="정규화 본문"),
+            patch.object(module, "build_chunks", return_value=[{"chunk_text": "본문"}]),
+            patch.object(module, "fetch_existing_doc", return_value=None),
+            patch.object(module, "insert_doc_and_chunks"),
+            patch.object(
+                module,
+                "insert_episode_summary",
+                AsyncMock(side_effect=reserve_error),
+            ),
+            patch.object(module, "mark_product_context_failed", mark_failed),
+        ]
+
+        with ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
+            results = await module.build_context_rows_delta(
+                rows=[row],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    use_epub_fallback=False,
+                    refresh_rp=False,
+                ),
+            )
+
+        self.assertEqual(results["deferred_budget"], 1)
+        self.assertEqual(results["products"][0]["context_status"], "deferred_budget")
+        self.assertEqual(results["products"][0]["persisted_context_status"], "ready")
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_DEFERRED_BUDGET_EXIT_CODE,
+        )
+        mark_failed.assert_not_called()
 
     async def test_out_of_cohort_ready_delta_builds_foundation_but_skips_character_assets(self):
         module = load_module()
@@ -3392,6 +3522,30 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         conn.commit.assert_called_once_with()
         conn.close.assert_called_once_with()
 
+    def test_product_progress_uses_contiguous_public_episode_frontier(self):
+        module = load_module()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "ready_episode_count": 7,
+            "current_context_status": "processing",
+        }
+
+        ready_episode_no, context_status = module.fetch_product_context_progress(
+            cursor,
+            product_id=687,
+        )
+
+        self.assertEqual(ready_episode_no, 7)
+        self.assertEqual(context_status, "processing")
+        query = " ".join(cursor.execute.call_args.args[0].split())
+        self.assertIn("MAX(ready_episode.episode_no)", query)
+        self.assertIn("NOT EXISTS", query)
+        self.assertIn(
+            "prefix_episode.episode_no <= ready_episode.episode_no",
+            query,
+        )
+        self.assertIn("prefix_summary.summary_id IS NULL", query)
+
     def test_refresh_preserves_ready_status_while_new_episodes_sync(self):
         module = load_module()
         cursor = MagicMock()
@@ -3506,6 +3660,25 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         results["character_asset_repair_failed"] = 1
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
 
+    def test_delta_exit_code_reports_budget_deferral_without_failure(self):
+        module = load_module()
+        results = module.build_empty_results()
+        results["deferred_budget"] = 1
+        results["products"] = [
+            {
+                "product_id": 687,
+                "context_status": "deferred_budget",
+                "ready_episode_count": 12,
+                "total_episode_count": 30,
+            }
+        ]
+
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_DEFERRED_BUDGET_EXIT_CODE,
+        )
+        self.assertEqual(module.build_delta_exit_code(results, apply=False), 0)
+
     def test_character_asset_repair_plan_routes_only_safe_scopes(self):
         module = load_module()
         plan = module.build_character_chat_asset_repair_plan(
@@ -3565,6 +3738,45 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual([row["episode_from"] for row in rows], [3])
         self.assertEqual(required, {3: {"character:main"}})
+
+    async def test_character_asset_repair_only_run_reports_budget_deferral(self):
+        module = load_module()
+        conn = FakeConnection()
+        client = FakeCreditAsyncClient(total_credits=20.0, total_usage=16.5)
+        results = module.build_empty_results()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "AsyncClient", return_value=client), \
+             patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_total_episode_count", return_value=30), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=12), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "product_lock_connection") as product_lock:
+            await module.repair_character_chat_assets(
+                rows=[
+                    {
+                        "product_id": 687,
+                        "title": "테스트 작품",
+                        "character_asset_collection_eligible": 1,
+                    }
+                ],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        self.assertEqual(results["deferred_budget"], 1)
+        self.assertEqual(
+            results["character_asset_repairs"],
+            [{"product_id": 687, "status": "deferred_budget"}],
+        )
+        self.assertEqual(results["products"][0]["persisted_context_status"], "ready")
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_DEFERRED_BUDGET_EXIT_CODE,
+        )
+        self.assertTrue(client.closed)
+        product_lock.assert_not_called()
 
     async def test_character_asset_repair_runs_without_foundation_delta_or_provider_preflight(self):
         module = load_module()
@@ -3679,6 +3891,59 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             [{"product_id": 787, "status": "skipped_cohort"}],
         )
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
+
+    async def test_character_asset_repair_midrun_reserve_exhaustion_is_deferred(self):
+        module = load_module()
+        conn = FakeConnection()
+        results = module.build_empty_results()
+        scope_key = "character:main"
+        before_readiness = {
+            "character_chat_status": "hold",
+            "public_candidate_count": 1,
+            "missing_usable_scene_scope_keys": [scope_key],
+        }
+        reserve_error = module.OpenRouterBackgroundCreditReserveError(
+            "background credit reserve blocked"
+        )
+        touch = MagicMock()
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_total_episode_count", return_value=30), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=12), \
+             patch.object(module, "fetch_character_chat_asset_readiness_verification", return_value=before_readiness), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value={scope_key: {"canonical_character_key": scope_key, "display_name": "데시", "work_role": "main_protagonist", "is_protagonist": True, "evidence_episode_nos": [1]} }), \
+             patch.object(module, "fetch_active_summary_rows", return_value=[{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}]), \
+             patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
+             patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
+             patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
+             patch.object(module, "build_episode_scene_extraction_summaries", AsyncMock(side_effect=reserve_error)), \
+             patch.object(module, "build_rp_summaries_delta", AsyncMock()) as rp_builder, \
+             patch.object(module, "touch_product_context_build_attempt", touch):
+            await module.repair_character_chat_assets(
+                rows=[{"product_id": 687, "title": "테스트 작품", "_character_asset_collection_eligible": True}],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    max_delta_episodes=2,
+                ),
+                results=results,
+            )
+
+        rp_builder.assert_not_awaited()
+        touch.assert_called_once()
+        self.assertEqual(results["character_asset_repair_failed"], 0)
+        self.assertEqual(results["deferred_budget"], 1)
+        self.assertEqual(results["character_asset_repairs"][0]["status"], "deferred_budget")
+        self.assertEqual(results["products"][0]["context_status"], "deferred_budget")
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_DEFERRED_BUDGET_EXIT_CODE,
+        )
 
     async def test_character_asset_repair_storage_failure_sets_failed_exit(self):
         module = load_module()
@@ -4519,7 +4784,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(args.max_delta_episodes, 5)
 
-    def test_target_queries_limit_future_collection_to_recent_ongoing_products(self):
+    def test_target_queries_include_all_consented_products_but_mark_character_cohort(self):
         module = load_module()
 
         args = SimpleNamespace(product_ids=[], episode_ids=[], episode_nos=[], limit=0)
@@ -4541,7 +4806,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertIn("COALESCE(p.blind_yn, 'N') = 'N'", query)
         self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", query)
         self.assertIn("COALESCE(sacp.context_status, 'pending') <> 'disabled'", query)
-        self.assertIn("OR COALESCE(sacp.context_status, 'pending') = 'ready'", query)
+        self.assertNotIn("OR COALESCE(sacp.context_status, 'pending') = 'ready'", query)
         self.assertIn("AS character_asset_collection_eligible", query)
         self.assertNotIn("p.price_type = 'free'", query)
 

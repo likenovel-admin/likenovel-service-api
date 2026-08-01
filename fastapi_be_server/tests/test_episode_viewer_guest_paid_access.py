@@ -28,6 +28,9 @@ class _FakeMappings:
     def all(self):
         return self._rows
 
+    def one_or_none(self):
+        return self._rows[0] if self._rows else None
+
 
 class _FakeResult:
     def __init__(self, rows):
@@ -46,6 +49,7 @@ class _GuestPaidEpisodeDb:
         product_price_type="paid",
         websochat_context_status="pending",
         websochat_synced_latest_episode_no=0,
+        websochat_supported=False,
     ):
         self.execute_count = 0
         self.episode_no = episode_no
@@ -53,6 +57,7 @@ class _GuestPaidEpisodeDb:
         self.product_price_type = product_price_type
         self.websochat_context_status = websochat_context_status
         self.websochat_synced_latest_episode_no = websochat_synced_latest_episode_no
+        self.websochat_supported = websochat_supported
 
     async def execute(self, *_args, **_kwargs):
         self.execute_count += 1
@@ -91,6 +96,7 @@ class _GuestPaidEpisodeDb:
                     "websochat_context_status": self.websochat_context_status,
                     "websochat_published_latest_episode_no": 5,
                     "websochat_synced_latest_episode_no": self.websochat_synced_latest_episode_no,
+                    "websochat_supported": self.websochat_supported,
                     "prev_price_type": "free",
                     "next_price_type": "paid",
                 }
@@ -119,6 +125,7 @@ def _viewer_row(**overrides):
         "websochat_context_status": "pending",
         "websochat_published_latest_episode_no": 5,
         "websochat_synced_latest_episode_no": 0,
+        "websochat_supported": True,
         "prev_price_type": "free",
         "next_price_type": "paid",
         "open_yn": "Y",
@@ -132,7 +139,6 @@ def _viewer_row(**overrides):
     }
     row.update(overrides)
     return row
-
 
 class _ViewerDb:
     def __init__(self, *, episode_row, actor_row=None):
@@ -224,7 +230,110 @@ class _InfoDb:
         raise AssertionError(f"unexpected query: {sql}")
 
 
+class _GuestReadinessDb:
+    def __init__(
+        self,
+        *,
+        episode_no=3,
+        synced_latest_episode_no=3,
+        episode_open_yn="Y",
+        product_open_yn="Y",
+        product_blind_yn="N",
+        product_author_id=None,
+    ):
+        self.execute_count = 0
+        self.statements = []
+        self.episode_no = episode_no
+        self.synced_latest_episode_no = synced_latest_episode_no
+        self.episode_open_yn = episode_open_yn
+        self.product_open_yn = product_open_yn
+        self.product_blind_yn = product_blind_yn
+        self.product_author_id = product_author_id
+
+    async def execute(self, statement, *_args, **_kwargs):
+        self.execute_count += 1
+        self.statements.append(str(statement))
+        return _FakeResult(
+            [
+                {
+                    "product_id": 2011,
+                    "episode_no": self.episode_no,
+                    "episode_price_type": "free",
+                    "episode_open_yn": self.episode_open_yn,
+                    "product_open_yn": self.product_open_yn,
+                    "product_blind_yn": self.product_blind_yn,
+                    "product_author_id": self.product_author_id,
+                    "product_user_id": None,
+                    "ai_content_service_enabled_yn": "Y",
+                    "websochat_context_status": "processing",
+                    "published_latest_episode_no": 10,
+                    "ready_episode_count": self.synced_latest_episode_no,
+                    "episode_owned": 0,
+                }
+            ]
+        )
+
+
 class EpisodeViewerGuestPaidAccessTest(unittest.IsolatedAsyncioTestCase):
+    async def test_readiness_poll_is_read_only_and_allows_prepared_processing_scope(self):
+        db = _GuestReadinessDb(episode_no=3, synced_latest_episode_no=3)
+
+        response = await episode_service.get_episode_websochat_readiness(
+            episode_id=27362,
+            kc_user_id="",
+            db=db,
+        )
+
+        self.assertEqual(db.execute_count, 1)
+        self.assertTrue(response["data"]["websochatSupported"])
+        self.assertTrue(response["data"]["websochatEligible"])
+        combined_sql = " ".join(db.statements).lower()
+        self.assertNotIn(" update ", f" {combined_sql} ")
+        self.assertNotIn(" insert ", f" {combined_sql} ")
+
+    async def test_readiness_poll_keeps_unprepared_episode_pending(self):
+        db = _GuestReadinessDb(episode_no=4, synced_latest_episode_no=3)
+
+        response = await episode_service.get_episode_websochat_readiness(
+            episode_id=27362,
+            kc_user_id="",
+            db=db,
+        )
+
+        self.assertTrue(response["data"]["websochatSupported"])
+        self.assertFalse(response["data"]["websochatEligible"])
+
+    async def test_readiness_poll_does_not_expose_private_episode_metadata_to_guest(self):
+        db = _GuestReadinessDb(episode_open_yn="N")
+
+        with self.assertRaises(episode_service.CustomResponseException):
+            await episode_service.get_episode_websochat_readiness(
+                episode_id=27362,
+                kc_user_id="",
+                db=db,
+            )
+
+    async def test_readiness_poll_allows_product_owner_to_read_private_metadata(self):
+        db = _GuestReadinessDb(
+            episode_open_yn="N",
+            product_open_yn="N",
+            product_author_id=77,
+        )
+
+        with patch.object(
+            episode_service.product_service,
+            "get_user_id",
+            AsyncMock(return_value=77),
+        ):
+            response = await episode_service.get_episode_websochat_readiness(
+                episode_id=27362,
+                kc_user_id="kc-owner",
+                db=db,
+            )
+
+        self.assertFalse(response["data"]["websochatSupported"])
+        self.assertFalse(response["data"]["websochatEligible"])
+
     async def test_guest_viewer_blocks_paid_episode_before_epub_url_generation(self):
         original_make_r2_presigned_url = episode_service.comm_service.make_r2_presigned_url
 
@@ -270,10 +379,39 @@ class EpisodeViewerGuestPaidAccessTest(unittest.IsolatedAsyncioTestCase):
                     product_price_type=None,
                     websochat_context_status="ready",
                     websochat_synced_latest_episode_no=3,
+                    websochat_supported=True,
                 ),
             )
 
         self.assertIsNone(response["data"]["priceType"])
+        self.assertTrue(response["data"]["websochatEligible"])
+
+    async def test_guest_viewer_enables_prepared_scope_while_context_is_processing(self):
+        with (
+            patch.object(
+                episode_service.comm_service,
+                "make_r2_presigned_url",
+                return_value="signed-episode.epub",
+            ),
+            patch.object(
+                episode_service.statistics_service,
+                "insert_site_statistics_log",
+                new_callable=AsyncMock,
+            ),
+        ):
+            response = await episode_service.get_episodes_episode_id(
+                episode_id="27362",
+                kc_user_id="",
+                db=_GuestPaidEpisodeDb(
+                    price_type=None,
+                    product_price_type=None,
+                    websochat_context_status="processing",
+                    websochat_synced_latest_episode_no=3,
+                    websochat_supported=True,
+                ),
+            )
+
+        self.assertTrue(response["data"]["websochatSupported"])
         self.assertTrue(response["data"]["websochatEligible"])
 
     async def test_authenticated_unowned_paid_episode_is_denied_before_side_effects(self):

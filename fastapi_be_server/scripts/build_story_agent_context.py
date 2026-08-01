@@ -22,6 +22,7 @@ import sys
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable
 
@@ -39,6 +40,7 @@ from app.const import settings  # noqa: E402
 from app.services.common import comm_service  # noqa: E402
 from app.services.common.openrouter_background_credit_guard import (  # noqa: E402
     OpenRouterBackgroundCreditGuardError,
+    OpenRouterBackgroundCreditReserveError,
     assert_openrouter_background_credit_available_async,
     post_openrouter_background_chat_completion_async,
 )
@@ -57,6 +59,23 @@ DB_PASSWORD = os.getenv("BATCH_DB_PASSWORD", settings.DB_USER_PW)
 DB_NAME = os.getenv("BATCH_DB_NAME", "likenovel")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+try:
+    STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD = format(
+        max(
+            Decimal(
+                os.getenv(
+                    "STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD",
+                    "1.00",
+                ).strip()
+                or "1.00"
+            ),
+            Decimal("1.00"),
+        ),
+        "f",
+    )
+except InvalidOperation as exc:
+    raise RuntimeError("invalid STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD") from exc
+STORYCTX_DEFERRED_BUDGET_EXIT_CODE = 75
 EPISODE_SUMMARY_MODEL = os.getenv("STORY_AGENT_SUMMARY_MODEL", "deepseek/deepseek-v3.2").strip()
 RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma-4-31b-it").strip()
 RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
@@ -1076,10 +1095,6 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
         "COALESCE(p.blind_yn, 'N') = 'N'",
         "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'",
         "COALESCE(sacp.context_status, 'pending') <> 'disabled'",
-        (
-            f"({character_asset_collection_cohort_sql} "
-            "OR COALESCE(sacp.context_status, 'pending') = 'ready')"
-        ),
     ]
     params: list[object] = []
 
@@ -1530,6 +1545,7 @@ async def request_rp_openrouter_json_payload(
             client,
             base_url=OPENROUTER_BASE_URL,
             api_key=OPENROUTER_API_KEY,
+            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
@@ -1559,6 +1575,7 @@ async def request_episode_scene_extraction_openrouter_json_payload(
             client,
             base_url=OPENROUTER_BASE_URL,
             api_key=OPENROUTER_API_KEY,
+            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
@@ -1762,6 +1779,7 @@ async def request_episode_summary_text(
         client,
         base_url=OPENROUTER_BASE_URL,
         api_key=OPENROUTER_API_KEY,
+        priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
@@ -1798,6 +1816,7 @@ async def assert_storyctx_openrouter_apply_ready(client: AsyncClient | None) -> 
         client,
         base_url=OPENROUTER_BASE_URL,
         api_key=OPENROUTER_API_KEY,
+        priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
     )
 
 
@@ -1859,6 +1878,8 @@ async def generate_episode_summary_text(
                 row=row,
                 normalized_text=normalized_text,
             )
+        except OpenRouterBackgroundCreditReserveError:
+            raise
         except (OpenRouterBackgroundCreditGuardError, HTTPStatusError, RequestError, ValueError) as exc:
             if verbose:
                 print(
@@ -4905,6 +4926,7 @@ async def request_rp_dialogue_items(
         client,
         base_url=OPENROUTER_BASE_URL,
         api_key=OPENROUTER_API_KEY,
+        priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
@@ -5051,6 +5073,7 @@ async def request_episode_character_signals_payload(
                         client,
                         base_url=OPENROUTER_BASE_URL,
                         api_key=OPENROUTER_API_KEY,
+                        priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
                         headers={
                             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                             "Content-Type": "application/json",
@@ -6367,6 +6390,8 @@ async def build_rp_summaries(
                 episode_texts_by_no=episode_texts_by_no,
             )
             targets = normalize_rp_character_plan(plan_payload, episode_rows, episode_texts_by_no)
+        except OpenRouterBackgroundCreditReserveError:
+            raise
         except Exception as exc:
             if verbose:
                 print(f"[rp-plan-skip] product_id={product_id} error={str(exc)[:160]}")
@@ -6413,6 +6438,8 @@ async def build_rp_summaries(
                     episode_texts_by_no=episode_texts_by_no,
                     aliases=aliases,
                 )
+            except OpenRouterBackgroundCreditReserveError:
+                raise
             except Exception as exc:
                 if verbose:
                     print(f"[rp-dialogue-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
@@ -6491,6 +6518,8 @@ async def build_rp_summaries(
                 inventory_item=inventory_item,
                 relation_context_lines=relation_context_lines,
             )
+        except OpenRouterBackgroundCreditReserveError:
+            raise
         except Exception as exc:
             if verbose:
                 print(f"[rp-profile-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
@@ -6550,6 +6579,8 @@ async def build_rp_summaries(
                 relation_context_lines=relation_context_lines,
                 scene_context_lines=scene_context_lines,
             )
+        except OpenRouterBackgroundCreditReserveError:
+            raise
         except Exception as exc:
             logger.warning(
                 "story_agent_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
@@ -6647,6 +6678,8 @@ def build_empty_delta_rp_counts() -> dict[str, object]:
 
 
 def is_expected_story_asset_provider_error(exc: BaseException) -> bool:
+    if isinstance(exc, OpenRouterBackgroundCreditReserveError):
+        return False
     return isinstance(
         exc,
         (
@@ -7042,7 +7075,13 @@ async def build_rp_summaries_delta(
                     aliases=aliases,
                 )
             except Exception as exc:
-                if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+                if isinstance(
+                    exc,
+                    OpenRouterBackgroundCreditReserveError,
+                ) or (
+                    raise_unexpected_errors
+                    and not is_expected_story_asset_provider_error(exc)
+                ):
                     raise
                 if verbose:
                     print(f"[rp-delta-dialogue-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
@@ -7087,7 +7126,10 @@ async def build_rp_summaries_delta(
                 relation_context_lines=relation_context_lines,
             )
         except Exception as exc:
-            if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+            if isinstance(exc, OpenRouterBackgroundCreditReserveError) or (
+                raise_unexpected_errors
+                and not is_expected_story_asset_provider_error(exc)
+            ):
                 raise
             if verbose:
                 print(f"[rp-delta-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
@@ -7144,7 +7186,10 @@ async def build_rp_summaries_delta(
                 scene_context_lines=scene_context_lines,
             )
         except Exception as exc:
-            if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+            if isinstance(exc, OpenRouterBackgroundCreditReserveError) or (
+                raise_unexpected_errors
+                and not is_expected_story_asset_provider_error(exc)
+            ):
                 raise
             logger.warning(
                 "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
@@ -7399,6 +7444,8 @@ async def build_character_chat_opening_summaries(
                 relation_context_lines=relation_context_lines,
                 scene_context_lines=scene_context_lines,
             )
+        except OpenRouterBackgroundCreditReserveError:
+            raise
         except Exception as exc:
             logger.warning(
                 "story_agent_character_chat_opening_keep_old product_id=%s scope_key=%s error=%s",
@@ -7787,7 +7834,10 @@ async def build_episode_scene_extraction_summaries(
                 canonical_character_packet=canonical_character_packet,
             )
         except Exception as exc:
-            if raise_unexpected_errors and not is_expected_story_asset_provider_error(exc):
+            if isinstance(exc, OpenRouterBackgroundCreditReserveError) or (
+                raise_unexpected_errors
+                and not is_expected_story_asset_provider_error(exc)
+            ):
                 raise
             logger.warning(
                 "story_agent_scene_extraction_failed product_id=%s episode_no=%s error=%s",
@@ -7864,6 +7914,8 @@ async def build_episode_scene_extraction_summaries_nonblocking(
 ) -> tuple[int, int]:
     try:
         return await build_episode_scene_extraction_summaries(conn, **kwargs)
+    except OpenRouterBackgroundCreditReserveError:
+        raise
     except Exception as exc:
         try:
             conn.rollback()
@@ -15873,26 +15925,53 @@ async def insert_episode_summary(
     return int(summary_id), inserted, summary_meta
 
 
-def refresh_product_context_status(cur, product_id: int, total_episode_count: int) -> dict[str, object]:
+def fetch_product_context_progress(
+    cur,
+    *,
+    product_id: int,
+) -> tuple[int, str]:
     cur.execute(
         """
-        SELECT COUNT(*) AS ready_episode_count,
+        SELECT COALESCE(MAX(ready_episode.episode_no), 0) AS ready_episode_count,
                (
                    SELECT context_status
                    FROM tb_story_agent_context_product
                    WHERE product_id = %s
                    LIMIT 1
                ) AS current_context_status
-          FROM tb_story_agent_context_summary
-         WHERE product_id = %s
-           AND summary_type = 'episode_summary'
-           AND is_active = 'Y'
+          FROM tb_product_episode ready_episode
+         WHERE ready_episode.product_id = %s
+           AND ready_episode.use_yn = 'Y'
+           AND ready_episode.open_yn = 'Y'
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM tb_product_episode prefix_episode
+                 LEFT JOIN tb_story_agent_context_summary prefix_summary
+                   ON prefix_summary.product_id = prefix_episode.product_id
+                  AND prefix_summary.summary_type = 'episode_summary'
+                  AND prefix_summary.is_active = 'Y'
+                  AND prefix_summary.scope_key = CONCAT('episode:', prefix_episode.episode_id)
+                WHERE prefix_episode.product_id = ready_episode.product_id
+                  AND prefix_episode.use_yn = 'Y'
+                  AND prefix_episode.open_yn = 'Y'
+                  AND prefix_episode.episode_no <= ready_episode.episode_no
+                  AND prefix_summary.summary_id IS NULL
+           )
         """,
         (product_id, product_id),
     )
     row = cur.fetchone() or {}
-    ready_episode_count = int(row.get("ready_episode_count") or 0)
-    current_context_status = str(row.get("current_context_status") or "").strip()
+    return (
+        int(row.get("ready_episode_count") or 0),
+        str(row.get("current_context_status") or "").strip(),
+    )
+
+
+def refresh_product_context_status(cur, product_id: int, total_episode_count: int) -> dict[str, object]:
+    ready_episode_count, current_context_status = fetch_product_context_progress(
+        cur,
+        product_id=product_id,
+    )
 
     if current_context_status == "disabled":
         context_status = "disabled"
@@ -16018,22 +16097,41 @@ def fetch_product_context_status(cur, *, product_id: int) -> str:
     return str(row.get("context_status") or "").strip()
 
 
+def build_deferred_budget_product_result(
+    cur,
+    *,
+    product_id: int,
+    total_episode_count: int | None = None,
+) -> dict[str, object]:
+    resolved_total_episode_count = (
+        fetch_total_episode_count(cur, product_id=product_id)
+        if total_episode_count is None
+        else int(total_episode_count)
+    )
+    return {
+        "product_id": product_id,
+        "context_status": "deferred_budget",
+        "persisted_context_status": fetch_product_context_status(
+            cur,
+            product_id=product_id,
+        )
+        or "pending",
+        "total_episode_count": resolved_total_episode_count,
+        "ready_episode_count": fetch_product_ready_episode_count(
+            cur,
+            product_id=product_id,
+        ),
+    }
+
+
 def mark_product_context_failed(*, product_id: int, total_episode_count: int, error_message: str) -> int:
     conn = db_connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS ready_episode_count
-                  FROM tb_story_agent_context_summary
-                 WHERE product_id = %s
-                   AND summary_type = 'episode_summary'
-                   AND is_active = 'Y'
-                """,
-                (product_id,),
+            ready_episode_count, _ = fetch_product_context_progress(
+                cur,
+                product_id=product_id,
             )
-            ready_row = cur.fetchone() or {}
-            ready_episode_count = int(ready_row.get("ready_episode_count") or 0)
             cur.execute(
                 """
                 INSERT INTO tb_story_agent_context_product (
@@ -16263,6 +16361,48 @@ async def repair_character_chat_assets(
 
     work_conn = db_connect()
     try:
+        if args.apply:
+            try:
+                await assert_storyctx_openrouter_apply_ready(summary_client)
+            except OpenRouterBackgroundCreditReserveError as exc:
+                for product_id in sorted(rows_by_product):
+                    with work_cursor(work_conn) as cur:
+                        total_episode_count = fetch_total_episode_count(
+                            cur,
+                            product_id=product_id,
+                        )
+                        ready_episode_count = fetch_product_ready_episode_count(
+                            cur,
+                            product_id=product_id,
+                        )
+                        persisted_context_status = fetch_product_context_status(
+                            cur,
+                            product_id=product_id,
+                        ) or "pending"
+                    product_results.append(
+                        {
+                            "product_id": product_id,
+                            "context_status": "deferred_budget",
+                            "persisted_context_status": persisted_context_status,
+                            "total_episode_count": total_episode_count,
+                            "ready_episode_count": ready_episode_count,
+                        }
+                    )
+                    repair_records.append(
+                        {
+                            "product_id": product_id,
+                            "status": "deferred_budget",
+                        }
+                    )
+                results["deferred_budget"] = int(
+                    results.get("deferred_budget") or 0
+                ) + len(rows_by_product)
+                logger.info(
+                    "story_agent_character_asset_repair_budget_deferred products=%s reason=%s",
+                    len(rows_by_product),
+                    str(exc)[:240],
+                )
+                return
         for product_id, product_rows in sorted(rows_by_product.items()):
             if not is_story_agent_character_asset_collection_eligible(product_rows):
                 repair_records.append(
@@ -16455,6 +16595,47 @@ async def repair_character_chat_assets(
                         len(list(repair_plan["rp_scope_keys"])),
                         len(list(repair_plan["scene_scope_keys"])),
                     )
+            except OpenRouterBackgroundCreditReserveError as exc:
+                try:
+                    work_conn.rollback()
+                except Exception:
+                    pass
+                with work_cursor(work_conn) as cur:
+                    touch_product_context_build_attempt(
+                        cur,
+                        product_id=product_id,
+                    )
+                    deferred_result = build_deferred_budget_product_result(
+                        cur,
+                        product_id=product_id,
+                        total_episode_count=total_episode_count,
+                    )
+                work_conn.commit()
+                results["deferred_budget"] = int(
+                    results.get("deferred_budget") or 0
+                ) + 1
+                repair_record.update({"status": "deferred_budget"})
+                repair_records.append(repair_record)
+                deferred_result["character_asset_repair"] = repair_record
+                existing_product = next(
+                    (
+                        item
+                        for item in product_results
+                        if int(dict(item or {}).get("product_id") or 0)
+                        == product_id
+                    ),
+                    None,
+                )
+                if existing_product is None:
+                    product_results.append(deferred_result)
+                else:
+                    existing_product.update(deferred_result)
+                logger.info(
+                    "story_agent_character_asset_repair_budget_deferred "
+                    "product_id=%s reason=%s",
+                    product_id,
+                    str(exc)[:240],
+                )
             except Exception as exc:
                 try:
                     work_conn.rollback()
@@ -16626,10 +16807,15 @@ def build_delta_exit_code(results: dict[str, object], *, apply: bool) -> int:
     for product in list(results.get("products") or []):
         if str((product or {}).get("context_status") or "").strip() == "failed":
             return 1
-    return int(
+    has_failure = bool(
         int(results.get("character_asset_repair_failed") or 0) > 0
         or int(results.get("inventory_reaggregation_failed") or 0) > 0
     )
+    if has_failure:
+        return 1
+    if int(results.get("deferred_budget") or 0) > 0:
+        return STORYCTX_DEFERRED_BUDGET_EXIT_CODE
+    return 0
 
 
 def build_empty_results() -> dict[str, object]:
@@ -16673,6 +16859,7 @@ def build_empty_results() -> dict[str, object]:
         "inventory_reaggregation_no_progress": 0,
         "inventory_reaggregation_failed": 0,
         "inventory_reaggregations": [],
+        "deferred_budget": 0,
         "skipped_rows": 0,
         "products": [],
         "delta_verifications": [],
@@ -16733,7 +16920,24 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
     work_conn = db_connect()
     try:
         if args.apply:
-            await assert_storyctx_apply_providers_ready(summary_client)
+            try:
+                await assert_storyctx_apply_providers_ready(summary_client)
+            except OpenRouterBackgroundCreditReserveError as exc:
+                for product_id in sorted(rows_by_product):
+                    with work_cursor(work_conn) as cur:
+                        results["products"].append(
+                            build_deferred_budget_product_result(
+                                cur,
+                                product_id=product_id,
+                            )
+                        )
+                results["deferred_budget"] = len(rows_by_product)
+                logger.info(
+                    "story_agent_full_budget_deferred products=%s reason=%s",
+                    len(rows_by_product),
+                    str(exc)[:240],
+                )
+                return results
         for product_id, product_rows in rows_by_product.items():
             product_failed = False
             failed_ready_episode_count = 0
@@ -16835,6 +17039,8 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                         f"summary_llm={summary_meta.get('used_llm')} "
                                         f"summary_fallback={summary_meta.get('fallback_used')}"
                                     )
+                            except OpenRouterBackgroundCreditReserveError:
+                                raise
                             except Exception as exc:
                                 product_failed = True
                                 failed_ready_episode_count = mark_product_context_failed(
@@ -17015,6 +17221,31 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                 "ready_episode_count": 0,
                             }
                         )
+                except OpenRouterBackgroundCreditReserveError as exc:
+                    try:
+                        work_conn.rollback()
+                    except Exception:
+                        pass
+                    with work_cursor(work_conn) as cur:
+                        deferred_result = build_deferred_budget_product_result(
+                            cur,
+                            product_id=product_id,
+                            total_episode_count=total_episode_count,
+                        )
+                    results["products"].append(deferred_result)
+                    results["deferred_budget"] = int(
+                        results.get("deferred_budget") or 0
+                    ) + 1
+                    logger.info(
+                        "story_agent_full_budget_deferred product_id=%s reason=%s",
+                        product_id,
+                        str(exc)[:240],
+                    )
+                    if args.verbose:
+                        print(
+                            f"[deferred-budget] product_id={product_id} "
+                            f"error={str(exc)[:200]}"
+                        )
                 except Exception as exc:
                     product_failed = True
                     if args.apply:
@@ -17067,7 +17298,39 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                         product_id=product_id,
                     )
             work_conn.commit()
-            await assert_storyctx_apply_providers_ready(summary_client)
+            try:
+                await assert_storyctx_apply_providers_ready(summary_client)
+            except OpenRouterBackgroundCreditReserveError as exc:
+                for product_id in sorted(rows_by_product):
+                    with work_cursor(work_conn) as cur:
+                        total_episode_count = fetch_total_episode_count(
+                            cur=cur,
+                            product_id=product_id,
+                        )
+                        ready_episode_count = fetch_product_ready_episode_count(
+                            cur,
+                            product_id=product_id,
+                        )
+                        persisted_context_status = fetch_product_context_status(
+                            cur,
+                            product_id=product_id,
+                        ) or "pending"
+                    results["products"].append(
+                        {
+                            "product_id": product_id,
+                            "context_status": "deferred_budget",
+                            "persisted_context_status": persisted_context_status,
+                            "total_episode_count": total_episode_count,
+                            "ready_episode_count": ready_episode_count,
+                        }
+                    )
+                results["deferred_budget"] = len(rows_by_product)
+                logger.info(
+                    "story_agent_delta_budget_deferred products=%s reason=%s",
+                    len(rows_by_product),
+                    str(exc)[:240],
+                )
+                return results
         for product_id, product_rows in rows_by_product.items():
             product_failed = False
             failed_ready_episode_count = 0
@@ -17487,6 +17750,31 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 "ready_episode_count": 0,
                             }
                         )
+                except OpenRouterBackgroundCreditReserveError as exc:
+                    try:
+                        work_conn.rollback()
+                    except Exception:
+                        pass
+                    with work_cursor(work_conn) as cur:
+                        deferred_result = build_deferred_budget_product_result(
+                            cur,
+                            product_id=product_id,
+                            total_episode_count=total_episode_count,
+                        )
+                    results["products"].append(deferred_result)
+                    results["deferred_budget"] = int(
+                        results.get("deferred_budget") or 0
+                    ) + 1
+                    logger.info(
+                        "story_agent_delta_budget_deferred product_id=%s reason=%s",
+                        product_id,
+                        str(exc)[:240],
+                    )
+                    if args.verbose:
+                        print(
+                            f"[delta-deferred-budget] product_id={product_id} "
+                            f"error={str(exc)[:200]}"
+                        )
                 except Exception as exc:
                     product_failed = True
                     if args.apply:
@@ -17543,6 +17831,7 @@ def print_summary(results: dict[str, object], apply: bool) -> None:
         f"inventory_reaggregation_updated={results['inventory_reaggregation_updated']} "
         f"inventory_reaggregation_no_progress={results['inventory_reaggregation_no_progress']} "
         f"inventory_reaggregation_failed={results['inventory_reaggregation_failed']} "
+        f"deferred_budget={results['deferred_budget']} "
         f"skipped_rows={results['skipped_rows']}"
     )
     for product in list(results.get("products") or [])[:20]:
@@ -17698,7 +17987,7 @@ async def main() -> int:
                 args=args,
                 results=results,
             )
-        if character_asset_repair_rows:
+        if character_asset_repair_rows and not int(results.get("deferred_budget") or 0):
             await repair_character_chat_assets(
                 rows=character_asset_repair_rows,
                 args=args,
@@ -17710,6 +17999,8 @@ async def main() -> int:
 
     results = await build_context_rows(rows=rows, args=args)
     print_summary(results=results, apply=args.apply)
+    if int(results.get("deferred_budget") or 0) > 0:
+        return STORYCTX_DEFERRED_BUDGET_EXIT_CODE
     return 0
 
 

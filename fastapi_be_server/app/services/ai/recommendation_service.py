@@ -1066,7 +1066,7 @@ def _should_skip_signal_factor_generation(
     active_seconds: float = 0.0,
 ) -> bool:
     normalized_event_type = str(event_type or "").strip().lower()
-    if normalized_event_type == "product_detail_view":
+    if normalized_event_type in {"product_detail_view", "websochat_asset_request"}:
         return True
 
     multiplier = _compute_signal_factor_score_multiplier(
@@ -1094,7 +1094,12 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
     episode_id = req_body.get("episode_id")
     event_type = req_body["event_type"]
 
-    if event_type in {"episode_view", "episode_end", "latest_episode_reached"} and episode_id is None:
+    if event_type in {
+        "episode_view",
+        "episode_end",
+        "latest_episode_reached",
+        "websochat_asset_request",
+    } and episode_id is None:
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=f"{event_type}에는 episode_id가 필요합니다.",
@@ -1153,7 +1158,170 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
                 message="열람 권한이 있는 회차만 AI 신호 이벤트를 저장할 수 있습니다.",
             )
 
+    websochat_asset_request_episode_no: int | None = None
+    if event_type == "websochat_asset_request":
+        demand_lock_result = await db.execute(
+            text(
+                """
+                SELECT p.product_id
+                FROM tb_product p
+                WHERE p.product_id = :product_id
+                FOR UPDATE
+                """
+            ),
+            {"product_id": product_id},
+        )
+        if demand_lock_result.scalar_one_or_none() is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="공개된 작품만 AI 신호 이벤트를 저장할 수 있습니다.",
+            )
+
+        asset_readiness_result = await db.execute(
+            text(
+                """
+                SELECT
+                    e.episode_no,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM tb_story_agent_context_summary episode_summary
+                            WHERE episode_summary.product_id = e.product_id
+                              AND episode_summary.summary_type = 'episode_summary'
+                              AND episode_summary.is_active = 'Y'
+                              AND episode_summary.scope_key = CONCAT('episode:', e.episode_id)
+                        )
+                         AND EXISTS (
+                            SELECT 1
+                            FROM tb_story_agent_context_summary episode_signal
+                            WHERE episode_signal.product_id = e.product_id
+                              AND episode_signal.summary_type = 'episode_character_signals'
+                              AND episode_signal.is_active = 'Y'
+                              AND episode_signal.scope_key = CONCAT('episode:', e.episode_id)
+                        )
+                         AND (
+                            NOT EXISTS (
+                                SELECT 1
+                                FROM tb_product_episode cohort_episode
+                                WHERE cohort_episode.product_id = e.product_id
+                                  AND cohort_episode.use_yn = 'Y'
+                                  AND cohort_episode.open_yn = 'Y'
+                                GROUP BY cohort_episode.product_id
+                                HAVING COUNT(*) >= 15
+                                   AND MIN(COALESCE(
+                                       cohort_episode.open_changed_date,
+                                       cohort_episode.publish_reserve_date,
+                                       cohort_episode.created_date
+                                   )) >= '2026-03-01 00:00:00'
+                            )
+                            OR EXISTS (
+                                SELECT 1
+                                FROM tb_story_agent_context_summary episode_scene
+                                WHERE episode_scene.product_id = e.product_id
+                                  AND episode_scene.summary_type = 'episode_scene_extraction'
+                                  AND episode_scene.is_active = 'Y'
+                                  AND episode_scene.scope_key = CONCAT('episode:', e.episode_id)
+                                  AND episode_scene.summary_id > COALESCE((
+                                      SELECT MAX(current_summary.summary_id)
+                                      FROM tb_story_agent_context_summary current_summary
+                                      WHERE current_summary.product_id = e.product_id
+                                        AND current_summary.summary_type = 'episode_summary'
+                                        AND current_summary.is_active = 'Y'
+                                        AND current_summary.scope_key = CONCAT('episode:', e.episode_id)
+                                  ), 0)
+                                  AND LOWER(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                                      IF(JSON_VALID(episode_scene.summary_text), episode_scene.summary_text, '{}'),
+                                      '$.status'
+                                  )), ''))) IN ('ok', 'partial')
+                                  AND JSON_TYPE(JSON_EXTRACT(
+                                      IF(JSON_VALID(episode_scene.summary_text), episode_scene.summary_text, '{}'),
+                                      '$.scene_count'
+                                  )) = 'INTEGER'
+                                  AND CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                                      IF(JSON_VALID(episode_scene.summary_text), episode_scene.summary_text, '{}'),
+                                      '$.scene_count'
+                                  )), '0') AS SIGNED) > 0
+                                  AND JSON_TYPE(JSON_EXTRACT(
+                                      IF(JSON_VALID(episode_scene.summary_text), episode_scene.summary_text, '{}'),
+                                      '$.scenes'
+                                  )) = 'ARRAY'
+                                  AND COALESCE(JSON_LENGTH(JSON_EXTRACT(
+                                      IF(JSON_VALID(episode_scene.summary_text), episode_scene.summary_text, '{}'),
+                                      '$.scenes'
+                                  )), 0) > 0
+                                  AND NULLIF(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                                      IF(JSON_VALID(episode_scene.summary_text), episode_scene.summary_text, '{}'),
+                                      '$.scenes[0].scene_gist'
+                                  )), '')), '') IS NOT NULL
+                            )
+                        )
+                        THEN 1
+                        ELSE 0
+                    END AS chat_asset_ready
+                FROM tb_product_episode e
+                JOIN tb_product p
+                  ON p.product_id = e.product_id
+                LEFT JOIN tb_story_agent_context_product sacp
+                  ON sacp.product_id = e.product_id
+                WHERE e.episode_id = :episode_id
+                  AND e.product_id = :product_id
+                  AND e.use_yn = 'Y'
+                  AND e.open_yn = 'Y'
+                  AND p.open_yn = 'Y'
+                  AND p.blind_yn = 'N'
+                  AND p.price_type IN ('free', 'paid')
+                  AND p.status_code = 'ongoing'
+                  AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
+                  AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {"episode_id": episode_id, "product_id": product_id},
+        )
+        asset_readiness = asset_readiness_result.mappings().one_or_none()
+        websochat_asset_request_episode_no = int(
+            (asset_readiness or {}).get("episode_no") or 0
+        )
+        chat_asset_ready = int(
+            (asset_readiness or {}).get("chat_asset_ready") or 0
+        ) == 1
+        if (
+            websochat_asset_request_episode_no <= 0
+            or chat_asset_ready
+        ):
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="웹소챗 자산이 준비되지 않은 회차만 요청할 수 있습니다.",
+            )
+
+        duplicate_request_result = await db.execute(
+            text(
+                """
+                SELECT 1
+                FROM tb_user_ai_signal_event demand
+                WHERE demand.user_id = :user_id
+                  AND demand.product_id = :product_id
+                  AND demand.episode_id = :episode_id
+                  AND demand.event_type = 'websochat_asset_request'
+                  AND demand.created_date >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {
+                "user_id": user_id,
+                "product_id": product_id,
+                "episode_id": episode_id,
+            },
+        )
+        if duplicate_request_result.scalar_one_or_none() is not None:
+            await db.rollback()
+            return {"message": "웹소챗 자산 준비 요청이 이미 반영되었습니다."}
+
     payload = dict(req_body.get("event_payload") or {})
+    if websochat_asset_request_episode_no is not None:
+        payload["episode_no"] = websochat_asset_request_episode_no
     # 축/점수는 top-level 검증값만 사용한다.
     payload.pop("factor_type", None)
     payload.pop("factor_key", None)

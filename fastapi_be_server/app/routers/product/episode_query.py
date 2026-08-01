@@ -107,6 +107,23 @@ async def get_episodes_episode_id(
 
 
 @router.get(
+    "/{episode_id}/websochat-readiness",
+    tags=["회차 - 뷰어"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def get_episode_websochat_readiness(
+    episode_id: int = Path(..., description="회차 id"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await episode_service.get_episode_websochat_readiness(
+        episode_id=episode_id,
+        kc_user_id=user.get("sub"),
+        db=db,
+    )
+
+
+@router.get(
     "/episode/upload/{file_name}",
     tags=["회차 - 회차 관리"],
     responses={

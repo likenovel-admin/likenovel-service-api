@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
 from app.services.ai import recommendation_service
+from app.schemas.ai_recommendation import PostAiSignalEventReqBody
 
 
 class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
@@ -29,6 +30,38 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         def all(self):
             return self._rows
 
+    class _SignalResult:
+        def __init__(self, *, scalar=None, row=None, lastrowid=None):
+            self._scalar = scalar
+            self._row = row
+            self.lastrowid = lastrowid
+
+        def scalar_one_or_none(self):
+            return self._scalar
+
+        def mappings(self):
+            return self
+
+        def one_or_none(self):
+            return self._row
+
+    class _SignalDb:
+        def __init__(self, results):
+            self._results = list(results)
+            self.calls = []
+            self.commit_count = 0
+            self.rollback_count = 0
+
+        async def execute(self, statement, params=None):
+            self.calls.append((str(statement), params or {}))
+            return self._results.pop(0)
+
+        async def commit(self):
+            self.commit_count += 1
+
+        async def rollback(self):
+            self.rollback_count += 1
+
     def test_user_facing_slot_title_uses_natural_goal_particle(self):
         title = recommendation_service._build_user_facing_slot_title(
             ["goal"],
@@ -37,6 +70,133 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(title, "요즘 주인공의 목표가 '여행'인 작품을 좋아하나봐요")
+
+    def test_websochat_asset_request_is_valid_but_not_a_taste_factor(self):
+        body = PostAiSignalEventReqBody(
+            product_id=1182,
+            episode_id=27362,
+            event_type="websochat_asset_request",
+            event_payload={"episode_no": 51},
+        )
+
+        self.assertEqual(body.event_type, "websochat_asset_request")
+        self.assertTrue(
+            recommendation_service._should_skip_signal_factor_generation(
+                body.event_type,
+                body.event_payload or {},
+            )
+        )
+
+    async def test_websochat_asset_request_uses_server_episode_no_and_deduplicates_by_episode(self):
+        db = self._SignalDb(
+            [
+                self._SignalResult(scalar=1),
+                self._SignalResult(scalar=1),
+                self._SignalResult(scalar=1182),
+                self._SignalResult(row={"episode_no": 51, "chat_asset_ready": 0}),
+                self._SignalResult(scalar=None),
+                self._SignalResult(lastrowid=901),
+            ]
+        )
+
+        with patch.object(
+            recommendation_service,
+            "_get_user_id_by_kc",
+            AsyncMock(return_value=100),
+        ):
+            result = await recommendation_service.post_signal_event(
+                "kc-user",
+                {
+                    "product_id": 1182,
+                    "episode_id": 27362,
+                    "event_type": "websochat_asset_request",
+                    "event_payload": {"episode_no": 999},
+                },
+                db,
+            )
+
+        self.assertEqual(result["message"], "AI 신호 이벤트가 저장되었습니다.")
+        self.assertEqual(db.commit_count, 1)
+        insert_sql, insert_params = db.calls[-1]
+        self.assertIn("INSERT INTO tb_user_ai_signal_event", insert_sql)
+        self.assertIn('"episode_no": 51', insert_params["event_payload"])
+        duplicate_sql, duplicate_params = db.calls[-2]
+        self.assertIn("INTERVAL 7 DAY", duplicate_sql)
+        self.assertIn("FOR UPDATE", duplicate_sql)
+        self.assertIn("demand.episode_id = :episode_id", duplicate_sql)
+        self.assertEqual(duplicate_params["episode_id"], 27362)
+        asset_readiness_sql = db.calls[-3][0]
+        self.assertIn("p.price_type IN ('free', 'paid')", asset_readiness_sql)
+        self.assertIn("p.status_code = 'ongoing'", asset_readiness_sql)
+        self.assertIn("FOR UPDATE", asset_readiness_sql)
+        self.assertIn("FOR UPDATE", db.calls[-4][0])
+
+    async def test_websochat_asset_request_rejects_already_prepared_episode(self):
+        db = self._SignalDb(
+            [
+                self._SignalResult(scalar=1),
+                self._SignalResult(scalar=1),
+                self._SignalResult(scalar=1182),
+                self._SignalResult(row={"episode_no": 51, "chat_asset_ready": 1}),
+            ]
+        )
+
+        with (
+            patch.object(
+                recommendation_service,
+                "_get_user_id_by_kc",
+                AsyncMock(return_value=100),
+            ),
+            self.assertRaises(recommendation_service.CustomResponseException),
+        ):
+            await recommendation_service.post_signal_event(
+                "kc-user",
+                {
+                    "product_id": 1182,
+                    "episode_id": 27362,
+                    "event_type": "websochat_asset_request",
+                    "event_payload": {"episode_no": 51},
+                },
+                db,
+            )
+
+        self.assertEqual(db.commit_count, 0)
+        self.assertEqual(len(db.calls), 4)
+
+    async def test_websochat_asset_request_duplicate_does_not_insert_again(self):
+        db = self._SignalDb(
+            [
+                self._SignalResult(scalar=1),
+                self._SignalResult(scalar=1),
+                self._SignalResult(scalar=1182),
+                self._SignalResult(row={"episode_no": 51, "chat_asset_ready": 0}),
+                self._SignalResult(scalar=1),
+            ]
+        )
+
+        with patch.object(
+            recommendation_service,
+            "_get_user_id_by_kc",
+            AsyncMock(return_value=100),
+        ):
+            result = await recommendation_service.post_signal_event(
+                "kc-user",
+                {
+                    "product_id": 1182,
+                    "episode_id": 27362,
+                    "event_type": "websochat_asset_request",
+                    "event_payload": {"episode_no": 51},
+                },
+                db,
+            )
+
+        self.assertEqual(result["message"], "웹소챗 자산 준비 요청이 이미 반영되었습니다.")
+        self.assertEqual(db.commit_count, 0)
+        self.assertEqual(db.rollback_count, 1)
+        self.assertEqual(len(db.calls), 5)
+        self.assertFalse(
+            any("INSERT INTO tb_user_ai_signal_event" in sql for sql, _ in db.calls)
+        )
 
     def test_user_facing_slot_title_joins_axis_clauses_naturally(self):
         title = recommendation_service._build_user_facing_slot_title(

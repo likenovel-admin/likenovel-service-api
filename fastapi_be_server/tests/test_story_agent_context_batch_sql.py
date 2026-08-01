@@ -20,6 +20,18 @@ def _batch_sh() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _builder_py() -> str:
+    return (ROOT / "scripts" / "build_story_agent_context.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def _recommendation_service_py() -> str:
+    return (
+        ROOT / "app" / "services" / "ai" / "recommendation_service.py"
+    ).read_text(encoding="utf-8")
+
+
 class StoryAgentContextBatchSqlTest(unittest.TestCase):
     def test_candidate_query_failure_exits_nonzero(self):
         script = _batch_sh()
@@ -66,8 +78,10 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
     def test_candidate_selection_uses_missing_open_foundation_rows_not_episode_no_max(self):
         script = _batch_sh()
 
-        self.assertIn("pe.use_yn = 'Y'", script)
-        self.assertIn("pe.open_yn = 'Y'", script)
+        self.assertIn("public_episode.use_yn = 'Y'", script)
+        self.assertIn("public_episode.open_yn = 'Y'", script)
+        self.assertIn("ROW_NUMBER() OVER (", script)
+        self.assertIn("AS public_episode_rank", script)
         self.assertIn("p.price_type IN ('free', 'paid')", script)
         self.assertIn("p.status_code = 'ongoing'", script)
         self.assertIn("FROM tb_product_episode cohort_episode", script)
@@ -81,8 +95,11 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("p.blind_yn = 'N'", script)
         self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", script)
         self.assertIn("COALESCE(sacp.context_status, 'pending') <> 'disabled'", script)
-        self.assertIn("collection_cohort.product_id IS NOT NULL", script)
-        self.assertIn("OR COALESCE(sacp.context_status, 'pending') = 'ready'", script)
+        self.assertNotIn(
+            "collection_cohort.product_id IS NOT NULL\n"
+            "      OR COALESCE(sacp.context_status, 'pending') = 'ready'",
+            script,
+        )
         self.assertIn(
             "CASE WHEN collection_cohort.product_id IS NULL THEN 0 ELSE (\n"
             "      SELECT COUNT(*)\n"
@@ -285,3 +302,150 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertNotIn("missing_open_episode_count > ${MAX_DELTA_EPISODES} THEN 1", script)
         self.assertNotIn('missing_open_episode_count BETWEEN 1 AND ${MAX_MISSING_EPISODES}', script)
         self.assertNotIn("--build-mode full", script)
+
+    def test_candidate_priority_uses_demand_and_fifty_episode_asset_target(self):
+        script = _batch_sh()
+
+        self.assertIn('CHAT_ASSET_TARGET_EPISODES="50"', script)
+        self.assertIn("websochat_asset_request", script)
+        self.assertIn("recent_user_demand_at", script)
+        self.assertIn("FROM tb_user_ai_signal_event demand_event", script)
+        self.assertIn(
+            "GROUP BY demand_event.product_id, demand_event.episode_id",
+            script,
+        )
+        self.assertIn("recent_demand.episode_id = pe.episode_id", script)
+        self.assertIn(
+            "WHEN recent_demand.recent_user_demand_at IS NOT NULL",
+            script,
+        )
+        self.assertIn("OR sacs_signal.summary_id IS NULL", script)
+        self.assertIn(
+            "collection_cohort.product_id IS NOT NULL AND sacs_scene.summary_id IS NULL",
+            script,
+        )
+        self.assertIn("chat_asset_ready_episode_count", script)
+        self.assertIn("chat_asset_target_episode_count", script)
+        self.assertIn(
+            "pe.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES}",
+            script,
+        )
+        self.assertNotIn(
+            "pe.episode_no <= ${CHAT_ASSET_TARGET_EPISODES}",
+            script,
+        )
+        self.assertIn("STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD", script)
+        self.assertIn("deferred=", script)
+
+        demand_priority = "WHEN candidates.recent_user_demand_at IS NOT NULL THEN 0"
+        target_priority = (
+            "WHEN candidates.chat_asset_ready_episode_count "
+            "< candidates.chat_asset_target_episode_count THEN 1"
+        )
+        ready_count_order = "candidates.chat_asset_ready_episode_count ASC"
+        last_built_order = "COALESCE(candidates.last_built_at, '1970-01-01') ASC"
+
+        self.assertIn(demand_priority, script)
+        self.assertIn(target_priority, script)
+        self.assertIn(ready_count_order, script)
+        self.assertLess(script.index(demand_priority), script.index(target_priority))
+        self.assertLess(script.index(ready_count_order), script.index(last_built_order))
+
+    def test_websochat_demand_signal_is_server_gated_and_deduplicated(self):
+        source = _recommendation_service_py()
+        demand_gate_start = source.index('if event_type == "websochat_asset_request":')
+        demand_gate_end = source.index("duplicate_request_result", demand_gate_start)
+        demand_gate = source[demand_gate_start:demand_gate_end]
+
+        self.assertIn('if event_type == "websochat_asset_request":', source)
+        self.assertIn("AS chat_asset_ready", demand_gate)
+        self.assertIn("or chat_asset_ready", demand_gate)
+        self.assertIn("AND e.open_yn = 'Y'", demand_gate)
+        self.assertIn("AND p.price_type IN ('free', 'paid')", demand_gate)
+        self.assertIn("AND p.status_code = 'ongoing'", demand_gate)
+        self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", demand_gate)
+        self.assertIn("COALESCE(sacp.context_status, 'pending') <> 'disabled'", demand_gate)
+        self.assertIn("demand.created_date >= DATE_SUB(NOW(), INTERVAL 7 DAY)", source)
+        self.assertIn("SELECT p.product_id", source)
+        self.assertIn("FOR UPDATE", source)
+        self.assertIn("await db.rollback()", source)
+        self.assertIn(
+            'payload["episode_no"] = websochat_asset_request_episode_no',
+            source,
+        )
+
+    def test_midrun_openrouter_reserve_propagates_to_deferred_exit(self):
+        source = _builder_py()
+
+        import_start = source.index(
+            "from app.services.common.openrouter_background_credit_guard import ("
+        )
+        import_end = source.index(")", import_start)
+        self.assertIn(
+            "OpenRouterBackgroundCreditReserveError",
+            source[import_start:import_end],
+        )
+        self.assertIn("except OpenRouterBackgroundCreditReserveError:", source)
+        self.assertIn("story_agent_full_budget_deferred product_id=%s", source)
+        self.assertIn("story_agent_delta_budget_deferred product_id=%s", source)
+        self.assertIn("story_agent_character_asset_repair_budget_deferred", source)
+        self.assertIn(
+            'if int(results.get("deferred_budget") or 0) > 0:\n'
+            "        return STORYCTX_DEFERRED_BUDGET_EXIT_CODE",
+            source,
+        )
+
+    def test_budget_deferred_child_is_not_counted_as_failure(self):
+        script = _batch_sh()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "dist" / "batch"
+            scripts_dir = root / "scripts"
+            venv_bin_dir = root / ".venv" / "bin"
+            bin_dir = root / "bin"
+            batch_dir.mkdir(parents=True)
+            scripts_dir.mkdir(parents=True)
+            venv_bin_dir.mkdir(parents=True)
+            bin_dir.mkdir()
+
+            batch_path = batch_dir / "build_story_agent_context_batch.sh"
+            batch_path.write_text(script, encoding="utf-8")
+            (scripts_dir / "build_story_agent_context.py").write_text("", encoding="utf-8")
+
+            mysql_path = bin_dir / "mysql"
+            mysql_path.write_text(
+                "#!/bin/sh\nprintf '1182\\tTest title\\t0\\t0\\t1.00\\n'\n",
+                encoding="utf-8",
+            )
+            mysql_path.chmod(0o755)
+
+            python_path = venv_bin_dir / "python"
+            python_path.write_text("#!/bin/sh\nexit 75\n", encoding="utf-8")
+            python_path.chmod(0o755)
+
+            log_path = root / "batch.log"
+            result = subprocess.run(
+                ["bash", str(batch_path)],
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "DB_HOST": "example.invalid",
+                    "DB_PORT": "3306",
+                    "DB_USER": "test-user",
+                    "DB_PW": "test-password",
+                    "DB_NAME": "likenovel",
+                    "OPENROUTER_API_KEY": "test-key",
+                    "STORYCTX_LOCK_DIR": str(root / "batch.lock"),
+                    "STORYCTX_LOG_FILE": str(log_path),
+                    "STORYCTX_MAX_PARALLEL": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("[deferred-budget] product_id=1182", log)
+            self.assertIn("ready=0 deferred=1 failed=0", log)
