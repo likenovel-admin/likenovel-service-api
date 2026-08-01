@@ -13,6 +13,7 @@ import httpx
 
 DEFAULT_BACKGROUND_RESERVE_USD = Decimal("2.00")
 DEFAULT_BACKGROUND_IN_FLIGHT_BUFFER_USD = Decimal("1.00")
+DEFAULT_BACKGROUND_PRIORITY_HEADROOM_USD = Decimal("0")
 DEFAULT_CREDIT_LOOKUP_TIMEOUT_SECONDS = 10.0
 DEFAULT_CREDIT_LOCK_PATH = "/tmp/likenovel-openrouter-background-credit.lock"
 
@@ -46,7 +47,17 @@ def _read_non_negative_decimal_env(name: str, default: Decimal) -> Decimal:
     return value
 
 
-def _minimum_required_usd() -> Decimal:
+def _normalize_non_negative_decimal(value: Any, *, name: str) -> Decimal:
+    try:
+        normalized = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise OpenRouterBackgroundCreditLookupError(f"invalid {name}") from exc
+    if not normalized.is_finite() or normalized < 0:
+        raise OpenRouterBackgroundCreditLookupError(f"invalid {name}")
+    return normalized
+
+
+def _minimum_required_usd(*, priority_headroom_usd: Any | None = None) -> Decimal:
     reserve = _read_non_negative_decimal_env(
         "OPENROUTER_BACKGROUND_RESERVE_USD",
         DEFAULT_BACKGROUND_RESERVE_USD,
@@ -55,10 +66,22 @@ def _minimum_required_usd() -> Decimal:
         "OPENROUTER_BACKGROUND_IN_FLIGHT_BUFFER_USD",
         DEFAULT_BACKGROUND_IN_FLIGHT_BUFFER_USD,
     )
-    return reserve + in_flight_buffer
+    priority_headroom = (
+        DEFAULT_BACKGROUND_PRIORITY_HEADROOM_USD
+        if priority_headroom_usd is None
+        else _normalize_non_negative_decimal(
+            priority_headroom_usd,
+            name="priority_headroom_usd",
+        )
+    )
+    return reserve + in_flight_buffer + priority_headroom
 
 
-def _credit_status_from_payload(payload: Any) -> OpenRouterBackgroundCreditStatus:
+def _credit_status_from_payload(
+    payload: Any,
+    *,
+    priority_headroom_usd: Any | None = None,
+) -> OpenRouterBackgroundCreditStatus:
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict):
         raise OpenRouterBackgroundCreditLookupError("OpenRouter credits response is missing data")
@@ -72,7 +95,9 @@ def _credit_status_from_payload(payload: Any) -> OpenRouterBackgroundCreditStatu
 
     status = OpenRouterBackgroundCreditStatus(
         remaining_usd=total_credits - total_usage,
-        minimum_required_usd=_minimum_required_usd(),
+        minimum_required_usd=_minimum_required_usd(
+            priority_headroom_usd=priority_headroom_usd,
+        ),
     )
     if status.remaining_usd < status.minimum_required_usd:
         raise OpenRouterBackgroundCreditReserveError(
@@ -94,6 +119,7 @@ def assert_openrouter_background_credit_available(
     *,
     base_url: str,
     api_key: str,
+    priority_headroom_usd: Any | None = None,
 ) -> OpenRouterBackgroundCreditStatus:
     try:
         response = client.get(
@@ -111,7 +137,10 @@ def assert_openrouter_background_credit_available(
         raise OpenRouterBackgroundCreditLookupError(
             f"OpenRouter credits lookup failed{suffix}"
         ) from exc
-    return _credit_status_from_payload(payload)
+    return _credit_status_from_payload(
+        payload,
+        priority_headroom_usd=priority_headroom_usd,
+    )
 
 
 async def assert_openrouter_background_credit_available_async(
@@ -119,6 +148,7 @@ async def assert_openrouter_background_credit_available_async(
     *,
     base_url: str,
     api_key: str,
+    priority_headroom_usd: Any | None = None,
 ) -> OpenRouterBackgroundCreditStatus:
     try:
         response = await client.get(
@@ -136,7 +166,10 @@ async def assert_openrouter_background_credit_available_async(
         raise OpenRouterBackgroundCreditLookupError(
             f"OpenRouter credits lookup failed{suffix}"
         ) from exc
-    return _credit_status_from_payload(payload)
+    return _credit_status_from_payload(
+        payload,
+        priority_headroom_usd=priority_headroom_usd,
+    )
 
 
 def _credit_lock_path() -> str:
@@ -182,6 +215,7 @@ def post_openrouter_background_chat_completion(
     api_key: str,
     headers: dict[str, str],
     json: dict[str, Any],
+    priority_headroom_usd: Any | None = None,
     **request_kwargs: Any,
 ) -> httpx.Response:
     with _background_credit_lock():
@@ -189,6 +223,7 @@ def post_openrouter_background_chat_completion(
             client,
             base_url=base_url,
             api_key=api_key,
+            priority_headroom_usd=priority_headroom_usd,
         )
         return client.post(
             f"{base_url.rstrip('/')}/chat/completions",
@@ -205,6 +240,7 @@ async def post_openrouter_background_chat_completion_async(
     api_key: str,
     headers: dict[str, str],
     json: dict[str, Any],
+    priority_headroom_usd: Any | None = None,
     **request_kwargs: Any,
 ) -> httpx.Response:
     async with _background_credit_lock_async():
@@ -212,6 +248,7 @@ async def post_openrouter_background_chat_completion_async(
             client,
             base_url=base_url,
             api_key=api_key,
+            priority_headroom_usd=priority_headroom_usd,
         )
         return await client.post(
             f"{base_url.rstrip('/')}/chat/completions",

@@ -12,6 +12,7 @@ ALLOWED_AI_SIGNAL_EVENT_TYPES = {
     "episode_end",        # 완독 (progress >= 95%)
     "latest_episode_reached",  # 최신화 열람 도달 신호 (완독 의미 아님, 최신화를 열었다는 사실)
     "next_episode_click",      # 다음 화 이동 클릭
+    "websochat_asset_request",  # 미준비 회차 웹소챗 버튼 클릭(배치 수요 신호)
 }
 MAX_EVENT_PAYLOAD_LENGTH = 3000
 

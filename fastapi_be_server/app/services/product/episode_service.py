@@ -682,6 +682,157 @@ async def _create_review_apply_for_episode_ids(
     return apply_ids
 
 
+async def get_episode_websochat_readiness(
+    *,
+    episode_id: int,
+    kc_user_id: str,
+    db: AsyncSession,
+) -> dict[str, object]:
+    user_id = None
+    if kc_user_id:
+        user_id = await product_service.get_user_id(kc_user_id, db)
+        if not user_id:
+            raise CustomResponseException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                message=ErrorMessages.LOGIN_REQUIRED,
+            )
+
+    query = text(
+        """
+        SELECT
+            e.product_id,
+            e.episode_no,
+            COALESCE(e.price_type, 'free') AS episode_price_type,
+            e.open_yn AS episode_open_yn,
+            p.open_yn AS product_open_yn,
+            COALESCE(p.blind_yn, 'N') AS product_blind_yn,
+            p.author_id AS product_author_id,
+            p.user_id AS product_user_id,
+            COALESCE(p.ai_content_service_enabled_yn, 'N') AS ai_content_service_enabled_yn,
+            COALESCE(sacp.context_status, 'pending') AS websochat_context_status,
+            COALESCE((
+                SELECT MAX(public_episode.episode_no)
+                  FROM tb_product_episode public_episode
+                 WHERE public_episode.product_id = e.product_id
+                   AND public_episode.use_yn = 'Y'
+                   AND public_episode.open_yn = 'Y'
+            ), 0) AS published_latest_episode_no,
+            COALESCE(sacp.ready_episode_count, 0) AS ready_episode_count,
+            CASE
+                WHEN :user_id IS NOT NULL AND EXISTS (
+                    SELECT 1
+                      FROM tb_user_productbook pb
+                     WHERE (
+                           pb.episode_id = e.episode_id
+                           OR (
+                               pb.episode_id IS NULL
+                               AND (pb.product_id = e.product_id OR pb.product_id IS NULL)
+                           )
+                     )
+                       AND pb.user_id = :user_id
+                       AND pb.use_yn = 'Y'
+                       AND (
+                           pb.own_type = 'own'
+                           OR (
+                               pb.own_type = 'rental'
+                               AND (pb.rental_expired_date IS NULL OR pb.rental_expired_date > NOW())
+                           )
+                       )
+                    LIMIT 1
+                ) THEN 1
+                ELSE 0
+            END AS episode_owned
+          FROM tb_product_episode e
+          JOIN tb_product p
+            ON p.product_id = e.product_id
+          LEFT JOIN tb_story_agent_context_product sacp
+            ON sacp.product_id = e.product_id
+         WHERE e.episode_id = :episode_id
+           AND e.use_yn = 'Y'
+         LIMIT 1
+        """
+    )
+    result = await db.execute(
+        query,
+        {
+            "episode_id": episode_id,
+            "user_id": user_id,
+        },
+    )
+    row = result.mappings().one_or_none()
+    if not row:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_EPISODE,
+        )
+
+    is_product_owner = bool(
+        user_id
+        and (
+            row.get("product_author_id") == user_id
+            or row.get("product_user_id") == user_id
+        )
+    )
+    episode_owned = int(row.get("episode_owned") or 0) == 1
+    can_read_episode_metadata = is_product_owner or (
+        row.get("product_open_yn") == "Y"
+        and row.get("product_blind_yn") == "N"
+        and (
+            row.get("episode_open_yn") == "Y"
+            or (user_id is not None and episode_owned)
+        )
+    )
+    if not can_read_episode_metadata:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message=ErrorMessages.NOT_FOUND_EPISODE,
+        )
+
+    episode_no = int(row.get("episode_no") or 0)
+    published_latest_episode_no = int(row.get("published_latest_episode_no") or 0)
+    synced_latest_episode_no = min(
+        int(row.get("ready_episode_count") or 0),
+        published_latest_episode_no,
+    )
+    context_status = str(row.get("websochat_context_status") or "pending")
+    supported = (
+        row.get("product_open_yn") == "Y"
+        and row.get("product_blind_yn") == "N"
+        and row.get("ai_content_service_enabled_yn") == "Y"
+        and context_status != "disabled"
+        and published_latest_episode_no > 0
+    )
+    episode_price_type = str(row.get("episode_price_type") or "free")
+    if user_id:
+        has_episode_access = (
+            row.get("episode_open_yn") == "Y"
+            and (episode_price_type == "free" or episode_owned)
+        )
+    else:
+        has_episode_access = (
+            row.get("episode_open_yn") == "Y"
+            and episode_price_type == "free"
+            and 0 < episode_no <= 5
+        )
+
+    return {
+        "data": {
+            "product_id": int(row.get("product_id") or 0),
+            "episodeNo": episode_no,
+            "websochatSupported": supported,
+            "websochatContextStatus": context_status,
+            "websochatPublishedLatestEpisodeNo": published_latest_episode_no,
+            "websochatSyncedLatestEpisodeNo": synced_latest_episode_no,
+            "websochatEligible": bool(
+                supported
+                and has_episode_access
+                and episode_no > 0
+                and synced_latest_episode_no >= episode_no
+            ),
+        }
+    }
+
+
 async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSession):
     res_data = {}
     episode_id_to_int = int(episode_id)
@@ -797,6 +948,21 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                         where sacp.product_id = a.product_id
                                         limit 1
                                     ), 'pending') as websochat_context_status
+                                    , case
+                                        when coalesce((
+                                            select p.ai_content_service_enabled_yn
+                                            from tb_product p
+                                            where p.product_id = a.product_id
+                                            limit 1
+                                        ), 'N') = 'Y'
+                                        and coalesce((
+                                            select sacp.context_status
+                                            from tb_story_agent_context_product sacp
+                                            where sacp.product_id = a.product_id
+                                            limit 1
+                                        ), 'pending') <> 'disabled'
+                                        then 1 else 0
+                                    end as websochat_supported
                                     , e.max_episode as websochat_published_latest_episode_no
                                     , coalesce((
                                         select least(coalesce(sacp.ready_episode_count, 0), e.max_episode)
@@ -933,6 +1099,9 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                     episode_price_type = db_rst[0].get("price_type") or "free"
                     product_price_type = db_rst[0].get("product_price_type")
                     websochat_context_status = db_rst[0].get("websochat_context_status")
+                    websochat_supported = int(
+                        db_rst[0].get("websochat_supported") or 0
+                    ) == 1
                     websochat_published_latest_episode_no = int(
                         db_rst[0].get("websochat_published_latest_episode_no") or 0
                     )
@@ -940,7 +1109,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                         db_rst[0].get("websochat_synced_latest_episode_no") or 0
                     )
                     websochat_eligible = (
-                        websochat_context_status == "ready"
+                        websochat_supported
                         and episode_no > 0
                         and websochat_synced_latest_episode_no >= episode_no
                         and (episode_price_type == "free" or bool(episode_own_type))
@@ -987,6 +1156,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                             "next_rental_remaining"
                         ),
                         "productPriceType": product_price_type,
+                        "websochatSupported": websochat_supported,
                         "websochatContextStatus": websochat_context_status,
                         "websochatPublishedLatestEpisodeNo": websochat_published_latest_episode_no,
                         "websochatSyncedLatestEpisodeNo": websochat_synced_latest_episode_no,
@@ -1177,6 +1347,21 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                                         where sacp.product_id = a.product_id
                                         limit 1
                                     ), 'pending') as websochat_context_status
+                                    , case
+                                        when coalesce((
+                                            select p.ai_content_service_enabled_yn
+                                            from tb_product p
+                                            where p.product_id = a.product_id
+                                            limit 1
+                                        ), 'N') = 'Y'
+                                        and coalesce((
+                                            select sacp.context_status
+                                            from tb_story_agent_context_product sacp
+                                            where sacp.product_id = a.product_id
+                                            limit 1
+                                        ), 'pending') <> 'disabled'
+                                        then 1 else 0
+                                    end as websochat_supported
                                     , b.max_episode as websochat_published_latest_episode_no
                                     , coalesce((
                                         select least(coalesce(sacp.ready_episode_count, 0), b.max_episode)
@@ -1210,6 +1395,9 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
 
                 product_price_type = db_rst[0].get("product_price_type")
                 websochat_context_status = db_rst[0].get("websochat_context_status")
+                websochat_supported = int(
+                    db_rst[0].get("websochat_supported") or 0
+                ) == 1
                 websochat_published_latest_episode_no = int(
                     db_rst[0].get("websochat_published_latest_episode_no") or 0
                 )
@@ -1218,7 +1406,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                 )
                 websochat_eligible = (
                     episode_price_type == "free"
-                    and websochat_context_status == "ready"
+                    and websochat_supported
                     and episode_no > 0
                     and episode_no <= 5
                     and websochat_synced_latest_episode_no >= episode_no
@@ -1263,6 +1451,7 @@ async def get_episodes_episode_id(episode_id: str, kc_user_id: str, db: AsyncSes
                     "previousEpisodeRentalRemaining": None,
                     "nextEpisodeRentalRemaining": None,
                     "productPriceType": product_price_type,
+                    "websochatSupported": websochat_supported,
                     "websochatContextStatus": websochat_context_status,
                     "websochatPublishedLatestEpisodeNo": websochat_published_latest_episode_no,
                     "websochatSyncedLatestEpisodeNo": websochat_synced_latest_episode_no,

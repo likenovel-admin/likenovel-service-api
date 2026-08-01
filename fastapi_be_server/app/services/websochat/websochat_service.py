@@ -885,14 +885,10 @@ def _resolve_websochat_synced_latest_episode_no(product_row: dict[str, Any] | No
 
 def _assert_websochat_product_context_available(product_row: dict[str, Any]) -> None:
     context_status = product_row.get("contextStatus")
-    if context_status != "ready":
+    if context_status == "disabled":
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            message=(
-                WEBSOCHAT_CONTEXT_DISABLED_MESSAGE
-                if context_status == "disabled"
-                else WEBSOCHAT_CONTEXT_PENDING_MESSAGE
-            ),
+            message=WEBSOCHAT_CONTEXT_DISABLED_MESSAGE,
         )
     if _resolve_websochat_synced_latest_episode_no(product_row) <= 0:
         raise CustomResponseException(
@@ -1863,10 +1859,11 @@ async def _get_websochat_product(product_id: int, adult_yn: str, db: AsyncSessio
           AND p.open_yn = 'Y'
           AND p.blind_yn = 'N'
           AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
-          AND COALESCE(sacp.context_status, 'pending') = 'ready'
+          AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
           {ratings_filter}
         GROUP BY p.product_id, p.title, p.author_name, p.story_agent_setting_text, p.thumbnail_file_id, p.status_code, p.price_type, sacp.context_status, sacp.ready_episode_count
         HAVING COALESCE(MAX(e.episode_no), 0) > 0
+           AND LEAST(COALESCE(sacp.ready_episode_count, 0), COALESCE(MAX(e.episode_no), 0)) > 0
         """
     )
     result = await db.execute(query, {"product_id": product_id})
@@ -1945,7 +1942,7 @@ async def _get_websochat_product_session_state(
         product.get("openYn") == "Y"
         and product.get("blindYn") == "N"
         and product.get("aiContentServiceEnabledYn") == "Y"
-        and product.get("contextStatus") == "ready"
+        and product.get("contextStatus") != "disabled"
         and int(product.get("latestEpisodeNo") or 0) > 0
         and _resolve_websochat_synced_latest_episode_no(product) > 0
         and (adult_yn == "Y" or product.get("ratingsCode") == "all")
@@ -1962,7 +1959,7 @@ async def _get_websochat_product_session_state(
             unavailable_message = WEBSOCHAT_CONSENT_DISABLED_MESSAGE
         elif product.get("contextStatus") == "disabled":
             unavailable_message = WEBSOCHAT_CONTEXT_DISABLED_MESSAGE
-        elif product.get("contextStatus") != "ready":
+        elif _resolve_websochat_synced_latest_episode_no(product) <= 0:
             unavailable_message = WEBSOCHAT_CONTEXT_PENDING_MESSAGE
         elif adult_yn != "Y" and product.get("ratingsCode") != "all":
             unavailable_message = WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE

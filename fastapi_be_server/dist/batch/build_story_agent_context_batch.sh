@@ -16,6 +16,10 @@ MAX_PARALLEL="${STORYCTX_MAX_PARALLEL:-2}"
 BUILD_MODE="${STORYCTX_BUILD_MODE:-delta}"
 MAX_DELTA_EPISODES="${STORYCTX_MAX_DELTA_EPISODES:-${STORYCTX_MAX_MISSING_EPISODES:-5}}"
 BACKLOG_PRIORITY_THRESHOLD="${STORYCTX_BACKLOG_PRIORITY_THRESHOLD:-20}"
+CHAT_ASSET_TARGET_EPISODES="50"
+CHAT_ASSET_PRIORITY_HEADROOM_USD="1.00"
+CHAT_ASSET_SURPLUS_HEADROOM_USD="2.00"
+DEFERRED_BUDGET_EXIT_CODE=75
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
@@ -158,7 +162,7 @@ fi
 normalize_parallel
 normalize_build_mode
 acquire_lock
-log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE} max_delta_episodes=${MAX_DELTA_EPISODES} backlog_priority_threshold=${BACKLOG_PRIORITY_THRESHOLD}"
+log "[INFO] build_story_agent_context_batch started max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE} max_delta_episodes=${MAX_DELTA_EPISODES} backlog_priority_threshold=${BACKLOG_PRIORITY_THRESHOLD} chat_asset_target_episodes=${CHAT_ASSET_TARGET_EPISODES}"
 
 MYSQL_CMD=(
   mysql
@@ -190,13 +194,39 @@ SELECT
         OR candidates.active_character_inventory_v3_count = 0
       ) THEN 1
     ELSE 0
-  END AS inventory_reaggregation_needed
+  END AS inventory_reaggregation_needed,
+  CASE
+    WHEN candidates.recent_user_demand_at IS NOT NULL THEN '${CHAT_ASSET_PRIORITY_HEADROOM_USD}'
+    WHEN candidates.chat_asset_ready_episode_count < candidates.chat_asset_target_episode_count
+      THEN '${CHAT_ASSET_PRIORITY_HEADROOM_USD}'
+    ELSE '${CHAT_ASSET_SURPLUS_HEADROOM_USD}'
+  END AS openrouter_priority_headroom_usd
 FROM (
   SELECT
     p.product_id,
     REPLACE(REPLACE(p.title, '\t', ' '), '\n', ' ') AS title,
     COALESCE(sacp.context_status, 'pending') AS context_status,
     sacp.last_built_at AS last_built_at,
+    COUNT(DISTINCT pe.episode_id) AS published_open_episode_count,
+    LEAST(COUNT(DISTINCT pe.episode_id), ${CHAT_ASSET_TARGET_EPISODES}) AS chat_asset_target_episode_count,
+    COUNT(DISTINCT CASE
+      WHEN pe.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES}
+       AND sacs.summary_id IS NOT NULL
+       AND sacs_signal.summary_id IS NOT NULL
+       AND (collection_cohort.product_id IS NULL OR sacs_scene.summary_id IS NOT NULL)
+      THEN pe.episode_id
+      ELSE NULL
+    END) AS chat_asset_ready_episode_count,
+    MAX(CASE
+      WHEN recent_demand.recent_user_demand_at IS NOT NULL
+       AND (
+         sacs.summary_id IS NULL
+         OR sacs_signal.summary_id IS NULL
+         OR (collection_cohort.product_id IS NOT NULL AND sacs_scene.summary_id IS NULL)
+       )
+      THEN recent_demand.recent_user_demand_at
+      ELSE NULL
+    END) AS recent_user_demand_at,
     SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count,
     SUM(CASE WHEN sacs_signal.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_character_signal_count,
     SUM(CASE WHEN sacs_signal.summary_id IS NOT NULL THEN 1 ELSE 0 END) AS active_open_character_signal_count,
@@ -310,10 +340,39 @@ FROM (
         )
     ) END AS character_asset_repair_needed
   FROM tb_product p
-  JOIN tb_product_episode pe
+  JOIN (
+    SELECT
+      ranked_episode.product_id,
+      ranked_episode.episode_id,
+      ranked_episode.episode_no,
+      ranked_episode.public_episode_rank
+    FROM (
+      SELECT
+        public_episode.product_id,
+        public_episode.episode_id,
+        public_episode.episode_no,
+        ROW_NUMBER() OVER (
+          PARTITION BY public_episode.product_id
+          ORDER BY public_episode.episode_no ASC, public_episode.episode_id ASC
+        ) AS public_episode_rank
+      FROM tb_product_episode public_episode
+      WHERE public_episode.use_yn = 'Y'
+        AND public_episode.open_yn = 'Y'
+    ) ranked_episode
+  ) pe
     ON pe.product_id = p.product_id
-   AND pe.use_yn = 'Y'
-   AND pe.open_yn = 'Y'
+  LEFT JOIN (
+    SELECT
+      demand_event.product_id,
+      demand_event.episode_id,
+      MAX(demand_event.created_date) AS recent_user_demand_at
+    FROM tb_user_ai_signal_event demand_event
+    WHERE demand_event.event_type = 'websochat_asset_request'
+      AND demand_event.created_date >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+    GROUP BY demand_event.product_id, demand_event.episode_id
+  ) recent_demand
+    ON recent_demand.product_id = p.product_id
+   AND recent_demand.episode_id = pe.episode_id
   LEFT JOIN (
     SELECT cohort_episode.product_id
     FROM tb_product_episode cohort_episode
@@ -376,10 +435,6 @@ FROM (
     AND p.blind_yn = 'N'
     AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
     AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
-    AND (
-      collection_cohort.product_id IS NOT NULL
-      OR COALESCE(sacp.context_status, 'pending') = 'ready'
-    )
   GROUP BY
     p.product_id,
     p.title,
@@ -405,6 +460,13 @@ FROM (
     )
 ) candidates
 ORDER BY
+  CASE
+    WHEN candidates.recent_user_demand_at IS NOT NULL THEN 0
+    WHEN candidates.chat_asset_ready_episode_count < candidates.chat_asset_target_episode_count THEN 1
+    ELSE 2
+  END ASC,
+  candidates.chat_asset_ready_episode_count ASC,
+  candidates.recent_user_demand_at DESC,
   COALESCE(candidates.last_built_at, '1970-01-01') ASC,
   CASE
     WHEN candidates.context_status = 'failed' THEN 0
@@ -442,7 +504,7 @@ fi
 
 if [ "${#CANDIDATE_ROWS[@]}" -eq 0 ]; then
   log "[batch-empty] no eligible products"
-  log "[INFO] build_story_agent_context_batch completed ready=0 failed=0 max_parallel=${MAX_PARALLEL}"
+  log "[INFO] build_story_agent_context_batch completed ready=0 deferred=0 failed=0 max_parallel=${MAX_PARALLEL}"
   exit 0
 fi
 
@@ -456,9 +518,11 @@ run_product() {
   local product_title="$2"
   local character_asset_repair_needed="${3:-0}"
   local inventory_reaggregation_needed="${4:-0}"
+  local openrouter_priority_headroom_usd="${5:-${CHAT_ASSET_PRIORITY_HEADROOM_USD}}"
 
   (
     export PYTHONUNBUFFERED=1
+    export STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD="${openrouter_priority_headroom_usd}"
     command=(
       "${PYTHON_BIN}" "${BUILD_SCRIPT}"
       --product-id "${product_id}" \
@@ -481,11 +545,11 @@ run_product() {
   PID_TO_PRODUCT_ID["${pid}"]="${product_id}"
   PID_TO_PRODUCT_TITLE["${pid}"]="${product_title}"
   PID_TO_START_TS["${pid}"]="$(date +%s)"
-  log "[start] product_id=${product_id} title=\"${product_title}\" pid=${pid}"
+  log "[start] product_id=${product_id} title=\"${product_title}\" pid=${pid} openrouter_priority_headroom_usd=${openrouter_priority_headroom_usd}"
 }
 
 for row in "${CANDIDATE_ROWS[@]}"; do
-  IFS=$'\t' read -r product_id product_title character_asset_repair_needed inventory_reaggregation_needed <<< "${row}"
+  IFS=$'\t' read -r product_id product_title character_asset_repair_needed inventory_reaggregation_needed openrouter_priority_headroom_usd <<< "${row}"
   if [ -z "${product_id:-}" ] || [ -z "${product_title:-}" ]; then
     continue
   fi
@@ -493,17 +557,19 @@ for row in "${CANDIDATE_ROWS[@]}"; do
     "${product_id}" \
     "${product_title}" \
     "${character_asset_repair_needed:-0}" \
-    "${inventory_reaggregation_needed:-0}"
+    "${inventory_reaggregation_needed:-0}" \
+    "${openrouter_priority_headroom_usd:-${CHAT_ASSET_PRIORITY_HEADROOM_USD}}"
 done
 
 if [ "${#PIDS[@]}" -eq 0 ]; then
   log "[batch-empty] selected rows were unparsable"
-  log "[INFO] build_story_agent_context_batch completed ready=0 failed=0 max_parallel=${MAX_PARALLEL}"
+  log "[INFO] build_story_agent_context_batch completed ready=0 deferred=0 failed=0 max_parallel=${MAX_PARALLEL}"
   exit 0
 fi
 
 fail_count=0
 success_count=0
+deferred_count=0
 
 for pid in "${PIDS[@]}"; do
   product_id="${PID_TO_PRODUCT_ID[${pid}]}"
@@ -515,14 +581,20 @@ for pid in "${PIDS[@]}"; do
     duration_sec=$(( $(date +%s) - start_ts ))
     log "[done] product_id=${product_id} title=\"${product_title}\" duration_sec=${duration_sec}"
   else
-    fail_count=$((fail_count + 1))
+    child_exit_code=$?
     duration_sec=$(( $(date +%s) - start_ts ))
-    log "[fail] product_id=${product_id} title=\"${product_title}\" duration_sec=${duration_sec}"
+    if [ "${child_exit_code}" -eq "${DEFERRED_BUDGET_EXIT_CODE}" ]; then
+      deferred_count=$((deferred_count + 1))
+      log "[deferred-budget] product_id=${product_id} title=\"${product_title}\" duration_sec=${duration_sec}"
+    else
+      fail_count=$((fail_count + 1))
+      log "[fail] product_id=${product_id} title=\"${product_title}\" duration_sec=${duration_sec} exit_code=${child_exit_code}"
+    fi
   fi
 done
 
-log "[summary] launched=${#PIDS[@]} ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
-log "[INFO] build_story_agent_context_batch completed ready=${success_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
+log "[summary] launched=${#PIDS[@]} ready=${success_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
+log "[INFO] build_story_agent_context_batch completed ready=${success_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
 
 if [ "${fail_count}" -gt 0 ]; then
   exit 1

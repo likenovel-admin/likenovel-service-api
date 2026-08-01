@@ -34,7 +34,7 @@ class _Db:
         return self._results.pop(0)
 
 
-def _product_state_row(*, consent="Y"):
+def _product_state_row(*, consent="Y", context_status="ready", synced_latest_episode_no=14):
     return {
         "productId": 1182,
         "title": "테스트 작품",
@@ -46,9 +46,9 @@ def _product_state_row(*, consent="Y"):
         "blindYn": "N",
         "aiContentServiceEnabledYn": consent,
         "ratingsCode": "all",
-        "contextStatus": "ready",
+        "contextStatus": context_status,
         "latestEpisodeNo": 14,
-        "syncedLatestEpisodeNo": 14,
+        "syncedLatestEpisodeNo": synced_latest_episode_no,
     }
 
 
@@ -80,6 +80,51 @@ class WebsochatProductConsentTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(state["canSendMessage"])
         self.assertIsNone(state["unavailableMessage"])
+
+    async def test_processing_context_allows_prepared_episode_scope(self):
+        db = _Db(
+            [
+                _Result(
+                    row=_product_state_row(
+                        context_status="processing",
+                        synced_latest_episode_no=7,
+                    )
+                )
+            ]
+        )
+
+        state = await websochat_service._get_websochat_product_session_state(
+            product_id=1182,
+            adult_yn="N",
+            db=db,
+        )
+
+        self.assertTrue(state["canSendMessage"])
+        self.assertIsNone(state["unavailableMessage"])
+
+    async def test_disabled_context_blocks_even_when_old_assets_exist(self):
+        db = _Db(
+            [
+                _Result(
+                    row=_product_state_row(
+                        context_status="disabled",
+                        synced_latest_episode_no=7,
+                    )
+                )
+            ]
+        )
+
+        state = await websochat_service._get_websochat_product_session_state(
+            product_id=1182,
+            adult_yn="N",
+            db=db,
+        )
+
+        self.assertFalse(state["canSendMessage"])
+        self.assertEqual(
+            state["unavailableMessage"],
+            websochat_service.WEBSOCHAT_CONTEXT_DISABLED_MESSAGE,
+        )
 
     async def test_private_product_remains_read_only_without_deleting_session(self):
         row = _product_state_row(consent="Y")

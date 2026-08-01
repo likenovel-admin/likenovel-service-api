@@ -97,6 +97,24 @@ class OpenRouterBackgroundCreditGuardTest(TestCase):
 
         self.assertNotIn("secret-key", str(ctx.exception))
 
+    def test_lower_priority_work_must_leave_priority_headroom(self):
+        client = FakeSyncClient(
+            build_response(
+                200,
+                {"data": {"total_credits": 20.0, "total_usage": 16.5}},
+            )
+        )
+
+        with self.assertRaises(OpenRouterBackgroundCreditReserveError) as ctx:
+            assert_openrouter_background_credit_available(
+                client,
+                base_url="https://openrouter.test/api/v1",
+                api_key="secret-key",
+                priority_headroom_usd="1.00",
+            )
+
+        self.assertIn("required=$4.00", str(ctx.exception))
+
     def test_lookup_failure_is_fail_closed(self):
         client = FakeSyncClient(build_response(503, {"error": "unavailable"}))
 
@@ -140,6 +158,21 @@ class OpenRouterBackgroundCreditGuardTest(TestCase):
         ):
             self.assertIn(variable_name, cron_env)
             self.assertIn(variable_name, ai_dna_batch)
+
+    def test_story_context_passes_its_lower_priority_headroom_to_every_request(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "scripts" / "build_story_agent_context.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('"STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD"', source)
+        self.assertIn('Decimal("1.00")', source)
+        self.assertEqual(
+            source.count(
+                "priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD"
+            ),
+            6,
+        )
 
 
 class OpenRouterBackgroundCreditGuardAsyncTest(IsolatedAsyncioTestCase):
