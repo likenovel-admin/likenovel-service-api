@@ -5,6 +5,35 @@ set -euo pipefail
 # 운영 시에는 서버점검 공지 후 해당 작업 권장(가장 안전한 방법)
 # -HUP을 통한 무중단 재기동 방법은 상황에 따라 잠재적 문제점이 있기에 패스
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+select_deployment_wheel() {
+  local -a wheels=()
+
+  shopt -s nullglob
+  wheels=("$SCRIPT_DIR"/app-*.whl)
+  shopt -u nullglob
+
+  if [ "${#wheels[@]}" -ne 1 ]; then
+    echo "[run_be] expected exactly one deployment wheel, found ${#wheels[@]}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "${wheels[0]}"
+}
+
+if [ "${1:-}" = "--print-deployment-wheel" ]; then
+  select_deployment_wheel
+  exit 0
+fi
+
+DEPLOYMENT_WHEEL="$(select_deployment_wheel)"
+
+if [ "${LIFECYCLE_EVENT:-}" = "BeforeInstall" ]; then
+  echo "[run_be] deployment wheel preinstall validation passed: $DEPLOYMENT_WHEEL"
+  exit 0
+fi
+
 sudo chown -R ln-admin:ln-admin /home/ln-admin/likenovel/api
 sudo chmod -R 700 /home/ln-admin/likenovel/api
 
@@ -190,7 +219,7 @@ prepare_next_venv() {
   rm -rf "$NEXT_VENV" "$NEXT_VENV.failed"
   python3 -m venv "$NEXT_VENV"
   "$NEXT_VENV/bin/python" -m pip install --upgrade pip
-  "$NEXT_VENV/bin/pip" install "$(ls -v app-*.whl | tail -n 1)"
+  "$NEXT_VENV/bin/pip" install "$DEPLOYMENT_WHEEL"
   "$NEXT_VENV/bin/python" - <<'PY'
 from importlib.metadata import version
 
