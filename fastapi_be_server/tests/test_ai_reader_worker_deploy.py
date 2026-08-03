@@ -1,6 +1,9 @@
 import asyncio
 import inspect
+import os
+import shutil
 import subprocess
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -32,7 +35,7 @@ def test_prod_deploy_bundle_includes_ai_reader_worker_script():
     content = workflow.read_text(encoding="utf-8")
 
     assert "cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py" in content
-    assert "zip -r $GITHUB_SHA.zip" in content
+    assert 'zip -r "$GITHUB_SHA.zip"' in content
     assert "verify_backend_prod_deploy.sh" in content
     assert "scripts/" in content
 
@@ -49,6 +52,46 @@ def test_prod_workflow_runs_pre_deploy_quality_gates_and_waits_for_codedeploy():
     assert "DEPLOY_ID=$(aws deploy create-deployment" in content
     assert 'aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"' in content
     assert 'aws deploy get-deployment --deployment-id "$DEPLOY_ID"' in content
+
+
+def test_prod_workflow_keeps_ephemeral_version_and_does_not_write_git():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    assert "  contents: read" in content
+    assert "concurrency:\n  group: backend-prod\n  cancel-in-progress: false" in content
+    assert "poetry version patch" in content
+    assert content.index("poetry version patch") < content.index("poetry build")
+    assert "git add pyproject.toml" not in content
+    assert 'git commit -m "version update"' not in content
+    assert "git push" not in content
+
+
+def test_prod_workflow_rejects_ambiguous_wheels_before_upload_or_deploy():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    guard = "wheels=(app-*.whl)"
+    upload = 'aws s3 cp "$GITHUB_SHA.zip"'
+    deploy = "DEPLOY_ID=$(aws deploy create-deployment"
+
+    assert "set -euo pipefail" in content
+    assert guard in content
+    assert 'if [ "${#wheels[@]}" -ne 1 ]; then' in content
+    assert "expected exactly one deployment wheel" in content
+    assert 'zip -r "$GITHUB_SHA.zip" "${wheels[0]}"' in content
+    assert content.index(guard) < content.index(upload)
+    assert content.index(guard) < content.index(deploy)
+
+
+def test_prod_codedeploy_validates_wheel_before_install():
+    appspec = (PROJECT_ROOT / "dist" / "appspec.yml").read_text(encoding="utf-8")
+
+    before_install = appspec.index("  BeforeInstall:")
+    application_start = appspec.index("  ApplicationStart:")
+
+    assert "    - location: run_be.sh" in appspec[before_install:application_start]
+    assert before_install < application_start
 
 
 def test_prod_workflow_runs_hard_readback_over_bastion():
@@ -118,11 +161,98 @@ def test_prod_run_script_uses_strict_mode_and_explicit_venv_pip():
     assert "source .venv/bin/activate" not in content
     assert "deactivate" not in content
     assert '"$NEXT_VENV/bin/python" -m pip install --upgrade pip' in content
-    assert '"$NEXT_VENV/bin/pip" install "$(ls -v app-*.whl | tail -n 1)"' in content
+    assert '"$NEXT_VENV/bin/pip" install "$DEPLOYMENT_WHEEL"' in content
+    assert "ls -v app-*.whl" not in content
     assert "from importlib.metadata import version" in content
     assert "[run_be] installed {package}==" in content
     assert 'chmod +x "$BATCH_DST"/*.sh' not in content
     assert 'for batch_script in "$BATCH_DST"/*.sh; do' in content
+
+
+def test_prod_run_script_selects_exact_archive_wheel_and_fails_closed():
+    source_script = PROJECT_ROOT / "dist" / "run_be.sh"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        archive = Path(temp_dir) / "deployment-archive"
+        archive.mkdir()
+        run_script = archive / "run_be.sh"
+        shutil.copy2(source_script, run_script)
+
+        fake_bin = Path(temp_dir) / "fake-bin"
+        fake_bin.mkdir()
+        mutation_marker = Path(temp_dir) / "sudo-called"
+        fake_sudo = fake_bin / "sudo"
+        fake_sudo.write_text(
+            "#!/bin/bash\nprintf 'called\\n' >> \"$MUTATION_MARKER\"\n",
+            encoding="utf-8",
+        )
+        fake_sudo.chmod(0o755)
+        production_env = os.environ.copy()
+        production_env["PATH"] = f"{fake_bin}:{production_env['PATH']}"
+        production_env["MUTATION_MARKER"] = str(mutation_marker)
+        preinstall_env = production_env.copy()
+        preinstall_env["LIFECYCLE_EVENT"] = "BeforeInstall"
+
+        no_wheel = subprocess.run(
+            ["bash", str(run_script), "--print-deployment-wheel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert no_wheel.returncode != 0
+        assert "expected exactly one deployment wheel, found 0" in no_wheel.stderr
+
+        no_wheel_production = subprocess.run(
+            ["bash", str(run_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=preinstall_env,
+        )
+        assert no_wheel_production.returncode != 0
+        assert not mutation_marker.exists()
+
+        expected_wheel = archive / "app-1.0.0-py3-none-any.whl"
+        expected_wheel.touch()
+        one_wheel = subprocess.run(
+            ["bash", str(run_script), "--print-deployment-wheel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert one_wheel.returncode == 0
+        assert one_wheel.stdout.strip() == str(expected_wheel)
+
+        one_wheel_preinstall = subprocess.run(
+            ["bash", str(run_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=preinstall_env,
+        )
+        assert one_wheel_preinstall.returncode == 0
+        assert not mutation_marker.exists()
+
+        (archive / "app-999.0.0-py3-none-any.whl").touch()
+        two_wheels = subprocess.run(
+            ["bash", str(run_script), "--print-deployment-wheel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert two_wheels.returncode != 0
+        assert "expected exactly one deployment wheel, found 2" in two_wheels.stderr
+
+
+        two_wheels_production = subprocess.run(
+            ["bash", str(run_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=preinstall_env,
+        )
+        assert two_wheels_production.returncode != 0
+        assert not mutation_marker.exists()
 
 
 def test_prod_run_script_prebuilds_next_venv_before_stopping_service():

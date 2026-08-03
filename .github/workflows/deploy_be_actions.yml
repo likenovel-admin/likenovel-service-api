@@ -13,7 +13,11 @@ on:
 
 # github_token 사용 권한
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: backend-prod
+  cancel-in-progress: false
 
 # 워크플로우
 # 내부 동작은 github 내 가상환경에서 실행되는 형태
@@ -52,11 +56,6 @@ jobs:
           bash -n dist/verify_backend_prod_deploy.sh
           shellcheck --severity=warning dist/run_be.sh dist/boot-start-api.sh dist/verify_backend_prod_deploy.sh
           poetry build
-          git config --global user.name 'likenovel-dev'
-          git config --global user.email 'infra@likenovel.net'
-          git add pyproject.toml
-          git commit -m "version update"
-          git push
         working-directory: ./fastapi_be_server
 
       - name: Configure AWS credentials
@@ -79,6 +78,15 @@ jobs:
           S3_BUCKET: ln-s3
           TAGS: ${{ inputs.tags }}
         run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(app-*.whl)
+          shopt -u nullglob
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "[ERROR] expected exactly one deployment wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+
           mkdir -p scripts
           cp ../scripts/build_story_agent_context.py ./scripts/build_story_agent_context.py
           cp ../scripts/apply_story_agent_identity_review.py ./scripts/apply_story_agent_identity_review.py
@@ -86,8 +94,8 @@ jobs:
           cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py
           chmod +x run_be.sh boot-start-api.sh verify_backend_prod_deploy.sh
           # *.whl, appspec.yml, run_be.sh, boot-start-api.sh, gconf.py, .env.production, init/, batch/ 압축
-          zip -r $GITHUB_SHA.zip *.whl appspec.yml run_be.sh boot-start-api.sh gconf.py verify_backend_prod_deploy.sh .env.production init/ batch/ scripts/
-          aws s3 cp $GITHUB_SHA.zip s3://$S3_BUCKET/$GITHUB_SHA.zip
+          zip -r "$GITHUB_SHA.zip" "${wheels[0]}" appspec.yml run_be.sh boot-start-api.sh gconf.py verify_backend_prod_deploy.sh .env.production init/ batch/ scripts/
+          aws s3 cp "$GITHUB_SHA.zip" "s3://$S3_BUCKET/$GITHUB_SHA.zip"
           DEPLOY_ID=$(aws deploy create-deployment \
             --application-name $APPLICATION_NAME \
             --deployment-config-name $DEPLOY_CONFIG_NAME \
