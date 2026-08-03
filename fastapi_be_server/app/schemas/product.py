@@ -57,7 +57,7 @@ class PostProductsReqBody(ProductsBase):
         default="Y", examples=["Y"], description="웹소챗 활성화 여부"
     )
     ai_content_service_enabled_yn: Optional[str] = Field(
-        default="N", examples=["N"], description="플랫폼 내 AI 콘텐츠 서비스 활성화 동의 여부"
+        default="Y", examples=["Y"], description="플랫폼 내 AI 콘텐츠 서비스 활성화 동의 여부"
     )
     ai_external_promotion_yn: Optional[str] = Field(
         default="N", examples=["N"], description="홍보·광고 목적 AI 생성 콘텐츠 외부 채널 게재 동의 여부"
