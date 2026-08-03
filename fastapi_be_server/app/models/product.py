@@ -111,7 +111,7 @@ class Product(Base):
     ai_content_service_enabled_yn: Mapped[str] = mapped_column(
         String(settings.VARCHAR_YN_SIZE),
         nullable=False,
-        server_default="N",
+        server_default="Y",
         comment="플랫폼 내 AI 콘텐츠 서비스 활성화 동의 여부",
     )
     ai_external_promotion_yn: Mapped[str] = mapped_column(
