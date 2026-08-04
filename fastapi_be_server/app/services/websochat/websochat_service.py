@@ -127,7 +127,7 @@ from app.services.websochat.websochat_scope_resolver import (
     WEBSOCHAT_KOREAN_ORDINAL_MAP,
     WEBSOCHAT_ORDINAL_EPISODE_RE,
     _infer_websochat_read_episode_to_from_prompt,
-    _is_websochat_unread_scope_prompt,
+    _merge_websochat_prompt_read_scope,
     _resolve_websochat_prompt_read_scope_decision,
     _resolve_websochat_scope_read_episode_to,
 )
@@ -1197,8 +1197,6 @@ async def _apply_websochat_account_read_scope(
     requested_account_read_episode_to = _resolve_websochat_requested_episode_to(account_read_episode_to)
     if not requested_account_read_episode_to:
         return normalized
-    if str(normalized.get("read_scope_source") or "").strip().lower() == "prompt":
-        return normalized
     authorized_scope = await _get_websochat_authorized_read_scope(
         product_id=product_id,
         user_id=user_id,
@@ -1238,19 +1236,40 @@ async def _clamp_websochat_session_read_scope_to_authorized(
     synced_latest_episode_no: int | None,
     db: AsyncSession,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    authorized_scope = await _get_websochat_authorized_read_scope(
+        product_id=product_id,
+        user_id=user_id,
+        requested_episode_to=_resolve_websochat_requested_episode_to(
+            session_memory.get("read_episode_to")
+        ),
+        synced_latest_episode_no=synced_latest_episode_no,
+        db=db,
+    )
+    return (
+        _clamp_websochat_session_read_scope_with_authorized_scope(
+            session_memory=session_memory,
+            authorized_scope=authorized_scope,
+        ),
+        authorized_scope,
+    )
+
+
+def _clamp_websochat_session_read_scope_with_authorized_scope(
+    *,
+    session_memory: dict[str, Any],
+    authorized_scope: dict[str, Any],
+) -> dict[str, Any]:
     normalized = _normalize_websochat_session_memory(session_memory)
     requested_read_episode_to = _resolve_websochat_requested_episode_to(
         normalized.get("read_episode_to")
     )
-    authorized_scope = await _get_websochat_authorized_read_scope(
-        product_id=product_id,
-        user_id=user_id,
-        requested_episode_to=requested_read_episode_to,
-        synced_latest_episode_no=synced_latest_episode_no,
-        db=db,
+    max_authorized_episode_to = _resolve_websochat_requested_episode_to(
+        authorized_scope.get("maxAuthorizedEpisodeTo")
     )
-    authorized_read_episode_to = _resolve_websochat_requested_episode_to(
-        authorized_scope.get("authorizedReadEpisodeTo")
+    authorized_read_episode_to = (
+        min(requested_read_episode_to, max_authorized_episode_to)
+        if requested_read_episode_to and max_authorized_episode_to
+        else None
     )
     if requested_read_episode_to and authorized_read_episode_to:
         normalized["read_episode_to"] = authorized_read_episode_to
@@ -1259,7 +1278,45 @@ async def _clamp_websochat_session_read_scope_to_authorized(
         normalized["read_episode_to"] = None
         normalized["read_scope_state"] = "unknown"
         normalized["read_scope_source"] = "unknown"
-    return normalized, authorized_scope
+    return normalized
+
+
+def _resolve_websochat_request_read_scope_memories(
+    *,
+    base_memory: dict[str, Any],
+    account_read_episode_to: int | None,
+    prompt_decision: WebsochatPromptReadScopeDecision,
+    authorized_scope: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    rebased_memory = _normalize_websochat_session_memory(base_memory)
+    requested_account_scope = _resolve_websochat_requested_episode_to(
+        account_read_episode_to
+    )
+    max_authorized_scope = _resolve_websochat_requested_episode_to(
+        authorized_scope.get("maxAuthorizedEpisodeTo")
+    )
+    if requested_account_scope and max_authorized_scope:
+        rebased_memory["read_episode_to"] = min(
+            requested_account_scope,
+            max_authorized_scope,
+        )
+        rebased_memory["read_scope_state"] = "known"
+        rebased_memory["read_scope_source"] = "account"
+
+    persistent_memory, turn_memory = _merge_websochat_prompt_read_scope(
+        session_memory=rebased_memory,
+        decision=prompt_decision,
+    )
+    return (
+        _clamp_websochat_session_read_scope_with_authorized_scope(
+            session_memory=persistent_memory,
+            authorized_scope=authorized_scope,
+        ),
+        _clamp_websochat_session_read_scope_with_authorized_scope(
+            session_memory=turn_memory,
+            authorized_scope=authorized_scope,
+        ),
+    )
 
 
 def _build_websochat_cta_cards(
@@ -1382,7 +1439,7 @@ def _build_websochat_read_scope_required_reply() -> str:
     return (
         "아직 어디까지 읽었는지 모르겠어요.\n"
         "스포일러 안 섞이게 맞춰서 이야기하려면, 어디까지 읽었는지만 먼저 알려주세요.\n"
-        "예: 프롤로그까지 읽었어 / 습격까지 읽었어 / 아직 시작 안 했어"
+        "예: 3화"
     )
 
 
@@ -2072,93 +2129,6 @@ async def _build_websochat_read_scope_label(
     return f"{resolved_read_episode_to}화"
 
 
-def _normalize_websochat_scope_lookup_text(raw_text: str | None) -> str:
-    normalized = re.sub(r"\s+", "", str(raw_text or "").strip().lower())
-    return re.sub(r"[^0-9a-z가-힣]", "", normalized)
-
-
-def _extract_websochat_episode_title_aliases(episode_title: str | None) -> list[str]:
-    aliases: list[str] = []
-
-    def append_alias(raw_value: str | None) -> None:
-        normalized = _normalize_websochat_scope_lookup_text(raw_value)
-        if len(normalized) < 2 or normalized in aliases:
-            return
-        aliases.append(normalized)
-
-    normalized_title = str(episode_title or "").strip()
-    if not normalized_title:
-        return aliases
-
-    append_alias(normalized_title)
-    prefix_match = re.match(r"^(프롤로그|\d+\s*화)\s*[\.\-:：·\)\]]*\s*(.*)$", normalized_title, re.IGNORECASE)
-    if prefix_match:
-        append_alias(prefix_match.group(1))
-        append_alias(prefix_match.group(2))
-
-    return aliases
-
-
-def _augment_websochat_episode_title_aliases(
-    *,
-    episode_no: int,
-    episode_title: str | None,
-) -> list[str]:
-    aliases = _extract_websochat_episode_title_aliases(episode_title)
-    if episode_no == 1:
-        for alias in ("프롤로그", "prologue"):
-            normalized = _normalize_websochat_scope_lookup_text(alias)
-            if normalized and normalized not in aliases:
-                aliases.append(normalized)
-    return aliases
-
-
-async def _resolve_websochat_prompt_episode_title_scope(
-    *,
-    product_id: int,
-    latest_episode_no: int,
-    user_prompt: str,
-    db: AsyncSession,
-) -> int | None:
-    prompt_lookup = _normalize_websochat_scope_lookup_text(user_prompt)
-    if not prompt_lookup or latest_episode_no <= 0:
-        return None
-
-    episode_rows = await _get_websochat_public_episode_refs(
-        product_id=product_id,
-        latest_episode_no=latest_episode_no,
-        db=db,
-    )
-    matched_scores: list[tuple[int, int]] = []
-    for row in episode_rows:
-        episode_no = int(row.get("episodeNo") or 0)
-        if episode_no <= 0:
-            continue
-        matched_length = max(
-            (
-                len(alias)
-                for alias in _augment_websochat_episode_title_aliases(
-                    episode_no=episode_no,
-                    episode_title=row.get("episodeTitle"),
-                )
-                if alias in prompt_lookup
-            ),
-            default=0,
-        )
-        if matched_length > 0:
-            matched_scores.append((episode_no, matched_length))
-
-    if not matched_scores:
-        return None
-
-    best_length = max(score for _, score in matched_scores)
-    best_episode_nos = sorted({episode_no for episode_no, score in matched_scores if score == best_length})
-    if len(best_episode_nos) != 1:
-        return None
-
-    return best_episode_nos[0]
-
-
 async def _resolve_websochat_prompt_read_episode_to(
     *,
     product_id: int,
@@ -2166,26 +2136,10 @@ async def _resolve_websochat_prompt_read_episode_to(
     user_prompt: str,
     db: AsyncSession,
 ) -> int | None:
-    if _is_websochat_unread_scope_prompt(user_prompt):
-        return 0
-
-    inferred_from_number = _infer_websochat_read_episode_to_from_prompt(
+    return _infer_websochat_read_episode_to_from_prompt(
         user_prompt,
         latest_episode_no=latest_episode_no,
     )
-    if inferred_from_number is not None:
-        return inferred_from_number
-
-    resolved_from_title = await _resolve_websochat_prompt_episode_title_scope(
-        product_id=product_id,
-        latest_episode_no=latest_episode_no,
-        user_prompt=user_prompt,
-        db=db,
-    )
-    if resolved_from_title is not None:
-        return resolved_from_title
-
-    return None
 
 
 def _expand_websochat_keyword_variants(token: str) -> list[str]:
@@ -3525,7 +3479,7 @@ async def _generate_websochat_worldcup_reply(
     read_scope_ceiling_episode_no = _resolve_websochat_episode_ref_ceiling(
         latest_episode_no,
         synced_latest_episode_no,
-        None,
+        normalized.get("read_episode_to"),
     )
 
     def clamp_worldcup_read_scope(read_episode_to: int | None) -> int | None:
@@ -3563,8 +3517,15 @@ async def _generate_websochat_worldcup_reply(
         reply = "좋아요. 월드컵은 여기서 잠깐 쉬고, 다시 작품 얘기로 돌아가볼게요."
         return reply, _clear_websochat_game_context(normalized)
 
+    top_level_read_scope = max(int(normalized.get("read_episode_to") or 0), 0)
+
     def clamp_worldcup_state_read_scope(current_state: dict[str, Any]) -> bool:
         previous_value = max(int(current_state.get("read_episode_to") or 0), 0)
+        if top_level_read_scope <= 0:
+            if previous_value <= 0:
+                return False
+            current_state["read_episode_to"] = None
+            return True
         if previous_value <= 0:
             return False
         next_value = clamp_worldcup_read_scope(previous_value)
@@ -3574,12 +3535,11 @@ async def _generate_websochat_worldcup_reply(
         return True
 
     read_scope_was_clamped = clamp_worldcup_state_read_scope(state)
-    inferred_read_episode_to = await _resolve_websochat_prompt_read_episode_to(
-        product_id=int(product_row.get("productId") or 0),
+    inferred_read_episode_to = _resolve_websochat_scope_read_episode_to(
+        session_memory=normalized,
         latest_episode_no=read_scope_ceiling_episode_no or latest_episode_no,
         user_prompt=user_prompt,
-        db=db,
-    )
+    ) or None
     inferred_requested_size = int(followup["requested_size"] or 0) or None
     requested_gender_scope = str(followup["gender_scope"] or "").strip().lower() or None
     requested_category = str(followup["category"] or "").strip().lower() or None
@@ -3642,7 +3602,7 @@ async def _generate_websochat_worldcup_reply(
     if not state.get("read_episode_to"):
         reply = (
             "월드컵은 읽은 범위 기준으로만 돌릴게.\n"
-            "어디까지 읽었는지 말해줘. 예: 3화까지 읽었어 / 프롤로그까지 읽었어"
+            "어디까지 읽었는지 말해줘. 예: 3화"
         )
         return reply, _set_websochat_game_state(
             normalized,
@@ -9009,14 +8969,6 @@ async def post_message(
             user_prompt=req_body.content,
             game_read_episode_to=req_body.game_read_episode_to,
         )
-    next_session_memory = await _apply_websochat_account_read_scope(
-        next_session_memory,
-        req_body.account_read_episode_to,
-        product_id=int(session_row["product_id"]),
-        user_id=user_id,
-        synced_latest_episode_no=synced_latest_episode_no,
-        db=db,
-    )
     requested_next_episode_write = _is_websochat_noncanonical_action(
         req_body.qa_action_key
     ) or _is_websochat_next_episode_write_query(req_body.content)
@@ -9035,34 +8987,15 @@ async def post_message(
         user_prompt=req_body.content,
         inferred_read_episode_to=inferred_prompt_read_episode_to,
     )
-    if read_scope_decision["scope_state"] == "known" and read_scope_decision["read_episode_to"] is not None:
-        next_session_memory["read_episode_to"] = int(read_scope_decision["read_episode_to"])
-        next_session_memory["read_scope_state"] = "known"
-        next_session_memory["read_scope_source"] = "prompt"
-    elif read_scope_decision["scope_state"] == "none":
-        next_session_memory["read_episode_to"] = None
-        next_session_memory["read_scope_state"] = "none"
-        next_session_memory["read_scope_source"] = "prompt"
-    next_session_memory, authorized_scope = await _clamp_websochat_session_read_scope_to_authorized(
-        session_memory=next_session_memory,
-        product_id=int(session_row["product_id"]),
-        user_id=user_id,
-        synced_latest_episode_no=synced_latest_episode_no,
-        db=db,
+    (
+        persistent_scope_memory,
+        next_session_memory,
+    ) = _resolve_websochat_request_read_scope_memories(
+        base_memory=next_session_memory,
+        account_read_episode_to=req_body.account_read_episode_to,
+        prompt_decision=read_scope_decision,
+        authorized_scope=authorized_scope,
     )
-    if is_character_chat_session:
-        _assert_websochat_character_chat_read_scope_not_decreased(
-            current_read_episode_to=int(current_session_memory.get("read_episode_to") or 0),
-            next_read_episode_to=int(next_session_memory.get("read_episode_to") or 0),
-        )
-        next_session_memory = await _ensure_websochat_character_chat_entry_context(
-            session_memory=next_session_memory,
-            product_id=int(session_row["product_id"]),
-            latest_episode_no=latest_episode_no,
-            resolved_active_character=str(resolved_active_character or ""),
-            resolution=resolution,
-            db=db,
-        )
 
     display_read_episode_to = _resolve_websochat_display_read_episode_to(
         scope_state=_resolve_websochat_read_scope_state(next_session_memory),
@@ -9139,6 +9072,37 @@ async def post_message(
             else WEBSOCHAT_DEFAULT_MODEL_KEY
         )
         next_session_memory["selected_model_key"] = selected_model_key
+        (
+            persistent_scope_memory,
+            locked_turn_scope_memory,
+        ) = _resolve_websochat_request_read_scope_memories(
+            base_memory=locked_session_memory,
+            account_read_episode_to=req_body.account_read_episode_to,
+            prompt_decision=read_scope_decision,
+            authorized_scope=authorized_scope,
+        )
+        for key in ("read_episode_to", "read_scope_state", "read_scope_source"):
+            next_session_memory[key] = locked_turn_scope_memory.get(key)
+        next_session_memory = _normalize_websochat_session_memory(next_session_memory)
+        if is_character_chat_session:
+            _assert_websochat_character_chat_read_scope_not_decreased(
+                current_read_episode_to=int(locked_session_memory.get("read_episode_to") or 0),
+                next_read_episode_to=int(persistent_scope_memory.get("read_episode_to") or 0),
+            )
+            next_session_memory = await _ensure_websochat_character_chat_entry_context(
+                session_memory=next_session_memory,
+                product_id=int(session_row["product_id"]),
+                latest_episode_no=latest_episode_no,
+                resolved_active_character=str(resolved_active_character or ""),
+                resolution=resolution,
+                db=db,
+            )
+        display_read_episode_to = _resolve_websochat_display_read_episode_to(
+            scope_state=_resolve_websochat_read_scope_state(next_session_memory),
+            latest_episode_no=latest_episode_no,
+            synced_latest_episode_no=synced_latest_episode_no,
+            requested_read_episode_to=next_session_memory.get("read_episode_to"),
+        )
         effective_model_key = _resolve_websochat_effective_model_key(
             selected_model_key,
             effective_qa_action_key,
@@ -9175,6 +9139,9 @@ async def post_message(
             }
 
         if character_resolution_clarify_reply:
+            clarify_session_memory = dict(next_session_memory)
+            for key in ("read_episode_to", "read_scope_state", "read_scope_source"):
+                clarify_session_memory[key] = persistent_scope_memory.get(key)
             user_content = str(req_body.content or request_active_character or "").strip()
             insert_query = text(
                 """
@@ -9241,9 +9208,9 @@ async def post_message(
                     "next_title": _resolve_websochat_next_session_title(
                         default_prompt=user_content,
                         starter_mode_key=starter_mode_key,
-                        session_memory=next_session_memory,
+                        session_memory=clarify_session_memory,
                     ),
-                    "session_memory_json": _serialize_websochat_session_memory(next_session_memory),
+                    "session_memory_json": _serialize_websochat_session_memory(clarify_session_memory),
                     "updated_id": created_id,
                     "session_id": session_id,
                 },
@@ -9463,13 +9430,20 @@ async def post_message(
                 user_prompt=req_body.content,
                 assistant_reply=assistant_reply,
             )
-        next_session_memory, _ = await _clamp_websochat_session_read_scope_to_authorized(
+        next_session_memory, fresh_authorized_scope = await _clamp_websochat_session_read_scope_to_authorized(
             session_memory=next_session_memory,
             product_id=int(session_row["product_id"]),
             user_id=user_id,
             synced_latest_episode_no=synced_latest_episode_no,
             db=db,
         )
+        persistent_scope_memory = _clamp_websochat_session_read_scope_with_authorized_scope(
+            session_memory=persistent_scope_memory,
+            authorized_scope=fresh_authorized_scope,
+        )
+        turn_read_episode_to = next_session_memory.get("read_episode_to")
+        for key in ("read_episode_to", "read_scope_state", "read_scope_source"):
+            next_session_memory[key] = persistent_scope_memory.get(key)
 
         insert_query = text(
             """
@@ -9582,6 +9556,11 @@ async def post_message(
             _build_websochat_prompt_preview(req_body.content),
         )
 
+        final_episode_ref_ceiling = _resolve_websochat_episode_ref_ceiling(
+            int(product_row.get("latestEpisodeNo") or 0),
+            _resolve_websochat_synced_latest_episode_no(product_row),
+            turn_read_episode_to,
+        )
         assistant_message = (
             {
                 "messageId": int(assistant_result.lastrowid),
@@ -9598,11 +9577,7 @@ async def post_message(
                     "clientMessageId": req_body.client_message_id,
                     "content": assistant_reply,
                 },
-                latest_episode_no=_resolve_websochat_episode_ref_ceiling(
-                    int(product_row.get("latestEpisodeNo") or 0),
-                    _resolve_websochat_synced_latest_episode_no(product_row),
-                    next_session_memory.get("read_episode_to"),
-                ),
+                latest_episode_no=final_episode_ref_ceiling,
             )
         )
         if (
@@ -9613,7 +9588,11 @@ async def post_message(
         ):
             assistant_message = {
                 **assistant_message,
-                "referencedEpisodeNos": sorted(set(route_referenced_episode_nos)),
+                "referencedEpisodeNos": [
+                    episode_no
+                    for episode_no in sorted(set(route_referenced_episode_nos))
+                    if episode_no <= final_episode_ref_ceiling
+                ],
             }
         logger.info(
             "websochat reply_episode_refs session_id=%s route_mode=%s referenced_episode_nos=%s reply_preview=%r",

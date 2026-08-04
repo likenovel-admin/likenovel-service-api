@@ -5,6 +5,128 @@ from app.services.websochat import websochat_service
 
 
 class WebsochatWorldcupScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worldcup_unknown_scope_does_not_initialize_from_freeform_prompt(self):
+        session_memory = {
+            "active_mode": "ideal_worldcup",
+            "read_scope_state": "unknown",
+            "read_scope_source": "unknown",
+            "game_context": {
+                "mode": "ideal_worldcup",
+                "gender_scope": "mixed",
+                "category": "romance",
+            },
+            "games": {
+                "ideal_worldcup": {
+                    "mixed": {
+                        "romance": {"read_episode_to": 50},
+                    },
+                    "male": {
+                        "romance": {"read_episode_to": 50},
+                    },
+                },
+            },
+        }
+        product_row = {
+            "productId": 777,
+            "title": "테스트 작품",
+            "contextStatus": "ready",
+            "latestEpisodeNo": 50,
+            "syncedLatestEpisodeNo": 50,
+        }
+
+        with (
+            patch.object(
+                websochat_service,
+                "_build_websochat_read_scope_label",
+                new_callable=AsyncMock,
+                return_value="50화",
+            ),
+            patch.object(
+                websochat_service,
+                "get_websochat_game_candidate_profiles",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as get_candidates,
+        ):
+            reply, next_memory = await websochat_service._generate_websochat_worldcup_reply(
+                session_memory=session_memory,
+                product_row=product_row,
+                user_prompt="남성으로 계속해줘",
+                db=AsyncMock(),
+            )
+
+        self.assertEqual(next_memory["game_context"]["gender_scope"], "male")
+        state = websochat_service._get_websochat_game_state(
+            next_memory,
+            game_mode="ideal_worldcup",
+            gender_scope="male",
+            category="romance",
+        )
+        self.assertIsNone(state["read_episode_to"])
+        self.assertIn("예: 3화", reply)
+        get_candidates.assert_not_awaited()
+
+    async def test_worldcup_preserves_top_level_turn_scope_ceiling(self):
+        session_memory = {
+            "active_mode": "ideal_worldcup",
+            "read_episode_to": 49,
+            "read_scope_state": "known",
+            "read_scope_source": "account",
+            "game_context": {
+                "mode": "ideal_worldcup",
+                "gender_scope": "mixed",
+                "category": "romance",
+            },
+            "games": {
+                "ideal_worldcup": {
+                    "mixed": {
+                        "romance": {"read_episode_to": 49},
+                    },
+                    "male": {
+                        "romance": {"read_episode_to": 50},
+                    },
+                },
+            },
+        }
+        product_row = {
+            "productId": 777,
+            "title": "테스트 작품",
+            "contextStatus": "ready",
+            "latestEpisodeNo": 50,
+            "syncedLatestEpisodeNo": 50,
+        }
+
+        with (
+            patch.object(
+                websochat_service,
+                "_build_websochat_read_scope_label",
+                new_callable=AsyncMock,
+                return_value="49화",
+            ),
+            patch.object(
+                websochat_service,
+                "get_websochat_game_candidate_profiles",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            reply, next_memory = await websochat_service._generate_websochat_worldcup_reply(
+                session_memory=session_memory,
+                product_row=product_row,
+                user_prompt="남성으로 계속해줘",
+                db=AsyncMock(),
+            )
+
+        self.assertEqual(next_memory["game_context"]["gender_scope"], "male")
+        state = websochat_service._get_websochat_game_state(
+            next_memory,
+            game_mode="ideal_worldcup",
+            gender_scope="male",
+            category="romance",
+        )
+        self.assertEqual(state["read_episode_to"], 49)
+        self.assertIn("49화", reply)
+
     async def test_worldcup_clamps_existing_game_read_scope_to_synced_latest(self):
         session_memory = {
             "active_mode": "ideal_worldcup",
