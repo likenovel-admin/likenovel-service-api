@@ -61,6 +61,34 @@ class WebsochatPaidAuthorizationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(memory["read_scope_state"], "known")
         self.assertEqual(memory["read_scope_source"], "prompt")
 
+    async def test_service_prompt_scope_accepts_exact_episode_command(self):
+        resolved = await websochat_service._resolve_websochat_prompt_read_episode_to(
+            product_id=100,
+            latest_episode_no=50,
+            user_prompt="49화",
+            db=_CountingDb(),
+        )
+
+        self.assertEqual(resolved, 49)
+
+    def test_unknown_prompt_scope_is_clamped_by_cached_authorization(self):
+        persistent_memory, turn_memory = (
+            websochat_service._resolve_websochat_request_read_scope_memories(
+                base_memory={},
+                account_read_episode_to=None,
+                prompt_decision={
+                    "read_episode_to": 50,
+                    "scope_state": "known",
+                    "is_scope_only": False,
+                },
+                authorized_scope={"maxAuthorizedEpisodeTo": 3},
+            )
+        )
+
+        self.assertEqual(persistent_memory["read_episode_to"], 3)
+        self.assertEqual(persistent_memory["read_scope_source"], "prompt")
+        self.assertEqual(turn_memory["read_episode_to"], 3)
+
     async def test_authorized_scope_uses_contiguous_paid_access_prefix(self):
         db = _FakeDb(
             [
@@ -151,30 +179,30 @@ class WebsochatPaidAuthorizationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(memory["read_scope_state"], "known")
         self.assertEqual(memory["read_scope_source"], "account")
 
-    async def test_account_read_scope_does_not_override_legacy_authorized_prompt_scope(self):
+    async def test_fresh_account_read_scope_supersedes_legacy_prompt_scope(self):
         db = _FakeDb(
             [
                 {"episodeNo": episode_no, "authorizedYn": 1}
-                for episode_no in range(1, 28)
+                for episode_no in range(1, 51)
             ]
         )
 
         memory = await websochat_service._apply_websochat_account_read_scope(
             {
-                "read_episode_to": 5,
+                "read_episode_to": 49,
                 "read_scope_state": "known",
                 "read_scope_source": "server_authorized_prompt",
             },
-            27,
+            50,
             product_id=100,
             user_id=200,
-            synced_latest_episode_no=27,
+            synced_latest_episode_no=50,
             db=db,
         )
 
-        self.assertEqual(memory["read_episode_to"], 5)
+        self.assertEqual(memory["read_episode_to"], 50)
         self.assertEqual(memory["read_scope_state"], "known")
-        self.assertEqual(memory["read_scope_source"], "prompt")
+        self.assertEqual(memory["read_scope_source"], "account")
 
     async def test_clamp_preserves_prompt_source_after_authorization(self):
         db = _FakeDb(
