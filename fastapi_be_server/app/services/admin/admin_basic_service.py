@@ -562,7 +562,7 @@ async def post_cancel_cash_charge_order(
         else "Admin canceled unused cash charge"
     )
 
-    async with db.begin():
+    async with db.begin_nested():
         order_query = text(
             """
             SELECT
@@ -657,7 +657,7 @@ async def post_cancel_cash_charge_order(
                 message="User has already spent cash and is not eligible for cancel.",
             )
 
-        charge_cash_amount = (int(order_data["total_price"]) * 11) // 10
+        charge_cash_amount = int(order_data["total_price"])
         if charge_cash_amount <= 0:
             raise CustomResponseException(
                 status_code=status.HTTP_400_BAD_REQUEST,
