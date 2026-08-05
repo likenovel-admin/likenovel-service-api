@@ -683,10 +683,16 @@ async def post_cancel_cash_charge_order(
             )
 
         try:
-            portone_client.payment.cancel_payment(
+            cancellation = portone_client.payment.cancel_payment(
                 payment_id=order_data["pg_payment_id"],
+                amount=charge_cash_amount,
+                current_cancellable_amount=charge_cash_amount,
                 reason=reason,
-            )
+            ).cancellation
+            if not isinstance(
+                cancellation, portone.payment.SucceededPaymentCancellation
+            ) or cancellation.total_amount != charge_cash_amount:
+                raise RuntimeError("payment cancellation was not completed in full")
         except Exception as e:
             logger.error(
                 "cash charge cancel failed in payment gateway - order_id=%s, error=%s",

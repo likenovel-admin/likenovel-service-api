@@ -8,6 +8,12 @@ from app.schemas.admin import PostCancelCashChargeOrderReqBody
 from app.services.admin import admin_basic_service
 
 
+def cancel_response(cancellation_type, total_amount=10_000):
+    cancellation = MagicMock(spec=cancellation_type)
+    cancellation.total_amount = total_amount
+    return MagicMock(cancellation=cancellation)
+
+
 class FakeResult:
     def __init__(self, row=None):
         self.row = row
@@ -75,7 +81,11 @@ class FakeDb:
 class AdminCashChargeCancelServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_refunds_and_reverses_exact_payment_amount(self):
         db = FakeDb(balance=10_000)
-        cancel_payment = MagicMock()
+        cancel_payment = MagicMock(
+            return_value=cancel_response(
+                admin_basic_service.portone.payment.SucceededPaymentCancellation
+            )
+        )
 
         with (
             patch.object(
@@ -93,6 +103,8 @@ class AdminCashChargeCancelServiceTest(unittest.IsolatedAsyncioTestCase):
 
         cancel_payment.assert_called_once_with(
             payment_id="payment-101",
+            amount=10_000,
+            current_cancellable_amount=10_000,
             reason="unused charge",
         )
         self.assertEqual(
@@ -117,7 +129,11 @@ class AdminCashChargeCancelServiceTest(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 admin_basic_service.portone_client.payment,
                 "cancel_payment",
-                MagicMock(),
+                MagicMock(
+                    return_value=cancel_response(
+                        admin_basic_service.portone.payment.SucceededPaymentCancellation
+                    )
+                ),
             ),
         ):
             await admin_basic_service.post_cancel_cash_charge_order(
@@ -129,6 +145,45 @@ class AdminCashChargeCancelServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(db.begin_calls, 0)
         self.assertEqual(db.begin_nested_calls, 1)
+
+    async def test_cancel_requires_succeeded_gateway_response_for_exact_amount(self):
+        cases = (
+            (admin_basic_service.portone.payment.RequestedPaymentCancellation, 10_000),
+            (admin_basic_service.portone.payment.SucceededPaymentCancellation, 9_999),
+        )
+
+        for cancellation_type, total_amount in cases:
+            with self.subTest(
+                cancellation_type=cancellation_type.__name__,
+                total_amount=total_amount,
+            ):
+                db = FakeDb(balance=10_000)
+                with patch.object(
+                    admin_basic_service.portone_client.payment,
+                    "cancel_payment",
+                    MagicMock(
+                        return_value=cancel_response(cancellation_type, total_amount)
+                    ),
+                ):
+                    with self.assertRaises(CustomResponseException) as raised:
+                        await admin_basic_service.post_cancel_cash_charge_order(
+                            order_id=101,
+                            req_body=PostCancelCashChargeOrderReqBody(),
+                            kc_user_id="kc-admin",
+                            db=db,
+                        )
+
+                self.assertEqual(raised.exception.status_code, 500)
+                self.assertEqual(
+                    raised.exception.message,
+                    ErrorMessages.PAYMENT_SERVICE_ERROR,
+                )
+                self.assertFalse(
+                    any(
+                        query.lstrip().startswith(("INSERT", "UPDATE", "DELETE"))
+                        for query, _ in db.executed
+                    )
+                )
 
     async def test_cancel_does_not_call_gateway_when_balance_is_insufficient(self):
         db = FakeDb(balance=9_999)
