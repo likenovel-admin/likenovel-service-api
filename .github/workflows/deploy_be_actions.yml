@@ -51,6 +51,7 @@ jobs:
           poetry install
           poetry run python tests/test_ai_reader_worker_deploy.py
           poetry run python tests/test_backend_prod_workflow_contract.py
+          poetry run python -m unittest tests.test_admin_cash_charge_cancel_service
           bash -n dist/run_be.sh
           bash -n dist/boot-start-api.sh
           bash -n dist/verify_backend_prod_deploy.sh
