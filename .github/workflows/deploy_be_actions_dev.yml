@@ -43,6 +43,7 @@ jobs:
           # - 배포 산출물(wheel)만 생성합니다.
           poetry install
           poetry run python tests/test_ai_reader_worker_deploy.py
+          poetry run python -m unittest tests.test_admin_cash_charge_cancel_service
           bash -n dist/run_be.dev.sh
           bash -n dist/boot-start-api-dev.sh
           bash -n dist/verify_backend_dev_deploy.sh
