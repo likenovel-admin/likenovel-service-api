@@ -13,7 +13,7 @@ on:
 
 # github_token 사용 권한
 permissions:
-  contents: write
+  contents: read
 
 # 워크플로우
 # 내부 동작은 github 내 가상환경에서 실행되는 형태
@@ -51,11 +51,6 @@ jobs:
           bash -n dist/verify_backend_prod_deploy.sh
           shellcheck --severity=warning dist/run_be.sh dist/boot-start-api.sh dist/verify_backend_prod_deploy.sh
           poetry build
-          git config --global user.name 'likenovel-dev'
-          git config --global user.email 'infra@likenovel.net'
-          git add pyproject.toml
-          git commit -m "version update"
-          git push
         working-directory: ./fastapi_be_server
 
       - name: Configure AWS credentials

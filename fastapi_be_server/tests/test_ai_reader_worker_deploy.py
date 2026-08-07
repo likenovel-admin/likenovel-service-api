@@ -51,6 +51,18 @@ def test_prod_workflow_runs_pre_deploy_quality_gates_and_waits_for_codedeploy():
     assert 'aws deploy get-deployment --deployment-id "$DEPLOY_ID"' in content
 
 
+def test_prod_workflow_keeps_ephemeral_version_and_does_not_write_git():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    assert "  contents: read" in content
+    assert "poetry version patch" in content
+    assert content.index("poetry version patch") < content.index("poetry build")
+    assert "git add pyproject.toml" not in content
+    assert 'git commit -m "version update"' not in content
+    assert "git push" not in content
+
+
 def test_prod_workflow_runs_hard_readback_over_bastion():
     workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions.yml"
     content = workflow.read_text(encoding="utf-8")
