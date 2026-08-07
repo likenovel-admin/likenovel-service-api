@@ -1053,11 +1053,14 @@ async def _process_reader_session_decision(
             db=db,
         )
 
+    llm_usage: decision_service.ReaderLlmUsage | None = None
     try:
-        llm_decision = await decision_service.request_reader_decision(
+        llm_result = await decision_service.request_reader_decision_with_usage(
             snapshot,
             llm_call=llm_call,
         )
+        llm_decision = llm_result.decision
+        llm_usage = llm_result.usage
         context = decision_service.ReaderActionContext(
             agent_id=session.ai_reader_agent_id,
             user_id=session.user_id,
@@ -1072,6 +1075,17 @@ async def _process_reader_session_decision(
                 db,
                 llm_decision_id=llm_decision_id,
                 error_message=str(exc) or exc.__class__.__name__,
+                usage=(
+                    exc.usage
+                    if isinstance(
+                        exc,
+                        (
+                            decision_service.InvalidReaderDecisionError,
+                            decision_service.ReaderLlmResponseError,
+                        ),
+                    )
+                    else None
+                ),
             )
         raise
 
@@ -1093,12 +1107,14 @@ async def _process_reader_session_decision(
                     db,
                     llm_decision_id=llm_decision_id,
                     error_message=block_reason,
+                    usage=llm_usage,
                 )
             else:
                 await mark_reader_llm_decision_succeeded(
                     db,
                     llm_decision_id=llm_decision_id,
                     decision=llm_decision,
+                    usage=llm_usage,
                 )
                 result = await persist_reader_session_decision(
                     session=session,
@@ -1113,6 +1129,7 @@ async def _process_reader_session_decision(
                 db,
                 llm_decision_id=llm_decision_id,
                 decision=llm_decision,
+                usage=llm_usage,
             )
             result = await persist_reader_session_decision(
                 session=session,
@@ -2494,6 +2511,7 @@ async def mark_reader_llm_decision_succeeded(
     *,
     llm_decision_id: int,
     decision: decision_service.ReaderLlmDecision,
+    usage: decision_service.ReaderLlmUsage | None = None,
 ) -> None:
     decision_json = json.dumps(asdict(decision), ensure_ascii=False, sort_keys=True)
     result = await db.execute(
@@ -2502,6 +2520,9 @@ async def mark_reader_llm_decision_succeeded(
                set decision_json = :decision_json
                  , decision_status = 'success'
                  , error_message = null
+                 , input_tokens = :input_tokens
+                 , output_tokens = :output_tokens
+                 , estimated_cost_usd = :estimated_cost_usd
                  , updated_date = current_timestamp
              where ai_reader_llm_decision_id = :llm_decision_id
                and decision_status = 'pending'
@@ -2509,6 +2530,11 @@ async def mark_reader_llm_decision_succeeded(
         {
             "llm_decision_id": llm_decision_id,
             "decision_json": decision_json,
+            "input_tokens": usage.input_tokens if usage is not None else None,
+            "output_tokens": usage.output_tokens if usage is not None else None,
+            "estimated_cost_usd": (
+                usage.estimated_cost_usd if usage is not None else None
+            ),
         },
     )
     _ensure_rows_changed(result, "mark_reader_llm_decision_succeeded", 1)
@@ -2519,12 +2545,16 @@ async def mark_reader_llm_decision_failed(
     *,
     llm_decision_id: int,
     error_message: str,
+    usage: decision_service.ReaderLlmUsage | None = None,
 ) -> None:
     result = await db.execute(
         text("""
             update tb_ai_reader_llm_decision
                set decision_status = 'failed'
                  , error_message = :error_message
+                 , input_tokens = :input_tokens
+                 , output_tokens = :output_tokens
+                 , estimated_cost_usd = :estimated_cost_usd
                  , updated_date = current_timestamp
              where ai_reader_llm_decision_id = :llm_decision_id
                and decision_status = 'pending'
@@ -2532,6 +2562,11 @@ async def mark_reader_llm_decision_failed(
         {
             "llm_decision_id": llm_decision_id,
             "error_message": error_message[:1000],
+            "input_tokens": usage.input_tokens if usage is not None else None,
+            "output_tokens": usage.output_tokens if usage is not None else None,
+            "estimated_cost_usd": (
+                usage.estimated_cost_usd if usage is not None else None
+            ),
         },
     )
     _ensure_rows_changed(result, "mark_reader_llm_decision_failed", 1)
