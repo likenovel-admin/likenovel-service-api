@@ -3,11 +3,16 @@ set -euo pipefail
 
 SERVICE_NAME=likenovel-api.service
 APP_DIR=/home/ln-admin/likenovel/api
+BATCH_DIR=/home/ln-admin/likenovel/batch
 PID_FILE=/home/ln-admin/likenovel/api/gunicorn.pid
 AI_READER_WORKER_PID=/home/ln-admin/likenovel/api/ai_reader_worker.pid
 AI_READER_WORKER_LOG=/home/ln-admin/likenovel/api/logs/data/ai_reader_worker.log
 HEALTH_URL=http://10.0.100.110:3010/health
 AI_READER_WORKER_LOG_MAX_AGE_SECONDS=300
+CODEBOOK_FILES=(
+  allowed-labels-by-axis.json
+  label-definitions-by-axis.json
+)
 
 # expected runtime output:
 # sqlalchemy==2.0.41
@@ -79,6 +84,15 @@ ss -ltnp | grep -F "10.0.100.110:3010" || fail "10.0.100.110:3010 listener missi
 
 note "checking health endpoint"
 curl -fsS "$HEALTH_URL" >/dev/null || fail "$HEALTH_URL failed"
+
+note "checking DNA codebook runtime copies"
+for codebook_file in "${CODEBOOK_FILES[@]}"; do
+  if require_file "$APP_DIR/batch/$codebook_file" \
+    && require_file "$BATCH_DIR/$codebook_file"; then
+    cmp -s "$APP_DIR/batch/$codebook_file" "$BATCH_DIR/$codebook_file" \
+      || fail "DNA codebook drift: $codebook_file"
+  fi
+done
 
 note "checking AI reader worker pid"
 if require_file "$AI_READER_WORKER_PID"; then

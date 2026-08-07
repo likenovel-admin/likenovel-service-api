@@ -48,10 +48,10 @@ class AiDnaCodebookContractTest(TestCase):
         docs_dir = CODEBOOK_DIRS[0]
 
         for filename in ("allowed-labels-by-axis.json", "label-definitions-by-axis.json"):
-            expected = (docs_dir / filename).read_text(encoding="utf-8")
+            expected = (docs_dir / filename).read_bytes()
             for codebook_dir in CODEBOOK_DIRS[1:]:
                 self.assertEqual(
-                    (codebook_dir / filename).read_text(encoding="utf-8"),
+                    (codebook_dir / filename).read_bytes(),
                     expected,
                     f"{codebook_dir / filename} must match {docs_dir / filename}",
                 )
