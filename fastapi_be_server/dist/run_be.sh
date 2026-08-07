@@ -18,6 +18,12 @@ AI_READER_WORKER_LOG=./logs/data/ai_reader_worker.log
 AI_READER_WORKER_PID=./ai_reader_worker.pid
 REQUIRED_ENV_KEYS=(DB_USER_ID DB_USER_PW DB_IP DB_PORT)
 PATH_ENV_KEYS=(ROOT_PATH FCM_SERVICE_ACCOUNT_JSON_PATH)
+BATCH_SRC=/home/ln-admin/likenovel/api/batch
+BATCH_DST=/home/ln-admin/likenovel/batch
+BATCH_CODEBOOK_FILES=(
+  allowed-labels-by-axis.json
+  label-definitions-by-axis.json
+)
 
 load_env_file() {
   local env_file="$1"
@@ -303,8 +309,104 @@ start_ai_reader_worker() {
   fi
 }
 
+preflight_batch_codebooks() {
+  local codebook_file
+
+  for codebook_file in "${BATCH_CODEBOOK_FILES[@]}"; do
+    if [ ! -f "$BATCH_SRC/$codebook_file" ]; then
+      echo "[run_be] mandatory batch codebook missing: $BATCH_SRC/$codebook_file" >&2
+      return 1
+    fi
+  done
+}
+
+sync_batch_codebooks() {
+  local codebook_file
+  local stage_dir
+  local backup_dir
+  local sync_status=0
+  local restore_status=0
+
+  if ! stage_dir="$(mktemp -d "$BATCH_DST/.dna-codebook-stage.XXXXXX")"; then
+    return 1
+  fi
+  if ! backup_dir="$(mktemp -d "$BATCH_DST/.dna-codebook-backup.XXXXXX")"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  for codebook_file in "${BATCH_CODEBOOK_FILES[@]}"; do
+    if ! cp "$BATCH_SRC/$codebook_file" "$stage_dir/$codebook_file"; then
+      sync_status=1
+      break
+    fi
+    if ! cmp -s "$BATCH_SRC/$codebook_file" "$stage_dir/$codebook_file"; then
+      sync_status=1
+      break
+    fi
+    if [ -f "$BATCH_DST/$codebook_file" ]; then
+      if ! cp -p "$BATCH_DST/$codebook_file" "$backup_dir/$codebook_file"; then
+        sync_status=1
+        break
+      fi
+    else
+      : > "$backup_dir/$codebook_file.missing"
+    fi
+  done
+
+  if [ "$sync_status" -eq 0 ]; then
+    for codebook_file in "${BATCH_CODEBOOK_FILES[@]}"; do
+      if ! mv -f "$stage_dir/$codebook_file" "$BATCH_DST/$codebook_file"; then
+        sync_status=1
+        break
+      fi
+    done
+  fi
+
+  if [ "$sync_status" -eq 0 ]; then
+    for codebook_file in "${BATCH_CODEBOOK_FILES[@]}"; do
+      if ! cmp -s "$BATCH_SRC/$codebook_file" "$BATCH_DST/$codebook_file"; then
+        sync_status=1
+        break
+      fi
+    done
+  fi
+
+  if [ "$sync_status" -ne 0 ]; then
+    for codebook_file in "${BATCH_CODEBOOK_FILES[@]}"; do
+      if [ -f "$backup_dir/$codebook_file" ]; then
+        cp -p "$backup_dir/$codebook_file" "$BATCH_DST/$codebook_file" || restore_status=1
+      elif [ -f "$backup_dir/$codebook_file.missing" ]; then
+        rm -f "$BATCH_DST/$codebook_file" || restore_status=1
+      fi
+    done
+    rm -rf "$stage_dir" "$backup_dir"
+    if [ "$restore_status" -ne 0 ]; then
+      echo "[run_be] batch codebook restore failed" >&2
+    fi
+    return 1
+  fi
+
+  rm -rf "$stage_dir" "$backup_dir"
+}
+
+sync_batch_files() {
+  mkdir -p "$BATCH_DST" || return 1
+  if ! sync_batch_codebooks; then
+    return 1
+  fi
+  cp "$BATCH_SRC"/*.sh "$BATCH_DST/" 2>/dev/null || true
+  cp "$BATCH_SRC"/*.sql "$BATCH_DST/" 2>/dev/null || true
+  cp "$BATCH_SRC"/*.py "$BATCH_DST/" 2>/dev/null || true
+  for batch_script in "$BATCH_DST"/*.sh; do
+    [ -f "$batch_script" ] || continue
+    chmod +x "$batch_script"
+  done
+}
+
 require_systemd_access
 validate_env_file .env.production
+preflight_batch_codebooks
 
 rm -rf ./__pycache__
 
@@ -343,19 +445,24 @@ if ! start_service_and_verify; then
 fi
 
 start_ai_reader_worker
-rm -rf "$PREV_VENV" "$NEXT_VENV.failed" "$ENV_BACKUP"
 
 # 배치 파일 동기화: 배포된 batch/ → 크론이 참조하는 /home/ln-admin/likenovel/batch/
-BATCH_SRC=/home/ln-admin/likenovel/api/batch
-BATCH_DST=/home/ln-admin/likenovel/batch
-mkdir -p "$BATCH_DST"
-cp "$BATCH_SRC"/*.sh "$BATCH_DST/" 2>/dev/null || true
-cp "$BATCH_SRC"/*.sql "$BATCH_DST/" 2>/dev/null || true
-cp "$BATCH_SRC"/*.py "$BATCH_DST/" 2>/dev/null || true
-for batch_script in "$BATCH_DST"/*.sh; do
-  [ -f "$batch_script" ] || continue
-  chmod +x "$batch_script"
-done
+if ! sync_batch_files; then
+  echo "[run_be] batch codebook sync failed; restoring previous env and venv" >&2
+  restore_status=0
+  stop_pidfile_process "$AI_READER_WORKER_PID" || restore_status=$?
+  restore_previous_env || restore_status=$?
+  restore_previous_venv_and_restart || restore_status=$?
+  if [ "$restore_status" -eq 0 ]; then
+    start_ai_reader_worker || restore_status=$?
+  fi
+  if [ "$restore_status" -ne 0 ]; then
+    echo "[run_be] rollback had failures: $restore_status" >&2
+  fi
+  exit 1
+fi
+
+rm -rf "$PREV_VENV" "$NEXT_VENV.failed" "$ENV_BACKUP"
 
 # prod 메인 룰 구좌 snapshot cron 보장 (기존 1일 1회 라인만 교체)
 MAIN_RULE_SLOT_CRON_LINE='45 1,7,13,19 * * * bash /home/ln-admin/likenovel/batch/main_rule_slot_snapshot_batch.sh >> /home/ln-admin/likenovel/batch/main_rule_slot_snapshot_batch.log 2>&1'

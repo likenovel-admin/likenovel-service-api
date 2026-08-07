@@ -1,10 +1,57 @@
 import importlib.util
+import json
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dist" / "batch" / "extract_product_dna.py"
+FASTAPI_ROOT = MODULE_PATH.parents[2]
+CODEBOOK_DIRS = [FASTAPI_ROOT / "dist" / "ai", FASTAPI_ROOT / "dist" / "batch"]
+
+
+class AiDnaCodebookContractTest(TestCase):
+    def test_runtime_codebook_copies_are_complete_and_in_sync(self):
+        expected_allowed_bytes = (CODEBOOK_DIRS[0] / "allowed-labels-by-axis.json").read_bytes()
+        expected_definitions_bytes = (CODEBOOK_DIRS[0] / "label-definitions-by-axis.json").read_bytes()
+        expected_allowed = json.loads(
+            expected_allowed_bytes.decode("utf-8")
+        )
+        expected_definitions = json.loads(
+            expected_definitions_bytes.decode("utf-8")
+        )
+
+        for codebook_dir in CODEBOOK_DIRS[1:]:
+            self.assertEqual(
+                (codebook_dir / "allowed-labels-by-axis.json").read_bytes(),
+                expected_allowed_bytes,
+            )
+            self.assertEqual(
+                (codebook_dir / "label-definitions-by-axis.json").read_bytes(),
+                expected_definitions_bytes,
+            )
+            self.assertEqual(
+                json.loads((codebook_dir / "allowed-labels-by-axis.json").read_text(encoding="utf-8")),
+                expected_allowed,
+            )
+            self.assertEqual(
+                json.loads((codebook_dir / "label-definitions-by-axis.json").read_text(encoding="utf-8")),
+                expected_definitions,
+            )
+
+        missing = {
+            axis: [label for label in labels if label not in expected_definitions.get(axis, {})]
+            for axis, labels in expected_allowed.items()
+        }
+        self.assertEqual({axis: labels for axis, labels in missing.items() if labels}, {})
+        self.assertEqual(sum(map(len, expected_allowed.values())), 361)
+
+        for label in ("회귀", "빙의", "환생"):
+            self.assertIn(label, expected_allowed["타"])
+            self.assertIn(label, expected_definitions["타"])
+        self.assertIn("무한회귀", expected_allowed["능"])
+        self.assertIn("루프", expected_allowed["작"])
+        self.assertIn("차원이동", expected_allowed["목"])
 
 
 def load_module():

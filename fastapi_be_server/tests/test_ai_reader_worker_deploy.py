@@ -125,6 +125,58 @@ def test_prod_run_script_uses_strict_mode_and_explicit_venv_pip():
     assert 'for batch_script in "$BATCH_DST"/*.sh; do' in content
 
 
+def test_prod_run_script_syncs_mandatory_dna_codebooks_before_cleanup():
+    content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
+    main_flow = content[content.index("\nrequire_systemd_access\n") :]
+
+    for filename in (
+        "allowed-labels-by-axis.json",
+        "label-definitions-by-axis.json",
+    ):
+        assert filename in content
+
+    assert "preflight_batch_codebooks" in content
+    assert "sync_batch_codebooks" in content
+    assert "if ! sync_batch_codebooks; then" in content
+    assert "return 1" in content[content.index("if ! sync_batch_codebooks; then") :]
+    assert 'cmp -s "$BATCH_SRC/$codebook_file" "$BATCH_DST/$codebook_file"' in content
+    assert main_flow.index("preflight_batch_codebooks") < main_flow.index("stop_service_and_orphans")
+    assert main_flow.index("sync_batch_files") < main_flow.index(
+        'rm -rf "$PREV_VENV" "$NEXT_VENV.failed" "$ENV_BACKUP"'
+    )
+
+
+def test_dev_run_script_syncs_mandatory_dna_codebooks():
+    content = (PROJECT_ROOT / "dist" / "run_be.dev.sh").read_text(encoding="utf-8")
+
+    for filename in (
+        "allowed-labels-by-axis.json",
+        "label-definitions-by-axis.json",
+    ):
+        assert filename in content
+
+    assert 'cmp -s "$batch_src/$codebook_file" "$batch_dst/$codebook_file"' in content
+    sync_failure_block = content[content.index("if ! sync_batch_files; then") :]
+    assert "stop_service_and_orphans" in sync_failure_block
+    assert "rollback_to_previous_release" in sync_failure_block
+    assert "start_service_and_verify" in sync_failure_block
+    assert sync_failure_block.index("rollback_to_previous_release") < sync_failure_block.index("exit 1")
+
+
+def test_prod_verify_checks_runtime_dna_codebook_copies():
+    content = (PROJECT_ROOT / "dist" / "verify_backend_prod_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "BATCH_DIR=/home/ln-admin/likenovel/batch" in content
+    for filename in (
+        "allowed-labels-by-axis.json",
+        "label-definitions-by-axis.json",
+    ):
+        assert filename in content
+    assert 'cmp -s "$APP_DIR/batch/$codebook_file" "$BATCH_DIR/$codebook_file"' in content
+
+
 def test_prod_run_script_prebuilds_next_venv_before_stopping_service():
     content = (PROJECT_ROOT / "dist" / "run_be.sh").read_text(encoding="utf-8")
     main_flow = content[content.index("\nrequire_systemd_access\n") :]
