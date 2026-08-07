@@ -6696,6 +6696,13 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             self._FakeMappingsResult(
                 [
                     {
+                        "summary_text": "현재 회차에서 주인공이 봉인된 문을 열었다."
+                    }
+                ]
+            ),
+            self._FakeMappingsResult(
+                [
+                    {
                         "state": "reading",
                         "read_episode_count": 1,
                         "bookmarked_yn": "N",
@@ -6714,9 +6721,12 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         ]
 
         async def fake_llm(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+            self.assertIn("DNA 초반요약과 함께 사용한다", system_prompt)
             self.assertIn("테스트 작품", user_prompt)
             self.assertIn("30s", user_prompt)
             self.assertIn("early_episode_summary_text", user_prompt)
+            self.assertIn("current_episode_summary_text", user_prompt)
+            self.assertIn("현재 회차에서 주인공이 봉인된 문을 열었다.", user_prompt)
             self.assertNotIn('"summary": "각성자가 탑에 오른다."', user_prompt)
             return """
             {
@@ -6756,6 +6766,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             [("read", ""), ("next_episode", "1"), ("bookmark", "Y"), ("recommend", "Y")],
         )
         self.assertIn("tb_product_ai_metadata", executed_sql)
+        self.assertIn("tb_story_agent_context_summary", executed_sql)
+        self.assertIn("summary_type = 'episode_summary'", executed_sql)
         self.assertIn("tb_user_taste_factor_score", executed_sql)
         self.assertIn("insert into tb_ai_reader_llm_decision", executed_sql)
         self.assertIn("insert into tb_ai_reader_action_queue", executed_sql)

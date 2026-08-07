@@ -1249,6 +1249,25 @@ async def build_reader_decision_snapshot(
         persona=persona,
         taste_factors=taste_factors,
     )
+    current_episode_summary_result = await db.execute(
+        text("""
+            select summary_text
+              from tb_story_agent_context_summary
+             where product_id = :product_id
+               and summary_type = 'episode_summary'
+               and is_active = 'Y'
+               and scope_key = concat('episode:', :episode_id)
+             order by version_no desc, summary_id desc
+             limit 1
+        """),
+        {
+            "product_id": target["product_id"],
+            "episode_id": target["episode_id"],
+        },
+    )
+    current_episode_summary_row = (
+        current_episode_summary_result.mappings().one_or_none()
+    )
     state = await _get_reader_product_state(session, target["product_id"], db)
     return {
         "agent": {
@@ -1277,6 +1296,11 @@ async def build_reader_decision_snapshot(
             "episode_id": target["episode_id"],
             "episode_no": target.get("episode_no"),
             "episode_title": target.get("episode_title"),
+            "current_episode_summary_text": (
+                current_episode_summary_row.get("summary_text")
+                if current_episode_summary_row
+                else None
+            ),
         },
         "dna": {
             "protagonist_type_tags": _parse_json_field(target.get("protagonist_type_tags"), []),

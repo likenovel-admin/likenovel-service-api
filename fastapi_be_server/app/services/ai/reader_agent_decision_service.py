@@ -15,7 +15,7 @@ from app.services.common.openrouter_background_credit_guard import (
 )
 
 
-READER_DECISION_PROMPT_VERSION = "ai-reader-decision-v2"
+READER_DECISION_PROMPT_VERSION = "ai-reader-decision-v3"
 READER_DECISION_MAX_TOKENS = 1200
 READER_DECISION_PARSE_MAX_ATTEMPTS = 2
 OPENROUTER_MAX_ATTEMPTS = 2
@@ -98,10 +98,11 @@ def build_reader_decision_prompt(input_snapshot: dict[str, Any]) -> tuple[str, s
 
 판단 기준:
 - 독자의 나이/성별/활동 패턴/초기 취향/DNA 취향 메모리를 우선한다.
-- 작품 DNA 태그, 제목, product.early_episode_summary_text, 이전 행동 상태, 현재 공개 지표를 참고한다.
+- 작품 DNA 태그, 제목, product.early_episode_summary_text, episode.current_episode_summary_text, 이전 행동 상태, 현재 공개 지표를 참고한다.
 - product.early_episode_summary_text는 DNA/AI 메타데이터가 만든 1~10화 초반 요약이다. 값이 있으면 작품의 초반 훅과 전개 흐름을 판단하는 주요 근거로 사용한다.
+- episode.current_episode_summary_text는 현재 episode.episode_id에 대응하는 storyctx 회차 요약이다. 값이 있으면 현재 N화 사건과 전개의 직접 근거로 DNA 초반요약과 함께 사용한다.
 - episode.episode_no가 10보다 커도 초반 요약을 현재 N화의 요약으로 해석하면 안 된다.
-- 현재 N화를 읽었다는 상태는 행동 판단 시점이다. 스냅샷에 현재 N화 본문이나 회차별 요약이 없으면 그 회차의 사건, 장면, 대사, 전개 속도를 추정하거나 지어내면 안 된다.
+- 현재 N화를 읽었다는 상태는 행동 판단 시점이다. episode.current_episode_summary_text가 없으면 그 회차의 사건, 장면, 대사, 전개 속도를 추정하거나 지어내면 안 된다.
 - 현재 회차 내용 근거가 없으면 독자 취향, 작품 DNA와 초반 요약, 이전 행동 상태, engagement_context만 조건부확률 evidence로 사용한다.
 - 스냅샷에서 없거나 빈 필드는 부정 근거로 사용하지 않는다.
 - reason과 taste_delta는 스냅샷에 실제로 있는 근거만 사용하며, 제공되지 않은 회차 세부 내용을 주장하면 안 된다.
