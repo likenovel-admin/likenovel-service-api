@@ -1,6 +1,24 @@
 import unittest
+from unittest.mock import AsyncMock
 
 from app.services.admin import admin_ai_metadata_service
+
+
+class _MappingsResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def one(self):
+        return self.rows[0]
+
+    def all(self):
+        return self.rows
+
+    def one_or_none(self):
+        return self.rows[0] if self.rows else None
 
 
 class AdminAiMetadataPromptTest(unittest.TestCase):
@@ -195,6 +213,7 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
         self.assertEqual(normalized["protagonist_type_tags"], ["성장형"])
         self.assertEqual(normalized["axis_label_scores"]["타"], [{"label": "성장형", "score": 0.7}])
 
+
     def test_normalizer_replaces_non_protagonist_knight_with_hunter(self):
         payload = {
             "summary": {
@@ -241,6 +260,82 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
 
         self.assertEqual(normalized["protagonist_job_tags"], ["헌터"])
         self.assertEqual(normalized["axis_label_scores"]["직"], [{"label": "헌터", "score": 0.7}])
+
+
+class AdminAiMetadataReadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_list_exposes_dna_status_and_storyctx_episode_progress(self):
+        db = AsyncMock()
+
+        async def execute(query, params):
+            sql = str(query)
+            if "COUNT(*) AS total_count" in sql:
+                return _MappingsResult([{"total_count": 1}])
+            self.assertIn("tb_story_agent_context_product", sql)
+            self.assertIn("story_context_status", sql)
+            self.assertIn("story_ready_episode_no", sql)
+            self.assertIn("story_total_episode_count", sql)
+            return _MappingsResult(
+                [
+                    {
+                        "product_id": 200,
+                        "title": "테스트 작품",
+                        "analysis_status": "success",
+                        "story_context_status": "processing",
+                        "story_ready_episode_no": 8,
+                        "story_total_episode_count": 12,
+                    }
+                ]
+            )
+
+        db.execute.side_effect = execute
+
+        result = await admin_ai_metadata_service.ai_product_metadata_list(
+            search_target="",
+            search_word="",
+            analysis_status="all",
+            exclude_from_recommend_yn="all",
+            page=1,
+            count_per_page=20,
+            db=db,
+        )
+
+        row = result["results"][0]
+        self.assertEqual(row["analysis_status"], "success")
+        self.assertEqual(row["story_context_status"], "processing")
+        self.assertEqual(row["story_ready_episode_no"], 8)
+        self.assertEqual(row["story_total_episode_count"], 12)
+
+    async def test_detail_exposes_storyctx_episode_progress(self):
+        db = AsyncMock()
+
+        async def execute(query, params):
+            sql = str(query)
+            self.assertIn("tb_story_agent_context_product", sql)
+            self.assertIn("story_context_status", sql)
+            self.assertIn("story_ready_episode_no", sql)
+            self.assertIn("story_total_episode_count", sql)
+            return _MappingsResult(
+                [
+                    {
+                        "product_id": 200,
+                        "title": "테스트 작품",
+                        "analysis_status": "success",
+                        "story_context_status": "ready",
+                        "story_ready_episode_no": 12,
+                        "story_total_episode_count": 12,
+                        "protagonist_goal_primary": None,
+                    }
+                ]
+            )
+
+        db.execute.side_effect = execute
+
+        result = await admin_ai_metadata_service.ai_product_metadata_detail(200, db)
+
+        detail = result["data"]
+        self.assertEqual(detail["story_context_status"], "ready")
+        self.assertEqual(detail["story_ready_episode_no"], 12)
+        self.assertEqual(detail["story_total_episode_count"], 12)
 
 
 class FakeAsyncSession:
