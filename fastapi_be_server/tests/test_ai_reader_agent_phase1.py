@@ -192,6 +192,35 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
         self.assertIn("1~10화 초반 요약", system_prompt)
         self.assertIn("테스트 작품", user_prompt)
 
+    def test_build_reader_decision_prompt_grounds_late_episode_without_current_summary(self):
+        from app.services.ai import reader_agent_decision_service as service
+
+        system_prompt, user_prompt = service.build_reader_decision_prompt(
+            {
+                "agent": {"taste_memory": {"positive": ["성장형"]}},
+                "product": {
+                    "product_id": 200,
+                    "title": "테스트 작품",
+                    "early_episode_summary_text": "1화: 주인공이 각성했다.",
+                },
+                "episode": {"episode_id": 312, "episode_no": 12},
+                "state": {"read_episode_count": 11},
+                "engagement_context": {"engagement_score_hint": 0.63},
+            }
+        )
+
+        self.assertIn(
+            "product.early_episode_summary_text는 DNA/AI 메타데이터가 만든 1~10화 초반 요약",
+            system_prompt,
+        )
+        self.assertIn("현재 N화의 요약으로 해석하면 안 된다", system_prompt)
+        self.assertIn("사건, 장면, 대사, 전개 속도를 추정하거나 지어내면 안 된다", system_prompt)
+        self.assertIn("없거나 빈 필드는 부정 근거로 사용하지 않는다", system_prompt)
+        self.assertIn("reason과 taste_delta는 스냅샷에 실제로 있는 근거만", system_prompt)
+        self.assertNotIn("현재 N화를 읽었다고 가정한 작품 훅", system_prompt)
+        self.assertIn('"episode_no": 12', user_prompt)
+        self.assertIn("1화: 주인공이 각성했다.", user_prompt)
+
     def test_request_reader_decision_calls_llm_and_parses_json(self):
         from app.services.ai import reader_agent_decision_service as service
 

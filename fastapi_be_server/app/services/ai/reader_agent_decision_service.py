@@ -15,7 +15,7 @@ from app.services.common.openrouter_background_credit_guard import (
 )
 
 
-READER_DECISION_PROMPT_VERSION = "ai-reader-decision-v1"
+READER_DECISION_PROMPT_VERSION = "ai-reader-decision-v2"
 READER_DECISION_MAX_TOKENS = 1200
 READER_DECISION_PARSE_MAX_ATTEMPTS = 2
 OPENROUTER_MAX_ATTEMPTS = 2
@@ -98,10 +98,16 @@ def build_reader_decision_prompt(input_snapshot: dict[str, Any]) -> tuple[str, s
 
 판단 기준:
 - 독자의 나이/성별/활동 패턴/초기 취향/DNA 취향 메모리를 우선한다.
-- 작품 DNA, 제목, 소개/메타데이터, 1~10화 초반 요약, 이전 행동 상태, 현재 공개 지표를 참고한다.
+- 작품 DNA 태그, 제목, product.early_episode_summary_text, 이전 행동 상태, 현재 공개 지표를 참고한다.
+- product.early_episode_summary_text는 DNA/AI 메타데이터가 만든 1~10화 초반 요약이다. 값이 있으면 작품의 초반 훅과 전개 흐름을 판단하는 주요 근거로 사용한다.
+- episode.episode_no가 10보다 커도 초반 요약을 현재 N화의 요약으로 해석하면 안 된다.
+- 현재 N화를 읽었다는 상태는 행동 판단 시점이다. 스냅샷에 현재 N화 본문이나 회차별 요약이 없으면 그 회차의 사건, 장면, 대사, 전개 속도를 추정하거나 지어내면 안 된다.
+- 현재 회차 내용 근거가 없으면 독자 취향, 작품 DNA와 초반 요약, 이전 행동 상태, engagement_context만 조건부확률 evidence로 사용한다.
+- 스냅샷에서 없거나 빈 필드는 부정 근거로 사용하지 않는다.
+- reason과 taste_delta는 스냅샷에 실제로 있는 근거만 사용하며, 제공되지 않은 회차 세부 내용을 주장하면 안 된다.
 - engagement_context.action_affordances는 서버가 취향 매칭, 읽은 회차 수, 현재 행동 상태, Bayesian 사후확률을 계산한 행동 판단 보조값이다.
 - engagement_context.bayesian_action_model은 현재 N화를 보기 전 N+1화 계속보기/선호작/추천/평가의 사전확률(prior)과 서버 posterior_hint를 담는다.
-- 현재 N화를 읽었다고 가정한 작품 훅, 전개감, 취향 적합성을 조건부확률 evidence로 보고 bayesian_update.posterior 사후확률을 갱신한다.
+- 위 조건부확률 evidence로 bayesian_update.posterior 사후확률을 갱신한다.
 - "루즈하면 멈출 수 있음"은 loose_stop_evidence_weight=0.1의 약한 부정 evidence일 뿐, 직접 중단 명령이 아니다.
 - action_affordances.*.suggested=true는 서버가 posterior_hint >= posterior_threshold라고 본 약한 행동 힌트다. 명령이 아니라 확신을 높이는 보조값이며, 작품 훅과 독자 취향이 함께 맞을 때 행동한다.
 - public action(선호작/추천/평가)의 기본값은 none이다. 명확한 긍정 근거가 없으면 none을 선택하고, 강한 감상이나 계속 볼 의사가 분명할 때만 행동한다.
