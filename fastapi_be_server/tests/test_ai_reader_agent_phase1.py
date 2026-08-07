@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -264,33 +265,54 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
         calls = {"count": 0}
 
-        async def fake_llm(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        async def fake_llm(
+            system_prompt: str,
+            user_prompt: str,
+            max_tokens: int,
+        ) -> service.ReaderLlmResponse:
             calls["count"] += 1
             if calls["count"] == 1:
-                return '{"continue_reading": true, "reason": "끊긴 응답'
-            return """
-            {
-              "continue_reading": true,
-              "next_episode_count": 1,
-              "drop_product": false,
-              "bookmark_action": "none",
-              "recommend_action": "press",
-              "evaluation": {"should_evaluate": false, "eval_code": null},
-              "taste_delta": {"positive": ["초반 훅"], "negative": []},
-              "reason": "초반 훅이 살아 있어 다음 회차를 본다"
-            }
-            """
+                return service.ReaderLlmResponse(
+                    content='{"continue_reading": true, "reason": "끊긴 응답',
+                    usage=service.ReaderLlmUsage(
+                        input_tokens=100,
+                        output_tokens=10,
+                        estimated_cost_usd=Decimal("0.001"),
+                    ),
+                )
+            return service.ReaderLlmResponse(
+                content="""
+                {
+                  "continue_reading": true,
+                  "next_episode_count": 1,
+                  "drop_product": false,
+                  "bookmark_action": "none",
+                  "recommend_action": "press",
+                  "evaluation": {"should_evaluate": false, "eval_code": null},
+                  "taste_delta": {"positive": ["초반 훅"], "negative": []},
+                  "reason": "초반 훅이 살아 있어 다음 회차를 본다"
+                }
+                """,
+                usage=service.ReaderLlmUsage(
+                    input_tokens=120,
+                    output_tokens=20,
+                    estimated_cost_usd=Decimal("0.002"),
+                ),
+            )
 
-        decision = asyncio.run(
-            service.request_reader_decision(
+        result = asyncio.run(
+            service.request_reader_decision_with_usage(
                 {"agent": {"age_group": "30s"}, "product": {"product_id": 200}},
                 llm_call=fake_llm,
             )
         )
 
         self.assertEqual(calls["count"], 2)
-        self.assertTrue(decision.continue_reading)
-        self.assertEqual(decision.recommend_action, "press")
+        self.assertTrue(result.decision.continue_reading)
+        self.assertEqual(result.decision.recommend_action, "press")
+        self.assertEqual(result.usage.input_tokens, 220)
+        self.assertEqual(result.usage.output_tokens, 30)
+        self.assertEqual(result.usage.estimated_cost_usd, Decimal("0.003"))
 
     def test_default_reader_llm_call_uses_openrouter_chat_completions(self):
         from app.services.ai import reader_agent_decision_service as service
@@ -319,7 +341,12 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                             "finish_reason": "stop",
                             "message": {"content": raw_decision},
                         }
-                    ]
+                    ],
+                    "usage": {
+                        "prompt_tokens": 456,
+                        "completion_tokens": 78,
+                        "cost": 0.001234,
+                    },
                 }
 
             def raise_for_status(self):
@@ -363,7 +390,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                         with patch.object(service.settings, "AI_READER_OPENROUTER_TEMPERATURE", 0.4):
                             with patch.object(service.settings, "AI_READER_OPENROUTER_TIMEOUT_SECONDS", 12.0):
                                 with patch.object(service.httpx, "AsyncClient", FakeAsyncClient):
-                                    raw = asyncio.run(
+                                    response = asyncio.run(
                                         service._default_llm_call(
                                             "system prompt",
                                             "user prompt",
@@ -371,7 +398,10 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                                         )
                                     )
 
-        self.assertEqual(raw, raw_decision.strip())
+        self.assertEqual(response.content, raw_decision.strip())
+        self.assertEqual(response.usage.input_tokens, 456)
+        self.assertEqual(response.usage.output_tokens, 78)
+        self.assertEqual(response.usage.estimated_cost_usd, Decimal("0.001234"))
         self.assertEqual(captured["timeout"], 12.0)
         self.assertEqual(captured["url"], "https://openrouter.test/api/v1/chat/completions")
         self.assertEqual(captured["headers"]["Authorization"], "Bearer openrouter-key")
@@ -508,7 +538,16 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
             async def post(self, url, *, headers, json):
                 calls["count"] += 1
                 if calls["count"] == 1:
-                    return FakeResponse({"choices": []})
+                    return FakeResponse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 100,
+                                "completion_tokens": 10,
+                                "cost": 0.001,
+                            },
+                        }
+                    )
                 return FakeResponse(
                     {
                         "choices": [
@@ -516,7 +555,12 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                                 "finish_reason": "stop",
                                 "message": {"content": raw_decision},
                             }
-                        ]
+                        ],
+                        "usage": {
+                            "prompt_tokens": 120,
+                            "completion_tokens": 20,
+                            "cost": 0.002,
+                        },
                     }
                 )
 
@@ -525,7 +569,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                 with patch.object(service.settings, "AI_READER_OPENROUTER_MODEL", "deepseek/deepseek-v3.2"):
                     with patch.object(service.settings, "AI_READER_OPENROUTER_PROVIDER_ONLY", ""):
                         with patch.object(service.httpx, "AsyncClient", FakeAsyncClient):
-                            raw = asyncio.run(
+                            response = asyncio.run(
                                 service._default_llm_call(
                                     "system prompt",
                                     "user prompt",
@@ -534,7 +578,10 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                             )
 
         self.assertEqual(calls["count"], 2)
-        self.assertEqual(raw, raw_decision.strip())
+        self.assertEqual(response.content, raw_decision.strip())
+        self.assertEqual(response.usage.input_tokens, 220)
+        self.assertEqual(response.usage.output_tokens, 30)
+        self.assertEqual(response.usage.estimated_cost_usd, Decimal("0.003"))
 
     def test_build_action_intents_generates_stable_idempotency_keys(self):
         from app.services.ai import reader_agent_decision_service as service
@@ -6660,6 +6707,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bookmark["suggested"])
 
     async def test_process_reader_session_persists_decision_and_enqueues_actions(self):
+        from app.services.ai import reader_agent_decision_service as decision_service
         from app.services.ai import reader_agent_session_service as service
 
         db = AsyncMock()
@@ -6733,7 +6781,11 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             self._FakeMappingsResult([], rowcount=6),
         ]
 
-        async def fake_llm(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        async def fake_llm(
+            system_prompt: str,
+            user_prompt: str,
+            max_tokens: int,
+        ) -> decision_service.ReaderLlmResponse:
             self.assertIn("storyctx 초반 회차요약과 함께 사용한다", system_prompt)
             self.assertIn("테스트 작품", user_prompt)
             self.assertIn("30s", user_prompt)
@@ -6742,18 +6794,25 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1화에서 주인공이 탑의 입구를 발견했다.", user_prompt)
             self.assertIn("현재 회차에서 주인공이 봉인된 문을 열었다.", user_prompt)
             self.assertNotIn("early_episode_summary_text", user_prompt)
-            return """
-            {
-              "continue_reading": true,
-              "next_episode_count": 1,
-              "drop_product": false,
-              "bookmark_action": "add",
-              "recommend_action": "press",
-              "evaluation": {"should_evaluate": false, "eval_code": null},
-              "taste_delta": {"positive": ["성장형"], "negative": []},
-              "reason": "취향과 맞아 다음 화를 본다"
-            }
-            """
+            return decision_service.ReaderLlmResponse(
+                content="""
+                {
+                  "continue_reading": true,
+                  "next_episode_count": 1,
+                  "drop_product": false,
+                  "bookmark_action": "add",
+                  "recommend_action": "press",
+                  "evaluation": {"should_evaluate": false, "eval_code": null},
+                  "taste_delta": {"positive": ["성장형"], "negative": []},
+                  "reason": "취향과 맞아 다음 화를 본다"
+                }
+                """,
+                usage=decision_service.ReaderLlmUsage(
+                    input_tokens=456,
+                    output_tokens=78,
+                    estimated_cost_usd=Decimal("0.001234"),
+                ),
+            )
 
         session = service.ReaderClaimedSession(
             ai_reader_schedule_id=1,
@@ -6786,6 +6845,17 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tb_user_taste_factor_score", executed_sql)
         self.assertIn("insert into tb_ai_reader_llm_decision", executed_sql)
         self.assertIn("insert into tb_ai_reader_action_queue", executed_sql)
+        decision_update_call = next(
+            call
+            for call in db.execute.await_args_list
+            if "decision_status = 'success'" in str(call.args[0])
+        )
+        self.assertEqual(decision_update_call.args[1]["input_tokens"], 456)
+        self.assertEqual(decision_update_call.args[1]["output_tokens"], 78)
+        self.assertEqual(
+            decision_update_call.args[1]["estimated_cost_usd"],
+            Decimal("0.001234"),
+        )
         self.assertLess(
             executed_sql.lower().index("from tb_ai_reader_action_queue"),
             executed_sql.lower().index("insert into tb_ai_reader_action_queue"),
@@ -7182,9 +7252,11 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reserve_params["session_id"], "1:2")
 
     async def test_process_reader_session_marks_reserved_decision_failed_when_llm_fails(self):
+        from app.services.ai import reader_agent_decision_service as decision_service
         from app.services.ai import reader_agent_session_service as service
 
         events = []
+        failed_params = {}
         db = AsyncMock()
         db.in_transaction = lambda: False
 
@@ -7225,6 +7297,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                         }
                     ]
                 )
+            if "tb_story_agent_context_summary" in sql:
+                return self._FakeMappingsResult([])
             if "from tb_ai_reader_product_state" in sql:
                 return self._FakeMappingsResult([])
             if "select a.daily_llm_budget" in sql:
@@ -7238,12 +7312,25 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             if "update tb_ai_reader_llm_decision" in sql:
                 events.append("failed")
                 self.assertIn("decision_status = 'failed'", sql)
+                failed_params.update(args[0])
                 return self._FakeMappingsResult([], rowcount=1)
             raise AssertionError(f"unexpected sql: {statement}")
 
-        async def fake_llm(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        async def fake_llm(
+            system_prompt: str,
+            user_prompt: str,
+            max_tokens: int,
+        ) -> decision_service.ReaderLlmResponse:
             events.append("llm")
-            raise RuntimeError("llm down")
+            call_no = events.count("llm")
+            return decision_service.ReaderLlmResponse(
+                content='{"continue_reading": true, "reason": "끊긴 응답',
+                usage=decision_service.ReaderLlmUsage(
+                    input_tokens=100 + (call_no - 1) * 20,
+                    output_tokens=10 + (call_no - 1) * 10,
+                    estimated_cost_usd=Decimal(f"0.00{call_no}"),
+                ),
+            )
 
         db.begin = fake_begin
         db.execute.side_effect = fake_execute
@@ -7258,13 +7345,26 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             activity_pattern_json="{}",
         )
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(decision_service.InvalidReaderDecisionError):
             await service.process_reader_session_decision(session, db, llm_call=fake_llm)
 
         self.assertEqual(
             events,
-            ["begin", "budget", "reserve", "end", "llm", "begin", "failed", "end"],
+            [
+                "begin",
+                "budget",
+                "reserve",
+                "end",
+                "llm",
+                "llm",
+                "begin",
+                "failed",
+                "end",
+            ],
         )
+        self.assertEqual(failed_params["input_tokens"], 220)
+        self.assertEqual(failed_params["output_tokens"], 30)
+        self.assertEqual(failed_params["estimated_cost_usd"], Decimal("0.003"))
 
     async def test_process_claimed_reader_session_persists_actions_and_success_in_one_transaction(self):
         from app.services.ai import reader_agent_session_service as service
@@ -7490,6 +7590,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             db,
             llm_decision_id=91,
             error_message="agent_paused",
+            usage=None,
         )
         mark_succeeded.assert_not_awaited()
         persist_decision.assert_not_awaited()
@@ -7590,6 +7691,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             db,
             llm_decision_id=91,
             error_message="schedule_window_closed",
+            usage=None,
         )
         mark_succeeded.assert_not_awaited()
         persist_decision.assert_not_awaited()
