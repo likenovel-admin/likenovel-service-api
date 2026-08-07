@@ -200,8 +200,82 @@ rollback_to_previous_release() {
 sync_batch_files() {
   local batch_src="$CURRENT_LINK/batch"
   local batch_dst=/home/ln-admin/likenovel/batch-dev
+  local codebook_file
+  local stage_dir
+  local backup_dir
+  local sync_status=0
+  local restore_status=0
+  local codebook_files=(
+    allowed-labels-by-axis.json
+    label-definitions-by-axis.json
+  )
 
-  mkdir -p "$batch_dst"
+  mkdir -p "$batch_dst" || return 1
+  if ! stage_dir="$(mktemp -d "$batch_dst/.dna-codebook-stage.XXXXXX")"; then
+    return 1
+  fi
+  if ! backup_dir="$(mktemp -d "$batch_dst/.dna-codebook-backup.XXXXXX")"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  for codebook_file in "${codebook_files[@]}"; do
+    if [ ! -f "$batch_src/$codebook_file" ]; then
+      sync_status=1
+      break
+    fi
+    if ! cp "$batch_src/$codebook_file" "$stage_dir/$codebook_file"; then
+      sync_status=1
+      break
+    fi
+    if ! cmp -s "$batch_src/$codebook_file" "$stage_dir/$codebook_file"; then
+      sync_status=1
+      break
+    fi
+    if [ -f "$batch_dst/$codebook_file" ]; then
+      if ! cp -p "$batch_dst/$codebook_file" "$backup_dir/$codebook_file"; then
+        sync_status=1
+        break
+      fi
+    else
+      : > "$backup_dir/$codebook_file.missing"
+    fi
+  done
+
+  if [ "$sync_status" -eq 0 ]; then
+    for codebook_file in "${codebook_files[@]}"; do
+      if ! mv -f "$stage_dir/$codebook_file" "$batch_dst/$codebook_file"; then
+        sync_status=1
+        break
+      fi
+    done
+  fi
+
+  if [ "$sync_status" -eq 0 ]; then
+    for codebook_file in "${codebook_files[@]}"; do
+      if ! cmp -s "$batch_src/$codebook_file" "$batch_dst/$codebook_file"; then
+        sync_status=1
+        break
+      fi
+    done
+  fi
+
+  if [ "$sync_status" -ne 0 ]; then
+    for codebook_file in "${codebook_files[@]}"; do
+      if [ -f "$backup_dir/$codebook_file" ]; then
+        cp -p "$backup_dir/$codebook_file" "$batch_dst/$codebook_file" || restore_status=1
+      elif [ -f "$backup_dir/$codebook_file.missing" ]; then
+        rm -f "$batch_dst/$codebook_file" || restore_status=1
+      fi
+    done
+    rm -rf "$stage_dir" "$backup_dir"
+    if [ "$restore_status" -ne 0 ]; then
+      echo "[run_be.dev] batch codebook restore failed" >&2
+    fi
+    return 1
+  fi
+
+  rm -rf "$stage_dir" "$backup_dir"
   cp "$batch_src"/*.sh "$batch_dst/" 2>/dev/null || true
   cp "$batch_src"/*.sql "$batch_dst/" 2>/dev/null || true
   cp "$batch_src"/*.py "$batch_dst/" 2>/dev/null || true
@@ -261,7 +335,16 @@ if ! start_service_and_verify; then
   exit 1
 fi
 
-sync_batch_files
+if ! sync_batch_files; then
+  echo "[run_be.dev] batch codebook sync failed; attempting rollback" >&2
+  stop_service_and_orphans || true
+  if rollback_to_previous_release && start_service_and_verify; then
+    echo "[run_be.dev] rollback succeeded" >&2
+  else
+    echo "[run_be.dev] rollback failed" >&2
+  fi
+  exit 1
+fi
 cleanup_old_releases "$RELEASE_KEEP"
 
 exit 0
