@@ -156,7 +156,9 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                 "product": {
                     "product_id": 200,
                     "title": "테스트 작품",
-                    "early_episode_summary_text": "초반 전투",
+                    "early_episode_summaries": [
+                        {"episode_no": 1, "summary_text": "초반 전투"}
+                    ],
                 },
                 "episode": {"episode_id": 300, "episode_no": 1},
                 "state": {"read_episode_count": 1, "bookmarked_yn": "N"},
@@ -189,7 +191,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
         self.assertIn("애매하거나 관망 중인 경우", system_prompt)
         self.assertIn("drop_product=true로 단정하지 말고", system_prompt)
         self.assertIn("치명적인 취향 불일치", system_prompt)
-        self.assertIn("1~10화 초반 요약", system_prompt)
+        self.assertIn("1~10화 회차요약", system_prompt)
         self.assertIn("테스트 작품", user_prompt)
 
     def test_build_reader_decision_prompt_grounds_late_episode_without_current_summary(self):
@@ -201,7 +203,12 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                 "product": {
                     "product_id": 200,
                     "title": "테스트 작품",
-                    "early_episode_summary_text": "1화: 주인공이 각성했다.",
+                    "early_episode_summaries": [
+                        {
+                            "episode_no": 1,
+                            "summary_text": "1화: 주인공이 각성했다.",
+                        }
+                    ],
                 },
                 "episode": {"episode_id": 312, "episode_no": 12},
                 "state": {"read_episode_count": 11},
@@ -210,7 +217,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
         )
 
         self.assertIn(
-            "product.early_episode_summary_text는 DNA/AI 메타데이터가 만든 1~10화 초반 요약",
+            "product.early_episode_summaries는 storyctx가 만든 1~10화 회차요약 목록",
             system_prompt,
         )
         self.assertIn("현재 N화의 요약으로 해석하면 안 된다", system_prompt)
@@ -6680,9 +6687,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                         "count_bookmark": 2,
                         "count_recommend": 1,
                         "episode_id": 300,
-                        "episode_no": 1,
+                        "episode_no": 12,
                         "episode_title": "첫 회",
-                        "episode_summary_text": "각성자가 탑에 오른다.",
                         "protagonist_type_tags": '["성장형"]',
                         "protagonist_job_tags": '["헌터"]',
                         "protagonist_material_tags": '["상태창"]',
@@ -6696,8 +6702,15 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             self._FakeMappingsResult(
                 [
                     {
+                        "episode_id": 301,
+                        "episode_no": 1,
+                        "summary_text": "1화에서 주인공이 탑의 입구를 발견했다.",
+                    },
+                    {
+                        "episode_id": 300,
+                        "episode_no": 12,
                         "summary_text": "현재 회차에서 주인공이 봉인된 문을 열었다."
-                    }
+                    },
                 ]
             ),
             self._FakeMappingsResult(
@@ -6721,13 +6734,14 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         ]
 
         async def fake_llm(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
-            self.assertIn("DNA 초반요약과 함께 사용한다", system_prompt)
+            self.assertIn("storyctx 초반 회차요약과 함께 사용한다", system_prompt)
             self.assertIn("테스트 작품", user_prompt)
             self.assertIn("30s", user_prompt)
-            self.assertIn("early_episode_summary_text", user_prompt)
+            self.assertIn("early_episode_summaries", user_prompt)
             self.assertIn("current_episode_summary_text", user_prompt)
+            self.assertIn("1화에서 주인공이 탑의 입구를 발견했다.", user_prompt)
             self.assertIn("현재 회차에서 주인공이 봉인된 문을 열었다.", user_prompt)
-            self.assertNotIn('"summary": "각성자가 탑에 오른다."', user_prompt)
+            self.assertNotIn("early_episode_summary_text", user_prompt)
             return """
             {
               "continue_reading": true,
@@ -6768,6 +6782,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tb_product_ai_metadata", executed_sql)
         self.assertIn("tb_story_agent_context_summary", executed_sql)
         self.assertIn("summary_type = 'episode_summary'", executed_sql)
+        self.assertIn("e.episode_no between 1 and 10", executed_sql.lower())
         self.assertIn("tb_user_taste_factor_score", executed_sql)
         self.assertIn("insert into tb_ai_reader_llm_decision", executed_sql)
         self.assertIn("insert into tb_ai_reader_action_queue", executed_sql)
@@ -7728,6 +7743,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                 ]
             ),
             self._FakeMappingsResult([]),
+            self._FakeMappingsResult([]),
         ]
 
         await service.build_reader_decision_snapshot(
@@ -7796,6 +7812,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                     }
                 ]
             ),
+            self._FakeMappingsResult([]),
             self._FakeMappingsResult([]),
         ]
 

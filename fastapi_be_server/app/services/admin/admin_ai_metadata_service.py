@@ -1040,6 +1040,9 @@ async def ai_product_metadata_list(
             p.author_name,
             p.price_type,
             COALESCE(m.analysis_status, 'missing') AS analysis_status,
+            COALESCE(sacp.context_status, 'missing') AS story_context_status,
+            COALESCE(sacp.ready_episode_count, 0) AS story_ready_episode_no,
+            COALESCE(sacp.total_episode_count, 0) AS story_total_episode_count,
             COALESCE(m.analysis_attempt_count, 0) AS analysis_attempt_count,
             COALESCE(m.exclude_from_recommend_yn, 'N') AS exclude_from_recommend_yn,
             m.analysis_error_message,
@@ -1048,6 +1051,7 @@ async def ai_product_metadata_list(
         FROM tb_product p
         LEFT JOIN tb_user u ON u.user_id = p.user_id
         LEFT JOIN tb_product_ai_metadata m ON m.product_id = p.product_id
+        LEFT JOIN tb_story_agent_context_product sacp ON sacp.product_id = p.product_id
         WHERE {where_sql}
         ORDER BY p.product_id DESC
         LIMIT :limit OFFSET :offset
@@ -1101,6 +1105,9 @@ async def ai_product_metadata_detail(product_id: int, db: AsyncSession) -> dict[
             m.taste_tags,
             m.raw_analysis,
             COALESCE(m.analysis_status, 'missing') AS analysis_status,
+            COALESCE(sacp.context_status, 'missing') AS story_context_status,
+            COALESCE(sacp.ready_episode_count, 0) AS story_ready_episode_no,
+            COALESCE(sacp.total_episode_count, 0) AS story_total_episode_count,
             COALESCE(m.analysis_attempt_count, 0) AS analysis_attempt_count,
             m.analysis_error_message,
             COALESCE(m.exclude_from_recommend_yn, 'N') AS exclude_from_recommend_yn,
@@ -1108,6 +1115,7 @@ async def ai_product_metadata_detail(product_id: int, db: AsyncSession) -> dict[
             m.updated_date
         FROM tb_product p
         LEFT JOIN tb_product_ai_metadata m ON m.product_id = p.product_id
+        LEFT JOIN tb_story_agent_context_product sacp ON sacp.product_id = p.product_id
         WHERE p.product_id = :product_id
         LIMIT 1
         """

@@ -1249,25 +1249,45 @@ async def build_reader_decision_snapshot(
         persona=persona,
         taste_factors=taste_factors,
     )
-    current_episode_summary_result = await db.execute(
+    storyctx_summary_result = await db.execute(
         text("""
-            select summary_text
-              from tb_story_agent_context_summary
-             where product_id = :product_id
-               and summary_type = 'episode_summary'
-               and is_active = 'Y'
-               and scope_key = concat('episode:', :episode_id)
-             order by version_no desc, summary_id desc
-             limit 1
+            select e.episode_id
+                 , e.episode_no
+                 , s.summary_text
+              from tb_product_episode e
+              join tb_story_agent_context_summary s
+                on s.product_id = e.product_id
+               and s.summary_type = 'episode_summary'
+               and s.is_active = 'Y'
+               and s.scope_key = concat('episode:', e.episode_id)
+             where e.product_id = :product_id
+               and e.use_yn = 'Y'
+               and e.open_yn = 'Y'
+               and (e.episode_no between 1 and 10 or e.episode_id = :episode_id)
+               and nullif(trim(s.summary_text), '') is not null
+             order by e.episode_no, s.version_no desc, s.summary_id desc
         """),
         {
             "product_id": target["product_id"],
             "episode_id": target["episode_id"],
         },
     )
-    current_episode_summary_row = (
-        current_episode_summary_result.mappings().one_or_none()
-    )
+    early_episode_summaries: list[dict[str, Any]] = []
+    current_episode_summary_text: str | None = None
+    seen_episode_ids: set[int] = set()
+    for row in storyctx_summary_result.mappings().all():
+        episode_id = int(row.get("episode_id") or 0)
+        if episode_id <= 0 or episode_id in seen_episode_ids:
+            continue
+        seen_episode_ids.add(episode_id)
+        episode_no = int(row.get("episode_no") or 0)
+        summary_text = str(row.get("summary_text") or "").strip()
+        if 1 <= episode_no <= 10:
+            early_episode_summaries.append(
+                {"episode_no": episode_no, "summary_text": summary_text}
+            )
+        if episode_id == int(target["episode_id"]):
+            current_episode_summary_text = summary_text
     state = await _get_reader_product_state(session, target["product_id"], db)
     return {
         "agent": {
@@ -1285,7 +1305,7 @@ async def build_reader_decision_snapshot(
             "product_type": target.get("product_type"),
             "price_type": target.get("price_type"),
             "status_code": target.get("status_code"),
-            "early_episode_summary_text": target.get("episode_summary_text"),
+            "early_episode_summaries": early_episode_summaries,
             "public_counts": {
                 "hit": target.get("count_hit") or 0,
                 "bookmark": target.get("count_bookmark") or 0,
@@ -1296,11 +1316,7 @@ async def build_reader_decision_snapshot(
             "episode_id": target["episode_id"],
             "episode_no": target.get("episode_no"),
             "episode_title": target.get("episode_title"),
-            "current_episode_summary_text": (
-                current_episode_summary_row.get("summary_text")
-                if current_episode_summary_row
-                else None
-            ),
+            "current_episode_summary_text": current_episode_summary_text,
         },
         "dna": {
             "protagonist_type_tags": _parse_json_field(target.get("protagonist_type_tags"), []),
@@ -1341,7 +1357,6 @@ async def _select_reader_target_episode(
                  , e.episode_id
                  , e.episode_no
                  , e.episode_title
-                 , m.episode_summary_text
                  , m.protagonist_goal_primary
                  , m.protagonist_type_tags
                  , m.protagonist_job_tags
