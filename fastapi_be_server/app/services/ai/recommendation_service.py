@@ -544,6 +544,7 @@ def _metadata_row_to_dict(row) -> dict:
         "protagonist_job_tags",
         "axis_style_tags",
         "axis_romance_tags",
+        "axis_label_scores",
     ):
         if isinstance(d.get(key), str):
             try:
@@ -3011,6 +3012,32 @@ def _collect_product_axis_labels(dna: dict, axis: str) -> dict[str, float]:
         return {}
     label_score = _clamp(overall_confidence, AXIS_CONFIDENCE_THRESHOLD, 1.0)
 
+    raw_axis_scores = dna.get("axis_label_scores")
+    if isinstance(raw_axis_scores, str):
+        try:
+            raw_axis_scores = json.loads(raw_axis_scores)
+        except (json.JSONDecodeError, TypeError):
+            raw_axis_scores = {}
+    axis_entries = (
+        raw_axis_scores.get(AXIS_CODEBOOK_KEY.get(axis, ""), [])
+        if isinstance(raw_axis_scores, dict)
+        else []
+    )
+    parsed_axis_scores: dict[str, float] = {}
+    if isinstance(axis_entries, list):
+        for entry in axis_entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_label = _normalize_factor_key(entry.get("label"))
+            raw_score = _safe_float(entry.get("score"), 0.0)
+            if not raw_label or raw_score <= 0:
+                continue
+            parsed_axis_scores[raw_label] = max(
+                parsed_axis_scores.get(raw_label, 0.0),
+                _clamp(raw_score, 0.0, 1.0),
+            )
+    product_axis_scores = _filter_axis_label_scores(axis, parsed_axis_scores)
+
     raw_values: list[str] = []
     if axis == "type":
         raw_values.extend(_as_list(dna.get("protagonist_type_tags")))
@@ -3035,7 +3062,8 @@ def _collect_product_axis_labels(dna: dict, axis: str) -> dict[str, float]:
         normalized = _normalize_factor_key(raw)
         if not normalized:
             continue
-        labels[normalized] = max(labels.get(normalized, 0.0), label_score)
+        score = product_axis_scores.get(normalized, label_score)
+        labels[normalized] = max(labels.get(normalized, 0.0), score)
     return labels
 
 
