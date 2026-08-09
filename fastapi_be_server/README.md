@@ -151,6 +151,8 @@ API 요청/응답 데이터 구조 정의 (27개 파일)
 - `OPENROUTER_BACKGROUND_RESERVE_USD` (기본 `2.00`): 사용자 서비스에 남겨둘 최소 크레딧
 - `OPENROUTER_BACKGROUND_IN_FLIGHT_BUFFER_USD` (기본 `1.00`): 진행할 배경 호출 한 건의 보수적 완충액
 - AI DNA, story context, AI-reader background 호출은 잔액이 두 값의 합보다 작으면 실행하지 않는다.
+- AI DNA 정기 배치와 CMS 재분석은 OpenRouter-only로 실행하며 Anthropic fallback을 사용하지 않는다.
+- DNA 정기 배치는 `AI_DNA_OPENROUTER_PROVIDER_ONLY`가 비어 있으면 자동 라우팅하고, 기본 `AI_DNA_RESPONSE_FORMAT` 값으로 `json_schema`를 사용한다.
 - 사용자 요청으로 실행되는 채팅 경로에는 이 가드를 적용하지 않는다.
 
 > **주의**: 실제 서비스 배포 시에는 민감 정보(비밀번호, 시크릿키 등)를 반드시 환경변수로 분리하거나 별도 보안 관리 필요.

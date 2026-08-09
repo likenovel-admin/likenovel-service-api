@@ -18,7 +18,12 @@ def _write_executable(path: Path, content: str) -> None:
 
 
 class AiDnaBatchRuntimeTest(TestCase):
-    def _run_batch(self, *, container_layout: bool) -> list[str]:
+    def _run_batch(
+        self,
+        *,
+        container_layout: bool,
+        provider: str | None = "openrouter",
+    ) -> tuple[list[str], str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             batch_dir = root / ("dist/batch" if container_layout else "batch")
@@ -57,14 +62,19 @@ class AiDnaBatchRuntimeTest(TestCase):
 
             env = {
                 **os.environ,
-                "AI_DNA_PROVIDER": "anthropic",
-                "ANTHROPIC_API_KEY": "test-key",
                 "DB_USER": "test-user",
                 "DB_PW": "test-password",
                 "MYSQL_SSL_OPT": "--skip-ssl",
                 "CALL_LOG": str(call_log),
                 "PATH": f"{fake_bin}:/usr/bin:/bin",
             }
+            if provider is None:
+                env.pop("AI_DNA_PROVIDER", None)
+                env["OPENROUTER_API_KEY"] = "test-key"
+            else:
+                env["AI_DNA_PROVIDER"] = provider
+                if provider == "openrouter":
+                    env["OPENROUTER_API_KEY"] = "test-key"
             completed = subprocess.run(
                 ["/bin/bash", str(batch_script)],
                 cwd=batch_dir,
@@ -75,18 +85,24 @@ class AiDnaBatchRuntimeTest(TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            return call_log.read_text(encoding="utf-8").splitlines()
+            return call_log.read_text(encoding="utf-8").splitlines(), completed.stdout
 
     def test_prod_layout_prefers_deployed_api_virtualenv(self) -> None:
-        calls = self._run_batch(container_layout=False)
+        calls, _ = self._run_batch(container_layout=False)
 
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].startswith("venv:"), calls)
         self.assertTrue(calls[0].endswith("extract_product_dna.py --all"), calls)
 
     def test_container_layout_falls_back_to_system_python(self) -> None:
-        calls = self._run_batch(container_layout=True)
+        calls, _ = self._run_batch(container_layout=True)
 
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].startswith("system:"), calls)
         self.assertTrue(calls[0].endswith("extract_product_dna.py --all"), calls)
+
+    def test_default_runtime_provider_is_openrouter(self) -> None:
+        calls, stdout = self._run_batch(container_layout=True, provider=None)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("AI DNA provider=openrouter", stdout)

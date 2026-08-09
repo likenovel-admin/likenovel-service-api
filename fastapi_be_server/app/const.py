@@ -217,6 +217,20 @@ class Settings(BaseSettings):
         "OPENROUTER_BASE_URL",
         "https://openrouter.ai/api/v1",
     ).rstrip("/")
+    AI_DNA_OPENROUTER_MODEL: str = os.getenv(
+        "AI_DNA_OPENROUTER_MODEL",
+        "deepseek/deepseek-v3.2",
+    ).strip()
+    AI_DNA_OPENROUTER_TIMEOUT_SECONDS: float = float(
+        os.getenv("AI_DNA_TIMEOUT_SECONDS", "120")
+    )
+    AI_DNA_MAX_OUTPUT_TOKENS: int = int(
+        os.getenv("AI_METADATA_MAX_TOKENS", "4096")
+    )
+    AI_DNA_ANALYSIS_PIPELINE_VERSION: str = os.getenv(
+        "AI_METADATA_PIPELINE_VERSION",
+        "dna-v20260611-r2",
+    ).strip()
     AI_READER_OPENROUTER_MODEL: str = os.getenv(
         "AI_READER_OPENROUTER_MODEL",
         os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v3.2"),

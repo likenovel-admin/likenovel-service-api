@@ -1,7 +1,14 @@
+import inspect
+import json
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+from fastapi import status
 
 from app.services.admin import admin_ai_metadata_service
+from app.services.common.openrouter_background_credit_guard import (
+    OpenRouterBackgroundCreditReserveError,
+)
 
 
 class _MappingsResult:
@@ -56,6 +63,8 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
         self.assertIn("조력자는 단순 도움 제공이 아니라", prompt)
         self.assertIn("axis_* 이름은 저장용 내부 키", prompt)
         self.assertNotIn("/", prompt)
+        self.assertIn("회귀, 빙의, 환생, 귀환자는 서로 독립적인 추천 신호", prompt)
+        self.assertIn("긴 시간 단절 뒤 같은 세계의 후대에 다시 등장", prompt)
 
     def test_prompt_defines_hook_as_entry_point_not_marketing_copy(self):
         prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
@@ -166,7 +175,7 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
         self.assertEqual(normalized["protagonist_material_tags"], ["버프"])
         self.assertEqual(normalized["axis_label_scores"]["능"], [{"label": "버프", "score": 0.7}])
 
-    def test_normalizer_replaces_false_possession_with_growth_type(self):
+    def test_normalizer_removes_explicit_false_possession_without_synthesizing_growth_type(self):
         payload = {
             "summary": {
                 "protagonist_type": "빙의적 상황",
@@ -207,11 +216,23 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
             enforce_axis_minimum=True,
             enforce_legacy_required=True,
             drop_unsupported_axis_labels=True,
-            source_text="재벌집 손자가 트로트 가수 데뷔 목표와 시스템 퀘스트를 받으며 성장한다.",
+            source_text="주인공은 원래 자신의 몸과 신분 그대로다. 몸이나 영혼의 이동은 없다.",
         )
 
-        self.assertEqual(normalized["protagonist_type_tags"], ["성장형"])
-        self.assertEqual(normalized["axis_label_scores"]["타"], [{"label": "성장형", "score": 0.7}])
+        self.assertEqual(normalized["protagonist_type_tags"], [])
+        self.assertEqual(normalized["axis_label_scores"]["타"], [])
+
+    def test_possession_contradiction_does_not_match_valid_transfer_contexts(self):
+        valid_contexts = (
+            "그 몸은 원래 자신의 몸이 아니었다.",
+            "원래 자신의 몸으로 돌아가기 위해 타인의 육체에서 살아간다.",
+            "시스템이 빙의시킨 소설 속 악역의 몸에서 깨어났다.",
+            "타인의 몸에 빙의한 뒤 별도의 프로그램이 설치되었다.",
+        )
+
+        for source_text in valid_contexts:
+            with self.subTest(source_text=source_text):
+                self.assertFalse(admin_ai_metadata_service._has_possession_contradiction(source_text))
 
 
     def test_normalizer_replaces_non_protagonist_knight_with_hunter(self):
@@ -260,6 +281,80 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
 
         self.assertEqual(normalized["protagonist_job_tags"], ["헌터"])
         self.assertEqual(normalized["axis_label_scores"]["직"], [{"label": "헌터", "score": 0.7}])
+
+
+class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
+    async def test_dna_request_uses_openrouter_auto_routing_and_strict_schema(self):
+        allowed = {axis: {f"{axis}-label"} for axis in admin_ai_metadata_service.AXIS_ORDER}
+        response = unittest.mock.MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "model": "routed/provider-model",
+            "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "cost": "0.00125",
+                "untrusted_extra": "drop-me",
+            },
+        }
+        post = AsyncMock(return_value=response)
+
+        with (
+            patch.object(admin_ai_metadata_service.settings, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(admin_ai_metadata_service.settings, "AI_DNA_OPENROUTER_MODEL", "deepseek/test-model"),
+            patch.object(admin_ai_metadata_service.settings, "AI_DNA_OPENROUTER_TIMEOUT_SECONDS", 120.0),
+            patch.object(admin_ai_metadata_service.settings, "AI_DNA_MAX_OUTPUT_TOKENS", 8192),
+            patch.object(admin_ai_metadata_service, "post_openrouter_background_chat_completion_async", post),
+        ):
+            raw, call_meta = await admin_ai_metadata_service._call_openrouter_dna(
+                "system", "user", allowed
+            )
+
+        self.assertEqual(raw, "{}")
+        request = post.await_args.kwargs["json"]
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        self.assertTrue(request["response_format"]["json_schema"]["strict"])
+        self.assertEqual(request.get("provider"), {"require_parameters": True})
+        self.assertNotIn("only", request.get("provider") or {})
+        serialized_request = json.dumps(request, ensure_ascii=False).lower()
+        self.assertNotIn("anthropic", serialized_request)
+        self.assertNotIn("friendli", serialized_request)
+        self.assertEqual(call_meta["routing"], "auto")
+        self.assertEqual(
+            call_meta["usage"],
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "cost": "0.00125",
+            },
+        )
+
+    def test_dna_admin_module_has_no_anthropic_execution_or_model_persistence(self):
+        module_source = inspect.getsource(admin_ai_metadata_service)
+        reanalyze_source = inspect.getsource(admin_ai_metadata_service.reanalyze_ai_product_metadata)
+
+        self.assertNotIn("_call_claude", reanalyze_source)
+        self.assertNotIn("settings.ANTHROPIC_MODEL", module_source)
+        self.assertIn("_call_openrouter_dna", reanalyze_source)
+
+    async def test_dna_http_402_becomes_non_retryable_reserve_error(self):
+        allowed = {axis: {f"{axis}-label"} for axis in admin_ai_metadata_service.AXIS_ORDER}
+        response = unittest.mock.MagicMock()
+        response.status_code = status.HTTP_402_PAYMENT_REQUIRED
+        post = AsyncMock(return_value=response)
+
+        with (
+            patch.object(admin_ai_metadata_service.settings, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(admin_ai_metadata_service.settings, "AI_DNA_OPENROUTER_MODEL", "deepseek/test-model"),
+            patch.object(admin_ai_metadata_service, "post_openrouter_background_chat_completion_async", post),
+            self.assertRaises(OpenRouterBackgroundCreditReserveError),
+        ):
+            await admin_ai_metadata_service._call_openrouter_dna("system", "user", allowed)
+
+        self.assertEqual(post.await_count, 1)
 
 
 class AdminAiMetadataReadTest(unittest.IsolatedAsyncioTestCase):
@@ -360,6 +455,13 @@ class AdminAiMetadataFailureGuardTest(unittest.IsolatedAsyncioTestCase):
             product_id=1162,
             analysis_attempt_count=3,
             error_message="provider failed",
+            analysis_version="dna-test|or|test-model|auto|schema",
+            raw_analysis={
+                "_llm_meta": {
+                    "calls": [{"usage": {"completion_tokens": 8192, "cost": "0.002"}}],
+                    "total_cost": 0.002,
+                }
+            },
             db=db,
         )
 
@@ -368,9 +470,13 @@ class AdminAiMetadataFailureGuardTest(unittest.IsolatedAsyncioTestCase):
             "analysis_attempt_count",
             "analysis_error_message",
             "model_version",
+            "raw_analysis",
         ):
             self.assertRegex(
                 db.sql,
                 rf"{column}\s*=\s*IF\(\s*analysis_status\s*=\s*'success',\s*{column},\s*VALUES\({column}\)\s*\)",
             )
+        self.assertEqual(db.params["model_version"], "dna-test|or|test-model|auto|schema")
+        stored = json.loads(db.params["raw_analysis"])
+        self.assertEqual(stored["_llm_meta"]["calls"][0]["usage"]["completion_tokens"], 8192)
         self.assertTrue(db.committed)
