@@ -1,23 +1,28 @@
 import json
 import logging
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from fastapi import status
+import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.const import settings
 from app.exceptions import CustomResponseException
-import app.services.ai.recommendation_service as recommendation_service
+from app.services.common.openrouter_background_credit_guard import (
+    OpenRouterBackgroundCreditGuardError,
+    OpenRouterBackgroundCreditReserveError,
+    post_openrouter_background_chat_completion_async,
+)
 
 logger = logging.getLogger("admin_app")
 
 MAX_RETRY_COUNT = 2  # 초기 1회 + 재시도 2회 = 총 3회
 MAX_ANALYZE_EPISODES = 10
 MAX_ANALYZE_CHARS = 60000
-MAX_LLM_OUTPUT_TOKENS = 4096
 MIN_REQUIRED_EPISODES = 3
 MIN_FIRST_EPISODE_TEXT_COUNT = 1000
 
@@ -37,6 +42,19 @@ AXIS_LIMITS: dict[str, tuple[int, int]] = {
     "목": (0, 1),
 }
 
+DNA_LIFECYCLE_LABELING_RULES = """
+
+생애전환 라벨 판정 규칙:
+- 타 그룹의 회귀는 같은 인물이 기억을 유지한 채 실제 과거 시점으로 돌아온 경우다. 미래 기억, 예지, 회상만으로 회귀를 부여하지 않는다.
+- 타 그룹의 빙의는 의식이 이미 존재하던 타인의 몸이나 작품 속 인물의 몸에 들어가 그 신분과 제약, 몸의 기억을 이어받아 사는 경우다. 게임 아바타, 변장, 살아 있는 상태의 차원이동만으로 빙의를 부여하지 않는다.
+- 타 그룹의 환생은 죽음이나 명시적인 전생 단절 뒤 새 육체·신분으로 두 번째 삶을 시작하고, 제목·공식 소개·장르 표방과 초반 전개가 환생 정체성을 함께 뒷받침하는 경우다. 출생 장면은 필수가 아니며, 이미 존재하던 타인의 몸이라면 빙의와 공동 부여할 수 있다.
+- 타 그룹의 귀환자는 다른 세계, 탑, 던전, 전장에서 장기간 생존하거나 수련한 뒤 원래 세계나 고향으로 돌아온 경우다. 또한 과거의 강자나 영웅이 오랜 수면, 봉인, 죽음, 실종 등 긴 시간 단절 뒤 같은 세계의 후대에 다시 등장해 옛 이름, 세력, 위상을 되찾는 경우도 귀환자다. 타인의 몸으로 돌아온 경우 빙의와 공동 부여할 수 있다. 평범한 귀가, 짧은 던전 출입, 일방향 차원이동은 귀환자가 아니다.
+- 회귀, 빙의, 환생, 귀환자는 서로 독립적인 추천 신호다. 공동 부여는 각 라벨에 독립 근거가 있거나, 하나의 사건에서 메커니즘 증거와 독자 대상 장르 표방이 각각 강하게 확인될 때 허용한다. 제목 한 단어, 비유, 근거 없는 추측만으로 공동 부여하지 않는다.
+- 타 배열에서는 먼저 회귀, 빙의, 환생, 귀환자를 각각 독립적으로 판정한다. 강하게 확인된 생애전환 라벨을 일반 타 라벨보다 앞에 배치한다. 남는 자리에만 성장형, 고인물 등 일반 타 라벨을 배치한다. 강한 생애전환 라벨을 일반 타 라벨 때문에 제외하지 않는다.
+- 강한 생애전환 라벨이 세 개를 초과하면 전환 메커니즘이 직접 확인되고 작품 정체성과 가장 강하게 연결된 세 개를 남긴다. 라벨 이름의 고정 순서로 자르지 않는다.
+- 차원이동은 목, 무한회귀는 능, 루프는 작 그룹의 별도 라벨이다. 전이 또는 이세계 언급만으로 차원이동이나 타 그룹의 생애전환 라벨을 자동 부여하지 않는다.
+"""
+
 DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EXTRACTOR_V1이다.
 입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 작품 신호와 설명 메타를 추출한다.
 출력은 반드시 JSON 단일 객체만 허용한다. 설명문, 마크다운, 코드블록 금지.
@@ -55,7 +73,7 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 1-6-2) 시대 배경 라벨과 기관, 세력, 반복 공간 라벨은 서로 대체하지 않는다. 중세 세계에서 전사 아카데미 입학이 초반 목표라면 중세와 아카데미를 함께 선택한다.
 1-7) 근거가 약하면 라벨을 선택하지 않는다. 어떤 그룹이든 부합하는 허용 라벨이 없으면 빈 배열로 둔다. 가장 가까운 라벨로 대체하지 않는다.
 1-7-1) 상태창은 스탯, 스킬, 업적을 보여주는 정보 창이고, 시스템은 퀘스트·보상·페널티·상점·레벨업을 집행하는 메커니즘이다. 정보 표시만 있으면 상태창만 선택한다.
-1-7-2) 회귀는 과거 특정 시점으로 돌아오는 1회성 또는 제한적 인생 재시작, 무한회귀는 실패 때마다 반복 재시도, 루프는 특정 사건·하루·구간 반복, 빙의는 타인의 몸이나 작품 속 인물 신분, 환생은 새 육체와 생애, 귀환자는 장기 생존 후 원래 세계 복귀, 차원이동은 살아 있는 상태의 세계 이동으로 구분한다.
+1-7-2) 회귀는 과거 특정 시점으로 돌아오는 1회성 또는 제한적 인생 재시작, 무한회귀는 실패 때마다 반복 재시도, 루프는 특정 사건·하루·구간 반복, 빙의는 이미 존재하던 타인의 몸이나 작품 속 인물 신분, 환생은 죽음·전생 단절 뒤 새 육체·신분의 두 번째 삶, 귀환자는 다른 공간에서 돌아오거나 긴 시간 단절 뒤 후대에 다시 등장해 옛 위상을 되찾는 경우, 차원이동은 살아 있는 상태의 세계 이동으로 구분한다.
 1-7-3) 아카데미는 특수능력 교육기관, 학원은 현대 학교생활, 청춘, 교우관계, 학교는 물리적 학교 공간 사건이 중심일 때만 선택한다.
 1-7-4) 하렘은 복수의 이성 캐릭터가 명확한 애정, 소유욕, 관계 긴장을 보일 때만, 조력자는 단순 도움 제공이 아니라 동등한 파트너십과 반복 동행이 작품 매력일 때만 선택한다.
 1-7-5) 직 라벨은 실제 직업, 신분, 역할, 전투 클래스가 직접 확인될 때만 선택한다. 세계를 구하거나 사람을 구하는 목표만으로 소방관, 의사, 경찰 같은 직업을 추정하지 않는다.
@@ -84,7 +102,7 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 20) 설명형 메타(summary.protagonist_desc, premise, hook, episode_summary_text)는 한국어로만 작성하고, 고유명사 외 영문 표현을 남발하지 않는다.
 21) 설명형 메타는 코드북 라벨 나열이나 복붙이 아니라 서사 정보 중심으로 작성한다.
 22) 문자열 값 앞뒤에 불필요한 따옴표와 백틱 문자를 넣지 않는다.
-"""
+""" + DNA_LIFECYCLE_LABELING_RULES
 
 DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하세요.
 
@@ -270,6 +288,278 @@ def _load_label_definitions() -> str:
         return _LABEL_DEFS_CACHE
     _LABEL_DEFS_CACHE = ""
     return _LABEL_DEFS_CACHE
+
+
+class OpenRouterDnaResponseError(RuntimeError):
+    def __init__(self, message: str, call_meta: dict[str, Any]):
+        self.call_meta = call_meta
+        super().__init__(message)
+
+
+def _compact_model_slug(model: str) -> str:
+    return (model or "").split("/")[-1].strip().lower().replace("deepseek-", "ds-")
+
+
+def _dna_analysis_version() -> str:
+    return "|".join(
+        (
+            settings.AI_DNA_ANALYSIS_PIPELINE_VERSION,
+            "or",
+            _compact_model_slug(settings.AI_DNA_OPENROUTER_MODEL),
+            "auto",
+            "schema",
+        )
+    )[:50]
+
+
+def _build_openrouter_dna_response_format(
+    allowed_labels: dict[str, set[str]],
+) -> dict[str, Any]:
+    axis_properties = {
+        axis: {
+            "type": "array",
+            "items": {"type": "string", "enum": sorted(allowed_labels[axis])},
+            "minItems": min_items,
+            "maxItems": max_items,
+        }
+        for axis, (min_items, max_items) in AXIS_LIMITS.items()
+    }
+    confidence_properties = {
+        axis: {"type": "number", "minimum": 0, "maximum": 1}
+        for axis in AXIS_ORDER
+    }
+    axis_label_score_properties = {
+        axis: {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "label": {"type": "string", "enum": sorted(allowed_labels[axis])},
+                    "score": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": ["label", "score"],
+            },
+            "minItems": min_items,
+            "maxItems": max_items,
+        }
+        for axis, (min_items, max_items) in AXIS_LIMITS.items()
+    }
+    evidence_properties = {
+        axis: {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 0,
+            "maxItems": max_items,
+        }
+        for axis, (_, max_items) in AXIS_LIMITS.items()
+    }
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "protagonist_type": {"type": "string"},
+                    "protagonist_desc": {"type": "string"},
+                    "heroine_type": {"type": "string"},
+                    "heroine_weight": {
+                        "type": "string",
+                        "enum": sorted(ALLOWED_HEROINE_WEIGHT),
+                    },
+                    "mood": {"type": "string"},
+                    "pacing": {"type": "string", "enum": sorted(ALLOWED_PACING)},
+                    "premise": {"type": "string"},
+                    "hook": {"type": "string"},
+                    "episode_summary_text": {"type": "string"},
+                    "themes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                    "taste_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                },
+                "required": [
+                    "protagonist_type",
+                    "protagonist_desc",
+                    "heroine_type",
+                    "heroine_weight",
+                    "mood",
+                    "pacing",
+                    "premise",
+                    "hook",
+                    "episode_summary_text",
+                    "themes",
+                    "taste_tags",
+                ],
+            },
+            "axis_labels": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": axis_properties,
+                "required": list(AXIS_ORDER),
+            },
+            "axis_confidence": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": confidence_properties,
+                "required": list(AXIS_ORDER),
+            },
+            "axis_label_scores": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": axis_label_score_properties,
+                "required": list(AXIS_ORDER),
+            },
+            "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": evidence_properties,
+                "required": list(AXIS_ORDER),
+            },
+        },
+        "required": [
+            "summary",
+            "axis_labels",
+            "axis_confidence",
+            "axis_label_scores",
+            "overall_confidence",
+            "evidence",
+        ],
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "likenovel_dna_admin_reanalysis",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+def _safe_openrouter_usage(usage: Any) -> dict[str, Any]:
+    raw = usage if isinstance(usage, dict) else {}
+    return {
+        "prompt_tokens": raw.get("prompt_tokens"),
+        "completion_tokens": raw.get("completion_tokens"),
+        "total_tokens": raw.get("total_tokens"),
+        "cost": raw.get("cost"),
+    }
+
+
+def _build_llm_meta(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    total_cost = Decimal("0")
+    found_cost = False
+    for call in calls:
+        raw_cost = (call.get("usage") or {}).get("cost")
+        if raw_cost is None:
+            continue
+        try:
+            cost = Decimal(str(raw_cost))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if not cost.is_finite() or cost < 0:
+            continue
+        total_cost += cost
+        found_cost = True
+    return {
+        "analysis_version": _dna_analysis_version(),
+        "calls": calls,
+        "total_cost": float(round(total_cost, 8)) if found_cost else None,
+    }
+
+
+def _extract_openrouter_message_text(choice: dict[str, Any]) -> str:
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text_value = item.get("text") or item.get("content") or ""
+                if text_value:
+                    parts.append(str(text_value))
+            elif item:
+                parts.append(str(item))
+        content = "\n".join(parts)
+    return str(content).strip()
+
+
+async def _call_openrouter_dna(
+    system_prompt: str,
+    user_prompt: str,
+    allowed_labels: dict[str, set[str]],
+) -> tuple[str, dict[str, Any]]:
+    if not settings.OPENROUTER_API_KEY or not settings.AI_DNA_OPENROUTER_MODEL:
+        raise CustomResponseException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            message="DNA OpenRouter 서비스가 설정되지 않았습니다.",
+        )
+
+    request_payload = {
+        "model": settings.AI_DNA_OPENROUTER_MODEL,
+        "temperature": 0.1,
+        "max_tokens": settings.AI_DNA_MAX_OUTPUT_TOKENS,
+        "response_format": _build_openrouter_dna_response_format(allowed_labels),
+        "provider": {"require_parameters": True},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    async with httpx.AsyncClient(timeout=settings.AI_DNA_OPENROUTER_TIMEOUT_SECONDS) as client:
+        response = await post_openrouter_background_chat_completion_async(
+            client,
+            base_url=settings.OPENROUTER_BASE_URL,
+            api_key=settings.OPENROUTER_API_KEY,
+            headers={
+                "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "LikeNovel AI DNA Admin Reanalysis",
+            },
+            json=request_payload,
+        )
+    if response.status_code == status.HTTP_402_PAYMENT_REQUIRED:
+        raise OpenRouterBackgroundCreditReserveError(
+            "OpenRouter background credit reserve blocked: provider returned status=402"
+        )
+    if response.status_code != 200:
+        logger.error("DNA OpenRouter API error: status=%s", response.status_code)
+        raise CustomResponseException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            message="DNA OpenRouter 호출에 실패했습니다.",
+        )
+
+    data = response.json()
+    call_meta = {
+        "provider": "openrouter",
+        "routing": "auto",
+        "requested_model": settings.AI_DNA_OPENROUTER_MODEL,
+        "response_model": str(data.get("model") or "")[:120] or None,
+        "response_format": "json_schema",
+        "usage": _safe_openrouter_usage(data.get("usage")),
+    }
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise OpenRouterDnaResponseError("OpenRouter invalid response: missing choices", call_meta)
+    choice = choices[0] or {}
+    finish_reason = choice.get("finish_reason")
+    if finish_reason != "stop":
+        raise OpenRouterDnaResponseError(
+            f"OpenRouter incomplete response: finish_reason={finish_reason or 'unknown'}",
+            call_meta,
+        )
+    raw = _extract_openrouter_message_text(choice)
+    if not raw:
+        raise OpenRouterDnaResponseError("OpenRouter empty content", call_meta)
+    return raw, call_meta
 
 
 def _strip_html(content: str) -> str:
@@ -502,33 +792,18 @@ def _has_buff_evidence(text: str) -> bool:
     return "버프" in text or ("계약" in text and any(marker in text for marker in ("힘을 얻", "강화", "능력")))
 
 
-def _has_possession_evidence(text: str) -> bool:
-    negative_markers = ("시스템이 빙의", "프로그램이 설치", "빙의한 형태")
-    if any(marker in text for marker in negative_markers):
-        return False
+def _has_possession_contradiction(text: str) -> bool:
     return any(
         marker in text
         for marker in (
-            "몸에 빙의",
-            "몸으로 빙의",
-            "몸에 들어",
-            "몸으로 들어",
-            "빙의해",
-            "빙의한",
-            "빙의되",
-            "빙의한다",
-            "소설 속",
-            "작품 속",
-            "게임 속",
-            "타인의 몸",
-            "남의 몸",
-            "다른 사람의 몸",
+            "주인공은 원래 자신의 몸과 신분 그대로다",
+            "주인공은 원래 자기 몸과 신분 그대로다",
+            "몸이나 영혼의 이동은 없다",
+            "의식이나 영혼의 이동은 없다",
+            "타인의 몸이 아니다",
+            "남의 몸이 아니다",
         )
     )
-
-
-def _has_growth_evidence(text: str) -> bool:
-    return any(marker in text for marker in ("성장", "데뷔", "훈련", "수련", "레벨업", "퀘스트", "목표"))
 
 
 def _has_monster_hunter_evidence(text: str) -> bool:
@@ -538,10 +813,15 @@ def _has_monster_hunter_evidence(text: str) -> bool:
 def _apply_axis_label_evidence_guards(
     axis_labels: dict[str, list[str]],
     allowed_labels: dict[str, set[str]],
-    source_text: str = "",
+    evidence_text: str = "",
+    *,
+    possession_source_text: str | None = None,
 ) -> dict[str, list[str]]:
-    if not source_text:
+    if not evidence_text and not possession_source_text:
         return axis_labels
+
+    source_text = evidence_text
+    possession_text = evidence_text if possession_source_text is None else possession_source_text
 
     guarded = {axis: list(labels) for axis, labels in axis_labels.items()}
 
@@ -566,10 +846,8 @@ def _apply_axis_label_evidence_guards(
         if "버프" in allowed_labels["능"] and "버프" not in guarded["능"] and _has_buff_evidence(source_text):
             guarded["능"].append("버프")
 
-    if "빙의" in guarded["타"] and not _has_possession_evidence(source_text):
+    if "빙의" in guarded["타"] and _has_possession_contradiction(possession_text):
         guarded["타"] = [label for label in guarded["타"] if label != "빙의"]
-        if not guarded["타"] and "성장형" in allowed_labels["타"] and _has_growth_evidence(source_text):
-            guarded["타"].append("성장형")
 
     _, worldview_max_items = AXIS_LIMITS["세"]
     if (
@@ -703,6 +981,7 @@ def _normalize_ai_payload(
         axis_labels,
         allowed,
         _payload_evidence_text(payload, source_text),
+        possession_source_text=source_text,
     )
 
     goal_labels = axis_labels["목"]
@@ -935,20 +1214,25 @@ async def _mark_analysis_failed(
     product_id: int,
     analysis_attempt_count: int,
     error_message: str,
+    analysis_version: str,
     db: AsyncSession,
+    raw_analysis: dict[str, Any] | None = None,
 ) -> None:
     failed_query = text(
         """
         INSERT INTO tb_product_ai_metadata (
-            product_id, analysis_status, analysis_attempt_count, analysis_error_message, model_version
+            product_id, analysis_status, analysis_attempt_count, analysis_error_message,
+            model_version, raw_analysis
         ) VALUES (
-            :product_id, 'failed', :analysis_attempt_count, :analysis_error_message, :model_version
+            :product_id, 'failed', :analysis_attempt_count, :analysis_error_message,
+            :model_version, :raw_analysis
         )
         ON DUPLICATE KEY UPDATE
             analysis_status = IF(analysis_status = 'success', analysis_status, VALUES(analysis_status)),
             analysis_attempt_count = IF(analysis_status = 'success', analysis_attempt_count, VALUES(analysis_attempt_count)),
             analysis_error_message = IF(analysis_status = 'success', analysis_error_message, VALUES(analysis_error_message)),
             model_version = IF(analysis_status = 'success', model_version, VALUES(model_version)),
+            raw_analysis = IF(analysis_status = 'success', raw_analysis, VALUES(raw_analysis)),
             updated_date = NOW()
         """
     )
@@ -958,7 +1242,12 @@ async def _mark_analysis_failed(
             "product_id": product_id,
             "analysis_attempt_count": analysis_attempt_count,
             "analysis_error_message": (error_message or "unknown error")[:1000],
-            "model_version": settings.ANTHROPIC_MODEL,
+            "model_version": analysis_version,
+            "raw_analysis": (
+                json.dumps(raw_analysis, ensure_ascii=False)
+                if raw_analysis is not None
+                else None
+            ),
         },
     )
     await db.commit()
@@ -1389,6 +1678,7 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
             product_id=product_id,
             analysis_attempt_count=failed_attempt_count,
             error_message=f"insufficient_episodes(<{MIN_REQUIRED_EPISODES})",
+            analysis_version=_dna_analysis_version(),
             db=db,
         )
         raise CustomResponseException(
@@ -1396,6 +1686,7 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
             message=f"{MIN_REQUIRED_EPISODES}화 미만 작품은 AI 메타 분석 대상이 아닙니다.",
         )
 
+    allowed_labels = _load_allowed_labels_by_axis()
     user_prompt = DNA_USER_TEMPLATE.format(
         title=product.get("title") or "",
         genres=product.get("genres") or "",
@@ -1411,17 +1702,20 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
     )
 
     last_error = "unknown error"
+    llm_calls: list[dict[str, Any]] = []
     for retry_index in range(MAX_RETRY_COUNT + 1):
         attempt_count = base_attempt_count + retry_index + 1
         try:
-            raw = await recommendation_service._call_claude(
+            raw, call_meta = await _call_openrouter_dna(
                 DNA_SYSTEM_PROMPT,
                 user_prompt,
-                max_tokens=MAX_LLM_OUTPUT_TOKENS,
-                fail_on_max_tokens=True,
+                allowed_labels,
             )
-            parsed = recommendation_service._parse_json_from_llm(raw)
-            raw_analysis_payload = json.dumps(parsed, ensure_ascii=False)
+            llm_calls.append(call_meta)
+            parsed = json.loads(raw)
+            raw_analysis = dict(parsed)
+            raw_analysis["_llm_meta"] = _build_llm_meta(llm_calls)
+            raw_analysis_payload = json.dumps(raw_analysis, ensure_ascii=False)
             normalized = _normalize_ai_payload(
                 parsed,
                 enforce_axis_minimum=True,
@@ -1522,7 +1816,7 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                     "similar_famous": json.dumps(normalized["similar_famous"], ensure_ascii=False),
                     "taste_tags": json.dumps(normalized["taste_tags"], ensure_ascii=False),
                     "raw_analysis": raw_analysis_payload,
-                    "model_version": settings.ANTHROPIC_MODEL,
+                    "model_version": _dna_analysis_version(),
                     "analysis_attempt_count": attempt_count,
                 },
             )
@@ -1535,6 +1829,39 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                     "axis_labels": _build_axis_labels_from_columns(normalized),
                 }
             }
+        except OpenRouterDnaResponseError as error:
+            llm_calls.append(error.call_meta)
+            await db.rollback()
+            last_error = str(error)
+            logger.warning(
+                f"[AI_META_REANALYZE_FAIL] product_id={product_id} "
+                f"attempt={retry_index + 1}/{MAX_RETRY_COUNT + 1} error={last_error}"
+            )
+        except OpenRouterBackgroundCreditGuardError as error:
+            await db.rollback()
+            logger.warning(
+                "[AI_META_REANALYZE_PAUSED] product_id=%s reason=%s",
+                product_id,
+                str(error),
+            )
+            raise CustomResponseException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                message="OpenRouter 크레딧 보호로 DNA 재분석을 중단했습니다.",
+            ) from error
+        except CustomResponseException as error:
+            await db.rollback()
+            if error.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+                logger.warning(
+                    "[AI_META_REANALYZE_PAUSED] product_id=%s reason=%s",
+                    product_id,
+                    str(error),
+                )
+                raise
+            last_error = str(error)
+            logger.warning(
+                f"[AI_META_REANALYZE_FAIL] product_id={product_id} "
+                f"attempt={retry_index + 1}/{MAX_RETRY_COUNT + 1} error={last_error}"
+            )
         except Exception as e:
             await db.rollback()
             last_error = str(e)
@@ -1548,7 +1875,9 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
         product_id=product_id,
         analysis_attempt_count=failed_attempt_count,
         error_message=last_error,
+        analysis_version=_dna_analysis_version(),
         db=db,
+        raw_analysis={"_llm_meta": _build_llm_meta(llm_calls)} if llm_calls else None,
     )
     raise CustomResponseException(
         status_code=status.HTTP_502_BAD_GATEWAY,

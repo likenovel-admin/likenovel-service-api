@@ -1,5 +1,6 @@
-import json
 import importlib.util
+import json
+import os
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -11,10 +12,8 @@ from app.services.common.openrouter_background_credit_guard import (
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dist" / "batch" / "extract_product_dna.py"
 LEGACY_MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "extract_product_dna.py"
-REPO_ROOT = MODULE_PATH.parents[5]
 FASTAPI_ROOT = MODULE_PATH.parents[2]
 CODEBOOK_DIRS = [
-    REPO_ROOT / "docs" / "ai-codebook",
     FASTAPI_ROOT / "dist" / "ai",
     FASTAPI_ROOT / "dist" / "batch",
 ]
@@ -207,34 +206,60 @@ class AiDnaCodebookContractTest(TestCase):
 
 
 class AiDnaOpenRouterFallbackTest(TestCase):
-    def test_anthropic_failure_falls_back_to_openrouter_deepseek(self):
+    def test_default_runtime_profile_is_openrouter_auto_schema_only(self):
+        with patch.dict(os.environ, {}, clear=True):
+            module = load_module()
+
+        self.assertEqual(module.AI_DNA_PROVIDER, "openrouter")
+        self.assertEqual(module.AI_DNA_OPENROUTER_PROVIDER_ONLY, "")
+        self.assertEqual(module.AI_DNA_RESPONSE_FORMAT, "json_schema")
+        self.assertFalse(hasattr(module, "call_claude"))
+
+    def test_openrouter_length_error_preserves_safe_usage(self):
+        module = load_module()
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"finish_reason": "length", "message": {"content": "{}"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 8192,
+                "total_tokens": 8292,
+                "cost": "0.12345",
+                "untrusted_extra": "must not persist",
+            },
+        }
+        client = MagicMock()
+        credit_response = MagicMock()
+        credit_response.json.return_value = {"data": {"total_credits": 20.0, "total_usage": 10.0}}
+        client.__enter__.return_value.get.return_value = credit_response
+        client.__enter__.return_value.post.return_value = response
+
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "AI_DNA_OPENROUTER_MODEL", "test-model"),
+            patch.object(module, "_build_openrouter_response_format", return_value={}),
+            patch.object(module.httpx, "Client", return_value=client),
+        ):
+            with self.assertRaises(module.OpenRouterResponseValidationError) as ctx:
+                module.call_openrouter("system", "user", {})
+
+        self.assertEqual(
+            ctx.exception.safe_llm_usage,
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 8192,
+                "total_tokens": 8292,
+                "cost": "0.12345",
+            },
+        )
+
+    def test_anthropic_runtime_profile_is_rejected(self):
         module = load_module()
         module.AI_DNA_PROVIDER = "anthropic"
-        module.ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-        module.OPENROUTER_API_KEY = "test-key"
-        module.AI_DNA_OPENROUTER_MODEL = "deepseek/deepseek-v4-pro"
-        allowed_labels = {axis: set() for axis in module.AXIS_ORDER}
 
-        with patch.object(module, "call_claude", side_effect=RuntimeError("Claude API error: 429 credit")), \
-             patch.object(module, "call_openrouter", return_value=("{}", {"total_tokens": 123})) as mocked_openrouter:
-            raw, meta = module._call_llm("system", "user", allowed_labels)
-
-        self.assertEqual(raw, "{}")
-        mocked_openrouter.assert_called_once_with("system", "user", allowed_labels)
-        self.assertEqual(meta["provider"], "openrouter")
-        self.assertEqual(meta["fallback_from"], "anthropic")
-        self.assertEqual(meta["model"], "deepseek/deepseek-v4-pro")
-        self.assertIn("Claude API error", meta["fallback_reason"])
-        self.assertEqual(meta["usage"], {"prompt_tokens": None, "completion_tokens": None, "total_tokens": 123, "cost": None})
-
-    def test_anthropic_failure_without_openrouter_key_raises_original_error(self):
-        module = load_module()
-        module.AI_DNA_PROVIDER = "anthropic"
-        module.OPENROUTER_API_KEY = ""
-
-        with patch.object(module, "call_claude", side_effect=RuntimeError("Claude API error: 429 credit")):
-            with self.assertRaisesRegex(RuntimeError, "Claude API error"):
-                module._call_llm("system", "user", {axis: set() for axis in module.AXIS_ORDER})
+        with self.assertRaisesRegex(RuntimeError, "unsupported AI_DNA_PROVIDER: anthropic"):
+            module._call_llm("system", "user", {axis: set() for axis in module.AXIS_ORDER})
 
 
 class AiDnaNormalizePayloadTest(TestCase):
@@ -411,7 +436,7 @@ class AiDnaNormalizePayloadTest(TestCase):
         self.assertEqual(normalized["protagonist_material_tags"], ["버프"])
         self.assertEqual(normalized["axis_label_scores"]["능"], [{"label": "버프", "score": 0.7}])
 
-    def test_source_evidence_guards_replace_false_possession_with_growth_type(self):
+    def test_source_evidence_guards_remove_explicit_false_possession_without_synthesizing_growth_type(self):
         module = load_module()
         allowed_labels = {
             "세": {"현대", "재벌", "연예계"},
@@ -460,11 +485,24 @@ class AiDnaNormalizePayloadTest(TestCase):
         normalized = module.normalize_payload(
             payload,
             allowed_labels,
-            source_text="재벌집 손자가 트로트 가수 데뷔 목표와 시스템 퀘스트를 받으며 성장한다.",
+            source_text="주인공은 원래 자신의 몸과 신분 그대로다. 몸이나 영혼의 이동은 없다.",
         )
 
-        self.assertEqual(normalized["protagonist_type_tags"], ["성장형"])
-        self.assertEqual(normalized["axis_label_scores"]["타"], [{"label": "성장형", "score": 0.7}])
+        self.assertEqual(normalized["protagonist_type_tags"], [])
+        self.assertEqual(normalized["axis_label_scores"]["타"], [])
+
+    def test_possession_contradiction_does_not_match_valid_transfer_contexts(self):
+        module = load_module()
+        valid_contexts = (
+            "그 몸은 원래 자신의 몸이 아니었다.",
+            "원래 자신의 몸으로 돌아가기 위해 타인의 육체에서 살아간다.",
+            "시스템이 빙의시킨 소설 속 악역의 몸에서 깨어났다.",
+            "타인의 몸에 빙의한 뒤 별도의 프로그램이 설치되었다.",
+        )
+
+        for source_text in valid_contexts:
+            with self.subTest(source_text=source_text):
+                self.assertFalse(module._has_possession_contradiction(source_text))
 
     def test_source_evidence_guards_replace_non_protagonist_knight_with_hunter(self):
         module = load_module()

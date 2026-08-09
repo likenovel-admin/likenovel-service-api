@@ -30,17 +30,13 @@ DB_USER = os.getenv("BATCH_DB_USER", "")
 DB_PASSWORD = os.getenv("BATCH_DB_PASSWORD", "")
 DB_NAME = os.getenv("BATCH_DB_NAME", "likenovel")
 
-# Anthropic
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-
-# DNA LLM provider switch.
-# Default stays Anthropic so an env rollback restores the previous behavior.
-AI_DNA_PROVIDER = os.getenv("AI_DNA_PROVIDER", "anthropic").strip().lower()
+# DNA LLM runtime is OpenRouter-only. Provider routing stays automatic unless
+# an explicit emergency override is supplied through the environment.
+AI_DNA_PROVIDER = os.getenv("AI_DNA_PROVIDER", "openrouter").strip().lower()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 AI_DNA_OPENROUTER_MODEL = os.getenv("AI_DNA_OPENROUTER_MODEL", "deepseek/deepseek-v3.2").strip()
-AI_DNA_OPENROUTER_PROVIDER_ONLY = os.getenv("AI_DNA_OPENROUTER_PROVIDER_ONLY", "friendli").strip()
+AI_DNA_OPENROUTER_PROVIDER_ONLY = os.getenv("AI_DNA_OPENROUTER_PROVIDER_ONLY", "").strip()
 # OpenRouter reasoning(thinking) 제어. 비어있으면 미전송(기존 동작 유지).
 # "low"/"medium"/"high" → {"effort": ...}, "enabled"/"on"/"true"/"1" → {"enabled": true}
 AI_DNA_OPENROUTER_REASONING = os.getenv("AI_DNA_OPENROUTER_REASONING", "").strip().lower()
@@ -116,6 +112,19 @@ LABEL_DEFS_JSON_CANDIDATES = [
     / "label-definitions-by-axis.json",
 ]
 
+DNA_LIFECYCLE_LABELING_RULES = """
+
+생애전환 라벨 판정 규칙:
+- 타 그룹의 회귀는 같은 인물이 기억을 유지한 채 실제 과거 시점으로 돌아온 경우다. 미래 기억, 예지, 회상만으로 회귀를 부여하지 않는다.
+- 타 그룹의 빙의는 의식이 이미 존재하던 타인의 몸이나 작품 속 인물의 몸에 들어가 그 신분과 제약, 몸의 기억을 이어받아 사는 경우다. 게임 아바타, 변장, 살아 있는 상태의 차원이동만으로 빙의를 부여하지 않는다.
+- 타 그룹의 환생은 죽음이나 명시적인 전생 단절 뒤 새 육체·신분으로 두 번째 삶을 시작하고, 제목·공식 소개·장르 표방과 초반 전개가 환생 정체성을 함께 뒷받침하는 경우다. 출생 장면은 필수가 아니며, 이미 존재하던 타인의 몸이라면 빙의와 공동 부여할 수 있다.
+- 타 그룹의 귀환자는 다른 세계, 탑, 던전, 전장에서 장기간 생존하거나 수련한 뒤 원래 세계나 고향으로 돌아온 경우다. 또한 과거의 강자나 영웅이 오랜 수면, 봉인, 죽음, 실종 등 긴 시간 단절 뒤 같은 세계의 후대에 다시 등장해 옛 이름, 세력, 위상을 되찾는 경우도 귀환자다. 타인의 몸으로 돌아온 경우 빙의와 공동 부여할 수 있다. 평범한 귀가, 짧은 던전 출입, 일방향 차원이동은 귀환자가 아니다.
+- 회귀, 빙의, 환생, 귀환자는 서로 독립적인 추천 신호다. 공동 부여는 각 라벨에 독립 근거가 있거나, 하나의 사건에서 메커니즘 증거와 독자 대상 장르 표방이 각각 강하게 확인될 때 허용한다. 제목 한 단어, 비유, 근거 없는 추측만으로 공동 부여하지 않는다.
+- 타 배열에서는 먼저 회귀, 빙의, 환생, 귀환자를 각각 독립적으로 판정한다. 강하게 확인된 생애전환 라벨을 일반 타 라벨보다 앞에 배치한다. 남는 자리에만 성장형, 고인물 등 일반 타 라벨을 배치한다. 강한 생애전환 라벨을 일반 타 라벨 때문에 제외하지 않는다.
+- 강한 생애전환 라벨이 세 개를 초과하면 전환 메커니즘이 직접 확인되고 작품 정체성과 가장 강하게 연결된 세 개를 남긴다. 라벨 이름의 고정 순서로 자르지 않는다.
+- 차원이동은 목, 무한회귀는 능, 루프는 작 그룹의 별도 라벨이다. 전이 또는 이세계 언급만으로 차원이동이나 타 그룹의 생애전환 라벨을 자동 부여하지 않는다.
+"""
+
 DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EXTRACTOR_V1이다.
 입력된 정보(작품정보 + 도입부 회차 본문)를 읽고 작품 신호와 설명 메타를 추출한다.
 출력은 반드시 JSON 단일 객체만 허용한다. 설명문, 마크다운, 코드블록 금지.
@@ -134,7 +143,7 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 1-6-2) 시대 배경 라벨과 기관, 세력, 반복 공간 라벨은 서로 대체하지 않는다. 중세 세계에서 전사 아카데미 입학이 초반 목표라면 중세와 아카데미를 함께 선택한다.
 1-7) 근거가 약하면 라벨을 선택하지 않는다. 어떤 그룹이든 부합하는 허용 라벨이 없으면 빈 배열로 둔다. 가장 가까운 라벨로 대체하지 않는다.
 1-7-1) 상태창은 스탯, 스킬, 업적을 보여주는 정보 창이고, 시스템은 퀘스트·보상·페널티·상점·레벨업을 집행하는 메커니즘이다. 정보 표시만 있으면 상태창만 선택한다.
-1-7-2) 회귀는 과거 특정 시점으로 돌아오는 1회성 또는 제한적 인생 재시작, 무한회귀는 실패 때마다 반복 재시도, 루프는 특정 사건·하루·구간 반복, 빙의는 타인의 몸이나 작품 속 인물 신분, 환생은 새 육체와 생애, 귀환자는 장기 생존 후 원래 세계 복귀, 차원이동은 살아 있는 상태의 세계 이동으로 구분한다.
+1-7-2) 회귀는 과거 특정 시점으로 돌아오는 1회성 또는 제한적 인생 재시작, 무한회귀는 실패 때마다 반복 재시도, 루프는 특정 사건·하루·구간 반복, 빙의는 이미 존재하던 타인의 몸이나 작품 속 인물 신분, 환생은 죽음·전생 단절 뒤 새 육체·신분의 두 번째 삶, 귀환자는 다른 공간에서 돌아오거나 긴 시간 단절 뒤 후대에 다시 등장해 옛 위상을 되찾는 경우, 차원이동은 살아 있는 상태의 세계 이동으로 구분한다.
 1-7-3) 아카데미는 특수능력 교육기관, 학원은 현대 학교생활, 청춘, 교우관계, 학교는 물리적 학교 공간 사건이 중심일 때만 선택한다.
 1-7-4) 하렘은 복수의 이성 캐릭터가 명확한 애정, 소유욕, 관계 긴장을 보일 때만, 조력자는 단순 도움 제공이 아니라 동등한 파트너십과 반복 동행이 작품 매력일 때만 선택한다.
 1-7-5) 직 라벨은 실제 직업, 신분, 역할, 전투 클래스가 직접 확인될 때만 선택한다. 세계를 구하거나 사람을 구하는 목표만으로 소방관, 의사, 경찰 같은 직업을 추정하지 않는다.
@@ -157,7 +166,7 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 14-3) intro는 2문장 이내. 첫 문장은 작품의 초반 사건·상황을 구체적으로, 둘째 문장은 어떤 독자에게 맞는지. 추상 홍보문구 금지(11~12번 규칙과 동일 기준).
 14-4) points는 정확히 3개. 각 1문장. ①이야기의 출발점(설정) ②주인공이 어떤 인물이고 무엇을 향해 가는지 ③어떤 취향의 독자에게 어울리는지.
 14-5) chips는 독자에게 익숙한 키워드 3~4개. 장르·트롭·소재 어휘만(예: 먼치킨, 아카데미, 회귀, 게이트). 고유명사(인명·작품명), 두 단어 초과 구, 금칙어 사용 금지.
-"""
+""" + DNA_LIFECYCLE_LABELING_RULES
 
 DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하세요.
 
@@ -273,6 +282,18 @@ class UnsupportedLabelError(ValueError):
 
 class OpenRouterInsufficientCreditsError(RuntimeError):
     pass
+
+
+class OpenRouterResponseValidationError(RuntimeError):
+    def __init__(self, message: str, usage: dict[str, Any] | None = None):
+        safe_usage = usage if isinstance(usage, dict) else {}
+        self.safe_llm_usage = {
+            "prompt_tokens": safe_usage.get("prompt_tokens"),
+            "completion_tokens": safe_usage.get("completion_tokens"),
+            "total_tokens": safe_usage.get("total_tokens"),
+            "cost": safe_usage.get("cost"),
+        }
+        super().__init__(message)
 
 
 def db_connect():
@@ -553,33 +574,18 @@ def _has_buff_evidence(text: str) -> bool:
     return "버프" in text or ("계약" in text and any(marker in text for marker in ("힘을 얻", "강화", "능력")))
 
 
-def _has_possession_evidence(text: str) -> bool:
-    negative_markers = ("시스템이 빙의", "프로그램이 설치", "빙의한 형태")
-    if any(marker in text for marker in negative_markers):
-        return False
+def _has_possession_contradiction(text: str) -> bool:
     return any(
         marker in text
         for marker in (
-            "몸에 빙의",
-            "몸으로 빙의",
-            "몸에 들어",
-            "몸으로 들어",
-            "빙의해",
-            "빙의한",
-            "빙의되",
-            "빙의한다",
-            "소설 속",
-            "작품 속",
-            "게임 속",
-            "타인의 몸",
-            "남의 몸",
-            "다른 사람의 몸",
+            "주인공은 원래 자신의 몸과 신분 그대로다",
+            "주인공은 원래 자기 몸과 신분 그대로다",
+            "몸이나 영혼의 이동은 없다",
+            "의식이나 영혼의 이동은 없다",
+            "타인의 몸이 아니다",
+            "남의 몸이 아니다",
         )
     )
-
-
-def _has_growth_evidence(text: str) -> bool:
-    return any(marker in text for marker in ("성장", "데뷔", "훈련", "수련", "레벨업", "퀘스트", "목표"))
 
 
 def _has_monster_hunter_evidence(text: str) -> bool:
@@ -589,10 +595,15 @@ def _has_monster_hunter_evidence(text: str) -> bool:
 def _apply_axis_label_evidence_guards(
     axis_labels: dict[str, list[str]],
     allowed_labels: dict[str, set[str]],
-    source_text: str = "",
+    evidence_text: str = "",
+    *,
+    possession_source_text: str | None = None,
 ) -> dict[str, list[str]]:
-    if not source_text:
+    if not evidence_text and not possession_source_text:
         return axis_labels
+
+    source_text = evidence_text
+    possession_text = evidence_text if possession_source_text is None else possession_source_text
 
     guarded = {axis: list(labels) for axis, labels in axis_labels.items()}
 
@@ -617,10 +628,8 @@ def _apply_axis_label_evidence_guards(
         if "버프" in allowed_labels["능"] and "버프" not in guarded["능"] and _has_buff_evidence(source_text):
             guarded["능"].append("버프")
 
-    if "빙의" in guarded["타"] and not _has_possession_evidence(source_text):
+    if "빙의" in guarded["타"] and _has_possession_contradiction(possession_text):
         guarded["타"] = [label for label in guarded["타"] if label != "빙의"]
-        if not guarded["타"] and "성장형" in allowed_labels["타"] and _has_growth_evidence(source_text):
-            guarded["타"].append("성장형")
 
     _, worldview_max_items = AXIS_LIMITS["세"]
     if (
@@ -730,8 +739,6 @@ def _compact_model_slug(model: str) -> str:
     slug = (model or "").split("/")[-1].strip().lower()
     return (
         slug.replace("deepseek-", "ds-")
-        .replace("claude-", "cl-")
-        .replace("haiku-", "hq-")
         .replace("json_schema", "schema")
     )
 
@@ -927,10 +934,6 @@ def _build_openrouter_response_format(allowed_labels: dict[str, set[str]]) -> di
 def _validate_runtime_config(allowed_labels: dict[str, set[str]]) -> None:
     if MAX_LLM_OUTPUT_TOKENS <= 0:
         raise RuntimeError("AI_METADATA_MAX_TOKENS must be > 0")
-    if AI_DNA_PROVIDER == "anthropic":
-        if not ANTHROPIC_API_KEY:
-            raise RuntimeError("ANTHROPIC_API_KEY 환경변수를 설정하세요.")
-        return
     if AI_DNA_PROVIDER != "openrouter":
         raise RuntimeError(f"unsupported AI_DNA_PROVIDER: {AI_DNA_PROVIDER}")
     if not OPENROUTER_API_KEY:
@@ -1000,6 +1003,7 @@ def normalize_payload(
         normalized_axis,
         allowed_labels,
         _payload_evidence_text(payload, source_text),
+        possession_source_text=source_text,
     )
 
     axis_confidence = payload.get("axis_confidence")
@@ -1074,36 +1078,6 @@ def normalize_payload(
         "axis_romance_tags": normalized_axis["연"],
         **_normalize_librarian(summary),
     }
-
-
-def call_claude(system_prompt: str, user_prompt: str) -> str:
-    """Anthropic Messages API 호출 (동기)."""
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY 환경변수를 설정하세요.")
-
-    with httpx.Client(timeout=60.0) as client:
-        resp = client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": MAX_LLM_OUTPUT_TOKENS,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_prompt}],
-            },
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Claude API error: {resp.status_code} {resp.text}")
-        data = resp.json()
-        if data.get("stop_reason") == "max_tokens":
-            raise RuntimeError(
-                f"Claude output truncated: stop_reason=max_tokens(max_tokens={MAX_LLM_OUTPUT_TOKENS})"
-            )
-        return data["content"][0]["text"]
 
 
 def _extract_openrouter_message_text(payload: dict[str, Any]) -> str:
@@ -1215,12 +1189,16 @@ def call_openrouter(
         raise RuntimeError(_sanitize_openrouter_error(resp))
 
     data = resp.json()
-    _validate_openrouter_choice(data)
-    raw = _extract_openrouter_message_text(data)
-    if not raw:
-        finish_reason = ((data.get("choices") or [{}])[0] or {}).get("finish_reason")
-        raise RuntimeError(f"OpenRouter empty content (finish_reason={finish_reason or 'unknown'})")
-    return raw, data.get("usage") or {}
+    usage = _usage_summary(data.get("usage"))
+    try:
+        _validate_openrouter_choice(data)
+        raw = _extract_openrouter_message_text(data)
+        if not raw:
+            finish_reason = ((data.get("choices") or [{}])[0] or {}).get("finish_reason")
+            raise RuntimeError(f"OpenRouter empty content (finish_reason={finish_reason or 'unknown'})")
+    except RuntimeError as error:
+        raise OpenRouterResponseValidationError(str(error), usage) from error
+    return raw, usage
 
 
 def _usage_summary(usage: dict[str, Any] | None) -> dict[str, Any]:
@@ -1238,36 +1216,16 @@ def _call_llm(
     user_prompt: str,
     allowed_labels: dict[str, set[str]],
 ) -> tuple[str, dict[str, Any]]:
-    if AI_DNA_PROVIDER == "anthropic":
-        try:
-            return call_claude(system_prompt, user_prompt), {
-                "provider": "anthropic",
-                "model": ANTHROPIC_MODEL,
-                "response_format": "json_object",
-            }
-        except Exception as exc:
-            if not OPENROUTER_API_KEY:
-                raise
-            raw, usage = call_openrouter(system_prompt, user_prompt, allowed_labels)
-            return raw, {
-                "provider": "openrouter",
-                "fallback_from": "anthropic",
-                "fallback_reason": str(exc)[:240],
-                "model": AI_DNA_OPENROUTER_MODEL,
-                "provider_only": _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY),
-                "response_format": AI_DNA_RESPONSE_FORMAT,
-                "usage": _usage_summary(usage),
-            }
-    if AI_DNA_PROVIDER == "openrouter":
-        raw, usage = call_openrouter(system_prompt, user_prompt, allowed_labels)
-        return raw, {
-            "provider": "openrouter",
-            "model": AI_DNA_OPENROUTER_MODEL,
-            "provider_only": _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY),
-            "response_format": AI_DNA_RESPONSE_FORMAT,
-            "usage": _usage_summary(usage),
-        }
-    raise RuntimeError(f"unsupported AI_DNA_PROVIDER: {AI_DNA_PROVIDER}")
+    if AI_DNA_PROVIDER != "openrouter":
+        raise RuntimeError(f"unsupported AI_DNA_PROVIDER: {AI_DNA_PROVIDER}")
+    raw, usage = call_openrouter(system_prompt, user_prompt, allowed_labels)
+    return raw, {
+        "provider": "openrouter",
+        "model": AI_DNA_OPENROUTER_MODEL,
+        "provider_only": _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY),
+        "response_format": AI_DNA_RESPONSE_FORMAT,
+        "usage": _usage_summary(usage),
+    }
 
 
 def _attach_llm_meta(parsed: dict[str, Any], calls: list[dict[str, Any]]) -> dict[str, Any]:
