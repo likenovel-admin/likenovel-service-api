@@ -256,6 +256,102 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
             recommendation_service._ALLOWED_AXIS_LABELS_CACHE = original_cache
             recommendation_service._ALLOWED_AXIS_LABELS_WARNED = original_warned
 
+    async def test_product_metadata_loader_decodes_axis_label_scores(self):
+        db = AsyncMock()
+        db.execute.return_value = self._FakeMappingsResult(
+            [
+                {
+                    "product_id": 123,
+                    "protagonist_type_tags": '["환생", "성장형"]',
+                    "axis_label_scores": (
+                        '{"타": ['
+                        '{"label": "환생", "score": 0.95}, '
+                        '{"label": "성장형", "score": 0.55}'
+                        "]}"
+                    ),
+                }
+            ]
+        )
+
+        rows = await recommendation_service.get_all_product_ai_metadata(db)
+
+        self.assertEqual(
+            rows[0]["axis_label_scores"]["타"],
+            [
+                {"label": "환생", "score": 0.95},
+                {"label": "성장형", "score": 0.55},
+            ],
+        )
+
+    def test_product_axis_label_scores_weight_multi_label_taste_match(self):
+        base_candidate = {
+            "protagonist_type_tags": ["환생", "성장형"],
+            "overall_confidence": 0.9,
+        }
+        lifecycle_strong = {
+            **base_candidate,
+            "axis_label_scores": {
+                "타": [
+                    {"label": "환생", "score": 0.95},
+                    {"label": "성장형", "score": 0.55},
+                ]
+            },
+        }
+        lifecycle_weak = {
+            **base_candidate,
+            "axis_label_scores": {
+                "타": [
+                    {"label": "환생", "score": 0.55},
+                    {"label": "성장형", "score": 0.95},
+                ]
+            },
+        }
+        factor_scores = {"protagonist": {"환생": 6.0}}
+
+        strong_score = recommendation_service.score_taste_for_candidate(
+            lifecycle_strong,
+            {},
+            factor_scores,
+        )
+        weak_score = recommendation_service.score_taste_for_candidate(
+            lifecycle_weak,
+            {},
+            factor_scores,
+        )
+
+        self.assertGreater(strong_score, weak_score)
+
+    def test_missing_product_axis_label_scores_preserves_legacy_match(self):
+        score = recommendation_service.score_taste_for_candidate(
+            {
+                "protagonist_type_tags": ["환생", "성장형"],
+                "overall_confidence": 0.9,
+            },
+            {},
+            {"protagonist": {"환생": 6.0}},
+        )
+
+        self.assertEqual(score, 5.0)
+
+    def test_product_axis_scores_cannot_inject_unselected_labels(self):
+        score = recommendation_service.score_taste_for_candidate(
+            {
+                "protagonist_type_tags": ["환생", "성장형"],
+                "overall_confidence": 0.9,
+                "axis_label_scores": {
+                    "타": [
+                        {"label": "환생", "score": 0.9},
+                        {"label": "성장형", "score": 0.6},
+                        {"label": "빙의", "score": 1.0},
+                    ]
+                },
+            },
+            {},
+            {"protagonist": {"빙의": 1.0}},
+        )
+
+        self.assertEqual(score, 0.0)
+
     async def test_update_ai_slot_feedback_flags_skips_unsupported_event(self):
         db = AsyncMock()
 
