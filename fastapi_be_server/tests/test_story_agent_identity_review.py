@@ -350,11 +350,70 @@ class CharacterIdentityReviewTest(TestCase):
                 }
             ],
         )
-        with self.assertRaisesRegex(ValueError, "stale character identity review signal"):
+        with self.assertRaisesRegex(
+            module.CharacterIdentityReviewStaleError,
+            "stale character identity review signal",
+        ):
             module.normalize_character_identity_review_document(
                 document,
                 signal_rows=rows,
             )
+
+    def test_missing_review_observation_is_typed_review_required(self):
+        module = load_module()
+        document = review_document(
+            module,
+            1149,
+            [
+                {
+                    "operation_id": "confirm-eric",
+                    "kind": "confirm_protagonist",
+                    "member_scope_keys": ["character:에릭"],
+                    "target_scope_key": "character:에릭",
+                    "authorized_observation_refs": ["summary:1:0"],
+                    "signal_anchors": [
+                        {"summary_id": 1, "source_hash": "signal-1"}
+                    ],
+                    "force_main_protagonist": True,
+                    "anonymous_protagonist": False,
+                    "reason": "reviewed protagonist",
+                }
+            ],
+        )
+        replacement_rows = [
+            signal_row(2, 1, [signal_character("named:에릭", "에릭")])
+        ]
+
+        with self.assertRaises(module.CharacterIdentityReviewStaleError) as caught:
+            module.normalize_character_identity_review_document(
+                document,
+                signal_rows=replacement_rows,
+            )
+
+        self.assertEqual(caught.exception.product_id, 1149)
+        self.assertEqual(caught.exception.operation_ids, ("confirm-eric",))
+        self.assertEqual(
+            caught.exception.reason_codes,
+            ("missing_observations",),
+        )
+
+    def test_malformed_review_remains_hard_failure(self):
+        module = load_module()
+        malformed = {
+            "schema_version": "character_identity_review_v1",
+            "product_id": 1149,
+            "review_origin": "operator_cli",
+            "reviewer_id": "codex.ops",
+            "operations": [],
+        }
+
+        with self.assertRaises(ValueError) as caught:
+            module.normalize_character_identity_review_document(malformed)
+
+        self.assertNotIsInstance(
+            caught.exception,
+            module.CharacterIdentityReviewStaleError,
+        )
 
     def test_retirement_pins_both_retired_and_replacement_scopes(self):
         module = load_module()

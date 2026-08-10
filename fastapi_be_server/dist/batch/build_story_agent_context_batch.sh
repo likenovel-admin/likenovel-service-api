@@ -20,6 +20,7 @@ CHAT_ASSET_TARGET_EPISODES="50"
 CHAT_ASSET_PRIORITY_HEADROOM_USD="1.00"
 CHAT_ASSET_SURPLUS_HEADROOM_USD="2.00"
 DEFERRED_BUDGET_EXIT_CODE=75
+REVIEW_REQUIRED_EXIT_CODE=76
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
@@ -180,13 +181,67 @@ if [ -n "${MYSQL_SSL_OPT:-}" ]; then
   MYSQL_CMD+=("${MYSQL_SSL_OPT}")
 fi
 
+REVIEW_REQUIRED_OUTPUT=""
+if ! REVIEW_REQUIRED_OUTPUT="$("${MYSQL_CMD[@]}" <<'SQL'
+SELECT CONCAT('REVIEW_REQUIRED:', identity_review.product_id)
+FROM tb_story_agent_context_product review_product
+STRAIGHT_JOIN tb_story_agent_context_summary identity_review
+  FORCE INDEX (idx_story_agent_context_summary_product_type)
+  ON identity_review.product_id = review_product.product_id
+ AND identity_review.summary_type = 'character_identity_review_v1'
+ AND identity_review.scope_key = 'identity_review'
+ AND identity_review.is_active = 'Y'
+JOIN JSON_TABLE(
+  IF(
+    JSON_VALID(identity_review.summary_text),
+    identity_review.summary_text,
+    '{"operations":[]}'
+  ),
+  '$.operations[*].signal_anchors[*]' COLUMNS (
+    summary_id BIGINT PATH '$.summary_id',
+    source_hash VARCHAR(64) PATH '$.source_hash'
+  )
+) review_anchor
+LEFT JOIN tb_story_agent_context_summary active_review_signal
+  ON active_review_signal.summary_id = review_anchor.summary_id
+ AND active_review_signal.product_id = identity_review.product_id
+ AND active_review_signal.summary_type = 'episode_character_signals'
+ AND active_review_signal.is_active = 'Y'
+ AND active_review_signal.source_hash = review_anchor.source_hash
+WHERE active_review_signal.summary_id IS NULL
+GROUP BY identity_review.product_id
+ORDER BY identity_review.product_id;
+SQL
+)"; then
+  log "[error] identity review freshness query failed"
+  exit 1
+fi
+
+REVIEW_REQUIRED_PRODUCT_IDS_SQL="0"
+declare -A REVIEW_REQUIRED_PRODUCT_IDS=()
+review_required_count=0
+while IFS= read -r review_required_line; do
+  if [[ "${review_required_line}" =~ ^REVIEW_REQUIRED:([0-9]+)$ ]]; then
+    review_required_product_id="${BASH_REMATCH[1]}"
+    if [ -z "${REVIEW_REQUIRED_PRODUCT_IDS[${review_required_product_id}]+x}" ]; then
+      REVIEW_REQUIRED_PRODUCT_IDS["${review_required_product_id}"]=1
+      REVIEW_REQUIRED_PRODUCT_IDS_SQL+=",${review_required_product_id}"
+      review_required_count=$((review_required_count + 1))
+    fi
+  fi
+done <<< "${REVIEW_REQUIRED_OUTPUT}"
+
 CANDIDATE_OUTPUT=""
 if ! CANDIDATE_OUTPUT="$("${MYSQL_CMD[@]}" <<SQL
 SELECT
   candidates.product_id,
   candidates.title,
-  candidates.character_asset_repair_needed,
   CASE
+    WHEN candidates.character_identity_review_required > 0 THEN 0
+    ELSE candidates.character_asset_repair_needed
+  END AS character_asset_repair_needed,
+  CASE
+    WHEN candidates.character_identity_review_required > 0 THEN 0
     WHEN candidates.missing_open_character_signal_count > 0 THEN 1
     WHEN candidates.active_open_character_signal_count > 0
       AND (
@@ -252,6 +307,10 @@ FROM (
         AND civ3.summary_type = 'character_inventory_v3'
         AND civ3.is_active = 'Y'
     ) AS active_character_inventory_v3_count,
+    CASE
+      WHEN p.product_id IN (${REVIEW_REQUIRED_PRODUCT_IDS_SQL}) THEN 1
+      ELSE 0
+    END AS character_identity_review_required,
     CASE WHEN collection_cohort.product_id IS NULL THEN 0 ELSE (
       SELECT COUNT(*)
       FROM tb_story_agent_context_summary repair_inventory
@@ -443,20 +502,25 @@ FROM (
     collection_cohort.product_id
   HAVING
     missing_foundation_episode_count > 0
-    OR missing_open_scene_count > 0
-    OR character_asset_repair_needed > 0
     OR (
-      active_open_character_signal_count > 0
+      character_identity_review_required = 0
       AND (
-        active_character_inventory_count = 0
-        OR active_character_inventory_v3_count = 0
+        missing_open_scene_count > 0
+        OR character_asset_repair_needed > 0
+        OR (
+          active_open_character_signal_count > 0
+          AND (
+            active_character_inventory_count = 0
+            OR active_character_inventory_v3_count = 0
+          )
+        )
+        OR (
+          context_status = 'failed'
+          AND missing_foundation_episode_count = 0
+          AND active_character_inventory_count > 0
+          AND active_character_inventory_v3_count > 0
+        )
       )
-    )
-    OR (
-      context_status = 'failed'
-      AND missing_foundation_episode_count = 0
-      AND active_character_inventory_count > 0
-      AND active_character_inventory_v3_count > 0
     )
 ) candidates
 ORDER BY
@@ -504,7 +568,7 @@ fi
 
 if [ "${#CANDIDATE_ROWS[@]}" -eq 0 ]; then
   log "[batch-empty] no eligible products"
-  log "[INFO] build_story_agent_context_batch completed ready=0 deferred=0 failed=0 max_parallel=${MAX_PARALLEL}"
+  log "[INFO] build_story_agent_context_batch completed ready=0 review_required=${review_required_count} deferred=0 failed=0 max_parallel=${MAX_PARALLEL}"
   exit 0
 fi
 
@@ -563,7 +627,7 @@ done
 
 if [ "${#PIDS[@]}" -eq 0 ]; then
   log "[batch-empty] selected rows were unparsable"
-  log "[INFO] build_story_agent_context_batch completed ready=0 deferred=0 failed=0 max_parallel=${MAX_PARALLEL}"
+  log "[INFO] build_story_agent_context_batch completed ready=0 review_required=${review_required_count} deferred=0 failed=0 max_parallel=${MAX_PARALLEL}"
   exit 0
 fi
 
@@ -583,7 +647,13 @@ for pid in "${PIDS[@]}"; do
   else
     child_exit_code=$?
     duration_sec=$(( $(date +%s) - start_ts ))
-    if [ "${child_exit_code}" -eq "${DEFERRED_BUDGET_EXIT_CODE}" ]; then
+    if [ "${child_exit_code}" -eq "${REVIEW_REQUIRED_EXIT_CODE}" ]; then
+      if [ -z "${REVIEW_REQUIRED_PRODUCT_IDS[${product_id}]+x}" ]; then
+        REVIEW_REQUIRED_PRODUCT_IDS["${product_id}"]=1
+        review_required_count=$((review_required_count + 1))
+      fi
+      log "[review-required] product_id=${product_id} title=\"${product_title}\" duration_sec=${duration_sec}"
+    elif [ "${child_exit_code}" -eq "${DEFERRED_BUDGET_EXIT_CODE}" ]; then
       deferred_count=$((deferred_count + 1))
       log "[deferred-budget] product_id=${product_id} title=\"${product_title}\" duration_sec=${duration_sec}"
     else
@@ -593,8 +663,8 @@ for pid in "${PIDS[@]}"; do
   fi
 done
 
-log "[summary] launched=${#PIDS[@]} ready=${success_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
-log "[INFO] build_story_agent_context_batch completed ready=${success_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
+log "[summary] launched=${#PIDS[@]} ready=${success_count} review_required=${review_required_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
+log "[INFO] build_story_agent_context_batch completed ready=${success_count} review_required=${review_required_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
 
 if [ "${fail_count}" -gt 0 ]; then
   exit 1

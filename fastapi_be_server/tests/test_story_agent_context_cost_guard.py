@@ -101,10 +101,14 @@ def signal_character(
 class FakeConnection:
     def __init__(self):
         self.commit_count = 0
+        self.rollback_count = 0
         self.close_count = 0
 
     def commit(self):
         self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
 
     def close(self):
         self.close_count += 1
@@ -747,6 +751,108 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["inserted_summaries"], 1)
         self.assertEqual(results["inserted_range_summaries"], 1)
         self.assertEqual(results["products"][0]["context_status"], "ready")
+
+    async def test_delta_stale_identity_review_keeps_foundation_and_lkg(self):
+        module = load_module()
+        conn = FakeConnection()
+        episode_summary_row = {
+            "summary_id": 11,
+            "scope_key": "episode:101",
+            "episode_from": 16,
+            "source_hash": "summary-hash",
+            "summary_text": "[16화] 요약",
+        }
+        row = {
+            "product_id": 1149,
+            "title": "테스트 작품",
+            "episode_id": 101,
+            "episode_no": 16,
+            "_character_asset_collection_eligible": True,
+        }
+        stale_error = module.CharacterIdentityReviewStaleError(
+            "stale character identity review observations: confirm-main count=1",
+            product_id=1149,
+            operation_id="confirm-main",
+            reason_code="missing_observations",
+        )
+        summary_builder = AsyncMock(return_value=(11, True, {"used_llm": True}))
+        signal_builder = AsyncMock(return_value=(1, 0, True))
+        scene_builder = AsyncMock()
+        rp_builder = AsyncMock()
+        mark_failed = MagicMock()
+        patchers = [
+            patch.object(module, "OPENROUTER_API_KEY", ""),
+            patch.object(module.settings, "ANTHROPIC_API_KEY", ""),
+            patch.object(module, "db_connect", return_value=conn),
+            patch.object(module, "work_cursor", fake_work_cursor),
+            patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())),
+            patch.object(module, "touch_product_context_build_attempt"),
+            patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()),
+            patch.object(module, "fetch_total_episode_count", return_value=16),
+            patch.object(module, "fetch_active_character_inventory_map", return_value={}),
+            patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}),
+            patch.object(module, "fetch_active_summary_state_map", return_value={}),
+            patch.object(module, "fetch_active_summary_rows_for_episode_nos", return_value=[episode_summary_row]),
+            patch.object(module, "resolve_source_payload", AsyncMock(return_value={"html_content": "본문", "source_type": "db"})),
+            patch.object(module, "normalize_episode_html", return_value="정규화 본문"),
+            patch.object(module, "build_chunks", return_value=[{"chunk_text": "정규화 본문"}]),
+            patch.object(module, "fetch_existing_doc", return_value=None),
+            patch.object(module, "insert_doc_and_chunks"),
+            patch.object(module, "insert_episode_summary", summary_builder),
+            patch.object(module, "build_episode_character_signals_summaries_nonblocking", signal_builder),
+            patch.object(module, "fetch_active_summary_rows", return_value=[episode_summary_row]),
+            patch.object(module, "build_work_protagonist_resolution_for_inventory_v3", AsyncMock(return_value={})),
+            patch.object(module, "build_compound_summaries_delta", return_value={"range": (1, 0), "product": (1, 0)}),
+            patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}),
+            patch.object(module, "build_character_inventory_v3_summaries", side_effect=stale_error),
+            patch.object(module, "build_episode_scene_extraction_summaries_nonblocking", scene_builder),
+            patch.object(module, "build_rp_summaries_delta", rp_builder),
+            patch.object(
+                module,
+                "refresh_product_context_status",
+                return_value={
+                    "product_id": 1149,
+                    "context_status": "ready",
+                    "total_episode_count": 16,
+                    "ready_episode_count": 16,
+                },
+            ),
+            patch.object(module, "attach_character_chat_asset_readiness_to_status_row", side_effect=lambda _cur, status: status),
+            patch.object(module, "mark_product_context_failed", mark_failed),
+        ]
+
+        with ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
+            results = await module.build_context_rows_delta(
+                rows=[row],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    use_epub_fallback=False,
+                    refresh_rp=False,
+                ),
+            )
+
+        summary_builder.assert_awaited_once()
+        signal_builder.assert_awaited_once()
+        scene_builder.assert_not_awaited()
+        rp_builder.assert_not_awaited()
+        mark_failed.assert_not_called()
+        self.assertEqual(conn.rollback_count, 1)
+        self.assertEqual(results["inserted_summaries"], 1)
+        self.assertEqual(results["inserted_episode_character_signals"], 1)
+        self.assertEqual(results["review_required"], 1)
+        self.assertEqual(results["products"][0]["context_status"], "review_required")
+        self.assertEqual(results["products"][0]["persisted_context_status"], "ready")
+        self.assertEqual(
+            results["products"][0]["review_reason_codes"],
+            ["missing_observations"],
+        )
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_REVIEW_REQUIRED_EXIT_CODE,
+        )
 
     async def test_episode_scene_extraction_skips_when_openrouter_key_missing(self):
         module = load_module()
@@ -3660,6 +3766,88 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         results["character_asset_repair_failed"] = 1
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
 
+    def test_product_result_merge_does_not_downgrade_failed_or_review_required(self):
+        module = load_module()
+        failed_products = [
+            {
+                "product_id": 687,
+                "context_status": "failed",
+                "total_episode_count": 5,
+                "ready_episode_count": 3,
+            }
+        ]
+
+        module.merge_story_agent_product_result(
+            failed_products,
+            {
+                "product_id": 687,
+                "context_status": "ready",
+                "total_episode_count": 5,
+                "ready_episode_count": 5,
+                "character_asset_repair": {"status": "no_progress"},
+            },
+        )
+
+        self.assertEqual(failed_products[0]["context_status"], "failed")
+        self.assertEqual(failed_products[0]["persisted_context_status"], "ready")
+        self.assertEqual(
+            failed_products[0]["character_asset_repair"],
+            {"status": "no_progress"},
+        )
+
+        review_required_products = [
+            {
+                "product_id": 688,
+                "context_status": "review_required",
+                "persisted_context_status": "ready",
+                "total_episode_count": 8,
+                "ready_episode_count": 8,
+            }
+        ]
+        module.merge_story_agent_product_result(
+            review_required_products,
+            {
+                "product_id": 688,
+                "context_status": "deferred_budget",
+                "persisted_context_status": "ready",
+                "total_episode_count": 8,
+                "ready_episode_count": 8,
+            },
+        )
+
+        self.assertEqual(
+            review_required_products[0]["context_status"],
+            "review_required",
+        )
+        self.assertEqual(
+            review_required_products[0]["persisted_context_status"],
+            "ready",
+        )
+
+    def test_identity_dependent_rows_exclude_only_review_required_products(self):
+        module = load_module()
+        results = module.build_empty_results()
+        results["products"] = [
+            {"product_id": 1149, "context_status": "review_required"},
+            {"product_id": 1109, "context_status": "ready"},
+            {"product_id": 1207, "context_status": "failed"},
+        ]
+        rows = [
+            {"product_id": 1149, "title": "stale review"},
+            {"product_id": 1109, "title": "fresh review"},
+            {"product_id": 1207, "title": "hard failure"},
+        ]
+
+        filtered = module.filter_review_required_product_rows(
+            rows,
+            results=results,
+        )
+
+        self.assertEqual(
+            [row["product_id"] for row in filtered],
+            [1109, 1207],
+        )
+
     def test_delta_exit_code_reports_budget_deferral_without_failure(self):
         module = load_module()
         results = module.build_empty_results()
@@ -3832,6 +4020,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                  "fetch_character_chat_asset_readiness_verification",
                  side_effect=[before_readiness, after_readiness],
              ), \
+             patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "fetch_active_character_inventory_map", return_value=inventory_map), \
              patch.object(module, "fetch_active_summary_rows", return_value=episode_rows), \
              patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
@@ -3862,6 +4051,68 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["character_asset_repair_failed"], 0)
         self.assertEqual(results["products"][0]["context_status"], "ready")
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
+
+    async def test_character_asset_repair_stale_review_stops_before_identity_writes(self):
+        module = load_module()
+        conn = FakeConnection()
+        results = module.build_empty_results()
+        stale_error = module.CharacterIdentityReviewStaleError(
+            "stale character identity review signal: confirm-main summary_id=1",
+            product_id=1176,
+            operation_id="confirm-main",
+            reason_code="signal_anchor_changed",
+        )
+        scene_builder = AsyncMock()
+        rp_builder = AsyncMock()
+
+        with patch.object(module, "OPENROUTER_API_KEY", ""), \
+             patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+             patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_total_episode_count", return_value=69), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=69), \
+             patch.object(module, "fetch_active_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_character_identity_review", side_effect=stale_error) as review_fetch, \
+             patch.object(module, "fetch_character_chat_asset_readiness_verification") as readiness, \
+             patch.object(module, "build_episode_scene_extraction_summaries", scene_builder), \
+             patch.object(module, "build_rp_summaries_delta", rp_builder), \
+             patch.object(module, "touch_product_context_build_attempt") as touch:
+            await module.repair_character_chat_assets(
+                rows=[
+                    {
+                        "product_id": 1176,
+                        "title": "테스트 작품",
+                        "_character_asset_collection_eligible": True,
+                    }
+                ],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    max_delta_episodes=2,
+                ),
+                results=results,
+            )
+
+        review_fetch.assert_called_once()
+        readiness.assert_not_called()
+        scene_builder.assert_not_awaited()
+        rp_builder.assert_not_awaited()
+        touch.assert_not_called()
+        self.assertEqual(conn.rollback_count, 2)
+        self.assertEqual(results["character_asset_repair_failed"], 0)
+        self.assertEqual(results["review_required"], 1)
+        self.assertEqual(
+            results["character_asset_repairs"][0]["status"],
+            "review_required",
+        )
+        self.assertEqual(results["products"][0]["context_status"], "review_required")
+        self.assertEqual(results["products"][0]["persisted_context_status"], "ready")
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_REVIEW_REQUIRED_EXIT_CODE,
+        )
 
     async def test_character_asset_repair_skips_out_of_cohort_product(self):
         module = load_module()
@@ -3916,6 +4167,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
              patch.object(module, "fetch_product_context_status", return_value="ready"), \
              patch.object(module, "fetch_product_ready_episode_count", return_value=12), \
              patch.object(module, "fetch_character_chat_asset_readiness_verification", return_value=before_readiness), \
+             patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "fetch_active_character_inventory_map", return_value={scope_key: {"canonical_character_key": scope_key, "display_name": "데시", "work_role": "main_protagonist", "is_protagonist": True, "evidence_episode_nos": [1]} }), \
              patch.object(module, "fetch_active_summary_rows", return_value=[{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}]), \
              patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
@@ -3965,6 +4217,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
              patch.object(module, "fetch_product_context_status", return_value="ready"), \
              patch.object(module, "fetch_product_ready_episode_count", return_value=1), \
              patch.object(module, "fetch_character_chat_asset_readiness_verification", return_value=before_readiness), \
+             patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "fetch_active_character_inventory_map", return_value={scope_key: {"canonical_character_key": scope_key, "display_name": "데시", "work_role": "main_protagonist", "is_protagonist": True, "evidence_episode_nos": [1]}}), \
              patch.object(module, "fetch_active_summary_rows", return_value=[{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}]), \
              patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
@@ -10871,3 +11124,51 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["inventory_reaggregation_failed"], 1)
         self.assertEqual(results["inventory_reaggregations"][0]["status"], "failed")
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 1)
+
+    async def test_inventory_reaggregation_stale_review_is_review_required(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+        stale_error = module.CharacterIdentityReviewStaleError(
+            "stale character identity review signal: confirm-main summary_id=1",
+            product_id=1176,
+            operation_id="confirm-main",
+            reason_code="signal_anchor_changed",
+        )
+        relation_builder = MagicMock()
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_active_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value={}), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
+             patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}), \
+             patch.object(module, "build_character_inventory_v3_summaries", side_effect=stale_error), \
+             patch.object(module, "build_relation_inventory_summaries_delta", relation_builder), \
+             patch.object(module, "fetch_total_episode_count", return_value=69), \
+             patch.object(module, "fetch_product_context_status", return_value="ready"), \
+             patch.object(module, "fetch_product_ready_episode_count", return_value=69), \
+             patch.object(module, "touch_product_context_build_attempt") as touch:
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1176, "title": "테스트 작품"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        relation_builder.assert_not_called()
+        touch.assert_not_called()
+        self.assertEqual(conn.commit_count, 0)
+        self.assertEqual(conn.rollback_count, 2)
+        self.assertEqual(results["inventory_reaggregation_failed"], 0)
+        self.assertEqual(results["review_required"], 1)
+        self.assertEqual(
+            results["inventory_reaggregations"][0]["status"],
+            "review_required",
+        )
+        self.assertEqual(results["products"][0]["context_status"], "review_required")
+        self.assertEqual(results["products"][0]["persisted_context_status"], "ready")
+        self.assertEqual(
+            module.build_delta_exit_code(results, apply=True),
+            module.STORYCTX_REVIEW_REQUIRED_EXIT_CODE,
+        )
