@@ -76,6 +76,7 @@ try:
 except InvalidOperation as exc:
     raise RuntimeError("invalid STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD") from exc
 STORYCTX_DEFERRED_BUDGET_EXIT_CODE = 75
+STORYCTX_REVIEW_REQUIRED_EXIT_CODE = 76
 EPISODE_SUMMARY_MODEL = os.getenv("STORY_AGENT_SUMMARY_MODEL", "deepseek/deepseek-v3.2").strip()
 RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma-4-31b-it").strip()
 RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
@@ -138,6 +139,21 @@ WORK_PROTAGONIST_CO_MAIN_MAX_COUNT = 3
 WORK_PROTAGONIST_CO_MAIN_NEAR_TIE_SCORE_RATIO = 0.95
 WORK_PROTAGONIST_CO_MAIN_MIN_SCORE = 0.15
 WORK_PROTAGONIST_CO_MAIN_HINT_RATIO = 0.80
+
+
+class CharacterIdentityReviewStaleError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        product_id: int,
+        operation_id: str,
+        reason_code: str,
+    ) -> None:
+        super().__init__(message)
+        self.product_id = product_id
+        self.operation_ids = (operation_id,)
+        self.reason_codes = (reason_code,)
 RELATION_INVENTORY_FORMAT_VERSION = "relation_inventory_v1"
 CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v3"
 CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
@@ -8241,9 +8257,12 @@ def normalize_character_identity_review_document(
             refs = list(operation["authorized_observation_refs"])
             missing_refs = set(refs) - set(observation_by_ref)
             if missing_refs:
-                raise ValueError(
+                raise CharacterIdentityReviewStaleError(
                     "stale character identity review observations: "
-                    f"{operation_id} count={len(missing_refs)}"
+                    f"{operation_id} count={len(missing_refs)}",
+                    product_id=product_id,
+                    operation_id=operation_id,
+                    reason_code="missing_observations",
                 )
             expected_anchor_map = {
                 int(item["summary_id"]): str(item["source_hash"])
@@ -8251,9 +8270,12 @@ def normalize_character_identity_review_document(
             }
             for summary_id, source_hash in expected_anchor_map.items():
                 if active_anchor_by_summary_id.get(summary_id) != source_hash:
-                    raise ValueError(
+                    raise CharacterIdentityReviewStaleError(
                         "stale character identity review signal: "
-                        f"{operation_id} summary_id={summary_id}"
+                        f"{operation_id} summary_id={summary_id}",
+                        product_id=product_id,
+                        operation_id=operation_id,
+                        reason_code="signal_anchor_changed",
                     )
             selected_anchor_map = {
                 int(observation_by_ref[ref].get("summary_id") or 0): str(
@@ -8262,8 +8284,11 @@ def normalize_character_identity_review_document(
                 for ref in refs
             }
             if selected_anchor_map != expected_anchor_map:
-                raise ValueError(
-                    f"character identity review anchor coverage mismatch: {operation_id}"
+                raise CharacterIdentityReviewStaleError(
+                    f"character identity review anchor coverage mismatch: {operation_id}",
+                    product_id=product_id,
+                    operation_id=operation_id,
+                    reason_code="anchor_coverage_changed",
                 )
     return normalized
 
@@ -16335,6 +16360,100 @@ def touch_product_context_build_attempt(cur, *, product_id: int) -> None:
     )
 
 
+_STORY_AGENT_RUN_OUTCOME_PRIORITY = {
+    "failed": 50,
+    "review_required": 40,
+    "deferred_budget": 30,
+    "locked": 20,
+}
+
+
+def merge_story_agent_product_result(
+    product_results: list[dict[str, object]],
+    incoming: dict[str, object],
+) -> None:
+    product_id = int(incoming.get("product_id") or 0)
+    existing = next(
+        (
+            item
+            for item in product_results
+            if int(dict(item or {}).get("product_id") or 0) == product_id
+        ),
+        None,
+    )
+    if existing is None:
+        product_results.append(incoming)
+        return
+
+    existing_status = str(existing.get("context_status") or "").strip()
+    incoming_status = str(incoming.get("context_status") or "").strip()
+    existing_priority = _STORY_AGENT_RUN_OUTCOME_PRIORITY.get(existing_status, 0)
+    incoming_priority = _STORY_AGENT_RUN_OUTCOME_PRIORITY.get(incoming_status, 0)
+    existing.update(incoming)
+    if existing_priority <= incoming_priority:
+        return
+
+    existing["context_status"] = existing_status
+    if incoming_status and incoming_status not in _STORY_AGENT_RUN_OUTCOME_PRIORITY:
+        existing["persisted_context_status"] = incoming_status
+
+
+def record_character_identity_review_required(
+    results: dict[str, object],
+    *,
+    product_id: int,
+    persisted_status: dict[str, object],
+    error: CharacterIdentityReviewStaleError,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    product_results = results.setdefault("products", [])
+    if not isinstance(product_results, list):
+        raise TypeError("story-agent results products must be a list")
+    already_recorded = any(
+        int(product.get("product_id") or 0) == product_id
+        and str(product.get("context_status") or "").strip()
+        == "review_required"
+        for product in product_results
+    )
+    persisted_context_status = str(
+        persisted_status.get("context_status") or "pending"
+    )
+    merge_story_agent_product_result(
+        product_results,
+        {
+            **persisted_status,
+            **dict(metadata or {}),
+            "product_id": product_id,
+            "context_status": "review_required",
+            "persisted_context_status": persisted_context_status,
+            "review_operation_ids": list(error.operation_ids),
+            "review_reason_codes": list(error.reason_codes),
+        },
+    )
+    if not already_recorded:
+        results["review_required"] = int(
+            results.get("review_required") or 0
+        ) + 1
+
+
+def filter_review_required_product_rows(
+    rows: Iterable[dict],
+    *,
+    results: dict[str, object],
+) -> list[dict]:
+    review_required_product_ids = {
+        int(product.get("product_id") or 0)
+        for product in list(results.get("products") or [])
+        if str(product.get("context_status") or "").strip()
+        == "review_required"
+    }
+    return [
+        row
+        for row in rows
+        if int(row.get("product_id") or 0) not in review_required_product_ids
+    ]
+
+
 async def repair_character_chat_assets(
     *,
     rows: Iterable[dict],
@@ -16379,14 +16498,15 @@ async def repair_character_chat_assets(
                             cur,
                             product_id=product_id,
                         ) or "pending"
-                    product_results.append(
+                    merge_story_agent_product_result(
+                        product_results,
                         {
                             "product_id": product_id,
                             "context_status": "deferred_budget",
                             "persisted_context_status": persisted_context_status,
                             "total_episode_count": total_episode_count,
                             "ready_episode_count": ready_episode_count,
-                        }
+                        },
                     )
                     repair_records.append(
                         {
@@ -16435,6 +16555,16 @@ async def repair_character_chat_assets(
                         ready_episode_count = fetch_product_ready_episode_count(
                             cur,
                             product_id=product_id,
+                        )
+                        active_signal_rows = fetch_active_summary_rows(
+                            cur=cur,
+                            product_id=product_id,
+                            summary_type="episode_character_signals",
+                        )
+                        fetch_character_identity_review(
+                            cur,
+                            product_id=product_id,
+                            signal_rows=active_signal_rows,
                         )
                         before_readiness = fetch_character_chat_asset_readiness_verification(
                             cur,
@@ -16574,19 +16704,7 @@ async def repair_character_chat_assets(
                         "character_chat_asset_readiness": after_readiness,
                         "character_asset_repair": repair_record,
                     }
-                    existing_product = next(
-                        (
-                            item
-                            for item in product_results
-                            if int(dict(item or {}).get("product_id") or 0)
-                            == product_id
-                        ),
-                        None,
-                    )
-                    if existing_product is None:
-                        product_results.append(product_result)
-                    else:
-                        existing_product.update(product_result)
+                    merge_story_agent_product_result(product_results, product_result)
                     repair_records.append(repair_record)
                     logger.info(
                         "story_agent_character_asset_repair product_id=%s status=%s rp_scopes=%s scene_scopes=%s",
@@ -16595,6 +16713,49 @@ async def repair_character_chat_assets(
                         len(list(repair_plan["rp_scope_keys"])),
                         len(list(repair_plan["scene_scope_keys"])),
                     )
+            except CharacterIdentityReviewStaleError as exc:
+                work_conn.rollback()
+                with work_cursor(work_conn) as cur:
+                    total_episode_count = fetch_total_episode_count(
+                        cur,
+                        product_id=product_id,
+                    )
+                    persisted_status = {
+                        "product_id": product_id,
+                        "context_status": fetch_product_context_status(
+                            cur,
+                            product_id=product_id,
+                        )
+                        or "pending",
+                        "total_episode_count": total_episode_count,
+                        "ready_episode_count": fetch_product_ready_episode_count(
+                            cur,
+                            product_id=product_id,
+                        ),
+                    }
+                work_conn.rollback()
+                repair_record.update(
+                    {
+                        "status": "review_required",
+                        "review_operation_ids": list(exc.operation_ids),
+                        "review_reason_codes": list(exc.reason_codes),
+                    }
+                )
+                repair_records.append(repair_record)
+                record_character_identity_review_required(
+                    results,
+                    product_id=product_id,
+                    persisted_status=persisted_status,
+                    error=exc,
+                    metadata={"character_asset_repair": repair_record},
+                )
+                logger.warning(
+                    "story_agent_character_asset_repair_review_required "
+                    "product_id=%s operations=%s reasons=%s",
+                    product_id,
+                    ",".join(exc.operation_ids),
+                    ",".join(exc.reason_codes),
+                )
             except OpenRouterBackgroundCreditReserveError as exc:
                 try:
                     work_conn.rollback()
@@ -16617,19 +16778,7 @@ async def repair_character_chat_assets(
                 repair_record.update({"status": "deferred_budget"})
                 repair_records.append(repair_record)
                 deferred_result["character_asset_repair"] = repair_record
-                existing_product = next(
-                    (
-                        item
-                        for item in product_results
-                        if int(dict(item or {}).get("product_id") or 0)
-                        == product_id
-                    ),
-                    None,
-                )
-                if existing_product is None:
-                    product_results.append(deferred_result)
-                else:
-                    existing_product.update(deferred_result)
+                merge_story_agent_product_result(product_results, deferred_result)
                 logger.info(
                     "story_agent_character_asset_repair_budget_deferred "
                     "product_id=%s reason=%s",
@@ -16784,6 +16933,49 @@ async def reaggregate_character_inventory_foundations(
                         record["inventory_v3_counts"],
                         record["relation_counts"],
                     )
+            except CharacterIdentityReviewStaleError as exc:
+                work_conn.rollback()
+                with work_cursor(work_conn) as cur:
+                    total_episode_count = fetch_total_episode_count(
+                        cur,
+                        product_id=product_id,
+                    )
+                    persisted_status = {
+                        "product_id": product_id,
+                        "context_status": fetch_product_context_status(
+                            cur,
+                            product_id=product_id,
+                        )
+                        or "pending",
+                        "total_episode_count": total_episode_count,
+                        "ready_episode_count": fetch_product_ready_episode_count(
+                            cur,
+                            product_id=product_id,
+                        ),
+                    }
+                work_conn.rollback()
+                record.update(
+                    {
+                        "status": "review_required",
+                        "review_operation_ids": list(exc.operation_ids),
+                        "review_reason_codes": list(exc.reason_codes),
+                    }
+                )
+                reaggregation_records.append(record)
+                record_character_identity_review_required(
+                    results,
+                    product_id=product_id,
+                    persisted_status=persisted_status,
+                    error=exc,
+                    metadata={"inventory_reaggregation": record},
+                )
+                logger.warning(
+                    "story_agent_inventory_reaggregation_review_required "
+                    "product_id=%s operations=%s reasons=%s",
+                    product_id,
+                    ",".join(exc.operation_ids),
+                    ",".join(exc.reason_codes),
+                )
             except Exception as exc:
                 try:
                     work_conn.rollback()
@@ -16813,6 +17005,8 @@ def build_delta_exit_code(results: dict[str, object], *, apply: bool) -> int:
     )
     if has_failure:
         return 1
+    if int(results.get("review_required") or 0) > 0:
+        return STORYCTX_REVIEW_REQUIRED_EXIT_CODE
     if int(results.get("deferred_budget") or 0) > 0:
         return STORYCTX_DEFERRED_BUDGET_EXIT_CODE
     return 0
@@ -16859,6 +17053,7 @@ def build_empty_results() -> dict[str, object]:
         "inventory_reaggregation_no_progress": 0,
         "inventory_reaggregation_failed": 0,
         "inventory_reaggregations": [],
+        "review_required": 0,
         "deferred_budget": 0,
         "skipped_rows": 0,
         "products": [],
@@ -17750,6 +17945,37 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 "ready_episode_count": 0,
                             }
                         )
+                except CharacterIdentityReviewStaleError as exc:
+                    work_conn.rollback()
+                    with work_cursor(work_conn) as cur:
+                        persisted_status = refresh_product_context_status(
+                            cur=cur,
+                            product_id=product_id,
+                            total_episode_count=total_episode_count,
+                        )
+                        persisted_status = attach_character_chat_asset_readiness_to_status_row(
+                            cur,
+                            persisted_status,
+                        )
+                    work_conn.commit()
+                    record_character_identity_review_required(
+                        results,
+                        product_id=product_id,
+                        persisted_status=persisted_status,
+                        error=exc,
+                    )
+                    logger.warning(
+                        "story_agent_delta_review_required product_id=%s operations=%s reasons=%s",
+                        product_id,
+                        ",".join(exc.operation_ids),
+                        ",".join(exc.reason_codes),
+                    )
+                    if args.verbose:
+                        print(
+                            f"[delta-review-required] product_id={product_id} "
+                            f"operations={','.join(exc.operation_ids)} "
+                            f"reasons={','.join(exc.reason_codes)}"
+                        )
                 except OpenRouterBackgroundCreditReserveError as exc:
                     try:
                         work_conn.rollback()
@@ -17831,6 +18057,7 @@ def print_summary(results: dict[str, object], apply: bool) -> None:
         f"inventory_reaggregation_updated={results['inventory_reaggregation_updated']} "
         f"inventory_reaggregation_no_progress={results['inventory_reaggregation_no_progress']} "
         f"inventory_reaggregation_failed={results['inventory_reaggregation_failed']} "
+        f"review_required={results['review_required']} "
         f"deferred_budget={results['deferred_budget']} "
         f"skipped_rows={results['skipped_rows']}"
     )
@@ -17981,12 +18208,24 @@ async def main() -> int:
                 *delta_status_repaired_products,
                 *list(results.get("products") or []),
             ]
+        inventory_reaggregation_rows = filter_review_required_product_rows(
+            inventory_reaggregation_rows,
+            results=results,
+        )
+        character_asset_repair_rows = filter_review_required_product_rows(
+            character_asset_repair_rows,
+            results=results,
+        )
         if inventory_reaggregation_rows:
             await reaggregate_character_inventory_foundations(
                 rows=inventory_reaggregation_rows,
                 args=args,
                 results=results,
             )
+        character_asset_repair_rows = filter_review_required_product_rows(
+            character_asset_repair_rows,
+            results=results,
+        )
         if character_asset_repair_rows and not int(results.get("deferred_budget") or 0):
             await repair_character_chat_assets(
                 rows=character_asset_repair_rows,

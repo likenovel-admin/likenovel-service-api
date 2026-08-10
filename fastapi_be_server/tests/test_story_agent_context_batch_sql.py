@@ -49,7 +49,15 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             batch_path.write_text(script, encoding="utf-8")
             (scripts_dir / "build_story_agent_context.py").write_text("", encoding="utf-8")
             mysql_path = bin_dir / "mysql"
-            mysql_path.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+            mysql_path.write_text(
+                "#!/bin/sh\n"
+                "query=$(cat)\n"
+                "case \"$query\" in\n"
+                "  *REVIEW_REQUIRED:*) exit 0 ;;\n"
+                "  *) exit 42 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
             mysql_path.chmod(0o755)
 
             log_path = root / "batch.log"
@@ -155,15 +163,111 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
     def test_inventory_only_drift_is_selected_for_reaggregation(self):
         script = _batch_sh()
 
-        self.assertIn(
-            "active_open_character_signal_count > 0\n"
-            "      AND (\n"
-            "        active_character_inventory_count = 0\n"
-            "        OR active_character_inventory_v3_count = 0\n"
-            "      )",
+        self.assertRegex(
             script,
+            r"active_open_character_signal_count > 0\s+"
+            r"AND \(\s+active_character_inventory_count = 0\s+"
+            r"OR active_character_inventory_v3_count = 0\s+\)",
         )
         self.assertIn("END AS inventory_reaggregation_needed", script)
+
+    def test_stale_identity_review_only_suppresses_identity_dependent_work(self):
+        script = _batch_sh()
+
+        self.assertIn("character_identity_review_required", script)
+        self.assertIn("'$.operations[*].signal_anchors[*]'", script)
+        self.assertIn("review_anchor.summary_id", script)
+        self.assertIn("review_anchor.source_hash", script)
+        self.assertIn(
+            "WHEN candidates.character_identity_review_required > 0 THEN 0",
+            script,
+        )
+
+    def test_stale_review_scan_is_index_bounded_before_candidate_query(self):
+        script = _batch_sh()
+
+        self.assertIn("REVIEW_REQUIRED_OUTPUT", script)
+        self.assertIn("REVIEW_REQUIRED_PRODUCT_IDS_SQL", script)
+        self.assertIn(
+            "FROM tb_story_agent_context_product review_product\n"
+            "STRAIGHT_JOIN tb_story_agent_context_summary identity_review",
+            script,
+        )
+        self.assertIn(
+            "FORCE INDEX (idx_story_agent_context_summary_product_type)",
+            script,
+        )
+        self.assertLess(
+            script.index("REVIEW_REQUIRED_OUTPUT"),
+            script.index("CANDIDATE_OUTPUT"),
+        )
+        self.assertIn(
+            "p.product_id IN (${REVIEW_REQUIRED_PRODUCT_IDS_SQL})",
+            script,
+        )
+        self.assertIn(
+            "missing_foundation_episode_count > 0\n"
+            "    OR (\n"
+            "      character_identity_review_required = 0",
+            script,
+        )
+
+    def test_suppressed_stale_review_is_still_counted_for_monitoring(self):
+        script = _batch_sh()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "dist" / "batch"
+            scripts_dir = root / "scripts"
+            bin_dir = root / "bin"
+            batch_dir.mkdir(parents=True)
+            scripts_dir.mkdir(parents=True)
+            bin_dir.mkdir()
+
+            batch_path = batch_dir / "build_story_agent_context_batch.sh"
+            batch_path.write_text(script, encoding="utf-8")
+            (scripts_dir / "build_story_agent_context.py").write_text(
+                "", encoding="utf-8"
+            )
+            mysql_path = bin_dir / "mysql"
+            mysql_path.write_text(
+                "#!/bin/sh\n"
+                "query=$(cat)\n"
+                "case \"$query\" in\n"
+                "  *REVIEW_REQUIRED:*) printf 'REVIEW_REQUIRED:1176\\n' ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            mysql_path.chmod(0o755)
+
+            log_path = root / "batch.log"
+            result = subprocess.run(
+                ["bash", str(batch_path)],
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "DB_HOST": "example.invalid",
+                    "DB_PORT": "3306",
+                    "DB_USER": "test-user",
+                    "DB_PW": "test-password",
+                    "DB_NAME": "likenovel",
+                    "OPENROUTER_API_KEY": "test-key",
+                    "STORYCTX_LOCK_DIR": str(root / "batch.lock"),
+                    "STORYCTX_LOG_FILE": str(log_path),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("[batch-empty] no eligible products", log)
+            self.assertIn(
+                "ready=0 review_required=1 deferred=0 failed=0",
+                log,
+            )
 
     def test_reaggregation_candidate_flag_reaches_delta_cli(self):
         script = _batch_sh()
@@ -448,4 +552,78 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             log = log_path.read_text(encoding="utf-8")
             self.assertIn("[deferred-budget] product_id=1182", log)
-            self.assertIn("ready=0 deferred=1 failed=0", log)
+            self.assertIn(
+                "ready=0 review_required=0 deferred=1 failed=0",
+                log,
+            )
+
+    def test_review_required_child_does_not_downgrade_successful_sibling(self):
+        script = _batch_sh()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "dist" / "batch"
+            scripts_dir = root / "scripts"
+            venv_bin_dir = root / ".venv" / "bin"
+            bin_dir = root / "bin"
+            batch_dir.mkdir(parents=True)
+            scripts_dir.mkdir(parents=True)
+            venv_bin_dir.mkdir(parents=True)
+            bin_dir.mkdir()
+
+            batch_path = batch_dir / "build_story_agent_context_batch.sh"
+            batch_path.write_text(script, encoding="utf-8")
+            (scripts_dir / "build_story_agent_context.py").write_text("", encoding="utf-8")
+
+            mysql_path = bin_dir / "mysql"
+            mysql_path.write_text(
+                "#!/bin/sh\n"
+                "printf '1109\\tFresh review\\t0\\t0\\t1.00\\n'\n"
+                "printf '1176\\tStale review\\t0\\t0\\t1.00\\n'\n",
+                encoding="utf-8",
+            )
+            mysql_path.chmod(0o755)
+
+            python_path = venv_bin_dir / "python"
+            python_path.write_text(
+                "#!/bin/sh\n"
+                "product_id=''\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = '--product-id' ]; then product_id=\"$2\"; break; fi\n"
+                "  shift\n"
+                "done\n"
+                "if [ \"$product_id\" = '1176' ]; then exit 76; fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            python_path.chmod(0o755)
+
+            log_path = root / "batch.log"
+            result = subprocess.run(
+                ["bash", str(batch_path)],
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "DB_HOST": "example.invalid",
+                    "DB_PORT": "3306",
+                    "DB_USER": "test-user",
+                    "DB_PW": "test-password",
+                    "DB_NAME": "likenovel",
+                    "OPENROUTER_API_KEY": "test-key",
+                    "STORYCTX_LOCK_DIR": str(root / "batch.lock"),
+                    "STORYCTX_LOG_FILE": str(log_path),
+                    "STORYCTX_MAX_PARALLEL": "2",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("[done] product_id=1109", log)
+            self.assertIn("[review-required] product_id=1176", log)
+            self.assertIn(
+                "ready=1 review_required=1 deferred=0 failed=0",
+                log,
+            )
