@@ -47,6 +47,7 @@ from app.services.common.openrouter_background_credit_guard import (  # noqa: E4
 from app.services.product.episode_service import _extract_epub_payload_from_epub  # noqa: E402
 from app.services.websochat.character_chat_product_policy import (  # noqa: E402
     CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
+    CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
 )
 
@@ -1156,14 +1157,37 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
             pe.episode_content,
             pe.episode_text_count,
             pe.epub_file_id,
+            asset_rank.public_episode_rank,
             CASE
                 WHEN {character_asset_collection_cohort_sql} THEN 1
                 ELSE 0
             END AS character_asset_collection_eligible,
+            CASE
+                WHEN asset_rank.public_episode_rank <= {CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES}
+                THEN 1
+                ELSE 0
+            END AS character_asset_episode_eligible,
             {file_select_sql}
         FROM tb_product p
         JOIN tb_product_episode pe
           ON pe.product_id = p.product_id
+        JOIN (
+            SELECT
+                ranked_episode.episode_id,
+                ranked_episode.public_episode_rank
+            FROM (
+                SELECT
+                    public_episode.episode_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY public_episode.product_id
+                        ORDER BY public_episode.episode_no ASC, public_episode.episode_id ASC
+                    ) AS public_episode_rank
+                FROM tb_product_episode public_episode
+                WHERE public_episode.use_yn = 'Y'
+                  AND public_episode.open_yn = 'Y'
+            ) ranked_episode
+        ) asset_rank
+          ON asset_rank.episode_id = pe.episode_id
         LEFT JOIN tb_story_agent_context_product sacp
           ON sacp.product_id = p.product_id
         {file_join_sql}
@@ -1189,6 +1213,17 @@ def is_story_agent_character_asset_collection_eligible(
         .lower()
         in {"1", "true", "y", "yes"}
         for row in product_rows
+    )
+
+
+def is_story_agent_character_asset_episode_eligible(row: dict) -> bool:
+    if "character_asset_episode_eligible" not in row:
+        return True
+    return (
+        str(row.get("character_asset_episode_eligible") or "")
+        .strip()
+        .lower()
+        in {"1", "true", "y", "yes"}
     )
 
 
@@ -2136,6 +2171,53 @@ def fetch_active_summary_rows_for_episode_nos(
     return list(cur.fetchall())
 
 
+def fetch_active_character_asset_summary_rows(
+    cur,
+    *,
+    product_id: int,
+    summary_type: str,
+) -> list[dict]:
+    cur.execute(
+        """
+        SELECT summary.summary_id,
+               summary.scope_key,
+               summary.episode_from,
+               summary.episode_to,
+               summary.source_hash,
+               summary.summary_text
+          FROM tb_story_agent_context_summary summary
+          JOIN (
+                SELECT ranked_episode.episode_id
+                  FROM (
+                        SELECT public_episode.episode_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY public_episode.product_id
+                                   ORDER BY public_episode.episode_no ASC,
+                                            public_episode.episode_id ASC
+                               ) AS public_episode_rank
+                          FROM tb_product_episode public_episode
+                         WHERE public_episode.product_id = %s
+                           AND public_episode.use_yn = 'Y'
+                           AND public_episode.open_yn = 'Y'
+                       ) ranked_episode
+                 WHERE ranked_episode.public_episode_rank <= %s
+               ) capped_episode
+            ON summary.scope_key = CONCAT('episode:', capped_episode.episode_id)
+         WHERE summary.product_id = %s
+           AND summary.summary_type = %s
+           AND summary.is_active = 'Y'
+         ORDER BY COALESCE(summary.episode_from, 0) ASC, summary.summary_id ASC
+        """,
+        (
+            product_id,
+            CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
+            product_id,
+            summary_type,
+        ),
+    )
+    return list(cur.fetchall())
+
+
 def pick_spread_rows(rows: list[dict], limit: int) -> list[dict]:
     if len(rows) <= limit:
         return rows
@@ -2303,6 +2385,8 @@ def build_signal_repair_episode_id_set(cur, *, product_id: int, product_rows: li
 
     repair_episode_ids: set[int] = set()
     for row in product_rows:
+        if not is_story_agent_character_asset_episode_eligible(row):
+            continue
         episode_id = int(row.get("episode_id") or 0)
         episode_no = int(row.get("episode_no") or 0)
         if episode_id <= 0:
@@ -2347,6 +2431,8 @@ def build_scene_repair_episode_id_set(cur, *, product_id: int, product_rows: lis
 
     repair_episode_ids: set[int] = set()
     for row in product_rows:
+        if not is_story_agent_character_asset_episode_eligible(row):
+            continue
         episode_id = int(row.get("episode_id") or 0)
         episode_no = int(row.get("episode_no") or 0)
         if episode_id <= 0:
@@ -2365,6 +2451,44 @@ def build_scene_repair_episode_id_set(cur, *, product_id: int, product_rows: lis
 
 def delta_episode_sort_key(row: dict) -> tuple[int, int]:
     return (int(row.get("episode_no") or 0), int(row.get("episode_id") or 0))
+
+
+def select_character_asset_episode_rows(
+    *,
+    product_rows: list[dict],
+    episode_summary_rows: list[dict],
+) -> tuple[list[dict], bool]:
+    eligible_episode_ids = {
+        int(row.get("episode_id") or 0)
+        for row in product_rows
+        if int(row.get("episode_id") or 0) > 0
+        and is_story_agent_character_asset_episode_eligible(row)
+    }
+    selected_rows = [
+        row
+        for row in episode_summary_rows
+        if str(row.get("scope_key") or "").removeprefix("episode:").isdigit()
+        and int(str(row.get("scope_key") or "").removeprefix("episode:"))
+        in eligible_episode_ids
+    ]
+    return selected_rows, False
+
+
+def filter_episode_texts_to_summary_rows(
+    *,
+    episode_texts_by_no: dict[int, str],
+    episode_summary_rows: list[dict],
+) -> dict[int, str]:
+    allowed_episode_nos = {
+        int(row.get("episode_from") or row.get("episode_no") or 0)
+        for row in episode_summary_rows
+        if int(row.get("episode_from") or row.get("episode_no") or 0) > 0
+    }
+    return {
+        episode_no: text_value
+        for episode_no, text_value in episode_texts_by_no.items()
+        if int(episode_no) in allowed_episode_nos
+    }
 
 
 def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes: int = 0) -> list[dict]:
@@ -6388,6 +6512,7 @@ async def build_rp_summaries(
     inventory_map: dict[str, dict[str, object]] | None = None,
     relation_map: dict[str, list[dict[str, object]]] | None = None,
     verbose: bool = False,
+    cleanup_missing_scopes: bool = True,
 ) -> dict[str, tuple[int, int]]:
     counts = {
         "profile": [0, 0],
@@ -6673,7 +6798,7 @@ async def build_rp_summaries(
         counts["examples"][0 if examples_inserted else 1] += 1
 
     successful_profile_count = int(counts["profile"][0]) + int(counts["profile"][1])
-    if successful_profile_count > 0:
+    if successful_profile_count > 0 and cleanup_missing_scopes:
         with work_cursor(conn) as cur:
             deactivate_missing_active_scopes(cur, product_id, "character_rp_profile", valid_scope_keys)
             deactivate_missing_active_scopes(cur, product_id, "character_rp_examples", valid_scope_keys)
@@ -13390,6 +13515,7 @@ def build_character_inventory_v3_summaries_from_signal_rows(
     signal_rows: list[dict],
     protagonist_resolution: dict | None = None,
     character_identity_review: dict[str, object] | None = None,
+    cleanup_missing_scopes: bool = True,
 ) -> tuple[int, int]:
     old_inventory_map = fetch_active_character_inventory_map(
         cur=cur,
@@ -13631,7 +13757,13 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             normalized_old_scope_key,
         )
 
-    deactivate_missing_active_scopes(cur, product_id, "character_inventory_v3", valid_scope_keys)
+    if cleanup_missing_scopes:
+        deactivate_missing_active_scopes(
+            cur,
+            product_id,
+            "character_inventory_v3",
+            valid_scope_keys,
+        )
     return inserted_count, reused_count
 
 
@@ -13640,8 +13772,13 @@ def build_character_inventory_v3_summaries(
     *,
     product_id: int,
     protagonist_resolution: dict | None = None,
+    cleanup_missing_scopes: bool = True,
 ) -> tuple[int, int]:
-    signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    signal_rows = fetch_active_character_asset_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
     character_identity_review = fetch_character_identity_review(
         cur,
         product_id=product_id,
@@ -13653,6 +13790,7 @@ def build_character_inventory_v3_summaries(
         signal_rows=signal_rows,
         protagonist_resolution=protagonist_resolution,
         character_identity_review=character_identity_review,
+        cleanup_missing_scopes=cleanup_missing_scopes,
     )
 
 
@@ -13664,8 +13802,13 @@ async def build_character_inventory_v3_summaries_resolved(
     summary_client: AsyncClient | None = None,
     episode_summary_rows: list[dict] | None = None,
     verbose: bool = False,
+    cleanup_missing_scopes: bool = True,
 ) -> tuple[int, int]:
-    signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    signal_rows = fetch_active_character_asset_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
     character_identity_review = fetch_character_identity_review(
         cur,
         product_id=product_id,
@@ -13692,6 +13835,7 @@ async def build_character_inventory_v3_summaries_resolved(
         signal_rows=signal_rows,
         protagonist_resolution=protagonist_resolution,
         character_identity_review=character_identity_review,
+        cleanup_missing_scopes=cleanup_missing_scopes,
     )
 
 
@@ -13920,8 +14064,13 @@ def build_character_inventory_summaries(
     cur,
     *,
     product_id: int,
+    cleanup_missing_scopes: bool = True,
 ) -> tuple[int, int]:
-    signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    signal_rows = fetch_active_character_asset_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
     inventory_rows = aggregate_character_inventory_rows(signal_rows)
     if signal_rows and not inventory_rows:
         raise ValueError(f"character_inventory aggregation returned 0 rows despite active signals: product_id={product_id}")
@@ -13945,7 +14094,13 @@ def build_character_inventory_summaries(
         else:
             reused_count += 1
 
-    deactivate_missing_active_scopes(cur, product_id, "character_inventory", valid_scope_keys)
+    if cleanup_missing_scopes:
+        deactivate_missing_active_scopes(
+            cur,
+            product_id,
+            "character_inventory",
+            valid_scope_keys,
+        )
     return inserted_count, reused_count
 
 
@@ -14254,8 +14409,13 @@ def build_relation_inventory_summaries(
     cur,
     *,
     product_id: int,
+    cleanup_missing_scopes: bool = True,
 ) -> tuple[int, int]:
-    signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    signal_rows = fetch_active_character_asset_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
     relation_rows = aggregate_relation_inventory_rows(signal_rows)
     inserted_count = 0
     reused_count = 0
@@ -14271,7 +14431,13 @@ def build_relation_inventory_summaries(
         else:
             reused_count += 1
 
-    deactivate_missing_active_scopes(cur, product_id, "relation_inventory", valid_scope_keys)
+    if cleanup_missing_scopes:
+        deactivate_missing_active_scopes(
+            cur,
+            product_id,
+            "relation_inventory",
+            valid_scope_keys,
+        )
     return inserted_count, reused_count
 
 
@@ -14283,7 +14449,11 @@ def build_character_inventory_summaries_delta(
     old_touched_signal_rows: list[dict],
     new_touched_signal_rows: list[dict],
 ) -> tuple[int, int]:
-    active_signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    active_signal_rows = fetch_active_character_asset_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
     candidate_rows = aggregate_character_inventory_rows(active_signal_rows)
     candidate_map = {
         str(item.get("character_key") or "").strip(): item
@@ -14364,7 +14534,11 @@ def build_relation_inventory_summaries_delta(
     old_touched_signal_rows: list[dict],
     new_touched_signal_rows: list[dict],
 ) -> tuple[int, int]:
-    active_signal_rows = fetch_active_summary_rows(cur=cur, product_id=product_id, summary_type="episode_character_signals")
+    active_signal_rows = fetch_active_character_asset_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type="episode_character_signals",
+    )
     candidate_rows = aggregate_relation_inventory_rows(active_signal_rows)
     candidate_map = {
         str(item.get("relation_key") or "").strip(): item
@@ -14542,6 +14716,23 @@ def build_canonical_relation_inventory_map(
                 continue
             canonical_relation_map.setdefault(canonical_source_key, []).append(payload)
     return canonical_relation_map
+
+
+def build_character_asset_relation_inventory_map(
+    *,
+    signal_rows: list[dict],
+    inventory_map: dict[str, dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
+    relation_rows = aggregate_relation_inventory_rows(signal_rows)
+    relation_map: dict[str, list[dict[str, object]]] = {}
+    for item in relation_rows:
+        source_key = str(item.get("source_key") or "").strip()
+        if source_key:
+            relation_map.setdefault(source_key, []).append(item)
+    return build_canonical_relation_inventory_map(
+        relation_map=relation_map,
+        inventory_map=inventory_map,
+    )
 
 
 def fetch_active_relation_inventory_by_relation_key_map(cur, *, product_id: int) -> dict[str, dict[str, object]]:
@@ -15078,7 +15269,7 @@ def load_character_chat_scene_context_lines_by_scope(conn, *, product_id: int) -
         return {}
     with work_cursor(conn) as cur:
         return build_character_chat_scene_context_lines_by_scope(
-            fetch_active_summary_rows(
+            fetch_active_character_asset_summary_rows(
                 cur=cur,
                 product_id=product_id,
                 summary_type="episode_scene_extraction",
@@ -16054,29 +16245,97 @@ def assert_story_agent_foundation_invariants(
 ) -> None:
     cur.execute(
         """
-        SELECT summary_type, COUNT(*) AS cnt
-          FROM tb_story_agent_context_summary
-         WHERE product_id = %s
-           AND is_active = 'Y'
-           AND summary_type IN ('episode_summary', 'episode_character_signals', 'character_inventory', 'character_inventory_v3')
-         GROUP BY summary_type
+        SELECT
+            (
+                SELECT COUNT(*)
+                  FROM tb_story_agent_context_summary episode_summary
+                 WHERE episode_summary.product_id = %s
+                   AND episode_summary.is_active = 'Y'
+                   AND episode_summary.summary_type = 'episode_summary'
+            ) AS episode_summary_count,
+            (
+                SELECT COUNT(*)
+                  FROM tb_story_agent_context_summary signal_summary
+                 WHERE signal_summary.product_id = %s
+                   AND signal_summary.is_active = 'Y'
+                   AND signal_summary.summary_type = 'episode_character_signals'
+            ) AS signal_count,
+            (
+                SELECT COUNT(*)
+                  FROM tb_story_agent_context_summary inventory
+                 WHERE inventory.product_id = %s
+                   AND inventory.is_active = 'Y'
+                   AND inventory.summary_type = 'character_inventory'
+            ) AS inventory_count,
+            (
+                SELECT COUNT(*)
+                  FROM tb_story_agent_context_summary inventory_v3
+                 WHERE inventory_v3.product_id = %s
+                   AND inventory_v3.is_active = 'Y'
+                   AND inventory_v3.summary_type = 'character_inventory_v3'
+            ) AS inventory_v3_count,
+            (
+                SELECT COUNT(*)
+                  FROM (
+                        SELECT ranked_episode.episode_id
+                          FROM (
+                                SELECT public_episode.episode_id,
+                                       ROW_NUMBER() OVER (
+                                           PARTITION BY public_episode.product_id
+                                           ORDER BY public_episode.episode_no ASC,
+                                                    public_episode.episode_id ASC
+                                       ) AS public_episode_rank
+                                  FROM tb_product_episode public_episode
+                                 WHERE public_episode.product_id = %s
+                                   AND public_episode.use_yn = 'Y'
+                                   AND public_episode.open_yn = 'Y'
+                               ) ranked_episode
+                         WHERE ranked_episode.public_episode_rank <= %s
+                       ) required_episode
+                 WHERE EXISTS (
+                       SELECT 1
+                         FROM tb_story_agent_context_summary required_summary
+                        WHERE required_summary.product_id = %s
+                          AND required_summary.is_active = 'Y'
+                          AND required_summary.summary_type = 'episode_summary'
+                          AND required_summary.scope_key = CONCAT('episode:', required_episode.episode_id)
+                 )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM tb_story_agent_context_summary required_signal
+                        WHERE required_signal.product_id = %s
+                          AND required_signal.is_active = 'Y'
+                          AND required_signal.summary_type = 'episode_character_signals'
+                          AND required_signal.scope_key = CONCAT('episode:', required_episode.episode_id)
+                   )
+            ) AS missing_required_signal_count
         """,
-        (product_id,),
+        (
+            product_id,
+            product_id,
+            product_id,
+            product_id,
+            product_id,
+            CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
+            product_id,
+            product_id,
+        ),
     )
-    counts = {str(row.get("summary_type") or ""): int(row.get("cnt") or 0) for row in list(cur.fetchall() or [])}
-    episode_summary_count = int(counts.get("episode_summary") or 0)
-    signal_count = int(counts.get("episode_character_signals") or 0)
-    inventory_count = int(counts.get("character_inventory") or 0)
-    inventory_v3_count = int(counts.get("character_inventory_v3") or 0)
+    row = cur.fetchone() or {}
+    episode_summary_count = int(row.get("episode_summary_count") or 0)
+    signal_count = int(row.get("signal_count") or 0)
+    inventory_count = int(row.get("inventory_count") or 0)
+    inventory_v3_count = int(row.get("inventory_v3_count") or 0)
+    missing_required_signal_count = int(
+        row.get("missing_required_signal_count") or 0
+    )
 
-    if (
-        require_signal_coverage
-        and episode_summary_count > 0
-        and signal_count != episode_summary_count
-    ):
+    if require_signal_coverage and missing_required_signal_count > 0:
         raise ValueError(
             f"story-agent foundation mismatch: product_id={product_id} "
-            f"episode_summary={episode_summary_count} episode_character_signals={signal_count}"
+            f"episode_summary={episode_summary_count} "
+            f"missing_required_episode_character_signals={missing_required_signal_count} "
+            f"episode_character_signals={signal_count}"
         )
     if signal_count > 0 and inventory_count <= 0:
         raise ValueError(
@@ -16275,6 +16534,66 @@ def build_character_chat_asset_repair_plan(
         "scene_scope_keys": sorted(scene_scope_keys),
         "blocked_scope_keys": sorted(blocked_scope_keys),
         "repairable": bool(rp_scope_keys or scene_scope_keys),
+    }
+
+
+def filter_character_chat_asset_repair_plan_to_signal_scope(
+    *,
+    repair_plan: dict[str, object],
+    signal_rows: list[dict],
+    inventory_map: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    source_scope_keys = extract_character_keys_from_signal_rows(signal_rows)
+    allowed_scope_keys = {
+        scope_key
+        for scope_key, inventory_item in inventory_map.items()
+        if scope_key in source_scope_keys
+        or bool(
+            source_scope_keys
+            & {
+                str(value or "").strip()
+                for value in list(
+                    dict(inventory_item or {}).get("source_character_keys") or []
+                )
+                if str(value or "").strip()
+            }
+        )
+    }
+    filtered = dict(repair_plan)
+    for field_name in ("rp_scope_keys", "scene_scope_keys"):
+        filtered[field_name] = sorted(
+            {
+                str(scope_key or "").strip()
+                for scope_key in list(repair_plan.get(field_name) or [])
+                if str(scope_key or "").strip() in allowed_scope_keys
+            }
+        )
+    filtered["repairable"] = bool(
+        filtered["rp_scope_keys"] or filtered["scene_scope_keys"]
+    )
+    return filtered
+
+
+def filter_character_inventory_map_to_signal_scope(
+    *,
+    inventory_map: dict[str, dict[str, object]],
+    signal_rows: list[dict],
+) -> dict[str, dict[str, object]]:
+    source_scope_keys = extract_character_keys_from_signal_rows(signal_rows)
+    return {
+        scope_key: inventory_item
+        for scope_key, inventory_item in inventory_map.items()
+        if scope_key in source_scope_keys
+        or bool(
+            source_scope_keys
+            & {
+                str(value or "").strip()
+                for value in list(
+                    dict(inventory_item or {}).get("source_character_keys") or []
+                )
+                if str(value or "").strip()
+            }
+        )
     }
 
 
@@ -16556,7 +16875,7 @@ async def repair_character_chat_assets(
                             cur,
                             product_id=product_id,
                         )
-                        active_signal_rows = fetch_active_summary_rows(
+                        active_signal_rows = fetch_active_character_asset_summary_rows(
                             cur=cur,
                             product_id=product_id,
                             summary_type="episode_character_signals",
@@ -16577,7 +16896,11 @@ async def repair_character_chat_assets(
                             product_id=product_id,
                             summary_type="character_inventory_v3",
                         )
-                        episode_summary_rows = fetch_active_summary_rows(
+                        capped_inventory_map = filter_character_inventory_map_to_signal_scope(
+                            inventory_map=inventory_map,
+                            signal_rows=active_signal_rows,
+                        )
+                        episode_summary_rows = fetch_active_character_asset_summary_rows(
                             cur=cur,
                             product_id=product_id,
                             summary_type="episode_summary",
@@ -16586,12 +16909,13 @@ async def repair_character_chat_assets(
                             cur,
                             product_id=product_id,
                         )
-                        relation_map = build_canonical_relation_inventory_map(
-                            relation_map=fetch_active_relation_inventory_map(
-                                cur=cur,
-                                product_id=product_id,
-                            ),
-                            inventory_map=inventory_map,
+                        episode_texts_by_no = filter_episode_texts_to_summary_rows(
+                            episode_texts_by_no=episode_texts_by_no,
+                            episode_summary_rows=episode_summary_rows,
+                        )
+                        relation_map = build_character_asset_relation_inventory_map(
+                            signal_rows=active_signal_rows,
+                            inventory_map=capped_inventory_map,
                         )
                         historical_inventory_state_map = (
                             fetch_rp_ready_character_inventory_history_state_map(
@@ -16602,6 +16926,11 @@ async def repair_character_chat_assets(
 
                     repair_plan = build_character_chat_asset_repair_plan(
                         before_readiness
+                    )
+                    repair_plan = filter_character_chat_asset_repair_plan_to_signal_scope(
+                        repair_plan=repair_plan,
+                        signal_rows=active_signal_rows,
+                        inventory_map=inventory_map,
                     )
                     scene_scope_keys = set(repair_plan["scene_scope_keys"])
                     scene_rows, required_scope_keys_by_episode_no = (
@@ -16622,7 +16951,7 @@ async def repair_character_chat_assets(
                             episode_texts_by_no=episode_texts_by_no,
                             summary_client=summary_client,
                             canonical_character_packet=build_episode_scene_canonical_character_packet(
-                                inventory_map
+                                capped_inventory_map
                             ),
                             required_scope_keys_by_episode_no=required_scope_keys_by_episode_no,
                             cleanup_missing_scopes=False,
@@ -16639,7 +16968,7 @@ async def repair_character_chat_assets(
                         episode_rows=episode_summary_rows,
                         episode_texts_by_no=episode_texts_by_no,
                         summary_client=summary_client,
-                        inventory_map=inventory_map,
+                        inventory_map=capped_inventory_map,
                         relation_map=relation_map,
                         historical_inventory_state_map=historical_inventory_state_map,
                         raise_unexpected_errors=True,
@@ -16845,7 +17174,7 @@ async def reaggregate_character_inventory_foundations(
                         continue
 
                     with work_cursor(work_conn) as cur:
-                        active_signal_rows = fetch_active_summary_rows(
+                        active_signal_rows = fetch_active_character_asset_summary_rows(
                             cur=cur,
                             product_id=product_id,
                             summary_type="episode_character_signals",
@@ -16880,6 +17209,7 @@ async def reaggregate_character_inventory_foundations(
                             cur=cur,
                             product_id=product_id,
                             protagonist_resolution=None,
+                            cleanup_missing_scopes=False,
                         )
                         relation_stats = build_relation_inventory_summaries_delta(
                             cur,
@@ -17293,19 +17623,29 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             episode_summary_rows=episode_summary_rows,
                             args=args,
                         )
+                        character_episode_processing_rows, cleanup_character_episode_scopes = (
+                            select_character_asset_episode_rows(
+                                product_rows=product_rows,
+                                episode_summary_rows=episode_processing_rows,
+                            )
+                        )
+                        character_episode_texts_by_no = filter_episode_texts_to_summary_rows(
+                            episode_texts_by_no=episode_texts_by_no,
+                            episode_summary_rows=character_episode_processing_rows,
+                        )
                         signal_counts = await build_episode_character_signals_summaries(
                             conn=work_conn,
                             product_id=product_id,
-                            episode_rows=episode_processing_rows,
+                            episode_rows=character_episode_processing_rows,
                             summary_client=summary_client,
                             verbose=args.verbose,
-                            cleanup_missing_scopes=cleanup_episode_scopes,
+                            cleanup_missing_scopes=cleanup_character_episode_scopes,
                         )
                         results["inserted_episode_character_signals"] += signal_counts[0]
                         results["reused_episode_character_signals"] += signal_counts[1]
 
                         with work_cursor(work_conn) as cur:
-                            inventory_signal_rows = fetch_active_summary_rows(
+                            inventory_signal_rows = fetch_active_character_asset_summary_rows(
                                 cur=cur,
                                 product_id=product_id,
                                 summary_type="episode_character_signals",
@@ -17315,7 +17655,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             product_title=str(product_rows[0].get("title") or ""),
                             signal_rows=inventory_signal_rows,
                             summary_client=summary_client,
-                            episode_summary_rows=episode_processing_rows,
+                            episode_summary_rows=character_episode_processing_rows,
                             verbose=args.verbose,
                         )
 
@@ -17323,15 +17663,18 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             inventory_counts = build_character_inventory_summaries(
                                 cur=cur,
                                 product_id=product_id,
+                                cleanup_missing_scopes=False,
                             )
                             inventory_v3_counts = build_character_inventory_v3_summaries(
                                 cur=cur,
                                 product_id=product_id,
                                 protagonist_resolution=work_protagonist_resolution,
+                                cleanup_missing_scopes=False,
                             )
                             relation_counts = build_relation_inventory_summaries(
                                 cur=cur,
                                 product_id=product_id,
+                                cleanup_missing_scopes=False,
                             )
                             assert_story_agent_foundation_invariants(
                                 cur=cur,
@@ -17342,13 +17685,15 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                 product_id=product_id,
                                 summary_type="character_inventory_v3",
                             )
-                            relation_map = fetch_active_relation_inventory_map(
-                                cur=cur,
-                                product_id=product_id,
+                            capped_inventory_v3_map = (
+                                filter_character_inventory_map_to_signal_scope(
+                                    inventory_map=inventory_v3_map,
+                                    signal_rows=inventory_signal_rows,
+                                )
                             )
-                            relation_map = build_canonical_relation_inventory_map(
-                                relation_map=relation_map,
-                                inventory_map=inventory_v3_map,
+                            relation_map = build_character_asset_relation_inventory_map(
+                                signal_rows=inventory_signal_rows,
+                                inventory_map=capped_inventory_v3_map,
                             )
                         work_conn.commit()
                         results["inserted_character_inventories"] += inventory_counts[0]
@@ -17362,12 +17707,12 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             conn=work_conn,
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),
-                            episode_rows=episode_processing_rows,
-                            episode_texts_by_no=episode_texts_by_no,
+                            episode_rows=character_episode_processing_rows,
+                            episode_texts_by_no=character_episode_texts_by_no,
                             summary_client=summary_client,
-                            canonical_character_packet=build_episode_scene_canonical_character_packet(inventory_v3_map),
+                            canonical_character_packet=build_episode_scene_canonical_character_packet(capped_inventory_v3_map),
                             verbose=args.verbose,
-                            cleanup_missing_scopes=cleanup_episode_scopes,
+                            cleanup_missing_scopes=cleanup_character_episode_scopes,
                         )
                         results["inserted_episode_scene_extractions"] += scene_counts[0]
                         results["reused_episode_scene_extractions"] += scene_counts[1]
@@ -17375,12 +17720,13 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                         rp_counts = await build_rp_summaries(
                             conn=work_conn,
                             product_id=product_id,
-                            episode_rows=episode_processing_rows,
-                            episode_texts_by_no=episode_texts_by_no,
+                            episode_rows=character_episode_processing_rows,
+                            episode_texts_by_no=character_episode_texts_by_no,
                             summary_client=summary_client,
-                            inventory_map=inventory_v3_map,
+                            inventory_map=capped_inventory_v3_map,
                             relation_map=relation_map,
                             verbose=args.verbose,
+                            cleanup_missing_scopes=False,
                         )
                         results["inserted_character_rp_profiles"] += rp_counts["profile"][0]
                         results["reused_character_rp_profiles"] += rp_counts["profile"][1]
@@ -17535,6 +17881,14 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
             touched_episode_nos = sorted(
                 set(int(row.get("episode_no") or 0) for row in product_rows if int(row.get("episode_no") or 0) > 0)
             )
+            touched_character_episode_nos = sorted(
+                {
+                    int(row.get("episode_no") or 0)
+                    for row in product_rows
+                    if int(row.get("episode_no") or 0) > 0
+                    and is_story_agent_character_asset_episode_eligible(row)
+                }
+            )
             touched_range_scopes = select_touched_range_scopes(touched_episode_nos)
             with work_cursor(work_conn) as cur:
                 total_episode_count = fetch_total_episode_count(cur=cur, product_id=product_id)
@@ -17579,7 +17933,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             cur,
                             product_id=product_id,
                             summary_type="episode_character_signals",
-                            episode_nos=touched_episode_nos,
+                            episode_nos=touched_character_episode_nos,
                         )
 
                     for row in product_rows:
@@ -17654,10 +18008,46 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 summary_type="episode_summary",
                                 episode_nos=touched_episode_nos,
                             )
+                        touched_character_episode_summary_rows, _ = (
+                            select_character_asset_episode_rows(
+                                product_rows=product_rows,
+                                episode_summary_rows=touched_episode_summary_rows,
+                            )
+                        )
+                        if not touched_character_episode_summary_rows:
+                            with work_cursor(work_conn) as cur:
+                                compound_counts = build_compound_summaries_delta(
+                                    cur,
+                                    product_id=product_id,
+                                    product_title=str(product_rows[0].get("title") or ""),
+                                    touched_range_scopes=touched_range_scopes,
+                                )
+                                status_row = refresh_product_context_status(
+                                    cur=cur,
+                                    product_id=product_id,
+                                    total_episode_count=total_episode_count,
+                                )
+                                status_row = attach_character_chat_asset_readiness_to_status_row(
+                                    cur,
+                                    status_row,
+                                )
+                            work_conn.commit()
+                            results["inserted_range_summaries"] += compound_counts["range"][0]
+                            results["reused_range_summaries"] += compound_counts["range"][1]
+                            results["inserted_product_summaries"] += compound_counts["product"][0]
+                            results["reused_product_summaries"] += compound_counts["product"][1]
+                            results["products"].append(status_row)
+                            logger.info(
+                                "story_agent_character_collection_skipped_cap "
+                                "product_id=%s touched_episode_count=%s",
+                                product_id,
+                                len(touched_episode_summary_rows),
+                            )
+                            continue
                         signal_inserted, signal_reused, signal_complete = await build_episode_character_signals_summaries_nonblocking(
                             conn=work_conn,
                             product_id=product_id,
-                            episode_rows=touched_episode_summary_rows,
+                            episode_rows=touched_character_episode_summary_rows,
                             summary_client=summary_client,
                             cleanup_missing_scopes=False,
                             verbose=args.verbose,
@@ -17695,12 +18085,12 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             continue
 
                         with work_cursor(work_conn) as cur:
-                            active_signal_rows_for_resolution = fetch_active_summary_rows(
+                            active_signal_rows_for_resolution = fetch_active_character_asset_summary_rows(
                                 cur=cur,
                                 product_id=product_id,
                                 summary_type="episode_character_signals",
                             )
-                            all_episode_summary_rows = fetch_active_summary_rows(
+                            all_episode_summary_rows = fetch_active_character_asset_summary_rows(
                                 cur=cur,
                                 product_id=product_id,
                                 summary_type="episode_summary",
@@ -17725,7 +18115,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 cur,
                                 product_id=product_id,
                                 summary_type="episode_character_signals",
-                                episode_nos=touched_episode_nos,
+                                episode_nos=touched_character_episode_nos,
                             )
                             inventory_counts = build_character_inventory_summaries_delta(
                                 cur,
@@ -17738,6 +18128,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 cur,
                                 product_id=product_id,
                                 protagonist_resolution=work_protagonist_resolution,
+                                cleanup_missing_scopes=False,
                             )
                             relation_counts = build_relation_inventory_summaries_delta(
                                 cur,
@@ -17746,32 +18137,40 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 old_touched_signal_rows=old_touched_signal_rows,
                                 new_touched_signal_rows=new_touched_signal_rows,
                             )
-                            character_cleanup = cleanup_duplicate_character_inventory_rows(
-                                cur,
-                                product_id=product_id,
-                            )
-                            cleanup_duplicate_relation_inventory_rows(
-                                cur,
-                                product_id=product_id,
-                                canonical_character_key_by_display_name=dict(
-                                    character_cleanup.get("canonical_character_key_by_display_name") or {}
-                                ),
-                            )
+                            character_cleanup = {
+                                "canonical_character_key_by_display_name": {},
+                                "touched_scope_keys": set(),
+                            }
                             new_inventory_map = fetch_active_character_inventory_map(cur=cur, product_id=product_id)
                             new_inventory_v3_map = fetch_active_character_inventory_map(
                                 cur=cur,
                                 product_id=product_id,
                                 summary_type="character_inventory_v3",
                             )
+                            capped_new_inventory_v3_map = (
+                                filter_character_inventory_map_to_signal_scope(
+                                    inventory_map=new_inventory_v3_map,
+                                    signal_rows=active_signal_rows_for_resolution,
+                                )
+                            )
+                            capped_old_inventory_v3_map = (
+                                filter_character_inventory_map_to_signal_scope(
+                                    inventory_map=old_inventory_v3_map,
+                                    signal_rows=active_signal_rows_for_resolution,
+                                )
+                            )
                             new_relation_map = fetch_active_relation_inventory_by_relation_key_map(cur=cur, product_id=product_id)
-                            new_relation_scope_map = fetch_active_relation_inventory_map(cur=cur, product_id=product_id)
-                            new_relation_scope_map = build_canonical_relation_inventory_map(
-                                relation_map=new_relation_scope_map,
-                                inventory_map=new_inventory_v3_map,
+                            new_relation_scope_map = build_character_asset_relation_inventory_map(
+                                signal_rows=active_signal_rows_for_resolution,
+                                inventory_map=capped_new_inventory_v3_map,
                             )
                             episode_texts_by_no = fetch_active_episode_texts_by_no(
                                 cur,
                                 product_id=product_id,
+                            )
+                            episode_texts_by_no = filter_episode_texts_to_summary_rows(
+                                episode_texts_by_no=episode_texts_by_no,
+                                episode_summary_rows=all_episode_summary_rows,
                             )
                         work_conn.commit()
                         rp_counts = build_empty_delta_rp_counts()
@@ -17782,11 +18181,11 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 conn=work_conn,
                                 product_id=product_id,
                                 product_title=str(product_rows[0].get("title") or ""),
-                                episode_rows=touched_episode_summary_rows,
+                                episode_rows=touched_character_episode_summary_rows,
                                 episode_texts_by_no=episode_texts_by_no,
                                 summary_client=summary_client,
                                 canonical_character_packet=build_episode_scene_canonical_character_packet(
-                                    new_inventory_v3_map
+                                    capped_new_inventory_v3_map
                                 ),
                                 cleanup_missing_scopes=False,
                                 verbose=args.verbose,
@@ -17798,7 +18197,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                     cur,
                                     product_id=product_id,
                                     summary_type="episode_scene_extraction",
-                                    episode_nos=touched_episode_nos,
+                                    episode_nos=touched_character_episode_nos,
                                 )
                             scene_affected_scope_keys = set(
                                 build_character_chat_scene_context_lines_by_scope(
@@ -17806,8 +18205,8 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 ).keys()
                             )
                             rp_affected_scope_keys = compute_rp_affected_scope_keys(
-                                old_inventory_map=old_inventory_v3_map,
-                                new_inventory_map=new_inventory_v3_map,
+                                old_inventory_map=capped_old_inventory_v3_map,
+                                new_inventory_map=capped_new_inventory_v3_map,
                                 old_relation_map=old_relation_map,
                                 new_relation_map=new_relation_map,
                                 old_touched_signal_rows=old_touched_signal_rows,
@@ -17823,7 +18222,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             rp_scope_keys_to_build = select_delta_rp_scope_keys(
                                 refresh_requested=should_refresh_delta_rp(args),
                                 affected_scope_keys=rp_affected_scope_keys,
-                                inventory_map=new_inventory_v3_map,
+                                inventory_map=capped_new_inventory_v3_map,
                                 profile_map=old_profile_map,
                                 examples_map=old_examples_map,
                             )
@@ -17847,7 +18246,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                     episode_rows=all_episode_summary_rows,
                                     episode_texts_by_no=episode_texts_by_no,
                                     summary_client=summary_client,
-                                    inventory_map=new_inventory_v3_map,
+                                    inventory_map=capped_new_inventory_v3_map,
                                     relation_map=new_relation_scope_map,
                                     historical_inventory_state_map=historical_inventory_state_map,
                                     verbose=args.verbose,
