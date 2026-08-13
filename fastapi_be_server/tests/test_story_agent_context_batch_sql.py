@@ -155,12 +155,8 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("JSON_TABLE", script)
         self.assertIn("repair_scene_participant.character_scope_key = repair_inventory.scope_key", script)
         self.assertIn("repair_scene_actor.character_scope_key = repair_inventory.scope_key", script)
-        self.assertIn("capped_character.character_scope_key = repair_inventory.scope_key", script)
-        self.assertIn("JSON_QUOTE(capped_character.character_scope_key)", script)
-        self.assertIn(
-            "capped_ranked_episode.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES}",
-            script,
-        )
+        self.assertNotIn("FROM tb_story_agent_context_summary capped_signal", script)
+        self.assertNotIn("capped_character.character_scope_key = repair_inventory.scope_key", script)
         self.assertIn("repair_example_item.example_text", script)
         self.assertIn("--repair-character-assets", script)
         self.assertIn("--reaggregate-character-inventory", script)
