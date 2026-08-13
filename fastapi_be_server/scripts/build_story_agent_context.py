@@ -1105,7 +1105,7 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
     )
     where = [
         "p.price_type IN ('free', 'paid')",
-        "p.status_code = 'ongoing'",
+        "p.status_code IN ('ongoing', 'end')",
         "pe.use_yn = 'Y'",
         "pe.open_yn = 'Y'",
         "p.open_yn = 'Y'",
@@ -16358,7 +16358,7 @@ def fetch_total_episode_count(cur, product_id: int) -> int:
             ON pe.product_id = p.product_id
          WHERE p.product_id = %s
            AND p.price_type IN ('free', 'paid')
-           AND p.status_code = 'ongoing'
+           AND p.status_code IN ('ongoing', 'end')
            AND pe.use_yn = 'Y'
            AND pe.open_yn = 'Y'
         """,

@@ -127,7 +127,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(duplicate_params["episode_id"], 27362)
         asset_readiness_sql = db.calls[-3][0]
         self.assertIn("p.price_type IN ('free', 'paid')", asset_readiness_sql)
-        self.assertIn("p.status_code = 'ongoing'", asset_readiness_sql)
+        self.assertIn("p.status_code IN ('ongoing', 'end')", asset_readiness_sql)
         self.assertIn("FOR UPDATE", asset_readiness_sql)
         self.assertIn("FOR UPDATE", db.calls[-4][0])
 

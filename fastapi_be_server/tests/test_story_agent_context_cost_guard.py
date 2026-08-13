@@ -5250,7 +5250,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(params, [])
         self.assertIn("p.price_type IN ('free', 'paid')", query)
-        self.assertIn("p.status_code = 'ongoing'", query)
+        self.assertIn("p.status_code IN ('ongoing', 'end')", query)
         self.assertIn("pe.open_yn = 'Y'", query)
         self.assertIn("FROM tb_product_episode cohort_episode", query)
         self.assertIn("cohort_episode.use_yn = 'Y'", query)
@@ -5268,7 +5268,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertIn("AS character_asset_collection_eligible", query)
         self.assertNotIn("p.price_type = 'free'", query)
 
-    def test_total_episode_count_matches_paid_ongoing_scope(self):
+    def test_total_episode_count_matches_public_serial_or_ended_scope(self):
         module = load_module()
 
         class FakeCursor:
@@ -5289,7 +5289,9 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(count, 7)
         self.assertEqual(cur.params, (1101,))
         self.assertIn("p.price_type IN ('free', 'paid')", cur.query)
-        self.assertIn("p.status_code = 'ongoing'", cur.query)
+        self.assertIn("p.status_code IN ('ongoing', 'end')", cur.query)
+        self.assertNotIn("'rest'", cur.query)
+        self.assertNotIn("'stop'", cur.query)
         self.assertNotIn("p.price_type = 'free'", cur.query)
 
 
