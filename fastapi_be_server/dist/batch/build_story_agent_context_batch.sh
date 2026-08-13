@@ -498,7 +498,7 @@ FROM (
          '$.scenes[0].scene_gist'
        )), '')), '') IS NOT NULL
   WHERE p.price_type IN ('free', 'paid')
-    AND p.status_code = 'ongoing'
+    AND p.status_code IN ('ongoing', 'end')
     AND p.open_yn = 'Y'
     AND p.blind_yn = 'N'
     AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'

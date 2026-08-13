@@ -1271,7 +1271,7 @@ async def post_signal_event(kc_user_id: str, req_body: dict, db: AsyncSession) -
                   AND p.open_yn = 'Y'
                   AND p.blind_yn = 'N'
                   AND p.price_type IN ('free', 'paid')
-                  AND p.status_code = 'ongoing'
+                  AND p.status_code IN ('ongoing', 'end')
                   AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
                   AND COALESCE(sacp.context_status, 'pending') <> 'disabled'
                 LIMIT 1
