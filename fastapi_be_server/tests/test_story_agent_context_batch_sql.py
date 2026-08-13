@@ -7,6 +7,7 @@ import unittest
 
 from app.services.websochat.character_chat_product_policy import (
     CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
+    CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
 )
 
@@ -154,6 +155,12 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("JSON_TABLE", script)
         self.assertIn("repair_scene_participant.character_scope_key = repair_inventory.scope_key", script)
         self.assertIn("repair_scene_actor.character_scope_key = repair_inventory.scope_key", script)
+        self.assertIn("capped_character.character_scope_key = repair_inventory.scope_key", script)
+        self.assertIn("JSON_QUOTE(capped_character.character_scope_key)", script)
+        self.assertIn(
+            "capped_ranked_episode.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES}",
+            script,
+        )
         self.assertIn("repair_example_item.example_text", script)
         self.assertIn("--repair-character-assets", script)
         self.assertIn("--reaggregate-character-inventory", script)
@@ -407,10 +414,13 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertNotIn('missing_open_episode_count BETWEEN 1 AND ${MAX_MISSING_EPISODES}', script)
         self.assertNotIn("--build-mode full", script)
 
-    def test_candidate_priority_uses_demand_and_fifty_episode_asset_target(self):
+    def test_candidate_priority_caps_character_assets_at_thirty_public_episodes(self):
         script = _batch_sh()
 
-        self.assertIn('CHAT_ASSET_TARGET_EPISODES="50"', script)
+        self.assertIn(
+            f'CHAT_ASSET_TARGET_EPISODES="{CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES}"',
+            script,
+        )
         self.assertIn("websochat_asset_request", script)
         self.assertIn("recent_user_demand_at", script)
         self.assertIn("FROM tb_user_ai_signal_event demand_event", script)
@@ -423,15 +433,30 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             "WHEN recent_demand.recent_user_demand_at IS NOT NULL",
             script,
         )
-        self.assertIn("OR sacs_signal.summary_id IS NULL", script)
+        self.assertIn("AND sacs_signal.summary_id IS NULL", script)
         self.assertIn(
-            "collection_cohort.product_id IS NOT NULL AND sacs_scene.summary_id IS NULL",
+            "collection_cohort.product_id IS NOT NULL\n"
+            "           AND sacs_scene.summary_id IS NULL",
             script,
         )
         self.assertIn("chat_asset_ready_episode_count", script)
         self.assertIn("chat_asset_target_episode_count", script)
         self.assertIn(
             "pe.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES}",
+            script,
+        )
+        self.assertIn(
+            "WHEN pe.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES} AND sacs_signal.summary_id IS NULL",
+            script,
+        )
+        self.assertIn(
+            "WHEN pe.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES}\n"
+            "       AND collection_cohort.product_id IS NOT NULL\n"
+            "       AND sacs_scene.summary_id IS NULL",
+            script,
+        )
+        self.assertIn(
+            "SUM(CASE WHEN sacs.summary_id IS NULL THEN 1 ELSE 0 END) AS missing_open_episode_count",
             script,
         )
         self.assertNotIn(

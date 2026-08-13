@@ -127,6 +127,9 @@ class FakeRowsCursor:
     def fetchall(self):
         return self.rows
 
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
 
 @contextmanager
 def fake_work_cursor(_conn):
@@ -597,6 +600,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "title": "grandfather 작품",
             "episode_id": 101,
             "episode_no": 16,
+            "character_asset_episode_eligible": 1,
             "_character_asset_collection_eligible": False,
         }
         summary_builder = AsyncMock(return_value=(11, True, {"used_llm": True}))
@@ -625,6 +629,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             patch.object(module, "insert_episode_summary", summary_builder),
             patch.object(module, "build_episode_character_signals_summaries_nonblocking", signal_builder),
             patch.object(module, "fetch_active_summary_rows", return_value=[episode_summary_row]),
+            patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[episode_summary_row]),
             patch.object(module, "build_work_protagonist_resolution_for_inventory_v3", AsyncMock(return_value={})),
             patch.object(module, "build_compound_summaries_delta", return_value={"range": (1, 0), "product": (1, 0)}),
             patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}),
@@ -665,6 +670,76 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         rp_builder.assert_not_awaited()
         self.assertEqual(results["inserted_summaries"], 1)
         self.assertEqual(results["inserted_episode_character_signals"], 1)
+        self.assertEqual(results["products"][0]["context_status"], "ready")
+
+    async def test_delta_above_character_cap_keeps_episode_summary_but_skips_character_collection(self):
+        module = load_module()
+        conn = FakeConnection()
+        episode_summary_row = {
+            "summary_id": 31,
+            "scope_key": "episode:131",
+            "episode_from": 31,
+            "source_hash": "summary-hash-31",
+            "summary_text": "[31화] 요약",
+        }
+        row = {
+            "product_id": 787,
+            "title": "30화 제한 작품",
+            "episode_id": 131,
+            "episode_no": 31,
+            "character_asset_episode_eligible": 0,
+            "_character_asset_collection_eligible": True,
+        }
+        summary_builder = AsyncMock(return_value=(31, True, {"used_llm": True}))
+        signal_builder = AsyncMock()
+        scene_builder = AsyncMock()
+        rp_builder = AsyncMock()
+        patchers = [
+            patch.object(module, "OPENROUTER_API_KEY", ""),
+            patch.object(module.settings, "ANTHROPIC_API_KEY", ""),
+            patch.object(module, "db_connect", return_value=conn),
+            patch.object(module, "work_cursor", fake_work_cursor),
+            patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())),
+            patch.object(module, "touch_product_context_build_attempt"),
+            patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()),
+            patch.object(module, "fetch_total_episode_count", return_value=31),
+            patch.object(module, "fetch_active_character_inventory_map", return_value={}),
+            patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}),
+            patch.object(module, "fetch_active_summary_state_map", return_value={}),
+            patch.object(module, "fetch_active_summary_rows_for_episode_nos", return_value=[episode_summary_row]),
+            patch.object(module, "resolve_source_payload", AsyncMock(return_value={"html_content": "본문", "source_type": "db"})),
+            patch.object(module, "normalize_episode_html", return_value="정규화 본문"),
+            patch.object(module, "build_chunks", return_value=[{"chunk_text": "정규화 본문"}]),
+            patch.object(module, "fetch_existing_doc", return_value=None),
+            patch.object(module, "insert_doc_and_chunks"),
+            patch.object(module, "insert_episode_summary", summary_builder),
+            patch.object(module, "build_episode_character_signals_summaries_nonblocking", signal_builder),
+            patch.object(module, "build_episode_scene_extraction_summaries_nonblocking", scene_builder),
+            patch.object(module, "build_rp_summaries_delta", rp_builder),
+            patch.object(module, "build_compound_summaries_delta", return_value={"range": (1, 0), "product": (1, 0)}),
+            patch.object(module, "refresh_product_context_status", return_value={"product_id": 787, "context_status": "ready"}),
+            patch.object(module, "attach_character_chat_asset_readiness_to_status_row", side_effect=lambda _cur, status: status),
+        ]
+
+        with ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
+            results = await module.build_context_rows_delta(
+                rows=[row],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    use_epub_fallback=False,
+                    refresh_rp=False,
+                ),
+            )
+
+        summary_builder.assert_awaited_once()
+        signal_builder.assert_not_awaited()
+        scene_builder.assert_not_awaited()
+        rp_builder.assert_not_awaited()
+        self.assertEqual(results["inserted_summaries"], 1)
+        self.assertEqual(results["inserted_episode_character_signals"], 0)
         self.assertEqual(results["products"][0]["context_status"], "ready")
 
     async def test_delta_signal_provider_failure_keeps_ready_product_and_lkg(self):
@@ -801,6 +876,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             patch.object(module, "insert_episode_summary", summary_builder),
             patch.object(module, "build_episode_character_signals_summaries_nonblocking", signal_builder),
             patch.object(module, "fetch_active_summary_rows", return_value=[episode_summary_row]),
+            patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[episode_summary_row]),
             patch.object(module, "build_work_protagonist_resolution_for_inventory_v3", AsyncMock(return_value={})),
             patch.object(module, "build_compound_summaries_delta", return_value={"range": (1, 0), "product": (1, 0)}),
             patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}),
@@ -3715,9 +3791,13 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         module = load_module()
         missing_v3_cursor = FakeRowsCursor(
             [
-                {"summary_type": "episode_summary", "cnt": 3},
-                {"summary_type": "episode_character_signals", "cnt": 3},
-                {"summary_type": "character_inventory", "cnt": 1},
+                {
+                    "episode_summary_count": 3,
+                    "signal_count": 3,
+                    "inventory_count": 1,
+                    "inventory_v3_count": 0,
+                    "missing_required_signal_count": 0,
+                }
             ]
         )
 
@@ -3726,10 +3806,13 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         ready_cursor = FakeRowsCursor(
             [
-                {"summary_type": "episode_summary", "cnt": 3},
-                {"summary_type": "episode_character_signals", "cnt": 3},
-                {"summary_type": "character_inventory", "cnt": 1},
-                {"summary_type": "character_inventory_v3", "cnt": 1},
+                {
+                    "episode_summary_count": 3,
+                    "signal_count": 3,
+                    "inventory_count": 1,
+                    "inventory_v3_count": 1,
+                    "missing_required_signal_count": 0,
+                }
             ]
         )
         module.assert_story_agent_foundation_invariants(ready_cursor, product_id=687)
@@ -3902,6 +3985,105 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(plan["rp_scope_keys"], ["character:co-main"])
         self.assertTrue(plan["repairable"])
 
+    def test_character_asset_repair_plan_excludes_over_cap_only_character(self):
+        module = load_module()
+        repair_plan = {
+            "rp_scope_keys": ["character:main", "character:late"],
+            "scene_scope_keys": ["character:main", "character:late"],
+            "blocked_scope_keys": [],
+            "repairable": True,
+        }
+        signal_rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="named:main",
+                        display_name="주인공",
+                    )
+                ],
+            )
+        ]
+        inventory_map = {
+            "character:main": {"source_character_keys": ["named:main"]},
+            "character:late": {"source_character_keys": ["named:late"]},
+        }
+
+        filtered = module.filter_character_chat_asset_repair_plan_to_signal_scope(
+            repair_plan=repair_plan,
+            signal_rows=signal_rows,
+            inventory_map=inventory_map,
+        )
+
+        self.assertEqual(filtered["rp_scope_keys"], ["character:main"])
+        self.assertEqual(filtered["scene_scope_keys"], ["character:main"])
+        self.assertTrue(filtered["repairable"])
+
+    def test_provider_inventory_map_excludes_over_cap_only_character(self):
+        module = load_module()
+        signal_rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="named:main",
+                        display_name="주인공",
+                    )
+                ],
+            )
+        ]
+        inventory_map = {
+            "character:main": {"source_character_keys": ["named:main"]},
+            "character:late": {"source_character_keys": ["named:late"]},
+        }
+
+        filtered = module.filter_character_inventory_map_to_signal_scope(
+            inventory_map=inventory_map,
+            signal_rows=signal_rows,
+        )
+
+        self.assertEqual(filtered, {"character:main": inventory_map["character:main"]})
+
+    def test_character_scene_context_loader_uses_first_thirty_public_episodes(self):
+        module = load_module()
+
+        class PingConnection:
+            def ping(self, reconnect=False):
+                return None
+
+        capped_scene_rows = [
+            {
+                "scope_key": "episode:130",
+                "episode_from": 30,
+                "summary_text": '{"episode_no":30,"scenes":[]}',
+            }
+        ]
+        with patch.object(
+            module,
+            "fetch_active_character_asset_summary_rows",
+            return_value=capped_scene_rows,
+        ) as capped_fetch, patch.object(
+            module,
+            "fetch_active_summary_rows",
+        ) as uncapped_fetch, patch.object(
+            module,
+            "work_cursor",
+            fake_work_cursor,
+        ):
+            module.load_character_chat_scene_context_lines_by_scope(
+                PingConnection(),
+                product_id=687,
+            )
+
+        capped_fetch.assert_called_once_with(
+            cur=ANY,
+            product_id=687,
+            summary_type="episode_scene_extraction",
+        )
+        uncapped_fetch.assert_not_called()
+
     def test_scene_repair_selection_prioritizes_main_and_caps_rows(self):
         module = load_module()
         rows, required = module.select_character_chat_scene_repair_rows(
@@ -4022,7 +4204,14 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
              ), \
              patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "fetch_active_character_inventory_map", return_value=inventory_map), \
-             patch.object(module, "fetch_active_summary_rows", return_value=episode_rows), \
+             patch.object(
+                 module,
+                 "fetch_active_character_asset_summary_rows",
+                 side_effect=[
+                     [signal_row(1, 1, [signal_character(character_key=scope_key, display_name="데시")])],
+                     episode_rows,
+                 ],
+             ), \
              patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
              patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
              patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
@@ -4073,7 +4262,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
              patch.object(module, "fetch_total_episode_count", return_value=69), \
              patch.object(module, "fetch_product_context_status", return_value="ready"), \
              patch.object(module, "fetch_product_ready_episode_count", return_value=69), \
-             patch.object(module, "fetch_active_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[signal_row(1, 1, [])]), \
              patch.object(module, "fetch_character_identity_review", side_effect=stale_error) as review_fetch, \
              patch.object(module, "fetch_character_chat_asset_readiness_verification") as readiness, \
              patch.object(module, "build_episode_scene_extraction_summaries", scene_builder), \
@@ -4169,7 +4358,14 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
              patch.object(module, "fetch_character_chat_asset_readiness_verification", return_value=before_readiness), \
              patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "fetch_active_character_inventory_map", return_value={scope_key: {"canonical_character_key": scope_key, "display_name": "데시", "work_role": "main_protagonist", "is_protagonist": True, "evidence_episode_nos": [1]} }), \
-             patch.object(module, "fetch_active_summary_rows", return_value=[{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}]), \
+             patch.object(
+                 module,
+                 "fetch_active_character_asset_summary_rows",
+                 side_effect=[
+                     [signal_row(1, 1, [signal_character(character_key=scope_key, display_name="데시")])],
+                     [{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}],
+                 ],
+             ), \
              patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
              patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
              patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
@@ -4219,7 +4415,14 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
              patch.object(module, "fetch_character_chat_asset_readiness_verification", return_value=before_readiness), \
              patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "fetch_active_character_inventory_map", return_value={scope_key: {"canonical_character_key": scope_key, "display_name": "데시", "work_role": "main_protagonist", "is_protagonist": True, "evidence_episode_nos": [1]}}), \
-             patch.object(module, "fetch_active_summary_rows", return_value=[{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}]), \
+             patch.object(
+                 module,
+                 "fetch_active_character_asset_summary_rows",
+                 side_effect=[
+                     [signal_row(1, 1, [signal_character(character_key=scope_key, display_name="데시")])],
+                     [{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}],
+                 ],
+             ), \
              patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
              patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
              patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
@@ -4376,7 +4579,8 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         request_mock = AsyncMock(return_value=resolver_payload)
 
-        with patch.object(module, "fetch_active_summary_rows", side_effect=fake_fetch), \
+        with patch.object(module, "fetch_active_character_asset_summary_rows", side_effect=fake_fetch), \
+             patch.object(module, "fetch_active_summary_rows", side_effect=fake_fetch), \
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "request_work_protagonist_resolution_payload", request_mock), \
              patch.object(module, "upsert_character_inventory_v3_item", side_effect=fake_upsert), \
@@ -4427,7 +4631,8 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         ]
         inserted_items = []
 
-        with patch.object(module, "fetch_active_summary_rows", return_value=rows), \
+        with patch.object(module, "fetch_active_character_asset_summary_rows", return_value=rows), \
+             patch.object(module, "fetch_active_summary_rows", return_value=rows), \
              patch.object(module, "fetch_character_identity_review", return_value=None), \
              patch.object(module, "OPENROUTER_API_KEY", ""), \
              patch.object(module, "request_work_protagonist_resolution_payload", AsyncMock()) as request_mock, \
@@ -9911,6 +10116,75 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         )
         self.assertEqual(repair_ids, {102})
 
+    def test_signal_and_scene_repairs_skip_episode_outside_character_collection_cap(self):
+        module = load_module()
+        cur = object()
+        rows = [
+            {
+                "product_id": 687,
+                "episode_id": 130,
+                "episode_no": 30,
+                "character_asset_episode_eligible": 1,
+            },
+            {
+                "product_id": 687,
+                "episode_id": 131,
+                "episode_no": 31,
+                "character_asset_episode_eligible": 0,
+            },
+        ]
+
+        with patch.object(module, "fetch_active_summary_rows", return_value=[]):
+            signal_repairs = module.build_signal_repair_episode_id_set(
+                cur,
+                product_id=687,
+                product_rows=rows,
+            )
+        with patch.object(module, "fetch_active_summary_rows", side_effect=[[], []]):
+            scene_repairs = module.build_scene_repair_episode_id_set(
+                cur,
+                product_id=687,
+                product_rows=rows,
+            )
+
+        self.assertEqual(signal_repairs, {130})
+        self.assertEqual(scene_repairs, {130})
+
+    def test_character_asset_rows_cap_first_public_rank_but_preserve_cleanup_scope(self):
+        module = load_module()
+        product_rows = [
+            {"episode_id": 130, "episode_no": 45, "character_asset_episode_eligible": 1},
+            {"episode_id": 131, "episode_no": 46, "character_asset_episode_eligible": 0},
+        ]
+        summary_rows = [
+            {"scope_key": "episode:130", "episode_from": 45},
+            {"scope_key": "episode:131", "episode_from": 46},
+        ]
+
+        selected, cleanup_missing_scopes = module.select_character_asset_episode_rows(
+            product_rows=product_rows,
+            episode_summary_rows=summary_rows,
+        )
+
+        self.assertEqual(selected, [summary_rows[0]])
+        self.assertFalse(cleanup_missing_scopes)
+
+    def test_target_query_marks_character_asset_eligibility_by_first_public_rank(self):
+        module = load_module()
+        query, _ = module.build_target_query(
+            SimpleNamespace(product_ids=[687], episode_ids=[], episode_nos=[], limit=0),
+            use_epub_fallback=False,
+        )
+
+        self.assertIn("ROW_NUMBER() OVER (", query)
+        self.assertIn("AS public_episode_rank", query)
+        self.assertIn(
+            f"asset_rank.public_episode_rank <= {module.CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES}",
+            query,
+        )
+        self.assertIn("asset_rank.public_episode_rank", query)
+        self.assertIn("AS character_asset_episode_eligible", query)
+
     def test_scene_repair_episode_id_set_requires_usable_active_scene(self):
         module = load_module()
         cur = object()
@@ -10522,6 +10796,41 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual(list(canonical_map.keys()), ["character:백이현"])
         self.assertEqual(lines, ["- 대상: 라이벌 | 관계 태그: 대립 | 반복 화수: 3 | 최근: 8화"])
 
+    def test_provider_relation_map_excludes_preserved_over_cap_relation(self):
+        module = load_module()
+        capped_signal_rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="named:main",
+                        display_name="주인공",
+                    )
+                ],
+            )
+        ]
+        inventory_map = {
+            "character:main": {
+                "source_character_keys": ["named:main"],
+                "display_name": "주인공",
+            }
+        }
+
+        provider_relation_map = module.build_character_asset_relation_inventory_map(
+            signal_rows=capped_signal_rows,
+            inventory_map=inventory_map,
+        )
+
+        self.assertEqual(provider_relation_map, {})
+        self.assertEqual(
+            module.build_rp_relation_context_lines(
+                character_key="character:main",
+                relation_map=provider_relation_map,
+            ),
+            [],
+        )
+
     def test_changed_rp_relation_context_is_rebuilt(self):
         module = load_module()
         signal_row = {
@@ -10960,7 +11269,7 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "fetch_active_summary_rows", return_value=active_signal_rows), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=active_signal_rows), \
              patch.object(module, "fetch_active_character_inventory_map", return_value=old_inventory_map), \
              patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value=old_relation_map), \
              patch.object(module, "build_character_inventory_summaries_delta", inventory_builder), \
@@ -10989,6 +11298,7 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
             cur=ANY,
             product_id=1103,
             protagonist_resolution=None,
+            cleanup_missing_scopes=False,
         )
         relation_builder.assert_called_once_with(
             ANY,
@@ -11023,7 +11333,7 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "fetch_active_summary_rows", return_value=active_signal_rows), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=active_signal_rows), \
              patch.object(module, "fetch_active_character_inventory_map", return_value={}), \
              patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
              patch.object(module, "build_character_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 0, "reused_count": 3})), \
@@ -11049,7 +11359,7 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "fetch_active_summary_rows", return_value=[]), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[]), \
              patch.object(module, "build_character_inventory_summaries_delta") as inventory_builder, \
              patch.object(module, "build_character_inventory_v3_summaries") as inventory_v3_builder, \
              patch.object(module, "build_relation_inventory_summaries_delta") as relation_builder, \
@@ -11079,10 +11389,13 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
     def test_reaggregation_invariant_allows_incomplete_signal_coverage(self):
         module = load_module()
         count_rows = [
-            {"summary_type": "episode_summary", "cnt": 117},
-            {"summary_type": "episode_character_signals", "cnt": 115},
-            {"summary_type": "character_inventory", "cnt": 123},
-            {"summary_type": "character_inventory_v3", "cnt": 160},
+            {
+                "episode_summary_count": 117,
+                "signal_count": 115,
+                "inventory_count": 123,
+                "inventory_v3_count": 160,
+                "missing_required_signal_count": 0,
+            }
         ]
 
         module.assert_story_agent_foundation_invariants(
@@ -11090,9 +11403,23 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
             product_id=1103,
             require_signal_coverage=False,
         )
-        with self.assertRaisesRegex(ValueError, "episode_summary=117 episode_character_signals=115"):
+        module.assert_story_agent_foundation_invariants(
+            FakeRowsCursor(count_rows),
+            product_id=1103,
+        )
+        with self.assertRaisesRegex(ValueError, "missing_required_episode_character_signals=1"):
             module.assert_story_agent_foundation_invariants(
-                FakeRowsCursor(count_rows),
+                FakeRowsCursor(
+                    [
+                        {
+                            "episode_summary_count": 117,
+                            "signal_count": 114,
+                            "inventory_count": 123,
+                            "inventory_v3_count": 160,
+                            "missing_required_signal_count": 1,
+                        }
+                    ]
+                ),
                 product_id=1103,
             )
 
@@ -11105,7 +11432,7 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "fetch_active_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[signal_row(1, 1, [])]), \
              patch.object(module, "fetch_active_character_inventory_map", return_value={}), \
              patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
              patch.object(module, "build_character_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 1, "reused_count": 0})), \
@@ -11140,7 +11467,7 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "db_connect", return_value=conn), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
-             patch.object(module, "fetch_active_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[signal_row(1, 1, [])]), \
              patch.object(module, "fetch_active_character_inventory_map", return_value={}), \
              patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
              patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}), \
