@@ -328,50 +328,6 @@ FROM (
         AND repair_inventory.is_active = 'Y'
         AND NULLIF(TRIM(repair_inventory.scope_key), '') IS NOT NULL
         AND JSON_VALID(repair_inventory.summary_text)
-        AND EXISTS (
-          SELECT 1
-          FROM tb_story_agent_context_summary capped_signal
-          JOIN (
-            SELECT
-              capped_ranked_episode.product_id,
-              capped_ranked_episode.episode_id
-            FROM (
-              SELECT
-                capped_public_episode.product_id,
-                capped_public_episode.episode_id,
-                ROW_NUMBER() OVER (
-                  PARTITION BY capped_public_episode.product_id
-                  ORDER BY capped_public_episode.episode_no ASC,
-                           capped_public_episode.episode_id ASC
-                ) AS public_episode_rank
-              FROM tb_product_episode capped_public_episode
-              WHERE capped_public_episode.use_yn = 'Y'
-                AND capped_public_episode.open_yn = 'Y'
-            ) capped_ranked_episode
-            WHERE capped_ranked_episode.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES}
-          ) capped_episode
-            ON capped_episode.product_id = p.product_id
-           AND capped_signal.scope_key = CONCAT('episode:', capped_episode.episode_id)
-          JOIN JSON_TABLE(
-            IF(JSON_VALID(capped_signal.summary_text), capped_signal.summary_text, '{"mentioned_characters":[]}'),
-            '$.mentioned_characters[*]' COLUMNS (
-              character_scope_key VARCHAR(255) PATH '$.character_key'
-            )
-          ) capped_character
-          WHERE capped_signal.product_id = p.product_id
-            AND capped_signal.summary_type = 'episode_character_signals'
-            AND capped_signal.is_active = 'Y'
-            AND (
-              capped_character.character_scope_key = repair_inventory.scope_key
-              OR JSON_CONTAINS(
-                COALESCE(
-                  JSON_EXTRACT(repair_inventory.summary_text, '$.source_character_keys'),
-                  JSON_ARRAY()
-                ),
-                JSON_QUOTE(capped_character.character_scope_key)
-              ) = 1
-            )
-        )
         AND NOT (
           LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.continuity_status')), '')) = 'ambiguous'
           OR JSON_CONTAINS(
