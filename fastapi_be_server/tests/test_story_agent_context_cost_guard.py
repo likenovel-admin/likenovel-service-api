@@ -2377,7 +2377,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "speech_style": {"tone": "단호"},
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
-            "example_dialogues": [item["text"] for item in legacy_examples["examples"][:3]],
+            "example_dialogues": [],
         }
         internal_prompt_payload = {"internal_prompt": "[핵심 정체성] 전승택은 직접 판단하고 움직인다."}
         upserted_types = []
@@ -2388,7 +2388,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
-             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=[])), \
+             patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": True}), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[
+                 {"episode_no": 1, "kind": "monologue", "text": "문을 열고 안으로 들어갔다."},
+                 {"episode_no": 2, "kind": "monologue", "text": "지금은 물러설 수 없었다."},
+             ]), \
              patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
              patch.object(module, "request_character_chat_internal_prompt_payload", AsyncMock(return_value=internal_prompt_payload)), \
              patch.object(module, "fetch_active_summary_state_map", return_value={
@@ -2404,7 +2408,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 conn,
                 product_id=756,
                 episode_rows=[],
-                episode_texts_by_no={1: "전승택은 말없이 문을 열었다."},
+                episode_texts_by_no={
+                    item["episode_no"]: item["text"]
+                    for item in legacy_examples["examples"]
+                },
                 summary_client=object(),
                 inventory_map={
                     "character:전승택": {
