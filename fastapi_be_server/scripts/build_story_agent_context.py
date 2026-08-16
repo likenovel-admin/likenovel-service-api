@@ -6018,6 +6018,26 @@ def build_rp_dialogue_items_from_example_payload(example_payload: dict[str, obje
     return dialogue_items
 
 
+def merge_grounded_existing_rp_examples(
+    dialogue_items: list[dict[str, object]],
+    *,
+    example_payload: dict[str, object],
+    episode_texts_by_no: dict[int, str],
+    aliases: list[str],
+) -> list[dict[str, object]]:
+    grounded_existing_items = validate_llm_rp_dialogue_items(
+        build_rp_dialogue_items_from_example_payload(example_payload),
+        episode_texts_by_no,
+    )
+    return mark_rp_example_candidates(
+        dedupe_rp_dialogue_items(
+            [*dialogue_items, *grounded_existing_items],
+            limit=80,
+        ),
+        aliases,
+    )
+
+
 def backfill_rp_example_episode_evidence(
     example_payload: dict[str, object],
     episode_texts_by_no: dict[int, str],
@@ -6558,6 +6578,34 @@ async def build_rp_summaries(
 
         dialogue_items = dedupe_rp_dialogue_items(dialogue_items, limit=80)
         dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
+        if (
+            bool(direct_voice_quality.get("strict_chat_ready"))
+            and sum(bool(item.get("is_example_candidate")) for item in dialogue_items)
+            < RP_PROFILE_MIN_EXAMPLE_TEXTS
+        ):
+            if existing_example_rows_by_scope is None:
+                with work_cursor(conn) as cur:
+                    existing_example_rows_by_scope = fetch_active_summary_state_map(
+                        cur=cur,
+                        product_id=product_id,
+                        summary_type="character_rp_examples",
+                    )
+            existing_example_row = fetch_summary_state_for_inventory_alias(
+                existing_example_rows_by_scope,
+                scope_key=character_key,
+                inventory_item=inventory_item,
+                allowed_alias_keys={
+                    alias_key
+                    for alias_key, owner_scope_key in source_scope_key_map.items()
+                    if owner_scope_key == character_key
+                },
+            )
+            dialogue_items = merge_grounded_existing_rp_examples(
+                dialogue_items,
+                example_payload=dict(existing_example_row.get("payload") or {}),
+                episode_texts_by_no=episode_texts_by_no,
+                aliases=aliases,
+            )
         summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
         relation_context_lines = build_rp_relation_context_lines(
             character_key=character_key,
@@ -7190,6 +7238,17 @@ async def build_rp_summaries_delta(
 
         dialogue_items = dedupe_rp_dialogue_items(dialogue_items, limit=80)
         dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
+        if (
+            bool(direct_voice_quality.get("strict_chat_ready"))
+            and sum(bool(item.get("is_example_candidate")) for item in dialogue_items)
+            < RP_PROFILE_MIN_EXAMPLE_TEXTS
+        ):
+            dialogue_items = merge_grounded_existing_rp_examples(
+                dialogue_items,
+                example_payload=repaired_exact_example_payload,
+                episode_texts_by_no=episode_texts_by_no,
+                aliases=aliases,
+            )
         if not dialogue_items:
             logger.info(
                 "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s",
