@@ -799,7 +799,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["inserted_episode_character_signals"], 1)
         self.assertEqual(results["products"][0]["context_status"], "ready")
 
-    async def test_delta_public_main_bundle_commits_once_after_scene_and_rp_are_ready(self):
+    async def test_delta_public_main_bundle_reuses_ready_scene_and_requires_current_rp(self):
         module = load_module()
         conn = FakeConnection()
         scope_key = "character:new-main"
@@ -844,7 +844,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         async def build_scene(**kwargs):
             asset_commit_counts.append(conn.commit_count)
-            kwargs["processed_character_scope_keys"].add(scope_key)
             return 1, 0
 
         async def build_rp(**kwargs):

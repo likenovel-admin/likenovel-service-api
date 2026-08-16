@@ -17410,8 +17410,6 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             missing_scope_keys = (
                                 bundle_scope_keys - ready_scope_keys
                             ) | (
-                                bundle_scope_keys - processed_scene_scope_keys
-                            ) | (
                                 bundle_scope_keys - processed_rp_scope_keys
                             )
                             if missing_scope_keys:
@@ -18025,8 +18023,6 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             )
                             missing_scope_keys = (
                                 bundle_scope_keys - ready_scope_keys
-                            ) | (
-                                bundle_scope_keys - processed_scene_scope_keys
                             ) | (
                                 bundle_scope_keys - processed_rp_scope_keys
                             )
