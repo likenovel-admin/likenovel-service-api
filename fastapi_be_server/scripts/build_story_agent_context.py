@@ -3172,18 +3172,28 @@ def parse_episode_character_signals_structured_text(raw_text: str) -> dict | Non
 def build_episode_character_signals_user_prompt(
     row: dict[str, object],
     summary_text: str,
+    opening_text: str = "",
 ) -> str:
     episode_no = int(row.get("episode_no") or row.get("episode_from") or 0)
     title = str(row.get("title") or "").strip()
     episode_title = str(row.get("episode_title") or "").strip()
+    opening_source = str(opening_text or "").strip()[:EPISODE_SUMMARY_MAX_INPUT_CHARS]
+    opening_context = (
+        "\n\n아래는 opening 회차 원문이다. 인물 이름과 동일인 판정은 요약보다 원문을 우선하라.\n"
+        "상태창의 임시 이름, 일반 역할어, 몸 주인의 이름과 화자의 실제 자칭을 구분하라.\n\n"
+        f"{opening_source}"
+        if opening_source
+        else ""
+    )
     return (
         f"작품명: {title}\n"
         f"episode_no: {episode_no}\n"
         f"회차 제목: {episode_title}\n"
         "아래는 해당 회차의 episode_summary다.\n"
-        "이 요약에서 드러나는 캐릭터/관계/행동 신호만 지정된 JSON schema로 추출하라.\n"
+        "아래 입력에서 드러나는 캐릭터/관계/행동 신호만 지정된 JSON schema로 추출하라.\n"
         "코드블록, 설명문은 쓰지 마라.\n\n"
         f"{summary_text}"
+        f"{opening_context}"
     )
 
 
@@ -3224,11 +3234,19 @@ def normalize_episode_character_signals_payload(
         social_call_names = normalize_signal_name_list(item.get("social_call_names"), limit=4)
         persona_names = normalize_signal_name_list(item.get("persona_names"), limit=4)
         real_names = normalize_signal_name_list(item.get("real_names"), limit=4)
-        has_possessed_as_claim = any(
-            isinstance(claim, dict)
-            and str(claim.get("claim_type") or "").strip().lower() == "possessed_as"
+        possessed_target_labels = {
+            normalize_signal_entity_label(
+                str(
+                    claim.get("normalized_target_label")
+                    or claim.get("target_label")
+                    or ""
+                )
+            )
             for claim in list(item.get("identity_claims") or [])
-        )
+            if isinstance(claim, dict)
+            and str(claim.get("claim_type") or "").strip().lower() == "possessed_as"
+        }
+        possessed_target_labels.discard("")
         safe_display_name = (
             display_name
             if not is_generic_character_label(display_name)
@@ -3236,10 +3254,14 @@ def normalize_episode_character_signals_payload(
             else ""
         )
         identity_name = max(real_names, key=lambda value: (len(value), value)) if real_names else safe_display_name
+        identity_matches_possessed_target = bool(
+            identity_name
+            and normalize_signal_entity_label(identity_name) in possessed_target_labels
+        )
         anonymous_work_role = bool(
             is_work_protagonist
             and not real_names
-            and (not identity_name or has_possessed_as_claim)
+            and (not identity_name or identity_matches_possessed_target)
         )
         if anonymous_work_role:
             display_name = "나(주인공)"
@@ -5041,8 +5063,13 @@ async def request_episode_character_signals_payload(
     *,
     row: dict[str, object],
     summary_text: str,
+    opening_text: str = "",
 ) -> dict | None:
-    user_prompt = build_episode_character_signals_user_prompt(row, summary_text)
+    user_prompt = build_episode_character_signals_user_prompt(
+        row,
+        summary_text,
+        opening_text,
+    )
     episode_no = int(row.get("episode_no") or 0)
 
     response_payload: dict | None = None
@@ -7633,6 +7660,7 @@ async def build_episode_character_signals_summaries(
     *,
     product_id: int,
     episode_rows: list[dict[str, object]],
+    episode_texts_by_no: dict[int, str] | None = None,
     summary_client: AsyncClient | None,
     cleanup_missing_scopes: bool = True,
     verbose: bool = False,
@@ -7656,12 +7684,22 @@ async def build_episode_character_signals_summaries(
         if not scope_key:
             continue
         valid_scope_keys.add(scope_key)
+        opening_text = (
+            str((episode_texts_by_no or {}).get(episode_no) or "").strip()
+            if episode_no <= 3
+            else ""
+        )
+        source_components = [
+            f"{summary_id}:{str(row.get('source_hash') or '').strip()}",
+            build_rp_reasoning_signature(),
+        ]
+        if opening_text:
+            source_components.append(
+                f"opening:{sha256_text(opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS])}"
+            )
         source_hash = build_compound_summary_source_hash(
             EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION,
-            [
-                f"{summary_id}:{str(row.get('source_hash') or '').strip()}",
-                build_rp_reasoning_signature(),
-            ],
+            source_components,
         )
         existing_summary_id = 0
         with work_cursor(conn) as cur:
@@ -7710,6 +7748,7 @@ async def build_episode_character_signals_summaries(
                     "episode_title": parse_summary_text(summary_text).get("header") or "",
                 },
                 summary_text=summary_text,
+                opening_text=opening_text,
             )
         except Exception as exc:
             logger.warning(
@@ -7769,6 +7808,7 @@ async def build_episode_character_signals_summaries_nonblocking(
     *,
     product_id: int,
     episode_rows: list[dict[str, object]],
+    episode_texts_by_no: dict[int, str] | None = None,
     summary_client: AsyncClient | None,
     cleanup_missing_scopes: bool = True,
     verbose: bool = False,
@@ -7783,6 +7823,7 @@ async def build_episode_character_signals_summaries_nonblocking(
             conn=conn,
             product_id=product_id,
             episode_rows=episode_rows,
+            episode_texts_by_no=episode_texts_by_no,
             summary_client=summary_client,
             cleanup_missing_scopes=cleanup_missing_scopes,
             verbose=verbose,
@@ -17338,6 +17379,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             conn=work_conn,
                             product_id=product_id,
                             episode_rows=character_episode_processing_rows,
+                            episode_texts_by_no=character_episode_texts_by_no,
                             summary_client=summary_client,
                             verbose=args.verbose,
                             cleanup_missing_scopes=cleanup_character_episode_scopes,
@@ -17642,6 +17684,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                 }
             )
             touched_range_scopes = select_touched_range_scopes(touched_episode_nos)
+            touched_episode_texts_by_no: dict[int, str] = {}
             with work_cursor(work_conn) as cur:
                 total_episode_count = fetch_total_episode_count(cur=cur, product_id=product_id)
 
@@ -17698,6 +17741,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                         if not normalized_text:
                             results["skipped_rows"] += 1
                             continue
+                        touched_episode_texts_by_no[int(row["episode_no"])] = normalized_text
 
                         chunks = build_chunks(normalized_text)
                         if not chunks:
@@ -17801,6 +17845,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             conn=work_conn,
                             product_id=product_id,
                             episode_rows=touched_character_episode_summary_rows,
+                            episode_texts_by_no=touched_episode_texts_by_no,
                             summary_client=summary_client,
                             cleanup_missing_scopes=False,
                             verbose=args.verbose,

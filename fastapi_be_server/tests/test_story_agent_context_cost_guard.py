@@ -1567,6 +1567,93 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         activate_existing.assert_called_once_with(ANY, 123, 687, "episode_character_signals", "episode:1001")
         self.assertEqual(conn.commit_count, 1)
 
+    async def test_opening_character_signal_uses_raw_text_and_invalidates_summary_only_cache(self):
+        module = load_module()
+        conn = FakeConnection()
+        row = {
+            "summary_id": 777,
+            "scope_key": "episode:1001",
+            "episode_from": 1,
+            "source_hash": "episode-summary-hash",
+            "summary_text": "[1화] 요약에서는 인물 이름이 미정으로 축약됐다.",
+        }
+        opening_text = "이름: 미정(추종자)\n내 이름은 추종자다."
+        old_source_hash = module.build_compound_summary_source_hash(
+            module.EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION,
+            [
+                "777:episode-summary-hash",
+                module.build_rp_reasoning_signature(),
+            ],
+        )
+        request_mock = AsyncMock(
+            return_value={
+                "mentioned_characters": [
+                    signal_character(
+                        character_key="ignored",
+                        display_name="추종자",
+                        real_names=["추종자"],
+                        is_work_protagonist=True,
+                    )
+                ]
+            }
+        )
+
+        def fetch_existing(*, source_hash, **kwargs):
+            return {"summary_id": 123} if source_hash == old_source_hash else None
+
+        with patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "is_episode_character_signals_provider_available", return_value=True), \
+             patch.object(module, "fetch_existing_summary", side_effect=fetch_existing), \
+             patch.object(module, "request_episode_character_signals_payload", request_mock), \
+             patch.object(module, "upsert_summary", return_value=(456, True)):
+            inserted, reused = await module.build_episode_character_signals_summaries(
+                conn,
+                product_id=687,
+                episode_rows=[row],
+                episode_texts_by_no={1: opening_text},
+                summary_client=object(),
+                cleanup_missing_scopes=False,
+            )
+
+        self.assertEqual((inserted, reused), (1, 0))
+        request_mock.assert_awaited_once()
+        self.assertEqual(
+            request_mock.await_args.kwargs["opening_text"],
+            opening_text,
+        )
+
+    def test_possessed_work_protagonist_keeps_distinct_named_persona(self):
+        module = load_module()
+
+        payload = module.normalize_episode_character_signals_payload(
+            {
+                "mentioned_characters": [
+                    signal_character(
+                        character_key="ignored",
+                        display_name="추종자",
+                        aliases=["추종자"],
+                        persona_names=["추종자"],
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        identity_claims=[
+                            {
+                                "target_label": "신미아의 동생",
+                                "claim_type": "possessed_as",
+                                "evidence": "추종자가 신미아의 동생 몸에 빙의했다",
+                            }
+                        ],
+                    )
+                ]
+            },
+            episode_no=1,
+        )
+
+        self.assertEqual(len(payload["mentioned_characters"]), 1)
+        protagonist = payload["mentioned_characters"][0]
+        self.assertEqual(protagonist["character_key"], "protagonist:named:추종자")
+        self.assertEqual(protagonist["display_name"], "추종자")
+        self.assertEqual(protagonist["entity_kind"], "person")
+
     async def test_episode_character_signal_can_stage_reuse_without_child_commit(self):
         module = load_module()
         conn = FakeConnection()
