@@ -7181,6 +7181,147 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             {"character:당신", "character:추종자"},
         )
 
+    def test_inventory_v3_authoritative_main_upgrade_is_not_blocked_by_major_lkg(self):
+        module = load_module()
+        cur = object()
+        old_main = {
+            "canonical_character_key": "character:당신",
+            "display_name": "당신",
+            "work_role": "main_protagonist",
+            "distinct_episode_count": 1,
+            "public_chat_eligible": False,
+            "public_slot_eligible": False,
+        }
+        old_major = {
+            "canonical_character_key": "character:추종자",
+            "display_name": "추종자",
+            "work_role": "major_character",
+            "public_chat_eligible": True,
+            "public_slot_eligible": False,
+        }
+        resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": "character:추종자",
+            "work_protagonist_keys": ["character:추종자"],
+            "confidence": "high",
+            "reason_code": "opening_role_continuity",
+            "rejected": [],
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+        fresh_main = {
+            "canonical_character_key": "character:추종자",
+            "display_name": "추종자",
+            "work_role": "main_protagonist",
+            "identity_status": "RESOLVED_NAMED",
+            "identity_conflict_reasons": [],
+            "distinct_episode_count": 30,
+            "public_chat_eligible": False,
+            "public_slot_eligible": False,
+            "work_protagonist_resolution": resolution,
+            "superseded_protagonist_scope_keys": ["character:당신"],
+        }
+        upserted_items: list[dict] = []
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value={
+                "character:당신": old_main,
+                "character:추종자": old_major,
+            },
+        ), patch.object(
+            module,
+            "aggregate_character_inventory_v3_rows",
+            return_value=[fresh_main],
+        ), patch.object(
+            module,
+            "reconcile_character_inventory_v3_scope_keys",
+            side_effect=lambda rows, **_kwargs: rows,
+        ), patch.object(
+            module,
+            "_refresh_character_inventory_v3_serving_fields",
+            side_effect=lambda _item: None,
+        ), patch.object(
+            module,
+            "upsert_character_inventory_v3_item",
+            side_effect=lambda _cur, *, product_id, item: upserted_items.append(dict(item)) or True,
+        ), patch.object(module, "deactivate_missing_active_scopes"):
+            module.build_character_inventory_v3_summaries_from_signal_rows(
+                cur,
+                product_id=1105,
+                signal_rows=[{"summary_text": "{}"}],
+                protagonist_resolution=resolution,
+            )
+
+        by_scope = {
+            item["canonical_character_key"]: item
+            for item in upserted_items
+        }
+        self.assertEqual(
+            by_scope["character:추종자"]["work_role"],
+            "main_protagonist",
+        )
+        self.assertEqual(
+            by_scope["character:당신"]["work_role"],
+            "major_character",
+        )
+
+    def test_inventory_v3_resolved_result_cannot_persist_without_a_main(self):
+        module = load_module()
+        resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": "character:추종자",
+            "work_protagonist_keys": ["character:추종자"],
+            "confidence": "high",
+            "reason_code": "opening_role_continuity",
+            "rejected": [],
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+        only_major = {
+            "canonical_character_key": "character:추종자",
+            "display_name": "추종자",
+            "work_role": "major_character",
+            "distinct_episode_count": 30,
+        }
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value={},
+        ), patch.object(
+            module,
+            "aggregate_character_inventory_v3_rows",
+            return_value=[only_major],
+        ), patch.object(
+            module,
+            "reconcile_character_inventory_v3_scope_keys",
+            side_effect=lambda rows, **_kwargs: rows,
+        ), patch.object(
+            module,
+            "upsert_character_inventory_v3_item",
+            return_value=True,
+        ), patch.object(module, "deactivate_missing_active_scopes"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "resolved protagonist inventory has no persisted main",
+            ):
+                module.build_character_inventory_v3_summaries_from_signal_rows(
+                    object(),
+                    product_id=1105,
+                    signal_rows=[{"summary_text": "{}"}],
+                    protagonist_resolution=resolution,
+                )
+
     def test_inventory_v3_does_not_overwrite_locked_main_with_conflicting_same_scope_row(self):
         module = load_module()
         cur = object()

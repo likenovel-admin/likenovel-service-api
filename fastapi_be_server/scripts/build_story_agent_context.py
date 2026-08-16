@@ -13250,6 +13250,7 @@ def build_character_inventory_v3_summaries_from_signal_rows(
     reused_count = 0
     valid_scope_keys: set[str] = set()
     preserved_locked_scope_keys: set[str] = set()
+    persisted_main_scope_keys: set[str] = set()
     current_inventory_by_scope = {
         str(item.get("canonical_character_key") or "").strip(): item
         for item in inventory_rows
@@ -13334,8 +13335,19 @@ def build_character_inventory_v3_summaries_from_signal_rows(
         if scope_key in retirement_replacements:
             continue
         old_item = dict(old_inventory_map.get(scope_key) or {})
+        authoritative_main_item = (
+            str(item.get("work_role") or "") == "main_protagonist"
+            and str(
+                dict(item.get("work_protagonist_resolution") or {}).get(
+                    "decision"
+                )
+                or ""
+            ).upper()
+            == "RESOLVED"
+        )
         if (
-            scope_key not in superseded_locked_scope_keys
+            not authoritative_main_item
+            and scope_key not in superseded_locked_scope_keys
             and _has_character_serving_contract(old_item)
             and not _has_character_serving_contract(item)
         ):
@@ -13359,6 +13371,8 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             continue
         valid_scope_keys.add(scope_key)
         inserted = upsert_character_inventory_v3_item(cur, product_id=product_id, item=item)
+        if str(item.get("work_role") or "") == "main_protagonist":
+            persisted_main_scope_keys.add(scope_key)
         if inserted:
             inserted_count += 1
         else:
@@ -13418,6 +13432,7 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             )
             continue
         if locked_scope_key in preserved_locked_scope_keys:
+            persisted_main_scope_keys.add(locked_scope_key)
             continue
         if any(
             str(item.get("work_role") or "") == "main_protagonist"
@@ -13426,6 +13441,7 @@ def build_character_inventory_v3_summaries_from_signal_rows(
         ):
             continue
         valid_scope_keys.add(locked_scope_key)
+        persisted_main_scope_keys.add(locked_scope_key)
         reused_count += 1
         logger.warning(
             "story_agent_protagonist_lock_preserved product_id=%s scope_key=%s reason=identity_not_in_current_inventory",
@@ -13447,6 +13463,16 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             "story_agent_character_lkg_preserved product_id=%s scope_key=%s reason=missing_from_current_inventory",
             product_id,
             normalized_old_scope_key,
+        )
+
+    if (
+        str(dict(protagonist_resolution or {}).get("decision") or "").upper()
+        == "RESOLVED"
+        and not persisted_main_scope_keys
+    ):
+        raise ValueError(
+            "resolved protagonist inventory has no persisted main: "
+            f"product_id={product_id}"
         )
 
     if cleanup_missing_scopes:
