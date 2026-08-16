@@ -1654,6 +1654,17 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(protagonist["display_name"], "추종자")
         self.assertEqual(protagonist["entity_kind"], "person")
 
+        inventory = module.aggregate_character_inventory_v3_rows(
+            [signal_row(1, 1, payload["mentioned_characters"])]
+        )
+        inventory_protagonist = next(
+            row
+            for row in inventory
+            if "protagonist:named:추종자"
+            in list(row.get("source_character_keys") or [])
+        )
+        self.assertEqual(inventory_protagonist["display_name"], "추종자")
+
     async def test_episode_character_signal_can_stage_reuse_without_child_commit(self):
         module = load_module()
         conn = FakeConnection()

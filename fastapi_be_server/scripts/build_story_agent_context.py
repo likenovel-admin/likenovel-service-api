@@ -10826,6 +10826,7 @@ def resolve_character_inventory_v3_clusters(
                 for claim in list(observation.get("identity_claims") or [])
                 if isinstance(claim, dict)
                 and str(claim.get("claim_type") or "").strip().lower() == "possessed_as"
+                and str(claim.get("target_key") or "").strip()
                 and str(claim.get("target_label") or "").strip()
             }
             if len(possessed_display_names) == 1:
