@@ -6031,7 +6031,7 @@ def merge_grounded_existing_rp_examples(
     )
     return mark_rp_example_candidates(
         dedupe_rp_dialogue_items(
-            [*dialogue_items, *grounded_existing_items],
+            [*grounded_existing_items, *dialogue_items],
             limit=80,
         ),
         aliases,

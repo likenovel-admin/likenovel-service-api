@@ -2390,8 +2390,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": True}), \
              patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[
-                 {"episode_no": 1, "kind": "monologue", "text": "문을 열고 안으로 들어갔다."},
-                 {"episode_no": 2, "kind": "monologue", "text": "지금은 물러설 수 없었다."},
+                 {"episode_no": (index % 5) + 1, "kind": "monologue", "text": f"내면 독백 근거 {index}번을 기록한다."}
+                 for index in range(80)
              ]), \
              patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
              patch.object(module, "request_character_chat_internal_prompt_payload", AsyncMock(return_value=internal_prompt_payload)), \
