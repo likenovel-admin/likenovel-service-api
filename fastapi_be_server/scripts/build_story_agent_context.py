@@ -17020,7 +17020,12 @@ async def repair_character_chat_assets(
 ) -> None:
     product_results = results.setdefault("products", [])
     repair_records = results.setdefault("character_asset_repairs", [])
-    if not isinstance(product_results, list) or not isinstance(repair_records, list):
+    reaggregation_records = results.setdefault("inventory_reaggregations", [])
+    if (
+        not isinstance(product_results, list)
+        or not isinstance(repair_records, list)
+        or not isinstance(reaggregation_records, list)
+    ):
         raise TypeError("story-agent repair results must contain list fields")
     rows_by_product: dict[int, list[dict]] = {}
     for row in rows:
@@ -17093,12 +17098,23 @@ async def repair_character_chat_assets(
                 continue
             results["character_asset_repair_attempted"] += 1
             repair_record: dict[str, object] = {"product_id": product_id}
+            combine_reaggregation = bool(
+                getattr(args, "reaggregate_character_inventory", False)
+            )
+            reaggregation_record: dict[str, object] | None = None
+            if combine_reaggregation:
+                results["inventory_reaggregation_attempted"] += 1
+                reaggregation_record = {"product_id": product_id}
             try:
                 with product_lock_connection(product_id) if args.apply else nullcontext(None) as lock_conn:
                     if args.apply and lock_conn is None:
                         repair_record["status"] = "locked"
                         results["character_asset_repair_no_progress"] += 1
                         repair_records.append(repair_record)
+                        if reaggregation_record is not None:
+                            reaggregation_record["status"] = "locked"
+                            results["inventory_reaggregation_no_progress"] += 1
+                            reaggregation_records.append(reaggregation_record)
                         continue
 
                     with work_cursor(work_conn) as cur:
@@ -17122,21 +17138,6 @@ async def repair_character_chat_assets(
                         fetch_character_identity_review(
                             cur,
                             product_id=product_id,
-                            signal_rows=active_signal_rows,
-                        )
-                        before_readiness = fetch_character_chat_asset_readiness_verification(
-                            cur,
-                            product_id=product_id,
-                            story_context_status=context_status,
-                            total_episode_count=total_episode_count,
-                        )
-                        inventory_map = fetch_active_character_inventory_map(
-                            cur=cur,
-                            product_id=product_id,
-                            summary_type="character_inventory_v3",
-                        )
-                        capped_inventory_map = filter_character_inventory_map_to_signal_scope(
-                            inventory_map=inventory_map,
                             signal_rows=active_signal_rows,
                         )
                         episode_summary_rows = fetch_active_character_asset_summary_rows(
@@ -17170,6 +17171,80 @@ async def repair_character_chat_assets(
                                 len(missing_required_signal_scope_keys),
                             )
                             continue
+
+                        bundle_scope_keys: set[str] = set()
+                        inventory_stats: dict[str, object] | None = None
+                        inventory_v3_counts: tuple[int, int] | None = None
+                        relation_stats: dict[str, object] | None = None
+                        if combine_reaggregation:
+                            old_inventory_map = fetch_active_character_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                            )
+                            old_inventory_v3_map = fetch_active_character_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                                summary_type="character_inventory_v3",
+                            )
+                            old_relation_map = (
+                                fetch_active_relation_inventory_by_relation_key_map(
+                                    cur=cur,
+                                    product_id=product_id,
+                                )
+                            )
+                            inventory_stats = build_character_inventory_summaries_delta(
+                                cur,
+                                product_id=product_id,
+                                old_inventory_map=old_inventory_map,
+                                old_touched_signal_rows=active_signal_rows,
+                                new_touched_signal_rows=active_signal_rows,
+                            )
+                            inventory_v3_counts = build_character_inventory_v3_summaries(
+                                cur=cur,
+                                product_id=product_id,
+                                protagonist_resolution=None,
+                                cleanup_missing_scopes=False,
+                            )
+                            relation_stats = build_relation_inventory_summaries_delta(
+                                cur,
+                                product_id=product_id,
+                                old_relation_map=old_relation_map,
+                                old_touched_signal_rows=active_signal_rows,
+                                new_touched_signal_rows=active_signal_rows,
+                            )
+                            assert_story_agent_foundation_invariants(
+                                cur=cur,
+                                product_id=product_id,
+                                require_signal_coverage=False,
+                            )
+                            inventory_map = fetch_active_character_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                                summary_type="character_inventory_v3",
+                            )
+                            bundle_scope_keys = (
+                                build_public_main_protagonist_bundle_scope_keys(
+                                    old_inventory_map=old_inventory_v3_map,
+                                    new_inventory_map=inventory_map,
+                                )
+                            )
+                        else:
+                            inventory_map = fetch_active_character_inventory_map(
+                                cur=cur,
+                                product_id=product_id,
+                                summary_type="character_inventory_v3",
+                            )
+
+                        before_readiness = fetch_character_chat_asset_readiness_verification(
+                            cur,
+                            product_id=product_id,
+                            story_context_status=context_status,
+                            total_episode_count=total_episode_count,
+                        )
+                        capped_inventory_map = filter_character_inventory_map_to_signal_scope(
+                            inventory_map=inventory_map,
+                            signal_rows=active_signal_rows,
+                        )
                         episode_texts_by_no = fetch_active_episode_texts_by_no(
                             cur,
                             product_id=product_id,
@@ -17197,6 +17272,13 @@ async def repair_character_chat_assets(
                         signal_rows=active_signal_rows,
                         inventory_map=inventory_map,
                     )
+                    if bundle_scope_keys:
+                        repair_plan["rp_scope_keys"] = sorted(
+                            set(repair_plan["rp_scope_keys"]) | bundle_scope_keys
+                        )
+                        repair_plan["scene_scope_keys"] = sorted(
+                            set(repair_plan["scene_scope_keys"]) | bundle_scope_keys
+                        )
                     scene_scope_keys = set(repair_plan["scene_scope_keys"])
                     scene_rows, required_scope_keys_by_episode_no = (
                         select_character_chat_scene_repair_rows(
@@ -17207,6 +17289,7 @@ async def repair_character_chat_assets(
                         )
                     )
                     scene_counts = (0, 0)
+                    processed_scene_scope_keys: set[str] = set()
                     if scene_rows:
                         scene_counts = await build_episode_scene_extraction_summaries(
                             conn=work_conn,
@@ -17222,10 +17305,11 @@ async def repair_character_chat_assets(
                             cleanup_missing_scopes=False,
                             raise_unexpected_errors=True,
                             verbose=args.verbose,
+                            commit_changes=not combine_reaggregation,
+                            processed_character_scope_keys=processed_scene_scope_keys,
                         )
-                        results["inserted_episode_scene_extractions"] += scene_counts[0]
-                        results["reused_episode_scene_extractions"] += scene_counts[1]
 
+                    processed_rp_scope_keys: set[str] = set()
                     rp_counts = await build_rp_summaries_delta(
                         conn=work_conn,
                         product_id=product_id,
@@ -17236,20 +17320,10 @@ async def repair_character_chat_assets(
                         inventory_map=capped_inventory_map,
                         relation_map=relation_map,
                         historical_inventory_state_map=historical_inventory_state_map,
+                        require_current_generation_scope_keys=bundle_scope_keys,
+                        processed_scope_keys=processed_rp_scope_keys,
                         raise_unexpected_errors=True,
                         verbose=args.verbose,
-                    )
-                    results["inserted_character_rp_profiles"] += int(
-                        (rp_counts.get("profile") or (0, 0))[0]
-                    )
-                    results["reused_character_rp_profiles"] += int(
-                        (rp_counts.get("profile") or (0, 0))[1]
-                    )
-                    results["inserted_character_rp_examples"] += int(
-                        (rp_counts.get("examples") or (0, 0))[0]
-                    )
-                    results["reused_character_rp_examples"] += int(
-                        (rp_counts.get("examples") or (0, 0))[1]
                     )
 
                     with work_cursor(work_conn) as cur:
@@ -17263,7 +17337,72 @@ async def repair_character_chat_assets(
                             cur,
                             product_id=product_id,
                         )
+                        if bundle_scope_keys:
+                            ready_scope_keys = set(
+                                after_readiness.get(
+                                    "ready_main_protagonist_scope_keys"
+                                )
+                                or []
+                            )
+                            missing_scope_keys = (
+                                bundle_scope_keys - ready_scope_keys
+                            ) | (
+                                bundle_scope_keys - processed_scene_scope_keys
+                            ) | (
+                                bundle_scope_keys - processed_rp_scope_keys
+                            )
+                            if missing_scope_keys:
+                                raise ValueError(
+                                    "public main character asset bundle incomplete: "
+                                    "missing_current_generation_scope_keys="
+                                    f"{','.join(sorted(missing_scope_keys))}"
+                                )
                     work_conn.commit()
+
+                    results["inserted_episode_scene_extractions"] += scene_counts[0]
+                    results["reused_episode_scene_extractions"] += scene_counts[1]
+                    results["inserted_character_rp_profiles"] += int(
+                        (rp_counts.get("profile") or (0, 0))[0]
+                    )
+                    results["reused_character_rp_profiles"] += int(
+                        (rp_counts.get("profile") or (0, 0))[1]
+                    )
+                    results["inserted_character_rp_examples"] += int(
+                        (rp_counts.get("examples") or (0, 0))[0]
+                    )
+                    results["reused_character_rp_examples"] += int(
+                        (rp_counts.get("examples") or (0, 0))[1]
+                    )
+                    if reaggregation_record is not None:
+                        changed = (
+                            int((inventory_stats or {}).get("inserted_count") or 0)
+                            + int((inventory_v3_counts or (0, 0))[0])
+                            + int((relation_stats or {}).get("inserted_count") or 0)
+                        ) > 0
+                        results[
+                            "inventory_reaggregation_updated"
+                            if changed
+                            else "inventory_reaggregation_no_progress"
+                        ] += 1
+                        reaggregation_record.update(
+                            {
+                                "status": "updated" if changed else "no_progress",
+                                "signal_count": len(active_signal_rows),
+                                "inventory_counts": [
+                                    int((inventory_stats or {}).get("inserted_count") or 0),
+                                    int((inventory_stats or {}).get("reused_count") or 0),
+                                ],
+                                "inventory_v3_counts": [
+                                    int((inventory_v3_counts or (0, 0))[0]),
+                                    int((inventory_v3_counts or (0, 0))[1]),
+                                ],
+                                "relation_counts": [
+                                    int((relation_stats or {}).get("inserted_count") or 0),
+                                    int((relation_stats or {}).get("reused_count") or 0),
+                                ],
+                            }
+                        )
+                        reaggregation_records.append(reaggregation_record)
 
                     recovered = (
                         is_character_chat_asset_readiness_actionable(before_readiness)
@@ -17397,6 +17536,12 @@ async def repair_character_chat_assets(
                     except Exception:
                         pass
                 results["character_asset_repair_failed"] += 1
+                if reaggregation_record is not None:
+                    results["inventory_reaggregation_failed"] += 1
+                    reaggregation_record.update(
+                        {"status": "failed", "error": str(exc)[:240]}
+                    )
+                    reaggregation_records.append(reaggregation_record)
                 repair_record.update(
                     {"status": "failed", "error": str(exc)[:240]}
                 )
@@ -19067,7 +19212,7 @@ async def main() -> int:
             character_asset_repair_rows,
             results=results,
         )
-        if inventory_reaggregation_rows:
+        if inventory_reaggregation_rows and not bool(args.repair_character_assets):
             await reaggregate_character_inventory_foundations(
                 rows=inventory_reaggregation_rows,
                 args=args,
