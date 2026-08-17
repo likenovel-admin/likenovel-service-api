@@ -4690,6 +4690,35 @@ def mark_rp_example_candidates(items: list[dict[str, object]], aliases: list[str
     return marked
 
 
+def build_rp_profile_voice_items(
+    *,
+    direct_items: list[dict[str, object]],
+    llm_dialogue_items: list[dict[str, object]],
+    aliases: list[str],
+) -> list[dict[str, object]]:
+    direct_dialogue_items = [
+        item
+        for item in direct_items
+        if str(item.get("kind") or "dialogue").strip().lower() == "dialogue"
+    ]
+    direct_non_dialogue_items = [
+        item
+        for item in direct_items
+        if str(item.get("kind") or "dialogue").strip().lower() != "dialogue"
+    ]
+    return mark_rp_example_candidates(
+        dedupe_rp_dialogue_items(
+            [
+                *direct_dialogue_items,
+                *llm_dialogue_items,
+                *direct_non_dialogue_items,
+            ],
+            limit=80,
+        ),
+        aliases,
+    )
+
+
 def build_voice_evidence_stats(items: list[dict[str, object]], aliases: list[str]) -> dict[str, object]:
     marked_items = mark_rp_example_candidates(dedupe_rp_dialogue_items(items, limit=200), aliases)
     episode_counts = Counter(
@@ -6578,8 +6607,27 @@ async def build_rp_summaries(
         aliases = [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()]
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
         direct_dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
+        direct_profile_voice_items = build_rp_profile_voice_items(
+            direct_items=direct_dialogue_items,
+            llm_dialogue_items=[],
+            aliases=aliases,
+        )
+        direct_dialogue_example_count = sum(
+            bool(item.get("is_example_candidate"))
+            for item in direct_profile_voice_items
+            if str(item.get("kind") or "dialogue").strip().lower()
+            == "dialogue"
+        )
+        needs_dialogue_fallback = (
+            not bool(direct_voice_quality.get("strict_chat_ready"))
+            or (
+                str(direct_voice_quality.get("status") or "")
+                == "strict_monologue_ready"
+                and direct_dialogue_example_count < RP_PROFILE_MIN_EXAMPLE_TEXTS
+            )
+        )
         dialogue_items: list[dict[str, object]] = []
-        if not bool(direct_voice_quality.get("strict_chat_ready")):
+        if needs_dialogue_fallback:
             try:
                 llm_dialogue_items = await collect_llm_rp_dialogue_items(
                     summary_client,
@@ -6593,11 +6641,11 @@ async def build_rp_summaries(
                 if verbose:
                     print(f"[rp-dialogue-skip] product_id={product_id} character={character_key} error={str(exc)[:160]}")
                 llm_dialogue_items = []
-            dialogue_items = dedupe_rp_dialogue_items(
-                [*direct_dialogue_items, *llm_dialogue_items],
-                limit=80,
+            dialogue_items = build_rp_profile_voice_items(
+                direct_items=direct_dialogue_items,
+                llm_dialogue_items=llm_dialogue_items,
+                aliases=aliases,
             )
-            dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
             if sum(bool(item.get("is_example_candidate")) for item in dialogue_items) < RP_PROFILE_MIN_EXAMPLE_TEXTS:
                 if existing_example_rows_by_scope is None:
                     with work_cursor(conn) as cur:
@@ -6629,7 +6677,7 @@ async def build_rp_summaries(
                     )
                     continue
         else:
-            dialogue_items = direct_dialogue_items
+            dialogue_items = direct_profile_voice_items
         if not dialogue_items:
             logger.info(
                 "story_agent_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
@@ -7260,9 +7308,28 @@ async def build_rp_summaries_delta(
         scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
 
         direct_dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
-        dialogue_items: list[dict[str, object]] = []
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
-        if not bool(direct_voice_quality.get("strict_chat_ready")):
+        direct_profile_voice_items = build_rp_profile_voice_items(
+            direct_items=direct_dialogue_items,
+            llm_dialogue_items=[],
+            aliases=aliases,
+        )
+        direct_dialogue_example_count = sum(
+            bool(item.get("is_example_candidate"))
+            for item in direct_profile_voice_items
+            if str(item.get("kind") or "dialogue").strip().lower()
+            == "dialogue"
+        )
+        needs_dialogue_fallback = (
+            not bool(direct_voice_quality.get("strict_chat_ready"))
+            or (
+                str(direct_voice_quality.get("status") or "")
+                == "strict_monologue_ready"
+                and direct_dialogue_example_count < RP_PROFILE_MIN_EXAMPLE_TEXTS
+            )
+        )
+        dialogue_items: list[dict[str, object]] = []
+        if needs_dialogue_fallback:
             try:
                 llm_dialogue_items = await collect_llm_rp_dialogue_items(
                     summary_client,
@@ -7282,23 +7349,13 @@ async def build_rp_summaries_delta(
                 if verbose:
                     print(f"[rp-delta-dialogue-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
                 llm_dialogue_items = []
-            dialogue_items = dedupe_rp_dialogue_items(
-                [*direct_dialogue_items, *llm_dialogue_items],
-                limit=80,
+            dialogue_items = build_rp_profile_voice_items(
+                direct_items=direct_dialogue_items,
+                llm_dialogue_items=llm_dialogue_items,
+                aliases=aliases,
             )
-            dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
-            if sum(bool(item.get("is_example_candidate")) for item in dialogue_items) < RP_PROFILE_MIN_EXAMPLE_TEXTS:
-                logger.info(
-                    "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
-                    product_id,
-                    scope_key,
-                    "direct_voice_not_ready",
-                    str(direct_voice_quality.get("status") or "unknown"),
-                )
-                counts["keep_old_dialogue_missing_count"] += 1
-                continue
         else:
-            dialogue_items = direct_dialogue_items
+            dialogue_items = direct_profile_voice_items
 
         dialogue_items = dedupe_rp_dialogue_items(dialogue_items, limit=80)
         dialogue_items = mark_rp_example_candidates(dialogue_items, aliases)
@@ -7313,6 +7370,16 @@ async def build_rp_summaries_delta(
                 episode_texts_by_no=episode_texts_by_no,
                 aliases=aliases,
             )
+        if sum(bool(item.get("is_example_candidate")) for item in dialogue_items) < RP_PROFILE_MIN_EXAMPLE_TEXTS:
+            logger.info(
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s status=%s",
+                product_id,
+                scope_key,
+                "direct_voice_not_ready",
+                str(direct_voice_quality.get("status") or "unknown"),
+            )
+            counts["keep_old_dialogue_missing_count"] += 1
+            continue
         if not dialogue_items:
             logger.info(
                 "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=%s",
