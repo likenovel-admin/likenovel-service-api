@@ -2123,6 +2123,23 @@ def fetch_active_character_asset_summary_rows(
     return list(cur.fetchall())
 
 
+def build_missing_required_signal_scope_keys(
+    *,
+    episode_summary_rows: Iterable[dict],
+    signal_rows: Iterable[dict],
+) -> set[str]:
+    signal_scope_keys = {
+        str(row.get("scope_key") or "").strip()
+        for row in signal_rows
+        if str(row.get("scope_key") or "").strip()
+    }
+    return {
+        str(row.get("scope_key") or "").strip()
+        for row in episode_summary_rows
+        if str(row.get("scope_key") or "").strip()
+    } - signal_scope_keys
+
+
 def pick_spread_rows(rows: list[dict], limit: int) -> list[dict]:
     if len(rows) <= limit:
         return rows
@@ -2417,16 +2434,16 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
                     character_asset_collection_eligible
                 )
                 product_filtered_rows.append(next_row)
-            elif episode_id in repair_episode_ids:
+            elif episode_id in signal_repair_episode_ids:
                 next_row = dict(row)
-                next_row["_delta_reason"] = "sync_repair"
+                next_row["_delta_reason"] = "signal_repair"
                 next_row["_character_asset_collection_eligible"] = (
                     character_asset_collection_eligible
                 )
                 product_filtered_rows.append(next_row)
-            elif episode_id in signal_repair_episode_ids:
+            elif episode_id in repair_episode_ids:
                 next_row = dict(row)
-                next_row["_delta_reason"] = "signal_repair"
+                next_row["_delta_reason"] = "sync_repair"
                 next_row["_character_asset_collection_eligible"] = (
                     character_asset_collection_eligible
                 )
@@ -2439,9 +2456,9 @@ def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes
                 )
                 product_filtered_rows.append(next_row)
         reason_priority = {
-            "open_add": 0,
-            "sync_repair": 1,
-            "signal_repair": 2,
+            "signal_repair": 0,
+            "open_add": 1,
+            "sync_repair": 2,
             "scene_repair": 3,
         }
         product_filtered_rows.sort(
@@ -17060,6 +17077,32 @@ async def repair_character_chat_assets(
                             product_id=product_id,
                             summary_type="episode_summary",
                         )
+                        missing_required_signal_scope_keys = (
+                            build_missing_required_signal_scope_keys(
+                                episode_summary_rows=episode_summary_rows,
+                                signal_rows=active_signal_rows,
+                            )
+                        )
+                        if missing_required_signal_scope_keys:
+                            repair_record.update(
+                                {
+                                    "status": "no_progress",
+                                    "reason": "signal_foundation_incomplete",
+                                    "missing_required_signal_count": len(
+                                        missing_required_signal_scope_keys
+                                    ),
+                                }
+                            )
+                            results["character_asset_repair_no_progress"] += 1
+                            repair_records.append(repair_record)
+                            logger.info(
+                                "story_agent_character_asset_repair_no_progress "
+                                "product_id=%s reason=signal_foundation_incomplete "
+                                "missing_required_signal_count=%s",
+                                product_id,
+                                len(missing_required_signal_scope_keys),
+                            )
+                            continue
                         episode_texts_by_no = fetch_active_episode_texts_by_no(
                             cur,
                             product_id=product_id,
@@ -17343,6 +17386,38 @@ async def reaggregate_character_inventory_foundations(
                             )
                             results["inventory_reaggregation_no_progress"] += 1
                             reaggregation_records.append(record)
+                            continue
+
+                        episode_summary_rows = fetch_active_character_asset_summary_rows(
+                            cur=cur,
+                            product_id=product_id,
+                            summary_type="episode_summary",
+                        )
+                        missing_required_signal_scope_keys = (
+                            build_missing_required_signal_scope_keys(
+                                episode_summary_rows=episode_summary_rows,
+                                signal_rows=active_signal_rows,
+                            )
+                        )
+                        if missing_required_signal_scope_keys:
+                            record.update(
+                                {
+                                    "status": "no_progress",
+                                    "reason": "signal_foundation_incomplete",
+                                    "missing_required_signal_count": len(
+                                        missing_required_signal_scope_keys
+                                    ),
+                                }
+                            )
+                            results["inventory_reaggregation_no_progress"] += 1
+                            reaggregation_records.append(record)
+                            logger.info(
+                                "story_agent_inventory_reaggregation_no_progress "
+                                "product_id=%s reason=signal_foundation_incomplete "
+                                "missing_required_signal_count=%s",
+                                product_id,
+                                len(missing_required_signal_scope_keys),
+                            )
                             continue
 
                         old_inventory_map = fetch_active_character_inventory_map(
@@ -18319,6 +18394,9 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             )
                             continue
 
+                        work_conn.commit()
+                        results["inserted_episode_character_signals"] += signal_inserted
+                        results["reused_episode_character_signals"] += signal_reused
                         with work_cursor(work_conn) as cur:
                             active_signal_rows_for_resolution = fetch_active_character_asset_summary_rows(
                                 cur=cur,
@@ -18330,6 +18408,43 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 product_id=product_id,
                                 summary_type="episode_summary",
                             )
+                        missing_required_signal_scope_keys = (
+                            build_missing_required_signal_scope_keys(
+                                episode_summary_rows=all_episode_summary_rows,
+                                signal_rows=active_signal_rows_for_resolution,
+                            )
+                        )
+                        if missing_required_signal_scope_keys:
+                            with work_cursor(work_conn) as cur:
+                                compound_counts = build_compound_summaries_delta(
+                                    cur,
+                                    product_id=product_id,
+                                    product_title=str(product_rows[0].get("title") or ""),
+                                    touched_range_scopes=touched_range_scopes,
+                                )
+                                status_row = refresh_product_context_status(
+                                    cur=cur,
+                                    product_id=product_id,
+                                    total_episode_count=total_episode_count,
+                                )
+                                status_row = attach_character_chat_asset_readiness_to_status_row(
+                                    cur,
+                                status_row,
+                            )
+                            work_conn.commit()
+                            results["inserted_range_summaries"] += compound_counts["range"][0]
+                            results["reused_range_summaries"] += compound_counts["range"][1]
+                            results["inserted_product_summaries"] += compound_counts["product"][0]
+                            results["reused_product_summaries"] += compound_counts["product"][1]
+                            results["products"].append(status_row)
+                            logger.info(
+                                "story_agent_delta_signal_foundation_staged "
+                                "product_id=%s committed_signal_count=%s missing_required_signal_count=%s",
+                                product_id,
+                                signal_inserted + signal_reused,
+                                len(missing_required_signal_scope_keys),
+                            )
+                            continue
                         work_protagonist_resolution = await build_work_protagonist_resolution_for_inventory_v3(
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),
@@ -18573,8 +18688,6 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 )
                         work_conn.commit()
                         results["delta_verifications"].append(delta_verification)
-                        results["inserted_episode_character_signals"] += signal_inserted
-                        results["reused_episode_character_signals"] += signal_reused
                         results["inserted_range_summaries"] += compound_counts["range"][0]
                         results["reused_range_summaries"] += compound_counts["range"][1]
                         results["inserted_product_summaries"] += compound_counts["product"][0]
