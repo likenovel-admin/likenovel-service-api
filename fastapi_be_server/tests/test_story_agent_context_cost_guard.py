@@ -1430,6 +1430,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "decision": "RESOLVED",
             "work_protagonist_key": "character:갤러해드지그문트",
             "work_protagonist_keys": ["character:갤러해드지그문트"],
+            "role_evidence_keys": ["character:갤러해드지그문트"],
             "confidence": "high",
             "reason_code": "persona_rename_same_person",
             "rationale": "3화 이후 현재 세계 이름이 작품 전체 행동 중심이다.",
@@ -4973,20 +4974,26 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             for episode_no in range(4, 101)
         ]
 
-        self.assertFalse(hasattr(module, "request_work_protagonist_resolution_payload"))
-        opening_resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
-            product_id=687,
-            product_title="테스트 작품",
-            signal_rows=opening_rows,
-            summary_client=None,
-        )
-        full_resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
-            product_id=687,
-            product_title="테스트 작품",
-            signal_rows=[*opening_rows, *later_rows],
-            summary_client=None,
-        )
+        requester = AsyncMock()
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "paid-model"),
+            patch.object(module, "request_work_protagonist_resolution_payload", requester),
+        ):
+            opening_resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=opening_rows,
+                summary_client=object(),
+            )
+            full_resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=[*opening_rows, *later_rows],
+                summary_client=object(),
+            )
 
+        requester.assert_not_awaited()
         self.assertEqual(opening_resolution, full_resolution)
         self.assertEqual(opening_resolution["decision"], "RESOLVED")
         self.assertEqual(opening_resolution["work_protagonist_key"], "character:초반주인공")
@@ -5286,6 +5293,487 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(resolution["decision"], "UNRESOLVED")
         self.assertEqual(resolution["work_protagonist_keys"], [])
 
+    async def test_possessed_opening_name_transition_keeps_one_work_role_without_identity_merge(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:named:차태석",
+                        display_name="차태석",
+                        narration_names=["차태석", "피고"],
+                        social_call_names=["피고"],
+                        persona_names=["차태석"],
+                        real_names=["차태석"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                    ),
+                    signal_character(
+                        character_key="named:백선우",
+                        display_name="백선우",
+                        narration_names=["백선우", "젊은 청년"],
+                        persona_names=["백선우", "차태석"],
+                        real_names=["백선우"],
+                        identity_claims=[
+                            {
+                                "target_label": "차태석",
+                                "normalized_target_label": "차태석",
+                                "target_key": "protagonist:named:차태석",
+                                "claim_type": "possessed_as",
+                                "evidence": "",
+                            }
+                        ],
+                    ),
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        character_key="protagonist:named:백선우",
+                        display_name="백선우",
+                        narration_names=["백선우"],
+                        persona_names=["백선우"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                    )
+                ],
+            ),
+            signal_row(
+                3,
+                3,
+                [
+                    signal_character(
+                        character_key="protagonist:named:백선우",
+                        display_name="백선우",
+                        narration_names=["백선우", "저승사자"],
+                        persona_names=["백선우", "저승사자"],
+                        real_names=["백선우"],
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                    )
+                ],
+            ),
+        ]
+
+        requested_resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": "character:백선우",
+            "work_protagonist_keys": ["character:백선우"],
+            "role_evidence_keys": ["character:차태석", "character:백선우"],
+            "confidence": "high",
+            "reason_code": "persona_rename_same_person",
+            "rationale": "동일한 작품 주인공이 현재 백선우의 신분으로 행동한다.",
+            "rejected": [],
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+        client = FakeOpenRouterClient(requested_resolution)
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "paid-model"),
+        ):
+            resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=rows,
+                summary_client=client,
+                episode_summary_rows=[
+                    {
+                        "episode_from": 1,
+                        "summary_text": "# 1화\n- 차태석은 죽은 뒤 백선우의 몸에서 깨어난다.",
+                    },
+                    {
+                        "episode_from": 2,
+                        "summary_text": "# 2화\n- 현재 화자는 몸의 원래 주인 백선우와 자신을 구분하고 그의 누명을 풀기로 한다.",
+                    },
+                    {
+                        "episode_from": 3,
+                        "summary_text": "# 3화\n- 현재 화자는 백선우의 사회적 신분으로 행동한다.",
+                    }
+                ],
+            )
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution=resolution,
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        request_payload = client.calls[0]["json"]
+        self.assertEqual(request_payload["reasoning"]["effort"], "low")
+        self.assertTrue(request_payload["provider"]["require_parameters"])
+        response_format = request_payload["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertEqual(
+            set(response_format["json_schema"]["schema"]["required"]),
+            {
+                "schema_version",
+                "decision",
+                "work_protagonist_key",
+                "work_protagonist_keys",
+                "role_evidence_keys",
+                "confidence",
+                "reason_code",
+                "rationale",
+                "rejected",
+                "safety_flags",
+            },
+        )
+        request_input = json.loads(request_payload["messages"][1]["content"])
+        self.assertEqual(
+            [item["episode_no"] for item in request_input["opening_signal_evidence"]],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [item["episode_no"] for item in request_input["episode_summary_evidence"]],
+            [1, 2, 3],
+        )
+        self.assertEqual(resolution["decision"], "RESOLVED")
+        self.assertEqual(resolution["work_protagonist_key"], "character:백선우")
+        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+        internal_identity = next(
+            row
+            for row in inventory
+            if row["canonical_character_key"] == "character:차태석"
+        )
+        self.assertEqual(main["canonical_character_key"], "character:백선우")
+        self.assertEqual(main["display_name"], "백선우")
+        self.assertEqual(main["evidence_episode_nos"], [1, 2, 3])
+        self.assertEqual(main["work_protagonist_evidence"]["episode_count"], 3)
+        self.assertIn("protagonist:named:백선우", main["source_character_keys"])
+        self.assertNotIn("protagonist:named:차태석", main["source_character_keys"])
+        self.assertNotEqual(internal_identity["work_role"], "main_protagonist")
+        self.assertNotEqual(
+            main["canonical_character_key"],
+            internal_identity["canonical_character_key"],
+        )
+
+    async def test_opening_joint_resolution_does_not_fold_named_side_arc_into_main(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key=(
+                            "protagonist:named:주인공A"
+                            if episode_no <= 2
+                            else "protagonist:named:인물B"
+                        ),
+                        display_name="주인공A" if episode_no <= 2 else "인물B",
+                        real_names=["주인공A" if episode_no <= 2 else "인물B"],
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        action_tags=["결정"] if episode_no <= 2 else ["조력"],
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+        requested_resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": "character:주인공A",
+            "work_protagonist_keys": ["character:주인공A"],
+            "role_evidence_keys": ["character:주인공A", "character:인물B"],
+            "confidence": "high",
+            "reason_code": "side_arc_not_protagonist",
+            "rationale": "3화의 인물B는 회차 중심일 뿐 작품 주인공은 아니다.",
+            "rejected": [],
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+        requester = AsyncMock(return_value=requested_resolution)
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "paid-model"),
+            patch.object(
+                module,
+                "request_work_protagonist_resolution_payload",
+                requester,
+                create=True,
+            ),
+        ):
+            resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=rows,
+                summary_client=object(),
+                episode_summary_rows=[
+                    {
+                        "episode_from": episode_no,
+                        "summary_text": f"# {episode_no}화\n- 사건 요약",
+                    }
+                    for episode_no in range(1, 4)
+                ],
+            )
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution=resolution,
+        )
+
+        requester.assert_awaited_once()
+        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+        side = next(row for row in inventory if row["display_name"] == "인물B")
+        self.assertEqual(main["canonical_character_key"], "character:주인공A")
+        self.assertEqual(main["evidence_episode_nos"], [1, 2])
+        self.assertEqual(main["dominant_action_tags"], ["결정"])
+        self.assertEqual(side["evidence_episode_nos"], [3])
+        self.assertEqual(side["dominant_action_tags"], ["조력"])
+
+    async def test_opening_transition_does_not_fold_member_with_later_evidence(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key=f"protagonist:named:{display_name}",
+                        display_name=display_name,
+                        real_names=[display_name],
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        action_tags=[action_tag],
+                    )
+                ],
+            )
+            for episode_no, display_name, action_tag in (
+                (1, "이전정체", "초반이전행동"),
+                (2, "현재정체", "현재행동"),
+                (3, "현재정체", "현재행동"),
+                (50, "이전정체", "후반별도행동"),
+            )
+        ]
+        requested_resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": "character:현재정체",
+            "work_protagonist_keys": ["character:현재정체"],
+            "role_evidence_keys": ["character:이전정체", "character:현재정체"],
+            "confidence": "high",
+            "reason_code": "persona_rename_same_person",
+            "rationale": "opening의 이전정체와 현재정체는 같은 주인공 역할이다.",
+            "rejected": [],
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+        requester = AsyncMock(return_value=requested_resolution)
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "paid-model"),
+            patch.object(module, "request_work_protagonist_resolution_payload", requester),
+        ):
+            resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=rows,
+                summary_client=object(),
+                episode_summary_rows=[
+                    {"episode_from": episode_no, "summary_text": f"# {episode_no}화\n- 사건"}
+                    for episode_no in range(1, 4)
+                ],
+            )
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution=resolution,
+        )
+
+        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+        previous = next(row for row in inventory if row["display_name"] == "이전정체")
+        self.assertEqual(main["evidence_episode_nos"], [2, 3])
+        self.assertNotIn("초반이전행동", main["dominant_action_tags"])
+        self.assertNotIn("후반별도행동", main["dominant_action_tags"])
+        self.assertEqual(previous["evidence_episode_nos"], [1, 50])
+
+    async def test_opening_joint_transition_folds_only_explicit_role_evidence_keys(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key=f"protagonist:named:{display_name}",
+                        display_name=display_name,
+                        real_names=[display_name],
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                        action_tags=[action_tag],
+                    )
+                ],
+            )
+            for episode_no, display_name, action_tag in (
+                (1, "이전정체", "이전행동"),
+                (2, "사이드인물", "사이드행동"),
+                (3, "현재정체", "현재행동"),
+            )
+        ]
+        requested_resolution = {
+            "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+            "decision": "RESOLVED",
+            "work_protagonist_key": "character:현재정체",
+            "work_protagonist_keys": ["character:현재정체"],
+            "role_evidence_keys": ["character:이전정체", "character:현재정체"],
+            "confidence": "high",
+            "reason_code": "persona_rename_same_person",
+            "rationale": "이전정체와 현재정체만 동일한 작품 주인공 역할이다.",
+            "rejected": [],
+            "safety_flags": {
+                "requires_identity_merge": False,
+                "selected_candidate_eligible": True,
+                "multiple_plausible_main_candidates": False,
+            },
+        }
+        requester = AsyncMock(return_value=requested_resolution)
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "paid-model"),
+            patch.object(module, "request_work_protagonist_resolution_payload", requester),
+        ):
+            resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=rows,
+                summary_client=object(),
+                episode_summary_rows=[
+                    {"episode_from": episode_no, "summary_text": f"# {episode_no}화\n- 사건"}
+                    for episode_no in range(1, 4)
+                ],
+            )
+        inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution=resolution,
+        )
+
+        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+        side = next(row for row in inventory if row["display_name"] == "사이드인물")
+        self.assertEqual(main["evidence_episode_nos"], [1, 3])
+        self.assertIn("이전행동", main["dominant_action_tags"])
+        self.assertNotIn("사이드행동", main["dominant_action_tags"])
+        self.assertEqual(side["evidence_episode_nos"], [2])
+
+    async def test_opening_joint_resolution_rejects_later_only_candidate(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key=f"protagonist:named:{display_name}",
+                        display_name=display_name,
+                        real_names=[display_name],
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                    )
+                ],
+            )
+            for episode_no, display_name in (
+                (1, "초반A"),
+                (2, "초반B"),
+                (3, "초반B"),
+                (4, "후반인물"),
+            )
+        ]
+        requester = AsyncMock(
+            return_value={
+                "schema_version": module.WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+                "decision": "RESOLVED",
+                "work_protagonist_key": "character:후반인물",
+                "work_protagonist_keys": ["character:후반인물"],
+                "role_evidence_keys": ["character:후반인물"],
+                "confidence": "high",
+                "reason_code": "single_clear",
+                "rationale": "잘못된 후반 후보 선택",
+                "rejected": [],
+                "safety_flags": {
+                    "requires_identity_merge": False,
+                    "selected_candidate_eligible": True,
+                    "multiple_plausible_main_candidates": False,
+                },
+            }
+        )
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "paid-model"),
+            patch.object(module, "request_work_protagonist_resolution_payload", requester),
+        ):
+            resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=rows,
+                summary_client=object(),
+                episode_summary_rows=[
+                    {"episode_from": episode_no, "summary_text": f"# {episode_no}화\n- 사건"}
+                    for episode_no in range(1, 4)
+                ],
+            )
+
+        candidate_keys = {
+            str(row.get("canonical_character_key") or "")
+            for row in requester.await_args.kwargs["candidate_rows"]
+        }
+        self.assertNotIn("character:후반인물", candidate_keys)
+        self.assertEqual(resolution["decision"], "UNRESOLVED")
+        self.assertEqual(resolution["reason_code"], "selected_candidate_not_found")
+
+    async def test_opening_joint_resolution_provider_timeout_preserves_unresolved(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        character_key=f"protagonist:named:후보{episode_no}",
+                        display_name=f"후보{episode_no}",
+                        real_names=[f"후보{episode_no}"],
+                        is_work_protagonist=True,
+                        is_episode_focal=True,
+                    )
+                ],
+            )
+            for episode_no in range(1, 4)
+        ]
+        requester = AsyncMock(side_effect=asyncio.TimeoutError())
+        with (
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "paid-model"),
+            patch.object(module, "request_work_protagonist_resolution_payload", requester),
+        ):
+            resolution = await module.build_work_protagonist_resolution_for_inventory_v3(
+                product_id=687,
+                product_title="테스트 작품",
+                signal_rows=rows,
+                summary_client=object(),
+                episode_summary_rows=[
+                    {"episode_from": episode_no, "summary_text": f"# {episode_no}화\n- 사건"}
+                    for episode_no in range(1, 4)
+                ],
+            )
+
+        self.assertEqual(resolution["decision"], "UNRESOLVED")
+        self.assertEqual(resolution["reason_code"], "conflicting_opening_claimants")
+
     async def test_work_protagonist_resolution_preserves_two_anonymous_claimants_in_one_episode(self):
         module = load_module()
         rows = []
@@ -5453,6 +5941,26 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(main["canonical_character_key"], "character:차태석")
         self.assertEqual(main["display_name"], "백선우")
         self.assertNotEqual(body_owner["work_role"], "main_protagonist")
+
+        transition_resolution = {
+            **resolution,
+            "reason_code": "persona_rename_same_person",
+            "role_evidence_keys": ["character:차태석"],
+        }
+        transition_inventory = module.aggregate_character_inventory_v3_rows(
+            rows,
+            protagonist_resolution=transition_resolution,
+        )
+        transition_main = next(
+            row
+            for row in transition_inventory
+            if row["work_role"] == "main_protagonist"
+        )
+        self.assertEqual(
+            transition_main["canonical_character_key"],
+            "character:차태석",
+        )
+        self.assertEqual(transition_main["display_name"], "백선우")
 
     async def test_possessed_protagonist_and_same_named_body_owner_remain_separate(self):
         module = load_module()

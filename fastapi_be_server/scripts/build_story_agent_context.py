@@ -99,6 +99,7 @@ if RP_REASONING_MODEL.startswith("anthropic."):
 RP_REASONING_EFFORT = (os.getenv("STORY_AGENT_RP_REASONING_EFFORT", "medium").strip() or "medium")
 RP_REASONING_THINKING_DISPLAY = (os.getenv("STORY_AGENT_RP_REASONING_THINKING_DISPLAY", "omitted").strip() or "omitted")
 EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS", "2600"))
+WORK_PROTAGONIST_RESOLUTION_MAX_OUTPUT_TOKENS = 1200
 EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL = (
     os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL", "").strip()
     or "deepseek/deepseek-v4-pro"
@@ -701,6 +702,25 @@ EPISODE_CHARACTER_SIGNALS_PROMPT = """너는 웹소설 회차 요약에서 캐�
    - 예: "호영이 조렌 테이머의 부활 중 빙의된 수호자"라면 호영 item에 target_label="조렌 테이머", claim_type="possessed_as"를 넣는다.
    - 단순 직책, 소속, 가족/상하관계, 상태 설명, 같은 장면 등장은 identity_claims로 만들지 않는다.
 14. HOOK은 0~3개만 넣는다.
+"""
+
+WORK_PROTAGONIST_RESOLUTION_PROMPT = """너는 웹소설 첫 3화를 함께 보고 작품 전체 주인공을 판정하는 분석기다.
+반드시 입력 candidates의 canonical_character_key 중 1~3개를 고르거나 UNRESOLVED를 반환하라.
+새 인물을 만들거나 서로 다른 candidate identity를 병합하지 마라.
+회차별 is_work_protagonist는 noisy extraction 결과이며 이름 횟수나 마지막 회차만으로 판정하지 마라.
+빙의·환생·가명·게임명처럼 동일한 작품 주인공의 현재 사회적 persona가 바뀐 경우,
+현재 독자가 주인공으로 만나는 persona candidate를 선택하고 reason_code=persona_rename_same_person으로 둔다.
+빙의 전 의식 주체와 현재 몸의 원래 주인이 서로 다른 identity여도 identity를 병합하지 않은 채,
+첫 3화가 한 주인공 역할의 연속을 명시하면 현재 사회에서 주인공으로 행동하는 persona candidate를 선택하라.
+이때 role_evidence_keys는 identity 병합 선언이 아니라 회차별 주인공 역할 근거의 출처 목록이다.
+죽음·빙의·환생·몸의 원래 주인·현재 신분이 episode_summary_evidence에 직접 명시되면,
+candidate identity가 둘이라는 이유만으로 UNRESOLVED를 반환하지 마라.
+서술 시점만 바뀌고 작품 주인공이 유지되면 reason_code=pov_shift_same_protagonist로 둔다.
+회차 중심의 다른 인물이나 side arc라면 그 인물을 선택하지 말고 reason_code=side_arc_not_protagonist로 둔다.
+공동주인공이면 실제 candidate key들을 함께 선택한다. 근거가 부족하면 UNRESOLVED로 둔다.
+persona/POV 전환이면 role_evidence_keys에 동일 주인공 역할로 확인한 candidate key만 넣는다.
+side arc나 별도 인물의 key는 role_evidence_keys에 넣지 마라.
+반드시 기존 work_protagonist_resolution_v1 키만 가진 JSON object를 반환하라.
 """
 
 EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA = {
@@ -11853,6 +11873,7 @@ def validate_work_protagonist_resolution_payload(
         "decision": "UNRESOLVED",
         "work_protagonist_key": None,
         "work_protagonist_keys": [],
+        "role_evidence_keys": [],
         "confidence": "low",
         "reason_code": "invalid_payload",
         "rationale": "",
@@ -11876,6 +11897,7 @@ def validate_work_protagonist_resolution_payload(
         "confidence": confidence if confidence in {"high", "medium", "low"} else "low",
         "reason_code": reason_code,
         "rationale": str(payload.get("rationale") or payload.get("reason") or "")[:240],
+        "role_evidence_keys": [],
         "rejected": list(payload.get("rejected") or [])[:8],
         "safety_flags": {
             "requires_identity_merge": bool(safety_flags.get("requires_identity_merge")),
@@ -11919,6 +11941,26 @@ def validate_work_protagonist_resolution_payload(
     if "selected_candidate_eligible" in safety_flags and not bool(safety_flags.get("selected_candidate_eligible")):
         normalized["reason_code"] = "selected_candidate_marked_ineligible"
         return normalized
+
+    role_evidence_keys = list(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in list(payload.get("role_evidence_keys") or [])
+            if str(value or "").strip()
+        )
+    )[:8]
+    if any(key not in row_by_key for key in role_evidence_keys):
+        normalized["reason_code"] = "role_evidence_candidate_not_found"
+        return normalized
+    transition_reason = reason_code in {
+        "persona_rename_same_person",
+        "pov_shift_same_protagonist",
+    }
+    if transition_reason:
+        if not role_evidence_keys or not set(selected_keys).issubset(role_evidence_keys):
+            normalized["reason_code"] = "role_evidence_keys_missing"
+            return normalized
+        normalized["role_evidence_keys"] = role_evidence_keys
 
     normalized["decision"] = "RESOLVED"
     normalized["work_protagonist_key"] = selected_keys[0]
@@ -12249,6 +12291,237 @@ def _opening_work_protagonist_names_are_compatible(left: str, right: str) -> boo
     )
 
 
+def build_opening_work_protagonist_signal_evidence(
+    signal_rows: list[dict],
+) -> list[dict[str, object]]:
+    rows_by_episode: dict[int, dict] = {}
+    for row in signal_rows:
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
+        if episode_no in {1, 2, 3}:
+            rows_by_episode.setdefault(episode_no, row)
+
+    evidence: list[dict[str, object]] = []
+    for episode_no in (1, 2, 3):
+        row = rows_by_episode.get(episode_no)
+        if row is None:
+            continue
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        characters = []
+        for item in list(payload.get("mentioned_characters") or []):
+            if not isinstance(item, dict):
+                continue
+            characters.append(
+                {
+                    "character_key": str(item.get("character_key") or ""),
+                    "display_name": str(item.get("display_name") or ""),
+                    "is_work_protagonist": parse_yes_no_flag(
+                        item.get("is_work_protagonist"),
+                        default=parse_yes_no_flag(item.get("is_protagonist")),
+                    ),
+                    "is_episode_focal": parse_yes_no_flag(item.get("is_episode_focal")),
+                    "is_first_person": parse_yes_no_flag(item.get("is_first_person")),
+                    "narration_names": list(item.get("narration_names") or [])[:4],
+                    "persona_names": list(item.get("persona_names") or [])[:4],
+                    "real_names": list(item.get("real_names") or [])[:4],
+                    "identity_claims": list(item.get("identity_claims") or [])[:4],
+                }
+            )
+        evidence.append({"episode_no": episode_no, "characters": characters})
+    return evidence
+
+
+def build_opening_work_protagonist_episode_summary_evidence(
+    episode_summary_rows: list[dict],
+) -> list[dict[str, object]]:
+    rows_by_episode: dict[int, dict] = {}
+    for row in episode_summary_rows:
+        episode_no = int(row.get("episode_from") or row.get("episode_to") or 0)
+        if episode_no in {1, 2, 3}:
+            rows_by_episode.setdefault(episode_no, row)
+
+    evidence: list[dict[str, object]] = []
+    for episode_no in (1, 2, 3):
+        row = rows_by_episode.get(episode_no)
+        if row is None:
+            continue
+        parsed = parse_summary_text(str(row.get("summary_text") or ""))
+        evidence.append(
+            {
+                "episode_no": episode_no,
+                "header": str(parsed.get("header") or "")[:120],
+                "bullets": [
+                    str(value).strip()[:240]
+                    for value in list(parsed.get("bullets") or [])[:5]
+                    if str(value).strip()
+                ],
+            }
+        )
+    return evidence
+
+
+async def request_work_protagonist_resolution_payload(
+    client: AsyncClient,
+    *,
+    product_id: int,
+    product_title: str,
+    candidate_rows: list[dict[str, object]],
+    opening_signal_evidence: list[dict[str, object]],
+    episode_summary_evidence: list[dict[str, object]],
+) -> dict | None:
+    candidates = [
+        {
+            "canonical_character_key": str(row.get("canonical_character_key") or ""),
+            "display_name": str(row.get("display_name") or ""),
+            "entity_kind": str(row.get("entity_kind") or "person"),
+            "identity_status": str(row.get("identity_status") or ""),
+            "source_character_keys": list(row.get("source_character_keys") or []),
+            "aliases": list(row.get("aliases") or [])[:8],
+            "persona_names": list(row.get("persona_names") or [])[:8],
+            "real_names": list(row.get("real_names") or [])[:8],
+            "evidence_episode_nos": list(row.get("evidence_episode_nos") or [])[:8],
+        }
+        for row in candidate_rows
+        if str(row.get("canonical_character_key") or "")
+    ]
+    user_prompt = json.dumps(
+        {
+            "product_id": product_id,
+            "product_title": product_title,
+            "candidates": candidates,
+            "opening_signal_evidence": opening_signal_evidence,
+            "episode_summary_evidence": episode_summary_evidence,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    request_payload = build_rp_openrouter_payload(
+        system_prompt=WORK_PROTAGONIST_RESOLUTION_PROMPT,
+        user_prompt=user_prompt,
+        max_tokens=WORK_PROTAGONIST_RESOLUTION_MAX_OUTPUT_TOKENS,
+        model=require_paid_character_signals_openrouter_model(),
+    )
+    request_payload["reasoning"] = {"effort": "low", "exclude": True}
+    provider_only = split_csv_values(DEEPSEEK_OPENROUTER_PROVIDER_ONLY)
+    request_payload["provider"] = {"require_parameters": True}
+    if provider_only:
+        request_payload["provider"].update(
+            {
+                "only": provider_only,
+                "order": provider_only,
+                "allow_fallbacks": len(provider_only) > 1,
+            }
+        )
+    request_payload["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "likenovel_opening_work_protagonist_resolution",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "schema_version": {
+                        "type": "string",
+                        "enum": [WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION],
+                    },
+                    "decision": {
+                        "type": "string",
+                        "enum": ["RESOLVED", "UNRESOLVED"],
+                    },
+                    "work_protagonist_key": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                    },
+                    "work_protagonist_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 3,
+                    },
+                    "role_evidence_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 8,
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "reason_code": {
+                        "type": "string",
+                        "enum": [
+                            "opening_role_continuity",
+                            "persona_rename_same_person",
+                            "pov_shift_same_protagonist",
+                            "side_arc_not_protagonist",
+                            "co_main_protagonists",
+                            "unresolved",
+                        ],
+                    },
+                    "rationale": {"type": "string"},
+                    "rejected": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "canonical_character_key": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["canonical_character_key", "reason"],
+                        },
+                        "maxItems": 8,
+                    },
+                    "safety_flags": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "requires_identity_merge": {"type": "boolean"},
+                            "selected_candidate_eligible": {"type": "boolean"},
+                            "multiple_plausible_main_candidates": {"type": "boolean"},
+                        },
+                        "required": [
+                            "requires_identity_merge",
+                            "selected_candidate_eligible",
+                            "multiple_plausible_main_candidates",
+                        ],
+                    },
+                },
+                "required": [
+                    "schema_version",
+                    "decision",
+                    "work_protagonist_key",
+                    "work_protagonist_keys",
+                    "role_evidence_keys",
+                    "confidence",
+                    "reason_code",
+                    "rationale",
+                    "rejected",
+                    "safety_flags",
+                ],
+            },
+        },
+    }
+    request_timeout_seconds = EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS
+    response = await asyncio.wait_for(
+        post_openrouter_background_chat_completion_async(
+            client,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
+            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "LikeNovel Story Agent Opening Protagonist Resolution",
+            },
+            json=request_payload,
+            timeout=request_timeout_seconds,
+        ),
+        timeout=request_timeout_seconds,
+    )
+    response.raise_for_status()
+    return extract_json_object(extract_openrouter_message_text(response.json()))
+
+
 def _build_opening_work_protagonist_resolution(
     signal_rows: list[dict],
     base_inventory_rows: list[dict[str, object]],
@@ -12290,7 +12563,9 @@ def _build_opening_work_protagonist_resolution(
         not _opening_work_protagonist_names_are_compatible(identity_names[0], identity_name)
         for identity_name in identity_names[1:]
     ):
-        return _unresolved_opening_work_protagonist_resolution("conflicting_opening_claimants")
+        return _unresolved_opening_work_protagonist_resolution(
+            "conflicting_opening_claimants"
+        )
 
     if identity_names:
         selected_name = max(
@@ -12363,6 +12638,58 @@ async def build_work_protagonist_resolution_for_inventory_v3(
         signal_rows,
         base_inventory_rows,
     )
+    if (
+        str(resolution.get("decision") or "").upper() != "RESOLVED"
+        and str(resolution.get("reason_code") or "") == "conflicting_opening_claimants"
+        and summary_client is not None
+        and OPENROUTER_API_KEY
+        and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL
+    ):
+        opening_signal_evidence = build_opening_work_protagonist_signal_evidence(
+            signal_rows
+        )
+        episode_summary_evidence = (
+            build_opening_work_protagonist_episode_summary_evidence(
+                list(episode_summary_rows or [])
+            )
+        )
+        opening_candidate_rows = [
+            row
+            for row in base_inventory_rows
+            if {
+                int(value)
+                for value in list(row.get("evidence_episode_nos") or [])
+                if int(value) > 0
+            }
+            & {1, 2, 3}
+        ]
+        if len(opening_signal_evidence) == 3 and len(episode_summary_evidence) == 3:
+            try:
+                payload = await request_work_protagonist_resolution_payload(
+                    summary_client,
+                    product_id=product_id,
+                    product_title=product_title,
+                    candidate_rows=opening_candidate_rows,
+                    opening_signal_evidence=opening_signal_evidence,
+                    episode_summary_evidence=episode_summary_evidence,
+                )
+            except Exception as exc:
+                if not (
+                    isinstance(exc, OpenRouterBackgroundCreditReserveError)
+                    or is_expected_story_asset_provider_error(exc)
+                ):
+                    raise
+                logger.warning(
+                    "story_agent_opening_protagonist_resolution_keep_unresolved "
+                    "product_id=%s error=%s",
+                    product_id,
+                    repr(exc)[:200],
+                )
+            else:
+                resolution = validate_work_protagonist_resolution_payload(
+                    payload,
+                    opening_candidate_rows,
+                )
     if verbose:
         print(
             f"[work-protagonist-resolution] product_id={product_id} "
@@ -12402,6 +12729,87 @@ def _fold_work_protagonist_evidence_into_selected_main(
     if selected_row is None:
         return
 
+    transition_reason = str(resolution.get("reason_code") or "") in {
+        "persona_rename_same_person",
+        "pov_shift_same_protagonist",
+    }
+    if str(resolution.get("reason_code") or "") == "persona_rename_same_person":
+        selected_label = normalize_signal_entity_label(
+            selected_keys[0].removeprefix("character:").split(":dup:", 1)[0]
+        )
+        selected_display_candidates = [
+            str(value or "").strip()
+            for value in list(selected_row.get("persona_names") or [])
+            if normalize_signal_entity_label(value).lower()
+            == selected_label.lower()
+        ]
+        if selected_display_candidates:
+            selected_display_name = sorted(
+                selected_display_candidates,
+                key=lambda value: (len(value), value),
+            )[0]
+            if normalize_signal_entity_label(
+                str(selected_row.get("display_name") or "")
+            ).lower() != selected_label.lower():
+                selected_row["display_name"] = selected_display_name
+                selected_row["display_name_source"] = "selected_persona_source"
+                selected_row["display_name_type"] = "named"
+                selected_row["is_generic_display_name"] = False
+    role_evidence_keys = (
+        {
+            str(value or "").strip()
+            for value in list(resolution.get("role_evidence_keys") or [])
+            if str(value or "").strip()
+        }
+        if transition_reason
+        else set()
+    )
+    selected_identity_names = [
+        str(value or "").strip()
+        for field_name in ("display_name", "aliases", "real_names")
+        for value in (
+            [selected_row.get(field_name)]
+            if field_name == "display_name"
+            else list(selected_row.get(field_name) or [])
+        )
+        if str(value or "").strip()
+    ]
+
+    def can_fold_role_evidence(row: dict[str, object]) -> bool:
+        source_keys = [
+            str(value or "").strip()
+            for value in list(row.get("source_character_keys") or [])
+            if str(value or "").strip()
+        ]
+        if source_keys and all(
+            _is_generic_protagonist_source_key(value) for value in source_keys
+        ):
+            return True
+        row_identity_names = [
+            str(value or "").strip()
+            for field_name in ("display_name", "aliases", "real_names")
+            for value in (
+                [row.get(field_name)]
+                if field_name == "display_name"
+                else list(row.get(field_name) or [])
+            )
+            if str(value or "").strip()
+        ]
+        if any(
+            _opening_work_protagonist_names_are_compatible(left, right)
+            for left in selected_identity_names
+            for right in row_identity_names
+        ):
+            return True
+        if str(row.get("canonical_character_key") or "") not in role_evidence_keys:
+            return False
+        episode_nos = {
+            int(value)
+            for value in list(row.get("evidence_episode_nos") or [])
+            if int(value) > 0
+        }
+        return bool(episode_nos) and episode_nos.issubset({1, 2, 3})
+
     evidence_rows = [
         row
         for row in rows
@@ -12412,6 +12820,7 @@ def _fold_work_protagonist_evidence_into_selected_main(
         )
         > 0
         and not _inventory_identity_blocking_conflict_reasons(row)
+        and can_fold_role_evidence(row)
     ]
     if not evidence_rows:
         return
