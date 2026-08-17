@@ -1430,7 +1430,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                  },
              ), \
              patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
-             patch.object(module, "upsert_summary", upsert_mock):
+             patch.object(module, "upsert_summary", upsert_mock), \
+             self.assertLogs(module.logger, level="WARNING") as captured_logs:
             counts = await module.build_episode_scene_extraction_summaries(
                 conn,
                 product_id=687,
@@ -1456,6 +1457,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts, (0, 0))
         request_mock.assert_awaited_once()
         upsert_mock.assert_not_called()
+        self.assertIn("reason=required_scope_missing", captured_logs.output[0])
+        self.assertIn(
+            "required=protagonist:named:데시,supporting:named:오리온",
+            captured_logs.output[0],
+        )
+        self.assertIn("generated=protagonist:named:데시", captured_logs.output[0])
 
     async def test_scene_repair_strict_mode_raises_unexpected_request_error(self):
         module = load_module()
@@ -5173,6 +5180,20 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             "ready_scope_keys": [new_scope_key],
             "ready_main_protagonist_scope_keys": [new_scope_key],
         }
+        existing_scene_readiness = {
+            "character_chat_status": "hold",
+            "public_candidate_count": 1,
+            "missing_profile_scope_keys": [new_scope_key],
+            "missing_examples_scope_keys": [new_scope_key],
+            "missing_usable_scene_scope_keys": [],
+        }
+        missing_scene_after_readiness = {
+            "character_chat_status": "hold",
+            "public_candidate_count": 1,
+            "ready_scope_keys": [],
+            "ready_main_protagonist_scope_keys": [],
+            "missing_usable_scene_scope_keys": [new_scope_key],
+        }
         inventory_v3_builder = MagicMock(return_value=(1, 1))
 
         async def build_scene(**kwargs):
@@ -5186,8 +5207,10 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         scene_builder = AsyncMock(side_effect=build_scene)
         rp_builder = AsyncMock(side_effect=build_rp)
 
-        conn_without_current_scene = FakeConnection()
-        results_without_current_scene = module.build_empty_results()
+        conn_with_existing_scene = FakeConnection()
+        results_with_existing_scene = module.build_empty_results()
+        conn_without_scene = FakeConnection()
+        results_without_scene = module.build_empty_results()
         first_scene_kwargs = {}
         first_rp_kwargs = {}
         with ExitStack() as stack:
@@ -5253,19 +5276,15 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             first_scene_kwargs = dict(scene_builder.await_args.kwargs)
             first_rp_kwargs = dict(rp_builder.await_args.kwargs)
             v3_maps = iter([old_inventory_v3_map, new_inventory_v3_map])
-            patched["db_connect"].return_value = conn_without_current_scene
+            patched["db_connect"].return_value = conn_with_existing_scene
             patched[
                 "fetch_character_chat_asset_readiness_verification"
-            ].side_effect = [before_readiness, after_readiness]
+            ].side_effect = [existing_scene_readiness, after_readiness]
             patched["fetch_active_character_asset_summary_rows"].side_effect = [
                 signal_rows,
                 episode_rows,
             ]
-
-            async def keep_stale_scene(**_kwargs):
-                return 0, 1
-
-            scene_builder.side_effect = keep_stale_scene
+            scene_builder.reset_mock()
             await module.repair_character_chat_assets(
                 rows=[
                     {
@@ -5280,10 +5299,43 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                     max_delta_episodes=2,
                     reaggregate_character_inventory=True,
                 ),
-                results=results_without_current_scene,
+                results=results_with_existing_scene,
             )
+            scene_builder.assert_not_awaited()
 
-        self.assertEqual(inventory_v3_builder.call_count, 2)
+            async def keep_stale_scene(**_kwargs):
+                return 0, 1
+
+            v3_maps = iter([old_inventory_v3_map, new_inventory_v3_map])
+            patched["db_connect"].return_value = conn_without_scene
+            patched[
+                "fetch_character_chat_asset_readiness_verification"
+            ].side_effect = [before_readiness, missing_scene_after_readiness]
+            patched["fetch_active_character_asset_summary_rows"].side_effect = [
+                signal_rows,
+                episode_rows,
+            ]
+            scene_builder.reset_mock()
+            scene_builder.side_effect = keep_stale_scene
+            with self.assertLogs(module.logger, level="ERROR") as captured_logs:
+                await module.repair_character_chat_assets(
+                    rows=[
+                        {
+                            "product_id": 687,
+                            "title": "테스트 작품",
+                            "_character_asset_collection_eligible": True,
+                        }
+                    ],
+                    args=SimpleNamespace(
+                        apply=True,
+                        verbose=False,
+                        max_delta_episodes=2,
+                        reaggregate_character_inventory=True,
+                    ),
+                    results=results_without_scene,
+                )
+
+        self.assertEqual(inventory_v3_builder.call_count, 3)
         inventory_v3_builder.assert_called_with(
             cur=ANY,
             product_id=687,
@@ -5306,24 +5358,30 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(conn.commit_count, 1)
         self.assertEqual(results["inventory_reaggregation_updated"], 1)
         self.assertEqual(results["character_asset_repair_recovered"], 1)
-        self.assertEqual(conn_without_current_scene.commit_count, 1)
-        self.assertEqual(conn_without_current_scene.rollback_count, 1)
+        self.assertEqual(conn_with_existing_scene.commit_count, 1)
+        self.assertEqual(conn_with_existing_scene.rollback_count, 0)
         self.assertEqual(
-            results_without_current_scene["inventory_reaggregation_updated"],
-            0,
-        )
-        self.assertEqual(
-            results_without_current_scene["character_asset_repair_recovered"],
-            0,
-        )
-        self.assertEqual(
-            results_without_current_scene["inventory_reaggregation_failed"],
+            results_with_existing_scene["inventory_reaggregation_updated"],
             1,
         )
         self.assertEqual(
-            results_without_current_scene["character_asset_repair_failed"],
+            results_with_existing_scene["character_asset_repair_recovered"],
             1,
         )
+        self.assertEqual(
+            results_without_scene["inventory_reaggregation_failed"],
+            1,
+        )
+        self.assertEqual(
+            results_without_scene["character_asset_repair_failed"],
+            1,
+        )
+        self.assertIn("not_ready=character:new", captured_logs.output[0])
+        self.assertIn(
+            "missing_scene=character:new",
+            captured_logs.output[0],
+        )
+        self.assertIn("missing_rp_current_generation=none", captured_logs.output[0])
 
     async def test_character_asset_repair_defers_until_signal_foundation_is_complete(self):
         module = load_module()

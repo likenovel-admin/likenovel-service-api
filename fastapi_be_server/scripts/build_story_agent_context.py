@@ -8171,7 +8171,7 @@ async def build_episode_scene_extraction_summaries(
         generated_scope_keys = extract_episode_scene_character_scope_keys(payload)
         required_output_scope_keys = required_scope_keys | preserved_scope_keys
         if not required_output_scope_keys.issubset(generated_scope_keys):
-            logger.info(
+            logger.warning(
                 "story_agent_scene_extraction_keep_old product_id=%s episode_no=%s reason=required_scope_missing required=%s generated=%s",
                 product_id,
                 episode_no,
@@ -17276,9 +17276,6 @@ async def repair_character_chat_assets(
                         repair_plan["rp_scope_keys"] = sorted(
                             set(repair_plan["rp_scope_keys"]) | bundle_scope_keys
                         )
-                        repair_plan["scene_scope_keys"] = sorted(
-                            set(repair_plan["scene_scope_keys"]) | bundle_scope_keys
-                        )
                     scene_scope_keys = set(repair_plan["scene_scope_keys"])
                     scene_rows, required_scope_keys_by_episode_no = (
                         select_character_chat_scene_repair_rows(
@@ -17344,18 +17341,30 @@ async def repair_character_chat_assets(
                                 )
                                 or []
                             )
-                            missing_scope_keys = (
-                                bundle_scope_keys - ready_scope_keys
-                            ) | (
-                                bundle_scope_keys - processed_scene_scope_keys
-                            ) | (
+                            not_ready_scope_keys = bundle_scope_keys - ready_scope_keys
+                            missing_scene_scope_keys = bundle_scope_keys & set(
+                                after_readiness.get(
+                                    "missing_usable_scene_scope_keys"
+                                )
+                                or []
+                            )
+                            missing_rp_scope_keys = (
                                 bundle_scope_keys - processed_rp_scope_keys
+                            )
+                            missing_scope_keys = (
+                                not_ready_scope_keys
+                                | missing_scene_scope_keys
+                                | missing_rp_scope_keys
                             )
                             if missing_scope_keys:
                                 raise ValueError(
                                     "public main character asset bundle incomplete: "
-                                    "missing_current_generation_scope_keys="
-                                    f"{','.join(sorted(missing_scope_keys))}"
+                                    "not_ready="
+                                    f"{','.join(sorted(not_ready_scope_keys)) or 'none'} "
+                                    "missing_scene="
+                                    f"{','.join(sorted(missing_scene_scope_keys)) or 'none'} "
+                                    "missing_rp_current_generation="
+                                    f"{','.join(sorted(missing_rp_scope_keys)) or 'none'}"
                                 )
                     work_conn.commit()
 
