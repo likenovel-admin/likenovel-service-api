@@ -5099,6 +5099,232 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["products"][0]["context_status"], "ready")
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
 
+    async def test_character_asset_repair_stages_reaggregation_before_new_main_assets(self):
+        module = load_module()
+        conn = FakeConnection()
+        results = module.build_empty_results()
+        old_scope_key = "character:old"
+        new_scope_key = "character:new"
+        old_inventory_v3_map = {
+            old_scope_key: {
+                "canonical_character_key": old_scope_key,
+                "display_name": "기존 주인공",
+                "work_role": "main_protagonist",
+                "public_chat_eligible": True,
+            }
+        }
+        new_inventory_v3_map = {
+            old_scope_key: {
+                **old_inventory_v3_map[old_scope_key],
+                "work_role": "major_character",
+                "public_chat_eligible": False,
+            },
+            new_scope_key: {
+                "canonical_character_key": new_scope_key,
+                "source_character_keys": ["named:new"],
+                "display_name": "새 주인공",
+                "work_role": "main_protagonist",
+                "is_protagonist": True,
+                "public_chat_eligible": True,
+                "evidence_episode_nos": [1],
+            },
+        }
+        v3_maps = iter([old_inventory_v3_map, new_inventory_v3_map])
+
+        def fetch_inventory_map(*, summary_type="character_inventory", **_kwargs):
+            if summary_type == "character_inventory_v3":
+                return next(v3_maps)
+            return {}
+
+        signal_rows = [
+            {
+                **signal_row(
+                    1,
+                    1,
+                    [
+                        signal_character(
+                            character_key="named:new",
+                            display_name="새 주인공",
+                        )
+                    ],
+                ),
+                "scope_key": "episode:101",
+            }
+        ]
+        episode_rows = [
+            {
+                "summary_id": 1,
+                "scope_key": "episode:101",
+                "episode_from": 1,
+                "source_hash": "summary-hash",
+                "summary_text": "[1화] 테스트",
+            }
+        ]
+        before_readiness = {
+            "character_chat_status": "hold",
+            "public_candidate_count": 1,
+            "missing_profile_scope_keys": [new_scope_key],
+            "missing_examples_scope_keys": [new_scope_key],
+            "missing_usable_scene_scope_keys": [new_scope_key],
+        }
+        after_readiness = {
+            "character_chat_status": "ready",
+            "public_candidate_count": 1,
+            "ready_scope_keys": [new_scope_key],
+            "ready_main_protagonist_scope_keys": [new_scope_key],
+        }
+        inventory_v3_builder = MagicMock(return_value=(1, 1))
+
+        async def build_scene(**kwargs):
+            kwargs["processed_character_scope_keys"].add(new_scope_key)
+            return 1, 0
+
+        async def build_rp(**kwargs):
+            kwargs["processed_scope_keys"].add(new_scope_key)
+            return {"profile": [1, 0], "examples": [1, 0]}
+
+        scene_builder = AsyncMock(side_effect=build_scene)
+        rp_builder = AsyncMock(side_effect=build_rp)
+
+        conn_without_current_scene = FakeConnection()
+        results_without_current_scene = module.build_empty_results()
+        first_scene_kwargs = {}
+        first_rp_kwargs = {}
+        with ExitStack() as stack:
+            patched = {}
+            for target, kwargs in (
+                ("OPENROUTER_API_KEY", {"new": ""}),
+                ("db_connect", {"return_value": conn}),
+                ("work_cursor", {"new": fake_work_cursor}),
+                ("product_lock_connection", {"return_value": module.nullcontext(object())}),
+                ("fetch_total_episode_count", {"return_value": 1}),
+                ("fetch_product_context_status", {"return_value": "ready"}),
+                ("fetch_product_ready_episode_count", {"return_value": 1}),
+                (
+                    "fetch_character_chat_asset_readiness_verification",
+                    {"side_effect": [before_readiness, after_readiness]},
+                ),
+                ("fetch_character_identity_review", {"return_value": None}),
+                ("fetch_active_character_inventory_map", {"side_effect": fetch_inventory_map}),
+                ("fetch_active_relation_inventory_by_relation_key_map", {"return_value": {}}),
+                (
+                    "fetch_active_character_asset_summary_rows",
+                    {"side_effect": [signal_rows, episode_rows]},
+                ),
+                ("fetch_active_episode_texts_by_no", {"return_value": {1: "새 주인공이 문을 연다."}}),
+                ("fetch_rp_ready_character_inventory_history_state_map", {"return_value": {}}),
+                (
+                    "build_character_inventory_summaries_delta",
+                    {"return_value": {"inserted_count": 1, "reused_count": 0}},
+                ),
+                ("build_character_inventory_v3_summaries", {"new": inventory_v3_builder}),
+                (
+                    "build_relation_inventory_summaries_delta",
+                    {"return_value": {"inserted_count": 0, "reused_count": 0}},
+                ),
+                ("assert_story_agent_foundation_invariants", {}),
+                ("build_episode_scene_extraction_summaries", {"new": scene_builder}),
+                ("build_rp_summaries_delta", {"new": rp_builder}),
+                ("touch_product_context_build_attempt", {}),
+            ):
+                patched[target] = stack.enter_context(
+                    patch.object(module, target, **kwargs)
+                )
+            stack.enter_context(
+                patch.object(module.settings, "ANTHROPIC_API_KEY", "")
+            )
+            await module.repair_character_chat_assets(
+                rows=[
+                    {
+                        "product_id": 687,
+                        "title": "테스트 작품",
+                        "_character_asset_collection_eligible": True,
+                    }
+                ],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    max_delta_episodes=2,
+                    reaggregate_character_inventory=True,
+                ),
+                results=results,
+            )
+
+            first_scene_kwargs = dict(scene_builder.await_args.kwargs)
+            first_rp_kwargs = dict(rp_builder.await_args.kwargs)
+            v3_maps = iter([old_inventory_v3_map, new_inventory_v3_map])
+            patched["db_connect"].return_value = conn_without_current_scene
+            patched[
+                "fetch_character_chat_asset_readiness_verification"
+            ].side_effect = [before_readiness, after_readiness]
+            patched["fetch_active_character_asset_summary_rows"].side_effect = [
+                signal_rows,
+                episode_rows,
+            ]
+
+            async def keep_stale_scene(**_kwargs):
+                return 0, 1
+
+            scene_builder.side_effect = keep_stale_scene
+            await module.repair_character_chat_assets(
+                rows=[
+                    {
+                        "product_id": 687,
+                        "title": "테스트 작품",
+                        "_character_asset_collection_eligible": True,
+                    }
+                ],
+                args=SimpleNamespace(
+                    apply=True,
+                    verbose=False,
+                    max_delta_episodes=2,
+                    reaggregate_character_inventory=True,
+                ),
+                results=results_without_current_scene,
+            )
+
+        self.assertEqual(inventory_v3_builder.call_count, 2)
+        inventory_v3_builder.assert_called_with(
+            cur=ANY,
+            product_id=687,
+            protagonist_resolution=None,
+            cleanup_missing_scopes=False,
+        )
+        self.assertEqual(
+            first_scene_kwargs["canonical_character_packet"]["characters"][0]["scope_key"],
+            new_scope_key,
+        )
+        self.assertEqual(
+            first_rp_kwargs["require_current_generation_scope_keys"],
+            {new_scope_key},
+        )
+        self.assertEqual(
+            first_rp_kwargs["inventory_map"],
+            {new_scope_key: new_inventory_v3_map[new_scope_key]},
+        )
+        self.assertFalse(first_scene_kwargs["commit_changes"])
+        self.assertEqual(conn.commit_count, 1)
+        self.assertEqual(results["inventory_reaggregation_updated"], 1)
+        self.assertEqual(results["character_asset_repair_recovered"], 1)
+        self.assertEqual(conn_without_current_scene.commit_count, 1)
+        self.assertEqual(conn_without_current_scene.rollback_count, 1)
+        self.assertEqual(
+            results_without_current_scene["inventory_reaggregation_updated"],
+            0,
+        )
+        self.assertEqual(
+            results_without_current_scene["character_asset_repair_recovered"],
+            0,
+        )
+        self.assertEqual(
+            results_without_current_scene["inventory_reaggregation_failed"],
+            1,
+        )
+        self.assertEqual(
+            results_without_current_scene["character_asset_repair_failed"],
+            1,
+        )
+
     async def test_character_asset_repair_defers_until_signal_foundation_is_complete(self):
         module = load_module()
         conn = FakeConnection()
