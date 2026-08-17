@@ -2829,6 +2829,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         }
         plan_mock = AsyncMock(return_value={"characters": []})
         profile_mock = AsyncMock(return_value=profile_payload)
+        dialogue_fallback = AsyncMock()
         scene_context_lines = ["[2화] 압력=문서 봉인 | hook=기록 확인"]
         internal_prompt_mock = AsyncMock(return_value={"internal_prompt": "[현재 장면] 문서 봉인을 확인한다."})
 
@@ -2836,6 +2837,15 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "request_rp_character_plan_payload", plan_mock), \
              patch.object(module, "request_rp_profile_payload", profile_mock), \
+             patch.object(
+                 module,
+                 "build_direct_voice_evidence_quality",
+                 return_value={
+                     "strict_chat_ready": True,
+                     "status": "strict_monologue_ready",
+                 },
+             ), \
+             patch.object(module, "collect_llm_rp_dialogue_items", dialogue_fallback), \
              patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
              patch.object(module, "fetch_active_summary_state_map", return_value={}), \
              patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={"character:백이현": scene_context_lines}), \
@@ -2867,6 +2877,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["profile"], [1, 0])
         self.assertEqual(counts["examples"], [1, 0])
         plan_mock.assert_not_called()
+        dialogue_fallback.assert_not_awaited()
         profile_mock.assert_awaited_once()
         internal_prompt_mock.assert_awaited_once()
         self.assertEqual(internal_prompt_mock.await_args.kwargs["scene_context_lines"], scene_context_lines)
@@ -2933,6 +2944,259 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["profile"], [1, 0])
         self.assertEqual(counts["examples"], [1, 0])
         self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
+
+    async def test_delta_rp_monologue_ready_main_extracts_grounded_dialogue_examples(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:박형훈"
+        monologue_items = [
+            {
+                "episode_no": (index % 6) + 1,
+                "kind": "monologue",
+                "text": f"내가 확인한 단서를 끝까지 따라가야 한다고 생각했다 {index}.",
+            }
+            for index in range(80)
+        ]
+        dialogue_items = [
+            {
+                "episode_no": 3,
+                "kind": "dialogue",
+                "text": "지금은 설명할 시간이 없어. 먼저 나예부터 찾아야 해.",
+            },
+            {
+                "episode_no": 5,
+                "kind": "dialogue",
+                "text": "그 사진을 다시 보여 줘. 놓친 단서가 있을 거야.",
+            },
+        ]
+        dialogue_fallback = AsyncMock(return_value=dialogue_items)
+        processed_scope_keys: set[str] = set()
+        profile_mock = AsyncMock(
+            return_value={
+                "speech_style": {"tone": "단호"},
+                "personality_core": ["집요함"],
+                "baseline_attitude": "경계",
+                "example_dialogues": [item["text"] for item in dialogue_items],
+            }
+        )
+        upserted_payloads: list[dict[str, object]] = []
+
+        def fake_upsert(_cur, **kwargs):
+            upserted_payloads.append(kwargs)
+            return {"summary_id": len(upserted_payloads)}, True
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(
+                 module,
+                 "build_direct_voice_evidence_quality",
+                 return_value={
+                     "strict_chat_ready": True,
+                     "status": "strict_monologue_ready",
+                 },
+             ), \
+             patch.object(
+                 module,
+                 "collect_rule_based_rp_dialogue_items_by_episode",
+                 return_value=monologue_items,
+             ), \
+             patch.object(module, "collect_llm_rp_dialogue_items", dialogue_fallback), \
+             patch.object(module, "request_rp_profile_payload", profile_mock), \
+             patch.object(
+                 module,
+                 "request_character_chat_internal_prompt_payload",
+                 AsyncMock(return_value=None),
+             ), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", side_effect=fake_upsert), \
+             patch.object(module, "deactivate_active_scope", return_value=0):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1084,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no={1: "원문"},
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "display_name": "박형훈",
+                        "aliases": ["박형훈", "주인공"],
+                        "is_protagonist": True,
+                        "is_first_person": True,
+                        "first_person_evidence": {"episode_count": 6},
+                        "distinct_episode_count": 20,
+                        "voice_evidence_count": 20,
+                    }
+                },
+                relation_map={},
+                require_current_generation_scope_keys={scope_key},
+                processed_scope_keys=processed_scope_keys,
+            )
+
+        dialogue_fallback.assert_awaited_once()
+        self.assertEqual(
+            [
+                (item["kind"], item["text"], item["episode_no"])
+                for item in profile_mock.await_args.kwargs["dialogue_items"][:2]
+            ],
+            [
+                (item["kind"], item["text"], item["episode_no"])
+                for item in dialogue_items
+            ],
+        )
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual(processed_scope_keys, {scope_key})
+        self.assertEqual(
+            [payload["summary_type"] for payload in upserted_payloads],
+            ["character_rp_profile", "character_rp_examples"],
+        )
+        saved_examples = json.loads(str(upserted_payloads[1]["summary_text"]))[
+            "examples"
+        ]
+        self.assertEqual(
+            [item["text"] for item in saved_examples],
+            [item["text"] for item in dialogue_items],
+        )
+
+    async def test_delta_rp_monologue_ready_main_reuses_grounded_existing_examples(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:박형훈"
+        existing_dialogue_items = [
+            {
+                "episode_no": 3,
+                "source_kind": "dialogue",
+                "text": "지금은 설명할 시간이 없어. 먼저 나예부터 찾아야 해.",
+                "confidence": 0.9,
+            },
+            {
+                "episode_no": 5,
+                "source_kind": "dialogue",
+                "text": "그 사진을 다시 보여 줘. 놓친 단서가 있을 거야.",
+                "confidence": 0.9,
+            },
+        ]
+        episode_texts_by_no = {
+            3: existing_dialogue_items[0]["text"],
+            5: existing_dialogue_items[1]["text"],
+        }
+        state_maps = {
+            "character_rp_profile": {},
+            "character_rp_examples": {
+                scope_key: {
+                    "summary_id": 12,
+                    "scope_key": scope_key,
+                    "source_hash": "existing-examples-hash",
+                    "payload": {
+                        "character_key": scope_key,
+                        "examples": existing_dialogue_items,
+                    },
+                }
+            },
+        }
+        monologue_items = [
+            {
+                "episode_no": (index % 6) + 1,
+                "kind": "monologue",
+                "text": f"내가 확인한 단서를 끝까지 따라가야 한다고 생각했다 {index}.",
+            }
+            for index in range(80)
+        ]
+        dialogue_fallback = AsyncMock(return_value=[])
+        profile_mock = AsyncMock(
+            return_value={
+                "speech_style": {"tone": "단호"},
+                "personality_core": ["집요함"],
+                "baseline_attitude": "경계",
+                "example_dialogues": [
+                    item["text"] for item in existing_dialogue_items
+                ],
+            }
+        )
+        processed_scope_keys: set[str] = set()
+
+        def fake_fetch_state_map(*, summary_type, **_kwargs):
+            return state_maps.get(summary_type, {})
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(
+                 module,
+                 "build_direct_voice_evidence_quality",
+                 return_value={
+                     "strict_chat_ready": True,
+                     "status": "strict_monologue_ready",
+                 },
+             ), \
+             patch.object(
+                 module,
+                 "collect_rule_based_rp_dialogue_items_by_episode",
+                 return_value=monologue_items,
+             ), \
+             patch.object(module, "collect_llm_rp_dialogue_items", dialogue_fallback), \
+             patch.object(module, "request_rp_profile_payload", profile_mock), \
+             patch.object(
+                 module,
+                 "request_character_chat_internal_prompt_payload",
+                 AsyncMock(return_value=None),
+             ), \
+             patch.object(
+                 module,
+                 "fetch_active_summary_state_map",
+                 side_effect=fake_fetch_state_map,
+             ), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(
+                 module,
+                 "upsert_summary",
+                 side_effect=[
+                     ({"summary_id": 21}, True),
+                     ({"summary_id": 22}, True),
+                 ],
+             ), \
+             patch.object(module, "deactivate_active_scope", return_value=0):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1084,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no=episode_texts_by_no,
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "display_name": "박형훈",
+                        "aliases": ["박형훈", "주인공"],
+                        "is_protagonist": True,
+                        "is_first_person": True,
+                        "first_person_evidence": {"episode_count": 6},
+                        "distinct_episode_count": 20,
+                        "voice_evidence_count": 20,
+                    }
+                },
+                relation_map={},
+                require_current_generation_scope_keys={scope_key},
+                processed_scope_keys=processed_scope_keys,
+            )
+
+        dialogue_fallback.assert_awaited_once()
+        profile_mock.assert_awaited_once()
+        self.assertEqual(counts["profile"], [1, 0])
+        self.assertEqual(counts["examples"], [1, 0])
+        self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
+        self.assertEqual(processed_scope_keys, {scope_key})
+        self.assertEqual(
+            [
+                item["text"]
+                for item in profile_mock.await_args.kwargs["dialogue_items"][:2]
+            ],
+            [item["text"] for item in existing_dialogue_items],
+        )
 
     async def test_delta_rp_strict_mode_raises_unexpected_dialogue_error(self):
         module = load_module()
