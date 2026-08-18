@@ -921,6 +921,12 @@ def parse_args() -> argparse.Namespace:
         help="delta 모드에서 신규 회차 없이 기존 신호로 캐릭터/관계 인벤토리를 재집계. provider 불요.",
     )
     parser.add_argument(
+        "--withdraw-identity-review-summary-id",
+        type=int,
+        default=0,
+        help="단일 작품 full apply에서 기대 active identity review와 기존 character bundle을 원자 reset",
+    )
+    parser.add_argument(
         "--verification-json-path",
         type=str,
         default="",
@@ -2181,6 +2187,23 @@ def select_touched_range_scopes(episode_nos: list[int]) -> list[tuple[str, int, 
 
 
 def validate_delta_args(args: argparse.Namespace) -> None:
+    withdraw_summary_id = int(
+        getattr(args, "withdraw_identity_review_summary_id", 0) or 0
+    )
+    if withdraw_summary_id:
+        product_ids = list(getattr(args, "product_ids", None) or [])
+        if (
+            args.build_mode != "full"
+            or not bool(getattr(args, "apply", False))
+            or len(product_ids) != 1
+            or bool(getattr(args, "episode_ids", None))
+            or bool(getattr(args, "episode_nos", None))
+            or int(getattr(args, "limit", 0) or 0) > 0
+        ):
+            raise ValueError(
+                "--withdraw-identity-review-summary-id는 단일 --product-id의 "
+                "무필터 --build-mode full --apply에서만 사용할 수 있습니다."
+            )
     if args.build_mode != "delta":
         if bool(getattr(args, "repair_character_assets", False)):
             raise ValueError("--repair-character-assets는 --build-mode delta에서만 사용할 수 있습니다.")
@@ -8914,6 +8937,70 @@ def upsert_character_identity_review(
     return summary_id, inserted, document
 
 
+def withdraw_active_character_identity_review_and_reset_bundle(
+    cur,
+    *,
+    product_id: int,
+    expected_summary_id: int,
+) -> int:
+    rows = fetch_active_summary_rows(
+        cur=cur,
+        product_id=product_id,
+        summary_type=CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION,
+    )
+    if len(rows) != 1 or str(rows[0].get("scope_key") or "").strip() != "identity_review":
+        raise ValueError(
+            f"character identity review active row invariant failed: product_id={product_id}"
+        )
+    active_summary_id = int(rows[0].get("summary_id") or 0)
+    if active_summary_id != expected_summary_id:
+        raise ValueError(
+            "active character identity review changed: "
+            f"expected={expected_summary_id} actual={active_summary_id}"
+        )
+    cur.execute(
+        """
+        UPDATE tb_story_agent_context_summary
+           SET is_active = 'N'
+         WHERE summary_id = %s
+           AND product_id = %s
+           AND summary_type = %s
+           AND scope_key = %s
+           AND is_active = 'Y'
+        """,
+        (
+            expected_summary_id,
+            product_id,
+            CHARACTER_IDENTITY_REVIEW_FORMAT_VERSION,
+            "identity_review",
+        ),
+    )
+    if int(cur.rowcount or 0) != 1:
+        raise RuntimeError(
+            "character identity review withdraw affected unexpected rows: "
+            f"product_id={product_id} summary_id={expected_summary_id} "
+            f"rowcount={int(cur.rowcount or 0)}"
+        )
+    for summary_type in (
+        "episode_character_signals",
+        "character_inventory",
+        "character_inventory_v3",
+        "relation_inventory",
+        "episode_scene_extraction",
+        "character_rp_profile",
+        "character_rp_examples",
+        "character_chat_internal_prompt",
+        "character_chat_opening_v1",
+    ):
+        deactivate_missing_active_scopes(
+            cur,
+            product_id,
+            summary_type,
+            set(),
+        )
+    return active_summary_id
+
+
 def aggregate_character_inventory_rows(signal_rows: list[dict]) -> list[dict[str, object]]:
     inventory_map: dict[str, dict[str, object]] = {}
     for row in signal_rows:
@@ -12711,6 +12798,7 @@ async def build_work_protagonist_resolution_for_inventory_v3(
     summary_client: AsyncClient | None,
     episode_summary_rows: list[dict] | None = None,
     verbose: bool = False,
+    raise_provider_errors: bool = False,
 ) -> dict[str, object] | None:
     base_inventory_rows = aggregate_character_inventory_v3_rows(
         signal_rows,
@@ -12758,6 +12846,8 @@ async def build_work_protagonist_resolution_for_inventory_v3(
                     episode_summary_evidence=episode_summary_evidence,
                 )
             except Exception as exc:
+                if raise_provider_errors:
+                    raise
                 if not (
                     isinstance(exc, OpenRouterBackgroundCreditReserveError)
                     or is_expected_story_asset_provider_error(exc)
@@ -18109,6 +18199,21 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             episode_texts_by_no=episode_texts_by_no,
                             episode_summary_rows=character_episode_processing_rows,
                         )
+                        withdraw_summary_id = int(
+                            getattr(
+                                args,
+                                "withdraw_identity_review_summary_id",
+                                0,
+                            )
+                            or 0
+                        )
+                        if withdraw_summary_id:
+                            with work_cursor(work_conn) as cur:
+                                withdraw_active_character_identity_review_and_reset_bundle(
+                                    cur,
+                                    product_id=product_id,
+                                    expected_summary_id=withdraw_summary_id,
+                                )
                         processed_signal_scope_keys: set[str] = set()
                         signal_counts = await build_episode_character_signals_summaries(
                             conn=work_conn,
@@ -18146,6 +18251,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             summary_client=summary_client,
                             episode_summary_rows=character_episode_processing_rows,
                             verbose=args.verbose,
+                            raise_provider_errors=bool(withdraw_summary_id),
                         )
 
                         with work_cursor(work_conn) as cur:
