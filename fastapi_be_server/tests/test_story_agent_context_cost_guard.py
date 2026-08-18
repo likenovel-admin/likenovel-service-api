@@ -13727,6 +13727,184 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["inventory_reaggregation_updated"], 0)
         self.assertEqual(results["inventory_reaggregations"][0]["status"], "no_progress")
 
+    async def test_inventory_reaggregation_below_character_chat_minimum_commits_without_bundle_guard(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+        scope_key = "character:main"
+        old_main = {
+            scope_key: {
+                "canonical_character_key": scope_key,
+                "work_role": "main_protagonist",
+                "public_chat_eligible": True,
+                "distinct_episode_count": 3,
+            }
+        }
+        new_main = {
+            scope_key: {
+                **old_main[scope_key],
+                "distinct_episode_count": 14,
+            }
+        }
+        v3_reads = iter([old_main, new_main])
+
+        def fetch_inventory_map(*, summary_type="character_inventory", **_kwargs):
+            if summary_type == "character_inventory_v3":
+                return next(v3_reads)
+            return {}
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_inventory_map", side_effect=fetch_inventory_map), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
+             patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}), \
+             patch.object(module, "build_character_inventory_v3_summaries", return_value=(1, 0)), \
+             patch.object(module, "build_relation_inventory_summaries_delta", return_value={"inserted_count": 0, "reused_count": 0}), \
+             patch.object(module, "assert_story_agent_foundation_invariants"), \
+             patch.object(module, "fetch_total_episode_count", return_value=14), \
+             patch.object(module, "touch_product_context_build_attempt"):
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1207, "title": "천의 여인"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        self.assertEqual(conn.rollback_count, 0)
+        self.assertEqual(conn.commit_count, 1)
+        self.assertEqual(results["inventory_reaggregation_failed"], 0)
+        self.assertEqual(results["inventory_reaggregation_updated"], 1)
+
+    async def test_inventory_reaggregation_at_character_chat_minimum_keeps_bundle_guard(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+        scope_key = "character:main"
+        old_main = {
+            scope_key: {
+                "canonical_character_key": scope_key,
+                "work_role": "main_protagonist",
+                "public_chat_eligible": True,
+                "distinct_episode_count": 3,
+            }
+        }
+        new_main = {
+            scope_key: {
+                **old_main[scope_key],
+                "distinct_episode_count": 15,
+            }
+        }
+        v3_reads = iter([old_main, new_main])
+
+        def fetch_inventory_map(*, summary_type="character_inventory", **_kwargs):
+            if summary_type == "character_inventory_v3":
+                return next(v3_reads)
+            return {}
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_inventory_map", side_effect=fetch_inventory_map), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
+             patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}), \
+             patch.object(module, "build_character_inventory_v3_summaries", return_value=(1, 0)), \
+             patch.object(module, "build_relation_inventory_summaries_delta", return_value={"inserted_count": 0, "reused_count": 0}), \
+             patch.object(module, "assert_story_agent_foundation_invariants"), \
+             patch.object(module, "fetch_total_episode_count", return_value=15), \
+             patch.object(module, "touch_product_context_build_attempt"):
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1103, "title": "테스트 작품"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        self.assertEqual(conn.commit_count, 0)
+        self.assertEqual(conn.rollback_count, 1)
+        self.assertEqual(results["inventory_reaggregation_failed"], 1)
+
+    async def test_inventory_reaggregation_cutoff_ineligible_above_minimum_keeps_bundle_guard(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+        scope_key = "character:main"
+        old_main = {
+            scope_key: {
+                "canonical_character_key": scope_key,
+                "work_role": "main_protagonist",
+                "public_chat_eligible": True,
+                "distinct_episode_count": 3,
+            }
+        }
+        new_main = {
+            scope_key: {
+                **old_main[scope_key],
+                "distinct_episode_count": 20,
+            }
+        }
+        v3_reads = iter([old_main, new_main])
+
+        def fetch_inventory_map(*, summary_type="character_inventory", **_kwargs):
+            if summary_type == "character_inventory_v3":
+                return next(v3_reads)
+            return {}
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=[signal_row(1, 1, [])]), \
+             patch.object(module, "fetch_active_character_inventory_map", side_effect=fetch_inventory_map), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
+             patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}), \
+             patch.object(module, "build_character_inventory_v3_summaries", return_value=(1, 0)), \
+             patch.object(module, "build_relation_inventory_summaries_delta", return_value={"inserted_count": 0, "reused_count": 0}), \
+             patch.object(module, "assert_story_agent_foundation_invariants"), \
+             patch.object(module, "fetch_total_episode_count", return_value=20), \
+             patch.object(module, "touch_product_context_build_attempt"):
+            await module.reaggregate_character_inventory_foundations(
+                rows=[
+                    {
+                        "product_id": 1104,
+                        "title": "컷오프 미달 작품",
+                        "characterChatEligible": 0,
+                    }
+                ],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        self.assertEqual(conn.commit_count, 0)
+        self.assertEqual(conn.rollback_count, 1)
+        self.assertEqual(results["inventory_reaggregation_failed"], 1)
+
+    async def test_inventory_reaggregation_no_progress_when_nothing_inserted_duplicate_guard(self):
+        module = load_module()
+        conn = FakeRollbackConnection()
+        results = module.build_empty_results()
+        active_signal_rows = [signal_row(1, 1, [])]
+
+        with patch.object(module, "db_connect", return_value=conn), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
+             patch.object(module, "fetch_active_character_asset_summary_rows", return_value=active_signal_rows), \
+             patch.object(module, "fetch_active_character_inventory_map", return_value={}), \
+             patch.object(module, "fetch_active_relation_inventory_by_relation_key_map", return_value={}), \
+             patch.object(module, "build_character_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 0, "reused_count": 3})), \
+             patch.object(module, "build_character_inventory_v3_summaries", MagicMock(return_value=(0, 7))), \
+             patch.object(module, "build_relation_inventory_summaries_delta", MagicMock(return_value={"inserted_count": 0, "reused_count": 2})), \
+             patch.object(module, "assert_story_agent_foundation_invariants", MagicMock()), \
+             patch.object(module, "touch_product_context_build_attempt"):
+            await module.reaggregate_character_inventory_foundations(
+                rows=[{"product_id": 1103, "title": "테스트 작품"}],
+                args=SimpleNamespace(apply=True, verbose=False),
+                results=results,
+            )
+
+        self.assertEqual(results["inventory_reaggregation_no_progress"], 1)
+        self.assertEqual(results["inventory_reaggregation_updated"], 0)
+        self.assertEqual(results["inventory_reaggregations"][0]["status"], "no_progress")
+
     async def test_inventory_reaggregation_without_active_signals_is_non_destructive_no_progress(self):
         module = load_module()
         conn = FakeRollbackConnection()
