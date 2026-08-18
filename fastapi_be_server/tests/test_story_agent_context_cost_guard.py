@@ -2279,10 +2279,29 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         ):
             module = load_module()
 
-        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL, "deepseek/deepseek-v4-pro")
+        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL, "deepseek/deepseek-v4-pro-0813")
         self.assertEqual(module.EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS, 5000)
         self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS, 120.0)
         self.assertIn("핵심 장면 2~3개", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
+
+    def test_episode_character_signals_defaults_to_same_deepseek_model_as_scene(self):
+        with patch.dict(
+            os.environ,
+            {
+                "STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL": "",
+                "STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL": "",
+            },
+        ):
+            module = load_module()
+
+        self.assertEqual(
+            module.EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+            "deepseek/deepseek-v4-pro-0813",
+        )
+        self.assertEqual(
+            module.EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+            module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL,
+        )
 
     def test_episode_character_signals_source_hash_uses_primary_model(self):
         module = load_module()
