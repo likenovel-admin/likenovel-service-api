@@ -17690,7 +17690,10 @@ async def reaggregate_character_inventory_foundations(
                                 new_inventory_map=new_inventory_v3_map,
                             )
                         )
-                        if bundle_scope_keys:
+                        if bundle_scope_keys and (
+                            fetch_total_episode_count(cur, product_id=product_id)
+                            >= CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT
+                        ):
                             raise ValueError(
                                 "public main character asset bundle incomplete: "
                                 "missing_current_generation_scope_keys="
