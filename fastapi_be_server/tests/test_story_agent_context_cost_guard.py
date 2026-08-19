@@ -278,6 +278,21 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             {"require_parameters": True},
         )
 
+    def test_rp_requests_default_to_compatible_openrouter_provider_routing(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", None)
+            module = load_module()
+
+        self.assertEqual(module.RP_OPENROUTER_PROVIDER_ONLY, "")
+        self.assertEqual(
+            module.build_rp_openrouter_payload(
+                system_prompt="s",
+                user_prompt="u",
+                max_tokens=100,
+            )["provider"],
+            {"require_parameters": True},
+        )
+
     def test_work_cursor_never_reconnects_across_bundle_transaction(self):
         module = load_module()
         conn = MagicMock()
@@ -2828,6 +2843,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(
             request_json["provider"],
             {
+                "require_parameters": True,
                 "only": ["deepinfra", "together"],
                 "order": ["deepinfra", "together"],
                 "allow_fallbacks": True,
@@ -2888,7 +2904,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             client.calls[0]["json"]["provider"],
-            {"only": ["google"], "order": ["google"], "allow_fallbacks": False},
+            {
+                "require_parameters": True,
+                "only": ["google"],
+                "order": ["google"],
+                "allow_fallbacks": False,
+            },
         )
 
     async def test_rp_build_keeps_old_profiles_when_plan_targets_missing(self):

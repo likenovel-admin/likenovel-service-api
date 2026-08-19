@@ -80,7 +80,7 @@ STORYCTX_DEFERRED_BUDGET_EXIT_CODE = 75
 STORYCTX_REVIEW_REQUIRED_EXIT_CODE = 76
 EPISODE_SUMMARY_MODEL = os.getenv("STORY_AGENT_SUMMARY_MODEL", "deepseek/deepseek-v3.2").strip()
 RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma-4-31b-it").strip()
-RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
+RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "").strip()
 DEEPSEEK_OPENROUTER_PROVIDER_ONLY = os.getenv(
     "STORY_AGENT_DEEPSEEK_OPENROUTER_PROVIDER_ONLY",
     "",
@@ -1436,13 +1436,16 @@ def build_rp_openrouter_payload(
             {"role": "user", "content": user_prompt},
         ],
     }
+    payload["provider"] = {"require_parameters": True}
     provider_only = split_csv_values(RP_OPENROUTER_PROVIDER_ONLY)
     if provider_only:
-        payload["provider"] = {
-            "only": provider_only,
-            "order": provider_only,
-            "allow_fallbacks": len(provider_only) > 1,
-        }
+        payload["provider"].update(
+            {
+                "only": provider_only,
+                "order": provider_only,
+                "allow_fallbacks": len(provider_only) > 1,
+            }
+        )
     return payload
 
 
