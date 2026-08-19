@@ -83,7 +83,7 @@ RP_OPENROUTER_MODEL = os.getenv("STORY_AGENT_RP_OPENROUTER_MODEL", "google/gemma
 RP_OPENROUTER_PROVIDER_ONLY = os.getenv("STORY_AGENT_RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together").strip()
 DEEPSEEK_OPENROUTER_PROVIDER_ONLY = os.getenv(
     "STORY_AGENT_DEEPSEEK_OPENROUTER_PROVIDER_ONLY",
-    "together",
+    "",
 ).strip()
 RP_OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("STORY_AGENT_RP_OPENROUTER_TIMEOUT_SECONDS", "90"))
 CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS = float(
@@ -1461,13 +1461,16 @@ def build_character_signals_openrouter_payload(*, user_prompt: str) -> dict[str,
             {"role": "user", "content": user_prompt},
         ],
     }
+    payload["provider"] = {"require_parameters": True}
     provider_only = split_csv_values(DEEPSEEK_OPENROUTER_PROVIDER_ONLY)
     if provider_only:
-        payload["provider"] = {
-            "only": provider_only,
-            "order": provider_only,
-            "allow_fallbacks": len(provider_only) > 1,
-        }
+        payload["provider"].update(
+            {
+                "only": provider_only,
+                "order": provider_only,
+                "allow_fallbacks": len(provider_only) > 1,
+            }
+        )
     return payload
 
 
@@ -1486,13 +1489,16 @@ def build_episode_scene_extraction_openrouter_payload(*, user_prompt: str) -> di
             {"role": "user", "content": user_prompt},
         ],
     }
+    payload["provider"] = {"require_parameters": True}
     provider_only = split_csv_values(DEEPSEEK_OPENROUTER_PROVIDER_ONLY)
     if provider_only:
-        payload["provider"] = {
-            "only": provider_only,
-            "order": provider_only,
-            "allow_fallbacks": len(provider_only) > 1,
-        }
+        payload["provider"].update(
+            {
+                "only": provider_only,
+                "order": provider_only,
+                "allow_fallbacks": len(provider_only) > 1,
+            }
+        )
     return payload
 
 
