@@ -927,6 +927,11 @@ def parse_args() -> argparse.Namespace:
         help="단일 작품 full apply에서 기대 active identity review와 기존 character bundle을 원자 reset",
     )
     parser.add_argument(
+        "--reset-character-bundle",
+        action="store_true",
+        help="단일 작품 full apply에서 기존 character bundle을 원자 reset",
+    )
+    parser.add_argument(
         "--verification-json-path",
         type=str,
         default="",
@@ -2190,6 +2195,24 @@ def validate_delta_args(args: argparse.Namespace) -> None:
     withdraw_summary_id = int(
         getattr(args, "withdraw_identity_review_summary_id", 0) or 0
     )
+    reset_character_bundle = bool(
+        getattr(args, "reset_character_bundle", False)
+    )
+    if reset_character_bundle:
+        product_ids = list(getattr(args, "product_ids", None) or [])
+        if (
+            args.build_mode != "full"
+            or not bool(getattr(args, "apply", False))
+            or len(product_ids) != 1
+            or bool(getattr(args, "episode_ids", None))
+            or bool(getattr(args, "episode_nos", None))
+            or int(getattr(args, "limit", 0) or 0) > 0
+            or withdraw_summary_id > 0
+        ):
+            raise ValueError(
+                "--reset-character-bundle은 단일 --product-id의 무필터 "
+                "--build-mode full --apply에서만 단독으로 사용할 수 있습니다."
+            )
     if withdraw_summary_id:
         product_ids = list(getattr(args, "product_ids", None) or [])
         if (
@@ -8981,6 +9004,11 @@ def withdraw_active_character_identity_review_and_reset_bundle(
             f"product_id={product_id} summary_id={expected_summary_id} "
             f"rowcount={int(cur.rowcount or 0)}"
         )
+    reset_active_character_bundle(cur, product_id=product_id)
+    return active_summary_id
+
+
+def reset_active_character_bundle(cur, *, product_id: int) -> None:
     for summary_type in (
         "episode_character_signals",
         "character_inventory",
@@ -8998,7 +9026,6 @@ def withdraw_active_character_identity_review_and_reset_bundle(
             summary_type,
             set(),
         )
-    return active_summary_id
 
 
 def aggregate_character_inventory_rows(signal_rows: list[dict]) -> list[dict[str, object]]:
@@ -18214,6 +18241,12 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                     product_id=product_id,
                                     expected_summary_id=withdraw_summary_id,
                                 )
+                        elif bool(getattr(args, "reset_character_bundle", False)):
+                            with work_cursor(work_conn) as cur:
+                                reset_active_character_bundle(
+                                    cur,
+                                    product_id=product_id,
+                                )
                         processed_signal_scope_keys: set[str] = set()
                         signal_counts = await build_episode_character_signals_summaries(
                             conn=work_conn,
@@ -18251,7 +18284,10 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             summary_client=summary_client,
                             episode_summary_rows=character_episode_processing_rows,
                             verbose=args.verbose,
-                            raise_provider_errors=bool(withdraw_summary_id),
+                            raise_provider_errors=bool(
+                                withdraw_summary_id
+                                or getattr(args, "reset_character_bundle", False)
+                            ),
                         )
 
                         with work_cursor(work_conn) as cur:
@@ -18349,6 +18385,20 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                 ).get("ready_main_protagonist_scope_keys")
                                 or []
                             )
+                            if (
+                                withdraw_summary_id
+                                or bool(
+                                    getattr(
+                                        args,
+                                        "reset_character_bundle",
+                                        False,
+                                    )
+                                )
+                            ) and not ready_scope_keys:
+                                raise ValueError(
+                                    "public main character asset bundle incomplete: "
+                                    "ready main protagonist missing"
+                                )
                             missing_scope_keys = (
                                 bundle_scope_keys - ready_scope_keys
                             ) | (
