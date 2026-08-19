@@ -259,6 +259,25 @@ class FakeCreditAsyncClient:
 
 
 class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
+    def test_deepseek_requests_default_to_compatible_openrouter_provider_routing(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("STORY_AGENT_DEEPSEEK_OPENROUTER_PROVIDER_ONLY", None)
+            module = load_module()
+
+        self.assertEqual(module.DEEPSEEK_OPENROUTER_PROVIDER_ONLY, "")
+        self.assertEqual(
+            module.build_character_signals_openrouter_payload(
+                user_prompt="test"
+            )["provider"],
+            {"require_parameters": True},
+        )
+        self.assertEqual(
+            module.build_episode_scene_extraction_openrouter_payload(
+                user_prompt="test"
+            )["provider"],
+            {"require_parameters": True},
+        )
+
     def test_work_cursor_never_reconnects_across_bundle_transaction(self):
         module = load_module()
         conn = MagicMock()
@@ -2537,7 +2556,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0]["json"]["model"], "google/gemma-4-31b-it")
         self.assertEqual(
             client.calls[0]["json"]["provider"],
-            {"only": ["together"], "order": ["together"], "allow_fallbacks": False},
+            {
+                "require_parameters": True,
+                "only": ["together"],
+                "order": ["together"],
+                "allow_fallbacks": False,
+            },
         )
         self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals OpenRouter")
 
@@ -2584,7 +2608,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0]["json"]["model"], "google/gemma-4-31b-it")
         self.assertEqual(
             client.calls[0]["json"]["provider"],
-            {"only": ["together"], "order": ["together"], "allow_fallbacks": False},
+            {
+                "require_parameters": True,
+                "only": ["together"],
+                "order": ["together"],
+                "allow_fallbacks": False,
+            },
         )
 
     async def test_episode_scene_extraction_429_honors_retry_after_before_retry(self):
