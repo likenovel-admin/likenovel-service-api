@@ -538,7 +538,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["products"][0]["context_status"], "deferred_budget")
         self.assertEqual(results["products"][0]["persisted_context_status"], "ready")
 
-    async def test_full_identity_review_reset_rolls_back_on_protagonist_provider_error(self):
+    async def test_full_character_bundle_reset_rolls_back_on_protagonist_provider_error(self):
         module = load_module()
 
         class ResetTrackingConnection(FakeConnection):
@@ -580,7 +580,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             episode_ids=None,
             episode_nos=None,
             limit=0,
-            withdraw_identity_review_summary_id=85698,
+            reset_character_bundle=True,
+            withdraw_identity_review_summary_id=0,
         )
 
         patches = [
@@ -643,7 +644,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ),
             patch.object(
                 module,
-                "withdraw_active_character_identity_review_and_reset_bundle",
+                "reset_active_character_bundle",
                 side_effect=stage_reset,
             ),
             patch.object(
@@ -690,6 +691,205 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["products"][0]["context_status"], "failed")
         self.assertTrue(resolver.await_args.kwargs["raise_provider_errors"])
         inventory_builder.assert_not_called()
+
+    async def test_full_character_bundle_reset_rolls_back_without_ready_main_protagonist(self):
+        module = load_module()
+
+        class ResetTrackingConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.reset_pending = False
+
+            def rollback(self):
+                super().rollback()
+                self.reset_pending = False
+
+        conn = ResetTrackingConnection()
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        episode_summary_rows = [
+            {
+                "summary_id": 101,
+                "scope_key": "episode:101",
+                "episode_from": 1,
+                "source_hash": "episode-summary-hash",
+                "summary_text": "# 1화\n- 사건",
+            }
+        ]
+
+        def stage_reset(*_args, **_kwargs):
+            conn.reset_pending = True
+
+        async def stage_signals(*_args, **kwargs):
+            kwargs["processed_scope_keys"].add("episode:101")
+            return 1, 0
+
+        args = SimpleNamespace(
+            apply=True,
+            verbose=False,
+            use_epub_fallback=False,
+            episode_ids=None,
+            episode_nos=None,
+            limit=0,
+            reset_character_bundle=True,
+            withdraw_identity_review_summary_id=0,
+        )
+
+        patches = [
+            patch.object(module, "OPENROUTER_API_KEY", "test-key"),
+            patch.object(module, "EPISODE_SUMMARY_MODEL", "paid-model"),
+            patch.object(module, "AsyncClient", return_value=client),
+            patch.object(module, "db_connect", return_value=conn),
+            patch.object(
+                module,
+                "work_cursor",
+                side_effect=lambda _conn: module.nullcontext(conn),
+            ),
+            patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()),
+            patch.object(module, "fetch_total_episode_count", return_value=30),
+            patch.object(
+                module,
+                "product_lock_connection",
+                return_value=module.nullcontext(object()),
+            ),
+            patch.object(
+                module,
+                "resolve_source_payload",
+                AsyncMock(
+                    return_value={
+                        "html_content": "<p>본문</p>",
+                        "source_type": "content",
+                    }
+                ),
+            ),
+            patch.object(module, "fetch_existing_doc", return_value=None),
+            patch.object(module, "insert_doc_and_chunks", return_value=1),
+            patch.object(
+                module,
+                "insert_episode_summary",
+                AsyncMock(return_value=(101, False, {})),
+            ),
+            patch.object(
+                module,
+                "build_compound_summaries",
+                return_value={
+                    "range": (0, 0),
+                    "product": (0, 0),
+                    "character": (0, 0),
+                },
+            ),
+            patch.object(
+                module,
+                "fetch_active_summary_rows",
+                return_value=episode_summary_rows,
+            ),
+            patch.object(
+                module,
+                "select_character_asset_episode_rows",
+                return_value=(episode_summary_rows, True),
+            ),
+            patch.object(
+                module,
+                "filter_episode_texts_to_summary_rows",
+                return_value={1: "본문"},
+            ),
+            patch.object(
+                module,
+                "reset_active_character_bundle",
+                side_effect=stage_reset,
+            ),
+            patch.object(
+                module,
+                "build_episode_character_signals_summaries",
+                side_effect=stage_signals,
+            ),
+            patch.object(
+                module,
+                "fetch_active_character_asset_summary_rows",
+                return_value=[signal_row(1, 1, [])],
+            ),
+            patch.object(
+                module,
+                "build_work_protagonist_resolution_for_inventory_v3",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                module,
+                "fetch_active_character_inventory_map",
+                return_value={},
+            ),
+            patch.object(
+                module,
+                "build_character_inventory_summaries",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                module,
+                "build_character_inventory_v3_summaries",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                module,
+                "build_relation_inventory_summaries",
+                return_value=(0, 0),
+            ),
+            patch.object(module, "assert_story_agent_foundation_invariants"),
+            patch.object(
+                module,
+                "filter_character_inventory_map_to_signal_scope",
+                return_value={},
+            ),
+            patch.object(
+                module,
+                "build_character_asset_relation_inventory_map",
+                return_value={},
+            ),
+            patch.object(
+                module,
+                "build_episode_scene_extraction_summaries_nonblocking",
+                AsyncMock(return_value=(0, 0)),
+            ),
+            patch.object(
+                module,
+                "build_rp_summaries",
+                AsyncMock(return_value={"profile": (0, 0), "examples": (0, 0)}),
+            ),
+            patch.object(
+                module,
+                "refresh_product_context_status",
+                return_value={"product_id": 1103, "context_status": "ready"},
+            ),
+            patch.object(
+                module,
+                "attach_character_chat_asset_readiness_to_status_row",
+                side_effect=lambda _cur, status: {
+                    **status,
+                    "character_chat_asset_readiness": {
+                        "ready_main_protagonist_scope_keys": []
+                    },
+                },
+            ),
+            patch.object(module, "mark_product_context_failed", return_value=30),
+        ]
+        with ExitStack() as stack:
+            for current_patch in patches:
+                stack.enter_context(current_patch)
+            results = await module.build_context_rows(
+                rows=[
+                    {
+                        "product_id": 1103,
+                        "episode_id": 101,
+                        "episode_no": 1,
+                        "title": "테스트 작품",
+                        "episode_title": "1화",
+                    }
+                ],
+                args=args,
+            )
+
+        self.assertEqual(conn.rollback_count, 1)
+        self.assertFalse(conn.reset_pending)
+        self.assertEqual(results["products"][0]["context_status"], "failed")
 
     async def test_apply_preflights_anthropic_billing_before_product_lock(self):
         module = load_module()
@@ -12830,7 +13030,7 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             source[withdraw_call:readiness_check],
         )
         self.assertIn(
-            "raise_provider_errors=bool(withdraw_summary_id)",
+            'raise_provider_errors=bool(\n                                withdraw_summary_id\n                                or getattr(args, "reset_character_bundle", False)',
             source[resolver_call:readiness_check],
         )
         self.assertGreater(final_commit, readiness_check)
@@ -13765,6 +13965,73 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
                 "--withdraw-identity-review-summary-id",
             ):
                 module.validate_delta_args(SimpleNamespace(**values))
+
+    def test_character_bundle_reset_requires_atomic_single_product_full_apply(self):
+        module = load_module()
+        valid = SimpleNamespace(
+            build_mode="full",
+            apply=True,
+            product_ids=[1103],
+            episode_ids=None,
+            episode_nos=None,
+            limit=0,
+            max_delta_episodes=0,
+            repair_character_assets=False,
+            reaggregate_character_inventory=False,
+            reset_character_bundle=True,
+            withdraw_identity_review_summary_id=0,
+        )
+
+        module.validate_delta_args(valid)
+        invalid_cases = [
+            {**vars(valid), "build_mode": "delta"},
+            {**vars(valid), "apply": False},
+            {**vars(valid), "product_ids": [1103, 1161]},
+            {**vars(valid), "episode_nos": [1, 2, 3]},
+            {**vars(valid), "limit": 1},
+            {
+                **vars(valid),
+                "withdraw_identity_review_summary_id": 85698,
+            },
+        ]
+        for values in invalid_cases:
+            with self.subTest(values=values), self.assertRaisesRegex(
+                ValueError,
+                "--reset-character-bundle",
+            ):
+                module.validate_delta_args(SimpleNamespace(**values))
+
+    def test_character_bundle_reset_deactivates_only_character_asset_types(self):
+        module = load_module()
+
+        class FakeCursor:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, query, params=None):
+                self.executed.append((" ".join(query.split()), params))
+
+        cur = FakeCursor()
+
+        module.reset_active_character_bundle(cur, product_id=1103)
+
+        self.assertEqual(
+            [params[1] for _, params in cur.executed],
+            [
+                "episode_character_signals",
+                "character_inventory",
+                "character_inventory_v3",
+                "relation_inventory",
+                "episode_scene_extraction",
+                "character_rp_profile",
+                "character_rp_examples",
+                "character_chat_internal_prompt",
+                "character_chat_opening_v1",
+            ],
+        )
+        for query, params in cur.executed:
+            self.assertIn("SET is_active = 'N'", query)
+            self.assertEqual(params[0], 1103)
 
     def test_identity_review_withdraw_resets_expected_active_character_bundle(self):
         module = load_module()
