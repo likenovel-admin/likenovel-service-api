@@ -758,6 +758,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             kwargs["processed_scope_keys"].add("episode:101")
             return 1, 0
 
+        mark_failed = MagicMock(return_value=30)
         args = SimpleNamespace(
             apply=True,
             verbose=False,
@@ -899,13 +900,24 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 side_effect=lambda _cur, status: {
                     **status,
                     "character_chat_asset_readiness": {
-                        "ready_main_protagonist_scope_keys": []
+                        "character_chat_status": "hold",
+                        "main_protagonist_scope_keys": ["character:레이븐"],
+                        "ready_main_protagonist_scope_keys": [],
+                        "missing_main_protagonist_scope_keys": ["character:레이븐"],
+                        "missing_profile_scope_keys": ["character:레이븐"],
+                        "missing_examples_scope_keys": [],
+                        "missing_usable_scene_scope_keys": ["character:레이븐"],
+                        "block_reason_counts": {
+                            "missing_profile": 1,
+                            "missing_usable_scene": 1,
+                        },
                     },
                 },
             ),
-            patch.object(module, "mark_product_context_failed", return_value=30),
+            patch.object(module, "mark_product_context_failed", mark_failed),
         ]
-        with ExitStack() as stack:
+        output = io.StringIO()
+        with redirect_stdout(output), ExitStack() as stack:
             for current_patch in patches:
                 stack.enter_context(current_patch)
             results = await module.build_context_rows(
@@ -924,6 +936,19 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(conn.rollback_count, 1)
         self.assertFalse(conn.reset_pending)
         self.assertEqual(results["products"][0]["context_status"], "failed")
+        error_message = mark_failed.call_args.kwargs["error_message"]
+        self.assertIn('"block_reason_counts":{"missing_profile":1,"missing_usable_scene":1}', error_message)
+        self.assertIn('"missing_profile_scope_keys":["character:레이븐"]', error_message)
+        self.assertIn('"missing_usable_scene_scope_keys":["character:레이븐"]', error_message)
+        self.assertIn(
+            '"processed_scope_counts":{"rp":0,"scenes":0,"signals":1}',
+            error_message,
+        )
+        self.assertIn(
+            '"staged_counts":{"rp_examples":[0,0],"rp_profiles":[0,0],"scenes":[0,0],"signals":[1,0]}',
+            error_message,
+        )
+        self.assertIn("[character-bundle-readiness] product_id=1103", output.getvalue())
 
     async def test_apply_preflights_anthropic_billing_before_product_lock(self):
         module = load_module()
