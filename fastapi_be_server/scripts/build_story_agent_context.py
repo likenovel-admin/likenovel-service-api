@@ -15914,6 +15914,56 @@ def fetch_character_chat_asset_readiness_verification(
     )
 
 
+def build_character_bundle_readiness_diagnostic(
+    *,
+    readiness: dict[str, object] | None,
+    bundle_scope_keys: set[str] | None = None,
+    stage_counts: dict[str, tuple[int, int]] | None = None,
+    processed_scope_keys_by_stage: dict[str, set[str]] | None = None,
+) -> str:
+    readiness_payload = dict(readiness or {})
+    diagnostic: dict[str, object] = {
+        key: readiness_payload.get(key)
+        for key in (
+            "character_chat_status",
+            "main_protagonist_scope_keys",
+            "ready_main_protagonist_scope_keys",
+            "missing_main_protagonist_scope_keys",
+            "missing_profile_scope_keys",
+            "invalid_profile_scope_keys",
+            "legacy_profile_scope_key_mismatch_scope_keys",
+            "missing_examples_scope_keys",
+            "invalid_examples_scope_keys",
+            "legacy_examples_scope_key_mismatch_scope_keys",
+            "missing_usable_scene_scope_keys",
+            "continuity_ambiguous_scope_keys",
+            "block_reason_counts",
+            "public_candidates",
+        )
+        if key in readiness_payload
+    }
+    diagnostic["bundle_scope_keys"] = sorted(bundle_scope_keys or set())
+    if stage_counts:
+        diagnostic["staged_counts"] = {
+            key: [int(counts[0]), int(counts[1])]
+            for key, counts in sorted(stage_counts.items())
+        }
+    if processed_scope_keys_by_stage:
+        diagnostic["processed_scope_counts"] = {
+            key: len(scope_keys)
+            for key, scope_keys in sorted(processed_scope_keys_by_stage.items())
+        }
+        diagnostic["processed_rp_scope_keys"] = sorted(
+            processed_scope_keys_by_stage.get("rp") or set()
+        )
+    return json.dumps(
+        diagnostic,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def is_character_chat_asset_readiness_actionable(
     readiness: dict[str, object] | None,
 ) -> bool:
@@ -17460,6 +17510,21 @@ async def repair_character_chat_assets(
                             cur,
                             product_id=product_id,
                         )
+                        readiness_diagnostic = (
+                            build_character_bundle_readiness_diagnostic(
+                                readiness=after_readiness,
+                                bundle_scope_keys=bundle_scope_keys,
+                                stage_counts={
+                                    "scenes": scene_counts,
+                                    "rp_profiles": tuple(rp_counts.get("profile") or (0, 0)),
+                                    "rp_examples": tuple(rp_counts.get("examples") or (0, 0)),
+                                },
+                                processed_scope_keys_by_stage={
+                                    "scenes": processed_scene_scope_keys,
+                                    "rp": processed_rp_scope_keys,
+                                },
+                            )
+                        )
                         if bundle_scope_keys:
                             ready_scope_keys = set(
                                 after_readiness.get(
@@ -17482,6 +17547,11 @@ async def repair_character_chat_assets(
                                 | missing_scene_scope_keys
                                 | missing_rp_scope_keys
                             )
+                            if args.verbose or missing_scope_keys:
+                                print(
+                                    "[character-bundle-readiness] "
+                                    f"product_id={product_id} {readiness_diagnostic}"
+                                )
                             if missing_scope_keys:
                                 raise ValueError(
                                     "public main character asset bundle incomplete: "
@@ -17490,7 +17560,8 @@ async def repair_character_chat_assets(
                                     "missing_scene="
                                     f"{','.join(sorted(missing_scene_scope_keys)) or 'none'} "
                                     "missing_rp_current_generation="
-                                    f"{','.join(sorted(missing_rp_scope_keys)) or 'none'}"
+                                    f"{','.join(sorted(missing_rp_scope_keys)) or 'none'} "
+                                    f"diagnostic={readiness_diagnostic}"
                                 )
                     work_conn.commit()
 
@@ -18385,16 +18456,34 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                     new_inventory_map=capped_inventory_v3_map,
                                 )
                             )
+                            readiness_payload = dict(
+                                status_row.get("character_chat_asset_readiness")
+                                or {}
+                            )
                             ready_scope_keys = set(
-                                dict(
-                                    status_row.get(
-                                        "character_chat_asset_readiness"
-                                    )
-                                    or {}
-                                ).get("ready_main_protagonist_scope_keys")
+                                readiness_payload.get(
+                                    "ready_main_protagonist_scope_keys"
+                                )
                                 or []
                             )
-                            if (
+                            readiness_diagnostic = (
+                                build_character_bundle_readiness_diagnostic(
+                                    readiness=readiness_payload,
+                                    bundle_scope_keys=bundle_scope_keys,
+                                    stage_counts={
+                                        "signals": signal_counts,
+                                        "scenes": scene_counts,
+                                        "rp_profiles": rp_counts["profile"],
+                                        "rp_examples": rp_counts["examples"],
+                                    },
+                                    processed_scope_keys_by_stage={
+                                        "signals": processed_signal_scope_keys,
+                                        "scenes": processed_scene_scope_keys,
+                                        "rp": processed_rp_scope_keys,
+                                    },
+                                )
+                            )
+                            reset_requires_ready_main = bool(
                                 withdraw_summary_id
                                 or bool(
                                     getattr(
@@ -18403,20 +18492,32 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                         False,
                                     )
                                 )
-                            ) and not ready_scope_keys:
-                                raise ValueError(
-                                    "public main character asset bundle incomplete: "
-                                    "ready main protagonist missing"
-                                )
+                            ) and not ready_scope_keys
                             missing_scope_keys = (
                                 bundle_scope_keys - ready_scope_keys
                             ) | (
                                 bundle_scope_keys - processed_rp_scope_keys
                             )
+                            if (
+                                args.verbose
+                                or reset_requires_ready_main
+                                or missing_scope_keys
+                            ):
+                                print(
+                                    "[character-bundle-readiness] "
+                                    f"product_id={product_id} {readiness_diagnostic}"
+                                )
+                            if reset_requires_ready_main:
+                                raise ValueError(
+                                    "public main character asset bundle incomplete: "
+                                    "ready main protagonist missing "
+                                    f"diagnostic={readiness_diagnostic}"
+                                )
                             if missing_scope_keys:
                                 raise ValueError(
                                     "public main character asset bundle incomplete: "
-                                    f"missing_ready_scope_keys={','.join(sorted(missing_scope_keys))}"
+                                    f"missing_ready_scope_keys={','.join(sorted(missing_scope_keys))} "
+                                    f"diagnostic={readiness_diagnostic}"
                                 )
                         work_conn.commit()
                         results["inserted_episode_character_signals"] += signal_counts[0]
@@ -19056,24 +19157,46 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 cur,
                                 status_row,
                             )
+                            readiness_payload = dict(
+                                status_row.get("character_chat_asset_readiness")
+                                or {}
+                            )
                             ready_scope_keys = set(
-                                dict(
-                                    status_row.get(
-                                        "character_chat_asset_readiness"
-                                    )
-                                    or {}
-                                ).get("ready_main_protagonist_scope_keys")
+                                readiness_payload.get(
+                                    "ready_main_protagonist_scope_keys"
+                                )
                                 or []
+                            )
+                            readiness_diagnostic = (
+                                build_character_bundle_readiness_diagnostic(
+                                    readiness=readiness_payload,
+                                    bundle_scope_keys=bundle_scope_keys,
+                                    stage_counts={
+                                        "scenes": scene_counts,
+                                        "rp_profiles": tuple(rp_counts.get("profile") or (0, 0)),
+                                        "rp_examples": tuple(rp_counts.get("examples") or (0, 0)),
+                                    },
+                                    processed_scope_keys_by_stage={
+                                        "scenes": processed_scene_scope_keys,
+                                        "rp": processed_rp_scope_keys,
+                                    },
+                                )
                             )
                             missing_scope_keys = (
                                 bundle_scope_keys - ready_scope_keys
                             ) | (
                                 bundle_scope_keys - processed_rp_scope_keys
                             )
+                            if args.verbose or missing_scope_keys:
+                                print(
+                                    "[character-bundle-readiness] "
+                                    f"product_id={product_id} {readiness_diagnostic}"
+                                )
                             if missing_scope_keys:
                                 raise ValueError(
                                     "public main character asset bundle incomplete: "
-                                    f"missing_ready_scope_keys={','.join(sorted(missing_scope_keys))}"
+                                    f"missing_ready_scope_keys={','.join(sorted(missing_scope_keys))} "
+                                    f"diagnostic={readiness_diagnostic}"
                                 )
                         work_conn.commit()
                         results["delta_verifications"].append(delta_verification)
