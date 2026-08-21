@@ -58,6 +58,89 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Start DEV RDS staging lease
+        env:
+          DEV_RDS_INSTANCE_ID: "likenovel-dev"
+          DEV_RDS_WORK_TTL_TAG: "likenovel-dev-work-until-epoch"
+        run: |
+          set -euo pipefail
+
+          if [ "$DEV_RDS_INSTANCE_ID" != "likenovel-dev" ]; then
+            echo "[dev-rds] refusing non-DEV DB target: $DEV_RDS_INSTANCE_ID" >&2
+            exit 2
+          fi
+
+          region="${AWS_REGION:?AWS_REGION is required}"
+          arn="$(aws rds describe-db-instances \
+            --region "$region" \
+            --db-instance-identifier "$DEV_RDS_INSTANCE_ID" \
+            --query 'DBInstances[0].DBInstanceArn' \
+            --output text)"
+          current_deadline="$(aws rds list-tags-for-resource \
+            --region "$region" \
+            --resource-name "$arn" \
+            --query "TagList[?Key=='$DEV_RDS_WORK_TTL_TAG'].Value | [0]" \
+            --output text)"
+          deadline="$(( $(date -u '+%s') + 3600 ))"
+          if [[ "$current_deadline" =~ ^[0-9]+$ ]] && [ "$current_deadline" -gt "$deadline" ]; then
+            deadline="$current_deadline"
+          fi
+          aws rds add-tags-to-resource \
+            --region "$region" \
+            --resource-name "$arn" \
+            --tags "Key=$DEV_RDS_WORK_TTL_TAG,Value=$deadline"
+
+          status=""
+          start_requested=0
+          for _ in $(seq 1 120); do
+            status="$(aws rds describe-db-instances \
+              --region "$region" \
+              --db-instance-identifier "$DEV_RDS_INSTANCE_ID" \
+              --query 'DBInstances[0].DBInstanceStatus' \
+              --output text)"
+            case "$status" in
+              available)
+                echo "[dev-rds] likenovel-dev is already available"
+                break
+                ;;
+              stopped)
+                if [ "$start_requested" -eq 0 ]; then
+                  aws rds start-db-instance \
+                    --region "$region" \
+                    --db-instance-identifier "$DEV_RDS_INSTANCE_ID" >/dev/null
+                  start_requested=1
+                fi
+                ;;
+              starting|stopping)
+                echo "[dev-rds] waiting for $DEV_RDS_INSTANCE_ID current=$status"
+                ;;
+              *)
+                echo "[dev-rds] cannot start $DEV_RDS_INSTANCE_ID from status: $status" >&2
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+
+          if [ "$status" != "available" ]; then
+            echo "[dev-rds] timed out waiting for $DEV_RDS_INSTANCE_ID" >&2
+            exit 1
+          fi
+
+          current_deadline="$(aws rds list-tags-for-resource \
+            --region "$region" \
+            --resource-name "$arn" \
+            --query "TagList[?Key=='$DEV_RDS_WORK_TTL_TAG'].Value | [0]" \
+            --output text)"
+          deadline="$(( $(date -u '+%s') + 3600 ))"
+          if [[ "$current_deadline" =~ ^[0-9]+$ ]] && [ "$current_deadline" -gt "$deadline" ]; then
+            deadline="$current_deadline"
+          fi
+          aws rds add-tags-to-resource \
+            --region "$region" \
+            --resource-name "$arn" \
+            --tags "Key=$DEV_RDS_WORK_TTL_TAG,Value=$deadline"
+
       # ---------------------------------------------------------------------
       # Build env file (DO NOT COMMIT)
       # ---------------------------------------------------------------------

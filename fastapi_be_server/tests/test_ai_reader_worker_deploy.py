@@ -4,6 +4,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import textwrap
+import time
 import tomllib
 from pathlib import Path
 
@@ -492,6 +494,94 @@ def test_dev_workflow_waits_for_codedeploy_and_verifies_runtime():
     assert "BACKEND_ENV_DEV: ${{ secrets.BACKEND_ENV_DEV }}" in content
     assert 'printf \'%s\' "$BACKEND_ENV_DEV"' in content
     assert 'printf \'%s\' "${{ secrets.BACKEND_ENV_DEV }}"' not in content
+
+
+def test_dev_workflow_renews_dev_rds_lease_without_restarting_available_db():
+    workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions_dev.yml"
+    content = workflow.read_text(encoding="utf-8")
+
+    credentials_index = content.index("      - name: Configure AWS credentials")
+    lease_index = content.index("      - name: Start DEV RDS staging lease")
+    deploy_index = content.index("      - name: Deploy with AWS codedeploy (DEV)")
+    assert credentials_index < lease_index < deploy_index
+    assert 'DEV_RDS_INSTANCE_ID: "likenovel-dev"' in content
+    assert 'if [ "$DEV_RDS_INSTANCE_ID" != "likenovel-dev" ]; then' in content
+    assert "aws rds start-db-instance" in content
+    assert "stop-db-instance" not in content
+
+    section = content.split("      - name: Start DEV RDS staging lease\n", 1)[1]
+    run_block = section.split("        run: |\n", 1)[1].split("\n      #", 1)[0]
+    script = textwrap.dedent(run_block)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        bin_path = tmp_path / "bin"
+        bin_path.mkdir()
+        calls_path = tmp_path / "calls"
+        deadline_path = tmp_path / "deadline"
+        original_deadline = int(time.time()) + 7200
+        deadline_path.write_text(str(original_deadline), encoding="utf-8")
+
+        fake_aws = bin_path / "aws"
+        fake_aws.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import sys
+                from pathlib import Path
+
+                args = sys.argv[1:]
+                operation = args[1]
+                state = Path(os.environ["FAKE_AWS_STATE"])
+                with (state / "calls").open("a", encoding="utf-8") as calls:
+                    calls.write(operation + "\\n")
+
+                if operation == "describe-db-instances":
+                    query = args[args.index("--query") + 1]
+                    print(
+                        "arn:aws:rds:ap-northeast-2:992382709044:db:likenovel-dev"
+                        if query.endswith("DBInstanceArn")
+                        else "available"
+                    )
+                elif operation == "list-tags-for-resource":
+                    print((state / "deadline").read_text(encoding="utf-8"))
+                elif operation == "add-tags-to-resource":
+                    tag = args[args.index("--tags") + 1]
+                    (state / "deadline").write_text(tag.rsplit("Value=", 1)[1], encoding="utf-8")
+                elif operation == "start-db-instance":
+                    raise SystemExit(99)
+                else:
+                    raise SystemExit(f"unexpected operation: {operation}")
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_aws.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "AWS_REGION": "ap-northeast-2",
+                "DEV_RDS_INSTANCE_ID": "likenovel-dev",
+                "DEV_RDS_WORK_TTL_TAG": "likenovel-dev-work-until-epoch",
+                "FAKE_AWS_STATE": str(tmp_path),
+                "PATH": f"{bin_path}:{env['PATH']}",
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "likenovel-dev is already available" in result.stdout
+        assert "start-db-instance" not in calls_path.read_text(encoding="utf-8")
+        assert int(deadline_path.read_text(encoding="utf-8")) == original_deadline
 
 
 def test_dev_verify_script_checks_exact_release_process_port_and_health():
