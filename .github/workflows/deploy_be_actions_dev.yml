@@ -111,12 +111,8 @@ jobs:
                   start_requested=1
                 fi
                 ;;
-              starting|stopping)
-                echo "[dev-rds] waiting for $DEV_RDS_INSTANCE_ID current=$status"
-                ;;
               *)
-                echo "[dev-rds] cannot start $DEV_RDS_INSTANCE_ID from status: $status" >&2
-                exit 1
+                echo "[dev-rds] waiting for $DEV_RDS_INSTANCE_ID current=$status"
                 ;;
             esac
             sleep 10

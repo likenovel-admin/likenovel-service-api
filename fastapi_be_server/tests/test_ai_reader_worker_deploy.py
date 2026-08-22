@@ -539,18 +539,21 @@ def test_dev_workflow_renews_dev_rds_lease_without_restarting_available_db():
 
                 if operation == "describe-db-instances":
                     query = args[args.index("--query") + 1]
-                    print(
-                        "arn:aws:rds:ap-northeast-2:992382709044:db:likenovel-dev"
-                        if query.endswith("DBInstanceArn")
-                        else "available"
-                    )
+                    if query.endswith("DBInstanceArn"):
+                        print("arn:aws:rds:ap-northeast-2:992382709044:db:likenovel-dev")
+                    elif (state / "statuses").exists():
+                        statuses = (state / "statuses").read_text(encoding="utf-8").splitlines()
+                        print(statuses.pop(0))
+                        (state / "statuses").write_text("\\n".join(statuses), encoding="utf-8")
+                    else:
+                        print("available")
                 elif operation == "list-tags-for-resource":
                     print((state / "deadline").read_text(encoding="utf-8"))
                 elif operation == "add-tags-to-resource":
                     tag = args[args.index("--tags") + 1]
                     (state / "deadline").write_text(tag.rsplit("Value=", 1)[1], encoding="utf-8")
                 elif operation == "start-db-instance":
-                    raise SystemExit(99)
+                    pass
                 else:
                     raise SystemExit(f"unexpected operation: {operation}")
                 """
@@ -582,6 +585,32 @@ def test_dev_workflow_renews_dev_rds_lease_without_restarting_available_db():
         assert "likenovel-dev is already available" in result.stdout
         assert "start-db-instance" not in calls_path.read_text(encoding="utf-8")
         assert int(deadline_path.read_text(encoding="utf-8")) == original_deadline
+
+        calls_path.write_text("", encoding="utf-8")
+        (tmp_path / "statuses").write_text(
+            "stopped\nstarting\nrebooting\nconfiguring-enhanced-monitoring\navailable\n",
+            encoding="utf-8",
+        )
+        fake_sleep = bin_path / "sleep"
+        fake_sleep.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+        fake_sleep.chmod(0o755)
+
+        starting_result = subprocess.run(
+            ["bash", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+
+        assert starting_result.returncode == 0, (
+            starting_result.stdout + starting_result.stderr
+        )
+        calls = calls_path.read_text(encoding="utf-8").splitlines()
+        assert calls.count("start-db-instance") == 1
+        assert "current=rebooting" in starting_result.stdout
+        assert "current=configuring-enhanced-monitoring" in starting_result.stdout
 
 
 def test_dev_verify_script_checks_exact_release_process_port_and_health():
