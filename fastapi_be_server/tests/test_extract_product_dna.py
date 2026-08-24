@@ -588,14 +588,28 @@ class FakeConnection:
 
 
 class AiDnaProductTargetQueryTest(TestCase):
-    def test_first_episode_minimum_text_count_is_1000(self):
+    def test_first_open_episode_minimum_text_count_is_500(self):
         module = load_module()
         conn = FakeConnection()
 
         module.get_products(conn, force=True)
 
-        self.assertIn("fe.episode_text_count >= 1000", conn.last_cursor.sql)
-        self.assertNotIn("fe.episode_text_count >= 5000", conn.last_cursor.sql)
+        self.assertEqual(module.MIN_FIRST_EPISODE_TEXT_COUNT, 500)
+        self.assertIn("), 0) >= 500", conn.last_cursor.sql)
+        self.assertNotIn(">= 1000", conn.last_cursor.sql)
+
+    def test_first_episode_gate_uses_open_order_not_episode_no(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        module.get_products(conn, force=True)
+
+        sql = conn.last_cursor.sql
+        self.assertNotIn("fe.episode_no = 1", sql)
+        self.assertRegex(
+            sql,
+            r"fe\.open_yn = 'Y'[\s\S]+ORDER BY fe\.episode_no ASC, fe\.episode_id ASC[\s\S]+LIMIT 1",
+        )
 
     def test_success_refresh_waits_for_retry_cooldown(self):
         module = load_module()
@@ -605,8 +619,26 @@ class AiDnaProductTargetQueryTest(TestCase):
 
         self.assertRegex(
             conn.last_cursor.sql,
-            rf"analysis_status[^\n]+success[\s\S]+updated_date[\s\S]+INTERVAL\s+{module.INCOMPLETE_RETRY_COOLDOWN_DAYS}\s+DAY[\s\S]+episode_no\s*=\s*{module.MAX_ANALYZE_EPISODES}",
+            rf"analysis_status[^\n]+success[\s\S]+updated_date[\s\S]+INTERVAL\s+{module.INCOMPLETE_RETRY_COOLDOWN_DAYS}\s+DAY[\s\S]+LIMIT 1 OFFSET {module.MAX_ANALYZE_EPISODES - 1}",
         )
+
+    def test_success_refresh_tracks_tenth_open_episode(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        module.get_products(conn, force=False)
+
+        sql = conn.last_cursor.sql
+        self.assertNotIn(f"le.episode_no = {module.MAX_ANALYZE_EPISODES}", sql)
+        self.assertIn("le.open_yn = 'Y'", sql)
+
+    def test_episode_collection_has_stable_public_order(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        module.get_episodes(conn, product_id=1225)
+
+        self.assertIn("ORDER BY episode_no ASC, episode_id ASC", conn.last_cursor.sql)
 
     def test_save_dna_writes_axis_label_scores(self):
         module = load_module()
