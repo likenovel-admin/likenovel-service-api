@@ -31,6 +31,22 @@ router = APIRouter(prefix="/admins")
 
 
 @router.get(
+    "/main-character-slots/config",
+    tags=["CMS - 메인 주인공 카드"],
+    responses={200: {"description": "홈 주인공챗 구좌 노출 모드"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def main_character_slot_config(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.get_admin_main_character_slot_config(
+        db=db
+    )
+
+
+@router.get(
     "/main-character-slots",
     tags=["CMS - 메인 주인공 카드"],
     responses={200: {"description": "메인 주인공 카드 목록"}},

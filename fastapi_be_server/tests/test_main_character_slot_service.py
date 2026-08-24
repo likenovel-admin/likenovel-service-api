@@ -283,6 +283,17 @@ def test_main_character_slot_migration_and_model_follow_project_conventions():
     assert MainCharacterSlot.__tablename__ == "tb_main_character_slot"
 
 
+def test_main_character_slot_config_migration_defaults_to_auto_mode():
+    migration = (
+        ROOT / "dist/init/108-create-main-character-slot-config.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "CREATE TABLE IF NOT EXISTS tb_main_character_slot_config" in migration
+    assert "display_mode VARCHAR(10) NOT NULL DEFAULT 'auto'" in migration
+    assert "INSERT INTO tb_main_character_slot_config" in migration
+    assert "SELECT 1, 'auto'" in migration
+
+
 def test_practical_rp_assets_require_nonempty_examples_without_episode_window():
     from app.services.product.main_character_slot_service import (
         _chat_ready_rp_assets_predicate,
@@ -883,6 +894,7 @@ def test_public_character_catalog_image_query_uses_selected_cards_only():
     assert "slot_group.group_type = 'character'" in query
     assert "cover_group.group_type = 'cover'" in query
     assert "COALESCE(" in query
+    assert "AS hasCharacterImage" in query
     assert "GROUP BY selected.character_slot_id" in query
 
 
@@ -1002,12 +1014,152 @@ def test_catalog_hides_character_below_minimum_public_asset_bundle():
     result = filter_and_rank_public_character_catalog(candidates, scenes)
 
     assert [item["characterSlotId"] for item in result] == [4]
+def test_catalog_recommendation_prioritizes_character_image_assets_and_protagonists():
+    from app.services.product.main_character_slot_service import (
+        rank_public_character_catalog_items,
+    )
+
+    items = [
+        {
+            "characterSlotId": 4,
+            "productId": 4,
+            "cardOrder": 0,
+            "hasCharacterImage": False,
+            "fullReady": True,
+            "chatQuality": "good",
+            "characterRole": "main_protagonist",
+            "readinessCoverageRatio": 1.0,
+            "distinctEpisodeCount": 20,
+            "exampleCount": 8,
+            "sceneCount": 8,
+        },
+        {
+            "characterSlotId": 3,
+            "productId": 3,
+            "cardOrder": 0,
+            "hasCharacterImage": True,
+            "fullReady": True,
+            "chatQuality": "good",
+            "characterRole": "major_character",
+            "readinessCoverageRatio": 1.0,
+            "distinctEpisodeCount": 20,
+            "exampleCount": 8,
+            "sceneCount": 8,
+        },
+        {
+            "characterSlotId": 2,
+            "productId": 2,
+            "cardOrder": 0,
+            "hasCharacterImage": True,
+            "fullReady": True,
+            "chatQuality": "good",
+            "characterRole": "main_protagonist",
+            "readinessCoverageRatio": 0.8,
+            "distinctEpisodeCount": 10,
+            "exampleCount": 4,
+            "sceneCount": 5,
+        },
+        {
+            "characterSlotId": 1,
+            "productId": 1,
+            "cardOrder": 0,
+            "hasCharacterImage": True,
+            "fullReady": False,
+            "chatQuality": "good",
+            "characterRole": "main_protagonist",
+            "readinessCoverageRatio": 0.9,
+            "distinctEpisodeCount": 30,
+            "exampleCount": 10,
+            "sceneCount": 10,
+        },
+    ]
+
+    ranked = rank_public_character_catalog_items(items)
+
+    assert [item["characterSlotId"] for item in ranked] == [2, 3, 1, 4]
+    assert [item["cardOrder"] for item in ranked] == [1, 2, 3, 4]
+
+
+def test_auto_home_selection_randomizes_top_pool_without_displacing_real_images():
+    from app.services.product.main_character_slot_service import (
+        select_auto_main_character_slots,
+    )
+
+    items = [
+        {
+            "characterSlotId": index,
+            "productId": index,
+            "characterScopeKey": f"character:{index}",
+            "characterName": f"캐릭터 {index}",
+            "characterRole": "main_protagonist",
+            "characterImagePath": f"/character/{index}.webp" if index <= 15 else None,
+            "hasCharacterImage": index <= 15,
+            "cardOrder": index,
+            "productTitle": f"작품 {index}",
+            "authorNickname": "작가",
+            "syncedLatestEpisodeNo": 20,
+            "entryEpisodeNo": 1,
+        }
+        for index in range(1, 31)
+    ]
+
+    def reverse_sample(values, count):
+        return list(reversed(values))[:count]
+
+    selected = select_auto_main_character_slots(items, sample_items=reverse_sample)
+
+    assert len(selected) == 12
+    assert all(item["hasCharacterImage"] for item in selected)
+    assert [item["characterSlotId"] for item in selected] == list(range(15, 3, -1))
+    assert [item["cardOrder"] for item in selected] == list(range(1, 13))
+
+
+def test_public_home_auto_mode_selects_from_the_authoritative_catalog():
+    from app.services.product import main_character_slot_service
+
+    catalog_items = [
+        {
+            "characterSlotId": 7,
+            "cardOrder": 1,
+            "hasCharacterImage": True,
+        }
+    ]
+    db = AsyncMock()
+    with (
+        patch.object(
+            main_character_slot_service,
+            "get_main_character_slot_display_mode",
+            new_callable=AsyncMock,
+            return_value="auto",
+        ),
+        patch.object(
+            main_character_slot_service,
+            "get_public_character_catalog",
+            new_callable=AsyncMock,
+            return_value={"data": catalog_items},
+        ) as get_catalog,
+    ):
+        response = asyncio.run(
+            main_character_slot_service.get_public_main_character_slots(
+                adult_yn="N",
+                db=db,
+            )
+        )
+
+    get_catalog.assert_awaited_once_with(
+        adult_yn="N",
+        kc_user_id=None,
+        db=db,
+    )
+    assert response == {"data": catalog_items}
+    db.execute.assert_not_awaited()
 
 
 def test_main_character_slot_request_schema_enforces_optional_period_contract():
     from app.schemas.admin import (
         PostMainCharacterSlotReqBody,
         PutMainCharacterSlotReqBody,
+        PutMainCharacterSlotConfigReqBody,
     )
 
     req = PostMainCharacterSlotReqBody(
@@ -1040,6 +1192,13 @@ def test_main_character_slot_request_schema_enforces_optional_period_contract():
         publish_start_at="2026-07-11T12:00:00+09:00",
     )
     assert update_req.character_image_file_id is None
+    assert (
+        PutMainCharacterSlotConfigReqBody(display_mode="auto").display_mode
+        == "auto"
+    )
+
+    with pytest.raises(ValueError):
+        PutMainCharacterSlotConfigReqBody(display_mode="random")
 
     with pytest.raises(ValueError):
         PostMainCharacterSlotReqBody(
@@ -1064,6 +1223,52 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         from app.services.product import main_character_slot_service
 
         main_character_slot_service._reset_public_character_catalog_cache()
+
+    async def test_display_mode_defaults_to_auto_and_preserves_manual(self):
+        from app.services.product import main_character_slot_service
+
+        result = MagicMock()
+        result.mappings.return_value.one_or_none.side_effect = [
+            None,
+            {"displayMode": "manual"},
+        ]
+        db = AsyncMock()
+        db.execute.return_value = result
+
+        assert (
+            await main_character_slot_service.get_main_character_slot_display_mode(
+                db=db
+            )
+            == "auto"
+        )
+        assert (
+            await main_character_slot_service.get_main_character_slot_display_mode(
+                db=db
+            )
+            == "manual"
+        )
+
+    async def test_admin_can_persist_the_main_character_slot_display_mode(self):
+        from app.schemas.admin import PutMainCharacterSlotConfigReqBody
+        from app.services.product import main_character_slot_service
+
+        db = AsyncMock()
+        response = (
+            await main_character_slot_service.update_admin_main_character_slot_config(
+                req_body=PutMainCharacterSlotConfigReqBody(display_mode="manual"),
+                admin_user_id=7,
+                db=db,
+            )
+        )
+
+        executed_sql = str(db.execute.await_args.args[0])
+        assert "INSERT INTO tb_main_character_slot_config" in executed_sql
+        assert "ON DUPLICATE KEY UPDATE" in executed_sql
+        assert db.execute.await_args.args[1] == {
+            "display_mode": "manual",
+            "admin_user_id": 7,
+        }
+        assert response == {"data": {"displayMode": "manual"}}
 
     @staticmethod
     def _catalog_base_db():
@@ -1119,7 +1324,11 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         ]
         image_result = MagicMock()
         image_result.mappings.return_value.all.return_value = [
-            {"characterSlotId": 1, "characterImagePath": "/cover.webp"}
+            {
+                "characterSlotId": 1,
+                "characterImagePath": "/cover.webp",
+                "hasCharacterImage": 0,
+            }
         ]
         db = AsyncMock()
         db.execute.side_effect = [
@@ -1502,15 +1711,21 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             SQLAlchemyError("entry episode lookup failed"),
         ]
 
-        with self.assertLogs(
-            main_character_slot_service.logger.name,
-            level="ERROR",
+        with (
+            patch.object(
+                main_character_slot_service,
+                "get_main_character_slot_display_mode",
+                new_callable=AsyncMock,
+                return_value="manual",
+            ),
+            self.assertLogs(
+                main_character_slot_service.logger.name,
+                level="ERROR",
+            ),
         ):
-            response = (
-                await main_character_slot_service.get_public_main_character_slots(
-                    adult_yn="N",
-                    db=db,
-                )
+            response = await main_character_slot_service.get_public_main_character_slots(
+                adult_yn="N",
+                db=db,
             )
 
         assert response == {
@@ -1556,10 +1771,16 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         db = AsyncMock()
         db.execute.side_effect = [slot_result, scene_result]
 
-        response = await main_character_slot_service.get_public_main_character_slots(
-            adult_yn="N",
-            db=db,
-        )
+        with patch.object(
+            main_character_slot_service,
+            "get_main_character_slot_display_mode",
+            new_callable=AsyncMock,
+            return_value="manual",
+        ):
+            response = await main_character_slot_service.get_public_main_character_slots(
+                adult_yn="N",
+                db=db,
+            )
 
         assert db.execute.await_count == 2
         assert json.loads(db.execute.await_args_list[1].args[1]["candidate_json"]) == [
@@ -1683,6 +1904,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "publishEndAt": None,
                     "cardOrder": 1,
                     "characterImagePath": "/cover.webp",
+                    "hasCharacterImage": False,
                     "fullReady": False,
                     "readinessCoverageRatio": 0.75,
                     "distinctEpisodeCount": 12,
@@ -1756,8 +1978,16 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         ]
         image_result = MagicMock()
         image_result.mappings.return_value.all.return_value = [
-            {"characterSlotId": 1, "characterImagePath": "/one.webp"},
-            {"characterSlotId": 2, "characterImagePath": "/two.webp"},
+            {
+                "characterSlotId": 1,
+                "characterImagePath": "/one.webp",
+                "hasCharacterImage": 1,
+            },
+            {
+                "characterSlotId": 2,
+                "characterImagePath": "/two.webp",
+                "hasCharacterImage": 1,
+            },
         ]
         progress_result = MagicMock()
         progress_result.mappings.return_value.all.return_value = [
@@ -1807,28 +2037,6 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert response == {
             "data": [
                 {
-                    "characterSlotId": 2,
-                    "productId": 1192,
-                    "characterScopeKey": "character:other",
-                    "characterRole": "main_protagonist",
-                    "productTitle": None,
-                    "authorNickname": None,
-                    "syncedLatestEpisodeNo": 6,
-                    "entryEpisodeNo": 3,
-                    "publishStartAt": None,
-                    "publishEndAt": None,
-                    "cardOrder": 1,
-                    "characterImagePath": "/two.webp",
-                    "fullReady": False,
-                    "readinessCoverageRatio": 0.5,
-                    "distinctEpisodeCount": 10,
-                    "exampleCount": 4,
-                    "sceneCount": 5,
-                    "chatQuality": "good",
-                    "lastViewedEpisodeNo": None,
-                    "lastViewedAt": None,
-                },
-                {
                     "characterSlotId": 1,
                     "productId": 1182,
                     "characterScopeKey": "character:adelite",
@@ -1839,8 +2047,9 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "entryEpisodeNo": 2,
                     "publishStartAt": None,
                     "publishEndAt": None,
-                    "cardOrder": 2,
+                    "cardOrder": 1,
                     "characterImagePath": "/one.webp",
+                    "hasCharacterImage": True,
                     "fullReady": True,
                     "readinessCoverageRatio": 1.0,
                     "distinctEpisodeCount": 8,
@@ -1849,6 +2058,29 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "chatQuality": "normal",
                     "lastViewedEpisodeNo": 17,
                     "lastViewedAt": "2026-07-22 12:34:56",
+                },
+                {
+                    "characterSlotId": 2,
+                    "productId": 1192,
+                    "characterScopeKey": "character:other",
+                    "characterRole": "main_protagonist",
+                    "productTitle": None,
+                    "authorNickname": None,
+                    "syncedLatestEpisodeNo": 6,
+                    "entryEpisodeNo": 3,
+                    "publishStartAt": None,
+                    "publishEndAt": None,
+                    "cardOrder": 2,
+                    "characterImagePath": "/two.webp",
+                    "hasCharacterImage": True,
+                    "fullReady": False,
+                    "readinessCoverageRatio": 0.5,
+                    "distinctEpisodeCount": 10,
+                    "exampleCount": 4,
+                    "sceneCount": 5,
+                    "chatQuality": "good",
+                    "lastViewedEpisodeNo": None,
+                    "lastViewedAt": None,
                 },
             ]
         }
@@ -2499,6 +2731,9 @@ def test_main_character_slot_router_service_model_schema_imports_and_routes():
         route.path for route in main_query.router.routes
     }
     assert "/admins/main-character-slots" in {route.path for route in admin_query.router.routes}
+    assert "/admins/main-character-slots/config" in {
+        route.path for route in admin_query.router.routes
+    }
     assert "/admins/main-character-slots/products" in {
         route.path for route in admin_query.router.routes
     }
@@ -2506,6 +2741,9 @@ def test_main_character_slot_router_service_model_schema_imports_and_routes():
         route.path for route in admin_query.router.routes
     }
     assert "/admins/main-character-slots" in {route.path for route in admin_command.router.routes}
+    assert "/admins/main-character-slots/config" in {
+        route.path for route in admin_command.router.routes
+    }
 
 
 def test_build_character_chat_preview_uses_matching_scene_and_source_chunk():
