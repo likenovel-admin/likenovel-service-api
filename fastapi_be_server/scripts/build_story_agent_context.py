@@ -154,7 +154,7 @@ class CharacterIdentityReviewStaleError(ValueError):
         self.operation_ids = (operation_id,)
         self.reason_codes = (reason_code,)
 RELATION_INVENTORY_FORMAT_VERSION = "relation_inventory_v1"
-CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v3"
+CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v4"
 CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
 CHARACTER_CHAT_INTERNAL_PROMPT_FORMAT_VERSION = "character_chat_internal_prompt_v1"
 CHARACTER_CHAT_OPENING_FORMAT_VERSION = "character_chat_opening_v1"

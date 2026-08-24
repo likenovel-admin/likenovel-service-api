@@ -542,6 +542,36 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ),
         )
 
+    def test_strict_rp_profile_contract_invalidates_v3_source_hash(self):
+        module = load_module()
+        kwargs = {
+            "character_key": "character:김도윤",
+            "inventory_item": {
+                "canonical_character_key": "character:김도윤",
+                "display_name": "김도윤",
+                "is_protagonist": True,
+            },
+            "dialogue_items": [
+                {"episode_no": 1, "text": "내가 직접 확인하겠습니다."},
+            ],
+            "summary_context_lines": ["[1화] 김도윤이 단서를 확인한다."],
+            "relation_context_lines": [],
+        }
+
+        current_hash = module.build_rp_profile_source_hash(**kwargs)
+        with patch.object(
+            module,
+            "CHARACTER_RP_PROFILE_FORMAT_VERSION",
+            "character_rp_profile_v3",
+        ):
+            legacy_hash = module.build_rp_profile_source_hash(**kwargs)
+
+        self.assertEqual(
+            module.CHARACTER_RP_PROFILE_FORMAT_VERSION,
+            "character_rp_profile_v4",
+        )
+        self.assertNotEqual(current_hash, legacy_hash)
+
     async def test_full_apply_preflight_reserve_is_deferred_before_product_lock(self):
         module = load_module()
         client = FakeCreditAsyncClient(total_credits=20.0, total_usage=17.01)
