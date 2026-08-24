@@ -954,14 +954,27 @@ class AiDnaLibrarianCopyTest(TestCase):
     def test_banned_words_demote_to_none_not_failure(self):
         result = self.module._normalize_librarian({
             "librarian": {
-                "intro": "성장 서사가 강하게 깔린 작품이에요.",
-                "points": ["이 결이 좋아요.", "축으로 움직여요.", "정상 문장이에요."],
-                "chips": ["먼치킨", "서사", "텍스트", "회귀"],
+                "intro": "이야기의 결이 선명한 작품이에요.",
+                "points": [
+                    "성장의 축으로 움직여요.",
+                    "주인공은 개발자예요.",
+                    "코미디를 좋아하면 어울려요.",
+                ],
+                "chips": ["서사", "동력", "몰입감", "텍스트"],
             }
         })
-        self.assertIsNone(result["librarian_intro"])  # 서사 포함
-        self.assertIsNone(result["librarian_points"])  # 결이/축으로 포함
-        self.assertEqual(result["librarian_chips"], ["먼치킨", "회귀"])  # 금칙 칩만 제거
+        self.assertIsNone(result["librarian_intro"])  # 결이 포함
+        self.assertIsNone(result["librarian_points"])  # 축으로 포함
+        self.assertEqual(result["librarian_chips"], ["서사", "동력", "몰입감"])  # 텍스트만 제거
+
+    def test_editorial_terms_are_not_librarian_banned_words(self):
+        banned_rule = next(
+            line for line in self.module.DNA_SYSTEM_PROMPT.splitlines() if "14-2) 금칙어:" in line
+        )
+        for word in ("서사", "동력", "몰입감"):
+            self.assertNotIn(f'"{word}"', banned_rule)
+        for text in ("서사가 탄탄해요.", "성장의 동력이 분명해요.", "몰입감이 좋아요."):
+            self.assertIsNone(self.module._LIBRARIAN_BANNED_RE.search(text), text)
 
     def test_banned_re_does_not_flag_normal_words(self):
         # 결혼/대결/축제 같은 정상 단어는 오탐하지 않는다

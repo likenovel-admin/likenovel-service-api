@@ -49,6 +49,17 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
             ["intro", "points", "chips"],
         )
 
+    def test_librarian_filter_allows_editorial_terms_and_keeps_other_bans(self):
+        prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
+        banned_rule = next(line for line in prompt.splitlines() if "23-2) 금칙어:" in line)
+
+        for word in ("서사", "동력", "몰입감"):
+            self.assertNotIn(f'"{word}"', banned_rule)
+        for text in ("서사가 탄탄해요.", "성장의 동력이 분명해요.", "몰입감이 좋아요."):
+            self.assertIsNone(admin_ai_metadata_service._LIBRARIAN_BANNED_RE.search(text), text)
+        for text in ("이야기의 결이 좋아요.", "성장이 중심축으로 움직여요.", "텍스트를 분석해요."):
+            self.assertIsNotNone(admin_ai_metadata_service._LIBRARIAN_BANNED_RE.search(text), text)
+
     def test_reanalyze_upsert_persists_librarian_columns(self):
         source = inspect.getsource(admin_ai_metadata_service.reanalyze_ai_product_metadata)
 
