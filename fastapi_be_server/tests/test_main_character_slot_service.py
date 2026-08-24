@@ -793,7 +793,7 @@ def test_catalog_uses_first_character_scene_as_entry_episode(
     scene_rows, expected_entry_episode_no,
 ):
     from app.services.product.main_character_slot_service import (
-        filter_and_rank_public_character_catalog,
+        filter_public_character_catalog_candidates,
     )
 
     candidates = [
@@ -808,7 +808,7 @@ def test_catalog_uses_first_character_scene_as_entry_episode(
         }
     ]
 
-    result = filter_and_rank_public_character_catalog(candidates, [scene_rows])
+    result = filter_public_character_catalog_candidates(candidates, [scene_rows])
 
     assert result[0]["entryEpisodeNo"] == expected_entry_episode_no
 
@@ -824,7 +824,7 @@ def test_catalog_uses_first_character_scene_as_entry_episode(
 )
 def test_catalog_rejects_missing_or_unsynced_entry_episode(scene_rows):
     from app.services.product.main_character_slot_service import (
-        filter_and_rank_public_character_catalog,
+        filter_public_character_catalog_candidates,
     )
 
     candidates = [
@@ -837,7 +837,7 @@ def test_catalog_rejects_missing_or_unsynced_entry_episode(scene_rows):
         }
     ]
 
-    assert filter_and_rank_public_character_catalog(candidates, scene_rows) == []
+    assert filter_public_character_catalog_candidates(candidates, scene_rows) == []
 
 
 def test_catalog_scene_candidates_include_runtime_compatible_inventory_aliases():
@@ -894,13 +894,13 @@ def test_public_character_catalog_image_query_uses_selected_cards_only():
     assert "slot_group.group_type = 'character'" in query
     assert "cover_group.group_type = 'cover'" in query
     assert "COALESCE(" in query
-    assert "AS hasCharacterImage" in query
+    assert "AS hasCharacterImage" not in query
     assert "GROUP BY selected.character_slot_id" in query
 
 
-def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
+def test_catalog_candidate_filter_keeps_supported_roles_and_valid_scenes():
     from app.services.product.main_character_slot_service import (
-        filter_and_rank_public_character_catalog,
+        filter_public_character_catalog_candidates,
     )
 
     candidates = [
@@ -944,7 +944,7 @@ def test_catalog_python_ranking_keeps_protagonist_and_top_two_per_product():
         {"characterSlotId": 3, "sceneCount": 2, "entryEpisodeNo": 3},
     ]
 
-    result = filter_and_rank_public_character_catalog(candidates, scenes)
+    result = filter_public_character_catalog_candidates(candidates, scenes)
 
     assert {item["characterSlotId"] for item in result} == {1, 2}
     assert {
@@ -1024,7 +1024,7 @@ def test_catalog_recommendation_prioritizes_character_image_assets_and_protagoni
             "characterSlotId": 4,
             "productId": 4,
             "cardOrder": 0,
-            "hasCharacterImage": False,
+            "characterImagePath": "/images/default-cover.png",
             "fullReady": True,
             "chatQuality": "good",
             "characterRole": "main_protagonist",
@@ -1037,7 +1037,7 @@ def test_catalog_recommendation_prioritizes_character_image_assets_and_protagoni
             "characterSlotId": 3,
             "productId": 3,
             "cardOrder": 0,
-            "hasCharacterImage": True,
+            "characterImagePath": "/covers/3.webp",
             "fullReady": True,
             "chatQuality": "good",
             "characterRole": "major_character",
@@ -1050,7 +1050,7 @@ def test_catalog_recommendation_prioritizes_character_image_assets_and_protagoni
             "characterSlotId": 2,
             "productId": 2,
             "cardOrder": 0,
-            "hasCharacterImage": True,
+            "characterImagePath": "/characters/2.webp",
             "fullReady": True,
             "chatQuality": "good",
             "characterRole": "main_protagonist",
@@ -1063,7 +1063,7 @@ def test_catalog_recommendation_prioritizes_character_image_assets_and_protagoni
             "characterSlotId": 1,
             "productId": 1,
             "cardOrder": 0,
-            "hasCharacterImage": True,
+            "characterImagePath": "/covers/1.webp",
             "fullReady": False,
             "chatQuality": "good",
             "characterRole": "main_protagonist",
@@ -1078,6 +1078,52 @@ def test_catalog_recommendation_prioritizes_character_image_assets_and_protagoni
 
     assert [item["characterSlotId"] for item in ranked] == [2, 3, 1, 4]
     assert [item["cardOrder"] for item in ranked] == [1, 2, 3, 4]
+    assert [item["hasCharacterImage"] for item in ranked] == [True, True, True, False]
+
+
+def test_catalog_applies_recommendation_priority_before_per_product_limit():
+    from app.services.product.main_character_slot_service import (
+        finalize_public_character_catalog_items,
+    )
+
+    shared = {
+        "productId": 10,
+        "cardOrder": 0,
+        "fullReady": True,
+        "chatQuality": "good",
+        "readinessCoverageRatio": 1.0,
+        "exampleCount": 8,
+        "sceneCount": 8,
+    }
+    items = [
+        {
+            **shared,
+            "characterSlotId": 1,
+            "characterImagePath": "/images/default-cover.png",
+            "characterRole": "main_protagonist",
+            "distinctEpisodeCount": 10,
+        },
+        {
+            **shared,
+            "characterSlotId": 2,
+            "characterImagePath": "ESokN0lzSgG0um4rn4tBeg/cover.webp",
+            "characterRole": "major_character",
+            "distinctEpisodeCount": 20,
+        },
+        {
+            **shared,
+            "characterSlotId": 3,
+            "characterImagePath": "/covers/real.webp",
+            "characterRole": "major_character",
+            "distinctEpisodeCount": 5,
+        },
+    ]
+
+    result = finalize_public_character_catalog_items(items)
+
+    assert [item["characterSlotId"] for item in result] == [3, 1]
+    assert [item["cardOrder"] for item in result] == [1, 2]
+    assert [item["hasCharacterImage"] for item in result] == [True, False]
 
 
 def test_auto_home_selection_randomizes_top_pool_without_displacing_real_images():
@@ -1327,7 +1373,6 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             {
                 "characterSlotId": 1,
                 "characterImagePath": "/cover.webp",
-                "hasCharacterImage": 0,
             }
         ]
         db = AsyncMock()
@@ -1389,17 +1434,18 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "characterSlotId": slot_id,
                     "productId": product_id,
                     "characterScopeKey": f"character:{slot_id}",
-                    "_distinctEpisodeCount": 10,
+                    "_distinctEpisodeCount": distinct_episode_count,
                     "_exampleCount": example_count,
                     "_inventorySummaryText": (
                         '{"work_role":"main_protagonist"}'
                     ),
                     "_isProtagonist": 1,
                 }
-                for slot_id, product_id, example_count in [
-                    (11, 1, threshold + 1),
-                    (12, 1, threshold + 1),
-                    (21, 2, threshold - 1),
+                for slot_id, product_id, distinct_episode_count, example_count in [
+                    (11, 1, 10, threshold + 1),
+                    (12, 1, 10, threshold + 1),
+                    (13, 1, 9, threshold + 1),
+                    (21, 2, 10, threshold - 1),
                 ]
             ]
         )
@@ -1429,16 +1475,20 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "sceneCount": 5,
                     "entryEpisodeNo": 1,
                 }
-                for slot_id in [11, 12, 21, 22]
+                for slot_id in [11, 12, 13, 21, 22]
             ]
         )
         image_result = result(
             [
                 {
                     "characterSlotId": slot_id,
-                    "characterImagePath": f"/{slot_id}.webp",
+                    "characterImagePath": (
+                        f"/{slot_id}.webp"
+                        if slot_id in {13, 21, 22}
+                        else "/images/default-cover.png"
+                    ),
                 }
-                for slot_id in [11, 12, 21, 22]
+                for slot_id in [11, 12, 13, 21, 22]
             ]
         )
         db = AsyncMock()
@@ -1461,11 +1511,17 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert db.execute.await_count == 6
         assert db.execute.await_args_list[3].args[1]["product_ids"] == [2]
         assert {
+            item["characterSlotId"]
+            for item in json.loads(
+                db.execute.await_args_list[5].args[1]["selected_json"]
+            )
+        } == {11, 12, 13, 21, 22}
+        assert {
             (item["characterSlotId"], item["productId"], item["exampleCount"])
             for item in catalog_items
         } == {
             (11, 1, threshold + 1),
-            (12, 1, threshold + 1),
+            (13, 1, threshold + 1),
             (21, 2, 9),
             (22, 2, 7),
         }
@@ -1904,7 +1960,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                     "publishEndAt": None,
                     "cardOrder": 1,
                     "characterImagePath": "/cover.webp",
-                    "hasCharacterImage": False,
+                    "hasCharacterImage": True,
                     "fullReady": False,
                     "readinessCoverageRatio": 0.75,
                     "distinctEpisodeCount": 12,
