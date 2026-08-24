@@ -7882,6 +7882,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("e.price_type", target_sql)
         self.assertIn("e_next.price_type", target_sql)
         self.assertIn("p.paid_episode_no", target_sql)
+        self.assertIn("recent_ai_view_count", target_sql)
+        self.assertIn("ps.read_episode_count", target_sql)
         self.assertIn("order by e_next.episode_no, e_next.episode_id", target_sql)
         self.assertIn("limit 1", target_sql)
 
@@ -8059,6 +8061,188 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         }
 
         self.assertTrue(selected_product_ids - {100})
+
+    def test_reader_candidate_choice_avoids_recently_overexposed_new_product(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        popular_match = {
+            "product_id": 100,
+            "title": "최근 AI 노출이 몰린 취향 후보",
+            "count_hit": 100,
+            "recent_ai_view_count": 6000,
+            "protagonist_type_tags": '["성장형"]',
+            "protagonist_job_tags": '["헌터"]',
+            "protagonist_material_tags": '["상태창"]',
+            "worldview_tags": '["현대"]',
+            "axis_style_tags": '["빠른전개"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "탑등반",
+            "ai_reader_product_state_id": None,
+        }
+        underexposed_rows = [
+            {
+                **popular_match,
+                "product_id": product_id,
+                "title": f"최근 AI 노출이 적은 후보 {product_id}",
+                "count_hit": 10,
+                "recent_ai_view_count": 0,
+            }
+            for product_id in range(200, 215)
+        ]
+        persona = {
+            "novelty_seeking": 0.15,
+            "initial_axis_bias": {
+                "세": {"현대": 0.9},
+                "직": {"헌터": 0.9},
+                "능": {"상태창": 0.9},
+                "연": {},
+                "작": {"빠른전개": 0.9},
+                "타": {"성장형": 0.9},
+                "목": {"탑등반": 0.9},
+            },
+        }
+
+        selected_product_ids = {
+            service._choose_reader_candidate(
+                [popular_match, *underexposed_rows],
+                persona=persona,
+                taste_factors=[],
+                session=service.ReaderClaimedSession(
+                    ai_reader_schedule_id=agent_id,
+                    ai_reader_agent_id=agent_id,
+                    user_id=3000 + agent_id,
+                    age_group="30s",
+                    gender="X",
+                    persona_json="{}",
+                    taste_memory_json="{}",
+                    activity_pattern_json="{}",
+                ),
+            )["product_id"]
+            for agent_id in range(1, 51)
+        }
+
+        self.assertNotIn(100, selected_product_ids)
+        self.assertGreaterEqual(len(selected_product_ids), 5)
+
+    def test_reader_candidate_choice_periodically_explores_new_product(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        continuing_row = {
+            "product_id": 100,
+            "title": "읽던 작품",
+            "count_hit": 10,
+            "recent_ai_view_count": 100,
+            "read_episode_count": 4,
+            "protagonist_type_tags": '["성장형"]',
+            "protagonist_job_tags": '["헌터"]',
+            "protagonist_material_tags": '["상태창"]',
+            "worldview_tags": '["현대"]',
+            "axis_style_tags": '["빠른전개"]',
+            "axis_romance_tags": "[]",
+            "protagonist_goal_primary": "탑등반",
+            "ai_reader_product_state_id": 1,
+        }
+        new_row = {
+            **continuing_row,
+            "product_id": 200,
+            "title": "새 작품",
+            "recent_ai_view_count": 0,
+            "read_episode_count": 0,
+            "ai_reader_product_state_id": None,
+        }
+        persona = {"novelty_seeking": 0.45}
+
+        selected_product_ids = [
+            service._choose_reader_candidate(
+                [continuing_row, new_row],
+                persona=persona,
+                taste_factors=[],
+                session=service.ReaderClaimedSession(
+                    ai_reader_schedule_id=schedule_id,
+                    ai_reader_agent_id=1,
+                    user_id=1,
+                    age_group="30s",
+                    gender="X",
+                    persona_json="{}",
+                    taste_memory_json="{}",
+                    activity_pattern_json="{}",
+                ),
+            )["product_id"]
+            for schedule_id in range(1, 101)
+        ]
+
+        self.assertEqual(set(selected_product_ids), {100, 200})
+        self.assertGreaterEqual(selected_product_ids.count(200), 35)
+        self.assertLessEqual(selected_product_ids.count(200), 55)
+
+    def test_reader_candidate_choice_broadens_new_product_pool(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        matching_rows = [
+            {
+                "product_id": product_id,
+                "title": f"취향 일치 후보 {product_id}",
+                "count_hit": 10,
+                "recent_ai_view_count": 0,
+                "protagonist_type_tags": '["성장형"]',
+                "protagonist_job_tags": '["헌터"]',
+                "protagonist_material_tags": '["상태창"]',
+                "worldview_tags": '["현대"]',
+                "axis_style_tags": '["빠른전개"]',
+                "axis_romance_tags": "[]",
+                "protagonist_goal_primary": "탑등반",
+                "ai_reader_product_state_id": None,
+            }
+            for product_id in range(1, 21)
+        ]
+        discovery_rows = [
+            {
+                **matching_rows[0],
+                "product_id": product_id,
+                "title": f"새 발견 후보 {product_id}",
+                "protagonist_type_tags": "[]",
+                "protagonist_job_tags": "[]",
+                "protagonist_material_tags": "[]",
+                "worldview_tags": "[]",
+                "axis_style_tags": "[]",
+                "protagonist_goal_primary": None,
+            }
+            for product_id in range(21, 41)
+        ]
+        persona = {
+            "novelty_seeking": 0.45,
+            "initial_axis_bias": {
+                "세": {"현대": 0.9},
+                "직": {"헌터": 0.9},
+                "능": {"상태창": 0.9},
+                "연": {},
+                "작": {"빠른전개": 0.9},
+                "타": {"성장형": 0.9},
+                "목": {"탑등반": 0.9},
+            },
+        }
+
+        selected_product_ids = {
+            service._choose_reader_candidate(
+                [*matching_rows, *discovery_rows],
+                persona=persona,
+                taste_factors=[],
+                session=service.ReaderClaimedSession(
+                    ai_reader_schedule_id=schedule_id,
+                    ai_reader_agent_id=schedule_id,
+                    user_id=4000 + schedule_id,
+                    age_group="30s",
+                    gender="X",
+                    persona_json="{}",
+                    taste_memory_json="{}",
+                    activity_pattern_json="{}",
+                ),
+            )["product_id"]
+            for schedule_id in range(1, 401)
+        }
+
+        self.assertGreaterEqual(len(selected_product_ids), 25)
+        self.assertTrue(selected_product_ids & set(range(21, 41)))
 
     def test_reader_candidate_choice_keeps_reading_state_even_for_high_novelty_agent(self):
         from app.services.ai import reader_agent_session_service as service

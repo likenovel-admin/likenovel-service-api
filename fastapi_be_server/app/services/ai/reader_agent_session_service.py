@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
@@ -82,6 +83,10 @@ BAYESIAN_CONTINUE_SUGGEST_THRESHOLD = 0.50
 BAYESIAN_RECOMMEND_SUGGEST_THRESHOLD = 0.55
 BAYESIAN_EVALUATE_SUGGEST_THRESHOLD = 0.55
 POPULARITY_SCORE_WEIGHT = 0.18
+BASE_NEW_PRODUCT_EXPLORATION_RATE = 0.35
+NOVELTY_NEW_PRODUCT_EXPLORATION_RATE = 0.20
+MIN_NEW_PRODUCT_EXPLORATION_READ_EPISODES = 3
+RECENT_AI_VIEW_SCORE_PENALTY_WEIGHT = 0.10
 DEFAULT_PRODUCT_TYPE_WEIGHTS = {
     "free_serial": 100,
     "paid_serial": 0,
@@ -1382,6 +1387,8 @@ async def _select_reader_target_episode(
                  , m.axis_style_tags
                  , m.axis_romance_tags
                  , ps.ai_reader_product_state_id
+                 , ps.read_episode_count
+                 , coalesce(recent_ai.recent_ai_view_count, 0) as recent_ai_view_count
               from tb_product p
               join tb_product_ai_metadata m
                 on m.product_id = p.product_id
@@ -1390,6 +1397,14 @@ async def _select_reader_target_episode(
               left join tb_ai_reader_product_state ps
                 on ps.ai_reader_agent_id = :ai_reader_agent_id
                and ps.product_id = p.product_id
+              left join (
+                    select product_id
+                         , sum(ai_view_count) as recent_ai_view_count
+                      from tb_ai_reader_public_metric_daily
+                     where stat_date >= date_sub(current_date, interval 6 day)
+                     group by product_id
+              ) recent_ai
+                on recent_ai.product_id = p.product_id
              where p.open_yn = 'Y'
                and coalesce(p.blind_yn, 'N') = 'N'
                and e.use_yn = 'Y'
@@ -1531,7 +1546,18 @@ def _score_reader_candidate(
         min(float(row.get("count_hit") or 0) / 100000.0, 1.0)
         * POPULARITY_SCORE_WEIGHT
     )
-    return state_score + persona_score + taste_score + popularity_score
+    recent_ai_view_penalty = 0.0
+    if not row.get("ai_reader_product_state_id"):
+        recent_ai_view_penalty = math.log1p(
+            max(0.0, _safe_float(row.get("recent_ai_view_count"), 0.0))
+        ) * RECENT_AI_VIEW_SCORE_PENALTY_WEIGHT
+    return (
+        state_score
+        + persona_score
+        + taste_score
+        + popularity_score
+        - recent_ai_view_penalty
+    )
 
 
 def _choose_reader_candidate(
@@ -1545,6 +1571,7 @@ def _choose_reader_candidate(
         raise InvalidReaderSessionError("no readable target episode")
 
     continuing_rows = [row for row in rows if row.get("ai_reader_product_state_id")]
+    new_rows = [row for row in rows if not row.get("ai_reader_product_state_id")]
 
     def ranking(row: dict[str, Any], *, jitter_scale: float) -> float:
         base_score = _score_reader_candidate(
@@ -1554,9 +1581,17 @@ def _choose_reader_candidate(
         )
         return base_score + _stable_reader_candidate_jitter(session, row) * jitter_scale
 
-    if continuing_rows:
+    if continuing_rows and (
+        not new_rows
+        or not _should_explore_new_reader_candidate(
+            continuing_rows,
+            persona=persona,
+            session=session,
+        )
+    ):
         return max(continuing_rows, key=lambda row: ranking(row, jitter_scale=0.02))
 
+    rows = new_rows or rows
     candidate_rows = _filter_reader_candidates_by_product_type_weight(
         rows,
         session=session,
@@ -1569,12 +1604,6 @@ def _choose_reader_candidate(
         candidate_rows,
         session=session,
     )
-    novelty_seeking = _clamp_probability(
-        _safe_float(persona.get("novelty_seeking"), 0.0)
-    )
-    if novelty_seeking < 0.55:
-        return max(candidate_rows, key=lambda row: ranking(row, jitter_scale=0.35))
-
     scored_rows = sorted(
         (
             (
@@ -1590,15 +1619,47 @@ def _choose_reader_candidate(
         key=lambda item: item[0],
         reverse=True,
     )
+    novelty_seeking = _clamp_probability(
+        _safe_float(persona.get("novelty_seeking"), 0.0)
+    )
     pool_size = min(
         len(scored_rows),
-        3 + int(round((novelty_seeking - 0.55) / 0.45 * 7)),
+        max(
+            1,
+            math.ceil(len(scored_rows) * (0.50 + novelty_seeking * 0.50)),
+        ),
     )
     exploration_pool = [row for _, row in scored_rows[: max(pool_size, 1)]]
     return max(
         exploration_pool,
         key=lambda row: _stable_reader_candidate_jitter(session, row),
     )
+
+
+def _should_explore_new_reader_candidate(
+    continuing_rows: list[dict[str, Any]],
+    *,
+    persona: dict[str, Any],
+    session: ReaderClaimedSession,
+) -> bool:
+    max_read_episode_count = max(
+        (
+            _clamp_int(row.get("read_episode_count"), 0, 1000, 0)
+            for row in continuing_rows
+        ),
+        default=0,
+    )
+    if max_read_episode_count < MIN_NEW_PRODUCT_EXPLORATION_READ_EPISODES:
+        return False
+
+    novelty_seeking = _clamp_probability(
+        _safe_float(persona.get("novelty_seeking"), 0.0)
+    )
+    exploration_rate = (
+        BASE_NEW_PRODUCT_EXPLORATION_RATE
+        + novelty_seeking * NOVELTY_NEW_PRODUCT_EXPLORATION_RATE
+    )
+    return _stable_reader_new_product_exploration_selector(session) < exploration_rate
 
 
 def _filter_reader_candidates_by_product_type_weight(
@@ -1843,6 +1904,20 @@ def _stable_reader_status_selector(session: ReaderClaimedSession) -> float:
         f"{session.user_id}:"
         f"{session.claimed_session_no}:"
         "product_status"
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
+
+
+def _stable_reader_new_product_exploration_selector(
+    session: ReaderClaimedSession,
+) -> float:
+    seed = (
+        f"{session.ai_reader_schedule_id}:"
+        f"{session.ai_reader_agent_id}:"
+        f"{session.user_id}:"
+        f"{session.claimed_session_no}:"
+        "new_product_exploration"
     )
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
     return int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
