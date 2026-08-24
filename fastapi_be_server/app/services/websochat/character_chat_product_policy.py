@@ -7,6 +7,108 @@ CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT = "2026-03-01 00:00:00"
 CHARACTER_CHAT_ELIGIBLE_STATUS_CODE = "ongoing"
 
 
+def _has_nonempty_profile_text(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return bool(
+            value
+            and isinstance(value[0], str)
+            and value[0].strip()
+        )
+    return False
+
+
+def is_character_chat_rp_profile_payload_ready(
+    payload: dict[str, Any] | None,
+    *,
+    expected_character_key: str | None = None,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    character_key = str(payload.get("character_key") or "").strip()
+    if not character_key:
+        return False
+    normalized_expected_key = str(expected_character_key or "").strip()
+    if normalized_expected_key and character_key != normalized_expected_key:
+        return False
+
+    personality_core = payload.get("personality_core")
+    speech_style = payload.get("speech_style")
+    if not isinstance(personality_core, list) or not _has_nonempty_profile_text(
+        personality_core
+    ):
+        return False
+    if not isinstance(speech_style, dict):
+        return False
+    return all(
+        (
+            _has_nonempty_profile_text(speech_style.get("tone")),
+            _has_nonempty_profile_text(speech_style.get("formality")),
+            _has_nonempty_profile_text(speech_style.get("sentence_length")),
+        )
+    )
+
+
+def build_character_chat_rp_profile_ready_sql(
+    *,
+    profile_alias: str,
+    expected_character_key_sql: str | None = None,
+) -> str:
+    character_key_sql = f"""TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+        {profile_alias}.summary_text, '$.character_key'
+    )), ''))"""
+    expected_key_predicate = (
+        f"AND {character_key_sql} = {expected_character_key_sql}"
+        if expected_character_key_sql
+        else f"AND {character_key_sql} <> ''"
+    )
+    return f"""(
+        JSON_VALID({profile_alias}.summary_text)
+        {expected_key_predicate}
+        AND JSON_TYPE(JSON_EXTRACT(
+            {profile_alias}.summary_text, '$.personality_core'
+        )) = 'ARRAY'
+        AND JSON_LENGTH(JSON_EXTRACT(
+            {profile_alias}.summary_text, '$.personality_core'
+        )) > 0
+        AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+            {profile_alias}.summary_text, '$.personality_core[0]'
+        )), '')) <> ''
+        AND JSON_TYPE(JSON_EXTRACT(
+            {profile_alias}.summary_text, '$.speech_style'
+        )) = 'OBJECT'
+        AND (
+            (
+                JSON_TYPE(JSON_EXTRACT(
+                    {profile_alias}.summary_text, '$.speech_style.tone'
+                )) = 'STRING'
+                AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                    {profile_alias}.summary_text, '$.speech_style.tone'
+                )), '')) <> ''
+            )
+            OR (
+                JSON_TYPE(JSON_EXTRACT(
+                    {profile_alias}.summary_text, '$.speech_style.tone'
+                )) = 'ARRAY'
+                AND JSON_LENGTH(JSON_EXTRACT(
+                    {profile_alias}.summary_text, '$.speech_style.tone'
+                )) > 0
+                AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                    {profile_alias}.summary_text, '$.speech_style.tone[0]'
+                )), '')) <> ''
+            )
+        )
+        AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+            {profile_alias}.summary_text, '$.speech_style.formality'
+        )), '')) <> ''
+        AND TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+            {profile_alias}.summary_text, '$.speech_style.sentence_length'
+        )), '')) <> ''
+    )"""
+
+
 def build_public_episode_opened_at_sql(episode_alias: str) -> str:
     return (
         f"COALESCE({episode_alias}.open_changed_date, "

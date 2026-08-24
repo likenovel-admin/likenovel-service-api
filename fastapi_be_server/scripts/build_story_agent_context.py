@@ -49,6 +49,7 @@ from app.services.websochat.character_chat_product_policy import (  # noqa: E402
     CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
     CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+    is_character_chat_rp_profile_payload_ready,
 )
 
 logger = logging.getLogger(__name__)
@@ -914,6 +915,12 @@ def parse_args() -> argparse.Namespace:
         "--repair-character-assets",
         action="store_true",
         help="delta 모드에서 신규 회차가 없어도 캐릭터 scene/RP 결손을 제한적으로 복구.",
+    )
+    parser.add_argument(
+        "--character-scope-key",
+        action="append",
+        dest="character_scope_keys",
+        help="캐릭터 asset 복구 대상을 정확한 scope_key로 제한. 여러 번 지정 가능.",
     )
     parser.add_argument(
         "--reaggregate-character-inventory",
@@ -2201,6 +2208,21 @@ def select_touched_range_scopes(episode_nos: list[int]) -> list[tuple[str, int, 
 
 
 def validate_delta_args(args: argparse.Namespace) -> None:
+    character_scope_keys = [
+        str(scope_key or "").strip()
+        for scope_key in list(getattr(args, "character_scope_keys", None) or [])
+    ]
+    if any(not scope_key for scope_key in character_scope_keys):
+        raise ValueError("--character-scope-key는 빈 값일 수 없습니다.")
+    if character_scope_keys and (
+        args.build_mode != "delta"
+        or not bool(getattr(args, "apply", False))
+        or not bool(getattr(args, "repair_character_assets", False))
+    ):
+        raise ValueError(
+            "--character-scope-key는 --build-mode delta --apply "
+            "--repair-character-assets와 함께 사용해야 합니다."
+        )
     withdraw_summary_id = int(
         getattr(args, "withdraw_identity_review_summary_id", 0) or 0
     )
@@ -6248,7 +6270,10 @@ def select_delta_rp_scope_keys(
             continue
         profile_payload = dict(dict((profile_map or {}).get(scope_key) or {}).get("payload") or {})
         examples_payload = dict(dict((examples_map or {}).get(scope_key) or {}).get("payload") or {})
-        if not profile_payload or not build_rp_dialogue_items_from_example_payload(examples_payload):
+        if not is_character_chat_rp_profile_payload_ready(
+            profile_payload,
+            expected_character_key=scope_key,
+        ) or not build_rp_dialogue_items_from_example_payload(examples_payload):
             missing_scope_keys.add(scope_key)
     return missing_scope_keys
 
@@ -6821,6 +6846,16 @@ async def build_rp_summaries(
             "personality_core": [str(item).strip() for item in (payload.get("personality_core") or []) if str(item).strip()][:2],
             "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
         }
+        if not is_character_chat_rp_profile_payload_ready(
+            profile_payload,
+            expected_character_key=character_key,
+        ):
+            logger.info(
+                "story_agent_rp_keep_old product_id=%s scope_key=%s reason=incomplete_profile_payload",
+                product_id,
+                character_key,
+            )
+            continue
         example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
         if not has_enough_rp_example_texts(example_texts):
             logger.info(
@@ -7114,8 +7149,9 @@ async def build_rp_summaries_delta(
                 episode_texts_by_no,
             )
         )
-        canonical_profile_ready = (
-            str(exact_profile_payload.get("character_key") or "").strip() == scope_key
+        canonical_profile_ready = is_character_chat_rp_profile_payload_ready(
+            exact_profile_payload,
+            expected_character_key=scope_key,
         )
         canonical_examples_ready = (
             str(repaired_exact_example_payload.get("character_key") or "").strip() == scope_key
@@ -7200,7 +7236,10 @@ async def build_rp_summaries_delta(
                 legacy_profile_payload = dict(legacy_profile_row.get("payload") or {})
                 legacy_example_payload = dict(legacy_example_row.get("payload") or {})
                 if (
-                    str(legacy_profile_payload.get("character_key") or "").strip() == alias_key
+                    is_character_chat_rp_profile_payload_ready(
+                        legacy_profile_payload,
+                        expected_character_key=alias_key,
+                    )
                     and str(legacy_example_payload.get("character_key") or "").strip() == alias_key
                     and build_rp_dialogue_items_from_example_payload(legacy_example_payload)
                 ):
@@ -7254,8 +7293,10 @@ async def build_rp_summaries_delta(
                     legacy_example_row.get("payload") or {}
                 )
                 if (
-                    str(legacy_profile_payload.get("character_key") or "").strip()
-                    == historical_scope_key
+                    is_character_chat_rp_profile_payload_ready(
+                        legacy_profile_payload,
+                        expected_character_key=historical_scope_key,
+                    )
                     and str(legacy_example_payload.get("character_key") or "").strip()
                     == historical_scope_key
                     and build_rp_dialogue_items_from_example_payload(
@@ -7281,7 +7322,7 @@ async def build_rp_summaries_delta(
         )
         existing_dialogue_items = build_rp_dialogue_items_from_example_payload(existing_example_payload)
         if (
-            existing_profile_payload
+            is_character_chat_rp_profile_payload_ready(existing_profile_payload)
             and existing_example_payload
             and existing_dialogue_items
             and has_rp_example_episode_evidence(existing_example_payload)
@@ -7474,6 +7515,16 @@ async def build_rp_summaries_delta(
             "personality_core": [str(item).strip() for item in (payload.get("personality_core") or []) if str(item).strip()][:2],
             "baseline_attitude": str(payload.get("baseline_attitude") or "").strip() or "무난",
         }
+        if not is_character_chat_rp_profile_payload_ready(
+            profile_payload,
+            expected_character_key=scope_key,
+        ):
+            logger.info(
+                "story_agent_delta_rp_keep_old product_id=%s scope_key=%s reason=incomplete_profile_payload",
+                product_id,
+                scope_key,
+            )
+            continue
         example_texts = select_rp_example_texts(payload, dialogue_items, aliases)
         if not has_enough_rp_example_texts(example_texts):
             logger.info(
@@ -15645,7 +15696,10 @@ def _is_character_chat_profile_row_ready(
     scope_key: str,
 ) -> bool:
     payload = _summary_row_payload(row or {})
-    return str(payload.get("character_key") or "").strip() == scope_key
+    return is_character_chat_rp_profile_payload_ready(
+        payload,
+        expected_character_key=scope_key,
+    )
 
 
 def _is_character_chat_examples_row_ready(
@@ -16989,6 +17043,35 @@ def filter_character_chat_asset_repair_plan_to_signal_scope(
     return filtered
 
 
+def filter_character_chat_asset_repair_plan_to_requested_scopes(
+    *,
+    repair_plan: dict[str, object],
+    requested_scope_keys: set[str],
+) -> dict[str, object]:
+    normalized_scope_keys = {
+        str(scope_key or "").strip()
+        for scope_key in requested_scope_keys
+        if str(scope_key or "").strip()
+    }
+    if not normalized_scope_keys:
+        return dict(repair_plan)
+
+    filtered = dict(repair_plan)
+    for field_name in ("rp_scope_keys", "scene_scope_keys"):
+        filtered[field_name] = sorted(
+            normalized_scope_keys
+            & {
+                str(scope_key or "").strip()
+                for scope_key in list(repair_plan.get(field_name) or [])
+                if str(scope_key or "").strip()
+            }
+        )
+    filtered["repairable"] = bool(
+        filtered["rp_scope_keys"] or filtered["scene_scope_keys"]
+    )
+    return filtered
+
+
 def filter_character_inventory_map_to_signal_scope(
     *,
     inventory_map: dict[str, dict[str, object]],
@@ -17448,10 +17531,25 @@ async def repair_character_chat_assets(
                         signal_rows=active_signal_rows,
                         inventory_map=inventory_map,
                     )
+                    requested_scope_keys = {
+                        str(scope_key or "").strip()
+                        for scope_key in list(
+                            getattr(args, "character_scope_keys", None) or []
+                        )
+                        if str(scope_key or "").strip()
+                    }
+                    if requested_scope_keys:
+                        bundle_scope_keys &= requested_scope_keys
                     if bundle_scope_keys:
                         repair_plan["rp_scope_keys"] = sorted(
                             set(repair_plan["rp_scope_keys"]) | bundle_scope_keys
                         )
+                    repair_plan = (
+                        filter_character_chat_asset_repair_plan_to_requested_scopes(
+                            repair_plan=repair_plan,
+                            requested_scope_keys=requested_scope_keys,
+                        )
+                    )
                     scene_scope_keys = set(repair_plan["scene_scope_keys"])
                     scene_rows, required_scope_keys_by_episode_no = (
                         select_character_chat_scene_repair_rows(

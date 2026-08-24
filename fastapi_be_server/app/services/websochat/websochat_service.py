@@ -29,6 +29,7 @@ from app.schemas.websochat import (
 )
 from app.services.websochat.character_chat_product_policy import (
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+    is_character_chat_rp_profile_payload_ready,
     is_character_chat_product_eligible,
 )
 from app.services.websochat.websochat_compare import (
@@ -5157,6 +5158,8 @@ def _is_websochat_character_chat_rp_context_ready(
 ) -> bool:
     resolved_scope_key = str(resolved_active_character or "").strip()
     if not resolved_scope_key or not profile or examples_payload is None:
+        return False
+    if not is_character_chat_rp_profile_payload_ready(profile):
         return False
     if not [item for item in list(examples_payload.get("examples") or []) if isinstance(item, dict)]:
         return False

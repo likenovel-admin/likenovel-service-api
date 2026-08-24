@@ -54,6 +54,23 @@ def _entry_context(
     }
 
 
+def _complete_profile(
+    character_scope_key: str,
+    *,
+    display_name: str = "신미아",
+) -> dict:
+    return {
+        "character_key": character_scope_key,
+        "display_name": display_name,
+        "personality_core": ["신중함"],
+        "speech_style": {
+            "tone": ["차분함"],
+            "formality": "반말",
+            "sentence_length": "짧음",
+        },
+    }
+
+
 class WebsochatCharacterChatContractTest(unittest.TestCase):
     def test_inventory_v3_alias_resolution_rejects_ambiguous_source_only_match(self):
         rows = [
@@ -454,10 +471,10 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
     def test_character_chat_context_rejects_mismatched_profile_identity(self):
         ready = _is_websochat_character_chat_rp_context_ready(
             resolved_active_character="character:신미아:dup:be14d6b7",
-            profile={
-                "character_key": "protagonist:first_person",
-                "display_name": "추종자",
-            },
+            profile=_complete_profile(
+                "protagonist:first_person",
+                display_name="추종자",
+            ),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
                 "examples": [{"text": "가자."}],
@@ -485,10 +502,10 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             read_episode_to=14,
             resolved_active_character=canonical_scope_key,
             compatible_scope_keys=[canonical_scope_key, previous_identity_scope_key],
-            profile={
-                "character_key": previous_identity_scope_key,
-                "display_name": "조렌테이머",
-            },
+            profile=_complete_profile(
+                previous_identity_scope_key,
+                display_name="조렌테이머",
+            ),
             examples_payload={
                 "character_key": previous_identity_scope_key,
                 "examples": [{"text": "가자."}],
@@ -509,7 +526,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
 
     def test_character_chat_context_requires_character_key_on_all_assets(self):
         scope_key = "character:신미아:dup:be14d6b7"
-        base_profile = {"character_key": scope_key, "display_name": "신미아"}
+        base_profile = _complete_profile(scope_key)
         base_examples_payload = {"character_key": scope_key, "examples": [{"text": "가자."}]}
         base_internal_prompt_payload = {
             "character_key": scope_key,
@@ -546,10 +563,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
     def test_character_chat_context_requires_v3_public_gate(self):
         ready = _is_websochat_character_chat_rp_context_ready(
             resolved_active_character="character:신미아:dup:be14d6b7",
-            profile={
-                "character_key": "character:신미아:dup:be14d6b7",
-                "display_name": "신미아",
-            },
+            profile=_complete_profile("character:신미아:dup:be14d6b7"),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
                 "examples": [{"text": "가자."}],
@@ -571,10 +585,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
     def test_character_chat_context_requires_read_boundary_entry_context(self):
         ready = _is_websochat_character_chat_rp_context_ready(
             resolved_active_character="character:신미아:dup:be14d6b7",
-            profile={
-                "character_key": "character:신미아:dup:be14d6b7",
-                "display_name": "신미아",
-            },
+            profile=_complete_profile("character:신미아:dup:be14d6b7"),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
                 "examples": [{"text": "가자."}],
@@ -613,10 +624,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
                     product_id=1182,
                     read_episode_to=14,
                     resolved_active_character="character:신미아:dup:be14d6b7",
-                    profile={
-                        "character_key": "character:신미아:dup:be14d6b7",
-                        "display_name": "신미아",
-                    },
+                    profile=_complete_profile("character:신미아:dup:be14d6b7"),
                     examples_payload={
                         "character_key": "character:신미아:dup:be14d6b7",
                         "examples": [{"text": "가자."}],
@@ -638,10 +646,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             product_id=1182,
             read_episode_to=14,
             resolved_active_character="character:신미아:dup:be14d6b7",
-            profile={
-                "character_key": "character:신미아:dup:be14d6b7",
-                "display_name": "신미아",
-            },
+            profile=_complete_profile("character:신미아:dup:be14d6b7"),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
                 "examples": [{"text": "가자."}],
@@ -660,6 +665,37 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
         )
 
         self.assertTrue(ready)
+
+    def test_character_chat_context_rejects_incomplete_profile_contract(self):
+        scope_key = "character:신미아:dup:be14d6b7"
+        incomplete_profile = _complete_profile(scope_key)
+        incomplete_profile["personality_core"] = []
+        incomplete_profile["speech_style"] = {
+            "tone": [],
+            "formality": "",
+            "sentence_length": "",
+        }
+
+        ready = _is_websochat_character_chat_rp_context_ready(
+            product_id=1182,
+            read_episode_to=14,
+            resolved_active_character=scope_key,
+            profile=incomplete_profile,
+            examples_payload={
+                "character_key": scope_key,
+                "examples": [{"text": "가자."}],
+            },
+            internal_prompt_payload=None,
+            internal_prompt="",
+            inventory_payload={
+                "display_name": "신미아",
+                "public_chat_eligible": True,
+                "display_safety": {"status": "pass"},
+            },
+            entry_context=_entry_context(),
+        )
+
+        self.assertFalse(ready)
 
 
 if __name__ == "__main__":

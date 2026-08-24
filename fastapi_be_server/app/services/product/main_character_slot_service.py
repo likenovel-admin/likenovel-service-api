@@ -15,8 +15,10 @@ from app.exceptions import CustomResponseException
 from app.services.websochat.character_chat_product_policy import (
     CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+    build_character_chat_rp_profile_ready_sql,
     build_correlated_character_chat_product_policy_sql,
     build_public_episode_opened_at_sql,
+    is_character_chat_rp_profile_payload_ready,
 )
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
 from app.utils.query import get_file_path_sub_query, get_pagination_params
@@ -221,6 +223,8 @@ def build_character_chat_preview_payload(
     scene_data = dict(scene_row)
     inventory = _extract_summary_payload(profile_data.get("inventorySummaryText"))
     profile = _extract_summary_payload(profile_data.get("profileSummaryText"))
+    if not is_character_chat_rp_profile_payload_ready(profile):
+        return None
     scene_payload = _extract_summary_payload(scene_data.get("sceneSummaryText"))
     scenes = scene_payload.get("scenes")
     if not isinstance(scenes, list):
@@ -306,6 +310,10 @@ def _canonical_character_scope_key_sql(inventory_alias: str) -> str:
 
 def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
     canonical_scope_key = _canonical_character_scope_key_sql(inventory_alias)
+    profile_ready_sql = build_character_chat_rp_profile_ready_sql(
+        profile_alias="profile",
+        expected_character_key_sql=canonical_scope_key,
+    )
     return f"""
         AND EXISTS (
             SELECT 1
@@ -314,10 +322,7 @@ def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
               AND profile.scope_key = {canonical_scope_key}
               AND profile.summary_type = 'character_rp_profile'
               AND profile.is_active = 'Y'
-              AND JSON_VALID(profile.summary_text)
-              AND JSON_UNQUOTE(JSON_EXTRACT(
-                  profile.summary_text, '$.character_key'
-              )) = {canonical_scope_key}
+              AND {profile_ready_sql}
         )
         AND EXISTS (
             SELECT 1
@@ -821,7 +826,11 @@ def build_public_character_catalog_readiness_query() -> str:
 
 
 def build_public_character_catalog_assets_query() -> str:
-    return """
+    profile_ready_sql = build_character_chat_rp_profile_ready_sql(
+        profile_alias="profile",
+        expected_character_key_sql="inventory.scope_key",
+    )
+    return f"""
         WITH inventory_assets AS (
             SELECT
                 inventory.summary_id AS characterSlotId,
@@ -850,10 +859,7 @@ def build_public_character_catalog_assets_query() -> str:
                AND profile.summary_type = 'character_rp_profile'
                AND profile.scope_key = inventory.scope_key
                AND profile.is_active = 'Y'
-               AND JSON_VALID(profile.summary_text)
-               AND JSON_UNQUOTE(JSON_EXTRACT(
-                   profile.summary_text, '$.character_key'
-               )) = inventory.scope_key
+               AND {profile_ready_sql}
             INNER JOIN tb_story_agent_context_summary examples
                 ON examples.product_id = inventory.product_id
                AND examples.summary_type = 'character_rp_examples'
@@ -941,6 +947,9 @@ def build_public_character_catalog_alias_fallback_query() -> str:
     profile_scope_key = compatible_scope_key("profile.scope_key")
     profile_payload_key = compatible_scope_key(
         "JSON_UNQUOTE(JSON_EXTRACT(profile.summary_text, '$.character_key'))"
+    )
+    profile_ready_sql = build_character_chat_rp_profile_ready_sql(
+        profile_alias="profile"
     )
     return f"""
         WITH inventory_ranked AS (
@@ -1033,7 +1042,7 @@ def build_public_character_catalog_alias_fallback_query() -> str:
                     AND {profile_scope_key}
                     AND profile.summary_type = 'character_rp_profile'
                     AND profile.is_active = 'Y'
-                    AND JSON_VALID(profile.summary_text)
+                    AND {profile_ready_sql}
                     AND {profile_payload_key}
               )
         )
@@ -1856,6 +1865,9 @@ async def get_public_character_chat_preview(
     profile_payload_key = compatible_scope_key(
         "JSON_UNQUOTE(JSON_EXTRACT(profile.summary_text, '$.character_key'))"
     )
+    profile_ready_sql = build_character_chat_rp_profile_ready_sql(
+        profile_alias="profile"
+    )
     example_scope_key = compatible_scope_key("examples.scope_key")
     example_payload_key = compatible_scope_key(
         "JSON_UNQUOTE(JSON_EXTRACT(examples.summary_text, '$.character_key'))"
@@ -1872,7 +1884,7 @@ async def get_public_character_chat_preview(
                AND {profile_scope_key}
                AND profile.summary_type = 'character_rp_profile'
                AND profile.is_active = 'Y'
-               AND JSON_VALID(profile.summary_text)
+               AND {profile_ready_sql}
                AND {profile_payload_key}
             WHERE inventory.product_id = :product_id
               AND inventory.summary_type = 'character_inventory_v3'
@@ -2339,6 +2351,7 @@ async def _load_main_character_chat_quality(
             product_id AS productId,
             scope_key AS scopeKey,
             summary_type AS summaryType,
+            summary_text AS summaryText,
             CASE
                 WHEN summary_type = 'character_rp_examples'
                  AND JSON_TYPE(JSON_EXTRACT(summary_text, '$.examples')) = 'ARRAY'
@@ -2373,7 +2386,12 @@ async def _load_main_character_chat_quality(
         if not key[0] or not key[1]:
             continue
         if row_data.get("summaryType") == "character_rp_profile":
-            profile_keys.add(key)
+            profile_payload = _extract_summary_payload(row_data.get("summaryText"))
+            if is_character_chat_rp_profile_payload_ready(
+                profile_payload,
+                expected_character_key=key[1],
+            ):
+                profile_keys.add(key)
         elif row_data.get("summaryType") == "character_rp_examples":
             example_counts[key] = max(
                 example_counts[key], int(row_data.get("exampleCount") or 0)

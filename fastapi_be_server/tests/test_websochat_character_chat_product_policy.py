@@ -5,6 +5,10 @@ from unittest.mock import AsyncMock, patch
 from app.exceptions import CustomResponseException
 from app.schemas.websochat import PostWebsochatMessageReqBody, PostWebsochatSessionReqBody
 from app.services.websochat import websochat_service
+from app.services.websochat.character_chat_product_policy import (
+    build_character_chat_rp_profile_ready_sql,
+    is_character_chat_rp_profile_payload_ready,
+)
 
 
 class _Mappings:
@@ -48,6 +52,66 @@ def _product_row(*, character_chat_eligible: int) -> dict:
 
 
 class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
+    def test_rp_profile_requires_personality_and_complete_speech_style(self):
+        complete = {
+            "character_key": "character:adelite",
+            "personality_core": ["신중함"],
+            "speech_style": {
+                "tone": ["차분함"],
+                "formality": "존댓말",
+                "sentence_length": "보통",
+            },
+        }
+
+        self.assertTrue(
+            is_character_chat_rp_profile_payload_ready(
+                complete,
+                expected_character_key="character:adelite",
+            )
+        )
+        for field_name in (
+            "personality_core",
+            "tone",
+            "formality",
+            "sentence_length",
+        ):
+            incomplete = json.loads(json.dumps(complete, ensure_ascii=False))
+            if field_name == "personality_core":
+                incomplete[field_name] = []
+            else:
+                incomplete["speech_style"][field_name] = [] if field_name == "tone" else ""
+            with self.subTest(field_name=field_name):
+                self.assertFalse(
+                    is_character_chat_rp_profile_payload_ready(
+                        incomplete,
+                        expected_character_key="character:adelite",
+                    )
+                )
+
+        self.assertFalse(
+            is_character_chat_rp_profile_payload_ready(
+                complete,
+                expected_character_key="character:other",
+            )
+        )
+
+        leading_blank = json.loads(json.dumps(complete, ensure_ascii=False))
+        leading_blank["personality_core"] = ["", "두 번째 값"]
+        self.assertFalse(is_character_chat_rp_profile_payload_ready(leading_blank))
+
+    def test_rp_profile_sql_uses_the_same_required_fields(self):
+        query = build_character_chat_rp_profile_ready_sql(
+            profile_alias="profile",
+            expected_character_key_sql="inventory.scope_key",
+        )
+
+        self.assertIn("$.character_key", query)
+        self.assertIn("$.personality_core", query)
+        self.assertIn("$.speech_style.tone", query)
+        self.assertIn("$.speech_style.formality", query)
+        self.assertIn("$.speech_style.sentence_length", query)
+        self.assertIn("inventory.scope_key", query)
+
     def test_character_chat_rp_lookup_includes_inventory_source_aliases(self):
         scope_keys = websochat_service._build_websochat_rp_lookup_scope_keys(
             normalized_memory={"session_kind": "character_chat"},
