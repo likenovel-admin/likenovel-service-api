@@ -8476,6 +8476,25 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             ["character:김도윤", "character:김록희"],
         )
 
+    def test_scoped_character_repair_skips_foundation_delta_candidates(self):
+        module = load_module()
+        rows = [
+            {
+                "product_id": 1171,
+                "episode_id": 29714,
+                "episode_no": 20,
+            }
+        ]
+
+        filtered = module.filter_delta_candidate_rows(
+            object(),
+            rows,
+            max_delta_episodes=0,
+            scoped_repair_keys=["character:유현"],
+        )
+
+        self.assertEqual(filtered, [])
+
     def test_character_scope_key_requires_apply_repair_combo(self):
         module = load_module()
         invalid_argvs = (
