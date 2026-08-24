@@ -2525,7 +2525,16 @@ def filter_episode_texts_to_summary_rows(
     }
 
 
-def filter_delta_candidate_rows(cur, rows: Iterable[dict], *, max_delta_episodes: int = 0) -> list[dict]:
+def filter_delta_candidate_rows(
+    cur,
+    rows: Iterable[dict],
+    *,
+    max_delta_episodes: int = 0,
+    scoped_repair_keys: Iterable[str] | None = None,
+) -> list[dict]:
+    if any(str(scope_key or "").strip() for scope_key in (scoped_repair_keys or [])):
+        return []
+
     rows_by_product: dict[int, list[dict]] = {}
     for row in rows:
         rows_by_product.setdefault(int(row["product_id"]), []).append(row)
@@ -19634,7 +19643,7 @@ async def main() -> int:
                     character_asset_repair_rows = list(rows)
                 if args.apply and bool(args.reaggregate_character_inventory):
                     inventory_reaggregation_rows = list(rows)
-                if args.apply:
+                if args.apply and not bool(args.character_scope_keys):
                     delta_status_repaired_products = repair_failed_delta_context_statuses(cur, rows)
                     if delta_status_repaired_products:
                         conn.commit()
@@ -19642,6 +19651,7 @@ async def main() -> int:
                     cur,
                     rows,
                     max_delta_episodes=args.max_delta_episodes,
+                    scoped_repair_keys=args.character_scope_keys,
                 )
             if args.build_mode == "delta" and not args.apply:
                 plans = build_delta_scope_plans(cur, rows)
