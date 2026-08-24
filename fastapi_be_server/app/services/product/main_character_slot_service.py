@@ -44,6 +44,11 @@ logger = logging.getLogger(__name__)
 PUBLIC_CHARACTER_CATALOG_CACHE_TTL_SECONDS = 300
 AUTO_MAIN_CHARACTER_SLOT_LIMIT = 12
 AUTO_MAIN_CHARACTER_SLOT_POOL_SIZE = 24
+DEFAULT_CHARACTER_IMAGE_PATHS = (
+    "/images/default-cover.png",
+    "/images/default_cover.png",
+)
+LEGACY_DEFAULT_CHARACTER_IMAGE_KEY = "ESokN0lzSgG0um4rn4tBeg"
 _public_character_catalog_cache: dict[str, tuple[float, list[dict]]] = {}
 _public_character_catalog_cache_locks: defaultdict[str, asyncio.Lock] = defaultdict(
     asyncio.Lock
@@ -1459,11 +1464,7 @@ def build_public_character_catalog_image_query() -> str:
             COALESCE(
                 MIN(slot_file.file_path),
                 MIN(cover_file.file_path)
-            ) AS characterImagePath,
-            CASE
-                WHEN MIN(slot_file.file_path) IS NULL THEN 0
-                ELSE 1
-            END AS hasCharacterImage
+            ) AS characterImagePath
         FROM JSON_TABLE(
             :selected_json,
             '$[*]' COLUMNS (
@@ -1503,8 +1504,26 @@ def build_public_character_catalog_image_query() -> str:
     """
 
 
+def _has_non_default_character_image(image_path) -> bool:
+    normalized_path = str(image_path or "").strip()
+    if not normalized_path:
+        return False
+    if LEGACY_DEFAULT_CHARACTER_IMAGE_KEY in normalized_path:
+        return False
+    return not any(
+        normalized_path == default_path or normalized_path.endswith(default_path)
+        for default_path in DEFAULT_CHARACTER_IMAGE_PATHS
+    )
+
+
 def rank_public_character_catalog_items(items) -> list[dict]:
-    ranked = [dict(item) for item in items]
+    ranked = []
+    for item in items:
+        ranked_item = dict(item)
+        ranked_item["hasCharacterImage"] = _has_non_default_character_image(
+            ranked_item.get("characterImagePath")
+        )
+        ranked.append(ranked_item)
     ranked.sort(
         key=lambda item: (
             0 if bool(item.get("hasCharacterImage")) else 1,
@@ -1521,6 +1540,26 @@ def rank_public_character_catalog_items(items) -> list[dict]:
     for card_order, item in enumerate(ranked, start=1):
         item["cardOrder"] = card_order
     return ranked
+
+
+def finalize_public_character_catalog_items(items) -> list[dict]:
+    ranked_items = rank_public_character_catalog_items(items)
+    selected_items: list[dict] = []
+    selected_count_by_product: defaultdict[int, int] = defaultdict(int)
+
+    for item in ranked_items:
+        product_id = int(item.get("productId") or 0)
+        if (
+            selected_count_by_product[product_id]
+            >= MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT
+        ):
+            continue
+        selected_count_by_product[product_id] += 1
+        selected_items.append(item)
+
+    for card_order, item in enumerate(selected_items, start=1):
+        item["cardOrder"] = card_order
+    return selected_items
 
 
 def select_auto_main_character_slots(
@@ -1550,7 +1589,7 @@ def select_auto_main_character_slots(
     return selected
 
 
-def filter_and_rank_public_character_catalog(
+def filter_public_character_catalog_candidates(
     candidate_rows, scene_rows
 ) -> list[dict]:
     scene_data_by_character_slot: dict[int, tuple[int, int | None]] = {}
@@ -1563,10 +1602,9 @@ def filter_and_rank_public_character_catalog(
                 _parse_int(row_data.get("entryEpisodeNo")),
             )
 
-    candidates_by_product: dict[int, list[dict]] = defaultdict(list)
+    eligible_items: list[dict] = []
     for row in candidate_rows:
         item = dict(row)
-        product_id = int(item.get("productId") or 0)
         character_role = item.get("characterRole") or _extract_public_character_role(
             item.get("_inventorySummaryText")
         )
@@ -1593,47 +1631,10 @@ def filter_and_rank_public_character_catalog(
             continue
         item["_sceneCount"] = scene_count
         item["entryEpisodeNo"] = entry_episode_no
-        candidates_by_product[product_id].append(item)
-
-    selected: list[dict] = []
-    for product_candidates in candidates_by_product.values():
-        product_candidates.sort(
-            key=lambda item: (
-                0 if item.get("characterRole") == "main_protagonist" else 1,
-                -int(item.get("_distinctEpisodeCount") or 0),
-                -int(item.get("_exampleCount") or 0),
-                -int(item.get("_sceneCount") or 0),
-                str(item.get("characterName") or ""),
-                -int(item.get("characterSlotId") or 0),
-            )
-        )
-        selected.extend(
-            product_candidates[:MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT]
-        )
-
-    selected.sort(
-        key=lambda item: (
-            0
-            if (
-                int(item.get("_distinctEpisodeCount") or 0)
-                >= MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES
-                and int(item.get("_exampleCount") or 0)
-                >= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
-                and int(item.get("_sceneCount") or 0)
-                >= MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES
-            )
-            else 1,
-            -int(item.get("_distinctEpisodeCount") or 0),
-            -int(item.get("_exampleCount") or 0),
-            -int(item.get("_sceneCount") or 0),
-            -int(item.get("characterSlotId") or 0),
-        )
-    )
-    for card_order, item in enumerate(selected, start=1):
-        item["cardOrder"] = card_order
         item.pop("_inventorySummaryText", None)
         item.pop("_isProtagonist", None)
-    return selected
+        eligible_items.append(item)
+    return eligible_items
 
 
 async def _get_public_manual_main_character_slots(*, adult_yn: str, db: AsyncSession):
@@ -1807,7 +1808,7 @@ async def _load_public_character_catalog_base(
             )
         },
     )
-    catalog_items = filter_and_rank_public_character_catalog(
+    catalog_items = filter_public_character_catalog_candidates(
         candidate_items,
         scene_result.mappings().all(),
     )
@@ -1840,7 +1841,9 @@ async def _load_public_character_catalog_base(
             int(item.get("characterSlotId") or 0), {}
         )
         item["characterImagePath"] = image_data.get("characterImagePath")
-        item["hasCharacterImage"] = bool(image_data.get("hasCharacterImage"))
+        item["hasCharacterImage"] = _has_non_default_character_image(
+            item["characterImagePath"]
+        )
         ready_episode_count = int(item.pop("_chatReadyEpisodeCount", 0) or 0)
         total_episode_count = int(item.pop("_chatTotalEpisodeCount", 0) or 0)
         distinct_episode_count = int(item.pop("_distinctEpisodeCount", 0) or 0)
@@ -1866,7 +1869,7 @@ async def _load_public_character_catalog_base(
         item["lastViewedEpisodeNo"] = None
         item["lastViewedAt"] = None
 
-    return rank_public_character_catalog_items(catalog_items)
+    return finalize_public_character_catalog_items(catalog_items)
 
 
 async def _get_cached_public_character_catalog_base(
