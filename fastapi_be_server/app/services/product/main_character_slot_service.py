@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 from collections import defaultdict
 from copy import deepcopy
 from time import monotonic
@@ -41,6 +42,8 @@ CHARACTER_CHAT_PREVIEW_EXCERPT_MAX_CHARS = 900
 logger = logging.getLogger(__name__)
 
 PUBLIC_CHARACTER_CATALOG_CACHE_TTL_SECONDS = 300
+AUTO_MAIN_CHARACTER_SLOT_LIMIT = 12
+AUTO_MAIN_CHARACTER_SLOT_POOL_SIZE = 24
 _public_character_catalog_cache: dict[str, tuple[float, list[dict]]] = {}
 _public_character_catalog_cache_locks: defaultdict[str, asyncio.Lock] = defaultdict(
     asyncio.Lock
@@ -50,6 +53,55 @@ _public_character_catalog_cache_locks: defaultdict[str, asyncio.Lock] = defaultd
 def _reset_public_character_catalog_cache() -> None:
     _public_character_catalog_cache.clear()
     _public_character_catalog_cache_locks.clear()
+
+
+async def get_main_character_slot_display_mode(*, db: AsyncSession) -> str:
+    result = await db.execute(
+        text("""
+            SELECT display_mode AS displayMode
+            FROM tb_main_character_slot_config
+            WHERE config_id = 1
+        """)
+    )
+    row = result.mappings().one_or_none()
+    display_mode = str(dict(row or {}).get("displayMode") or "auto").strip()
+    return "manual" if display_mode == "manual" else "auto"
+
+
+async def get_admin_main_character_slot_config(*, db: AsyncSession):
+    display_mode = await get_main_character_slot_display_mode(db=db)
+    return {"data": {"displayMode": display_mode}}
+
+
+async def update_admin_main_character_slot_config(
+    *,
+    req_body: admin_schema.PutMainCharacterSlotConfigReqBody,
+    admin_user_id: int | None,
+    db: AsyncSession,
+):
+    await db.execute(
+        text("""
+            INSERT INTO tb_main_character_slot_config (
+                config_id,
+                display_mode,
+                created_id,
+                updated_id
+            ) VALUES (
+                1,
+                :display_mode,
+                :admin_user_id,
+                :admin_user_id
+            )
+            ON DUPLICATE KEY UPDATE
+                display_mode = VALUES(display_mode),
+                updated_id = VALUES(updated_id)
+        """),
+        {
+            "display_mode": req_body.display_mode,
+            "admin_user_id": admin_user_id,
+        },
+    )
+    return {"data": {"displayMode": req_body.display_mode}}
 
 
 def _normalize_public_character_catalog_adult_yn(adult_yn: str | None) -> str:
@@ -1407,7 +1459,11 @@ def build_public_character_catalog_image_query() -> str:
             COALESCE(
                 MIN(slot_file.file_path),
                 MIN(cover_file.file_path)
-            ) AS characterImagePath
+            ) AS characterImagePath,
+            CASE
+                WHEN MIN(slot_file.file_path) IS NULL THEN 0
+                ELSE 1
+            END AS hasCharacterImage
         FROM JSON_TABLE(
             :selected_json,
             '$[*]' COLUMNS (
@@ -1445,6 +1501,53 @@ def build_public_character_catalog_image_query() -> str:
            AND cover_file.use_yn = 'Y'
         GROUP BY selected.character_slot_id
     """
+
+
+def rank_public_character_catalog_items(items) -> list[dict]:
+    ranked = [dict(item) for item in items]
+    ranked.sort(
+        key=lambda item: (
+            0 if bool(item.get("hasCharacterImage")) else 1,
+            0 if bool(item.get("fullReady")) else 1,
+            0 if item.get("chatQuality") == "good" else 1,
+            0 if item.get("characterRole") == "main_protagonist" else 1,
+            -float(item.get("readinessCoverageRatio") or 0),
+            -int(item.get("distinctEpisodeCount") or 0),
+            -int(item.get("exampleCount") or 0),
+            -int(item.get("sceneCount") or 0),
+            int(item.get("characterSlotId") or 0),
+        )
+    )
+    for card_order, item in enumerate(ranked, start=1):
+        item["cardOrder"] = card_order
+    return ranked
+
+
+def select_auto_main_character_slots(
+    items,
+    *,
+    sample_items=random.sample,
+) -> list[dict]:
+    top_pool = [dict(item) for item in items[:AUTO_MAIN_CHARACTER_SLOT_POOL_SIZE]]
+    image_items = [item for item in top_pool if item.get("hasCharacterImage")]
+    fallback_items = [item for item in top_pool if not item.get("hasCharacterImage")]
+
+    selected = sample_items(
+        image_items,
+        min(AUTO_MAIN_CHARACTER_SLOT_LIMIT, len(image_items)),
+    )
+    remaining_count = AUTO_MAIN_CHARACTER_SLOT_LIMIT - len(selected)
+    if remaining_count > 0:
+        selected.extend(
+            sample_items(
+                fallback_items,
+                min(remaining_count, len(fallback_items)),
+            )
+        )
+
+    for card_order, item in enumerate(selected, start=1):
+        item["cardOrder"] = card_order
+    return selected
 
 
 def filter_and_rank_public_character_catalog(
@@ -1533,7 +1636,7 @@ def filter_and_rank_public_character_catalog(
     return selected
 
 
-async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
+async def _get_public_manual_main_character_slots(*, adult_yn: str, db: AsyncSession):
     result = await db.execute(
         text(build_public_main_character_slots_query()),
         {"adult_yn": adult_yn},
@@ -1608,6 +1711,24 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
         item.pop("_inventorySummaryText", None)
         visible_slot_items.append(item)
     return {"data": visible_slot_items}
+
+
+async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
+    display_mode = await get_main_character_slot_display_mode(db=db)
+    if display_mode == "manual":
+        return await _get_public_manual_main_character_slots(
+            adult_yn=adult_yn,
+            db=db,
+        )
+
+    catalog_response = await get_public_character_catalog(
+        adult_yn=adult_yn,
+        kc_user_id=None,
+        db=db,
+    )
+    return {
+        "data": select_auto_main_character_slots(catalog_response.get("data", []))
+    }
 
 
 async def _load_public_character_catalog_base(
@@ -1710,14 +1831,16 @@ async def _load_public_character_catalog_base(
         },
     )
     image_by_character_slot = {
-        int(row_data["characterSlotId"]): row_data.get("characterImagePath")
+        int(row_data["characterSlotId"]): row_data
         for row in image_result.mappings().all()
         if (row_data := dict(row)).get("characterSlotId") is not None
     }
     for item in catalog_items:
-        item["characterImagePath"] = image_by_character_slot.get(
-            int(item.get("characterSlotId") or 0)
+        image_data = image_by_character_slot.get(
+            int(item.get("characterSlotId") or 0), {}
         )
+        item["characterImagePath"] = image_data.get("characterImagePath")
+        item["hasCharacterImage"] = bool(image_data.get("hasCharacterImage"))
         ready_episode_count = int(item.pop("_chatReadyEpisodeCount", 0) or 0)
         total_episode_count = int(item.pop("_chatTotalEpisodeCount", 0) or 0)
         distinct_episode_count = int(item.pop("_distinctEpisodeCount", 0) or 0)
@@ -1743,7 +1866,7 @@ async def _load_public_character_catalog_base(
         item["lastViewedEpisodeNo"] = None
         item["lastViewedAt"] = None
 
-    return catalog_items
+    return rank_public_character_catalog_items(catalog_items)
 
 
 async def _get_cached_public_character_catalog_base(
@@ -2634,6 +2757,7 @@ async def post_admin_main_character_slot(
         """),
         params,
     )
+    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": result.lastrowid}}
 
 
@@ -2674,6 +2798,7 @@ async def publish_admin_main_character_slot_now(
         """),
         params,
     )
+    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": result.lastrowid}}
 
 
@@ -2713,6 +2838,7 @@ async def update_admin_main_character_slot(
             status_code=status.HTTP_404_NOT_FOUND,
             message="존재하지 않는 메인 주인공 카드입니다.",
         )
+    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": character_slot_id}}
 
 
@@ -2736,4 +2862,5 @@ async def delete_admin_main_character_slot(
             status_code=status.HTTP_404_NOT_FOUND,
             message="존재하지 않는 메인 주인공 카드입니다.",
         )
+    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": character_slot_id}}

@@ -474,6 +474,13 @@ class PutMainCharacterSlotReqBody(PostMainCharacterSlotReqBody):
     )
 
 
+class PutMainCharacterSlotConfigReqBody(AdminBase):
+    display_mode: Literal["auto", "manual"] = Field(
+        examples=["auto"],
+        description="홈 주인공챗 구좌 노출 모드(auto | manual)",
+    )
+
+
 class PostMainCharacterSlotPublishNowReqBody(MainCharacterSlotReqBody):
     pass
 

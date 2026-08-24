@@ -34,6 +34,24 @@ from app.utils.common import check_user
 router = APIRouter(prefix="/admins")
 
 
+@router.put(
+    "/main-character-slots/config",
+    tags=["CMS - 메인 주인공 카드"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_main_character_slot_config(
+    req_body: admin_schema.PutMainCharacterSlotConfigReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await main_character_slot_service.update_admin_main_character_slot_config(
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
 @router.post(
     "/main-character-slots",
     tags=["CMS - 메인 주인공 카드"],
