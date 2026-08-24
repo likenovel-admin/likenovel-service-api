@@ -21,6 +21,7 @@ _STUBBED_MODULE_NAMES = (
     "app.services.common",
     "app.services.common.cp_link_service",
     "app.services.common.comm_service",
+    "app.services.common.genre_policy",
     "app.config",
     "app.config.log_config",
     "app.services.common.statistics_service",
@@ -140,6 +141,10 @@ comm_service_stub = ModuleType("app.services.common.comm_service")
 comm_service_stub.get_user_from_kc = None
 sys.modules["app.services.common.comm_service"] = comm_service_stub
 
+genre_policy_stub = ModuleType("app.services.common.genre_policy")
+genre_policy_stub.can_use_as_primary_genre = lambda genre_name: True
+sys.modules["app.services.common.genre_policy"] = genre_policy_stub
+
 log_config_stub = ModuleType("app.config.log_config")
 log_config_stub.service_error_logger = lambda *args, **kwargs: None
 sys.modules["app.config"] = ModuleType("app.config")
@@ -165,6 +170,7 @@ try:
     )
     from app.services.product.product_service import (
         get_products_validate_cp_nickname,
+        _resolve_author_id,
         _resolve_reenabled_websochat_context_status,
         _resolve_product_cp_link_update_values,
     )
@@ -174,6 +180,22 @@ finally:
 
 
 class ProductMonopolyPolicyUnitTest(unittest.TestCase):
+    def test_existing_product_author_identity_does_not_require_profile_nickname_match(self):
+        class UnexpectedDatabaseLookup:
+            async def execute(self, *args, **kwargs):
+                raise AssertionError("existing author identity must be preserved")
+
+        author_id = asyncio.run(
+            _resolve_author_id(
+                "말티즈레인",
+                UnexpectedDatabaseLookup(),
+                current_author_id=1413,
+                current_author_name="말티즈레인",
+            )
+        )
+
+        self.assertEqual(author_id, 1413)
+
     def test_omitted_cp_company_preserves_existing_cp_link(self):
         contract_yn, cp_user_id = _resolve_cp_link_update_values(
             fields_set={"monopoly_yn"},

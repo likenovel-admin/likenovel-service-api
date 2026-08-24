@@ -272,12 +272,17 @@ async def _resolve_author_id(
     author_nickname: str,
     db: AsyncSession,
     allow_external_author_nickname: bool = False,
+    current_author_id: int | None = None,
+    current_author_name: str | None = None,
 ) -> int:
     """
     ?묎? ?됰꽕?꾩쑝濡?author_id瑜?議고쉶?쒕떎.
     - 湲곕낯: tb_user_profile.nickname 留ㅼ묶 ?꾩슂
     - allow_external_author_nickname=True ?닿퀬 ?됰꽕?꾩씠 鍮꾩뼱?덉? ?딆쑝硫?鍮꾪쉶???묎?(0) ?덉슜
     """
+    if current_author_id is not None and author_nickname == current_author_name:
+        return current_author_id
+
     query = text("""
                      select user_id
                        from tb_user_profile
@@ -3643,6 +3648,8 @@ async def put_products_product_id(
                 query = text("""
                                  select blind_yn
                                       , open_yn
+                                      , author_id
+                                      , author_name
                                       , monopoly_yn
                                       , contract_yn
                                       , cp_user_id
@@ -3830,6 +3837,8 @@ async def put_products_product_id(
                     author_nickname=req_body.author_nickname,
                     db=db,
                     allow_external_author_nickname=allow_external_author_nickname,
+                    current_author_id=current_product.get("author_id"),
+                    current_author_name=current_product.get("author_name"),
                 )
 
                 # 1李??λⅤ 寃利?
