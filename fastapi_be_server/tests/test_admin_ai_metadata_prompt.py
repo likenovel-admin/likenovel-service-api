@@ -29,6 +29,56 @@ class _MappingsResult:
 
 
 class AdminAiMetadataPromptTest(unittest.TestCase):
+    def test_prompt_and_schema_require_librarian_copy(self):
+        prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
+        template = admin_ai_metadata_service.DNA_USER_TEMPLATE
+        allowed = {
+            axis: {f"{axis}-label"}
+            for axis in admin_ai_metadata_service.AXIS_ORDER
+        }
+        response_format = admin_ai_metadata_service._build_openrouter_dna_response_format(allowed)
+        summary_schema = response_format["json_schema"]["schema"]["properties"]["summary"]
+
+        self.assertIn("summary.librarian", prompt)
+        self.assertIn("금칙어", prompt)
+        self.assertIn('"librarian"', template)
+        self.assertIn("librarian", summary_schema["properties"])
+        self.assertIn("librarian", summary_schema["required"])
+        self.assertEqual(
+            summary_schema["properties"]["librarian"]["required"],
+            ["intro", "points", "chips"],
+        )
+
+    def test_reanalyze_upsert_persists_librarian_columns(self):
+        source = inspect.getsource(admin_ai_metadata_service.reanalyze_ai_product_metadata)
+
+        for column in ("librarian_intro", "librarian_points", "librarian_chips"):
+            self.assertIn(f":{column}", source)
+            self.assertIn(f"{column} = VALUES({column})", source)
+
+    def test_normalize_payload_keeps_librarian_copy(self):
+        normalized = admin_ai_metadata_service._normalize_ai_payload(
+            {
+                "summary": {
+                    "librarian": {
+                        "intro": "해고된 날 대문호가 깃들었어요. 유쾌한 이야기를 좋아하면 잘 맞아요.",
+                        "points": [
+                            "출발점은 게임 개발이에요.",
+                            "주인공은 개발자예요.",
+                            "코미디를 좋아하면 어울려요.",
+                        ],
+                        "chips": ["먼치킨", "게임개발", "코미디"],
+                    }
+                }
+            },
+            enforce_axis_minimum=False,
+            enforce_legacy_required=False,
+        )
+
+        self.assertTrue(normalized["librarian_intro"].startswith("해고된 날"))
+        self.assertEqual(len(normalized["librarian_points"]), 3)
+        self.assertEqual(normalized["librarian_chips"], ["먼치킨", "게임개발", "코미디"])
+
     def test_prompt_separates_ai_librarian_public_tone_from_internal_summary_style(self):
         prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
 
@@ -358,12 +408,79 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminAiMetadataReadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_product_analysis_uses_first_public_episode_and_500_chars(self):
+        db = AsyncMock()
+
+        async def execute(query, params):
+            sql = str(query)
+            self.assertNotIn("e.episode_no = 1", sql)
+            self.assertIn("ORDER BY e.episode_no ASC, e.episode_id ASC", sql)
+            return _MappingsResult(
+                [
+                    {
+                        "product_id": 1225,
+                        "title": "아저씨의 요술램프",
+                        "author_nickname": "작가",
+                        "author_role_type": "normal",
+                        "first_episode_text_count": 500,
+                        "episode_count": 23,
+                    }
+                ]
+            )
+
+        db.execute.side_effect = execute
+
+        product = await admin_ai_metadata_service._get_product_for_analysis(1225, db)
+
+        self.assertEqual(admin_ai_metadata_service.MIN_FIRST_EPISODE_TEXT_COUNT, 500)
+        self.assertEqual(product["product_id"], 1225)
+
+    async def test_product_analysis_rejects_zero_public_episodes(self):
+        db = AsyncMock()
+        db.execute.return_value = _MappingsResult(
+            [
+                {
+                    "product_id": 1226,
+                    "title": "공개 전 작품",
+                    "author_nickname": "작가",
+                    "author_role_type": "normal",
+                    "first_episode_text_count": None,
+                    "episode_count": 0,
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(Exception, "첫 공개회차 500자 미만"):
+            await admin_ai_metadata_service._get_product_for_analysis(1226, db)
+
+    async def test_product_analysis_rejects_fewer_than_three_public_episodes(self):
+        db = AsyncMock()
+        db.execute.return_value = _MappingsResult(
+            [
+                {
+                    "product_id": 1227,
+                    "title": "공개 2화 작품",
+                    "author_nickname": "작가",
+                    "author_role_type": "normal",
+                    "first_episode_text_count": 700,
+                    "episode_count": 2,
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(Exception, "3화 미만"):
+            await admin_ai_metadata_service._get_product_for_analysis(1227, db)
+
     async def test_list_exposes_dna_status_and_storyctx_episode_progress(self):
         db = AsyncMock()
 
         async def execute(query, params):
             sql = str(query)
             if "COUNT(*) AS total_count" in sql:
+                self.assertNotIn("fe.episode_no = 1", sql)
+                self.assertIn("ORDER BY fe.episode_no ASC, fe.episode_id ASC", sql)
+                self.assertIn("), 0) >= 500", sql)
+                self.assertRegex(sql, r"COUNT\(\*\)[\s\S]+>= 3")
                 return _MappingsResult([{"total_count": 1}])
             self.assertIn("tb_story_agent_context_product", sql)
             self.assertIn("story_context_status", sql)

@@ -48,7 +48,7 @@ MAX_ANALYZE_EPISODES = 10
 MAX_ANALYZE_CHARS = 60000
 MAX_LLM_OUTPUT_TOKENS = int(os.getenv("AI_METADATA_MAX_TOKENS", "4096"))
 MIN_REQUIRED_EPISODES = 3
-MIN_FIRST_EPISODE_TEXT_COUNT = 1000
+MIN_FIRST_EPISODE_TEXT_COUNT = 500
 FAILED_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_FAILED_RETRY_COOLDOWN_DAYS", "3"))
 INCOMPLETE_RETRY_COOLDOWN_DAYS = int(os.getenv("AI_METADATA_INCOMPLETE_RETRY_COOLDOWN_DAYS", "3"))
 ANALYSIS_PIPELINE_VERSION = os.getenv("AI_METADATA_PIPELINE_VERSION", "dna-v20260611-r2")
@@ -321,15 +321,15 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
             AND COALESCE(p.blind_yn, 'N') = 'N'
             AND COALESCE(u.role_type, 'normal') != 'admin'
             AND COALESCE(TRIM(p.author_name), '') != ''
-            AND EXISTS (
-                SELECT 1
+            AND COALESCE((
+                SELECT fe.episode_text_count
                 FROM tb_product_episode fe
                 WHERE fe.product_id = p.product_id
-                  AND fe.episode_no = 1
                   AND fe.use_yn = 'Y'
                   AND fe.open_yn = 'Y'
-                  AND fe.episode_text_count >= {MIN_FIRST_EPISODE_TEXT_COUNT}
-            )
+                ORDER BY fe.episode_no ASC, fe.episode_id ASC
+                LIMIT 1
+            ), 0) >= {MIN_FIRST_EPISODE_TEXT_COUNT}
             AND (
                 SELECT COUNT(*)
                 FROM tb_product_episode e
@@ -359,18 +359,18 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
                     COALESCE(m.analysis_status, 'pending') = 'success'
                     AND COALESCE(m.updated_date, m.created_date, m.analyzed_at, '1970-01-01 00:00:00')
                         < DATE_SUB(NOW(), INTERVAL {INCOMPLETE_RETRY_COOLDOWN_DAYS} DAY)
-                    AND EXISTS (
-                        SELECT 1
+                    AND (
+                        SELECT le.updated_date
                         FROM tb_product_episode le
                         WHERE le.product_id = p.product_id
-                          AND le.episode_no = {MAX_ANALYZE_EPISODES}
                           AND le.use_yn = 'Y'
                           AND le.open_yn = 'Y'
-                          AND le.updated_date > m.analyzed_at
-                    )
+                        ORDER BY le.episode_no ASC, le.episode_id ASC
+                        LIMIT 1 OFFSET {MAX_ANALYZE_EPISODES - 1}
+                    ) > m.analyzed_at
                 )
             )
-            """  # 미분석 즉시, 실패/refresh 재시도는 cooldown 뒤, 10화 공개/수정 시 최종 1회 재분석
+            """  # 미분석 즉시, 실패/refresh 재시도는 cooldown 뒤, 공개 10번째 회차 공개/수정 시 최종 1회 재분석
             params.append(f"{UNSUPPORTED_LABEL_ERROR_PREFIX}%")
 
         cur.execute(
@@ -416,7 +416,7 @@ def get_episodes(conn, product_id: int) -> list[dict[str, Any]]:
             WHERE product_id = %s
               AND use_yn = 'Y'
               AND open_yn = 'Y'
-            ORDER BY episode_no ASC
+            ORDER BY episode_no ASC, episode_id ASC
             LIMIT %s
             """,
             (product_id, MAX_ANALYZE_EPISODES),

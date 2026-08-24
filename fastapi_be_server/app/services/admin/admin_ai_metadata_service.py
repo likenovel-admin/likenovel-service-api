@@ -24,12 +24,16 @@ MAX_RETRY_COUNT = 2  # 초기 1회 + 재시도 2회 = 총 3회
 MAX_ANALYZE_EPISODES = 10
 MAX_ANALYZE_CHARS = 60000
 MIN_REQUIRED_EPISODES = 3
-MIN_FIRST_EPISODE_TEXT_COUNT = 1000
+MIN_FIRST_EPISODE_TEXT_COUNT = 500
 
 ALLOWED_ANALYSIS_STATUS = {"pending", "success", "failed"}
 ALLOWED_EXCLUDE_YN = {"Y", "N"}
 ALLOWED_HEROINE_WEIGHT = {"high", "mid", "low", "none"}
 ALLOWED_PACING = {"fast", "medium", "slow"}
+# 배치 경로와 같은 기존 공개 카피 금칙어만 적용한다.
+_LIBRARIAN_BANNED_RE = re.compile(
+    r"결[이을의은]\s|축[이을의]\s|축으로|서사|동력|몰입감|감각적|텍스트|콘텐츠|신호|라벨"
+)
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
 # min은 전 축 0 — 부합 라벨이 없으면 빈 배열이 정답(근접 라벨 강제 매핑 금지)
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
@@ -102,6 +106,12 @@ DNA_SYSTEM_PROMPT = """너는 라이크노벨 내부 메타 추출기 LN_AXIS_EX
 20) 설명형 메타(summary.protagonist_desc, premise, hook, episode_summary_text)는 한국어로만 작성하고, 고유명사 외 영문 표현을 남발하지 않는다.
 21) 설명형 메타는 코드북 라벨 나열이나 복붙이 아니라 서사 정보 중심으로 작성한다.
 22) 문자열 값 앞뒤에 불필요한 따옴표와 백틱 문자를 넣지 않는다.
+23) summary.librarian은 작품 상세페이지의 "AI 사서" 카드에 그대로 노출되는 독자용 소개다.
+23-1) 말투: 서점 직원이 단골 독자에게 권하듯 자연스러운 한국어 존댓말("~요"). 분석가 말투 금지.
+23-2) 금칙어: "결", "축", "서사", "동력", "몰입감", "감각적", "텍스트", "콘텐츠", "신호", "라벨". 이 단어들이 들어간 문장을 쓰지 않는다.
+23-3) intro는 2문장 이내. 첫 문장은 작품의 초반 사건·상황을 구체적으로, 둘째 문장은 어떤 독자에게 맞는지. 추상 홍보문구 금지(9~10번 규칙과 동일 기준).
+23-4) points는 정확히 3개. 각 1문장. ①이야기의 출발점(설정) ②주인공이 어떤 인물이고 무엇을 향해 가는지 ③어떤 취향의 독자에게 어울리는지.
+23-5) chips는 독자에게 익숙한 키워드 3~4개. 장르·트롭·소재 어휘만(예: 먼치킨, 아카데미, 회귀, 게이트). 고유명사(인명·작품명), 두 단어 초과 구, 금칙어 사용 금지.
 """ + DNA_LIFECYCLE_LABELING_RULES
 
 DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하세요.
@@ -137,7 +147,12 @@ DNA_USER_TEMPLATE = """아래 작품 정보를 분석하여 JSON으로 응답하
     "hook": "string",
     "episode_summary_text": "string",
     "themes": ["string"],
-    "taste_tags": ["string"]
+    "taste_tags": ["string"],
+    "librarian": {{
+      "intro": "string",
+      "points": ["string", "string", "string"],
+      "chips": ["string"]
+    }}
   }},
   "axis_labels": {{
     "세": ["string"],
@@ -384,6 +399,26 @@ def _build_openrouter_dna_response_format(
                         "items": {"type": "string"},
                         "minItems": 1,
                     },
+                    "librarian": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "intro": {"type": "string"},
+                            "points": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 3,
+                                "maxItems": 3,
+                            },
+                            "chips": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 3,
+                                "maxItems": 4,
+                            },
+                        },
+                        "required": ["intro", "points", "chips"],
+                    },
                 },
                 "required": [
                     "protagonist_type",
@@ -397,6 +432,7 @@ def _build_openrouter_dna_response_format(
                     "episode_summary_text",
                     "themes",
                     "taste_tags",
+                    "librarian",
                 ],
             },
             "axis_labels": {
@@ -640,6 +676,44 @@ def _sanitize_episode_summary_text(value: Any) -> str | None:
     if not lines:
         return None
     return "\n".join(lines)[:5000]
+
+
+def _normalize_librarian(summary: dict[str, Any]) -> dict[str, Any]:
+    """AI 사서 공개 카피만 검증하고 품질 미달 필드는 fallback용 None으로 둔다."""
+    empty = {"librarian_intro": None, "librarian_points": None, "librarian_chips": None}
+    raw = summary.get("librarian")
+    if not isinstance(raw, dict):
+        return empty
+    try:
+        intro = _safe_text(raw.get("intro"), "summary.librarian.intro", 300)
+        points = _safe_list(
+            raw.get("points"),
+            "summary.librarian.points",
+            max_items=3,
+            max_item_length=200,
+        )
+        chips = _safe_list(
+            raw.get("chips"),
+            "summary.librarian.chips",
+            max_items=4,
+            max_item_length=20,
+        )
+    except ValueError:
+        return empty
+    if intro and _LIBRARIAN_BANNED_RE.search(intro):
+        intro = None
+    if points and (len(points) < 3 or any(_LIBRARIAN_BANNED_RE.search(point) for point in points)):
+        points = []
+    chips = [
+        chip
+        for chip in chips
+        if not _LIBRARIAN_BANNED_RE.search(chip) and len(chip.split()) <= 2
+    ]
+    return {
+        "librarian_intro": intro,
+        "librarian_points": points or None,
+        "librarian_chips": chips or None,
+    }
 
 
 def _safe_enum(value: Any, field_name: str, allowed: set[str], required: bool = False) -> str | None:
@@ -1067,6 +1141,7 @@ def _normalize_ai_payload(
         ),
         "overall_confidence": _safe_confidence(pick("overall_confidence"), "overall_confidence"),
         "axis_label_scores": axis_label_scores,
+        **_normalize_librarian(summary),
     }
 
     if normalized["romance_chemistry_weight"] is None:
@@ -1139,10 +1214,9 @@ async def _get_product_for_analysis(product_id: int, db: AsyncSession) -> dict[s
                 SELECT e.episode_text_count
                 FROM tb_product_episode e
                 WHERE e.product_id = p.product_id
-                  AND e.episode_no = 1
                   AND e.use_yn = 'Y'
                   AND e.open_yn = 'Y'
-                ORDER BY e.episode_id ASC
+                ORDER BY e.episode_no ASC, e.episode_id ASC
                 LIMIT 1
             ) AS first_episode_text_count,
             (
@@ -1180,7 +1254,12 @@ async def _get_product_for_analysis(product_id: int, db: AsyncSession) -> dict[s
     if (product.get("first_episode_text_count") or 0) < MIN_FIRST_EPISODE_TEXT_COUNT:
         raise CustomResponseException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            message=f"첫 회차 {MIN_FIRST_EPISODE_TEXT_COUNT}자 미만 작품은 AI 메타 수집 대상이 아닙니다.",
+            message=f"첫 공개회차 {MIN_FIRST_EPISODE_TEXT_COUNT}자 미만 작품은 AI 메타 수집 대상이 아닙니다.",
+        )
+    if (product.get("episode_count") or 0) < MIN_REQUIRED_EPISODES:
+        raise CustomResponseException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            message=f"공개 {MIN_REQUIRED_EPISODES}화 미만 작품은 AI 메타 수집 대상이 아닙니다.",
         )
     return product
 
@@ -1196,7 +1275,7 @@ async def _get_episodes_for_analysis(product_id: int, db: AsyncSession) -> list[
         WHERE e.product_id = :product_id
           AND e.use_yn = 'Y'
           AND e.open_yn = 'Y'
-        ORDER BY e.episode_no ASC
+        ORDER BY e.episode_no ASC, e.episode_id ASC
         LIMIT :max_episode
         """
     )
@@ -1270,15 +1349,24 @@ async def ai_product_metadata_list(
         "COALESCE(u.role_type, 'normal') != 'admin'",
         "COALESCE(TRIM(p.author_name), '') != ''",
         f"""
-        EXISTS (
-            SELECT 1
+        COALESCE((
+            SELECT fe.episode_text_count
             FROM tb_product_episode fe
             WHERE fe.product_id = p.product_id
-              AND fe.episode_no = 1
               AND fe.use_yn = 'Y'
               AND fe.open_yn = 'Y'
-              AND fe.episode_text_count >= {MIN_FIRST_EPISODE_TEXT_COUNT}
-        )
+            ORDER BY fe.episode_no ASC, fe.episode_id ASC
+            LIMIT 1
+        ), 0) >= {MIN_FIRST_EPISODE_TEXT_COUNT}
+        """,
+        f"""
+        (
+            SELECT COUNT(*)
+            FROM tb_product_episode episode_count
+            WHERE episode_count.product_id = p.product_id
+              AND episode_count.use_yn = 'Y'
+              AND episode_count.open_yn = 'Y'
+        ) >= {MIN_REQUIRED_EPISODES}
         """,
     ]
     params: dict[str, Any] = {}
@@ -1742,6 +1830,7 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                     protagonist_goal_primary, goal_confidence, overall_confidence, axis_label_scores,
                     protagonist_material_tags, worldview_tags, protagonist_type_tags, protagonist_job_tags, axis_style_tags, axis_romance_tags,
                     themes, similar_famous, taste_tags,
+                    librarian_intro, librarian_points, librarian_chips,
                     raw_analysis, analyzed_at, model_version,
                     analysis_status, analysis_attempt_count, analysis_error_message
                 ) VALUES (
@@ -1752,6 +1841,7 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                     :protagonist_goal_primary, :goal_confidence, :overall_confidence, :axis_label_scores,
                     :protagonist_material_tags, :worldview_tags, :protagonist_type_tags, :protagonist_job_tags, :axis_style_tags, :axis_romance_tags,
                     :themes, :similar_famous, :taste_tags,
+                    :librarian_intro, :librarian_points, :librarian_chips,
                     :raw_analysis, NOW(), :model_version,
                     'success', :analysis_attempt_count, NULL
                 )
@@ -1779,6 +1869,9 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                     themes = VALUES(themes),
                     similar_famous = VALUES(similar_famous),
                     taste_tags = VALUES(taste_tags),
+                    librarian_intro = VALUES(librarian_intro),
+                    librarian_points = VALUES(librarian_points),
+                    librarian_chips = VALUES(librarian_chips),
                     raw_analysis = VALUES(raw_analysis),
                     analyzed_at = NOW(),
                     model_version = VALUES(model_version),
@@ -1815,6 +1908,17 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                     "themes": json.dumps(normalized["themes"], ensure_ascii=False),
                     "similar_famous": json.dumps(normalized["similar_famous"], ensure_ascii=False),
                     "taste_tags": json.dumps(normalized["taste_tags"], ensure_ascii=False),
+                    "librarian_intro": normalized["librarian_intro"],
+                    "librarian_points": (
+                        json.dumps(normalized["librarian_points"], ensure_ascii=False)
+                        if normalized["librarian_points"]
+                        else None
+                    ),
+                    "librarian_chips": (
+                        json.dumps(normalized["librarian_chips"], ensure_ascii=False)
+                        if normalized["librarian_chips"]
+                        else None
+                    ),
                     "raw_analysis": raw_analysis_payload,
                     "model_version": _dna_analysis_version(),
                     "analysis_attempt_count": attempt_count,
