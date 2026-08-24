@@ -396,6 +396,61 @@ RP_PROFILE_SYNTHESIS_PROMPT = """너는 웹소설 캐릭터 RP 프로필 합성�
 11. 가능하면 반응축마다 대표 대사 1개씩 먼저 고르고, 축이 부족할 때만 같은 축의 대사를 추가하라.
 """
 
+RP_PROFILE_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "character_rp_profile",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "speech_style": {
+                    "type": "object",
+                    "properties": {
+                        "tone": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                        "formality": {"type": "string", "minLength": 1},
+                        "sentence_length": {"type": "string", "minLength": 1},
+                        "habit": {"type": "array", "items": {"type": "string"}},
+                        "address": {"type": "string"},
+                    },
+                    "required": [
+                        "tone",
+                        "formality",
+                        "sentence_length",
+                        "habit",
+                        "address",
+                    ],
+                    "additionalProperties": False,
+                },
+                "personality_core": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 2,
+                },
+                "baseline_attitude": {"type": "string", "minLength": 1},
+                "example_dialogues": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 5,
+                },
+            },
+            "required": [
+                "speech_style",
+                "personality_core",
+                "baseline_attitude",
+                "example_dialogues",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
+
 CHARACTER_CHAT_INTERNAL_PROMPT_SYSTEM = """너는 웹소설 원고 기반 캐릭터챗 내부 프롬프트 설계자다.
 반드시 JSON만 반환하라. 원문/요약/관계/대사 근거에 없는 설정을 만들지 마라.
 
@@ -1428,6 +1483,7 @@ def build_rp_openrouter_payload(
     user_prompt: str,
     max_tokens: int,
     model: str | None = None,
+    response_format: dict[str, object] | None = None,
 ) -> dict[str, object]:
     selected_model = str(model or "").strip() or require_paid_rp_openrouter_model()
     if selected_model.lower().endswith(":free"):
@@ -1436,7 +1492,7 @@ def build_rp_openrouter_payload(
         "model": selected_model,
         "temperature": 0.0,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
+        "response_format": response_format or {"type": "json_object"},
         "reasoning": {"effort": "none", "exclude": True},
         "messages": [
             {"role": "system", "content": f"{system_prompt}\n\n반드시 유효한 JSON object만 반환하라."},
@@ -1521,6 +1577,7 @@ async def request_rp_openrouter_json_payload(
     title: str,
     model: str | None = None,
     timeout_seconds: float | None = None,
+    response_format: dict[str, object] | None = None,
 ) -> dict | None:
     request_timeout_seconds = timeout_seconds or RP_OPENROUTER_TIMEOUT_SECONDS
     response = await asyncio.wait_for(
@@ -1539,6 +1596,7 @@ async def request_rp_openrouter_json_payload(
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
                 model=model,
+                response_format=response_format,
             ),
             timeout=request_timeout_seconds,
         ),
@@ -5369,6 +5427,7 @@ async def request_rp_profile_payload(
         user_prompt=user_prompt,
         max_tokens=1200,
         title="LikeNovel Story Agent RP Profile Batch",
+        response_format=RP_PROFILE_RESPONSE_FORMAT,
     )
 
 

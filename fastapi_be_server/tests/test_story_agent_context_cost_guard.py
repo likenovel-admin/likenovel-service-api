@@ -2875,7 +2875,25 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(request_json["reasoning"], {"effort": "none", "exclude": True})
-        self.assertEqual(request_json["response_format"], {"type": "json_object"})
+        response_format = request_json["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        profile_schema = response_format["json_schema"]
+        self.assertTrue(profile_schema["strict"])
+        self.assertEqual(
+            set(profile_schema["schema"]["required"]),
+            {
+                "speech_style",
+                "personality_core",
+                "baseline_attitude",
+                "example_dialogues",
+            },
+        )
+        self.assertEqual(
+            set(
+                profile_schema["schema"]["properties"]["speech_style"]["required"]
+            ),
+            {"tone", "formality", "sentence_length", "habit", "address"},
+        )
         self.assertNotIn(":free", request_json["model"])
 
     async def test_rp_openrouter_rejects_free_model_variant_before_network_call(self):
