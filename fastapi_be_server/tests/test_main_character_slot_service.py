@@ -292,6 +292,10 @@ def test_practical_rp_assets_require_nonempty_examples_without_episode_window():
 
     assert "summary_type = 'character_rp_profile'" in query
     assert "summary_type = 'character_rp_examples'" in query
+    assert "$.personality_core" in query
+    assert "$.speech_style.tone" in query
+    assert "$.speech_style.formality" in query
+    assert "$.speech_style.sentence_length" in query
     assert "JSON_LENGTH(JSON_EXTRACT(" in query
     assert ")) > 0" in query
     assert "eligible_rp_example.episode_no BETWEEN 0 AND 1" not in query
@@ -508,6 +512,10 @@ def test_public_character_catalog_assets_query_filters_before_returning_payload(
     assert "$.display_safety.status" not in query
     assert "summary_type = 'character_rp_profile'" in query
     assert "summary_type = 'character_rp_examples'" in query
+    assert "$.personality_core" in query
+    assert "$.speech_style.tone" in query
+    assert "$.speech_style.formality" in query
+    assert "$.speech_style.sentence_length" in query
     assert "profile.scope_key = inventory.scope_key" in normalized_query
     assert "examples.scope_key = inventory.scope_key" in normalized_query
     assert "inventory.source_doc_count AS _distinctEpisodeCount" in query
@@ -592,6 +600,10 @@ def test_catalog_alias_fallback_query_preserves_compatible_scope_contract():
     assert "JSON_QUOTE(profile.scope_key)" in query
     assert "JSON_QUOTE(examples.scope_key)" in query
     assert "$.public_chat_eligible" in query
+    assert "$.personality_core" in query
+    assert "$.speech_style.tone" in query
+    assert "$.speech_style.formality" in query
+    assert "$.speech_style.sentence_length" in query
 
 
 def test_catalog_alias_fallback_targets_only_incomplete_or_weak_exact_products():
@@ -2187,6 +2199,18 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "productId": 1192,
                 "scopeKey": "character:adelite",
                 "summaryType": "character_rp_profile",
+                "summaryText": json.dumps(
+                    {
+                        "character_key": "character:adelite",
+                        "personality_core": ["신중함"],
+                        "speech_style": {
+                            "tone": ["차분함"],
+                            "formality": "존댓말",
+                            "sentence_length": "보통",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
                 "exampleCount": 0,
             },
             {
@@ -2449,6 +2473,7 @@ def test_build_character_chat_preview_uses_matching_scene_and_source_chunk():
     )
     profile_text = json.dumps(
         {
+            "character_key": "character:윤서하",
             "role_label": "몰락한 왕가의 마지막 황녀",
             "personality_core": ["신중함", "책임감이 강함"],
             "speech_style": {
@@ -2517,7 +2542,18 @@ def test_build_character_chat_preview_matches_action_owner_inventory_alias():
                 },
                 ensure_ascii=False,
             ),
-            "profileSummaryText": "{}",
+            "profileSummaryText": json.dumps(
+                {
+                    "character_key": "character:방호영",
+                    "personality_core": ["단호함"],
+                    "speech_style": {
+                        "tone": ["낮고 단정함"],
+                        "formality": "반말",
+                        "sentence_length": "짧음",
+                    },
+                },
+                ensure_ascii=False,
+            ),
         },
         scene_row={
             "episodeId": 1,
@@ -2591,7 +2627,17 @@ def test_build_character_chat_preview_rejects_malformed_scene_coordinates(
             "inventorySummaryText": json.dumps(
                 {"canonical_character_key": "character:lead"}
             ),
-            "profileSummaryText": "{}",
+            "profileSummaryText": json.dumps(
+                {
+                    "character_key": "character:lead",
+                    "personality_core": ["신중함"],
+                    "speech_style": {
+                        "tone": ["차분함"],
+                        "formality": "반말",
+                        "sentence_length": "짧음",
+                    },
+                }
+            ),
         },
         scene_row={
             "episodeNo": 1,
@@ -2604,6 +2650,51 @@ def test_build_character_chat_preview_rejects_malformed_scene_coordinates(
                 "text": source_text,
             }
         ],
+    )
+
+    assert payload is None
+
+
+def test_build_character_chat_preview_rejects_incomplete_profile_contract():
+    from app.services.product.main_character_slot_service import (
+        build_character_chat_preview_payload,
+    )
+
+    payload = build_character_chat_preview_payload(
+        character_scope_key="character:lead",
+        profile_row={
+            "inventorySummaryText": json.dumps(
+                {"canonical_character_key": "character:lead"}
+            ),
+            "profileSummaryText": json.dumps(
+                {
+                    "character_key": "character:lead",
+                    "personality_core": [],
+                    "speech_style": {
+                        "tone": [],
+                        "formality": "",
+                        "sentence_length": "",
+                    },
+                }
+            ),
+        },
+        scene_row={
+            "episodeNo": 1,
+            "sceneSummaryText": json.dumps(
+                {
+                    "scenes": [
+                        {
+                            "scene_index": 1,
+                            "scene_gist": "장면 요약",
+                            "char_start": 0,
+                            "char_end": 4,
+                            "participants": [{"scope_key": "character:lead"}],
+                        }
+                    ]
+                }
+            ),
+        },
+        chunk_rows=[{"charStart": 0, "charEnd": 4, "text": "장면 원문"}],
     )
 
     assert payload is None

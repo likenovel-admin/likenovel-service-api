@@ -63,7 +63,16 @@ def inventory_payload(
 
 
 def profile_payload(scope_key="protagonist:named:데시"):
-    return {"character_key": scope_key, "display_name": "데시"}
+    return {
+        "character_key": scope_key,
+        "display_name": "데시",
+        "personality_core": ["신중함"],
+        "speech_style": {
+            "tone": ["차분함"],
+            "formality": "반말",
+            "sentence_length": "짧음",
+        },
+    }
 
 
 def examples_payload(scope_key="protagonist:named:데시"):
@@ -131,6 +140,49 @@ def opening_payload(scope_key="protagonist:named:데시"):
 
 
 class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
+    def test_character_chat_holds_profile_with_empty_personality_and_speech_style(self):
+        module = load_module()
+        scope_key = "protagonist:named:데시"
+        incomplete_profile = profile_payload(scope_key)
+        incomplete_profile["personality_core"] = []
+        incomplete_profile["speech_style"] = {
+            "tone": [],
+            "formality": "",
+            "sentence_length": "",
+        }
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=109,
+            story_context_status="ready",
+            total_episode_count=3,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row("character_inventory_v3", scope_key, inventory_payload(scope_key))
+                ],
+                "character_rp_profile": [
+                    row("character_rp_profile", scope_key, incomplete_profile)
+                ],
+                "character_rp_examples": [
+                    row("character_rp_examples", scope_key, examples_payload(scope_key))
+                ],
+                "episode_scene_extraction": [
+                    row(
+                        "episode_scene_extraction",
+                        "episode:3",
+                        scene_payload(scope_key),
+                        episode_from=3,
+                    )
+                ],
+            },
+        )
+
+        self.assertEqual(verification["character_chat_status"], "hold")
+        self.assertEqual(verification["invalid_profile_scope_keys"], [scope_key])
+        self.assertEqual(
+            verification["block_reason_counts"]["invalid_profile_payload"],
+            1,
+        )
+
     def test_story_context_ready_does_not_make_character_chat_ready_without_assets(self):
         module = load_module()
 

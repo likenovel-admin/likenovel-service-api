@@ -125,7 +125,11 @@ class _FakeRpContextDb:
                             {
                                 "character_key": profile_scope_key,
                                 "display_name": self.profile_display_name,
-                                "speech_style": {"tone": ["차분"]},
+                                "speech_style": {
+                                    "tone": ["차분"],
+                                    "formality": "반말",
+                                    "sentence_length": "보통",
+                                },
                                 "personality_core": ["상처를 숨김"],
                                 "baseline_attitude": "경계",
                             },
@@ -365,7 +369,11 @@ class _FakeUnsafeInventoryV3WithLegacyRpDb:
                         "summaryText": json.dumps(
                             {
                                 "display_name": "산군",
-                                "speech_style": {"tone": ["거칠고 단호함"]},
+                                "speech_style": {
+                                    "tone": ["거칠고 단호함"],
+                                    "formality": "반말",
+                                    "sentence_length": "짧음",
+                                },
                                 "personality_core": ["생존 본능이 강함"],
                                 "baseline_attitude": "경계",
                             },

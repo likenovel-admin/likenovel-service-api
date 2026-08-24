@@ -3026,7 +3026,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ),
         }
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
             "example_dialogues": [
@@ -3098,7 +3102,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ]
         }
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
             "example_dialogues": [],
@@ -3187,7 +3195,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ),
         }
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
             "example_dialogues": [
@@ -3272,7 +3284,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ),
         }
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
             "example_dialogues": [
@@ -3358,7 +3374,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertFalse(module.is_strict_dialogue_item_set_ready(dialogue_items, aliases))
 
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["책임감"],
             "baseline_attitude": "보호",
             "example_dialogues": [item["text"] for item in dialogue_items],
@@ -3399,6 +3419,71 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["examples"], [1, 0])
         self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
 
+    async def test_delta_rp_build_does_not_store_incomplete_generated_profile(self):
+        module = load_module()
+        conn = FakeConnection()
+        scope_key = "character:이시혁"
+        dialogue_items = [
+            {
+                "episode_no": 3,
+                "kind": "dialogue",
+                "text": "아저씨 얼른 저 따라오세요. 여기 위험해요.",
+            },
+            {
+                "episode_no": 3,
+                "kind": "dialogue",
+                "text": "이번에는 제가 아저씨를 살려드릴게요.",
+            },
+        ]
+        incomplete_profile = {
+            "speech_style": {
+                "tone": [],
+                "formality": "",
+                "sentence_length": "",
+            },
+            "personality_core": [],
+            "baseline_attitude": "보호",
+            "example_dialogues": [item["text"] for item in dialogue_items],
+        }
+        prompt_mock = AsyncMock(return_value={"internal_prompt": "사용되지 않아야 한다."})
+        upsert_mock = MagicMock()
+
+        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
+             patch.object(module, "build_direct_voice_evidence_quality", return_value={"strict_chat_ready": False, "status": "insufficient"}), \
+             patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
+             patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=dialogue_items)), \
+             patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=incomplete_profile)), \
+             patch.object(module, "request_character_chat_internal_prompt_payload", prompt_mock), \
+             patch.object(module, "fetch_active_summary_state_map", return_value={}), \
+             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "upsert_summary", upsert_mock), \
+             patch.object(module, "deactivate_active_scope", return_value=0):
+            counts = await module.build_rp_summaries_delta(
+                conn,
+                product_id=1099,
+                affected_scope_keys={scope_key},
+                episode_rows=[],
+                episode_texts_by_no={3: "원문"},
+                summary_client=object(),
+                inventory_map={
+                    scope_key: {
+                        "canonical_character_key": scope_key,
+                        "display_name": "이시혁",
+                        "aliases": ["이시혁"],
+                        "is_protagonist": True,
+                        "distinct_episode_count": 83,
+                    }
+                },
+                relation_map={},
+            )
+
+        self.assertEqual(counts["profile"], [0, 0])
+        self.assertEqual(counts["examples"], [0, 0])
+        prompt_mock.assert_not_awaited()
+        upsert_mock.assert_not_called()
+
     async def test_delta_rp_monologue_ready_main_extracts_grounded_dialogue_examples(self):
         module = load_module()
         conn = FakeConnection()
@@ -3427,7 +3512,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         processed_scope_keys: set[str] = set()
         profile_mock = AsyncMock(
             return_value={
-                "speech_style": {"tone": "단호"},
+                "speech_style": {
+                    "tone": "단호",
+                    "formality": "반말",
+                    "sentence_length": "보통",
+                },
                 "personality_core": ["집요함"],
                 "baseline_attitude": "경계",
                 "example_dialogues": [item["text"] for item in dialogue_items],
@@ -3563,7 +3652,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         dialogue_fallback = AsyncMock(return_value=[])
         profile_mock = AsyncMock(
             return_value={
-                "speech_style": {"tone": "단호"},
+                "speech_style": {
+                    "tone": "단호",
+                    "formality": "반말",
+                    "sentence_length": "보통",
+                },
                 "personality_core": ["집요함"],
                 "baseline_attitude": "경계",
                 "example_dialogues": [
@@ -3739,7 +3832,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "character_key": legacy_scope_key,
             "display_name": "백이현",
             "aliases": ["백이현"],
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
         }
@@ -3836,7 +3933,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "character_key": legacy_scope_key,
             "display_name": "백의",
             "aliases": ["백의", "실눈 성자"],
-            "speech_style": {"tone": "담담"},
+            "speech_style": {
+                "tone": "담담",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["신중함"],
             "baseline_attitude": "경계",
         }
@@ -3947,7 +4048,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                     "payload": {
                         "character_key": legacy_scope_key,
                         "display_name": "레이븐",
-                        "speech_style": {"tone": "건조"},
+                        "speech_style": {
+                            "tone": "건조",
+                            "formality": "반말",
+                            "sentence_length": "보통",
+                        },
+                        "personality_core": ["신중함"],
                     },
                 }
             },
@@ -4062,6 +4168,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                     "payload": {
                         "character_key": scope_key,
                         "display_name": "레이븐",
+                        "personality_core": ["신중함"],
+                        "speech_style": {
+                            "tone": "건조",
+                            "formality": "반말",
+                            "sentence_length": "보통",
+                        },
                     },
                 }
             },
@@ -4259,12 +4371,30 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 ]
             ),
         }
-        canonical_profile_payload = {"character_key": scope_key, "display_name": "백이현", "speech_style": {"tone": "old"}}
+        canonical_profile_payload = {
+            "character_key": scope_key,
+            "display_name": "백이현",
+            "personality_core": ["원칙적"],
+            "speech_style": {
+                "tone": "old",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
+        }
         canonical_example_payload = {
             "character_key": scope_key,
             "examples": [{"episode_no": 1, "text": "낡은 대표 대사"}],
         }
-        legacy_profile_payload = {"character_key": legacy_scope_key, "display_name": "백이현", "speech_style": {"tone": "legacy"}}
+        legacy_profile_payload = {
+            "character_key": legacy_scope_key,
+            "display_name": "백이현",
+            "personality_core": ["원칙적"],
+            "speech_style": {
+                "tone": "legacy",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
+        }
         legacy_example_payload = {
             "character_key": legacy_scope_key,
             "examples": [{"episode_no": 1, "text": "legacy 대표 대사"}],
@@ -4281,7 +4411,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         }
         profile_mock = AsyncMock(
             return_value={
-                "speech_style": {"tone": "new"},
+                "speech_style": {
+                    "tone": "new",
+                    "formality": "반말",
+                    "sentence_length": "보통",
+                },
                 "personality_core": ["원칙적"],
                 "baseline_attitude": "경계",
                 "example_dialogues": [
@@ -4398,7 +4532,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "character_key": scope_key,
             "display_name": "백이현",
             "aliases": ["백이현"],
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
         }
         example_payload = {
             "character_key": scope_key,
@@ -4504,7 +4642,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "character_key": legacy_scope_key,
             "display_name": "백이현",
             "aliases": ["백이현"],
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
         }
         example_payload = {
             "character_key": legacy_scope_key,
@@ -4750,7 +4892,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             4: "김도윤은 말없이 장면 밖에 머물렀다.",
         }
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
             "example_dialogues": [
@@ -4856,7 +5002,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             {"episode_no": 4, "kind": "dialogue", "text": "따라오지 마, 여기서부터는 내가 정리하고 끝내겠다.", "confidence": 0.95},
         ]
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["책임감"],
             "baseline_attitude": "경계",
             "example_dialogues": [
@@ -4916,7 +5066,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             for episode_no in range(1, 6)
         ]
         profile_payload = {
-            "speech_style": {"tone": "단호"},
+            "speech_style": {
+                "tone": "단호",
+                "formality": "반말",
+                "sentence_length": "보통",
+            },
             "personality_core": ["책임감"],
             "baseline_attitude": "경계",
             "example_dialogues": [item["text"] for item in dialogue_items[:3]],
@@ -5321,6 +5475,22 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(filtered["rp_scope_keys"], ["character:main"])
         self.assertEqual(filtered["scene_scope_keys"], ["character:main"])
+        self.assertTrue(filtered["repairable"])
+
+    def test_character_asset_repair_plan_intersects_explicit_scope_keys(self):
+        module = load_module()
+        filtered = module.filter_character_chat_asset_repair_plan_to_requested_scopes(
+            repair_plan={
+                "rp_scope_keys": ["character:도윤", "character:동료"],
+                "scene_scope_keys": ["character:도윤", "character:동료"],
+                "blocked_scope_keys": [],
+                "repairable": True,
+            },
+            requested_scope_keys={"character:도윤"},
+        )
+
+        self.assertEqual(filtered["rp_scope_keys"], ["character:도윤"])
+        self.assertEqual(filtered["scene_scope_keys"], ["character:도윤"])
         self.assertTrue(filtered["repairable"])
 
     def test_provider_inventory_map_excludes_over_cap_only_character(self):
@@ -7630,7 +7800,11 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 "relation_episode_count": 3,
             },
             "profile": {
-                "speech_style": {"tone": "단호", "formality": "반말"},
+                "speech_style": {
+                    "tone": "단호",
+                    "formality": "반말",
+                    "sentence_length": "보통",
+                },
                 "personality_core": ["원칙적", "경계심"],
                 "baseline_attitude": "경계",
             },
@@ -8122,7 +8296,17 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 "voice_evidence_count": 6,
             },
         }
-        complete_profile = {"payload": {"character_key": "character:티르", "speech_style": {"tone": "차분"}}}
+        complete_profile = {
+            "payload": {
+                "character_key": "character:티르",
+                "personality_core": ["신중함"],
+                "speech_style": {
+                    "tone": "차분",
+                    "formality": "존댓말",
+                    "sentence_length": "보통",
+                },
+            }
+        }
         complete_examples = {
             "payload": {
                 "character_key": "character:티르",
@@ -8144,6 +8328,44 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(selected, {"character:루벤"})
+
+    def test_delta_rp_scope_selection_repairs_incomplete_profile(self):
+        module = load_module()
+        selected = module.select_delta_rp_scope_keys(
+            refresh_requested=False,
+            affected_scope_keys=set(),
+            inventory_map={
+                "character:도윤": {
+                    "display_name": "도윤",
+                    "is_protagonist": True,
+                    "distinct_episode_count": 15,
+                    "voice_evidence_count": 12,
+                }
+            },
+            profile_map={
+                "character:도윤": {
+                    "payload": {
+                        "character_key": "character:도윤",
+                        "personality_core": [],
+                        "speech_style": {
+                            "tone": [],
+                            "formality": "",
+                            "sentence_length": "",
+                        },
+                    }
+                }
+            },
+            examples_map={
+                "character:도윤": {
+                    "payload": {
+                        "character_key": "character:도윤",
+                        "examples": [{"episode_no": 1, "text": "가자."}],
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(selected, {"character:도윤"})
 
     def test_delta_rp_scope_selection_refresh_uses_affected_scope_keys(self):
         module = load_module()
@@ -8177,6 +8399,65 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             args = module.parse_args()
 
         self.assertEqual(args.max_delta_episodes, 5)
+
+    def test_delta_repair_cli_accepts_repeated_character_scope_keys(self):
+        module = load_module()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "build_story_agent_context.py",
+                "--build-mode",
+                "delta",
+                "--apply",
+                "--repair-character-assets",
+                "--product-id",
+                "1217",
+                "--character-scope-key",
+                "character:김도윤",
+                "--character-scope-key",
+                "character:김록희",
+            ],
+        ):
+            args = module.parse_args()
+
+        module.validate_delta_args(args)
+        self.assertEqual(
+            args.character_scope_keys,
+            ["character:김도윤", "character:김록희"],
+        )
+
+    def test_character_scope_key_requires_apply_repair_combo(self):
+        module = load_module()
+        invalid_argvs = (
+            [
+                "build_story_agent_context.py",
+                "--build-mode",
+                "delta",
+                "--product-id",
+                "1217",
+                "--repair-character-assets",
+                "--character-scope-key",
+                "character:김도윤",
+            ],
+            [
+                "build_story_agent_context.py",
+                "--build-mode",
+                "delta",
+                "--apply",
+                "--product-id",
+                "1217",
+                "--character-scope-key",
+                "character:김도윤",
+            ],
+        )
+
+        for argv in invalid_argvs:
+            with self.subTest(argv=argv), patch.object(sys, "argv", argv):
+                args = module.parse_args()
+                with self.assertRaisesRegex(ValueError, "--character-scope-key"):
+                    module.validate_delta_args(args)
 
     def test_target_queries_include_all_consented_products_but_mark_character_cohort(self):
         module = load_module()
