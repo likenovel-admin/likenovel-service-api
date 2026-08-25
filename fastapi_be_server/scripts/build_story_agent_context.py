@@ -12612,6 +12612,189 @@ def _unresolved_opening_work_protagonist_resolution(reason_code: str) -> dict[st
     }
 
 
+CUMULATIVE_WORK_PROTAGONIST_MIN_EPISODE_COUNT = 5
+CUMULATIVE_WORK_PROTAGONIST_MIN_EPISODE_COVERAGE = 0.25
+CUMULATIVE_WORK_PROTAGONIST_DOMINANCE_RATIO = 2.0
+
+
+def count_distinct_signal_episode_nos(signal_rows: list[dict]) -> int:
+    return len(
+        {
+            episode_no
+            for row in signal_rows
+            if (
+                episode_no := int(
+                    (extract_json_object(str(row.get("summary_text") or "")) or {}).get("episode_no")
+                    or row.get("episode_from")
+                    or 0
+                )
+            )
+            > 0
+        }
+    )
+
+
+def _cumulative_work_protagonist_episode_count(row: dict[str, object]) -> int:
+    return int(dict(row.get("work_protagonist_evidence") or {}).get("episode_count") or 0)
+
+
+def _cumulative_selection_conflicts_with_locked_rows(
+    selected_row: dict[str, object],
+    *,
+    locked_protagonist_rows: list[dict[str, object]] | None,
+) -> bool:
+    """누적 근거 1위가 이미 확정된 주인공과 다른 인물인지 판정한다.
+
+    축약형 별칭이 별개 행으로 남아 풀네임 주인공보다 많은 근거를 갖는
+    작품이 있다. 그런 행을 승격시키면 표시명이 축약형으로 격하되므로
+    기존 확정을 유지한다.
+    """
+    locked_scope_keys: set[str] = set()
+    for locked_row in list(locked_protagonist_rows or []):
+        locked_scope_keys |= _work_protagonist_identity_scope_keys(locked_row)
+    if not locked_scope_keys:
+        return False
+    return not (
+        _work_protagonist_identity_scope_keys(selected_row) & locked_scope_keys
+    )
+
+
+def _guard_cumulative_resolution_against_locked_rows(
+    rows: list[dict[str, object]],
+    resolution: dict[str, object],
+    *,
+    locked_protagonist_rows: list[dict[str, object]] | None,
+) -> dict[str, object]:
+    """resolver가 만든 누적 판정에 locked 가드를 사후 적용한다."""
+    selected_key = str(resolution.get("work_protagonist_key") or "").strip()
+    if not selected_key:
+        return resolution
+    selected_row = next(
+        (
+            row
+            for row in rows
+            if str(row.get("canonical_character_key") or "").strip() == selected_key
+        ),
+        None,
+    )
+    if selected_row is None:
+        return resolution
+    if not _cumulative_selection_conflicts_with_locked_rows(
+        selected_row,
+        locked_protagonist_rows=locked_protagonist_rows,
+    ):
+        return resolution
+    return _unresolved_opening_work_protagonist_resolution(
+        "cumulative_evidence_conflicts_with_locked_protagonist"
+    )
+
+
+def _cumulative_work_protagonist_candidates(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """누적 주인공 근거로 평가할 수 있는 후보만 남긴다.
+
+    보통명사/역할 라벨 행과 정체성 충돌 행은 제외한다. 이 행들은 확정해도
+    공개 노출이 차단되며, 동일 인물이 파편으로 갈라진 결과인 경우가 많다.
+    """
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        canonical_key = str(row.get("canonical_character_key") or "").strip()
+        if not canonical_key or canonical_key == "character:나(주인공)":
+            continue
+        if _inventory_identity_blocking_conflict_reasons(row):
+            continue
+        display_safety = dict(
+            row.get("display_safety") or build_inventory_display_safety(row)
+        )
+        if str(display_safety.get("status") or "") == "fail":
+            continue
+        candidates.append(row)
+    return sorted(
+        candidates,
+        key=lambda row: (
+            -_cumulative_work_protagonist_episode_count(row),
+            -int(row.get("distinct_episode_count") or 0),
+            str(row.get("display_name") or ""),
+        ),
+    )
+
+
+def _build_cumulative_work_protagonist_resolution(
+    rows: list[dict[str, object]],
+    *,
+    total_signal_episodes: int,
+    unresolved_fallback: dict[str, object] | None = None,
+    locked_protagonist_rows: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """첫 3화 판정이 실패했을 때 누적 회차 근거로 작품 주인공을 확정한다.
+
+    첫 3화에 주인공 후보가 겹치면 오프닝 판정은 즉시 포기하지만, 실제
+    주인공은 전 회차에 걸쳐 압도적 비중을 갖는 경우가 많다. 1위가 최소
+    화수, 전체 회차 대비 비중, 2위 대비 우위를 모두 만족할 때만 확정한다.
+
+    확정하지 못하면 `unresolved_fallback`을 그대로 돌려준다. 앞선 판정
+    단계가 남긴 진단 사유를 누적 판정 사유로 덮어쓰지 않기 위해서다.
+    """
+
+    def _keep_unresolved(reason_code: str) -> dict[str, object]:
+        if unresolved_fallback is not None:
+            return unresolved_fallback
+        return _unresolved_opening_work_protagonist_resolution(reason_code)
+
+    candidates = _cumulative_work_protagonist_candidates(rows)
+    if not candidates:
+        return _keep_unresolved("cumulative_evidence_candidate_not_found")
+
+    top_row = candidates[0]
+    top_episode_count = _cumulative_work_protagonist_episode_count(top_row)
+    second_episode_count = (
+        _cumulative_work_protagonist_episode_count(candidates[1])
+        if len(candidates) > 1
+        else 0
+    )
+    if top_episode_count < CUMULATIVE_WORK_PROTAGONIST_MIN_EPISODE_COUNT:
+        return _keep_unresolved("cumulative_evidence_below_minimum")
+    if (
+        total_signal_episodes > 0
+        and top_episode_count
+        < total_signal_episodes * CUMULATIVE_WORK_PROTAGONIST_MIN_EPISODE_COVERAGE
+    ):
+        return _keep_unresolved("cumulative_evidence_coverage_below_minimum")
+    if (
+        second_episode_count > 0
+        and top_episode_count
+        < second_episode_count * CUMULATIVE_WORK_PROTAGONIST_DOMINANCE_RATIO
+    ):
+        return _keep_unresolved("cumulative_evidence_not_dominant")
+
+    if _cumulative_selection_conflicts_with_locked_rows(
+        top_row,
+        locked_protagonist_rows=locked_protagonist_rows,
+    ):
+        return _keep_unresolved("cumulative_evidence_conflicts_with_locked_protagonist")
+
+    selected_key = str(top_row.get("canonical_character_key") or "").strip()
+    return {
+        "schema_version": WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION,
+        "decision": "RESOLVED",
+        "work_protagonist_key": selected_key,
+        "work_protagonist_keys": [selected_key],
+        "confidence": "medium",
+        "reason_code": "cumulative_role_dominance",
+        "rationale": (
+            f"누적 {top_episode_count}화 작품 주인공 근거가 "
+            f"차순위 {second_episode_count}화를 압도한다."
+        ),
+        "rejected": [],
+        "safety_flags": {
+            "requires_identity_merge": False,
+            "selected_candidate_eligible": True,
+            "multiple_plausible_main_candidates": False,
+        },
+    }
+
+
 def _opening_work_protagonist_identity_name(item: dict[str, object]) -> str:
     real_names = [
         str(value or "").strip()
@@ -13048,6 +13231,12 @@ async def build_work_protagonist_resolution_for_inventory_v3(
                     payload,
                     opening_candidate_rows,
                 )
+    if str(resolution.get("decision") or "").upper() != "RESOLVED":
+        resolution = _build_cumulative_work_protagonist_resolution(
+            base_inventory_rows,
+            total_signal_episodes=count_distinct_signal_episode_nos(signal_rows),
+            unresolved_fallback=resolution,
+        )
     if verbose:
         print(
             f"[work-protagonist-resolution] product_id={product_id} "
@@ -13571,13 +13760,7 @@ def aggregate_character_inventory_v3_rows(
         observations,
         character_identity_review=character_identity_review,
     )
-    total_signal_episodes = len(
-        {
-            int((extract_json_object(str(row.get("summary_text") or "")) or {}).get("episode_no") or row.get("episode_from") or 0)
-            for row in signal_rows
-            if int((extract_json_object(str(row.get("summary_text") or "")) or {}).get("episode_no") or row.get("episode_from") or 0) > 0
-        }
-    )
+    total_signal_episodes = count_distinct_signal_episode_nos(signal_rows)
     rows: list[dict[str, object]] = []
     for cluster in clusters:
         cluster_observations = list(cluster.get("observations") or [])
@@ -13734,6 +13917,21 @@ def aggregate_character_inventory_v3_rows(
         protagonist_resolution = _build_opening_work_protagonist_resolution(
             signal_rows,
             rows,
+        )
+        if str(protagonist_resolution.get("decision") or "").upper() != "RESOLVED":
+            protagonist_resolution = _build_cumulative_work_protagonist_resolution(
+                rows,
+                total_signal_episodes=total_signal_episodes,
+                unresolved_fallback=protagonist_resolution,
+                locked_protagonist_rows=list(locked_protagonist_rows or []),
+            )
+    elif str(protagonist_resolution.get("reason_code") or "") == "cumulative_role_dominance":
+        # resolver 단계는 확정 주인공 목록을 모른다. 여기서 같은 locked 가드를
+        # 다시 적용해 축약형 별칭이 기존 확정 주인공을 밀어내지 않게 한다.
+        protagonist_resolution = _guard_cumulative_resolution_against_locked_rows(
+            rows,
+            protagonist_resolution,
+            locked_protagonist_rows=list(locked_protagonist_rows or []),
         )
     _fold_work_protagonist_evidence_into_selected_main(
         rows,
