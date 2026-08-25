@@ -5525,6 +5525,26 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(filtered["scene_scope_keys"], ["character:main"])
         self.assertTrue(filtered["repairable"])
 
+    def test_requested_rp_refresh_selects_only_active_inventory_scope(self):
+        module = load_module()
+
+        selected = module.select_requested_rp_refresh_scope_keys(
+            refresh_requested=True,
+            requested_scope_keys=["character:차태흠"],
+            inventory_map={"character:차태흠": {"display_name": "차태흠"}},
+        )
+
+        self.assertEqual(selected, {"character:차태흠"})
+        with self.assertRaisesRegex(
+            ValueError,
+            "requested RP refresh scope missing",
+        ):
+            module.select_requested_rp_refresh_scope_keys(
+                refresh_requested=True,
+                requested_scope_keys=["character:차태흠정령"],
+                inventory_map={"character:차태흠": {"display_name": "차태흠"}},
+            )
+
     def test_character_asset_repair_plan_intersects_explicit_scope_keys(self):
         module = load_module()
         filtered = module.filter_character_chat_asset_repair_plan_to_requested_scopes(

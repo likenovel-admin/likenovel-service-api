@@ -17169,6 +17169,28 @@ def filter_character_chat_asset_repair_plan_to_requested_scopes(
     return filtered
 
 
+def select_requested_rp_refresh_scope_keys(
+    *,
+    refresh_requested: bool,
+    requested_scope_keys: Iterable[str],
+    inventory_map: dict[str, dict[str, object]],
+) -> set[str]:
+    if not refresh_requested:
+        return set()
+    normalized_scope_keys = {
+        str(scope_key or "").strip()
+        for scope_key in requested_scope_keys
+        if str(scope_key or "").strip()
+    }
+    missing_scope_keys = normalized_scope_keys - set(inventory_map)
+    if missing_scope_keys:
+        raise ValueError(
+            "requested RP refresh scope missing from active inventory: "
+            f"{','.join(sorted(missing_scope_keys))}"
+        )
+    return normalized_scope_keys
+
+
 def filter_character_inventory_map_to_signal_scope(
     *,
     inventory_map: dict[str, dict[str, object]],
@@ -17635,11 +17657,22 @@ async def repair_character_chat_assets(
                         )
                         if str(scope_key or "").strip()
                     }
+                    requested_rp_refresh_scope_keys = (
+                        select_requested_rp_refresh_scope_keys(
+                            refresh_requested=should_refresh_delta_rp(args),
+                            requested_scope_keys=requested_scope_keys,
+                            inventory_map=capped_inventory_map,
+                        )
+                    )
                     if requested_scope_keys:
                         bundle_scope_keys &= requested_scope_keys
-                    if bundle_scope_keys:
+                    current_generation_rp_scope_keys = (
+                        bundle_scope_keys | requested_rp_refresh_scope_keys
+                    )
+                    if current_generation_rp_scope_keys:
                         repair_plan["rp_scope_keys"] = sorted(
-                            set(repair_plan["rp_scope_keys"]) | bundle_scope_keys
+                            set(repair_plan["rp_scope_keys"])
+                            | current_generation_rp_scope_keys
                         )
                     repair_plan = (
                         filter_character_chat_asset_repair_plan_to_requested_scopes(
@@ -17688,7 +17721,9 @@ async def repair_character_chat_assets(
                         inventory_map=capped_inventory_map,
                         relation_map=relation_map,
                         historical_inventory_state_map=historical_inventory_state_map,
-                        require_current_generation_scope_keys=bundle_scope_keys,
+                        require_current_generation_scope_keys=(
+                            current_generation_rp_scope_keys
+                        ),
                         processed_scope_keys=processed_rp_scope_keys,
                         raise_unexpected_errors=True,
                         verbose=args.verbose,
@@ -17705,6 +17740,15 @@ async def repair_character_chat_assets(
                             cur,
                             product_id=product_id,
                         )
+                        missing_requested_rp_refresh_scope_keys = (
+                            requested_rp_refresh_scope_keys
+                            - processed_rp_scope_keys
+                        )
+                        if missing_requested_rp_refresh_scope_keys:
+                            raise ValueError(
+                                "requested RP refresh made no progress: "
+                                f"{','.join(sorted(missing_requested_rp_refresh_scope_keys))}"
+                            )
                         readiness_diagnostic = (
                             build_character_bundle_readiness_diagnostic(
                                 readiness=after_readiness,
@@ -17805,7 +17849,7 @@ async def repair_character_chat_assets(
                         )
                         reaggregation_records.append(reaggregation_record)
 
-                    recovered = (
+                    recovered = bool(requested_rp_refresh_scope_keys) or (
                         is_character_chat_asset_readiness_actionable(before_readiness)
                         and not is_character_chat_asset_readiness_actionable(after_readiness)
                     )
