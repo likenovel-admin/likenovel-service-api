@@ -8933,6 +8933,24 @@ def materialize_character_identity_review_document(
             for value in identity_values
             if normalize_signal_entity_label(value)
         }
+        blocked_alias_scope_keys = (
+            member_scope_keys
+            if kind == "merge_active_scopes"
+            else [target_scope_key]
+        )
+        blocked_alias_identity_labels = {
+            normalize_signal_entity_label(str(value or "")).lower()
+            for scope_key in blocked_alias_scope_keys
+            for value in [
+                dict(inventory_map[scope_key]).get("display_name"),
+                *list(dict(inventory_map[scope_key]).get("aliases") or []),
+                *list(dict(inventory_map[scope_key]).get("narration_names") or []),
+                *list(dict(inventory_map[scope_key]).get("social_call_names") or []),
+                *list(dict(inventory_map[scope_key]).get("persona_names") or []),
+                *list(dict(inventory_map[scope_key]).get("real_names") or []),
+            ]
+            if normalize_signal_entity_label(str(value or ""))
+        }
         canonical_display_label = normalize_signal_entity_label(
             canonical_display_name
         ).lower()
@@ -8943,7 +8961,8 @@ def materialize_character_identity_review_document(
         missing_blocked_aliases = [
             value
             for value in blocked_aliases
-            if normalize_signal_entity_label(value).lower() not in identity_labels
+            if normalize_signal_entity_label(value).lower()
+            not in blocked_alias_identity_labels
         ]
         if missing_blocked_aliases:
             raise ValueError(
@@ -10940,14 +10959,24 @@ def resolve_character_inventory_v3_clusters(
         if len(operation_indexes) != len(
             list(operation.get("authorized_observation_refs") or [])
         ) or len(operation_parents) != 1:
-            raise ValueError(
-                f"reviewed identity no longer resolves to one cluster: {operation_id}"
+            raise CharacterIdentityReviewStaleError(
+                f"reviewed identity no longer resolves to one cluster: {operation_id}",
+                product_id=int(
+                    dict(normalized_review or {}).get("product_id") or 0
+                ),
+                operation_id=operation_id,
+                reason_code="cluster_membership_changed",
             )
         operation_parent = next(iter(operation_parents))
         if operation_parent in reviewed_operation_by_parent:
-            raise ValueError(
+            raise CharacterIdentityReviewStaleError(
                 "multiple identity reviews resolved to one cluster: "
-                f"{operation_id}"
+                f"{operation_id}",
+                product_id=int(
+                    dict(normalized_review or {}).get("product_id") or 0
+                ),
+                operation_id=operation_id,
+                reason_code="review_clusters_overlap",
             )
         reviewed_operation_by_parent[operation_parent] = {
             "operation_id": operation_id,

@@ -268,6 +268,76 @@ class CharacterIdentityReviewTest(TestCase):
         self.assertEqual(operation["canonical_display_name"], "라파엘")
         self.assertEqual(operation["blocked_aliases"], ["안드레이 카르마조프"])
 
+    def test_materializer_accepts_blocked_alias_from_merge_member(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        "protagonist:named:윤서진",
+                        "윤서진",
+                        protagonist=True,
+                    ),
+                    signal_character("named:윤서진대령", "윤서진 대령"),
+                ],
+            )
+        ]
+        inventory_map = {
+            "character:윤서진": {
+                "display_name": "윤서진",
+                "source_observation_refs": ["summary:1:0"],
+                "aliases": ["윤서진"],
+                "public_chat_eligible": True,
+            },
+            "character:윤서진대령": {
+                "display_name": "윤서진 대령",
+                "source_observation_refs": ["summary:1:1"],
+                "aliases": ["윤서진 대령"],
+                "public_chat_eligible": False,
+            },
+        }
+        request = {
+            "schema_version": "character_identity_review_request_v1",
+            "product_id": 1177,
+            "operations": [
+                {
+                    "operation_id": "merge-yoon-seojin-rank",
+                    "kind": "merge_active_scopes",
+                    "member_scope_keys": [
+                        "character:윤서진",
+                        "character:윤서진대령",
+                    ],
+                    "target_scope_key": "character:윤서진",
+                    "force_main_protagonist": True,
+                    "canonical_display_name": "윤서진",
+                    "blocked_aliases": ["윤서진 대령"],
+                    "reason": "merge rank-like duplicate identity",
+                }
+            ],
+        }
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=inventory_map,
+        ), patch.object(
+            module,
+            "fetch_active_summary_rows",
+            return_value=rows,
+        ):
+            document = module.materialize_character_identity_review_document(
+                object(),
+                product_id=1177,
+                request=request,
+                reviewer_id="codex.ops",
+            )
+
+        self.assertEqual(
+            document["operations"][0]["blocked_aliases"],
+            ["윤서진 대령"],
+        )
+
     def test_materializer_rejects_unbacked_display_and_missing_blocked_alias(self):
         module = load_module()
         rows = [
@@ -395,6 +465,129 @@ class CharacterIdentityReviewTest(TestCase):
         self.assertEqual(
             caught.exception.reason_codes,
             ("missing_observations",),
+        )
+
+    def test_split_confirmed_identity_is_typed_review_required(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        "protagonist:named:윤서진",
+                        "윤서진",
+                        protagonist=True,
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [signal_character("named:윤서진대령", "윤서진 대령")],
+            ),
+        ]
+        document = review_document(
+            module,
+            1177,
+            [
+                {
+                    "operation_id": "confirm-yoon-seojin",
+                    "kind": "confirm_protagonist",
+                    "member_scope_keys": ["character:윤서진"],
+                    "target_scope_key": "character:윤서진",
+                    "authorized_observation_refs": [
+                        "summary:1:0",
+                        "summary:2:0",
+                    ],
+                    "signal_anchors": [
+                        {"summary_id": 1, "source_hash": "signal-1"},
+                        {"summary_id": 2, "source_hash": "signal-2"},
+                    ],
+                    "force_main_protagonist": True,
+                    "anonymous_protagonist": False,
+                    "canonical_display_name": "윤서진",
+                    "reason": "reviewed protagonist identity",
+                }
+            ],
+        )
+
+        with self.assertRaises(
+            module.CharacterIdentityReviewStaleError
+        ) as caught:
+            module.aggregate_character_inventory_v3_rows(
+                rows,
+                character_identity_review=document,
+            )
+
+        self.assertEqual(caught.exception.product_id, 1177)
+        self.assertEqual(
+            caught.exception.operation_ids,
+            ("confirm-yoon-seojin",),
+        )
+        self.assertEqual(
+            caught.exception.reason_codes,
+            ("cluster_membership_changed",),
+        )
+
+    def test_overlapping_confirmed_identities_are_typed_review_required(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                episode_no,
+                episode_no,
+                [
+                    signal_character(
+                        "protagonist:named:윤서진",
+                        "윤서진",
+                        protagonist=True,
+                    )
+                ],
+            )
+            for episode_no in (1, 2)
+        ]
+        document = review_document(
+            module,
+            1178,
+            [
+                {
+                    "operation_id": f"confirm-yoon-seojin-{episode_no}",
+                    "kind": "confirm_protagonist",
+                    "member_scope_keys": [f"character:윤서진-{episode_no}"],
+                    "target_scope_key": f"character:윤서진-{episode_no}",
+                    "authorized_observation_refs": [
+                        f"summary:{episode_no}:0"
+                    ],
+                    "signal_anchors": [
+                        {
+                            "summary_id": episode_no,
+                            "source_hash": f"signal-{episode_no}",
+                        }
+                    ],
+                    "force_main_protagonist": True,
+                    "anonymous_protagonist": False,
+                    "reason": "reviewed protagonist identity",
+                }
+                for episode_no in (1, 2)
+            ],
+        )
+
+        with self.assertRaises(
+            module.CharacterIdentityReviewStaleError
+        ) as caught:
+            module.aggregate_character_inventory_v3_rows(
+                rows,
+                character_identity_review=document,
+            )
+
+        self.assertEqual(caught.exception.product_id, 1178)
+        self.assertEqual(
+            caught.exception.operation_ids,
+            ("confirm-yoon-seojin-2",),
+        )
+        self.assertEqual(
+            caught.exception.reason_codes,
+            ("review_clusters_overlap",),
         )
 
     def test_malformed_review_remains_hard_failure(self):
