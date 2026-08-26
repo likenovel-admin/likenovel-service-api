@@ -206,6 +206,108 @@ class CharacterIdentityReviewTest(TestCase):
         )
         self.assertTrue(document["review_digest"])
 
+    def test_materializer_explicit_signal_window_pins_only_in_window_refs(self):
+        module = load_module()
+        in_window_rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character("named:아셔", "아셔"),
+                    signal_character("named:이안", "이안"),
+                ],
+            )
+        ]
+        inventory_map = {
+            "character:아셔": {
+                "source_observation_refs": ["summary:1:0", "summary:31:0"],
+                "public_chat_eligible": True,
+            },
+            "character:이안": {
+                "source_observation_refs": ["summary:1:1", "summary:31:1"],
+                "public_chat_eligible": False,
+            },
+        }
+        request = {
+            "schema_version": "character_identity_review_request_v1",
+            "product_id": 1137,
+            "operations": [
+                {
+                    "operation_id": "merge-asher-ian",
+                    "kind": "merge_active_scopes",
+                    "member_scope_keys": ["character:아셔", "character:이안"],
+                    "target_scope_key": "character:아셔",
+                    "force_main_protagonist": True,
+                    "reason": "same protagonist in current collection window",
+                }
+            ],
+        }
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=inventory_map,
+        ), patch.object(module, "fetch_active_summary_rows") as fetch_all:
+            document = module.materialize_character_identity_review_document(
+                object(),
+                product_id=1137,
+                request=request,
+                reviewer_id="codex.ops",
+                signal_rows=in_window_rows,
+            )
+
+        fetch_all.assert_not_called()
+        self.assertEqual(
+            document["operations"][0]["authorized_observation_refs"],
+            ["summary:1:0", "summary:1:1"],
+        )
+
+    def test_materializer_explicit_signal_window_rejects_scope_without_observation(self):
+        module = load_module()
+        in_window_rows = [
+            signal_row(1, 1, [signal_character("named:아셔", "아셔")])
+        ]
+        inventory_map = {
+            "character:아셔": {
+                "source_observation_refs": ["summary:1:0"],
+                "public_chat_eligible": True,
+            },
+            "character:이안": {
+                "source_observation_refs": ["summary:31:0"],
+                "public_chat_eligible": False,
+            },
+        }
+        request = {
+            "schema_version": "character_identity_review_request_v1",
+            "product_id": 1137,
+            "operations": [
+                {
+                    "operation_id": "merge-asher-ian",
+                    "kind": "merge_active_scopes",
+                    "member_scope_keys": ["character:아셔", "character:이안"],
+                    "target_scope_key": "character:아셔",
+                    "force_main_protagonist": True,
+                    "reason": "same protagonist in current collection window",
+                }
+            ],
+        }
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=inventory_map,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "active scope has no reviewable observations in signal window",
+        ):
+            module.materialize_character_identity_review_document(
+                object(),
+                product_id=1137,
+                request=request,
+                reviewer_id="codex.ops",
+                signal_rows=in_window_rows,
+            )
+
     def test_materializer_accepts_source_backed_display_and_existing_blocked_aliases(self):
         module = load_module()
         rows = [
@@ -1440,7 +1542,7 @@ class CharacterIdentityReviewTest(TestCase):
             return_value=document,
         ), patch.object(
             story_agent,
-            "fetch_active_summary_rows",
+            "fetch_active_character_asset_summary_rows",
             return_value=[],
         ), patch.object(
             cli,
@@ -1458,6 +1560,92 @@ class CharacterIdentityReviewTest(TestCase):
                 apply=True,
             )
         self.assertEqual(fake_connection.commit_count, 0)
+        self.assertEqual(fake_connection.rollback_count, 1)
+        self.assertEqual(fake_connection.close_count, 1)
+
+    def test_operator_cli_uses_character_asset_signal_window(self):
+        story_agent = load_module()
+        cli = load_cli(story_agent)
+
+        class FakeConnection:
+            def __init__(self):
+                self.rollback_count = 0
+                self.close_count = 0
+
+            def rollback(self):
+                self.rollback_count += 1
+
+            def close(self):
+                self.close_count += 1
+
+        fake_connection = FakeConnection()
+        in_window_rows = [
+            signal_row(1, 1, [signal_character("named:아셔", "아셔")])
+        ]
+        document = {
+            "review_digest": "digest",
+            "operations": [
+                {
+                    "operation_id": "confirm-asher",
+                    "kind": "confirm_protagonist",
+                    "target_scope_key": "character:아셔",
+                    "member_scope_keys": ["character:아셔"],
+                    "force_main_protagonist": True,
+                }
+            ],
+        }
+
+        @contextmanager
+        def fake_lock(_product_id):
+            yield object()
+
+        @contextmanager
+        def fake_cursor(_conn):
+            yield object()
+
+        with patch.object(
+            story_agent,
+            "product_lock_connection",
+            side_effect=fake_lock,
+        ), patch.object(
+            story_agent,
+            "db_connect",
+            return_value=fake_connection,
+        ), patch.object(
+            story_agent,
+            "work_cursor",
+            side_effect=fake_cursor,
+        ), patch.object(
+            story_agent,
+            "fetch_active_character_asset_summary_rows",
+            return_value=in_window_rows,
+        ) as fetch_window, patch.object(
+            story_agent,
+            "materialize_character_identity_review_document",
+            return_value=document,
+        ) as materialize, patch.object(
+            cli,
+            "_build_preview_rows",
+            return_value=[
+                {
+                    "canonical_character_key": "character:아셔",
+                    "work_role": "main_protagonist",
+                }
+            ],
+        ):
+            cli.run_identity_review(
+                product_id=1137,
+                request={"product_id": 1137},
+                reviewer_id="codex.ops",
+                apply=False,
+            )
+
+        fetch_window.assert_called_once_with(
+            cur=materialize.call_args.args[0],
+            product_id=1137,
+            summary_type="episode_character_signals",
+        )
+        self.assertIs(materialize.call_args.kwargs["signal_rows"], in_window_rows)
         self.assertEqual(fake_connection.rollback_count, 1)
         self.assertEqual(fake_connection.close_count, 1)
 
@@ -1487,7 +1675,7 @@ class CharacterIdentityReviewAsyncTest(IsolatedAsyncioTestCase):
         )
         with patch.object(
             module,
-            "fetch_active_summary_rows",
+            "fetch_active_character_asset_summary_rows",
             return_value=rows,
         ), patch.object(
             module,

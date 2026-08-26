@@ -129,16 +129,17 @@ def run_identity_review(
         conn = story_agent.db_connect()
         try:
             with story_agent.work_cursor(conn) as cur:
+                signal_rows = story_agent.fetch_active_character_asset_summary_rows(
+                    cur=cur,
+                    product_id=product_id,
+                    summary_type="episode_character_signals",
+                )
                 review_document = story_agent.materialize_character_identity_review_document(
                     cur,
                     product_id=product_id,
                     request=request,
                     reviewer_id=reviewer_id,
-                )
-                signal_rows = story_agent.fetch_active_summary_rows(
-                    cur=cur,
-                    product_id=product_id,
-                    summary_type="episode_character_signals",
+                    signal_rows=signal_rows,
                 )
                 preview_rows = _build_preview_rows(
                     cur,
@@ -166,6 +167,7 @@ def run_identity_review(
                             product_id=product_id,
                             request=request,
                             reviewer_id=reviewer_id,
+                            signal_rows=signal_rows,
                         )
                     )
                     inserted_count, reused_count = (
