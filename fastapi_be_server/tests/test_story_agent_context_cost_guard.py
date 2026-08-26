@@ -9472,6 +9472,90 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             {"character:란"},
         )
 
+    def test_inventory_v3_reaggregation_retires_only_missing_legacy_anonymous_protagonist_scopes(self):
+        module = load_module()
+        cur = object()
+        old_inventory = {
+            "character:legacy-anonymous": {
+                "canonical_character_key": "character:legacy-anonymous",
+                "display_name": "나",
+                "aliases": ["나"],
+                "source_character_keys": ["protagonist:first_person"],
+                "evidence_episode_nos": [1],
+                "distinct_episode_count": 1,
+                "work_role": "major_character",
+                "public_chat_eligible": False,
+                "public_slot_eligible": False,
+            },
+            "character:current-anonymous": {
+                "canonical_character_key": "character:current-anonymous",
+                "display_name": "나",
+                "aliases": ["나"],
+                "source_character_keys": ["protagonist:first_person"],
+                "evidence_episode_nos": [9],
+                "distinct_episode_count": 1,
+                "work_role": "major_character",
+                "public_chat_eligible": False,
+                "public_slot_eligible": False,
+            },
+        }
+        current_main = {
+            "canonical_character_key": "character:나(주인공)",
+            "display_name": "나(주인공)",
+            "aliases": ["나(주인공)"],
+            "source_character_keys": ["protagonist:generic"],
+            "work_role": "main_protagonist",
+            "identity_status": "UNRESOLVED",
+            "identity_conflict_reasons": [],
+            "entity_kind": "stable_role",
+            "distinct_episode_count": 8,
+            "evidence_episode_nos": list(range(1, 9)),
+            "voice_mode_counts": {"monologue": 8},
+            "public_chat_eligible": False,
+            "public_slot_eligible": False,
+        }
+
+        with patch.object(
+            module,
+            "fetch_active_character_inventory_map",
+            return_value=old_inventory,
+        ), patch.object(
+            module,
+            "aggregate_character_inventory_v3_rows",
+            return_value=[current_main],
+        ), patch.object(
+            module,
+            "reconcile_character_inventory_v3_scope_keys",
+            side_effect=lambda rows, **_kwargs: rows,
+        ), patch.object(
+            module,
+            "upsert_character_inventory_v3_item",
+            return_value=True,
+        ), patch.object(
+            module,
+            "deactivate_active_scope",
+            return_value=1,
+        ) as deactivate_scope, patch.object(
+            module,
+            "deactivate_missing_active_scopes",
+        ) as deactivate_missing:
+            counts = module.build_character_inventory_v3_summaries_from_signal_rows(
+                cur,
+                product_id=1097,
+                signal_rows=[{"summary_text": "{}"}],
+                cleanup_missing_scopes=False,
+                cleanup_legacy_anonymous_protagonist_scopes=True,
+            )
+
+        self.assertEqual(counts[0], 1)
+        deactivate_scope.assert_called_once_with(
+            cur,
+            product_id=1097,
+            summary_type="character_inventory_v3",
+            scope_key="character:legacy-anonymous",
+        )
+        deactivate_missing.assert_not_called()
+
     def test_inventory_v3_demotes_superseded_lock_without_deleting_old_character(self):
         module = load_module()
         cur = object()
@@ -14952,6 +15036,7 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
             product_id=1103,
             protagonist_resolution=None,
             cleanup_missing_scopes=False,
+            cleanup_legacy_anonymous_protagonist_scopes=True,
         )
         relation_builder.assert_called_once_with(
             ANY,
