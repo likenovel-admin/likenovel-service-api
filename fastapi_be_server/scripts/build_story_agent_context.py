@@ -8899,6 +8899,7 @@ def materialize_character_identity_review_document(
     product_id: int,
     request: dict[str, object],
     reviewer_id: str,
+    signal_rows: list[dict] | None = None,
 ) -> dict[str, object]:
     if not isinstance(request, dict):
         raise ValueError("character identity review request must be an object")
@@ -8918,11 +8919,13 @@ def materialize_character_identity_review_document(
         product_id=product_id,
         summary_type="character_inventory_v3",
     )
-    signal_rows = fetch_active_summary_rows(
-        cur=cur,
-        product_id=product_id,
-        summary_type="episode_character_signals",
-    )
+    explicit_signal_window = signal_rows is not None
+    if signal_rows is None:
+        signal_rows = fetch_active_summary_rows(
+            cur=cur,
+            product_id=product_id,
+            summary_type="episode_character_signals",
+        )
     observations = build_character_inventory_v3_observations(signal_rows)
     observation_by_ref = {
         str(item.get("observation_id") or ""): item
@@ -9111,14 +9114,33 @@ def materialize_character_identity_review_document(
             if kind == "retire_active_scope"
             else set(member_scope_keys)
         )
-        authorized_observation_refs = sorted(
-            {
+        scope_observation_refs = {
+            scope_key: {
                 str(value or "").strip()
-                for scope_key in reviewed_scope_keys
                 for value in list(
                     dict(inventory_map[scope_key]).get("source_observation_refs") or []
                 )
                 if str(value or "").strip()
+            }
+            for scope_key in reviewed_scope_keys
+        }
+        if explicit_signal_window:
+            scopes_without_window_observations = [
+                scope_key
+                for scope_key, refs in scope_observation_refs.items()
+                if not refs.intersection(observation_by_ref)
+            ]
+            if scopes_without_window_observations:
+                raise ValueError(
+                    "active scope has no reviewable observations in signal window: "
+                    f"{operation_id}"
+                )
+        authorized_observation_refs = sorted(
+            {
+                ref
+                for refs in scope_observation_refs.values()
+                for ref in refs
+                if not explicit_signal_window or ref in observation_by_ref
             }
         )
         if not authorized_observation_refs:
@@ -9200,12 +9222,14 @@ def upsert_character_identity_review(
     product_id: int,
     request: dict[str, object],
     reviewer_id: str,
+    signal_rows: list[dict] | None = None,
 ) -> tuple[int, bool, dict[str, object]]:
     document = materialize_character_identity_review_document(
         cur,
         product_id=product_id,
         request=request,
         reviewer_id=reviewer_id,
+        signal_rows=signal_rows,
     )
     serialized = json.dumps(
         document,
