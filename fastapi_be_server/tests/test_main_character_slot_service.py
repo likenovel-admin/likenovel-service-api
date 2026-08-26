@@ -424,13 +424,22 @@ def test_public_character_catalog_readiness_query_is_product_bounded():
         " FROM ready_episode"
         in normalized_query
     )
-    assert "FROM ready_episode_no" in query
+    assert "public_episode_no AS" in query
+    assert "numbered_public_episode AS" in query
+    assert "FROM public_episode_no" in query
     assert "ROW_NUMBER() OVER" in query
     assert (
-        "numbered_ready_episode.episode_no !="
-        " numbered_ready_episode.ready_ordinal"
+        "LEFT JOIN ready_episode_no ON ready_episode_no.product_id ="
+        " numbered_public_episode.product_id"
         in normalized_query
     )
+    assert "ready_episode_no.episode_no IS NULL" in normalized_query
+    assert (
+        "readiness_sequence.public_ordinal <"
+        " readiness_sequence.first_missing_ordinal"
+        in normalized_query
+    )
+    assert "episode_no != ready_ordinal" not in normalized_query
     assert "GROUP BY public_episode.product_id" in query
 
 
