@@ -2631,6 +2631,57 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         )
         self.assertIn("안드레이 카르마조프", inventory_map[raphael_scope_key]["aliases"])
 
+    def test_rp_target_keeps_operator_merged_short_name_out_of_competitors(self):
+        module = load_module()
+        target_scope_key = "character:김태식"
+        superseded_scope_key = "character:태식"
+        inventory_map = {
+            target_scope_key: {
+                "canonical_character_key": target_scope_key,
+                "display_name": "김태식",
+                "aliases": ["김태식"],
+                "is_protagonist": True,
+                "is_first_person": True,
+                "work_role": "main_protagonist",
+                "continuity_status": "operator_reviewed",
+                "superseded_identity_scope_keys": [superseded_scope_key],
+            },
+            superseded_scope_key: {
+                "canonical_character_key": superseded_scope_key,
+                "display_name": "태식",
+                "aliases": ["태식"],
+                "continuity_status": "superseded",
+            },
+            "character:승만": {
+                "canonical_character_key": "character:승만",
+                "display_name": "승만",
+                "aliases": ["승만"],
+                "work_role": "major_character",
+            },
+        }
+
+        target = module.build_inventory_rp_target(
+            scope_key=target_scope_key,
+            inventory_item=inventory_map[target_scope_key],
+        )
+        assert target is not None
+        target = module.attach_competing_speaker_anchors(
+            target,
+            current_scope_key=target_scope_key,
+            inventory_map=inventory_map,
+        )
+
+        self.assertIn("태식", target["aliases"])
+        self.assertIn("태식", target["collection_rules"]["speaker_anchors"])
+        self.assertNotIn(
+            "태식",
+            target["collection_rules"]["competing_speaker_anchors"],
+        )
+        self.assertIn(
+            "승만",
+            target["collection_rules"]["competing_speaker_anchors"],
+        )
+
     async def test_episode_character_signals_defaults_to_deepseek_direct(self):
         module = load_module()
         client = FakeOpenRouterClient(
@@ -8243,6 +8294,39 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         items = module.collect_rule_based_rp_dialogue_items(target, text)
 
         self.assertEqual([item["text"] for item in items], ["나는 직접 확인하겠어."])
+
+    def test_first_person_collection_accepts_only_explicit_narrator_attribution(self):
+        module = load_module()
+        target = {
+            "display_name": "김태식",
+            "aliases": ["김태식"],
+            "is_protagonist": True,
+            "is_first_person": True,
+            "collection_rules": {
+                "use_dialogue": True,
+                "use_monologue": False,
+                "speaker_anchors": ["김태식"],
+            },
+        }
+        text = "\n".join(
+            [
+                "잠시 고민하다 내가 말했다.",
+                '"그럼 내가 먼저 확인하고 올게."',
+                "내 질문에 그는 잠시 침묵하다 대답했다.",
+                '"위치 때문입니다."',
+                '"내가 말했지. 여기서 기다리라고."',
+                '"그럼 네가 직접 해."',
+                "나는 이를 악물었다.",
+                '"절대 안 돼."',
+            ]
+        )
+
+        items = module.collect_rule_based_rp_dialogue_items(target, text)
+
+        self.assertEqual(
+            [item["text"] for item in items if item["kind"] == "dialogue"],
+            ["그럼 내가 먼저 확인하고 올게."],
+        )
 
     def test_inventory_rp_targets_exclude_generic_identity_labels(self):
         module = load_module()

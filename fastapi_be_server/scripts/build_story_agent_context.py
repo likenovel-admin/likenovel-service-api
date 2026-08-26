@@ -189,6 +189,10 @@ SPEECH_VERB_PATTERN = (
     r"소리쳤|소리쳤다|중얼|중얼거렸|속삭|속삭였|대꾸했|대꾸했다|반박했|반박했다|"
     r"선언했|선언했다|명령했|명령했다|덧붙였|덧붙였다|웃었|웃었다)"
 )
+FIRST_PERSON_SPEAKER_ATTRIBUTION_RE = re.compile(
+    rf"(?<![가-힣A-Za-z0-9])(?:나는|내가|난)(?![가-힣A-Za-z0-9])"
+    rf"[^\"“”\n.!?]{{0,48}}(?<![가-힣]){SPEECH_VERB_PATTERN}"
+)
 RP_SIMPLE_VOCATIVE_RE = re.compile(r"^[가-힣A-Za-z0-9]{2,12}(?:아|야)?[!?.…~]*$")
 RP_NOISE_ONLY_RE = re.compile(r"^[!?.…~ㅋㅎㅠㅜ\s]+$")
 RP_GENERIC_DISPLAY_NAMES = {"지금", "오늘", "그때", "나", "내", "그", "그녀", "그들", "현재", "이번"}
@@ -4668,6 +4672,23 @@ def _is_bare_quote_line(item: dict[str, object]) -> bool:
     return not re.sub(r"[\s,.'\"“”!?…~:;·-]+", "", without_quotes)
 
 
+def is_dialogue_attributed_to_first_person_narrator(
+    item: dict[str, object],
+) -> bool:
+    contexts = [
+        str(item.get("pre_quote") or ""),
+        str(item.get("post_quote") or ""),
+    ]
+    if _is_bare_quote_line(item):
+        contexts.append(str(item.get("prev_line") or ""))
+    return any(
+        FIRST_PERSON_SPEAKER_ATTRIBUTION_RE.search(
+            DIALOGUE_QUOTE_RE.sub("", context)
+        )
+        for context in contexts
+    )
+
+
 def find_attributed_speaker_anchors(
     item: dict[str, object],
     speaker_anchors: list[str],
@@ -4728,22 +4749,30 @@ def collect_rule_based_rp_dialogue_items(target: dict[str, object], normalized_t
     competing_speaker_anchors = [str(anchor).strip() for anchor in (collection_rules.get("competing_speaker_anchors") or []) if str(anchor).strip()]
     exclude_tokens = [str(token).strip() for token in (collection_rules.get("exclude_tokens") or []) if str(token).strip()]
     allow_single_char_anchors = len(str(target.get("display_name") or "").strip()) == 1
+    is_first_person_target = bool(target.get("is_protagonist")) and bool(
+        target.get("is_first_person")
+    )
 
     dialogue_segments = extract_dialogue_segments(normalized_text)
     matched: list[dict[str, object]] = []
-    if use_dialogue and speaker_anchors:
+    if use_dialogue:
         for item in dialogue_segments:
             hint = str(item.get("speaker_hint") or "")
             if exclude_tokens and any(token in hint for token in exclude_tokens):
                 continue
-            if is_dialogue_attributed_to_target(
+            named_attribution = bool(speaker_anchors) and is_dialogue_attributed_to_target(
                 item,
                 speaker_anchors,
                 competing_speaker_anchors=competing_speaker_anchors,
                 allow_single_char_anchors=allow_single_char_anchors,
-            ):
+            )
+            first_person_attribution = (
+                is_first_person_target
+                and is_dialogue_attributed_to_first_person_narrator(item)
+            )
+            if named_attribution or first_person_attribution:
                 matched.append(item)
-    if bool(target.get("is_protagonist")) and bool(target.get("is_first_person")) and use_monologue:
+    if is_first_person_target and use_monologue:
         matched.extend(extract_first_person_monologues(normalized_text))
     return matched
 
@@ -5994,6 +6023,29 @@ def attach_competing_speaker_anchors(
     copied = dict(target)
     rules = dict(copied.get("collection_rules") or {})
     inventory_item = dict((inventory_map or {}).get(str(current_scope_key)) or {})
+    superseded_identity_scope_keys = (
+        {
+            str(scope_key or "").strip()
+            for scope_key in list(
+                inventory_item.get("superseded_identity_scope_keys") or []
+            )
+            if str(scope_key or "").strip()
+            and str(
+                dict((inventory_map or {}).get(str(scope_key)) or {}).get(
+                    "continuity_status"
+                )
+                or ""
+            ).strip()
+            == "superseded"
+        }
+        if str(inventory_item.get("continuity_status") or "").strip()
+        == "operator_reviewed"
+        else set()
+    )
+    same_identity_scope_keys = {
+        str(current_scope_key),
+        *superseded_identity_scope_keys,
+    }
     non_unique_labels = {
         normalize_signal_entity_label(str(label or ""))
         for label in list(inventory_item.get("non_unique_identity_labels") or [])
@@ -6002,7 +6054,7 @@ def attach_competing_speaker_anchors(
     competing_display_labels = {
         normalize_signal_entity_label(str(item.get("display_name") or ""))
         for scope_key, item in (inventory_map or {}).items()
-        if str(scope_key) != str(current_scope_key)
+        if str(scope_key) not in same_identity_scope_keys
         and normalize_signal_entity_label(str(item.get("display_name") or ""))
     }
     target_display_label = normalize_signal_entity_label(str(copied.get("display_name") or ""))
@@ -6017,14 +6069,34 @@ def attach_competing_speaker_anchors(
             return False
         return True
 
+    alias_candidates = list(copied.get("aliases") or [])
+    speaker_anchor_candidates = list(rules.get("speaker_anchors") or [])
+    for superseded_scope_key in sorted(superseded_identity_scope_keys):
+        superseded_item = dict(
+            (inventory_map or {}).get(superseded_scope_key) or {}
+        )
+        display_name = str(superseded_item.get("display_name") or "").strip()
+        if (
+            not display_name
+            or bool(superseded_item.get("is_generic_display_name"))
+            or str(superseded_item.get("entity_kind") or "person").strip()
+            != "person"
+            or is_generic_character_label(display_name)
+        ):
+            continue
+        if display_name not in alias_candidates:
+            alias_candidates.append(display_name)
+        if display_name not in speaker_anchor_candidates:
+            speaker_anchor_candidates.append(display_name)
+
     copied["aliases"] = [
         str(alias).strip()
-        for alias in list(copied.get("aliases") or [])
+        for alias in alias_candidates
         if is_safe_target_anchor(alias)
     ]
     rules["speaker_anchors"] = [
         str(anchor).strip()
-        for anchor in list(rules.get("speaker_anchors") or [])
+        for anchor in speaker_anchor_candidates
         if is_safe_target_anchor(anchor, dialogue=True)
     ]
     if not rules["speaker_anchors"]:
@@ -6036,7 +6108,7 @@ def attach_competing_speaker_anchors(
     }
     competing: list[str] = []
     for scope_key, inventory_item in (inventory_map or {}).items():
-        if str(scope_key) == str(current_scope_key):
+        if str(scope_key) in same_identity_scope_keys:
             continue
         for anchor in collect_inventory_speaker_anchors(dict(inventory_item or {})):
             if anchor in target_anchors or anchor in competing:
