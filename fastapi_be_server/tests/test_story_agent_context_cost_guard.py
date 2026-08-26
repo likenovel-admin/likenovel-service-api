@@ -10338,6 +10338,147 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertEqual(by_name["송하늘"]["distinct_episode_count"], 2)
         self.assertIn("하늘 씨", by_name["송하늘"]["aliases"])
 
+    def test_inventory_v3_normalizes_only_legacy_anonymous_work_protagonist(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="나",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_first_person=True,
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                2,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="주인공",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_first_person=True,
+                    )
+                ],
+            ),
+            signal_row(
+                3,
+                3,
+                [
+                    signal_character(
+                        character_key="protagonist:generic",
+                        display_name="나(주인공)",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_first_person=True,
+                        entity_kind="stable_role",
+                    )
+                ],
+            ),
+        ]
+        rows[0]["created_date"] = "2026-08-14 01:00:00"
+        rows[1]["created_date"] = "2026-08-14 01:01:00"
+        rows[2]["created_date"] = "2026-08-20 01:00:00"
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+        anonymous_rows = [
+            row
+            for row in inventory
+            if set(row["source_character_keys"])
+            <= {"protagonist:first_person", "protagonist:generic"}
+        ]
+
+        self.assertEqual(len(anonymous_rows), 1)
+        self.assertEqual(anonymous_rows[0]["canonical_character_key"], "character:나(주인공)")
+        self.assertEqual(anonymous_rows[0]["display_name"], "나(주인공)")
+        self.assertEqual(anonymous_rows[0]["source_character_keys"], ["protagonist:generic"])
+        self.assertEqual(anonymous_rows[0]["evidence_episode_nos"], [1, 2, 3])
+
+    def test_legacy_anonymous_work_protagonist_normalizes_relation_targets(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="나",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_first_person=True,
+                    ),
+                    signal_character(
+                        character_key="named:동료",
+                        display_name="동료",
+                        relation_edges=[
+                            {
+                                "target_key": "protagonist:first_person",
+                                "target_label": "나",
+                                "relation_tag": "신뢰",
+                                "direction": "to_target",
+                            }
+                        ],
+                    ),
+                ],
+            )
+        ]
+        rows[0]["created_date"] = "2026-08-14 01:00:00"
+
+        relation_keys = {
+            row["relation_key"]
+            for row in module.aggregate_relation_inventory_rows(rows)
+        }
+
+        self.assertEqual(
+            relation_keys,
+            {
+                "named:동료=>protagonist:generic",
+            },
+        )
+
+    def test_legacy_anonymous_work_protagonist_keeps_ambiguous_same_episode_speakers_separate(self):
+        module = load_module()
+        rows = [
+            signal_row(
+                1,
+                1,
+                [
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="나",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_first_person=True,
+                    ),
+                    signal_character(
+                        character_key="protagonist:first_person",
+                        display_name="주인공",
+                        is_protagonist=True,
+                        is_work_protagonist=True,
+                        is_first_person=True,
+                    ),
+                ],
+            )
+        ]
+        rows[0]["created_date"] = "2026-08-14 01:00:00"
+
+        inventory = module.aggregate_character_inventory_v3_rows(rows)
+
+        self.assertEqual(len(inventory), 2)
+        self.assertTrue(
+            all(
+                row["source_character_keys"] == ["protagonist:first_person"]
+                for row in inventory
+            )
+        )
+
     def test_inventory_v3_rejects_unverified_first_person_topic_as_public_identity(self):
         module = load_module()
         rows = [
@@ -10447,6 +10588,7 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
                 ],
             )
         ]
+        rows[0]["created_date"] = "2026-08-14 01:00:00"
 
         inventory = module.aggregate_character_inventory_v3_rows(rows)
         source_sets = [set(row["source_character_keys"]) for row in inventory]

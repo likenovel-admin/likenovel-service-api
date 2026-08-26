@@ -125,6 +125,7 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|(?<=다\.)\s+|(?<=요\.)\s+")
 KEYWORD_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 EPISODE_SUMMARY_FORMAT_VERSION = "episode_summary_v12"
 EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION = "episode_character_signals_v3"
+LEGACY_ANONYMOUS_WORK_PROTAGONIST_CUTOFF = "2026-08-17 00:00:00"
 RANGE_SUMMARY_FORMAT_VERSION = "range_summary_v1"
 PRODUCT_SUMMARY_FORMAT_VERSION = "product_summary_v1"
 CHARACTER_SNAPSHOT_FORMAT_VERSION = "character_snapshot_v1"
@@ -2126,7 +2127,7 @@ def parse_summary_text(summary_text: str) -> dict[str, object]:
 def fetch_active_summary_rows(cur, product_id: int, summary_type: str) -> list[dict]:
     cur.execute(
         """
-        SELECT summary_id, scope_key, episode_from, episode_to, source_hash, summary_text
+        SELECT summary_id, scope_key, episode_from, episode_to, source_hash, summary_text, created_date
           FROM tb_story_agent_context_summary
          WHERE product_id = %s
            AND summary_type = %s
@@ -2152,7 +2153,7 @@ def fetch_active_summary_rows_for_episode_nos(
     placeholders = ", ".join(["%s"] * len(normalized_episode_nos))
     cur.execute(
         f"""
-        SELECT summary_id, scope_key, episode_from, episode_to, source_hash, summary_text
+        SELECT summary_id, scope_key, episode_from, episode_to, source_hash, summary_text, created_date
           FROM tb_story_agent_context_summary
          WHERE product_id = %s
            AND summary_type = %s
@@ -2178,7 +2179,8 @@ def fetch_active_character_asset_summary_rows(
                summary.episode_from,
                summary.episode_to,
                summary.source_hash,
-               summary.summary_text
+               summary.summary_text,
+               summary.created_date
           FROM tb_story_agent_context_summary summary
           JOIN (
                 SELECT ranked_episode.episode_id
@@ -9326,7 +9328,10 @@ def reset_active_character_bundle(cur, *, product_id: int) -> None:
 def aggregate_character_inventory_rows(signal_rows: list[dict]) -> list[dict[str, object]]:
     inventory_map: dict[str, dict[str, object]] = {}
     for row in signal_rows:
-        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
+            extract_json_object(str(row.get("summary_text") or "")) or {},
+            created_date=row.get("created_date"),
+        )
         episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
         for item in list(payload.get("mentioned_characters") or []):
             if not isinstance(item, dict):
@@ -9464,10 +9469,107 @@ def is_generic_character_label(value: str) -> bool:
     return not normalized or normalized in GENERIC_CHARACTER_LABELS
 
 
+def _normalize_legacy_anonymous_work_protagonist_signal_payload(
+    payload: dict[str, object],
+    *,
+    created_date: object = None,
+) -> dict[str, object]:
+    normalized_created_date = str(created_date or "").strip().replace("T", " ")[:19]
+    if (
+        not normalized_created_date
+        or normalized_created_date >= LEGACY_ANONYMOUS_WORK_PROTAGONIST_CUTOFF
+    ):
+        return payload
+    mentioned_characters = list(payload.get("mentioned_characters") or [])
+    legacy_indexes = []
+    for item_index, item in enumerate(mentioned_characters):
+        if not isinstance(item, dict):
+            continue
+        labels = [
+            str(item.get("display_name") or "").strip(),
+            *[
+                str(alias or "").strip()
+                for alias in list(item.get("aliases") or [])
+                if str(alias or "").strip()
+            ],
+        ]
+        normalized_labels = {
+            normalize_signal_entity_label(label)
+            for label in labels
+            if normalize_signal_entity_label(label)
+        }
+        if (
+            str(item.get("character_key") or "").strip()
+            != "protagonist:first_person"
+            or str(item.get("entity_kind") or "person").strip().lower()
+            != "person"
+            or not parse_yes_no_flag(item.get("is_work_protagonist"))
+            or not parse_yes_no_flag(item.get("is_first_person"))
+            or not normalized_labels
+            or not normalized_labels <= {"나", "주인공"}
+            or normalize_signal_name_list(item.get("real_names"), limit=1)
+            or list(item.get("relation_edges") or [])
+            or list(item.get("identity_claims") or [])
+        ):
+            continue
+        legacy_indexes.append(item_index)
+
+    if len(legacy_indexes) != 1 or any(
+        isinstance(item, dict)
+        and str(item.get("character_key") or "").strip().startswith(
+            "protagonist:generic"
+        )
+        for item in mentioned_characters
+    ):
+        return payload
+
+    legacy_index = legacy_indexes[0]
+    normalized_characters: list[object] = []
+    for item_index, raw_item in enumerate(mentioned_characters):
+        if not isinstance(raw_item, dict):
+            normalized_characters.append(raw_item)
+            continue
+        item = dict(raw_item)
+        if item_index == legacy_index:
+            item.update(
+                {
+                    "character_key": "protagonist:generic",
+                    "display_name": "나(주인공)",
+                    "aliases": ["나(주인공)"],
+                    "entity_kind": "stable_role",
+                    "narration_names": [],
+                    "social_call_names": [],
+                    "persona_names": [],
+                }
+            )
+        for field_name in ("relation_edges", "identity_claims"):
+            normalized_items = []
+            for raw_nested_item in list(item.get(field_name) or []):
+                if not isinstance(raw_nested_item, dict):
+                    normalized_items.append(raw_nested_item)
+                    continue
+                nested_item = dict(raw_nested_item)
+                if (
+                    str(nested_item.get("target_key") or "").strip()
+                    == "protagonist:first_person"
+                ):
+                    nested_item["target_key"] = "protagonist:generic"
+                normalized_items.append(nested_item)
+            item[field_name] = normalized_items
+        normalized_characters.append(item)
+
+    normalized_payload = dict(payload)
+    normalized_payload["mentioned_characters"] = normalized_characters
+    return normalized_payload
+
+
 def build_character_inventory_v3_observations(signal_rows: list[dict]) -> list[dict[str, object]]:
     observations: list[dict[str, object]] = []
     for row in signal_rows:
-        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
+            extract_json_object(str(row.get("summary_text") or "")) or {},
+            created_date=row.get("created_date"),
+        )
         episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
         source_hash = str(row.get("source_hash") or "").strip()
         summary_id = str(row.get("summary_id") or "").strip()
@@ -14674,7 +14776,10 @@ async def build_character_inventory_v3_summaries_resolved(
 def build_character_signal_provenance_map(signal_rows: list[dict]) -> dict[str, list[str]]:
     signal_provenance_map: dict[str, list[str]] = {}
     for row in signal_rows:
-        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
+            extract_json_object(str(row.get("summary_text") or "")) or {},
+            created_date=row.get("created_date"),
+        )
         summary_component = f"{int(row.get('summary_id') or 0)}:{str(row.get('source_hash') or '')}"
         for item in list(payload.get("mentioned_characters") or []):
             if not isinstance(item, dict):
@@ -14882,7 +14987,10 @@ def should_skip_new_character_inventory_candidate(
 def extract_character_keys_from_signal_rows(signal_rows: list[dict]) -> set[str]:
     character_keys: set[str] = set()
     for row in signal_rows:
-        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
+            extract_json_object(str(row.get("summary_text") or "")) or {},
+            created_date=row.get("created_date"),
+        )
         for item in list(payload.get("mentioned_characters") or []):
             if not isinstance(item, dict):
                 continue
@@ -14973,7 +15081,10 @@ def aggregate_relation_inventory_rows(signal_rows: list[dict]) -> list[dict[str,
             current["relation_tag_counts"][relation_tag] = int(current["relation_tag_counts"].get(relation_tag) or 0) + 1
 
     for row in signal_rows:
-        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
+            extract_json_object(str(row.get("summary_text") or "")) or {},
+            created_date=row.get("created_date"),
+        )
         episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
         summary_component = f"{int(row.get('summary_id') or 0)}:{str(row.get('source_hash') or '')}"
         display_name_by_key: dict[str, str] = {}
@@ -15200,7 +15311,10 @@ def should_skip_new_relation_inventory_candidate(
 def extract_relation_keys_from_signal_rows(signal_rows: list[dict]) -> set[str]:
     relation_keys: set[str] = set()
     for row in signal_rows:
-        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
+            extract_json_object(str(row.get("summary_text") or "")) or {},
+            created_date=row.get("created_date"),
+        )
         episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
         summary_component = f"{int(row.get('summary_id') or 0)}:{str(row.get('source_hash') or '')}"
         mentioned_characters = list(payload.get("mentioned_characters") or [])
