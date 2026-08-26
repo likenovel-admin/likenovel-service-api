@@ -1906,6 +1906,102 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         )
         self.assertIn("generated=protagonist:named:데시", captured_logs.output[0])
 
+    async def test_scene_repair_replaces_superseded_scope_with_canonical_character(self):
+        module = load_module()
+        conn = FakeConnection()
+        canonical_scope_key = "character:김태식"
+        superseded_scope_key = "character:legacy-protagonist"
+        existing_payload = {
+            "episode_no": 27,
+            "status": "ok",
+            "scene_count": 1,
+            "scenes": [
+                {
+                    "scene_gist": "주인공이 배를 산다.",
+                    "participants": [{"scope_key": superseded_scope_key}],
+                    "action_ownership": [],
+                }
+            ],
+        }
+        regenerated_payload = {
+            **existing_payload,
+            "scenes": [
+                {
+                    "scene_gist": "김태식이 배를 산다.",
+                    "participants": [{"scope_key": canonical_scope_key}],
+                    "action_ownership": [],
+                }
+            ],
+        }
+        request_mock = AsyncMock(return_value=regenerated_payload)
+        upsert_mock = MagicMock(return_value=(10, True))
+        inventory_map = {
+            canonical_scope_key: {
+                "canonical_character_key": canonical_scope_key,
+                "display_name": "김태식",
+                "entity_kind": "person",
+                "work_role": "main_protagonist",
+                "superseded_identity_scope_keys": [superseded_scope_key],
+            },
+            superseded_scope_key: {
+                "canonical_character_key": superseded_scope_key,
+                "display_name": "주인공",
+                "entity_kind": "person",
+                "work_role": "unknown",
+                "continuity_status": "superseded",
+            },
+        }
+        canonical_character_packet = module.build_episode_scene_canonical_character_packet(
+            inventory_map
+        )
+        scope_key_replacements = module.build_character_identity_scope_replacements(
+            inventory_map
+        )
+
+        with patch.object(module, "OPENROUTER_API_KEY", "test-key"), \
+             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "test-model"), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(
+                 module,
+                 "fetch_active_summary_by_scope",
+                 return_value={
+                     "summary_id": 9,
+                     "source_hash": "previous-source-hash",
+                     "summary_text": json.dumps(existing_payload, ensure_ascii=False),
+                 },
+             ), \
+             patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
+             patch.object(module, "upsert_summary", upsert_mock):
+            counts = await module.build_episode_scene_extraction_summaries(
+                conn,
+                product_id=1225,
+                product_title="아저씨의 요술램프",
+                episode_rows=[
+                    {
+                        "summary_id": 1,
+                        "scope_key": "episode:29879",
+                        "episode_from": 27,
+                        "source_hash": "hash",
+                        "summary_text": "[27화] 테스트",
+                    }
+                ],
+                episode_texts_by_no={27: "김태식은 배를 샀다."},
+                summary_client=object(),
+                canonical_character_packet=canonical_character_packet,
+                scope_key_replacements=scope_key_replacements,
+                required_scope_keys_by_episode_no={27: {canonical_scope_key}},
+                cleanup_missing_scopes=False,
+            )
+
+        self.assertEqual(counts, (1, 0))
+        self.assertEqual(
+            [item["scope_key"] for item in canonical_character_packet["characters"]],
+            [canonical_scope_key],
+        )
+        request_mock.assert_awaited_once()
+        upsert_mock.assert_called_once()
+
     async def test_scene_repair_strict_mode_raises_unexpected_request_error(self):
         module = load_module()
         conn = FakeConnection()

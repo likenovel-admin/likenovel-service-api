@@ -8133,6 +8133,33 @@ async def build_episode_character_signals_summaries_nonblocking(
     return inserted_count, reused_count, complete
 
 
+def build_character_identity_scope_replacements(
+    inventory_map: dict[str, dict[str, object]],
+) -> dict[str, str]:
+    replacements: dict[str, str] = {}
+    for scope_key, item in (inventory_map or {}).items():
+        canonical_scope_key = str(
+            item.get("canonical_character_key") or scope_key or ""
+        ).strip()
+        if (
+            not canonical_scope_key
+            or str(item.get("continuity_status") or "").strip() == "superseded"
+        ):
+            continue
+        for raw_scope_key in list(item.get("superseded_identity_scope_keys") or []):
+            superseded_scope_key = str(raw_scope_key or "").strip()
+            if not superseded_scope_key or superseded_scope_key == canonical_scope_key:
+                continue
+            existing_replacement = replacements.get(superseded_scope_key)
+            if existing_replacement and existing_replacement != canonical_scope_key:
+                raise ValueError(
+                    "ambiguous superseded character scope replacement: "
+                    f"{superseded_scope_key}"
+                )
+            replacements[superseded_scope_key] = canonical_scope_key
+    return replacements
+
+
 def build_episode_scene_canonical_character_packet(
     inventory_map: dict[str, dict[str, object]],
     *,
@@ -8140,6 +8167,8 @@ def build_episode_scene_canonical_character_packet(
 ) -> dict[str, list[dict[str, object]]]:
     rows: list[dict[str, object]] = []
     for scope_key, item in (inventory_map or {}).items():
+        if str(item.get("continuity_status") or "").strip() == "superseded":
+            continue
         scope_key = str(scope_key or item.get("canonical_character_key") or "").strip()
         display_name = str(item.get("display_name") or "").strip()
         if not scope_key or not display_name:
@@ -8217,6 +8246,7 @@ async def build_episode_scene_extraction_summaries(
     episode_texts_by_no: dict[int, str],
     summary_client: AsyncClient | None,
     canonical_character_packet: object | None,
+    scope_key_replacements: dict[str, str] | None = None,
     required_scope_keys_by_episode_no: dict[int, set[str]] | None = None,
     cleanup_missing_scopes: bool = True,
     raise_unexpected_errors: bool = False,
@@ -8233,6 +8263,14 @@ async def build_episode_scene_extraction_summaries(
     )
     if not packet_characters:
         return 0, 0
+    resolved_scope_key_replacements = {
+        str(scope_key or "").strip(): str(replacement_scope_key or "").strip()
+        for scope_key, replacement_scope_key in dict(
+            scope_key_replacements or {}
+        ).items()
+        if str(scope_key or "").strip()
+        and str(replacement_scope_key or "").strip()
+    }
 
     inserted_count = 0
     reused_count = 0
@@ -8242,9 +8280,13 @@ async def build_episode_scene_extraction_summaries(
         episode_no = int(row.get("episode_from") or row.get("episode_no") or 0)
         normalized_text = str(episode_texts_by_no.get(episode_no) or "").strip()
         scope_key = str(row.get("scope_key") or "").strip()
-        required_scope_keys = set(
-            (required_scope_keys_by_episode_no or {}).get(episode_no) or set()
-        )
+        required_scope_keys = {
+            resolved_scope_key_replacements.get(scope_key, scope_key)
+            for scope_key in set(
+                (required_scope_keys_by_episode_no or {}).get(episode_no)
+                or set()
+            )
+        }
         preserved_scope_keys: set[str] = set()
         if not summary_id or episode_no <= 0 or not normalized_text or not scope_key:
             continue
@@ -8272,7 +8314,10 @@ async def build_episode_scene_extraction_summaries(
             ) or {}
             if _is_usable_episode_scene_payload(active_payload):
                 preserved_scope_keys.update(
-                    extract_episode_scene_character_scope_keys(active_payload)
+                    resolved_scope_key_replacements.get(scope_key, scope_key)
+                    for scope_key in extract_episode_scene_character_scope_keys(
+                        active_payload
+                    )
                 )
             if existing:
                 existing_payload = extract_json_object(str(existing.get("summary_text") or "")) or {}
@@ -8283,7 +8328,14 @@ async def build_episode_scene_extraction_summaries(
                     existing_payload
                 )
                 required_existing_scope_keys = required_scope_keys | preserved_scope_keys
-                if existing_payload_usable and required_existing_scope_keys.issubset(existing_scope_keys):
+                existing_has_superseded_scope = bool(
+                    existing_scope_keys & set(resolved_scope_key_replacements)
+                )
+                if (
+                    existing_payload_usable
+                    and not existing_has_superseded_scope
+                    and required_existing_scope_keys.issubset(existing_scope_keys)
+                ):
                     existing_summary_id = int(existing["summary_id"])
                     activate_existing_summary(
                         cur,
@@ -17900,6 +17952,9 @@ async def repair_character_chat_assets(
                             canonical_character_packet=build_episode_scene_canonical_character_packet(
                                 capped_inventory_map
                             ),
+                            scope_key_replacements=build_character_identity_scope_replacements(
+                                capped_inventory_map
+                            ),
                             required_scope_keys_by_episode_no=required_scope_keys_by_episode_no,
                             cleanup_missing_scopes=False,
                             raise_unexpected_errors=True,
@@ -18857,6 +18912,9 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             episode_texts_by_no=character_episode_texts_by_no,
                             summary_client=summary_client,
                             canonical_character_packet=build_episode_scene_canonical_character_packet(capped_inventory_v3_map),
+                            scope_key_replacements=build_character_identity_scope_replacements(
+                                capped_inventory_v3_map
+                            ),
                             verbose=args.verbose,
                             cleanup_missing_scopes=cleanup_character_episode_scopes,
                             commit_changes=False,
@@ -19470,6 +19528,9 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 episode_texts_by_no=episode_texts_by_no,
                                 summary_client=summary_client,
                                 canonical_character_packet=build_episode_scene_canonical_character_packet(
+                                    capped_new_inventory_v3_map
+                                ),
+                                scope_key_replacements=build_character_identity_scope_replacements(
                                     capped_new_inventory_v3_map
                                 ),
                                 cleanup_missing_scopes=False,
