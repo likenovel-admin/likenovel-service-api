@@ -775,30 +775,58 @@ def build_public_character_catalog_readiness_query() -> str:
             FROM ready_episode
             WHERE ready_episode.episode_no >= 1
         ),
-        numbered_ready_episode AS (
+        public_episode_no AS (
+            SELECT DISTINCT
+                public_episode.product_id,
+                public_episode.episode_no
+            FROM tb_product_episode public_episode
+            WHERE public_episode.product_id IN :product_ids
+              AND public_episode.use_yn = 'Y'
+              AND public_episode.open_yn = 'Y'
+              AND public_episode.episode_no >= 1
+        ),
+        numbered_public_episode AS (
             SELECT
-                ready_episode_no.product_id,
-                ready_episode_no.episode_no,
+                public_episode_no.product_id,
+                public_episode_no.episode_no,
                 ROW_NUMBER() OVER (
-                    PARTITION BY ready_episode_no.product_id
-                    ORDER BY ready_episode_no.episode_no
-                ) AS ready_ordinal
-            FROM ready_episode_no
+                    PARTITION BY public_episode_no.product_id
+                    ORDER BY public_episode_no.episode_no
+                ) AS public_ordinal
+            FROM public_episode_no
+        ),
+        readiness_sequence AS (
+            SELECT
+                numbered_public_episode.product_id,
+                numbered_public_episode.episode_no,
+                numbered_public_episode.public_ordinal,
+                MIN(CASE
+                    WHEN ready_episode_no.episode_no IS NULL
+                    THEN numbered_public_episode.public_ordinal
+                END) OVER (
+                    PARTITION BY numbered_public_episode.product_id
+                ) AS first_missing_ordinal
+            FROM numbered_public_episode
+            LEFT JOIN ready_episode_no
+                ON ready_episode_no.product_id =
+                    numbered_public_episode.product_id
+               AND ready_episode_no.episode_no =
+                    numbered_public_episode.episode_no
         ),
         continuous_readiness AS (
             SELECT
-                numbered_ready_episode.product_id,
+                readiness_sequence.product_id,
                 COALESCE(
-                    MIN(CASE
-                        WHEN numbered_ready_episode.episode_no !=
-                            numbered_ready_episode.ready_ordinal
-                        THEN numbered_ready_episode.ready_ordinal - 1
+                    MAX(CASE
+                        WHEN readiness_sequence.first_missing_ordinal IS NULL
+                          OR readiness_sequence.public_ordinal <
+                            readiness_sequence.first_missing_ordinal
+                        THEN readiness_sequence.episode_no
                     END),
-                    MAX(numbered_ready_episode.episode_no),
                     0
                 ) AS _continuousReadyEpisodeNo
-            FROM numbered_ready_episode
-            GROUP BY numbered_ready_episode.product_id
+            FROM readiness_sequence
+            GROUP BY readiness_sequence.product_id
         )
         SELECT
             public_episode.product_id AS productId,
