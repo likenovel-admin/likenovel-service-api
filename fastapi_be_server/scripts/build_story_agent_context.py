@@ -14424,6 +14424,7 @@ def build_character_inventory_v3_summaries_from_signal_rows(
     protagonist_resolution: dict | None = None,
     character_identity_review: dict[str, object] | None = None,
     cleanup_missing_scopes: bool = True,
+    cleanup_legacy_anonymous_protagonist_scopes: bool = False,
 ) -> tuple[int, int]:
     old_inventory_map = fetch_active_character_inventory_map(
         cur=cur,
@@ -14471,6 +14472,20 @@ def build_character_inventory_v3_summaries_from_signal_rows(
         str(item.get("canonical_character_key") or "").strip(): item
         for item in inventory_rows
         if str(item.get("canonical_character_key") or "").strip()
+    }
+    legacy_replacement_episode_nos = {
+        int(episode_no)
+        for item in inventory_rows
+        if (
+            str(item.get("work_role") or "") == "main_protagonist"
+            or "protagonist:generic"
+            in {
+                str(value or "").strip()
+                for value in list(item.get("source_character_keys") or [])
+            }
+        )
+        for episode_no in list(item.get("evidence_episode_nos") or [])
+        if int(episode_no) > 0
     }
     retirement_replacements: dict[str, tuple[str, str]] = {}
     for operation in list(
@@ -14665,13 +14680,44 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             locked_scope_key,
         )
 
+    retired_legacy_scope_keys: set[str] = set()
     for old_scope_key, old_item in old_inventory_map.items():
         normalized_old_scope_key = str(old_scope_key or "").strip()
         if (
             not normalized_old_scope_key
             or normalized_old_scope_key in valid_scope_keys
-            or not _has_character_serving_contract(old_item)
         ):
+            continue
+        old_source_keys = {
+            str(value or "").strip()
+            for value in list(old_item.get("source_character_keys") or [])
+            if str(value or "").strip()
+        }
+        old_evidence_episode_nos = {
+            int(episode_no)
+            for episode_no in list(old_item.get("evidence_episode_nos") or [])
+            if int(episode_no) > 0
+        }
+        if (
+            cleanup_legacy_anonymous_protagonist_scopes
+            and old_source_keys == {"protagonist:first_person"}
+            and normalize_signal_entity_label(
+                str(old_item.get("display_name") or "")
+            )
+            in {"나", "주인공"}
+            and not bool(old_item.get("is_protagonist"))
+            and str(old_item.get("work_role") or "") != "main_protagonist"
+            and not bool(old_item.get("public_chat_eligible"))
+            and not bool(old_item.get("public_slot_eligible"))
+            and not list(old_item.get("real_names") or [])
+            and old_evidence_episode_nos
+            and old_evidence_episode_nos.issubset(
+                legacy_replacement_episode_nos
+            )
+        ):
+            retired_legacy_scope_keys.add(normalized_old_scope_key)
+            continue
+        if not _has_character_serving_contract(old_item):
             continue
         valid_scope_keys.add(normalized_old_scope_key)
         reused_count += 1
@@ -14680,6 +14726,21 @@ def build_character_inventory_v3_summaries_from_signal_rows(
             product_id,
             normalized_old_scope_key,
         )
+
+    if cleanup_legacy_anonymous_protagonist_scopes and not cleanup_missing_scopes:
+        for retired_scope_key in sorted(retired_legacy_scope_keys):
+            if deactivate_active_scope(
+                cur,
+                product_id=product_id,
+                summary_type="character_inventory_v3",
+                scope_key=retired_scope_key,
+            ):
+                logger.warning(
+                    "story_agent_legacy_anonymous_protagonist_scope_retired "
+                    "product_id=%s scope_key=%s",
+                    product_id,
+                    retired_scope_key,
+                )
 
     if (
         str(dict(protagonist_resolution or {}).get("decision") or "").upper()
@@ -14707,6 +14768,7 @@ def build_character_inventory_v3_summaries(
     product_id: int,
     protagonist_resolution: dict | None = None,
     cleanup_missing_scopes: bool = True,
+    cleanup_legacy_anonymous_protagonist_scopes: bool = False,
 ) -> tuple[int, int]:
     signal_rows = fetch_active_character_asset_summary_rows(
         cur=cur,
@@ -14725,6 +14787,9 @@ def build_character_inventory_v3_summaries(
         protagonist_resolution=protagonist_resolution,
         character_identity_review=character_identity_review,
         cleanup_missing_scopes=cleanup_missing_scopes,
+        cleanup_legacy_anonymous_protagonist_scopes=(
+            cleanup_legacy_anonymous_protagonist_scopes
+        ),
     )
 
 
@@ -18565,6 +18630,7 @@ async def reaggregate_character_inventory_foundations(
                             product_id=product_id,
                             protagonist_resolution=None,
                             cleanup_missing_scopes=False,
+                            cleanup_legacy_anonymous_protagonist_scopes=True,
                         )
                         relation_stats = build_relation_inventory_summaries_delta(
                             cur,
