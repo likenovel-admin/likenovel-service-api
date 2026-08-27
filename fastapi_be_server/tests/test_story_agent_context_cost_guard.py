@@ -6058,6 +6058,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         scene_builder.assert_awaited_once()
         rp_builder.assert_awaited_once()
         self.assertTrue(scene_builder.await_args.kwargs["raise_unexpected_errors"])
+        self.assertFalse(scene_builder.await_args.kwargs["commit_changes"])
         self.assertTrue(rp_builder.await_args.kwargs["raise_unexpected_errors"])
         touch.assert_called_once()
         self.assertEqual(results["character_asset_repair_attempted"], 1)

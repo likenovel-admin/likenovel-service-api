@@ -18677,7 +18677,7 @@ async def repair_character_chat_assets(
                             cleanup_missing_scopes=False,
                             raise_unexpected_errors=True,
                             verbose=args.verbose,
-                            commit_changes=not combine_reaggregation,
+                            commit_changes=False,
                             processed_character_scope_keys=processed_scene_scope_keys,
                         )
 
