@@ -29,6 +29,9 @@ MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT = (
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT
 )
 MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT = 2
+MAIN_CHARACTER_CHAT_MIN_DISTINCT_EPISODES = 5
+MAIN_CHARACTER_CHAT_MIN_EXAMPLES = 1
+MAIN_CHARACTER_CHAT_MIN_SCENES = 5
 MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES = 10
 MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES = 4
 MAIN_CHARACTER_CHAT_GOOD_MIN_SCENES = 5
@@ -101,10 +104,12 @@ def classify_main_character_chat_quality(
     example_count: int,
     scene_count: int,
 ) -> tuple[str, str]:
-    if example_count <= 0:
-        return "insufficient", "RP 예시 데이터 없음"
-    if scene_count <= 0:
-        return "insufficient", "캐릭터 장면 데이터 없음"
+    if distinct_episode_count < MAIN_CHARACTER_CHAT_MIN_DISTINCT_EPISODES:
+        return "insufficient", "등장 회차 근거 부족"
+    if example_count < MAIN_CHARACTER_CHAT_MIN_EXAMPLES:
+        return "insufficient", "RP 예시 부족"
+    if scene_count < MAIN_CHARACTER_CHAT_MIN_SCENES:
+        return "insufficient", "캐릭터 장면 부족"
     if (
         distinct_episode_count >= MAIN_CHARACTER_CHAT_GOOD_MIN_DISTINCT_EPISODES
         and example_count >= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
@@ -337,7 +342,7 @@ def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
               )) = 'ARRAY'
               AND JSON_LENGTH(JSON_EXTRACT(
                   examples.summary_text, '$.examples'
-              )) > 0
+              )) >= {MAIN_CHARACTER_CHAT_MIN_EXAMPLES}
               AND JSON_UNQUOTE(JSON_EXTRACT(
                   examples.summary_text, '$.character_key'
               )) = {canonical_scope_key}
@@ -383,6 +388,9 @@ def _public_character_slot_eligibility_predicate(
                       '$.display_safety.status'
                   )
               ) = 'pass'
+              AND CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
+                  inventory.summary_text, '$.distinct_episode_count'
+              )), '0') AS UNSIGNED) >= {MAIN_CHARACTER_CHAT_MIN_DISTINCT_EPISODES}
               AND (
                   LOWER(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
                       inventory.summary_text,
@@ -1472,6 +1480,13 @@ def filter_and_rank_public_character_catalog(
             or entry_episode_no > synced_latest_episode_no
         ):
             continue
+        quality, _ = classify_main_character_chat_quality(
+            distinct_episode_count=int(item.get("_distinctEpisodeCount") or 0),
+            example_count=int(item.get("_exampleCount") or 0),
+            scene_count=scene_count,
+        )
+        if quality == "insufficient":
+            continue
         item["_sceneCount"] = scene_count
         item["entryEpisodeNo"] = entry_episode_no
         candidates_by_product[product_id].append(item)
@@ -1541,7 +1556,8 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
     if not slot_items:
         return {"data": []}
 
-    entry_episode_by_character_slot: dict[int, int | None] = {}
+    scene_data_by_character_slot: dict[int, tuple[int, int | None]] = {}
+    scene_enrichment_succeeded = False
     try:
         scene_result = await db.execute(
             text(build_public_character_catalog_scene_query()),
@@ -1552,22 +1568,34 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
                 )
             },
         )
-        entry_episode_by_character_slot = {
-            int(row_data["characterSlotId"]): _parse_int(
-                row_data.get("entryEpisodeNo")
+        scene_data_by_character_slot = {
+            int(row_data["characterSlotId"]): (
+                int(row_data.get("sceneCount") or 0),
+                _parse_int(row_data.get("entryEpisodeNo")),
             )
             for row in scene_result.mappings().all()
             if (row_data := dict(row)).get("characterSlotId") is not None
         }
+        scene_enrichment_succeeded = True
     except SQLAlchemyError:
         logger.exception(
             "main character home entry episode enrichment failed; "
             "preserving existing slots with episode 1 fallback"
         )
+    visible_slot_items: list[dict] = []
     for item in slot_items:
         character_slot_id = int(item.get("characterSlotId") or 0)
-        entry_episode_no = entry_episode_by_character_slot.get(character_slot_id)
+        scene_count, entry_episode_no = scene_data_by_character_slot.get(
+            character_slot_id, (0, None)
+        )
         synced_latest_episode_no = int(item.get("syncedLatestEpisodeNo") or 0)
+        if scene_enrichment_succeeded and (
+            scene_count < MAIN_CHARACTER_CHAT_MIN_SCENES
+            or entry_episode_no is None
+            or entry_episode_no < 1
+            or entry_episode_no > synced_latest_episode_no
+        ):
+            continue
         item["entryEpisodeNo"] = (
             entry_episode_no
             if (
@@ -1577,7 +1605,8 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
             else 1
         )
         item.pop("_inventorySummaryText", None)
-    return {"data": slot_items}
+        visible_slot_items.append(item)
+    return {"data": visible_slot_items}
 
 
 async def _load_public_character_catalog_base(
