@@ -5791,11 +5791,67 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 {"episode_from": 3, "scope_key": "episode:103"},
             ],
             scene_scope_keys={"character:main", "character:support"},
+            usable_scene_episode_nos_by_scope={},
             limit=1,
         )
 
         self.assertEqual([row["episode_from"] for row in rows], [3])
         self.assertEqual(required, {3: {"character:main"}})
+
+    def test_scene_repair_selection_fills_only_the_five_episode_deficit(self):
+        module = load_module()
+        rows, required = module.select_character_chat_scene_repair_rows(
+            inventory_map={
+                "character:main": {
+                    "work_role": "main_protagonist",
+                    "evidence_episode_nos": [1, 2, 3, 4, 5, 6],
+                }
+            },
+            episode_summary_rows=[
+                {"episode_from": episode_no, "scope_key": f"episode:{episode_no}"}
+                for episode_no in range(1, 7)
+            ],
+            scene_scope_keys={"character:main"},
+            usable_scene_episode_nos_by_scope={"character:main": [1]},
+            limit=5,
+        )
+
+        self.assertEqual(
+            [row["episode_from"] for row in rows],
+            [3, 4, 5, 6],
+        )
+        self.assertEqual(
+            required,
+            {
+                3: {"character:main"},
+                4: {"character:main"},
+                5: {"character:main"},
+                6: {"character:main"},
+            },
+        )
+
+    def test_requested_scene_repair_selects_only_underbuilt_active_scope(self):
+        module = load_module()
+
+        selected = module.select_requested_scene_repair_scope_keys(
+            requested_scope_keys=["character:main", "character:ready"],
+            inventory_map={
+                "character:main": {},
+                "character:ready": {},
+            },
+            usable_scene_episode_nos_by_scope={
+                "character:main": [1, 2],
+                "character:ready": [1, 2, 3, 4, 5],
+            },
+        )
+
+        self.assertEqual(selected, {"character:main"})
+        with self.assertRaisesRegex(ValueError, "requested scene repair scope missing"):
+            module.select_requested_scene_repair_scope_keys(
+                requested_scope_keys=["character:missing"],
+                inventory_map={"character:main": {}},
+                usable_scene_episode_nos_by_scope={},
+            )
 
     async def test_character_asset_repair_only_run_reports_budget_deferral(self):
         module = load_module()
