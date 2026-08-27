@@ -49,6 +49,7 @@ from app.services.websochat.character_chat_product_policy import (  # noqa: E402
     CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
     CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+    CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT,
     is_character_chat_rp_profile_payload_ready,
 )
 
@@ -16475,6 +16476,49 @@ def build_character_chat_scene_context_lines_by_scope(
     return lines_by_scope
 
 
+def build_usable_character_scene_episode_nos_by_scope(
+    scene_rows: list[dict[str, object]],
+) -> dict[str, list[int]]:
+    episode_nos_by_scope: dict[str, set[int]] = {}
+    for row in scene_rows:
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("status") or "").strip().lower() not in {"ok", "partial"}:
+            continue
+        episode_no = int(
+            row.get("episode_to")
+            or payload.get("episode_no")
+            or row.get("episode_from")
+            or 0
+        )
+        if episode_no <= 0:
+            continue
+        for scene in list(payload.get("scenes") or []):
+            if not isinstance(scene, dict) or not str(
+                scene.get("scene_gist") or ""
+            ).strip():
+                continue
+            scope_keys = {
+                str(item.get("scope_key") or "").strip()
+                for item in list(scene.get("participants") or [])
+                if isinstance(item, dict)
+                and str(item.get("scope_key") or "").strip()
+            }
+            scope_keys.update(
+                str(item.get("actor_scope_key") or "").strip()
+                for item in list(scene.get("action_ownership") or [])
+                if isinstance(item, dict)
+                and str(item.get("actor_scope_key") or "").strip()
+            )
+            for scope_key in scope_keys:
+                episode_nos_by_scope.setdefault(scope_key, set()).add(episode_no)
+    return {
+        scope_key: sorted(episode_nos)
+        for scope_key, episode_nos in sorted(episode_nos_by_scope.items())
+    }
+
+
 def load_character_chat_scene_context_lines_by_scope(conn, *, product_id: int) -> dict[str, list[str]]:
     if not hasattr(conn, "ping"):
         return {}
@@ -16609,6 +16653,12 @@ def build_character_chat_asset_readiness_verification(
     profile_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_profile"])
     example_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_examples"])
     scene_scope_keys = set(build_character_chat_scene_context_lines_by_scope(rows_by_type["episode_scene_extraction"]).keys())
+    raw_scene_episode_nos_by_scope = (
+        build_usable_character_scene_episode_nos_by_scope(
+            rows_by_type["episode_scene_extraction"]
+        )
+    )
+    usable_scene_episode_nos_by_scope: dict[str, list[int]] = {}
 
     public_candidates: list[dict[str, object]] = []
     block_reason_counts: dict[str, int] = {}
@@ -16653,6 +16703,28 @@ def build_character_chat_asset_readiness_verification(
             _increment_reason(block_reason_counts, "identity_continuity_ambiguous")
         if not _is_character_chat_public_candidate(payload):
             continue
+
+        compatible_scene_scope_keys = {
+            scope_key,
+            str(payload.get("canonical_character_key") or "").strip(),
+            *(
+                str(value or "").strip()
+                for value in list(payload.get("protagonist_identity_scope_keys") or [])
+            ),
+            *(
+                str(value or "").strip()
+                for value in list(payload.get("source_character_keys") or [])
+            ),
+        } - {""}
+        usable_scene_episode_nos_by_scope[scope_key] = sorted(
+            {
+                episode_no
+                for compatible_scope_key in compatible_scene_scope_keys
+                for episode_no in raw_scene_episode_nos_by_scope.get(
+                    compatible_scope_key, []
+                )
+            }
+        )
 
         missing_reasons: list[str] = []
         profile_row = profile_rows_by_scope.get(scope_key)
@@ -16756,6 +16828,7 @@ def build_character_chat_asset_readiness_verification(
         "missing_opening_scope_keys": sorted(set(missing_opening_scope_keys)),
         "invalid_opening_scope_keys": sorted(set(invalid_opening_scope_keys)),
         "missing_usable_scene_scope_keys": sorted(set(missing_usable_scene_scope_keys)),
+        "usable_scene_episode_nos_by_scope": usable_scene_episode_nos_by_scope,
         "invalid_profile_scope_keys": sorted(set(invalid_profile_scope_keys)),
         "invalid_examples_scope_keys": sorted(set(invalid_examples_scope_keys)),
         "legacy_profile_scope_key_mismatch_scope_keys": sorted(set(legacy_profile_scope_key_mismatch_scope_keys)),
@@ -17916,6 +17989,31 @@ def select_requested_rp_refresh_scope_keys(
     return normalized_scope_keys
 
 
+def select_requested_scene_repair_scope_keys(
+    *,
+    requested_scope_keys: Iterable[str],
+    inventory_map: dict[str, dict[str, object]],
+    usable_scene_episode_nos_by_scope: dict[str, list[int]],
+) -> set[str]:
+    normalized_scope_keys = {
+        str(scope_key or "").strip()
+        for scope_key in requested_scope_keys
+        if str(scope_key or "").strip()
+    }
+    missing_scope_keys = normalized_scope_keys - set(inventory_map)
+    if missing_scope_keys:
+        raise ValueError(
+            "requested scene repair scope missing from active inventory: "
+            f"{','.join(sorted(missing_scope_keys))}"
+        )
+    return {
+        scope_key
+        for scope_key in normalized_scope_keys
+        if len(set(usable_scene_episode_nos_by_scope.get(scope_key) or []))
+        < CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT
+    }
+
+
 def filter_character_inventory_map_to_signal_scope(
     *,
     inventory_map: dict[str, dict[str, object]],
@@ -17944,6 +18042,7 @@ def select_character_chat_scene_repair_rows(
     inventory_map: dict[str, dict[str, object]],
     episode_summary_rows: list[dict[str, object]],
     scene_scope_keys: set[str],
+    usable_scene_episode_nos_by_scope: dict[str, list[int]],
     limit: int,
 ) -> tuple[list[dict[str, object]], dict[int, set[str]]]:
     episode_rows_by_no = {
@@ -17962,14 +18061,29 @@ def select_character_chat_scene_repair_rows(
             scope_key,
         ),
     )
-    max_rows = max(int(limit or 0), 1)
+    max_rows = max(int(limit or 0), 0)
     for scope_key in ordered_scope_keys:
         inventory_item = dict(inventory_map.get(scope_key) or {})
+        existing_scene_episode_nos = {
+            int(value)
+            for value in list(
+                usable_scene_episode_nos_by_scope.get(scope_key) or []
+            )
+            if int(value) > 0
+        }
+        missing_scene_episode_count = max(
+            CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT
+            - len(existing_scene_episode_nos),
+            0,
+        )
+        if missing_scene_episode_count <= 0:
+            continue
         evidence_episode_nos = sorted(
             {
                 int(value)
                 for value in list(inventory_item.get("evidence_episode_nos") or [])
                 if int(value) in episode_rows_by_no
+                and int(value) not in existing_scene_episode_nos
             },
             reverse=True,
         )
@@ -17979,17 +18093,25 @@ def select_character_chat_scene_repair_rows(
                 or inventory_item.get("first_seen_episode_no")
                 or 0
             )
-            if fallback_episode_no in episode_rows_by_no:
+            if (
+                fallback_episode_no in episode_rows_by_no
+                and fallback_episode_no not in existing_scene_episode_nos
+            ):
                 evidence_episode_nos = [fallback_episode_no]
-        for episode_no in evidence_episode_nos[:1]:
+        selected_for_scope = 0
+        for episode_no in evidence_episode_nos:
             if (
                 episode_no not in required_scope_keys_by_episode_no
+                and max_rows > 0
                 and len(required_scope_keys_by_episode_no) >= max_rows
             ):
                 continue
             required_scope_keys_by_episode_no.setdefault(episode_no, set()).add(
                 scope_key
             )
+            selected_for_scope += 1
+            if selected_for_scope >= missing_scene_episode_count:
+                break
     selected_rows = [
         episode_rows_by_no[episode_no]
         for episode_no in sorted(required_scope_keys_by_episode_no)
@@ -18389,6 +18511,21 @@ async def repair_character_chat_assets(
                             inventory_map=capped_inventory_map,
                         )
                     )
+                    usable_scene_episode_nos_by_scope = dict(
+                        before_readiness.get(
+                            "usable_scene_episode_nos_by_scope"
+                        )
+                        or {}
+                    )
+                    requested_scene_repair_scope_keys = (
+                        select_requested_scene_repair_scope_keys(
+                            requested_scope_keys=requested_scope_keys,
+                            inventory_map=capped_inventory_map,
+                            usable_scene_episode_nos_by_scope=(
+                                usable_scene_episode_nos_by_scope
+                            ),
+                        )
+                    )
                     if requested_scope_keys:
                         bundle_scope_keys &= requested_scope_keys
                     current_generation_rp_scope_keys = (
@@ -18399,6 +18536,12 @@ async def repair_character_chat_assets(
                             set(repair_plan["rp_scope_keys"])
                             | current_generation_rp_scope_keys
                         )
+                    if requested_scene_repair_scope_keys:
+                        repair_plan["scene_scope_keys"] = sorted(
+                            set(repair_plan["scene_scope_keys"])
+                            | requested_scene_repair_scope_keys
+                        )
+                        repair_plan["repairable"] = True
                     repair_plan = (
                         filter_character_chat_asset_repair_plan_to_requested_scopes(
                             repair_plan=repair_plan,
@@ -18411,6 +18554,9 @@ async def repair_character_chat_assets(
                             inventory_map=inventory_map,
                             episode_summary_rows=episode_summary_rows,
                             scene_scope_keys=scene_scope_keys,
+                            usable_scene_episode_nos_by_scope=(
+                                usable_scene_episode_nos_by_scope
+                            ),
                             limit=int(getattr(args, "max_delta_episodes", 0) or 0),
                         )
                     )
@@ -18476,6 +18622,29 @@ async def repair_character_chat_assets(
                             raise ValueError(
                                 "requested RP refresh made no progress: "
                                 f"{','.join(sorted(missing_requested_rp_refresh_scope_keys))}"
+                            )
+                        after_scene_episode_nos_by_scope = dict(
+                            after_readiness.get(
+                                "usable_scene_episode_nos_by_scope"
+                            )
+                            or {}
+                        )
+                        incomplete_requested_scene_scope_keys = {
+                            scope_key
+                            for scope_key in requested_scene_repair_scope_keys
+                            if len(
+                                set(
+                                    after_scene_episode_nos_by_scope.get(
+                                        scope_key, []
+                                    )
+                                )
+                            )
+                            < CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT
+                        }
+                        if incomplete_requested_scene_scope_keys:
+                            raise ValueError(
+                                "requested scene repair remains below minimum: "
+                                f"{','.join(sorted(incomplete_requested_scene_scope_keys))}"
                             )
                         readiness_diagnostic = (
                             build_character_bundle_readiness_diagnostic(
@@ -18577,7 +18746,10 @@ async def repair_character_chat_assets(
                         )
                         reaggregation_records.append(reaggregation_record)
 
-                    recovered = bool(requested_rp_refresh_scope_keys) or (
+                    recovered = bool(
+                        requested_rp_refresh_scope_keys
+                        or requested_scene_repair_scope_keys
+                    ) or (
                         is_character_chat_asset_readiness_actionable(before_readiness)
                         and not is_character_chat_asset_readiness_actionable(after_readiness)
                     )

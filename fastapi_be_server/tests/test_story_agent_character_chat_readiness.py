@@ -140,6 +140,53 @@ def opening_payload(scope_key="protagonist:named:데시"):
 
 
 class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
+    def test_readiness_reports_distinct_usable_scene_episodes_for_canonical_scope(self):
+        module = load_module()
+        scope_key = "character:데시"
+        legacy_scope_key = "named:데시"
+        payload = inventory_payload(scope_key)
+        payload["source_character_keys"] = [legacy_scope_key]
+        scene_rows = [
+            row(
+                "episode_scene_extraction",
+                f"episode:{episode_no}",
+                scene_payload(scene_scope_key),
+                episode_from=episode_no,
+                summary_id=episode_no,
+            )
+            for episode_no, scene_scope_key in [
+                (1, legacy_scope_key),
+                (2, scope_key),
+            ]
+        ]
+        empty_gist = scene_payload(scope_key)
+        empty_gist["episode_no"] = 3
+        empty_gist["scenes"][0]["scene_gist"] = ""
+        scene_rows.append(
+            row(
+                "episode_scene_extraction",
+                "episode:3",
+                empty_gist,
+                episode_from=3,
+                summary_id=3,
+            )
+        )
+
+        verification = module.build_character_chat_asset_readiness_verification(
+            product_id=101,
+            summary_rows_by_type={
+                "character_inventory_v3": [
+                    row("character_inventory_v3", scope_key, payload)
+                ],
+                "episode_scene_extraction": scene_rows,
+            },
+        )
+
+        self.assertEqual(
+            verification["usable_scene_episode_nos_by_scope"],
+            {scope_key: [1, 2]},
+        )
+
     def test_character_chat_holds_profile_with_empty_personality_and_speech_style(self):
         module = load_module()
         scope_key = "protagonist:named:데시"
