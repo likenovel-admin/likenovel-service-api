@@ -13571,7 +13571,18 @@ def _build_opening_work_protagonist_resolution(
                 and _cumulative_work_protagonist_episode_count(cumulative_row)
                 > _cumulative_work_protagonist_episode_count(selected_rows[0])
             )
-            if not names_are_compatible or cumulative_is_better_full_name:
+            cumulative_is_better_same_display = bool(
+                names_are_compatible
+                and normalize_signal_entity_label(cumulative_display_name).lower()
+                == normalize_signal_entity_label(selected_display_name).lower()
+                and _cumulative_work_protagonist_episode_count(cumulative_row)
+                > _cumulative_work_protagonist_episode_count(selected_rows[0])
+            )
+            if (
+                not names_are_compatible
+                or cumulative_is_better_full_name
+                or cumulative_is_better_same_display
+            ):
                 return _unresolved_opening_work_protagonist_resolution(
                     "opening_claimant_contradicted_by_cumulative_evidence"
                 )

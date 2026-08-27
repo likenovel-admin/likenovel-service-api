@@ -268,6 +268,75 @@ class CumulativeWorkProtagonistFallbackTest(unittest.TestCase):
         self.assertEqual(opening.get("decision"), "RESOLVED")
         self.assertEqual(opening.get("work_protagonist_key"), "character:진프라흐")
 
+    def test_opening_does_not_replace_dominant_possessed_identity(self):
+        """빙의 전 이름보다 이후 누적된 빙의 대상의 정체성을 유지한다."""
+        possessed_protagonist = character_item(
+            "protagonist:named:이사육",
+            "이사육",
+            work_protagonist=True,
+        )
+        possessed_protagonist["real_names"] = []
+        possessed_protagonist["aliases"] = ["이사육"]
+        possessed_protagonist["narration_names"] = ["이사육"]
+        possessed_protagonist["persona_names"] = ["야율천"]
+        possessed_protagonist["identity_claims"] = [
+            {
+                "claim_type": "possessed_as",
+                "target_key": "named:야율천",
+                "target_label": "야율천",
+                "normalized_target_label": "야율천",
+                "evidence": "",
+            }
+        ]
+        signal_rows = [
+            signal_row(
+                1,
+                [
+                    possessed_protagonist,
+                    character_item("named:야율천", "야율천"),
+                ],
+            ),
+            signal_row(
+                2,
+                [
+                    character_item(
+                        "protagonist:named:소궁주",
+                        "소궁주",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+            signal_row(3, [anonymous_protagonist_item(first_person=False)]),
+            *[
+                signal_row(
+                    episode_no,
+                    [
+                        character_item(
+                            "protagonist:named:야율천",
+                            "야율천",
+                            work_protagonist=True,
+                        )
+                    ],
+                )
+                for episode_no in range(4, 11)
+            ],
+        ]
+        base_rows = story.aggregate_character_inventory_v3_rows(
+            signal_rows,
+            protagonist_resolution=story._unresolved_opening_work_protagonist_resolution(
+                "resolver_base_inventory"
+            ),
+        )
+
+        opening = story._build_opening_work_protagonist_resolution(signal_rows, base_rows)
+        cumulative = story._build_cumulative_work_protagonist_resolution(
+            base_rows,
+            total_signal_episodes=story.count_distinct_signal_episode_nos(signal_rows),
+        )
+
+        self.assertEqual(opening.get("decision"), "UNRESOLVED")
+        self.assertEqual(cumulative.get("work_protagonist_key"), "character:야율천")
+
     def test_opening_allows_named_reveal_when_every_claim_is_first_person(self):
         """1인칭 화자의 이름이 3화에 처음 드러나는 정상 케이스는 유지한다."""
         named_protagonist = character_item(
