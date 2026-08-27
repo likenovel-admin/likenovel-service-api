@@ -2140,6 +2140,30 @@ def fetch_active_summary_rows(cur, product_id: int, summary_type: str) -> list[d
     return list(cur.fetchall())
 
 
+def fetch_character_chat_catalog_scene_episode_nos(
+    cur,
+    *,
+    product_id: int,
+) -> set[int]:
+    cur.execute(
+        """
+        SELECT DISTINCT episode_no
+          FROM tb_product_episode
+         WHERE product_id = %s
+           AND use_yn = 'Y'
+           AND open_yn = 'Y'
+           AND episode_no >= 1
+           AND COALESCE(price_type, 'free') = 'free'
+        """,
+        (product_id,),
+    )
+    return {
+        int(row.get("episode_no") or 0)
+        for row in cur.fetchall()
+        if int(row.get("episode_no") or 0) > 0
+    }
+
+
 def fetch_active_summary_rows_for_episode_nos(
     cur,
     *,
@@ -16519,6 +16543,23 @@ def build_usable_character_scene_episode_nos_by_scope(
     }
 
 
+def filter_usable_character_scene_episode_nos(
+    episode_nos_by_scope: dict[str, list[int]],
+    *,
+    eligible_episode_nos: set[int],
+) -> dict[str, list[int]]:
+    return {
+        scope_key: sorted(
+            {
+                int(value)
+                for value in list(episode_nos or [])
+                if int(value) in eligible_episode_nos
+            }
+        )
+        for scope_key, episode_nos in episode_nos_by_scope.items()
+    }
+
+
 def load_character_chat_scene_context_lines_by_scope(conn, *, product_id: int) -> dict[str, list[str]]:
     if not hasattr(conn, "ping"):
         return {}
@@ -18044,11 +18085,34 @@ def select_character_chat_scene_repair_rows(
     scene_scope_keys: set[str],
     usable_scene_episode_nos_by_scope: dict[str, list[int]],
     limit: int,
+    eligible_scene_episode_nos: set[int] | None = None,
 ) -> tuple[list[dict[str, object]], dict[int, set[str]]]:
+    eligible_episode_nos = (
+        None
+        if eligible_scene_episode_nos is None
+        else {
+            int(value)
+            for value in eligible_scene_episode_nos
+            if int(value) > 0
+        }
+    )
+    filtered_scene_episode_nos_by_scope = (
+        usable_scene_episode_nos_by_scope
+        if eligible_episode_nos is None
+        else filter_usable_character_scene_episode_nos(
+            usable_scene_episode_nos_by_scope,
+            eligible_episode_nos=eligible_episode_nos,
+        )
+    )
     episode_rows_by_no = {
         int(row.get("episode_from") or row.get("episode_no") or 0): row
         for row in episode_summary_rows
         if int(row.get("episode_from") or row.get("episode_no") or 0) > 0
+        and (
+            eligible_episode_nos is None
+            or int(row.get("episode_from") or row.get("episode_no") or 0)
+            in eligible_episode_nos
+        )
     }
     required_scope_keys_by_episode_no: dict[int, set[str]] = {}
     ordered_scope_keys = sorted(
@@ -18067,7 +18131,7 @@ def select_character_chat_scene_repair_rows(
         existing_scene_episode_nos = {
             int(value)
             for value in list(
-                usable_scene_episode_nos_by_scope.get(scope_key) or []
+                filtered_scene_episode_nos_by_scope.get(scope_key) or []
             )
             if int(value) > 0
         }
@@ -18323,6 +18387,14 @@ async def repair_character_chat_assets(
                 continue
             results["character_asset_repair_attempted"] += 1
             repair_record: dict[str, object] = {"product_id": product_id}
+            requested_scope_keys = {
+                str(scope_key or "").strip()
+                for scope_key in list(
+                    getattr(args, "character_scope_keys", None) or []
+                )
+                if str(scope_key or "").strip()
+            }
+            catalog_scene_episode_nos: set[int] | None = None
             combine_reaggregation = bool(
                 getattr(args, "reaggregate_character_inventory", False)
             )
@@ -18370,6 +18442,13 @@ async def repair_character_chat_assets(
                             product_id=product_id,
                             summary_type="episode_summary",
                         )
+                        if requested_scope_keys:
+                            catalog_scene_episode_nos = (
+                                fetch_character_chat_catalog_scene_episode_nos(
+                                    cur,
+                                    product_id=product_id,
+                                )
+                            )
                         missing_required_signal_scope_keys = (
                             build_missing_required_signal_scope_keys(
                                 episode_summary_rows=episode_summary_rows,
@@ -18497,13 +18576,6 @@ async def repair_character_chat_assets(
                         signal_rows=active_signal_rows,
                         inventory_map=inventory_map,
                     )
-                    requested_scope_keys = {
-                        str(scope_key or "").strip()
-                        for scope_key in list(
-                            getattr(args, "character_scope_keys", None) or []
-                        )
-                        if str(scope_key or "").strip()
-                    }
                     requested_rp_refresh_scope_keys = (
                         select_requested_rp_refresh_scope_keys(
                             refresh_requested=should_refresh_delta_rp(args),
@@ -18517,6 +18589,15 @@ async def repair_character_chat_assets(
                         )
                         or {}
                     )
+                    if catalog_scene_episode_nos is not None:
+                        usable_scene_episode_nos_by_scope = (
+                            filter_usable_character_scene_episode_nos(
+                                usable_scene_episode_nos_by_scope,
+                                eligible_episode_nos=(
+                                    catalog_scene_episode_nos
+                                ),
+                            )
+                        )
                     requested_scene_repair_scope_keys = (
                         select_requested_scene_repair_scope_keys(
                             requested_scope_keys=requested_scope_keys,
@@ -18556,6 +18637,9 @@ async def repair_character_chat_assets(
                             scene_scope_keys=scene_scope_keys,
                             usable_scene_episode_nos_by_scope=(
                                 usable_scene_episode_nos_by_scope
+                            ),
+                            eligible_scene_episode_nos=(
+                                catalog_scene_episode_nos
                             ),
                             limit=int(getattr(args, "max_delta_episodes", 0) or 0),
                         )
@@ -18629,6 +18713,15 @@ async def repair_character_chat_assets(
                             )
                             or {}
                         )
+                        if catalog_scene_episode_nos is not None:
+                            after_scene_episode_nos_by_scope = (
+                                filter_usable_character_scene_episode_nos(
+                                    after_scene_episode_nos_by_scope,
+                                    eligible_episode_nos=(
+                                        catalog_scene_episode_nos
+                                    ),
+                                )
+                            )
                         incomplete_requested_scene_scope_keys = {
                             scope_key
                             for scope_key in requested_scene_repair_scope_keys
