@@ -1200,6 +1200,16 @@ def is_story_agent_character_asset_collection_eligible(
     )
 
 
+def is_story_agent_character_asset_repair_eligible(
+    product_rows: Iterable[dict],
+    *,
+    requested_scope_keys: set[str],
+) -> bool:
+    return bool(requested_scope_keys) or is_story_agent_character_asset_collection_eligible(
+        product_rows
+    )
+
+
 def is_story_agent_character_asset_episode_eligible(row: dict) -> bool:
     if "character_asset_episode_eligible" not in row:
         return True
@@ -18376,7 +18386,17 @@ async def repair_character_chat_assets(
                 )
                 return
         for product_id, product_rows in sorted(rows_by_product.items()):
-            if not is_story_agent_character_asset_collection_eligible(product_rows):
+            requested_scope_keys = {
+                str(scope_key or "").strip()
+                for scope_key in list(
+                    getattr(args, "character_scope_keys", None) or []
+                )
+                if str(scope_key or "").strip()
+            }
+            if not is_story_agent_character_asset_repair_eligible(
+                product_rows,
+                requested_scope_keys=requested_scope_keys,
+            ):
                 repair_records.append(
                     {"product_id": product_id, "status": "skipped_cohort"}
                 )
@@ -18387,13 +18407,6 @@ async def repair_character_chat_assets(
                 continue
             results["character_asset_repair_attempted"] += 1
             repair_record: dict[str, object] = {"product_id": product_id}
-            requested_scope_keys = {
-                str(scope_key or "").strip()
-                for scope_key in list(
-                    getattr(args, "character_scope_keys", None) or []
-                )
-                if str(scope_key or "").strip()
-            }
             catalog_scene_episode_nos: set[int] | None = None
             combine_reaggregation = bool(
                 getattr(args, "reaggregate_character_inventory", False)

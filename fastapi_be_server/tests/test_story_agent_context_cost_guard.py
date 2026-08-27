@@ -5903,6 +5903,28 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 usable_scene_episode_nos_by_scope={},
             )
 
+    def test_exact_scope_repair_allows_existing_legacy_character(self):
+        module = load_module()
+        legacy_rows = [
+            {
+                "product_id": 777,
+                "_character_asset_collection_eligible": False,
+            }
+        ]
+
+        self.assertFalse(
+            module.is_story_agent_character_asset_repair_eligible(
+                legacy_rows,
+                requested_scope_keys=set(),
+            )
+        )
+        self.assertTrue(
+            module.is_story_agent_character_asset_repair_eligible(
+                legacy_rows,
+                requested_scope_keys={"character:legacy-main"},
+            )
+        )
+
     async def test_character_asset_repair_only_run_reports_budget_deferral(self):
         module = load_module()
         conn = FakeConnection()
