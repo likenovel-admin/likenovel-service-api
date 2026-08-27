@@ -18096,6 +18096,8 @@ def select_character_chat_scene_repair_rows(
     usable_scene_episode_nos_by_scope: dict[str, list[int]],
     limit: int,
     eligible_scene_episode_nos: set[int] | None = None,
+    episode_texts_by_no: dict[int, str] | None = None,
+    prefer_canonical_name_mentions: bool = False,
 ) -> tuple[list[dict[str, object]], dict[int, set[str]]]:
     eligible_episode_nos = (
         None
@@ -18152,7 +18154,7 @@ def select_character_chat_scene_repair_rows(
         )
         if missing_scene_episode_count <= 0:
             continue
-        evidence_episode_nos = sorted(
+        inventory_evidence_episode_nos = sorted(
             {
                 int(value)
                 for value in list(inventory_item.get("evidence_episode_nos") or [])
@@ -18161,6 +18163,33 @@ def select_character_chat_scene_repair_rows(
             },
             reverse=True,
         )
+        canonical_mention_episode_nos: list[int] = []
+        if prefer_canonical_name_mentions:
+            canonical_scope_key = str(
+                inventory_item.get("canonical_character_key") or scope_key
+            ).strip()
+            canonical_name = canonical_scope_key.removeprefix("character:").split(
+                ":dup:", 1
+            )[0]
+            canonical_label = normalize_signal_entity_label(canonical_name)
+            if canonical_label:
+                canonical_mention_episode_nos = sorted(
+                    episode_no
+                    for episode_no in episode_rows_by_no
+                    if episode_no not in existing_scene_episode_nos
+                    and canonical_label
+                    in normalize_signal_entity_label(
+                        str((episode_texts_by_no or {}).get(episode_no) or "")
+                    )
+                )
+        evidence_episode_nos = [
+            *canonical_mention_episode_nos,
+            *[
+                episode_no
+                for episode_no in inventory_evidence_episode_nos
+                if episode_no not in canonical_mention_episode_nos
+            ],
+        ]
         if not evidence_episode_nos:
             fallback_episode_no = int(
                 inventory_item.get("latest_seen_episode_no")
@@ -18653,6 +18682,10 @@ async def repair_character_chat_assets(
                             ),
                             eligible_scene_episode_nos=(
                                 catalog_scene_episode_nos
+                            ),
+                            episode_texts_by_no=episode_texts_by_no,
+                            prefer_canonical_name_mentions=bool(
+                                requested_scene_repair_scope_keys
                             ),
                             limit=int(getattr(args, "max_delta_episodes", 0) or 0),
                         )

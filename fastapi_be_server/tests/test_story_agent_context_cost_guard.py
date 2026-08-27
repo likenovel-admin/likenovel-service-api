@@ -5830,6 +5830,45 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             },
         )
 
+    def test_exact_scene_repair_prefers_canonical_name_mentions(self):
+        module = load_module()
+        rows, required = module.select_character_chat_scene_repair_rows(
+            inventory_map={
+                "character:이창준": {
+                    "canonical_character_key": "character:이창준",
+                    "work_role": "main_protagonist",
+                    "evidence_episode_nos": [21, 22],
+                }
+            },
+            episode_summary_rows=[
+                {"episode_from": episode_no, "scope_key": f"episode:{episode_no}"}
+                for episode_no in [2, 3, 4, 6, 21, 22]
+            ],
+            scene_scope_keys={"character:이창준"},
+            usable_scene_episode_nos_by_scope={"character:이창준": [2]},
+            limit=5,
+            eligible_scene_episode_nos={2, 3, 4, 6, 21, 22},
+            episode_texts_by_no={
+                3: "이창준이 진료실 문을 열었다.",
+                4: "이 창준은 아니지만 이창준은 여기에 있다.",
+                6: "간호사가 이창준을 불렀다.",
+                21: "다른 교수가 회진했다.",
+                22: "임가민이 환자를 살폈다.",
+            },
+            prefer_canonical_name_mentions=True,
+        )
+
+        self.assertEqual([row["episode_from"] for row in rows], [3, 4, 6, 22])
+        self.assertEqual(
+            required,
+            {
+                3: {"character:이창준"},
+                4: {"character:이창준"},
+                6: {"character:이창준"},
+                22: {"character:이창준"},
+            },
+        )
+
     def test_exact_scene_repair_counts_only_catalog_eligible_episodes(self):
         module = load_module()
         rows, required = module.select_character_chat_scene_repair_rows(
