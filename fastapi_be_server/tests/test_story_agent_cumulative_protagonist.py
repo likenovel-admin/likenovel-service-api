@@ -66,6 +66,21 @@ def signal_row(episode_no, items):
     }
 
 
+def anonymous_protagonist_item(*, first_person=True):
+    return {
+        "character_key": "protagonist:generic",
+        "display_name": "나(주인공)",
+        "entity_kind": "stable_role",
+        "real_names": [],
+        "role_in_episode": "lead",
+        "scene_weight": "high",
+        "voice_mode": "monologue" if first_person else "narration_only",
+        "is_work_protagonist": "Y",
+        "episode_focal": "Y",
+        "is_first_person": "Y" if first_person else "N",
+    }
+
+
 def build_conflicting_opening_signal_rows(total_episodes=30, protagonist_episodes=26):
     """1~3화에 주인공 주장이 겹쳐 오프닝 판정이 실패하지만,
     누적으로는 차우진이 압도적인 작품을 재현한다."""
@@ -100,6 +115,315 @@ def build_conflicting_opening_signal_rows(total_episodes=30, protagonist_episode
 
 
 class CumulativeWorkProtagonistFallbackTest(unittest.TestCase):
+    def test_opening_rejects_one_named_claim_after_anonymous_non_pov_claims(self):
+        """1101: 단발성 네아보다 누적 근거가 압도적인 원유성을 우선한다."""
+        signal_rows = [
+            signal_row(1, [anonymous_protagonist_item(first_person=False)]),
+            signal_row(2, [anonymous_protagonist_item(first_person=False)]),
+            signal_row(
+                3,
+                [character_item("protagonist:named:네아", "네아", work_protagonist=True)],
+            ),
+            *[
+                signal_row(
+                    episode_no,
+                    [
+                        character_item(
+                            "protagonist:named:원유성",
+                            "원유성",
+                            work_protagonist=True,
+                        )
+                    ],
+                )
+                for episode_no in range(4, 11)
+            ],
+        ]
+        base_rows = story.aggregate_character_inventory_v3_rows(
+            signal_rows,
+            protagonist_resolution=story._unresolved_opening_work_protagonist_resolution(
+                "resolver_base_inventory"
+            ),
+        )
+
+        opening = story._build_opening_work_protagonist_resolution(signal_rows, base_rows)
+
+        self.assertEqual(opening.get("decision"), "UNRESOLVED")
+        self.assertIsNone(opening.get("work_protagonist_key"))
+
+    def test_opening_keeps_one_named_claim_without_strong_competitor(self):
+        """누적 반증이 없으면 기존 단일 오프닝 실명 판정을 유지한다."""
+        signal_rows = [
+            signal_row(1, [anonymous_protagonist_item(first_person=False)]),
+            signal_row(2, [anonymous_protagonist_item(first_person=False)]),
+            signal_row(
+                3,
+                [
+                    character_item(
+                        "protagonist:named:이해일",
+                        "이해일",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+        ]
+        base_rows = story.aggregate_character_inventory_v3_rows(
+            signal_rows,
+            protagonist_resolution=story._unresolved_opening_work_protagonist_resolution(
+                "resolver_base_inventory"
+            ),
+        )
+
+        opening = story._build_opening_work_protagonist_resolution(signal_rows, base_rows)
+
+        self.assertEqual(opening.get("decision"), "RESOLVED")
+        self.assertEqual(opening.get("work_protagonist_key"), "character:이해일")
+
+    def test_opening_keeps_full_name_when_cumulative_candidate_is_shorter(self):
+        """1107: 누적 축약명이 기존 오프닝 풀네임을 밀어내지 않는다."""
+        signal_rows = [
+            signal_row(1, [anonymous_protagonist_item(first_person=False)]),
+            signal_row(2, [anonymous_protagonist_item(first_person=False)]),
+            signal_row(
+                3,
+                [
+                    character_item(
+                        "protagonist:named:도미닉가르시아",
+                        "도미닉 가르시아",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+            *[
+                signal_row(
+                    episode_no,
+                    [
+                        character_item(
+                            "protagonist:named:도미닉",
+                            "도미닉",
+                            work_protagonist=True,
+                        )
+                    ],
+                )
+                for episode_no in range(4, 11)
+            ],
+        ]
+        base_rows = story.aggregate_character_inventory_v3_rows(
+            signal_rows,
+            protagonist_resolution=story._unresolved_opening_work_protagonist_resolution(
+                "resolver_base_inventory"
+            ),
+        )
+
+        opening = story._build_opening_work_protagonist_resolution(signal_rows, base_rows)
+
+        self.assertEqual(opening.get("decision"), "RESOLVED")
+        self.assertEqual(
+            opening.get("work_protagonist_key"),
+            "character:도미닉가르시아",
+        )
+
+    def test_opening_treats_bare_honorific_as_role_not_identity(self):
+        """1235: 도련님은 별도 인물이 아니라 진 프라흐의 호칭 근거다."""
+        signal_rows = [
+            signal_row(
+                1,
+                [
+                    character_item(
+                        "protagonist:named:진프라흐",
+                        "진 프라흐",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+            signal_row(
+                2,
+                [
+                    character_item(
+                        "protagonist:named:도련님",
+                        "도련님",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+            signal_row(
+                3,
+                [
+                    character_item(
+                        "protagonist:named:진프라흐",
+                        "진 프라흐",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+        ]
+        base_rows = story.aggregate_character_inventory_v3_rows(
+            signal_rows,
+            protagonist_resolution=story._unresolved_opening_work_protagonist_resolution(
+                "resolver_base_inventory"
+            ),
+        )
+
+        opening = story._build_opening_work_protagonist_resolution(signal_rows, base_rows)
+
+        self.assertEqual(opening.get("decision"), "RESOLVED")
+        self.assertEqual(opening.get("work_protagonist_key"), "character:진프라흐")
+
+    def test_opening_allows_named_reveal_when_every_claim_is_first_person(self):
+        """1인칭 화자의 이름이 3화에 처음 드러나는 정상 케이스는 유지한다."""
+        named_protagonist = character_item(
+            "protagonist:named:김유성",
+            "김유성",
+            work_protagonist=True,
+        )
+        named_protagonist["is_first_person"] = "Y"
+        signal_rows = [
+            signal_row(1, [anonymous_protagonist_item()]),
+            signal_row(2, [anonymous_protagonist_item()]),
+            signal_row(3, [named_protagonist]),
+        ]
+        base_rows = story.aggregate_character_inventory_v3_rows(
+            signal_rows,
+            protagonist_resolution=story._unresolved_opening_work_protagonist_resolution(
+                "resolver_base_inventory"
+            ),
+        )
+
+        opening = story._build_opening_work_protagonist_resolution(signal_rows, base_rows)
+
+        self.assertEqual(opening.get("decision"), "RESOLVED")
+        self.assertEqual(opening.get("work_protagonist_key"), "character:김유성")
+
+    def test_cumulative_links_first_person_evidence_to_full_name_variant_family(self):
+        """1223: 나/덕영/하덕영의 주인공 근거를 하덕영 자산으로 모은다."""
+        signal_rows = [
+            signal_row(
+                1,
+                [
+                    character_item(
+                        "protagonist:named:하얀여우",
+                        "하얀 여우",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+            signal_row(2, [anonymous_protagonist_item()]),
+            signal_row(
+                3,
+                [character_item("protagonist:named:덕영", "덕영", work_protagonist=True)],
+            ),
+            signal_row(
+                4,
+                [character_item("named:하덕영", "하덕영", work_protagonist=False)],
+            ),
+            signal_row(5, []),
+            signal_row(6, [anonymous_protagonist_item()]),
+            signal_row(
+                7,
+                [character_item("protagonist:named:하덕영", "하덕영", work_protagonist=True)],
+            ),
+            signal_row(
+                8,
+                [
+                    character_item(
+                        "protagonist:named:하선생님",
+                        "하 선생님",
+                        work_protagonist=True,
+                    )
+                ],
+            ),
+            signal_row(
+                9,
+                [character_item("protagonist:named:하덕영", "하덕영", work_protagonist=True)],
+            ),
+            signal_row(10, [anonymous_protagonist_item()]),
+        ]
+
+        inventory = story.aggregate_character_inventory_v3_rows(signal_rows)
+        main_rows = [row for row in inventory if row.get("work_role") == "main_protagonist"]
+
+        self.assertEqual([row.get("display_name") for row in main_rows], ["하덕영"])
+        self.assertEqual(
+            main_rows[0].get("work_protagonist_evidence", {}).get("episode_count"),
+            6,
+        )
+        self.assertFalse(
+            any(row.get("canonical_character_key") == "character:나(주인공)" for row in inventory)
+        )
+
+    def test_cumulative_does_not_attach_first_person_to_one_unlinked_real_name(self):
+        """교차 시점처럼 익명 화자와 실명 하나만 있으면 자동 연결하지 않는다."""
+        signal_rows = [
+            signal_row(
+                1,
+                [
+                    character_item("character:남우진", "남우진", work_protagonist=True),
+                    character_item("character:송하늘", "송하늘", work_protagonist=True),
+                ],
+            ),
+            signal_row(2, [anonymous_protagonist_item()]),
+            signal_row(3, [anonymous_protagonist_item()]),
+            signal_row(
+                4,
+                [character_item("character:남우진", "남우진", work_protagonist=True)],
+            ),
+            signal_row(5, [anonymous_protagonist_item()]),
+            signal_row(
+                6,
+                [character_item("character:남우진", "남우진", work_protagonist=True)],
+            ),
+            signal_row(7, [anonymous_protagonist_item()]),
+            signal_row(8, [anonymous_protagonist_item()]),
+        ]
+
+        inventory = story.aggregate_character_inventory_v3_rows(signal_rows)
+
+        self.assertFalse(
+            any(row.get("work_role") == "main_protagonist" for row in inventory)
+        )
+
+    def test_cumulative_does_not_merge_persona_name_variants(self):
+        """빙의 주인공과 원래 몸 주인은 표시명이 비슷해도 합산하지 않는다."""
+        rows = [
+            {
+                "canonical_character_key": "character:방호영",
+                "display_name": "조렌 테이머",
+                "aliases": ["조렌 테이머"],
+                "real_names": ["방호영"],
+                "persona_names": ["조렌 테이머"],
+                "evidence_episode_nos": [1, 4, 6],
+                "work_protagonist_evidence": {"episode_count": 3},
+                "first_person_evidence": {"episode_count": 0},
+                "identity_conflict_reasons": [],
+                "display_safety": {"status": "pass"},
+            },
+            {
+                "canonical_character_key": "character:조렌",
+                "display_name": "조렌 테이머 변방백",
+                "aliases": ["조렌 테이머 변방백"],
+                "real_names": ["조렌"],
+                "persona_names": ["조렌 테이머 변방백"],
+                "evidence_episode_nos": [3, 5, 7],
+                "work_protagonist_evidence": {"episode_count": 3},
+                "first_person_evidence": {"episode_count": 0},
+                "identity_conflict_reasons": [],
+                "display_safety": {"status": "pass"},
+            },
+            {
+                "canonical_character_key": "character:나(주인공)",
+                "display_name": "나(주인공)",
+                "evidence_episode_nos": [2, 8, 9],
+                "work_protagonist_evidence": {"episode_count": 3},
+                "first_person_evidence": {"episode_count": 3},
+            },
+        ]
+
+        resolution = story._build_cumulative_work_protagonist_resolution(
+            rows,
+            total_signal_episodes=9,
+        )
+
+        self.assertEqual(resolution.get("decision"), "UNRESOLVED")
+
     def test_opening_resolution_fails_on_conflicting_claimants(self):
         signal_rows = build_conflicting_opening_signal_rows()
         base_rows = story.aggregate_character_inventory_v3_rows(
@@ -230,6 +554,40 @@ class CumulativeWorkProtagonistFallbackTest(unittest.TestCase):
             base_rows,
             total_signal_episodes=24,
         )
+        self.assertEqual(resolution.get("decision"), "UNRESOLVED")
+
+    def test_fallback_rejects_duplicate_canonical_key_candidate(self):
+        """identity가 분열된 dup 행은 누적 근거가 많아도 주인공으로 승격하지 않는다."""
+        rows = [
+            {
+                "canonical_character_key": "character:오레오:dup:d0c8e351",
+                "display_name": "오레오",
+                "aliases": ["오레오"],
+                "real_names": [],
+                "persona_names": [],
+                "evidence_episode_nos": list(range(1, 10)),
+                "work_protagonist_evidence": {"episode_count": 9},
+                "identity_conflict_reasons": ["duplicate_canonical_key"],
+                "display_safety": {"status": "pass"},
+            },
+            {
+                "canonical_character_key": "character:신데렐라",
+                "display_name": "신데렐라",
+                "aliases": ["신데렐라"],
+                "real_names": [],
+                "persona_names": [],
+                "evidence_episode_nos": [1, 2, 3],
+                "work_protagonist_evidence": {"episode_count": 3},
+                "identity_conflict_reasons": [],
+                "display_safety": {"status": "pass"},
+            },
+        ]
+
+        resolution = story._build_cumulative_work_protagonist_resolution(
+            rows,
+            total_signal_episodes=10,
+        )
+
         self.assertEqual(resolution.get("decision"), "UNRESOLVED")
 
     def test_opening_resolution_still_wins_when_available(self):

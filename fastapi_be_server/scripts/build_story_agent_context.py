@@ -12952,6 +12952,10 @@ def _cumulative_work_protagonist_candidates(
         canonical_key = str(row.get("canonical_character_key") or "").strip()
         if not canonical_key or canonical_key == "character:나(주인공)":
             continue
+        if ":dup:" in canonical_key or "duplicate_canonical_key" in list(
+            row.get("identity_conflict_reasons") or []
+        ):
+            continue
         if _inventory_identity_blocking_conflict_reasons(row):
             continue
         display_safety = dict(
@@ -12996,12 +13000,144 @@ def _build_cumulative_work_protagonist_resolution(
     if not candidates:
         return _keep_unresolved("cumulative_evidence_candidate_not_found")
 
-    top_row = candidates[0]
-    top_episode_count = _cumulative_work_protagonist_episode_count(top_row)
-    second_episode_count = (
-        _cumulative_work_protagonist_episode_count(candidates[1])
-        if len(candidates) > 1
-        else 0
+    def candidate_name_variant_family(
+        anchor_row: dict[str, object],
+    ) -> list[dict[str, object]]:
+        def has_distinct_persona_identity(row: dict[str, object]) -> bool:
+            display_name = str(row.get("display_name") or "").strip()
+            real_names = [
+                str(value or "").strip()
+                for value in list(row.get("real_names") or [])
+                if str(value or "").strip()
+            ]
+            return bool(
+                display_name
+                and real_names
+                and not any(
+                    _opening_work_protagonist_names_are_compatible(
+                        display_name,
+                        real_name,
+                    )
+                    for real_name in real_names
+                )
+            )
+
+        if has_distinct_persona_identity(anchor_row):
+            return [anchor_row]
+        anchor_names = [
+            str(value or "").strip()
+            for field_name in ("display_name", "real_names")
+            for value in (
+                [anchor_row.get(field_name)]
+                if field_name == "display_name"
+                else list(anchor_row.get(field_name) or [])
+            )
+            if str(value or "").strip()
+        ]
+        anchor_episode_nos = {
+            int(value)
+            for value in list(anchor_row.get("evidence_episode_nos") or [])
+            if int(value) > 0
+        }
+        family = [anchor_row]
+        for candidate_row in candidates:
+            if candidate_row is anchor_row:
+                continue
+            if has_distinct_persona_identity(candidate_row):
+                continue
+            candidate_episode_nos = {
+                int(value)
+                for value in list(candidate_row.get("evidence_episode_nos") or [])
+                if int(value) > 0
+            }
+            if anchor_episode_nos & candidate_episode_nos:
+                continue
+            candidate_names = [
+                str(value or "").strip()
+                for field_name in ("display_name", "real_names")
+                for value in (
+                    [candidate_row.get(field_name)]
+                    if field_name == "display_name"
+                    else list(candidate_row.get(field_name) or [])
+                )
+                if str(value or "").strip()
+            ]
+            if any(
+                _labels_are_same_character_name_variant(left, right)
+                for left in anchor_names
+                for right in candidate_names
+            ):
+                family.append(candidate_row)
+        return family
+
+    candidate_families: list[list[dict[str, object]]] = []
+    seen_family_keys: set[tuple[str, ...]] = set()
+    candidate_rank_by_id = {
+        id(candidate): rank for rank, candidate in enumerate(candidates)
+    }
+    for candidate in candidates:
+        family = candidate_name_variant_family(candidate)
+        family_key = tuple(
+            sorted(str(row.get("canonical_character_key") or "") for row in family)
+        )
+        if family_key in seen_family_keys:
+            continue
+        seen_family_keys.add(family_key)
+        candidate_families.append(family)
+    candidate_families.sort(
+        key=lambda family: (
+            -sum(_cumulative_work_protagonist_episode_count(row) for row in family),
+            min(candidate_rank_by_id[id(row)] for row in family),
+        )
+    )
+
+    top_family = candidate_families[0]
+    top_named_episode_count = sum(
+        _cumulative_work_protagonist_episode_count(row) for row in top_family
+    )
+    top_family_keys = {
+        str(row.get("canonical_character_key") or "") for row in top_family
+    }
+    second_episode_count = max(
+        (
+            sum(
+                _cumulative_work_protagonist_episode_count(row)
+                for row in family
+                if str(row.get("canonical_character_key") or "")
+                not in top_family_keys
+            )
+            for family in candidate_families
+        ),
+        default=0,
+    )
+    if (
+        second_episode_count > 0
+        and top_named_episode_count
+        < second_episode_count * CUMULATIVE_WORK_PROTAGONIST_DOMINANCE_RATIO
+    ):
+        return _keep_unresolved("cumulative_evidence_not_dominant")
+
+    anonymous_first_person_episode_count = 0
+    if len(top_family) >= 2:
+        anonymous_first_person_episode_count = sum(
+            min(
+                _cumulative_work_protagonist_episode_count(row),
+                int(dict(row.get("first_person_evidence") or {}).get("episode_count") or 0),
+            )
+            for row in rows
+            if str(row.get("canonical_character_key") or "") == "character:나(주인공)"
+        )
+    top_episode_count = min(
+        max(total_signal_episodes, top_named_episode_count),
+        top_named_episode_count + anonymous_first_person_episode_count,
+    )
+    top_row = max(
+        top_family,
+        key=lambda row: (
+            _cumulative_work_protagonist_episode_count(row),
+            len(normalize_signal_entity_label(str(row.get("display_name") or ""))),
+            str(row.get("display_name") or ""),
+        ),
     )
     if top_episode_count < CUMULATIVE_WORK_PROTAGONIST_MIN_EPISODE_COUNT:
         return _keep_unresolved("cumulative_evidence_below_minimum")
@@ -13011,13 +13147,6 @@ def _build_cumulative_work_protagonist_resolution(
         < total_signal_episodes * CUMULATIVE_WORK_PROTAGONIST_MIN_EPISODE_COVERAGE
     ):
         return _keep_unresolved("cumulative_evidence_coverage_below_minimum")
-    if (
-        second_episode_count > 0
-        and top_episode_count
-        < second_episode_count * CUMULATIVE_WORK_PROTAGONIST_DOMINANCE_RATIO
-    ):
-        return _keep_unresolved("cumulative_evidence_not_dominant")
-
     if _cumulative_selection_conflicts_with_locked_rows(
         top_row,
         locked_protagonist_rows=locked_protagonist_rows,
@@ -13046,11 +13175,19 @@ def _build_cumulative_work_protagonist_resolution(
 
 
 def _opening_work_protagonist_identity_name(item: dict[str, object]) -> str:
+    def is_bare_honorific(value: str) -> bool:
+        normalized_value = normalize_signal_entity_label(value)
+        return bool(normalized_value) and normalized_value in {
+            normalize_signal_entity_label(suffix)
+            for suffix in HONORIFIC_ADDRESS_SUFFIXES
+        }
+
     real_names = [
         str(value or "").strip()
         for value in list(item.get("real_names") or [])
         if str(value or "").strip()
         and not is_generic_character_label(str(value or ""))
+        and not is_bare_honorific(str(value or ""))
     ]
     if real_names:
         return max(real_names, key=lambda value: (len(normalize_signal_entity_label(value)), value))
@@ -13061,6 +13198,7 @@ def _opening_work_protagonist_identity_name(item: dict[str, object]) -> str:
         display_name
         if display_name
         and not is_generic_character_label(display_name)
+        and not is_bare_honorific(display_name)
         and not _display_label_has_hard_public_block(display_name)
         else ""
     )
@@ -13386,6 +13524,57 @@ def _build_opening_work_protagonist_resolution(
             for row in base_inventory_rows
             if str(row.get("canonical_character_key") or "") == "character:나(주인공)"
         ]
+    if (
+        len(identity_names) == 1
+        and len(selected_rows) == 1
+        and not all(
+            parse_yes_no_flag(item.get("is_first_person"))
+            for item in claimant_items
+        )
+    ):
+        cumulative_resolution = _build_cumulative_work_protagonist_resolution(
+            base_inventory_rows,
+            total_signal_episodes=count_distinct_signal_episode_nos(signal_rows),
+        )
+        if (
+            str(cumulative_resolution.get("decision") or "").upper()
+            == "RESOLVED"
+            and str(cumulative_resolution.get("work_protagonist_key") or "")
+            != str(selected_rows[0].get("canonical_character_key") or "")
+        ):
+            cumulative_row = next(
+                (
+                    row
+                    for row in base_inventory_rows
+                    if str(row.get("canonical_character_key") or "")
+                    == str(cumulative_resolution.get("work_protagonist_key") or "")
+                ),
+                None,
+            )
+            selected_display_name = str(
+                selected_rows[0].get("display_name") or ""
+            )
+            cumulative_display_name = str(
+                (cumulative_row or {}).get("display_name") or ""
+            )
+            names_are_compatible = (
+                cumulative_row is not None
+                and _opening_work_protagonist_names_are_compatible(
+                    selected_display_name,
+                    cumulative_display_name,
+                )
+            )
+            cumulative_is_better_full_name = bool(
+                names_are_compatible
+                and len(normalize_signal_entity_label(cumulative_display_name))
+                > len(normalize_signal_entity_label(selected_display_name))
+                and _cumulative_work_protagonist_episode_count(cumulative_row)
+                > _cumulative_work_protagonist_episode_count(selected_rows[0])
+            )
+            if not names_are_compatible or cumulative_is_better_full_name:
+                return _unresolved_opening_work_protagonist_resolution(
+                    "opening_claimant_contradicted_by_cumulative_evidence"
+                )
     if len(selected_rows) != 1:
         return _unresolved_opening_work_protagonist_resolution("opening_identity_ambiguous")
 
