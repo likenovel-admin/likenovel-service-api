@@ -5830,6 +5830,56 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             },
         )
 
+    def test_exact_scene_repair_counts_only_catalog_eligible_episodes(self):
+        module = load_module()
+        rows, required = module.select_character_chat_scene_repair_rows(
+            inventory_map={
+                "character:main": {
+                    "work_role": "main_protagonist",
+                    "evidence_episode_nos": [2, 5, 6, 7, 8, 30, 40],
+                }
+            },
+            episode_summary_rows=[
+                {"episode_from": episode_no, "scope_key": f"episode:{episode_no}"}
+                for episode_no in [2, 5, 6, 7, 8, 30, 40]
+            ],
+            scene_scope_keys={"character:main"},
+            usable_scene_episode_nos_by_scope={
+                "character:main": [2, 5, 30, 40]
+            },
+            eligible_scene_episode_nos={2, 5, 6, 7, 8},
+            limit=5,
+        )
+
+        self.assertEqual(
+            [row["episode_from"] for row in rows],
+            [6, 7, 8],
+        )
+        self.assertEqual(
+            required,
+            {
+                6: {"character:main"},
+                7: {"character:main"},
+                8: {"character:main"},
+            },
+        )
+
+    def test_fetch_catalog_scene_episode_nos_uses_public_free_gate(self):
+        module = load_module()
+        cursor = FakeRowsCursor([{"episode_no": 3}, {"episode_no": 4}])
+
+        result = module.fetch_character_chat_catalog_scene_episode_nos(
+            cursor,
+            product_id=1225,
+        )
+
+        self.assertEqual(result, {3, 4})
+        self.assertEqual(cursor.params, (1225,))
+        query = " ".join(cursor.query.split())
+        self.assertIn("use_yn = 'Y'", query)
+        self.assertIn("open_yn = 'Y'", query)
+        self.assertIn("COALESCE(price_type, 'free') = 'free'", query)
+
     def test_requested_scene_repair_selects_only_underbuilt_active_scope(self):
         module = load_module()
 
