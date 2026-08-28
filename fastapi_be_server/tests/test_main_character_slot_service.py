@@ -983,7 +983,7 @@ def test_character_chat_quality_enforces_minimum_public_asset_bundle(
 
 def test_catalog_hides_character_below_minimum_public_asset_bundle():
     from app.services.product.main_character_slot_service import (
-        filter_and_rank_public_character_catalog,
+        filter_public_character_catalog_candidates,
     )
 
     candidates = [
@@ -1011,9 +1011,11 @@ def test_catalog_hides_character_below_minimum_public_asset_bundle():
         {"characterSlotId": 4, "sceneCount": 5, "entryEpisodeNo": 1},
     ]
 
-    result = filter_and_rank_public_character_catalog(candidates, scenes)
+    result = filter_public_character_catalog_candidates(candidates, scenes)
 
     assert [item["characterSlotId"] for item in result] == [4]
+
+
 def test_catalog_recommendation_prioritizes_character_image_assets_and_protagonists():
     from app.services.product.main_character_slot_service import (
         rank_public_character_catalog_items,
