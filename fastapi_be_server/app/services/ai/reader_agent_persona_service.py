@@ -184,7 +184,7 @@ def build_activity_pattern(
 ) -> dict[str, Any]:
     rng = random.Random(f"likenovel-ai-reader-activity:{age_group}:{gender}:{seed}")
     base_hours_by_age = {
-        "10s": [16, 17, 18, 19, 20, 21, 22, 23],
+        "10s": [16, 17, 18, 21, 22, 23],
         "20s": [8, 12, 18, 19, 20, 21, 22, 23, 0],
         "30s": [7, 8, 12, 20, 21, 22],
         "40s": [6, 7, 8, 12, 20, 21],

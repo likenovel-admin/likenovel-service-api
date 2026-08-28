@@ -4051,6 +4051,127 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(token_a, token_b)
 
+    def test_restart_dry_run_token_includes_activity_schedule_mode(self):
+        from app.services.admin import admin_ai_reader_service
+
+        common_kwargs = {
+            "agent_count": 20,
+            "schedule_date": "2026-05-14",
+        }
+
+        token_a = admin_ai_reader_service.build_ai_reader_restart_dry_run_token(
+            **common_kwargs,
+            activity_schedule_mode="uniform",
+        )
+        token_b = admin_ai_reader_service.build_ai_reader_restart_dry_run_token(
+            **common_kwargs,
+            activity_schedule_mode="age_group",
+        )
+
+        self.assertNotEqual(token_a, token_b)
+
+    def test_restart_request_defaults_to_uniform_activity_schedule(self):
+        from app.schemas.admin import PostAiReaderRestartReqBody
+
+        uniform_request = PostAiReaderRestartReqBody()
+        age_group_request = PostAiReaderRestartReqBody(
+            activity_schedule_mode="age_group"
+        )
+
+        self.assertEqual(uniform_request.activity_schedule_mode, "uniform")
+        self.assertEqual(age_group_request.activity_schedule_mode, "age_group")
+
+    def test_resume_activity_pattern_uses_age_group_schedule_only_when_selected(self):
+        from app.schemas.admin import PostAiReaderRestartReqBody
+        from app.services.admin import admin_ai_reader_service
+        from app.services.ai import reader_agent_session_service
+
+        agent = {
+            "ai_reader_agent_id": 31,
+            "age_group": "10s",
+            "gender": "F",
+            "activity_pattern_json": json.dumps(
+                {
+                    "active_hours": [7, 12, 20],
+                    "daily_session_target": 2,
+                    "time_blocks": [
+                        {
+                            "label": "공통",
+                            "start_hour": 7,
+                            "end_hour": 9,
+                            "sessions_per_agent": 1,
+                        }
+                    ],
+                }
+            ),
+        }
+        uniform_request = PostAiReaderRestartReqBody(
+            active_hours=[7, 12, 20],
+            daily_session_target=2,
+            time_blocks=[
+                {
+                    "label": "공통",
+                    "start_hour": 7,
+                    "end_hour": 9,
+                    "sessions_per_agent": 1,
+                }
+            ],
+        )
+        age_group_request = PostAiReaderRestartReqBody(
+            activity_schedule_mode="age_group",
+            active_hours=[7, 12, 20],
+            daily_session_target=2,
+            time_blocks=[
+                {
+                    "label": "공통",
+                    "start_hour": 7,
+                    "end_hour": 9,
+                    "sessions_per_agent": 1,
+                }
+            ],
+        )
+
+        uniform_pattern = admin_ai_reader_service._resume_activity_pattern_for_agent(
+            agent,
+            uniform_request,
+        )
+        age_group_pattern = admin_ai_reader_service._resume_activity_pattern_for_agent(
+            agent,
+            age_group_request,
+        )
+        teen_windows = reader_agent_session_service.build_reader_daily_schedule_windows(
+            ai_reader_agent_id=agent["ai_reader_agent_id"],
+            schedule_date=date(2026, 8, 28),
+            activity_pattern=age_group_pattern,
+        )
+        older_agent = {
+            **agent,
+            "ai_reader_agent_id": 32,
+            "age_group": "50s",
+        }
+        older_age_group_pattern = admin_ai_reader_service._resume_activity_pattern_for_agent(
+            older_agent,
+            age_group_request,
+        )
+
+        self.assertEqual(uniform_pattern["time_blocks"][0]["label"], "공통")
+        self.assertEqual(uniform_pattern["active_hours"], [7, 12, 20])
+        self.assertNotIn("time_blocks", age_group_pattern)
+        self.assertEqual(age_group_pattern["daily_session_target"], 2)
+        self.assertEqual(age_group_pattern["activity_schedule_mode"], "age_group")
+        self.assertTrue(any(hour >= 22 for hour in age_group_pattern["active_hours"]))
+        self.assertEqual(len(teen_windows), 2)
+        self.assertEqual(
+            [window.active_start_at.hour for window in teen_windows],
+            [16, 21],
+        )
+        self.assertEqual([window.session_budget for window in teen_windows], [1, 1])
+        self.assertTrue(any(hour <= 6 for hour in older_age_group_pattern["active_hours"]))
+        self.assertNotEqual(
+            age_group_pattern["active_hours"],
+            older_age_group_pattern["active_hours"],
+        )
+
     def test_bootstrap_dry_run_token_includes_product_status_weights(self):
         from app.services.admin import admin_ai_reader_service
 

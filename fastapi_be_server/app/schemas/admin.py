@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from datetime import datetime
 import re
@@ -1292,6 +1292,10 @@ class PostAiReaderBootstrapReqBody(AdminBase):
         description="AI 독자 활동 시간대 0~23",
     )
     daily_session_target: int = Field(default=2, ge=1, le=8, description="하루 wake 세션 목표")
+    activity_schedule_mode: Literal["uniform", "age_group"] = Field(
+        default="uniform",
+        description="활동 시간표 방식. uniform은 공통 시간표, age_group은 연령별 생활패턴",
+    )
     time_blocks: Optional[List[AiReaderTimeBlock]] = Field(
         default=None,
         min_length=1,
@@ -1468,6 +1472,10 @@ class PostAiReaderResumePausedReqBody(AdminBase):
         ge=1,
         le=8,
         description="재가동 시 덮어쓸 하루 wake 세션 목표",
+    )
+    activity_schedule_mode: Literal["uniform", "age_group"] = Field(
+        default="uniform",
+        description="활동 시간표 방식. uniform은 공통 시간표, age_group은 연령별 생활패턴",
     )
     time_blocks: Optional[List[AiReaderTimeBlock]] = Field(
         default=None,
