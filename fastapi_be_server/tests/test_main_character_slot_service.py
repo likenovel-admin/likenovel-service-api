@@ -1128,7 +1128,7 @@ def test_catalog_applies_recommendation_priority_before_per_product_limit():
     assert [item["hasCharacterImage"] for item in result] == [True, False]
 
 
-def test_auto_home_selection_randomizes_top_pool_without_displacing_real_images():
+def test_auto_home_selection_keeps_catalog_top_twelve_in_recommendation_order():
     from app.services.product.main_character_slot_service import (
         select_auto_main_character_slots,
     )
@@ -1151,14 +1151,11 @@ def test_auto_home_selection_randomizes_top_pool_without_displacing_real_images(
         for index in range(1, 31)
     ]
 
-    def reverse_sample(values, count):
-        return list(reversed(values))[:count]
-
-    selected = select_auto_main_character_slots(items, sample_items=reverse_sample)
+    selected = select_auto_main_character_slots(items)
 
     assert len(selected) == 12
     assert all(item["hasCharacterImage"] for item in selected)
-    assert [item["characterSlotId"] for item in selected] == list(range(15, 3, -1))
+    assert [item["characterSlotId"] for item in selected] == list(range(1, 13))
     assert [item["cardOrder"] for item in selected] == list(range(1, 13))
 
 
