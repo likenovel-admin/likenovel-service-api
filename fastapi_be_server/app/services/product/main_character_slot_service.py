@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import random
 from collections import defaultdict
 from copy import deepcopy
 from time import monotonic
@@ -43,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 PUBLIC_CHARACTER_CATALOG_CACHE_TTL_SECONDS = 300
 AUTO_MAIN_CHARACTER_SLOT_LIMIT = 12
-AUTO_MAIN_CHARACTER_SLOT_POOL_SIZE = 24
 DEFAULT_CHARACTER_IMAGE_PATHS = (
     "/images/default-cover.png",
     "/images/default_cover.png",
@@ -1564,25 +1562,8 @@ def finalize_public_character_catalog_items(items) -> list[dict]:
 
 def select_auto_main_character_slots(
     items,
-    *,
-    sample_items=random.sample,
 ) -> list[dict]:
-    top_pool = [dict(item) for item in items[:AUTO_MAIN_CHARACTER_SLOT_POOL_SIZE]]
-    image_items = [item for item in top_pool if item.get("hasCharacterImage")]
-    fallback_items = [item for item in top_pool if not item.get("hasCharacterImage")]
-
-    selected = sample_items(
-        image_items,
-        min(AUTO_MAIN_CHARACTER_SLOT_LIMIT, len(image_items)),
-    )
-    remaining_count = AUTO_MAIN_CHARACTER_SLOT_LIMIT - len(selected)
-    if remaining_count > 0:
-        selected.extend(
-            sample_items(
-                fallback_items,
-                min(remaining_count, len(fallback_items)),
-            )
-        )
+    selected = [dict(item) for item in items[:AUTO_MAIN_CHARACTER_SLOT_LIMIT]]
 
     for card_order, item in enumerate(selected, start=1):
         item["cardOrder"] = card_order
