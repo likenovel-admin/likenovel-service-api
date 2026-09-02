@@ -715,6 +715,29 @@ async def post_products_comments_episodes_episode_id(
     episode_id_to_int = int(episode_id)
 
     async with db.begin():
+        # 댓글 비허용 회차는 UI 우회 요청까지 차단한다
+        query = text("""
+                         select product_id
+                              , comment_open_yn
+                           from tb_product_episode
+                          where episode_id = :episode_id
+                         """)
+
+        result = await db.execute(query, {"episode_id": episode_id_to_int})
+        episode_row = result.mappings().first()
+
+        if not episode_row:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=ErrorMessages.INVALID_EPISODE_INFO,
+            )
+
+        if episode_row.get("comment_open_yn") == "N":
+            raise CustomResponseException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                message=ErrorMessages.FORBIDDEN_CLOSED_EPISODE_COMMENT,
+            )
+
         user_id = await comm_service.get_user_from_kc(kc_user_id, db)
         if user_id == -1:
             raise CustomResponseException(
@@ -743,9 +766,10 @@ async def post_products_comments_episodes_episode_id(
                          select product_id, :episode_id, :user_id, :profile_id, :content, :created_id, :updated_id
                            from tb_product_episode
                           where episode_id = :episode_id
+                            and comment_open_yn = 'Y'
                          """)
 
-        await db.execute(
+        insert_result = await db.execute(
             query,
             {
                 "episode_id": episode_id_to_int,
@@ -756,6 +780,11 @@ async def post_products_comments_episodes_episode_id(
                 "updated_id": settings.DB_DML_DEFAULT_ID,
             },
         )
+        if insert_result.rowcount != 1:
+            raise CustomResponseException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                message=ErrorMessages.FORBIDDEN_CLOSED_EPISODE_COMMENT,
+            )
 
         query = text("""
                          select last_insert_id()

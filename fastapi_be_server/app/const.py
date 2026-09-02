@@ -385,6 +385,7 @@ class ErrorMessages:
     FORBIDDEN_NOT_AUTHOR_OF_PRODUCT = "해당 작품의 작가가 아닙니다."
     FORBIDDEN_NOT_OWNER_OF_PRODUCTBOOK = "대여권 소유자만 사용할 수 있습니다."
     FORBIDDEN_NOT_OWNER_OF_TICKETBOOK = "이용권 소유자만 사용할 수 있습니다."
+    FORBIDDEN_CLOSED_EPISODE_COMMENT = "댓글이 비허용된 회차입니다."
 
     # 데이터 유효성 관련
     INVALID_PRODUCT_INFO = "유효하지 않은 작품 정보입니다."
