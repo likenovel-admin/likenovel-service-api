@@ -90,6 +90,27 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
         self.assertEqual(len(normalized["librarian_points"]), 3)
         self.assertEqual(normalized["librarian_chips"], ["먼치킨", "게임개발", "코미디"])
 
+    def test_suspicious_unicode_demotes_public_copy_and_filters_tags(self):
+        normalized = admin_ai_metadata_service._normalize_ai_payload(
+            {
+                "summary": {
+                    "taste_tags": ["범죄 수사", "사이다 먼ō"],
+                    "librarian": {
+                        "intro": "통쾌한 사ī다를 좋아하면 잘 맞아요.",
+                        "points": ["배ԩ을 살펴요.", "주인공을 따라가요.", "반전을 즐겨요."],
+                        "chips": ["미스터리", "사ī다"],
+                    },
+                }
+            },
+            enforce_axis_minimum=False,
+            enforce_legacy_required=False,
+        )
+
+        self.assertEqual(normalized["taste_tags"], ["범죄 수사"])
+        self.assertIsNone(normalized["librarian_intro"])
+        self.assertIsNone(normalized["librarian_points"])
+        self.assertEqual(normalized["librarian_chips"], ["미스터리"])
+
     def test_prompt_separates_ai_librarian_public_tone_from_internal_summary_style(self):
         prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
 

@@ -951,6 +951,41 @@ class AiDnaLibrarianCopyTest(TestCase):
         self.assertEqual(len(result["librarian_points"]), 3)
         self.assertEqual(result["librarian_chips"], ["먼치킨", "게임개발", "코미디"])
 
+    def test_suspicious_unicode_demotes_public_copy_and_filters_tags(self):
+        result = self.module._normalize_librarian({
+            "librarian": {
+                "intro": "통쾌한 사ī다를 좋아하면 잘 맞아요.",
+                "points": ["배ԩ을 살펴요.", "주인공을 따라가요.", "반전을 즐겨요."],
+                "chips": ["미스터리", "사ī다"],
+            }
+        })
+        self.assertIsNone(result["librarian_intro"])
+        self.assertIsNone(result["librarian_points"])
+        self.assertEqual(result["librarian_chips"], ["미스터리"])
+
+        allowed = {axis: set() for axis in ("세", "직", "능", "연", "작", "타", "목")}
+        normalized = self.module.normalize_payload(
+            {
+                "summary": {
+                    "protagonist_type": "기자",
+                    "protagonist_desc": "사건을 추적하는 전직 기자",
+                    "heroine_type": "없음",
+                    "heroine_weight": "none",
+                    "mood": "긴장감 있는 분위기",
+                    "pacing": "medium",
+                    "premise": "카페를 운영하며 사건을 해결하는 이야기",
+                    "hook": "이웃의 누명을 벗기기 위해 진범을 추적한다",
+                    "themes": ["추리"],
+                    "taste_tags": ["범죄 수사", "사이다 먼ō"],
+                },
+                "axis_labels": {axis: [] for axis in allowed},
+                "axis_confidence": {},
+                "overall_confidence": 0.9,
+            },
+            allowed,
+        )
+        self.assertEqual(normalized["taste_tags"], ["범죄 수사"])
+
     def test_banned_words_demote_to_none_not_failure(self):
         result = self.module._normalize_librarian({
             "librarian": {

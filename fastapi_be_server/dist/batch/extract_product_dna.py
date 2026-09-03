@@ -949,6 +949,11 @@ def _validate_runtime_config(allowed_labels: dict[str, set[str]]) -> None:
 _LIBRARIAN_BANNED_RE = re.compile(
     r"결[이을의은]\s|축[이을의]\s|축으로|감각적|텍스트|콘텐츠|신호|라벨"
 )
+_SUSPICIOUS_GENERATED_TEXT_RE = re.compile(r"[\u0100-\u024f\u0370-\u052f]")
+
+
+def _has_suspicious_generated_text(value: str) -> bool:
+    return bool(_SUSPICIOUS_GENERATED_TEXT_RE.search(value))
 
 
 def _normalize_librarian(summary: dict) -> dict[str, Any]:
@@ -966,11 +971,27 @@ def _normalize_librarian(summary: dict) -> dict[str, Any]:
         chips = _safe_list(raw.get("chips"), "summary.librarian.chips", max_items=4, max_item_length=20)
     except ValueError:
         return empty
-    if intro and _LIBRARIAN_BANNED_RE.search(intro):
+    if intro and (
+        _LIBRARIAN_BANNED_RE.search(intro)
+        or _has_suspicious_generated_text(intro)
+    ):
         intro = None
-    if points and (len(points) < 3 or any(_LIBRARIAN_BANNED_RE.search(p) for p in points)):
+    if points and (
+        len(points) < 3
+        or any(
+            _LIBRARIAN_BANNED_RE.search(point)
+            or _has_suspicious_generated_text(point)
+            for point in points
+        )
+    ):
         points = None
-    chips = [c for c in (chips or []) if not _LIBRARIAN_BANNED_RE.search(c) and len(c.split()) <= 2]
+    chips = [
+        chip
+        for chip in (chips or [])
+        if not _LIBRARIAN_BANNED_RE.search(chip)
+        and not _has_suspicious_generated_text(chip)
+        and len(chip.split()) <= 2
+    ]
     return {
         "librarian_intro": intro,
         "librarian_points": points or None,
@@ -1032,6 +1053,7 @@ def normalize_payload(
     premise = _safe_text(summary.get("premise"), "summary.premise", 500, required=True)
 
     taste_tags = _safe_list(summary.get("taste_tags"), "summary.taste_tags", max_items=30)
+    taste_tags = [tag for tag in taste_tags if not _has_suspicious_generated_text(tag)]
     if not taste_tags:
         merged = (
             normalized_axis["세"]
