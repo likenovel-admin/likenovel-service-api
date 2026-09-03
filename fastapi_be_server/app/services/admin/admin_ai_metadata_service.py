@@ -34,6 +34,11 @@ ALLOWED_PACING = {"fast", "medium", "slow"}
 _LIBRARIAN_BANNED_RE = re.compile(
     r"결[이을의은]\s|축[이을의]\s|축으로|감각적|텍스트|콘텐츠|신호|라벨"
 )
+_SUSPICIOUS_GENERATED_TEXT_RE = re.compile(r"[\u0100-\u024f\u0370-\u052f]")
+
+
+def _has_suspicious_generated_text(value: str) -> bool:
+    return bool(_SUSPICIOUS_GENERATED_TEXT_RE.search(value))
 AXIS_ORDER = ("세", "직", "능", "연", "작", "타", "목")
 # min은 전 축 0 — 부합 라벨이 없으면 빈 배열이 정답(근접 라벨 강제 매핑 금지)
 AXIS_LIMITS: dict[str, tuple[int, int]] = {
@@ -700,14 +705,26 @@ def _normalize_librarian(summary: dict[str, Any]) -> dict[str, Any]:
         )
     except ValueError:
         return empty
-    if intro and _LIBRARIAN_BANNED_RE.search(intro):
+    if intro and (
+        _LIBRARIAN_BANNED_RE.search(intro)
+        or _has_suspicious_generated_text(intro)
+    ):
         intro = None
-    if points and (len(points) < 3 or any(_LIBRARIAN_BANNED_RE.search(point) for point in points)):
+    if points and (
+        len(points) < 3
+        or any(
+            _LIBRARIAN_BANNED_RE.search(point)
+            or _has_suspicious_generated_text(point)
+            for point in points
+        )
+    ):
         points = []
     chips = [
         chip
         for chip in chips
-        if not _LIBRARIAN_BANNED_RE.search(chip) and len(chip.split()) <= 2
+        if not _LIBRARIAN_BANNED_RE.search(chip)
+        and not _has_suspicious_generated_text(chip)
+        and len(chip.split()) <= 2
     ]
     return {
         "librarian_intro": intro,
@@ -1083,6 +1100,7 @@ def _normalize_ai_payload(
         protagonist_type = axis_labels["타"][0]
 
     taste_tags = _safe_list(pick("taste_tags"), "taste_tags", max_items=30, max_item_length=100)
+    taste_tags = [tag for tag in taste_tags if not _has_suspicious_generated_text(tag)]
     if not taste_tags:
         merged = (
             axis_labels["세"]
