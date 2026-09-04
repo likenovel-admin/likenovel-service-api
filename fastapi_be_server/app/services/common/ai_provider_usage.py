@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -90,6 +91,12 @@ WHERE call_id = :call_id
    OR (operation_id = :operation_id AND attempt_no = :attempt_no)
 LIMIT 1
 """
+_SQLALCHEMY_BIND_PATTERN = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+_INSERT_SQL_PYMYSQL = _SQLALCHEMY_BIND_PATTERN.sub(r"%(\1)s", _INSERT_SQL)
+_FIND_EXISTING_SQL_PYMYSQL = _SQLALCHEMY_BIND_PATTERN.sub(
+    r"%(\1)s",
+    _FIND_EXISTING_SQL,
+)
 
 
 def _utc_now() -> datetime:
@@ -465,7 +472,7 @@ async def persist_ai_provider_usage_async(record: AiProviderUsageRecord) -> bool
 
 def _existing_sync_record_matches(connection: object, params: dict[str, object]) -> bool:
     with connection.cursor() as cursor:
-        cursor.execute(_FIND_EXISTING_SQL, params)
+        cursor.execute(_FIND_EXISTING_SQL_PYMYSQL, params)
         row = cursor.fetchone()
     return bool(row and str(row.get("record_hash") or "") == params["record_hash"])
 
@@ -479,7 +486,7 @@ def persist_ai_provider_usage_pymysql(
         try:
             connection.ping(reconnect=attempt_no > 0)
             with connection.cursor() as cursor:
-                cursor.execute(_INSERT_SQL, params)
+                cursor.execute(_INSERT_SQL_PYMYSQL, params)
             connection.commit()
             return True
         except pymysql.err.IntegrityError:
