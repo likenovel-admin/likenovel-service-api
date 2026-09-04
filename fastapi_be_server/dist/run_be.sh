@@ -509,4 +509,19 @@ if ! crontab -l 2>/dev/null | grep -Fq "/home/ln-admin/likenovel/batch/build_sto
   (crontab -l 2>/dev/null; echo "$STORYCTX_CRON_LINE") | crontab -
 fi
 
+# AUTO 주인공챗 추천순은 request가 아니라 단일 background snapshot으로 갱신한다.
+PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE="${PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE:-0}"
+PUBLIC_CHARACTER_CATALOG_CRON_LINE='7,22,37,52 * * * * bash /home/ln-admin/likenovel/batch/public_character_catalog_snapshot_batch.sh >> /home/ln-admin/likenovel/batch/public_character_catalog_snapshot_batch.log 2>&1'
+current_cron="$(crontab -l 2>/dev/null || true)"
+if [ "$PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE" = "1" ] && ! printf '%s\n' "$current_cron" | grep -Fqx "$PUBLIC_CHARACTER_CATALOG_CRON_LINE"; then
+  {
+    printf '%s\n' "$current_cron" | grep -Fv "/home/ln-admin/likenovel/batch/public_character_catalog_snapshot_batch.sh" || true
+    printf '%s\n' "$PUBLIC_CHARACTER_CATALOG_CRON_LINE"
+  } | crontab -
+elif [ "$PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE" != "1" ] && printf '%s\n' "$current_cron" | grep -Fq "/home/ln-admin/likenovel/batch/public_character_catalog_snapshot_batch.sh"; then
+  printf '%s\n' "$current_cron" \
+    | grep -Fv "/home/ln-admin/likenovel/batch/public_character_catalog_snapshot_batch.sh" \
+    | crontab -
+fi
+
 exit 0
