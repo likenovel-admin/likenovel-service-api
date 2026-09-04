@@ -93,6 +93,7 @@ jobs:
           cp ../scripts/apply_story_agent_identity_review.py ./scripts/apply_story_agent_identity_review.py
           cp ../scripts/audit_character_chat_asset_readiness_db.py ./scripts/audit_character_chat_asset_readiness_db.py
           cp ../scripts/run_ai_reader_worker.py ./scripts/run_ai_reader_worker.py
+          cp ../scripts/refresh_public_character_catalog_snapshot.py ./scripts/refresh_public_character_catalog_snapshot.py
           chmod +x run_be.sh boot-start-api.sh verify_backend_prod_deploy.sh
           # *.whl, appspec.yml, run_be.sh, boot-start-api.sh, gconf.py, .env.production, init/, batch/ 압축
           zip -r "$GITHUB_SHA.zip" "${wheels[0]}" appspec.yml run_be.sh boot-start-api.sh gconf.py verify_backend_prod_deploy.sh .env.production init/ batch/ scripts/
