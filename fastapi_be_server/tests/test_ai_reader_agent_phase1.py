@@ -7254,7 +7254,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(llm_decision_id, 91)
         reserve_params = db.execute.await_args_list[1].args[1]
-        self.assertEqual(reserve_params["model_name"], "google/gemma-4-31b-it")
+        self.assertEqual(reserve_params["model_name"], "deepseek/deepseek-v3.2")
 
     async def test_reserve_reader_llm_decision_reuses_existing_pending_session_audit_when_budget_is_exhausted(self):
         from app.services.ai import reader_agent_session_service as service

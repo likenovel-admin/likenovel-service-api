@@ -29,10 +29,10 @@ def _read_ai_reader_model(**env_overrides: str) -> str:
 
 
 class AiReaderSettingsTest(unittest.TestCase):
-    def test_default_is_gemma_independently_of_global_openrouter_model(self):
+    def test_default_is_deepseek_independently_of_global_openrouter_model(self):
         self.assertEqual(
-            _read_ai_reader_model(OPENROUTER_MODEL="deepseek/deepseek-v3.2"),
-            "google/gemma-4-31b-it",
+            _read_ai_reader_model(OPENROUTER_MODEL="vendor/global-model"),
+            "deepseek/deepseek-v3.2",
         )
 
     def test_explicit_model_override_is_preserved(self):
