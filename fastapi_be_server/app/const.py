@@ -233,7 +233,7 @@ class Settings(BaseSettings):
     ).strip()
     AI_READER_OPENROUTER_MODEL: str = os.getenv(
         "AI_READER_OPENROUTER_MODEL",
-        "google/gemma-4-31b-it",
+        "deepseek/deepseek-v3.2",
     )
     AI_READER_OPENROUTER_PROVIDER_ONLY: str = os.getenv(
         "AI_READER_OPENROUTER_PROVIDER_ONLY",
