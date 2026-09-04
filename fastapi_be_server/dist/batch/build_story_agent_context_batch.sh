@@ -21,6 +21,7 @@ CHAT_ASSET_PRIORITY_HEADROOM_USD="1.00"
 CHAT_ASSET_SURPLUS_HEADROOM_USD="2.00"
 DEFERRED_BUDGET_EXIT_CODE=75
 REVIEW_REQUIRED_EXIT_CODE=76
+PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE="${PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE:-0}"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
@@ -674,6 +675,16 @@ done
 
 log "[summary] launched=${#PIDS[@]} ready=${success_count} review_required=${review_required_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
 log "[INFO] build_story_agent_context_batch completed ready=${success_count} review_required=${review_required_count} deferred=${deferred_count} failed=${fail_count} max_parallel=${MAX_PARALLEL} build_mode=${BUILD_MODE}"
+
+if [ "${success_count}" -gt 0 ] && [ "${PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE}" = "1" ]; then
+  SNAPSHOT_BATCH="${SCRIPT_DIR}/public_character_catalog_snapshot_batch.sh"
+  SNAPSHOT_LOG_FILE="${STORYCTX_CHARACTER_CATALOG_SNAPSHOT_LOG_FILE:-${SCRIPT_DIR}/public_character_catalog_snapshot_batch.log}"
+  if bash "${SNAPSHOT_BATCH}" >> "${SNAPSHOT_LOG_FILE}" 2>&1; then
+    log "[INFO] public character catalog snapshot refresh completed after storyctx updates"
+  else
+    log "[warn] public character catalog snapshot refresh failed; last published generation remains active"
+  fi
+fi
 
 if [ "${fail_count}" -gt 0 ]; then
   exit 1
