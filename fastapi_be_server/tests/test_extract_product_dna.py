@@ -375,11 +375,13 @@ class AiDnaNormalizePayloadTest(TestCase):
             payload,
             allowed_labels,
             source_text="중세 제국의 전사 아카데미 입학 시험을 통과해야 한다.",
+            allow_axis_confidence_score_fallback=False,
         )
 
         self.assertEqual(normalized["worldview_tags"], ["중세", "아카데미"])
         self.assertEqual(normalized["protagonist_job_tags"], ["마법사"])
         self.assertEqual(normalized["axis_label_scores"]["직"], [{"label": "마법사", "score": 0.8}])
+        self.assertEqual(normalized["axis_label_scores"]["세"], [])
 
     def test_source_evidence_guards_replace_status_window_with_buff(self):
         module = load_module()
@@ -423,6 +425,7 @@ class AiDnaNormalizePayloadTest(TestCase):
                 "타": 0.8,
                 "목": 0.9,
             },
+            "axis_label_scores": {"능": [{"label": "상태창", "score": 0.2}]},
             "evidence": {"능": ["상태창이나 시스템은 없지만 계약으로 버프를 받는다."]},
             "overall_confidence": 0.8,
         }
@@ -431,10 +434,11 @@ class AiDnaNormalizePayloadTest(TestCase):
             payload,
             allowed_labels,
             source_text="다크엘프에게 버프를 받고 계약을 통해 힘을 얻는다.",
+            allow_axis_confidence_score_fallback=False,
         )
 
         self.assertEqual(normalized["protagonist_material_tags"], ["버프"])
-        self.assertEqual(normalized["axis_label_scores"]["능"], [{"label": "버프", "score": 0.7}])
+        self.assertEqual(normalized["axis_label_scores"]["능"], [])
 
     def test_source_evidence_guards_remove_explicit_false_possession_without_synthesizing_growth_type(self):
         module = load_module()
@@ -546,6 +550,7 @@ class AiDnaNormalizePayloadTest(TestCase):
                 "타": 0.8,
                 "목": 0.9,
             },
+            "axis_label_scores": {"직": [{"label": "기사", "score": 0.2}]},
             "evidence": {"직": ["주인공의 아버지가 기사이며, 주인공도 검술을 사용한다."]},
             "overall_confidence": 0.82,
         }
@@ -554,10 +559,11 @@ class AiDnaNormalizePayloadTest(TestCase):
             payload,
             allowed_labels,
             source_text="괴물사냥꾼이 되어 괴물을 사냥한다. 주인공의 아버지가 기사다.",
+            allow_axis_confidence_score_fallback=False,
         )
 
         self.assertEqual(normalized["protagonist_job_tags"], ["헌터"])
-        self.assertEqual(normalized["axis_label_scores"]["직"], [{"label": "헌터", "score": 0.7}])
+        self.assertEqual(normalized["axis_label_scores"]["직"], [])
 
 
 class FakeCursor:
@@ -588,6 +594,14 @@ class FakeConnection:
 
 
 class AiDnaProductTargetQueryTest(TestCase):
+    def test_target_query_requires_ai_content_consent(self):
+        module = load_module()
+        conn = FakeConnection()
+
+        module.get_products(conn, force=True)
+
+        self.assertIn("COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'", conn.last_cursor.sql)
+
     def test_first_open_episode_minimum_text_count_is_500(self):
         module = load_module()
         conn = FakeConnection()
@@ -961,7 +975,7 @@ class AiDnaLibrarianCopyTest(TestCase):
         })
         self.assertIsNone(result["librarian_intro"])
         self.assertIsNone(result["librarian_points"])
-        self.assertEqual(result["librarian_chips"], ["미스터리"])
+        self.assertIsNone(result["librarian_chips"])
 
         allowed = {axis: set() for axis in ("세", "직", "능", "연", "작", "타", "목")}
         normalized = self.module.normalize_payload(
@@ -1000,7 +1014,26 @@ class AiDnaLibrarianCopyTest(TestCase):
         })
         self.assertIsNone(result["librarian_intro"])  # 결이 포함
         self.assertIsNone(result["librarian_points"])  # 축으로 포함
-        self.assertEqual(result["librarian_chips"], ["서사", "동력", "몰입감"])  # 텍스트만 제거
+        self.assertIsNone(result["librarian_chips"])
+
+    def test_one_bad_chip_keeps_atomic_copy_only_when_three_valid_chips_remain(self):
+        base = {
+            "intro": "사건의 진실을 추적하는 이야기를 좋아하면 잘 맞아요.",
+            "points": ["생활형 추리예요.", "주인공은 기자예요.", "반전을 따라가요."],
+        }
+
+        kept = self.module._normalize_librarian(
+            {"librarian": {**base, "chips": ["추리", "기자", "반전", "텍스트"]}}
+        )
+        dropped = self.module._normalize_librarian(
+            {"librarian": {**base, "chips": ["추리", "반전", "텍스트"]}}
+        )
+
+        self.assertEqual(kept["librarian_chips"], ["추리", "기자", "반전"])
+        self.assertEqual(
+            dropped,
+            {"librarian_intro": None, "librarian_points": None, "librarian_chips": None},
+        )
 
     def test_editorial_terms_are_not_librarian_banned_words(self):
         banned_rule = next(
@@ -1013,8 +1046,19 @@ class AiDnaLibrarianCopyTest(TestCase):
 
     def test_banned_re_does_not_flag_normal_words(self):
         # 결혼/대결/축제 같은 정상 단어는 오탐하지 않는다
-        for text in ("결혼을 앞둔 주인공이에요.", "축제에서 사건이 벌어져요.", "대결 구도가 뚜렷해요."):
+        for text in (
+            "결혼을 앞둔 주인공이에요.",
+            "축제에서 사건이 벌어져요.",
+            "대결 구도가 뚜렷해요.",
+            "숙명의 대결을 벌여요.",
+            "한결은 끝까지 포기하지 않아요.",
+            "문제를 해결을 통해 풀어요.",
+            "인물 연결의 의미를 살펴요.",
+        ):
             self.assertIsNone(self.module._LIBRARIAN_BANNED_RE.search(text), text)
+
+        for text in ("결이 좋아요.", "결을 봐요.", "결의 의미예요.", "결은 선명해요."):
+            self.assertIsNotNone(self.module._LIBRARIAN_BANNED_RE.search(text), text)
 
     def test_missing_or_short_librarian_falls_back(self):
         self.assertEqual(
@@ -1055,3 +1099,356 @@ class AiDnaLibrarianCopyTest(TestCase):
         self.assertEqual(dna["librarian_intro"], "유쾌한 이야기예요.")
         self.assertEqual(len(dna["librarian_points"]), 3)
         self.assertEqual(len(dna["librarian_chips"]), 3)
+
+
+class AiDnaLlmPayloadContractTest(TestCase):
+    @staticmethod
+    def build_payload() -> dict:
+        axes = ("세", "직", "능", "연", "작", "타", "목")
+        return {
+            "summary": {
+                "protagonist_type": "기자",
+                "protagonist_desc": "사건을 추적하는 전직 기자",
+                "heroine_type": "없음",
+                "heroine_weight": "none",
+                "mood": "긴장감 있는 분위기",
+                "pacing": "medium",
+                "premise": "카페를 운영하며 사건을 해결하는 이야기",
+                "hook": "이웃의 누명을 벗기기 위해 진범을 추적한다",
+                "themes": ["추리"],
+                "taste_tags": ["범죄 수사"],
+                "librarian": {
+                    "intro": "사건의 진실을 추적하는 이야기를 좋아하면 잘 맞아요.",
+                    "points": ["생활형 추리예요.", "주인공은 기자예요.", "반전을 따라가요."],
+                    "chips": ["추리", "기자", "반전"],
+                },
+            },
+            "axis_labels": {axis: [] for axis in axes},
+            "axis_confidence": {axis: 0.9 for axis in axes},
+            "axis_label_scores": {axis: [] for axis in axes},
+            "overall_confidence": 0.9,
+            "evidence": {axis: [] for axis in axes},
+            "unmapped_concepts": [],
+        }
+
+    def test_contract_accepts_complete_payload_with_empty_axes(self):
+        module = load_module()
+
+        module._validate_llm_payload_contract(self.build_payload())
+
+    def test_contract_rejects_misspelled_required_top_level_key(self):
+        module = load_module()
+        payload = self.build_payload()
+        payload["overall_conffidence"] = payload.pop("overall_confidence")
+
+        with self.assertRaisesRegex(ValueError, "missing required key: overall_confidence"):
+            module._validate_llm_payload_contract(payload)
+
+    def test_contract_rejects_missing_axis_container_key(self):
+        module = load_module()
+        payload = self.build_payload()
+        del payload["evidence"]["능"]
+
+        with self.assertRaisesRegex(ValueError, "evidence missing required key: 능"):
+            module._validate_llm_payload_contract(payload)
+
+    def test_contract_allows_missing_librarian_and_normalizer_falls_back_atomically(self):
+        module = load_module()
+        payload = self.build_payload()
+        payload["summary"]["librarrian"] = payload["summary"].pop("librarian")
+
+        module._validate_llm_payload_contract(payload)
+        normalized = module.normalize_payload(
+            payload,
+            {axis: set() for axis in module.AXIS_ORDER},
+        )
+
+        self.assertIsNone(normalized["librarian_intro"])
+        self.assertIsNone(normalized["librarian_points"])
+        self.assertIsNone(normalized["librarian_chips"])
+
+    def test_contract_rejects_observed_garbled_generated_text(self):
+        module = load_module()
+        latin_payload = self.build_payload()
+        latin_payload["summary"]["librarian"]["intro"] = "통쾌한 사ø다를 좋아하면 잘 맞아요."
+        cjk_payload = self.build_payload()
+        cjk_payload["summary"]["themes"] = ["착各과 오해"]
+
+        module._validate_llm_payload_contract(latin_payload)
+        librarian = module._normalize_librarian(latin_payload["summary"])
+        self.assertIsNone(librarian["librarian_intro"])
+        with self.assertRaisesRegex(ValueError, "suspicious generated text"):
+            module._validate_llm_payload_contract(cjk_payload)
+
+    def test_suspicious_text_requires_exact_prompt_source_token(self):
+        module = load_module()
+        self.assertFalse(
+            module._has_suspicious_generated_text("가수 Beyoncé가 등장해요.", "원문에 Beyoncé가 등장한다.")
+        )
+        self.assertTrue(
+            module._has_suspicious_generated_text("가수 Beyoncé가 등장해요.", "원문에는 Beyoncè가 등장한다.")
+        )
+        self.assertTrue(
+            module._has_suspicious_generated_text("Beyoncé", "원문 xBeyoncéy 표기")
+        )
+        self.assertFalse(module._has_suspicious_generated_text("한中글", "원문 한中글 표기"))
+        self.assertTrue(module._has_suspicious_generated_text("한中글", "원문 중中문 표기"))
+        self.assertTrue(
+            module._has_suspicious_generated_text("한中글文자", "원문 한中글 표기")
+        )
+        self.assertFalse(
+            module._has_suspicious_generated_text(
+                "한中글文자",
+                "원문 한中글과 글文자가 모두 표기",
+            )
+        )
+
+        payload = self.build_payload()
+        payload["summary"]["themes"] = ["Beyoncé"]
+        payload["evidence"]["세"] = ["Beyoncé"]
+        with self.assertRaisesRegex(ValueError, "suspicious generated text"):
+            module._validate_llm_payload_contract(payload, source_text="")
+
+    def test_contract_rejects_nonfinite_confidence_and_score_label_drift(self):
+        module = load_module()
+        for field, value in (
+            ("overall_confidence", float("nan")),
+            ("overall_confidence", float("inf")),
+            ("overall_confidence", 1.1),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = self.build_payload()
+                payload[field] = value
+                with self.assertRaisesRegex(ValueError, "overall_confidence"):
+                    module._validate_llm_payload_contract(payload)
+
+        mismatch = self.build_payload()
+        mismatch["axis_labels"]["타"] = ["환생"]
+        with self.assertRaisesRegex(ValueError, "labels must match"):
+            module._validate_llm_payload_contract(mismatch)
+
+        duplicate = self.build_payload()
+        duplicate["axis_labels"]["타"] = ["환생", "환생"]
+        duplicate["axis_label_scores"]["타"] = [
+            {"label": "환생", "score": 0.9},
+            {"label": "환생", "score": 0.8},
+        ]
+        with self.assertRaisesRegex(ValueError, "duplicate label"):
+            module._validate_llm_payload_contract(duplicate)
+
+        over_limit = self.build_payload()
+        over_limit["axis_labels"]["목"] = ["생존", "성장"]
+        over_limit["axis_label_scores"]["목"] = [
+            {"label": "생존", "score": 0.9},
+            {"label": "성장", "score": 0.8},
+        ]
+        with self.assertRaisesRegex(ValueError, "axis_labels.목 exceeds maximum of 1"):
+            module._validate_llm_payload_contract(over_limit)
+
+    def test_contract_rejects_unsupported_labels_against_codebook(self):
+        module = load_module()
+        payload = self.build_payload()
+        payload["axis_labels"]["타"] = ["없는라벨"]
+        payload["axis_label_scores"]["타"] = [{"label": "없는라벨", "score": 0.9}]
+
+        with self.assertRaises(module.UnsupportedLabelError):
+            module._validate_llm_payload_contract(
+                payload,
+                {axis: set() for axis in module.AXIS_ORDER},
+            )
+
+    def test_analyze_product_validates_raw_payload_before_normalizing(self):
+        module = load_module()
+        payload = self.build_payload()
+        payload["overall_conffidence"] = payload.pop("overall_confidence")
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+
+        with (
+            patch.object(module, "_call_llm", return_value=(json.dumps(payload), call_meta)),
+            self.assertRaisesRegex(ValueError, "missing required key: overall_confidence"),
+        ):
+            module.analyze_product(
+                {"title": "테스트", "genres": "", "keywords": "", "synopsis_text": ""},
+                {axis: set() for axis in module.AXIS_ORDER},
+                "회차 본문",
+                3,
+            )
+
+    def test_analyze_product_validates_repaired_payload_before_saving(self):
+        module = load_module()
+        initial = self.build_payload()
+        initial["axis_labels"]["타"] = ["없는라벨"]
+        initial["axis_label_scores"]["타"] = [{"label": "없는라벨", "score": 0.9}]
+        repaired = self.build_payload()
+        repaired["axis_label_scores"]["타"] = [{"label": "남은점수", "score": 0.9}]
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+
+        with (
+            patch.object(
+                module,
+                "_call_llm",
+                side_effect=[
+                    (json.dumps(initial), call_meta),
+                    (json.dumps(repaired), call_meta),
+                ],
+            ) as call_llm,
+            self.assertRaisesRegex(ValueError, "labels must match"),
+        ):
+            module.analyze_product(
+                {"title": "테스트", "genres": "", "keywords": "", "synopsis_text": ""},
+                {axis: set() for axis in module.AXIS_ORDER},
+                "회차 본문",
+                3,
+            )
+
+        self.assertEqual(call_llm.call_count, 2)
+
+    def test_analyze_product_preserves_all_rejected_labels_through_persistence(self):
+        module = load_module()
+        initial = self.build_payload()
+        initial["axis_labels"]["직"] = ["없는직업"]
+        initial["axis_label_scores"]["직"] = [{"label": "없는직업", "score": 0.8}]
+        initial["axis_labels"]["타"] = ["없는라벨"]
+        initial["axis_label_scores"]["타"] = [{"label": "없는라벨", "score": 0.9}]
+        repaired = self.build_payload()
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+
+        with patch.object(
+            module,
+            "_call_llm",
+            side_effect=[
+                (json.dumps(initial), call_meta),
+                (json.dumps(repaired), call_meta),
+            ],
+        ):
+            normalized, raw = module.analyze_product(
+                {"title": "테스트", "genres": "", "keywords": "", "synopsis_text": ""},
+                {axis: set() for axis in module.AXIS_ORDER},
+                "회차 본문",
+                3,
+            )
+
+        expected = ["없는직업", "없는라벨"]
+        self.assertEqual(normalized["unmapped_concepts"], expected)
+        self.assertEqual(raw["unmapped_concepts"], expected)
+
+        conn = FakeConnection()
+        module.save_dna(conn, product_id=1, dna=normalized, parsed=raw, attempt_count=1)
+        persisted_raw = next(
+            json.loads(param)
+            for param in conn.last_cursor.params
+            if isinstance(param, str) and '"_llm_meta"' in param
+        )
+        self.assertEqual(persisted_raw["unmapped_concepts"], expected)
+
+    def test_analyze_product_fails_closed_when_repair_cannot_preserve_rejected_label(self):
+        module = load_module()
+        initial = self.build_payload()
+        initial["axis_labels"]["타"] = ["없는라벨"]
+        initial["axis_label_scores"]["타"] = [{"label": "없는라벨", "score": 0.9}]
+        repaired = self.build_payload()
+        repaired["unmapped_concepts"] = [f"미지원개념{i}" for i in range(10)]
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+
+        with (
+            patch.object(
+                module,
+                "_call_llm",
+                side_effect=[
+                    (json.dumps(initial), call_meta),
+                    (json.dumps(repaired), call_meta),
+                ],
+            ) as call_llm,
+            self.assertRaisesRegex(ValueError, "cannot preserve every rejected label"),
+        ):
+            module.analyze_product(
+                {"title": "테스트", "genres": "", "keywords": "", "synopsis_text": ""},
+                {axis: set() for axis in module.AXIS_ORDER},
+                "회차 본문",
+                3,
+            )
+
+        self.assertEqual(call_llm.call_count, 2)
+
+    def test_analyze_product_treats_typo_librarian_unicode_as_one_call_fallback(self):
+        module = load_module()
+        payload = self.build_payload()
+        typo_librarian = payload["summary"].pop("librarian")
+        typo_librarian["intro"] = "통쾌한 사ø다를 좋아하면 잘 맞아요."
+        payload["summary"]["librarrian"] = typo_librarian
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+
+        with patch.object(
+            module,
+            "_call_llm",
+            return_value=(json.dumps(payload), call_meta),
+        ) as call_llm:
+            normalized, _ = module.analyze_product(
+                {"title": "테스트", "genres": "", "keywords": "", "synopsis_text": ""},
+                {axis: set() for axis in module.AXIS_ORDER},
+                "회차 본문",
+                3,
+            )
+
+        self.assertEqual(call_llm.call_count, 1)
+        self.assertIsNone(normalized["librarian_intro"])
+        self.assertIsNone(normalized["librarian_points"])
+        self.assertIsNone(normalized["librarian_chips"])
+
+    def test_analyze_product_source_exception_uses_only_prompt_visible_synopsis(self):
+        module = load_module()
+        payload = self.build_payload()
+        payload["summary"]["themes"] = ["Beyoncé"]
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+
+        with (
+            patch.object(module, "_call_llm", return_value=(json.dumps(payload), call_meta)),
+            self.assertRaisesRegex(ValueError, "suspicious generated text"),
+        ):
+            module.analyze_product(
+                {
+                    "title": "테스트",
+                    "genres": "",
+                    "keywords": "",
+                    "synopsis_text": ("가" * 1000) + "Beyoncé",
+                },
+                {axis: set() for axis in module.AXIS_ORDER},
+                "회차 본문",
+                3,
+            )
