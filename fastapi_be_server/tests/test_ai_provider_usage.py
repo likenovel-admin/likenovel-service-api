@@ -233,6 +233,11 @@ class AiProviderUsageTest(unittest.TestCase):
 
             def execute(self, sql, params):
                 self.params = params
+                if ":call_id" in sql:
+                    raise pymysql.err.ProgrammingError(
+                        1064,
+                        "SQLAlchemy-style placeholders are invalid in PyMySQL",
+                    )
                 if sql.lstrip().startswith("INSERT"):
                     raise pymysql.err.IntegrityError(1062, "duplicate")
 
@@ -262,6 +267,56 @@ class AiProviderUsageTest(unittest.TestCase):
                 )
             )
         error_log.assert_called_once()
+
+    def test_pymysql_persistence_uses_dbapi_named_placeholders(self):
+        record = build_ai_provider_usage_record(
+            AiProviderUsageOperation(
+                feature_key="storyctx",
+                stage_key="episode_summary",
+            ).start_attempt(
+                provider="openrouter",
+                requested_model="deepseek/deepseek-v3.2",
+                request_mode="nonstream",
+            ),
+            status="success",
+            response_json={"usage": {"cost": 0}},
+        )
+
+        class FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, sql, params):
+                if ":call_id" in sql:
+                    raise pymysql.err.ProgrammingError(
+                        1064,
+                        "SQLAlchemy-style placeholders are invalid in PyMySQL",
+                    )
+                self.params = params
+
+        class FakeConnection:
+            def __init__(self):
+                self.commit_count = 0
+
+            def ping(self, *, reconnect):
+                return None
+
+            def cursor(self):
+                return FakeCursor()
+
+            def commit(self):
+                self.commit_count += 1
+
+            def rollback(self):
+                return None
+
+        connection = FakeConnection()
+
+        self.assertTrue(persist_ai_provider_usage_pymysql(connection, record))
+        self.assertEqual(connection.commit_count, 1)
 
 
 if __name__ == "__main__":
