@@ -58,6 +58,38 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
                     "untracked_count": 1,
                 }
             ]),
+            FakeResult([
+                {
+                    "attempt_count": 4,
+                    "operation_count": 3,
+                    "retry_attempt_count": 1,
+                    "success_count": 3,
+                    "failure_count": 1,
+                    "exact_cost_usd": 0.02,
+                    "estimated_cost_usd": 0.01,
+                    "untracked_count": 1,
+                }
+            ]),
+            FakeResult([
+                {
+                    "feature_key": "websochat",
+                    "stage_key": "qa_reply",
+                    "provider": "gemini",
+                    "model_name": "gemini-3.1-flash-lite",
+                    "attempt_count": 4,
+                    "operation_count": 3,
+                    "retry_attempt_count": 1,
+                    "success_count": 3,
+                    "failure_count": 1,
+                    "input_tokens": 100,
+                    "cached_input_tokens": 10,
+                    "output_tokens": 20,
+                    "reasoning_tokens": 5,
+                    "exact_cost_usd": 0.02,
+                    "estimated_cost_usd": 0.01,
+                    "untracked_count": 1,
+                }
+            ]),
         ]
 
         with patch.object(
@@ -77,6 +109,9 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["results"][0]["source_key"], "dna_batch")
         self.assertEqual(result["results"][1]["source_key"], "websochat_chat")
         self.assertEqual(result["model_summary"][0]["model_name"], "deepseek/deepseek-v3.2")
+        self.assertEqual(result["provider_attempt_summary"]["attempt_count"], 4)
+        self.assertEqual(result["provider_attempt_summary"]["tracked_cost_usd"], 0.03)
+        self.assertEqual(result["provider_attempts"][0]["stage_key"], "qa_reply")
         self.assertEqual(result["provider_health"][0]["provider"], "gemini")
         executed_sql = "\n".join(str(call.args[0]) for call in db.execute.call_args_list)
         self.assertIn("$._llm_meta.total_cost", executed_sql)
@@ -85,10 +120,18 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("COALESCE(SUM(CASE WHEN d.decision_status = 'success'", executed_sql)
         self.assertIn("COLLATE utf8mb4_general_ci", executed_sql)
         self.assertIn("WHERE request_count > 0", executed_sql)
+        self.assertIn("FROM tb_ai_provider_usage_call p", executed_sql)
+        self.assertIn("COUNT(DISTINCT p.operation_id)", executed_sql)
+        self.assertIn("CONVERT_TZ(CONCAT(:start_date", executed_sql)
 
     async def test_ai_api_usage_defaults_to_recent_seven_days(self):
         db = AsyncMock()
-        db.execute.side_effect = [FakeResult([]), FakeResult([])]
+        db.execute.side_effect = [
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+        ]
 
         with patch.object(statistics_service, "date") as mock_date:
             mock_date.today.return_value = date(2026, 5, 26)
@@ -104,13 +147,19 @@ class AiApiUsageStatisticsTest(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(result["summary"]["request_count"], 0)
+        self.assertEqual(result["provider_attempt_summary"]["attempt_count"], 0)
         first_params = db.execute.call_args_list[0].args[1]
         self.assertEqual(first_params["start_date"], "2026-05-20")
         self.assertEqual(first_params["end_date_exclusive"], "2026-05-27")
 
     async def test_ai_api_usage_same_start_end_counts_one_day(self):
         db = AsyncMock()
-        db.execute.side_effect = [FakeResult([]), FakeResult([])]
+        db.execute.side_effect = [
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+        ]
 
         with patch.object(
             statistics_service.ai_provider_health_service,

@@ -259,6 +259,28 @@ class FakeCreditAsyncClient:
 
 
 class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
+    async def test_credit_guard_rejection_does_not_consume_physical_attempt_number(self):
+        module = load_module()
+        operation = module.AiProviderUsageOperation(
+            feature_key="storyctx",
+            stage_key="episode_summary",
+        )
+
+        with self.assertRaises(module.OpenRouterBackgroundCreditGuardError):
+            async with module.storyctx_provider_attempt(
+                operation,
+                provider="openrouter",
+                model="deepseek/deepseek-v3.2",
+            ):
+                raise module.OpenRouterBackgroundCreditGuardError("credit preflight blocked")
+
+        first_physical_call = operation.start_attempt(
+            provider="openrouter",
+            requested_model="deepseek/deepseek-v3.2",
+            request_mode="nonstream",
+        )
+        self.assertEqual(first_physical_call.attempt_no, 1)
+
     def test_deepseek_requests_default_to_compatible_openrouter_provider_routing(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("STORY_AGENT_DEEPSEEK_OPENROUTER_PROVIDER_ONLY", None)
@@ -2728,6 +2750,90 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertIn("JSON schema", call_messages[1]["content"])
         self.assertNotIn("라인 포맷", call_messages[1]["content"])
         self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals OpenRouter")
+
+    async def test_character_signals_records_anthropic_parse_failure_and_openrouter_fallback(self):
+        module = load_module()
+        request = httpx.Request("POST", "https://provider.test")
+
+        class FallbackClient:
+            async def get(self, url, **kwargs):
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={"data": {"total_credits": 20.0, "total_usage": 10.0}},
+                )
+
+            async def post(self, url, **kwargs):
+                if "anthropic.com" in url:
+                    return httpx.Response(
+                        200,
+                        request=request,
+                        headers={"request-id": "anthropic-1"},
+                        json={
+                            "id": "anthropic-1",
+                            "model": "claude-haiku-4-5-20251001",
+                            "content": [{"type": "text", "text": "not structured"}],
+                            "usage": {"input_tokens": 100, "output_tokens": 10},
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "id": "openrouter-1",
+                        "model": "deepseek/deepseek-v4-pro",
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "episode_no": 1,
+                                            "mentioned_characters": [],
+                                            "cliffhanger_hooks": [],
+                                        }
+                                    )
+                                }
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 200,
+                            "completion_tokens": 20,
+                            "total_tokens": 220,
+                            "cost": 0.00042,
+                        },
+                    },
+                )
+
+        with patch.object(module.settings, "ANTHROPIC_API_KEY", "anthropic-key"), \
+             patch.object(module, "RP_REASONING_MODEL", "claude-haiku-4-5-20251001"), \
+             patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "_storyctx_usage_connection", object()), \
+             patch.object(module, "persist_ai_provider_usage_pymysql", return_value=True) as persist_usage:
+            payload = await module.request_episode_character_signals_payload(
+                FallbackClient(),
+                row={
+                    "product_id": 687,
+                    "episode_id": 1001,
+                    "episode_no": 1,
+                    "title": "테스트",
+                    "episode_title": "1화",
+                },
+                summary_text="[1화] 테스트\n주인공이 움직인다.",
+            )
+
+        self.assertEqual(payload["episode_no"], 1)
+        records = [call.args[1] for call in persist_usage.call_args_list]
+        self.assertEqual(len(records), 2)
+        self.assertEqual([record.provider for record in records], ["anthropic", "openrouter"])
+        self.assertEqual(
+            [record.attempt_status for record in records],
+            ["parse_error", "success"],
+        )
+        self.assertEqual([record.attempt_no for record in records], [1, 2])
+        self.assertEqual(records[0].cost_source, "rate_card")
+        self.assertEqual(records[1].cost_source, "provider_reported")
+        self.assertEqual(str(records[1].cost_usd), "0.000420000")
 
     async def test_episode_character_signals_uses_configured_openrouter_model(self):
         module = load_module()

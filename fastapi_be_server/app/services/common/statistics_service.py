@@ -1879,6 +1879,7 @@ async def ai_api_usage_statistics(
         "reader": "",
         "websochat": "",
         "librarian": "",
+        "provider_attempt": "",
     }
 
     if not start_date and not end_date:
@@ -1919,6 +1920,10 @@ async def ai_api_usage_statistics(
             "reader": "AND d.created_date >= :start_date AND d.created_date < :end_date_exclusive",
             "websochat": "AND l.created_date >= :start_date AND l.created_date < :end_date_exclusive",
             "librarian": "AND c.created_date >= :start_date AND c.created_date < :end_date_exclusive",
+            "provider_attempt": """
+                AND p.attempt_started_at >= CONVERT_TZ(CONCAT(:start_date, ' 00:00:00'), '+09:00', '+00:00')
+                AND p.attempt_started_at < CONVERT_TZ(CONCAT(:end_date_exclusive, ' 00:00:00'), '+09:00', '+00:00')
+            """,
         }
 
     source_sql = text(f"""
@@ -2061,6 +2066,69 @@ async def ai_api_usage_statistics(
     model_result = await db.execute(model_sql, params)
     model_rows = [dict(row) for row in model_result.mappings().all()]
 
+    provider_attempt_summary_sql = text(f"""
+        SELECT
+            COUNT(*) AS attempt_count,
+            COUNT(DISTINCT p.operation_id) AS operation_count,
+            COALESCE(SUM(CASE WHEN p.attempt_no > 1 THEN 1 ELSE 0 END), 0) AS retry_attempt_count,
+            COALESCE(SUM(CASE WHEN p.attempt_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+            COALESCE(SUM(CASE WHEN p.attempt_status <> 'success' THEN 1 ELSE 0 END), 0) AS failure_count,
+            COALESCE(SUM(CASE WHEN p.cost_source = 'provider_reported' THEN p.cost_usd ELSE 0 END), 0) AS exact_cost_usd,
+            COALESCE(SUM(CASE WHEN p.cost_source = 'rate_card' THEN p.cost_usd ELSE 0 END), 0) AS estimated_cost_usd,
+            COALESCE(SUM(CASE WHEN p.cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS untracked_count
+        FROM tb_ai_provider_usage_call p
+        WHERE 1 = 1
+        {date_filters["provider_attempt"]}
+    """)
+    provider_attempt_summary_result = await db.execute(
+        provider_attempt_summary_sql,
+        params,
+    )
+    provider_attempt_summary = dict(
+        provider_attempt_summary_result.mappings().first() or {}
+    )
+    provider_attempt_summary = {
+        "attempt_count": int(provider_attempt_summary.get("attempt_count") or 0),
+        "operation_count": int(provider_attempt_summary.get("operation_count") or 0),
+        "retry_attempt_count": int(provider_attempt_summary.get("retry_attempt_count") or 0),
+        "success_count": int(provider_attempt_summary.get("success_count") or 0),
+        "failure_count": int(provider_attempt_summary.get("failure_count") or 0),
+        "exact_cost_usd": float(provider_attempt_summary.get("exact_cost_usd") or 0),
+        "estimated_cost_usd": float(provider_attempt_summary.get("estimated_cost_usd") or 0),
+        "tracked_cost_usd": float(provider_attempt_summary.get("exact_cost_usd") or 0)
+        + float(provider_attempt_summary.get("estimated_cost_usd") or 0),
+        "untracked_count": int(provider_attempt_summary.get("untracked_count") or 0),
+    }
+
+    provider_attempt_sql = text(f"""
+        SELECT
+            p.feature_key,
+            p.stage_key,
+            p.provider,
+            COALESCE(p.resolved_model, p.requested_model) AS model_name,
+            COUNT(*) AS attempt_count,
+            COUNT(DISTINCT p.operation_id) AS operation_count,
+            COALESCE(SUM(CASE WHEN p.attempt_no > 1 THEN 1 ELSE 0 END), 0) AS retry_attempt_count,
+            COALESCE(SUM(CASE WHEN p.attempt_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+            COALESCE(SUM(CASE WHEN p.attempt_status <> 'success' THEN 1 ELSE 0 END), 0) AS failure_count,
+            COALESCE(SUM(p.input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(p.cached_input_tokens), 0) AS cached_input_tokens,
+            COALESCE(SUM(p.output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(p.reasoning_tokens), 0) AS reasoning_tokens,
+            COALESCE(SUM(CASE WHEN p.cost_source = 'provider_reported' THEN p.cost_usd ELSE 0 END), 0) AS exact_cost_usd,
+            COALESCE(SUM(CASE WHEN p.cost_source = 'rate_card' THEN p.cost_usd ELSE 0 END), 0) AS estimated_cost_usd,
+            COALESCE(SUM(CASE WHEN p.cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS untracked_count
+        FROM tb_ai_provider_usage_call p
+        WHERE 1 = 1
+        {date_filters["provider_attempt"]}
+        GROUP BY p.feature_key, p.stage_key, p.provider, model_name
+        ORDER BY exact_cost_usd + estimated_cost_usd DESC, attempt_count DESC
+    """)
+    provider_attempt_result = await db.execute(provider_attempt_sql, params)
+    provider_attempt_rows = [
+        dict(row) for row in provider_attempt_result.mappings().all()
+    ]
+
     summary = {
         "request_count": sum(int(row.get("request_count") or 0) for row in rows),
         "success_count": sum(int(row.get("success_count") or 0) for row in rows),
@@ -2082,6 +2150,8 @@ async def ai_api_usage_statistics(
         "summary": summary,
         "results": rows,
         "model_summary": model_rows,
+        "provider_attempt_summary": provider_attempt_summary,
+        "provider_attempts": provider_attempt_rows,
         "provider_health": await ai_provider_health_service.get_ai_provider_health_summary(db),
     }
 

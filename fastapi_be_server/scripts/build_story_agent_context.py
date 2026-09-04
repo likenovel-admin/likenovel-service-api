@@ -20,7 +20,7 @@ import os
 import re
 import sys
 from collections import Counter
-from contextlib import contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -38,6 +38,12 @@ if str(ROOT_DIR) not in sys.path:
 
 from app.const import settings  # noqa: E402
 from app.services.common import comm_service  # noqa: E402
+from app.services.common.ai_provider_usage import (  # noqa: E402
+    AiProviderUsageAttempt,
+    AiProviderUsageOperation,
+    build_ai_provider_usage_record,
+    persist_ai_provider_usage_pymysql,
+)
 from app.services.common.openrouter_background_credit_guard import (  # noqa: E402
     OpenRouterBackgroundCreditGuardError,
     OpenRouterBackgroundCreditReserveError,
@@ -54,6 +60,8 @@ from app.services.websochat.character_chat_product_policy import (  # noqa: E402
 )
 
 logger = logging.getLogger(__name__)
+
+_storyctx_usage_connection = None
 
 DB_HOST = os.getenv("BATCH_DB_HOST", settings.DB_IP)
 DB_PORT = int(os.getenv("BATCH_DB_PORT", str(settings.DB_PORT)))
@@ -1008,9 +1016,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def db_connect(*, autocommit: bool = False):
+def db_connect(*, autocommit: bool = False, timeout_seconds: int | None = None):
     if not DB_USER or not DB_PASSWORD:
         raise RuntimeError("DB 접속 정보가 비어 있습니다. BATCH_DB_* 또는 app.const.settings를 확인하세요.")
+    connect_kwargs: dict[str, object] = {}
+    if timeout_seconds is not None:
+        connect_kwargs.update(
+            {
+                "connect_timeout": timeout_seconds,
+                "read_timeout": timeout_seconds,
+                "write_timeout": timeout_seconds,
+            }
+        )
     return pymysql.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -1021,7 +1038,140 @@ def db_connect(*, autocommit: bool = False):
         autocommit=autocommit,
         client_flag=CLIENT.MULTI_STATEMENTS,
         cursorclass=DictCursor,
+        **connect_kwargs,
     )
+
+
+def _open_storyctx_usage_connection() -> None:
+    global _storyctx_usage_connection
+    if _storyctx_usage_connection is None:
+        try:
+            _storyctx_usage_connection = db_connect(
+                autocommit=True,
+                timeout_seconds=2,
+            )
+        except Exception as exc:
+            logger.error(
+                "ai_provider_usage connection_failed feature=storyctx db_error_class=%s",
+                type(exc).__name__,
+            )
+
+
+def _close_storyctx_usage_connection() -> None:
+    global _storyctx_usage_connection
+    connection = _storyctx_usage_connection
+    _storyctx_usage_connection = None
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception as exc:
+            logger.error(
+                "ai_provider_usage connection_close_failed feature=storyctx db_error_class=%s",
+                type(exc).__name__,
+            )
+
+
+@dataclass
+class StoryctxProviderAttempt:
+    attempt: AiProviderUsageAttempt
+    attempt_status: str = "internal_error"
+    response_json: dict[str, object] | None = None
+    response_headers: object | None = None
+    http_status: int | None = None
+    error_code: str | None = None
+    should_record: bool = True
+
+    def observe_response(self, response: object) -> None:
+        self.http_status = int(getattr(response, "status_code", 0) or 0) or None
+        self.response_headers = getattr(response, "headers", None)
+
+    def capture_response(self, response: object) -> dict[str, object]:
+        self.observe_response(response)
+        payload = response.json()
+        self.response_json = payload if isinstance(payload, dict) else {}
+        return self.response_json
+
+    def finish(self, status: str, *, error_code: str | None = None) -> None:
+        self.attempt_status = status
+        self.error_code = error_code
+
+
+def _record_storyctx_provider_attempt(tracked: StoryctxProviderAttempt) -> None:
+    if _storyctx_usage_connection is None or not tracked.should_record:
+        return
+    try:
+        persist_ai_provider_usage_pymysql(
+            _storyctx_usage_connection,
+            build_ai_provider_usage_record(
+                tracked.attempt,
+                status=tracked.attempt_status,
+                response_json=tracked.response_json,
+                response_headers=tracked.response_headers,
+                http_status=tracked.http_status,
+                error_code=tracked.error_code,
+            ),
+        )
+    except Exception as exc:
+        logger.error(
+            "ai_provider_usage persist_failed feature=storyctx stage=%s call_id=%s db_error_class=%s",
+            tracked.attempt.stage_key,
+            tracked.attempt.call_id,
+            type(exc).__name__,
+        )
+
+
+@asynccontextmanager
+async def storyctx_provider_attempt(
+    operation: AiProviderUsageOperation,
+    *,
+    provider: str,
+    model: str,
+    request_mode: str = "nonstream",
+):
+    tracked = StoryctxProviderAttempt(
+        operation.start_attempt(
+            provider=provider,
+            requested_model=model,
+            request_mode=request_mode,
+        )
+    )
+    try:
+        yield tracked
+    except OpenRouterBackgroundCreditGuardError:
+        tracked.should_record = False
+        if not operation.discard_attempt(tracked.attempt):
+            logger.error(
+                "ai_provider_usage preflight_discard_failed feature=storyctx stage=%s call_id=%s",
+                tracked.attempt.stage_key,
+                tracked.attempt.call_id,
+            )
+        raise
+    except asyncio.CancelledError:
+        tracked.finish("cancelled", error_code="CANCELLED")
+        raise
+    except asyncio.TimeoutError:
+        tracked.finish("timeout", error_code="TIMEOUT")
+        raise
+    except HTTPStatusError as exc:
+        if tracked.http_status is None and getattr(exc, "response", None) is not None:
+            tracked.http_status = int(exc.response.status_code)
+            tracked.response_headers = getattr(exc.response, "headers", None)
+        tracked.finish("provider_error", error_code="HTTP_STATUS_ERROR")
+        raise
+    except RequestError:
+        tracked.finish("provider_error", error_code="REQUEST_ERROR")
+        raise
+    except json.JSONDecodeError:
+        tracked.finish("parse_error", error_code="JSON_DECODE_ERROR")
+        raise
+    except ValueError as exc:
+        tracked.finish("validation_error", error_code=type(exc).__name__)
+        raise
+    except BaseException as exc:
+        tracked.finish("internal_error", error_code=type(exc).__name__)
+        raise
+    finally:
+        _record_storyctx_provider_attempt(tracked)
 
 
 @contextmanager
@@ -1594,56 +1744,93 @@ async def request_rp_openrouter_json_payload(
     model: str | None = None,
     timeout_seconds: float | None = None,
     response_format: dict[str, object] | None = None,
+    stage_key: str = "rp_json",
+    product_id: int | None = None,
+    scope_key: str | None = None,
 ) -> dict | None:
     request_timeout_seconds = timeout_seconds or RP_OPENROUTER_TIMEOUT_SECONDS
-    response = await asyncio.wait_for(
-        post_openrouter_background_chat_completion_async(
-            client,
-            base_url=OPENROUTER_BASE_URL,
-            api_key=OPENROUTER_API_KEY,
-            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "X-Title": title,
-            },
-            json=build_rp_openrouter_payload(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_tokens=max_tokens,
-                model=model,
-                response_format=response_format,
+    requested_model = model or RP_OPENROUTER_MODEL
+    operation = AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key=stage_key,
+        product_id=product_id,
+        scope_key=scope_key,
+    )
+    async with storyctx_provider_attempt(
+        operation,
+        provider="openrouter",
+        model=requested_model,
+    ) as usage:
+        response = await asyncio.wait_for(
+            post_openrouter_background_chat_completion_async(
+                client,
+                base_url=OPENROUTER_BASE_URL,
+                api_key=OPENROUTER_API_KEY,
+                priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "X-Title": title,
+                },
+                json=build_rp_openrouter_payload(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=max_tokens,
+                    model=model,
+                    response_format=response_format,
+                ),
+                timeout=request_timeout_seconds,
             ),
             timeout=request_timeout_seconds,
-        ),
-        timeout=request_timeout_seconds,
-    )
-    response.raise_for_status()
-    return extract_json_object(extract_openrouter_message_text(response.json()))
+        )
+        usage.observe_response(response)
+        response.raise_for_status()
+        response_json = usage.capture_response(response)
+        parsed = extract_json_object(extract_openrouter_message_text(response_json))
+        usage.finish("success" if parsed else "parse_error")
+        return parsed
 
 
 async def request_episode_scene_extraction_openrouter_json_payload(
     client: AsyncClient,
     *,
     user_prompt: str,
+    usage_operation: AiProviderUsageOperation | None = None,
+    product_id: int | None = None,
+    episode_id: int | None = None,
 ) -> dict | None:
-    response = await asyncio.wait_for(
-        post_openrouter_background_chat_completion_async(
-            client,
-            base_url=OPENROUTER_BASE_URL,
-            api_key=OPENROUTER_API_KEY,
-            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "X-Title": "LikeNovel Story Agent Episode Scene Extraction Batch",
-            },
-            json=build_episode_scene_extraction_openrouter_payload(user_prompt=user_prompt),
-        ),
-        timeout=EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS,
+    operation = usage_operation or AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key="episode_scene_extraction",
+        product_id=product_id,
+        episode_id=episode_id,
     )
-    response.raise_for_status()
-    return extract_json_object(extract_openrouter_message_text(response.json()))
+    async with storyctx_provider_attempt(
+        operation,
+        provider="openrouter",
+        model=EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL,
+    ) as usage:
+        response = await asyncio.wait_for(
+            post_openrouter_background_chat_completion_async(
+                client,
+                base_url=OPENROUTER_BASE_URL,
+                api_key=OPENROUTER_API_KEY,
+                priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "X-Title": "LikeNovel Story Agent Episode Scene Extraction Batch",
+                },
+                json=build_episode_scene_extraction_openrouter_payload(user_prompt=user_prompt),
+            ),
+            timeout=EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS,
+        )
+        usage.observe_response(response)
+        response.raise_for_status()
+        response_json = usage.capture_response(response)
+        parsed = extract_json_object(extract_openrouter_message_text(response_json))
+        usage.finish("success" if parsed else "parse_error")
+        return parsed
 
 
 class EpisodeCharacterSignalsParseError(ValueError):
@@ -1832,28 +2019,44 @@ async def request_episode_summary_text(
     row: dict,
     normalized_text: str,
 ) -> str:
-    response = await post_openrouter_background_chat_completion_async(
-        client,
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
-        priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "X-Title": "LikeNovel Story Agent Episode Summary Batch",
-        },
-        json={
-            "model": EPISODE_SUMMARY_MODEL,
-            "temperature": EPISODE_SUMMARY_TEMPERATURE,
-            "max_completion_tokens": EPISODE_SUMMARY_MAX_OUTPUT_TOKENS,
-            "messages": [
-                {"role": "system", "content": EPISODE_SUMMARY_SYSTEM_PROMPT},
-                {"role": "user", "content": build_episode_summary_user_prompt(row, normalized_text)},
-            ],
-        },
+    operation = AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key="episode_summary",
+        product_id=int(row.get("product_id") or 0) or None,
+        episode_id=int(row.get("episode_id") or 0) or None,
+        scope_key=(f"episode:{int(row.get('episode_no') or 0)}" if int(row.get("episode_no") or 0) else None),
     )
-    response.raise_for_status()
-    return extract_openrouter_message_text(response.json())
+    async with storyctx_provider_attempt(
+        operation,
+        provider="openrouter",
+        model=EPISODE_SUMMARY_MODEL,
+    ) as usage:
+        response = await post_openrouter_background_chat_completion_async(
+            client,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
+            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "LikeNovel Story Agent Episode Summary Batch",
+            },
+            json={
+                "model": EPISODE_SUMMARY_MODEL,
+                "temperature": EPISODE_SUMMARY_TEMPERATURE,
+                "max_completion_tokens": EPISODE_SUMMARY_MAX_OUTPUT_TOKENS,
+                "messages": [
+                    {"role": "system", "content": EPISODE_SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": build_episode_summary_user_prompt(row, normalized_text)},
+                ],
+            },
+        )
+        usage.observe_response(response)
+        response.raise_for_status()
+        response_json = usage.capture_response(response)
+        text_value = extract_openrouter_message_text(response_json)
+        usage.finish("success" if text_value else "empty_response")
+        return text_value
 
 
 def is_anthropic_billing_error(exc: BaseException) -> bool:
@@ -1880,21 +2083,36 @@ async def assert_storyctx_openrouter_apply_ready(client: AsyncClient | None) -> 
 async def assert_storyctx_anthropic_apply_ready(client: AsyncClient | None) -> None:
     if client is None or not settings.ANTHROPIC_API_KEY or not RP_REASONING_MODEL:
         return
+    operation = AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key="provider_preflight",
+    )
     try:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": settings.ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": RP_REASONING_MODEL,
-                "max_tokens": 8,
-                "messages": [{"role": "user", "content": "ping"}],
-            },
-        )
-        response.raise_for_status()
+        async with storyctx_provider_attempt(
+            operation,
+            provider="anthropic",
+            model=RP_REASONING_MODEL,
+        ) as usage:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": settings.ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": RP_REASONING_MODEL,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+            )
+            usage.observe_response(response)
+            response.raise_for_status()
+            try:
+                usage.capture_response(response)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            usage.finish("success")
     except HTTPStatusError as exc:
         if is_anthropic_billing_error(exc):
             raise RuntimeError("Anthropic preflight failed: billing or credit unavailable") from exc
@@ -5274,48 +5492,61 @@ async def request_rp_dialogue_items(
     target: dict[str, object],
     normalized_text: str,
 ) -> list[dict[str, object]]:
-    response = await post_openrouter_background_chat_completion_async(
-        client,
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
-        priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "X-Title": "LikeNovel Story Agent RP Dialogue Batch",
-        },
-        json=build_rp_openrouter_payload(
-            system_prompt=RP_DIALOGUE_COLLECTION_PROMPT,
-            user_prompt=build_rp_dialogue_collection_user_prompt(target, normalized_text),
-            max_tokens=1800,
-        ),
+    operation = AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key="rp_dialogue_collection",
+        scope_key=str(target.get("scope_key") or target.get("character_key") or "").strip() or None,
     )
-    response.raise_for_status()
-    parsed = extract_json_object(extract_openrouter_message_text(response.json())) or {}
-    items = parsed.get("items") or []
-    cleaned: list[dict[str, object]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        text_value = str(item.get("text") or "").strip()
-        if not text_value:
-            continue
-        try:
-            episode_no = int(item.get("episode_no") or 0)
-            confidence = float(item.get("confidence") or 0.0)
-        except (TypeError, ValueError):
-            episode_no = 0
-            confidence = 0.0
-        cleaned.append(
-            {
-                "kind": str(item.get("kind") or "dialogue").strip().lower() or "dialogue",
-                "context": str(item.get("context") or "").strip()[:20],
-                "text": text_value[:300],
-                "episode_no": episode_no,
-                "confidence": confidence,
-            }
+    async with storyctx_provider_attempt(
+        operation,
+        provider="openrouter",
+        model=RP_OPENROUTER_MODEL,
+    ) as usage:
+        response = await post_openrouter_background_chat_completion_async(
+            client,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
+            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "LikeNovel Story Agent RP Dialogue Batch",
+            },
+            json=build_rp_openrouter_payload(
+                system_prompt=RP_DIALOGUE_COLLECTION_PROMPT,
+                user_prompt=build_rp_dialogue_collection_user_prompt(target, normalized_text),
+                max_tokens=1800,
+            ),
         )
-    return cleaned
+        usage.observe_response(response)
+        response.raise_for_status()
+        response_json = usage.capture_response(response)
+        parsed = extract_json_object(extract_openrouter_message_text(response_json)) or {}
+        items = parsed.get("items") or []
+        cleaned: list[dict[str, object]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text_value = str(item.get("text") or "").strip()
+            if not text_value:
+                continue
+            try:
+                episode_no = int(item.get("episode_no") or 0)
+                confidence = float(item.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                episode_no = 0
+                confidence = 0.0
+            cleaned.append(
+                {
+                    "kind": str(item.get("kind") or "dialogue").strip().lower() or "dialogue",
+                    "context": str(item.get("context") or "").strip()[:20],
+                    "text": text_value[:300],
+                    "episode_no": episode_no,
+                    "confidence": confidence,
+                }
+            )
+        usage.finish("success" if cleaned else "validation_error")
+        return cleaned
 
 
 async def request_rp_character_plan_payload(
@@ -5331,6 +5562,7 @@ async def request_rp_character_plan_payload(
         user_prompt=user_prompt,
         max_tokens=1800,
         title="LikeNovel Story Agent RP Character Plan Batch",
+        stage_key="rp_character_plan",
     )
 
 
@@ -5347,6 +5579,13 @@ async def request_episode_character_signals_payload(
         opening_text,
     )
     episode_no = int(row.get("episode_no") or 0)
+    usage_operation = AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key="episode_character_signals",
+        product_id=int(row.get("product_id") or 0) or None,
+        episode_id=int(row.get("episode_id") or 0) or None,
+        scope_key=f"episode:{episode_no}" if episode_no else None,
+    )
 
     response_payload: dict | None = None
     request_id = ""
@@ -5367,40 +5606,70 @@ async def request_episode_character_signals_payload(
         }
 
         try:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=request_headers,
-                json=request_payload,
-            )
-            response.raise_for_status()
-            response_payload = response.json()
-            request_id = (
-                response.headers.get("request-id")
-                or response.headers.get("x-request-id")
-                or response.headers.get("anthropic-request-id")
-                or ""
-            ).strip()
-        except (HTTPStatusError, RequestError) as exc:
-            try:
+            async with storyctx_provider_attempt(
+                usage_operation,
+                provider="anthropic",
+                model=RP_REASONING_MODEL,
+            ) as usage:
                 response = await client.post(
                     "https://api.anthropic.com/v1/messages",
                     headers=request_headers,
-                    json={
-                        "model": RP_REASONING_MODEL,
-                        "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
-                        "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
-                        "messages": [{"role": "user", "content": user_prompt}],
-                        **build_anthropic_reasoning_options(RP_REASONING_MODEL),
-                    },
+                    json=request_payload,
                 )
+                usage.observe_response(response)
                 response.raise_for_status()
-                response_payload = response.json()
+                response_payload = usage.capture_response(response)
                 request_id = (
                     response.headers.get("request-id")
                     or response.headers.get("x-request-id")
                     or response.headers.get("anthropic-request-id")
                     or ""
                 ).strip()
+                parsed_response = (
+                    extract_anthropic_tool_input(
+                        response_payload,
+                        tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME,
+                    )
+                    or extract_json_object(extract_anthropic_message_text(response_payload))
+                    or parse_episode_character_signals_structured_text(
+                        extract_anthropic_message_text(response_payload)
+                    )
+                )
+                usage.finish("success" if parsed_response else "parse_error")
+        except (HTTPStatusError, RequestError) as exc:
+            try:
+                async with storyctx_provider_attempt(
+                    usage_operation,
+                    provider="anthropic",
+                    model=RP_REASONING_MODEL,
+                ) as usage:
+                    response = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=request_headers,
+                        json={
+                            "model": RP_REASONING_MODEL,
+                            "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
+                            "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
+                            "messages": [{"role": "user", "content": user_prompt}],
+                            **build_anthropic_reasoning_options(RP_REASONING_MODEL),
+                        },
+                    )
+                    usage.observe_response(response)
+                    response.raise_for_status()
+                    response_payload = usage.capture_response(response)
+                    request_id = (
+                        response.headers.get("request-id")
+                        or response.headers.get("x-request-id")
+                        or response.headers.get("anthropic-request-id")
+                        or ""
+                    ).strip()
+                    parsed_response = (
+                        extract_json_object(extract_anthropic_message_text(response_payload))
+                        or parse_episode_character_signals_structured_text(
+                            extract_anthropic_message_text(response_payload)
+                        )
+                    )
+                    usage.finish("success" if parsed_response else "parse_error")
             except (HTTPStatusError, RequestError) as retry_exc:
                 logger.warning(
                     "[storyctx] episode_character_signals anthropic failed episode_no=%s: %s / retry=%s",
@@ -5425,35 +5694,45 @@ async def request_episode_character_signals_payload(
     if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
         for attempt in range(2):
             try:
-                response = await asyncio.wait_for(
-                    post_openrouter_background_chat_completion_async(
-                        client,
-                        base_url=OPENROUTER_BASE_URL,
-                        api_key=OPENROUTER_API_KEY,
-                        priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-                        headers={
-                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                            "Content-Type": "application/json",
-                            "X-Title": "LikeNovel Story Agent Episode Character Signals OpenRouter",
-                        },
-                        json=build_character_signals_openrouter_payload(
-                            user_prompt=(
-                                build_episode_character_signals_user_prompt(row, summary_text)
-                                + "\n\nJSON object must satisfy the episode_character_signals schema exactly."
+                async with storyctx_provider_attempt(
+                    usage_operation,
+                    provider="openrouter",
+                    model=EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+                ) as usage:
+                    response = await asyncio.wait_for(
+                        post_openrouter_background_chat_completion_async(
+                            client,
+                            base_url=OPENROUTER_BASE_URL,
+                            api_key=OPENROUTER_API_KEY,
+                            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+                            headers={
+                                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                                "Content-Type": "application/json",
+                                "X-Title": "LikeNovel Story Agent Episode Character Signals OpenRouter",
+                            },
+                            json=build_character_signals_openrouter_payload(
+                                user_prompt=(
+                                    build_episode_character_signals_user_prompt(row, summary_text)
+                                    + "\n\nJSON object must satisfy the episode_character_signals schema exactly."
+                                ),
                             ),
                         ),
-                    ),
-                    timeout=EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS,
-                )
-                response.raise_for_status()
-                openrouter_payload = extract_json_object(extract_openrouter_message_text(response.json()))
-                if openrouter_payload:
-                    logger.info(
-                        "[storyctx] episode_character_signals provider=openrouter model=%s episode_no=%s",
-                        EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
-                        episode_no,
+                        timeout=EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS,
                     )
-                    return openrouter_payload
+                    usage.observe_response(response)
+                    response.raise_for_status()
+                    response_json = usage.capture_response(response)
+                    openrouter_payload = extract_json_object(
+                        extract_openrouter_message_text(response_json)
+                    )
+                    usage.finish("success" if openrouter_payload else "parse_error")
+                    if openrouter_payload:
+                        logger.info(
+                            "[storyctx] episode_character_signals provider=openrouter model=%s episode_no=%s",
+                            EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+                            episode_no,
+                        )
+                        return openrouter_payload
             except (asyncio.TimeoutError, HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning(
                     "[storyctx] episode_character_signals openrouter fallback failed episode_no=%s attempt=%s: %s",
@@ -5503,6 +5782,8 @@ async def request_rp_profile_payload(
         max_tokens=1200,
         title="LikeNovel Story Agent RP Profile Batch",
         response_format=RP_PROFILE_RESPONSE_FORMAT,
+        stage_key="rp_profile",
+        scope_key=str(target.get("scope_key") or target.get("character_key") or "").strip() or None,
     )
 
 
@@ -5543,6 +5824,8 @@ async def request_character_chat_internal_prompt_payload(
         max_tokens=3200,
         title="LikeNovel Story Agent Character Chat Internal Prompt Batch",
         timeout_seconds=CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS,
+        stage_key="character_chat_internal_prompt",
+        scope_key=str(target.get("scope_key") or target.get("character_key") or "").strip() or None,
     )
     return normalize_character_chat_internal_prompt_payload(payload)
 
@@ -5784,6 +6067,8 @@ async def request_character_chat_opening_payload(
         ),
         max_tokens=3000,
         title="LikeNovel Story Agent Character Chat Opening Batch",
+        stage_key="character_chat_opening",
+        scope_key=scope_key,
     )
     return normalize_character_chat_opening_payload(
         payload,
@@ -5800,6 +6085,7 @@ async def request_episode_scene_extraction_payload(
     episode_title: str,
     normalized_text: str,
     canonical_character_packet: object | None = None,
+    product_id: int | None = None,
 ) -> dict[str, object]:
     user_prompt = build_episode_scene_extraction_user_prompt(
         product_title=product_title,
@@ -5809,6 +6095,12 @@ async def request_episode_scene_extraction_payload(
         canonical_character_packet=canonical_character_packet,
     )
     normalized_payload: dict[str, object] = {}
+    usage_operation = AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key="episode_scene_extraction",
+        product_id=product_id,
+        scope_key=f"episode:{episode_no}" if episode_no else None,
+    )
     for attempt in range(2):
         retry_suffix = (
             "\n\n이전 응답은 완전한 JSON object가 아니었다. "
@@ -5820,6 +6112,8 @@ async def request_episode_scene_extraction_payload(
             payload = await request_episode_scene_extraction_openrouter_json_payload(
                 client,
                 user_prompt=user_prompt + retry_suffix,
+                usage_operation=usage_operation,
+                product_id=product_id,
             )
         except (asyncio.TimeoutError, HTTPStatusError, RequestError, json.JSONDecodeError) as exc:
             logger.warning(
@@ -8478,6 +8772,7 @@ async def build_episode_scene_extraction_summaries(
                 episode_title=parse_summary_text(str(row.get("summary_text") or "")).get("header") or "",
                 normalized_text=normalized_text,
                 canonical_character_packet=canonical_character_packet,
+                product_id=product_id,
             )
         except Exception as exc:
             if isinstance(exc, OpenRouterBackgroundCreditReserveError) or (
@@ -13463,24 +13758,38 @@ async def request_work_protagonist_resolution_payload(
         },
     }
     request_timeout_seconds = EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS
-    response = await asyncio.wait_for(
-        post_openrouter_background_chat_completion_async(
-            client,
-            base_url=OPENROUTER_BASE_URL,
-            api_key=OPENROUTER_API_KEY,
-            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "X-Title": "LikeNovel Story Agent Opening Protagonist Resolution",
-            },
-            json=request_payload,
-            timeout=request_timeout_seconds,
-        ),
-        timeout=request_timeout_seconds,
+    operation = AiProviderUsageOperation(
+        feature_key="storyctx",
+        stage_key="work_protagonist_resolution",
+        product_id=product_id,
     )
-    response.raise_for_status()
-    return extract_json_object(extract_openrouter_message_text(response.json()))
+    async with storyctx_provider_attempt(
+        operation,
+        provider="openrouter",
+        model=EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+    ) as usage:
+        response = await asyncio.wait_for(
+            post_openrouter_background_chat_completion_async(
+                client,
+                base_url=OPENROUTER_BASE_URL,
+                api_key=OPENROUTER_API_KEY,
+                priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "X-Title": "LikeNovel Story Agent Opening Protagonist Resolution",
+                },
+                json=request_payload,
+                timeout=request_timeout_seconds,
+            ),
+            timeout=request_timeout_seconds,
+        )
+        usage.observe_response(response)
+        response.raise_for_status()
+        response_json = usage.capture_response(response)
+        parsed = extract_json_object(extract_openrouter_message_text(response_json))
+        usage.finish("success" if parsed else "parse_error")
+        return parsed
 
 
 def _build_opening_work_protagonist_resolution(
@@ -20746,50 +21055,55 @@ async def main() -> int:
     finally:
         conn.close()
 
-    if args.build_mode == "delta":
-        results = (
-            await build_context_rows_delta(rows=rows, args=args)
-            if rows
-            else build_empty_results()
-        )
-        if delta_status_repaired_products:
-            results["products"] = [
-                *delta_status_repaired_products,
-                *list(results.get("products") or []),
-            ]
-        inventory_reaggregation_rows = filter_review_required_product_rows(
-            inventory_reaggregation_rows,
-            results=results,
-        )
-        character_asset_repair_rows = filter_review_required_product_rows(
-            character_asset_repair_rows,
-            results=results,
-        )
-        if inventory_reaggregation_rows and not bool(args.repair_character_assets):
-            await reaggregate_character_inventory_foundations(
-                rows=inventory_reaggregation_rows,
-                args=args,
+    if args.apply:
+        _open_storyctx_usage_connection()
+    try:
+        if args.build_mode == "delta":
+            results = (
+                await build_context_rows_delta(rows=rows, args=args)
+                if rows
+                else build_empty_results()
+            )
+            if delta_status_repaired_products:
+                results["products"] = [
+                    *delta_status_repaired_products,
+                    *list(results.get("products") or []),
+                ]
+            inventory_reaggregation_rows = filter_review_required_product_rows(
+                inventory_reaggregation_rows,
                 results=results,
             )
-        character_asset_repair_rows = filter_review_required_product_rows(
-            character_asset_repair_rows,
-            results=results,
-        )
-        if character_asset_repair_rows and not int(results.get("deferred_budget") or 0):
-            await repair_character_chat_assets(
-                rows=character_asset_repair_rows,
-                args=args,
+            character_asset_repair_rows = filter_review_required_product_rows(
+                character_asset_repair_rows,
                 results=results,
             )
-        print_summary(results=results, apply=args.apply)
-        write_delta_verification_json(args.verification_json_path, results)
-        return build_delta_exit_code(results, apply=args.apply)
+            if inventory_reaggregation_rows and not bool(args.repair_character_assets):
+                await reaggregate_character_inventory_foundations(
+                    rows=inventory_reaggregation_rows,
+                    args=args,
+                    results=results,
+                )
+            character_asset_repair_rows = filter_review_required_product_rows(
+                character_asset_repair_rows,
+                results=results,
+            )
+            if character_asset_repair_rows and not int(results.get("deferred_budget") or 0):
+                await repair_character_chat_assets(
+                    rows=character_asset_repair_rows,
+                    args=args,
+                    results=results,
+                )
+            print_summary(results=results, apply=args.apply)
+            write_delta_verification_json(args.verification_json_path, results)
+            return build_delta_exit_code(results, apply=args.apply)
 
-    results = await build_context_rows(rows=rows, args=args)
-    print_summary(results=results, apply=args.apply)
-    if int(results.get("deferred_budget") or 0) > 0:
-        return STORYCTX_DEFERRED_BUDGET_EXIT_CODE
-    return 0
+        results = await build_context_rows(rows=rows, args=args)
+        print_summary(results=results, apply=args.apply)
+        if int(results.get("deferred_budget") or 0) > 0:
+            return STORYCTX_DEFERRED_BUDGET_EXIT_CODE
+        return 0
+    finally:
+        _close_storyctx_usage_connection()
 
 
 if __name__ == "__main__":
