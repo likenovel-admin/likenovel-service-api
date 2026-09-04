@@ -57,6 +57,20 @@ def test_batch_wiring_is_bounded_and_dev_schedule_remains_disabled():
     assert "# 7,22,37,52 * * * *" in dev_cron
 
 
+def test_backend_deploy_workflows_package_snapshot_refresh_script():
+    copy_line = (
+        "cp ../scripts/refresh_public_character_catalog_snapshot.py "
+        "./scripts/refresh_public_character_catalog_snapshot.py"
+    )
+
+    for workflow_path in (
+        ".github/workflows/deploy_be_actions_dev.yml",
+        ".github/workflows/deploy_be_actions.yml",
+    ):
+        workflow = (ROOT.parent / workflow_path).read_text(encoding="utf-8")
+        assert copy_line in workflow
+
+
 def _run_wrapper(tmp_path: Path, *, python_exit: int, timeout_exit: int | None = None):
     api_root = tmp_path / "api"
     batch_dir = api_root / "dist" / "batch"
