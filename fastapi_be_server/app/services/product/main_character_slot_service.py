@@ -1,9 +1,6 @@
-import asyncio
 import json
 import logging
 from collections import defaultdict
-from copy import deepcopy
-from time import monotonic
 
 from fastapi import status
 from sqlalchemy import bindparam, text
@@ -22,6 +19,9 @@ from app.services.websochat.character_chat_product_policy import (
     is_character_chat_rp_profile_payload_ready,
 )
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
+from app.services.product.public_character_catalog_snapshot_service import (
+    read_public_character_catalog_snapshot,
+)
 from app.utils.query import get_file_path_sub_query, get_pagination_params
 from app.utils.response import build_paginated_response
 
@@ -40,24 +40,12 @@ CHARACTER_CHAT_PREVIEW_EXCERPT_MAX_CHARS = 900
 
 logger = logging.getLogger(__name__)
 
-PUBLIC_CHARACTER_CATALOG_CACHE_TTL_SECONDS = 300
 AUTO_MAIN_CHARACTER_SLOT_LIMIT = 12
 DEFAULT_CHARACTER_IMAGE_PATHS = (
     "/images/default-cover.png",
     "/images/default_cover.png",
 )
 LEGACY_DEFAULT_CHARACTER_IMAGE_KEY = "ESokN0lzSgG0um4rn4tBeg"
-_public_character_catalog_cache: dict[str, tuple[float, list[dict]]] = {}
-_public_character_catalog_cache_locks: defaultdict[str, asyncio.Lock] = defaultdict(
-    asyncio.Lock
-)
-
-
-def _reset_public_character_catalog_cache() -> None:
-    _public_character_catalog_cache.clear()
-    _public_character_catalog_cache_locks.clear()
-
-
 async def get_main_character_slot_display_mode(*, db: AsyncSession) -> str:
     result = await db.execute(
         text("""
@@ -1560,16 +1548,6 @@ def finalize_public_character_catalog_items(items) -> list[dict]:
     return selected_items
 
 
-def select_auto_main_character_slots(
-    items,
-) -> list[dict]:
-    selected = [dict(item) for item in items[:AUTO_MAIN_CHARACTER_SLOT_LIMIT]]
-
-    for card_order, item in enumerate(selected, start=1):
-        item["cardOrder"] = card_order
-    return selected
-
-
 def filter_public_character_catalog_candidates(
     candidate_rows, scene_rows
 ) -> list[dict]:
@@ -1703,14 +1681,12 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
             db=db,
         )
 
-    catalog_response = await get_public_character_catalog(
-        adult_yn=adult_yn,
-        kc_user_id=None,
+    catalog_items = await read_public_character_catalog_snapshot(
+        adult_yn=_normalize_public_character_catalog_adult_yn(adult_yn),
         db=db,
+        limit=AUTO_MAIN_CHARACTER_SLOT_LIMIT,
     )
-    return {
-        "data": select_auto_main_character_slots(catalog_response.get("data", []))
-    }
+    return {"data": catalog_items}
 
 
 async def _load_public_character_catalog_base(
@@ -1853,71 +1829,6 @@ async def _load_public_character_catalog_base(
     return finalize_public_character_catalog_items(catalog_items)
 
 
-async def _get_cached_public_character_catalog_base(
-    *,
-    adult_yn: str,
-    db: AsyncSession,
-) -> tuple[list[dict], bool]:
-    cached = _public_character_catalog_cache.get(adult_yn)
-    now = monotonic()
-    if cached and cached[0] > now:
-        return deepcopy(cached[1]), True
-
-    async with _public_character_catalog_cache_locks[adult_yn]:
-        cached = _public_character_catalog_cache.get(adult_yn)
-        now = monotonic()
-        if cached and cached[0] > now:
-            return deepcopy(cached[1]), True
-
-        catalog_items = await _load_public_character_catalog_base(
-            adult_yn=adult_yn,
-            db=db,
-        )
-        _public_character_catalog_cache[adult_yn] = (
-            monotonic() + PUBLIC_CHARACTER_CATALOG_CACHE_TTL_SECONDS,
-            catalog_items,
-        )
-        return deepcopy(catalog_items), False
-
-
-async def _filter_currently_public_character_catalog_items(
-    *,
-    catalog_items: list[dict],
-    adult_yn: str,
-    db: AsyncSession,
-) -> list[dict]:
-    product_ids = sorted(
-        {
-            int(item["productId"])
-            for item in catalog_items
-            if int(item.get("productId") or 0) > 0
-        }
-    )
-    if not product_ids:
-        return []
-    result = await db.execute(
-        text(
-            build_public_character_catalog_query(
-                restrict_to_product_ids=True
-            )
-        ).bindparams(bindparam("product_ids", expanding=True)),
-        {
-            "adult_yn": adult_yn,
-            "product_ids": product_ids,
-        },
-    )
-    current_product_ids = {
-        int(row_data["productId"])
-        for row in result.mappings().all()
-        if (row_data := dict(row)).get("productId") is not None
-    }
-    return [
-        item
-        for item in catalog_items
-        if int(item.get("productId") or 0) in current_product_ids
-    ]
-
-
 async def get_public_character_catalog(
     *,
     adult_yn: str,
@@ -1925,20 +1836,12 @@ async def get_public_character_catalog(
     db: AsyncSession,
 ):
     normalized_adult_yn = _normalize_public_character_catalog_adult_yn(adult_yn)
-    catalog_items, cache_hit = await _get_cached_public_character_catalog_base(
+    catalog_items = await read_public_character_catalog_snapshot(
         adult_yn=normalized_adult_yn,
         db=db,
     )
     if not catalog_items:
         return {"data": []}
-    if cache_hit:
-        catalog_items = await _filter_currently_public_character_catalog_items(
-            catalog_items=catalog_items,
-            adult_yn=normalized_adult_yn,
-            db=db,
-        )
-        if not catalog_items:
-            return {"data": []}
 
     product_ids = sorted(
         {
@@ -2741,7 +2644,6 @@ async def post_admin_main_character_slot(
         """),
         params,
     )
-    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": result.lastrowid}}
 
 
@@ -2782,7 +2684,6 @@ async def publish_admin_main_character_slot_now(
         """),
         params,
     )
-    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": result.lastrowid}}
 
 
@@ -2822,7 +2723,6 @@ async def update_admin_main_character_slot(
             status_code=status.HTTP_404_NOT_FOUND,
             message="존재하지 않는 메인 주인공 카드입니다.",
         )
-    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": character_slot_id}}
 
 
@@ -2846,5 +2746,4 @@ async def delete_admin_main_character_slot(
             status_code=status.HTTP_404_NOT_FOUND,
             message="존재하지 않는 메인 주인공 카드입니다.",
         )
-    _reset_public_character_catalog_cache()
     return {"result": {"characterSlotId": character_slot_id}}

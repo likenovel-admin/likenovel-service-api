@@ -1128,38 +1128,7 @@ def test_catalog_applies_recommendation_priority_before_per_product_limit():
     assert [item["hasCharacterImage"] for item in result] == [True, False]
 
 
-def test_auto_home_selection_keeps_catalog_top_twelve_in_recommendation_order():
-    from app.services.product.main_character_slot_service import (
-        select_auto_main_character_slots,
-    )
-
-    items = [
-        {
-            "characterSlotId": index,
-            "productId": index,
-            "characterScopeKey": f"character:{index}",
-            "characterName": f"캐릭터 {index}",
-            "characterRole": "main_protagonist",
-            "characterImagePath": f"/character/{index}.webp" if index <= 15 else None,
-            "hasCharacterImage": index <= 15,
-            "cardOrder": index,
-            "productTitle": f"작품 {index}",
-            "authorNickname": "작가",
-            "syncedLatestEpisodeNo": 20,
-            "entryEpisodeNo": 1,
-        }
-        for index in range(1, 31)
-    ]
-
-    selected = select_auto_main_character_slots(items)
-
-    assert len(selected) == 12
-    assert all(item["hasCharacterImage"] for item in selected)
-    assert [item["characterSlotId"] for item in selected] == list(range(1, 13))
-    assert [item["cardOrder"] for item in selected] == list(range(1, 13))
-
-
-def test_public_home_auto_mode_selects_from_the_authoritative_catalog():
+def test_public_home_auto_mode_does_not_build_the_full_catalog_in_request():
     from app.services.product import main_character_slot_service
 
     catalog_items = [
@@ -1179,9 +1148,14 @@ def test_public_home_auto_mode_selects_from_the_authoritative_catalog():
         ),
         patch.object(
             main_character_slot_service,
+            "read_public_character_catalog_snapshot",
+            new_callable=AsyncMock,
+            return_value=catalog_items,
+        ) as read_snapshot,
+        patch.object(
+            main_character_slot_service,
             "get_public_character_catalog",
             new_callable=AsyncMock,
-            return_value={"data": catalog_items},
         ) as get_catalog,
     ):
         response = asyncio.run(
@@ -1191,10 +1165,11 @@ def test_public_home_auto_mode_selects_from_the_authoritative_catalog():
             )
         )
 
-    get_catalog.assert_awaited_once_with(
+    get_catalog.assert_not_awaited()
+    read_snapshot.assert_awaited_once_with(
         adult_yn="N",
-        kc_user_id=None,
         db=db,
+        limit=12,
     )
     assert response == {"data": catalog_items}
     db.execute.assert_not_awaited()
@@ -1264,11 +1239,6 @@ def test_storage_upload_accepts_character_group_type_through_existing_validator(
 
 
 class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        from app.services.product import main_character_slot_service
-
-        main_character_slot_service._reset_public_character_catalog_cache()
-
     async def test_display_mode_defaults_to_auto_and_preserves_manual(self):
         from app.services.product import main_character_slot_service
 
@@ -1383,14 +1353,6 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             image_result,
         ]
         return db
-
-    @staticmethod
-    def _catalog_visibility_result(*product_ids):
-        result = MagicMock()
-        result.mappings.return_value.all.return_value = [
-            {"productId": product_id} for product_id in product_ids
-        ]
-        return result
 
     async def test_catalog_load_queries_fallback_only_for_target_products(self):
         from app.services.product import main_character_slot_service
@@ -1525,77 +1487,40 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             (22, 2, 7),
         }
 
-    async def test_character_catalog_reuses_adult_scoped_base_with_deep_copies(self):
+    async def test_character_catalog_reads_snapshot_for_each_request_and_normalizes_scope(self):
         from app.services.product import main_character_slot_service
 
-        miss_db = self._catalog_base_db()
-        hit_db = AsyncMock()
-        hit_db.execute.return_value = self._catalog_visibility_result(1182)
-        second_hit_db = AsyncMock()
-        second_hit_db.execute.return_value = self._catalog_visibility_result(1182)
-        invalid_adult_db = AsyncMock()
-        invalid_adult_db.execute.return_value = self._catalog_visibility_result(1182)
-        adult_db = self._catalog_base_db()
-        expired_db = self._catalog_base_db()
-
-        with patch.object(main_character_slot_service, "monotonic") as clock:
-            clock.return_value = 0
-            miss_response = (
-                await main_character_slot_service.get_public_character_catalog(
-                    adult_yn="N",
-                    kc_user_id=None,
-                    db=miss_db,
-                )
+        db = AsyncMock()
+        with patch.object(
+            main_character_slot_service,
+            "read_public_character_catalog_snapshot",
+            new_callable=AsyncMock,
+            side_effect=[
+                [{"productId": 1182, "productTitle": "일반"}],
+                [{"productId": 1182, "productTitle": "일반 재조회"}],
+                [{"productId": 1192, "productTitle": "성인"}],
+            ],
+        ) as read_snapshot:
+            invalid_response = await main_character_slot_service.get_public_character_catalog(
+                adult_yn="invalid", kc_user_id=None, db=db
             )
-            miss_response["data"][0]["productTitle"] = "호출자 변경"
-            clock.return_value = 299
-            hit_response = (
-                await main_character_slot_service.get_public_character_catalog(
-                    adult_yn="N",
-                    kc_user_id=None,
-                    db=hit_db,
-                )
+            normal_response = await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N", kc_user_id=None, db=db
             )
-            hit_response["data"][0]["productTitle"] = "두 번째 호출자 변경"
-            second_hit_response = (
-                await main_character_slot_service.get_public_character_catalog(
-                    adult_yn="N",
-                    kc_user_id=None,
-                    db=second_hit_db,
-                )
-            )
-            invalid_adult_response = (
-                await main_character_slot_service.get_public_character_catalog(
-                    adult_yn="invalid",
-                    kc_user_id=None,
-                    db=invalid_adult_db,
-                )
-            )
-            adult_response = (
-                await main_character_slot_service.get_public_character_catalog(
-                    adult_yn="Y",
-                    kc_user_id=None,
-                    db=adult_db,
-                )
-            )
-            clock.return_value = 301
-            await main_character_slot_service.get_public_character_catalog(
-                adult_yn="N",
-                kc_user_id=None,
-                db=expired_db,
+            adult_response = await main_character_slot_service.get_public_character_catalog(
+                adult_yn="Y", kc_user_id=None, db=db
             )
 
-        assert miss_db.execute.await_count == 5
-        assert hit_db.execute.await_count == 1
-        assert second_hit_db.execute.await_count == 1
-        assert invalid_adult_db.execute.await_count == 1
-        assert invalid_adult_db.execute.await_args.args[1]["adult_yn"] == "N"
-        assert adult_db.execute.await_count == 5
-        assert expired_db.execute.await_count == 5
-        assert hit_response["data"][0]["productTitle"] == "두 번째 호출자 변경"
-        assert second_hit_response["data"][0]["productTitle"] == "테스트 작품"
-        assert invalid_adult_response["data"][0]["productTitle"] == "테스트 작품"
-        assert adult_response["data"][0]["productTitle"] == "테스트 작품"
+        assert [call.kwargs["adult_yn"] for call in read_snapshot.await_args_list] == [
+            "N",
+            "N",
+            "Y",
+        ]
+        assert all(call.kwargs["db"] is db for call in read_snapshot.await_args_list)
+        assert db.execute.await_count == 0
+        assert invalid_response["data"][0]["productTitle"] == "일반"
+        assert normal_response["data"][0]["productTitle"] == "일반 재조회"
+        assert adult_response["data"][0]["productTitle"] == "성인"
 
     async def test_character_catalog_keeps_authenticated_progress_fresh_and_private(self):
         from app.services.product import main_character_slot_service
@@ -1608,11 +1533,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "lastViewedAt": "2026-07-22 12:34:56",
             }
         ]
-        first_db = self._catalog_base_db()
-        first_db.execute.side_effect = [
-            *first_db.execute.side_effect,
-            first_progress_result,
-        ]
+        first_db = AsyncMock()
+        first_db.execute.return_value = first_progress_result
 
         second_progress_result = MagicMock()
         second_progress_result.mappings.return_value.all.return_value = [
@@ -1623,29 +1545,28 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             }
         ]
         second_db = AsyncMock()
-        second_db.execute.side_effect = [
-            self._catalog_visibility_result(1182),
-            second_progress_result,
-        ]
-
-        first_response = (
-            await main_character_slot_service.get_public_character_catalog(
-                adult_yn="N",
-                kc_user_id="kc-user-1",
-                db=first_db,
+        second_db.execute.return_value = second_progress_result
+        snapshot_item = {
+            "productId": 1182,
+            "lastViewedEpisodeNo": None,
+            "lastViewedAt": None,
+        }
+        with patch.object(
+            main_character_slot_service,
+            "read_public_character_catalog_snapshot",
+            new_callable=AsyncMock,
+            side_effect=[[dict(snapshot_item)], [dict(snapshot_item)]],
+        ):
+            first_response = await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N", kc_user_id="kc-user-1", db=first_db
             )
-        )
-        second_response = (
-            await main_character_slot_service.get_public_character_catalog(
-                adult_yn="N",
-                kc_user_id="kc-user-2",
-                db=second_db,
+            second_response = await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N", kc_user_id="kc-user-2", db=second_db
             )
-        )
 
-        assert first_db.execute.await_count == 6
-        assert second_db.execute.await_count == 2
-        assert second_db.execute.await_args_list[1].args[1]["kc_user_id"] == "kc-user-2"
+        assert first_db.execute.await_count == 1
+        assert second_db.execute.await_count == 1
+        assert second_db.execute.await_args.args[1]["kc_user_id"] == "kc-user-2"
         assert (
             first_response["data"][0]["lastViewedEpisodeNo"],
             first_response["data"][0]["lastViewedAt"],
@@ -1654,96 +1575,6 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             second_response["data"][0]["lastViewedEpisodeNo"],
             second_response["data"][0]["lastViewedAt"],
         ) == (3, "2026-07-24 09:00:00")
-
-    async def test_character_catalog_cache_hit_rechecks_live_product_visibility(self):
-        from sqlalchemy.exc import SQLAlchemyError
-
-        from app.services.product import main_character_slot_service
-
-        warm_db = self._catalog_base_db()
-        await main_character_slot_service.get_public_character_catalog(
-            adult_yn="N",
-            kc_user_id=None,
-            db=warm_db,
-        )
-
-        hidden_result = self._catalog_visibility_result()
-        hidden_db = AsyncMock()
-        hidden_db.execute.return_value = hidden_result
-        hidden_response = (
-            await main_character_slot_service.get_public_character_catalog(
-                adult_yn="N",
-                kc_user_id="kc-user-1",
-                db=hidden_db,
-            )
-        )
-
-        assert hidden_response == {"data": []}
-        assert hidden_db.execute.await_count == 1
-
-        failing_db = AsyncMock()
-        failing_db.execute.side_effect = SQLAlchemyError("live gate failed")
-        with self.assertRaises(SQLAlchemyError):
-            await main_character_slot_service.get_public_character_catalog(
-                adult_yn="N",
-                kc_user_id=None,
-                db=failing_db,
-            )
-        assert failing_db.execute.await_count == 1
-
-    async def test_character_catalog_serializes_concurrent_misses_per_adult_scope(self):
-        from app.services.product import main_character_slot_service
-
-        load_started = asyncio.Event()
-        release_load = asyncio.Event()
-        first_db = AsyncMock()
-        second_db = AsyncMock()
-        second_db.execute.return_value = self._catalog_visibility_result(1182)
-
-        async def load_base(*, adult_yn, db):
-            load_started.set()
-            await release_load.wait()
-            return [
-                {
-                    "productId": 1182,
-                    "lastViewedEpisodeNo": None,
-                    "lastViewedAt": None,
-                }
-            ]
-
-        with patch.object(
-            main_character_slot_service,
-            "_load_public_character_catalog_base",
-            side_effect=load_base,
-        ) as load_mock:
-            first_task = asyncio.create_task(
-                main_character_slot_service.get_public_character_catalog(
-                    adult_yn="Y",
-                    kc_user_id=None,
-                    db=first_db,
-                )
-            )
-            await load_started.wait()
-            second_task = asyncio.create_task(
-                main_character_slot_service.get_public_character_catalog(
-                    adult_yn="Y",
-                    kc_user_id=None,
-                    db=second_db,
-                )
-            )
-            await asyncio.sleep(0)
-            release_load.set()
-            first_response, second_response = await asyncio.gather(
-                first_task,
-                second_task,
-            )
-
-        assert load_mock.await_count == 1
-        assert first_db.execute.await_count == 0
-        assert second_db.execute.await_count == 1
-        assert first_response == second_response
-        assert first_response is not second_response
-        assert first_response["data"] is not second_response["data"]
 
     async def test_public_home_slots_survive_entry_episode_query_failure(self):
         from sqlalchemy.exc import SQLAlchemyError
@@ -1918,9 +1749,8 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             image_result,
         ]
 
-        response = await main_character_slot_service.get_public_character_catalog(
+        catalog_items = await main_character_slot_service._load_public_character_catalog_base(
             adult_yn="N",
-            kc_user_id=None,
             db=db,
         )
 
@@ -1944,33 +1774,31 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "compatibleScopeKeys": ["character:support"],
             },
         ]
-        assert response == {
-            "data": [
-                {
-                    "characterSlotId": 1,
-                    "productId": 1182,
-                    "characterScopeKey": "character:adelite",
-                    "characterRole": "main_protagonist",
-                    "productTitle": "테스트 작품",
-                    "authorNickname": "테스트 작가",
-                    "syncedLatestEpisodeNo": 3,
-                    "entryEpisodeNo": 2,
-                    "publishStartAt": None,
-                    "publishEndAt": None,
-                    "cardOrder": 1,
-                    "characterImagePath": "/cover.webp",
-                    "hasCharacterImage": True,
-                    "fullReady": False,
-                    "readinessCoverageRatio": 0.75,
-                    "distinctEpisodeCount": 12,
-                    "exampleCount": 5,
-                    "sceneCount": 5,
-                    "chatQuality": "good",
-                    "lastViewedEpisodeNo": None,
-                    "lastViewedAt": None,
-                }
-            ]
-        }
+        assert catalog_items == [
+            {
+                "characterSlotId": 1,
+                "productId": 1182,
+                "characterScopeKey": "character:adelite",
+                "characterRole": "main_protagonist",
+                "productTitle": "테스트 작품",
+                "authorNickname": "테스트 작가",
+                "syncedLatestEpisodeNo": 3,
+                "entryEpisodeNo": 2,
+                "publishStartAt": None,
+                "publishEndAt": None,
+                "cardOrder": 1,
+                "characterImagePath": "/cover.webp",
+                "hasCharacterImage": True,
+                "fullReady": False,
+                "readinessCoverageRatio": 0.75,
+                "distinctEpisodeCount": 12,
+                "exampleCount": 5,
+                "sceneCount": 5,
+                "chatQuality": "good",
+                "lastViewedEpisodeNo": None,
+                "lastViewedAt": None,
+            }
+        ]
 
     async def test_character_catalog_auth_bulk_loads_and_merges_progress(self):
         from app.services.product import main_character_slot_service
@@ -2063,11 +1891,18 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             progress_result,
         ]
 
-        response = await main_character_slot_service.get_public_character_catalog(
-            adult_yn="N",
-            kc_user_id="kc-user-1",
-            db=db,
+        catalog_items = await main_character_slot_service._load_public_character_catalog_base(
+            adult_yn="N", db=db
         )
+        with patch.object(
+            main_character_slot_service,
+            "read_public_character_catalog_snapshot",
+            new_callable=AsyncMock,
+            return_value=catalog_items,
+        ):
+            response = await main_character_slot_service.get_public_character_catalog(
+                adult_yn="N", kc_user_id="kc-user-1", db=db
+            )
 
         assert db.execute.await_count == 7
         progress_query = db.execute.await_args_list[6].args[0]
@@ -2207,11 +2042,18 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             progress_result,
         ]
 
-        response = await main_character_slot_service.get_public_character_catalog(
-            adult_yn="Y",
-            kc_user_id="kc-user-1",
-            db=db,
+        catalog_items = await main_character_slot_service._load_public_character_catalog_base(
+            adult_yn="Y", db=db
         )
+        with patch.object(
+            main_character_slot_service,
+            "read_public_character_catalog_snapshot",
+            new_callable=AsyncMock,
+            return_value=catalog_items,
+        ):
+            response = await main_character_slot_service.get_public_character_catalog(
+                adult_yn="Y", kc_user_id="kc-user-1", db=db
+            )
 
         assert db.execute.await_count == 6
         assert db.execute.await_args_list[5].args[1]["product_ids"] == [1182]
