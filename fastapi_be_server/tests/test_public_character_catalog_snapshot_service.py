@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from scripts import refresh_public_character_catalog_snapshot as snapshot_refresh
 from app.services.product.public_character_catalog_snapshot_service import (
     _prepare_snapshot_rows,
     publish_public_character_catalog_snapshot,
@@ -125,3 +126,37 @@ def test_snapshot_lock_distinguishes_busy_from_provider_errors():
         _is_snapshot_lock_acquired(None)
     with pytest.raises(RuntimeError, match="unexpected GET_LOCK"):
         _is_snapshot_lock_acquired(2)
+
+
+class PublicCharacterCatalogSnapshotScriptLifecycleTest(
+    unittest.IsolatedAsyncioTestCase
+):
+    async def test_main_disposes_engine_after_success(self):
+        original_refresh = snapshot_refresh.refresh_public_character_catalog_snapshot
+        original_engine = snapshot_refresh.likenovel_db_engine
+        refresh = AsyncMock(return_value={"status": "published"})
+        engine = MagicMock()
+        engine.dispose = AsyncMock()
+        snapshot_refresh.refresh_public_character_catalog_snapshot = refresh
+        snapshot_refresh.likenovel_db_engine = engine
+        try:
+            assert await snapshot_refresh.main() == 0
+            engine.dispose.assert_awaited_once()
+        finally:
+            snapshot_refresh.refresh_public_character_catalog_snapshot = original_refresh
+            snapshot_refresh.likenovel_db_engine = original_engine
+
+    async def test_main_disposes_engine_after_failure(self):
+        original_refresh = snapshot_refresh.refresh_public_character_catalog_snapshot
+        original_engine = snapshot_refresh.likenovel_db_engine
+        refresh = AsyncMock(side_effect=RuntimeError("refresh failed"))
+        engine = MagicMock()
+        engine.dispose = AsyncMock()
+        snapshot_refresh.refresh_public_character_catalog_snapshot = refresh
+        snapshot_refresh.likenovel_db_engine = engine
+        try:
+            assert await snapshot_refresh.main() == 1
+            engine.dispose.assert_awaited_once()
+        finally:
+            snapshot_refresh.refresh_public_character_catalog_snapshot = original_refresh
+            snapshot_refresh.likenovel_db_engine = original_engine

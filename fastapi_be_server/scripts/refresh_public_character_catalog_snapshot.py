@@ -102,6 +102,8 @@ async def main() -> int:
             file=sys.stderr,
         )
         return 1
+    finally:
+        await likenovel_db_engine.dispose()
 
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
