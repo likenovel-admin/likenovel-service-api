@@ -244,6 +244,71 @@ class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_usage_persistence_failure_does_not_fail_provider_reply(self):
+        _FakeOpenRouterAsyncClient.post_response = _FakeOpenRouterResponse(
+            payload={
+                "choices": [{"message": {"content": "정상 응답"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.001},
+            }
+        )
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
+            patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+            patch.object(
+                websochat_llm,
+                "persist_ai_provider_usage_async",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("telemetry unavailable"),
+            ),
+        ):
+            reply = await websochat_llm.call_websochat_openrouter(
+                model="google/gemma-4-31b-it",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+                stream=False,
+                usage_operation=websochat_llm.AiProviderUsageOperation(
+                    feature_key="websochat",
+                    stage_key="qa_reply",
+                ),
+            )
+
+        self.assertEqual(reply, "정상 응답")
+
+    async def test_caller_validation_failure_is_recorded_without_changing_reply(self):
+        _FakeOpenRouterAsyncClient.post_response = _FakeOpenRouterResponse(
+            payload={
+                "choices": [{"message": {"content": "형식 불일치 응답"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.001},
+            }
+        )
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
+            patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+            patch.object(
+                websochat_llm,
+                "persist_ai_provider_usage_async",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as persist_usage,
+        ):
+            reply = await websochat_llm.call_websochat_openrouter(
+                model="google/gemma-4-31b-it",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+                stream=False,
+                usage_operation=websochat_llm.AiProviderUsageOperation(
+                    feature_key="websochat",
+                    stage_key="character_chat_choices",
+                ),
+                usage_result_validator=lambda _value: False,
+            )
+
+        self.assertEqual(reply, "형식 불일치 응답")
+        self.assertEqual(
+            persist_usage.await_args.args[0].attempt_status,
+            "validation_error",
+        )
+
     async def test_openrouter_stream_parses_delta_and_done(self):
         _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(
             lines=[
@@ -305,12 +370,23 @@ class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
             patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+            patch.object(
+                websochat_llm,
+                "persist_ai_provider_usage_async",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as persist_usage,
         ):
             reply = await websochat_llm.call_websochat_openrouter(
                 model="google/gemma-4-31b-it",
                 system_prompt="system",
                 messages=[{"role": "user", "content": "질문"}],
                 stream=True,
+                usage_operation=websochat_llm.AiProviderUsageOperation(
+                    feature_key="websochat",
+                    stage_key="qa_reply",
+                    product_id=123,
+                ),
             )
 
         self.assertEqual(reply, "재시도 응답")
@@ -318,6 +394,36 @@ class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
             [call["kind"] for call in _FakeOpenRouterAsyncClient.calls],
             ["stream", "post"],
         )
+        records = [call.args[0] for call in persist_usage.await_args_list]
+        self.assertEqual([record.attempt_no for record in records], [1, 2])
+        self.assertEqual(
+            [record.attempt_status for record in records],
+            ["empty_response", "success"],
+        )
+        self.assertEqual(records[0].operation_id, records[1].operation_id)
+
+    async def test_openrouter_local_config_rejection_creates_no_physical_call_row(self):
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", ""),
+            patch.object(
+                websochat_llm,
+                "persist_ai_provider_usage_async",
+                new_callable=AsyncMock,
+            ) as persist_usage,
+        ):
+            with self.assertRaises(CustomResponseException):
+                await websochat_llm.call_websochat_openrouter(
+                    model="google/gemma-4-31b-it",
+                    system_prompt="system",
+                    messages=[{"role": "user", "content": "질문"}],
+                    stream=False,
+                    usage_operation=websochat_llm.AiProviderUsageOperation(
+                        feature_key="websochat",
+                        stage_key="qa_reply",
+                    ),
+                )
+
+        persist_usage.assert_not_awaited()
 
     async def test_openrouter_without_key_does_not_fallback_to_gemini(self):
         with (

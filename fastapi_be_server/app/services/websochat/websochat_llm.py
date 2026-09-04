@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from fastapi import status
 
 from app.const import settings
 from app.exceptions import CustomResponseException
+from app.services.common.ai_provider_usage import (
+    AiProviderUsageAttempt,
+    AiProviderUsageOperation,
+    build_ai_provider_usage_record,
+    persist_ai_provider_usage_async,
+)
 from app.services.websochat.websochat_stream import emit_websochat_stream_delta, is_websochat_stream_enabled
 from app.services.websochat.websochat_model_catalog import (
     WEBSOCHAT_DEFAULT_MODEL_KEY,
@@ -30,6 +37,71 @@ WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE = "AI 답변을 불러오지 못했어
 WEBSOCHAT_AI_PROVIDER_LIMITED_MESSAGE = "지금은 AI 생성 요청이 많아 답변을 완성하지 못했어요. 잠시 후 다시 시도해 주세요."
 WEBSOCHAT_AI_PROVIDER_AUTH_MESSAGE = "AI 생성 설정을 확인하는 중이에요. 잠시 후 다시 시도해 주세요."
 WEBSOCHAT_AI_PROVIDER_TIMEOUT_MESSAGE = "생성 시간이 길어져 답변을 마치지 못했어요. 조금 뒤 다시 시도해 주세요."
+
+
+def _websochat_attempt_status_from_exception(exc: BaseException) -> str:
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, json.JSONDecodeError):
+        return "parse_error"
+    if isinstance(exc, CustomResponseException):
+        if exc.code == "AI_PROVIDER_EMPTY_RESPONSE":
+            return "empty_response"
+        if exc.code == "AI_PROVIDER_TIMEOUT":
+            return "timeout"
+        return "provider_error"
+    if isinstance(exc, httpx.HTTPError):
+        return "provider_error"
+    return "internal_error"
+
+
+async def _persist_websochat_attempt(
+    attempt: AiProviderUsageAttempt,
+    *,
+    attempt_status: str,
+    response_json: dict[str, Any] | None = None,
+    response_headers: object | None = None,
+    http_status: int | None = None,
+    error_code: str | None = None,
+) -> None:
+    try:
+        await asyncio.wait_for(
+            persist_ai_provider_usage_async(
+                build_ai_provider_usage_record(
+                    attempt,
+                    status=attempt_status,
+                    response_json=response_json,
+                    response_headers=response_headers,
+                    http_status=http_status,
+                    error_code=error_code,
+                )
+            ),
+            timeout=2.0,
+        )
+    except Exception as exc:
+        logger.error(
+            "ai_provider_usage persist_failed feature=websochat stage=%s call_id=%s db_error_class=%s",
+            attempt.stage_key,
+            attempt.call_id,
+            type(exc).__name__,
+        )
+
+
+def _classify_websochat_reply_status(
+    reply: str,
+    validator: Callable[[str], bool] | None,
+) -> str:
+    if not reply:
+        return "empty_response"
+    if validator is None:
+        return "success"
+    try:
+        return "success" if validator(reply) else "validation_error"
+    except Exception:
+        logger.exception("websochat usage result validator failed")
+        return "validation_error"
 
 
 def to_websochat_gemini_contents(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -248,6 +320,8 @@ async def _call_websochat_openrouter_stream(
     temperature: float,
     timeout_seconds: float,
     stream_state: dict[str, bool],
+    usage_operation: AiProviderUsageOperation,
+    usage_result_validator: Callable[[str], bool] | None,
 ) -> str:
     payload = {
         "model": model,
@@ -259,7 +333,15 @@ async def _call_websochat_openrouter_stream(
     }
     accumulated = ""
     latest_usage_event: dict[str, Any] = {}
-    started_at = monotonic()
+    response_headers: object | None = None
+    http_status: int | None = None
+    attempt_status = "internal_error"
+    error_code: str | None = None
+    usage_attempt = usage_operation.start_attempt(
+        provider="openrouter",
+        requested_model=model,
+        request_mode="stream",
+    )
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             async with client.stream(
@@ -272,8 +354,14 @@ async def _call_websochat_openrouter_stream(
                 },
                 json=payload,
             ) as response:
+                http_status = response.status_code
+                response_headers = getattr(response, "headers", None)
                 if response.status_code != 200:
                     error_text = await response.aread()
+                    error_code = _classify_websochat_provider_error(
+                        response.status_code,
+                        error_text,
+                    )[0]
                     _raise_websochat_provider_error(
                         response.status_code,
                         error_text,
@@ -292,6 +380,7 @@ async def _call_websochat_openrouter_stream(
                     except json.JSONDecodeError:
                         continue
                     if event_json.get("error"):
+                        error_code = "AI_PROVIDER_UNAVAILABLE"
                         _raise_websochat_openrouter_event_error(
                             event_json["error"],
                             operation="chat/completions stream",
@@ -307,34 +396,64 @@ async def _call_websochat_openrouter_stream(
                         stream_state["emitted"] = True
                         await emit_websochat_stream_delta(chunk)
                         accumulated += chunk
-    except CustomResponseException:
+    except CustomResponseException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = error_code or exc.code
         raise
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = "AI_PROVIDER_TIMEOUT"
         _raise_websochat_provider_timeout(
             operation="chat/completions stream",
             provider="OpenRouter",
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = "AI_PROVIDER_UNAVAILABLE"
         logger.exception("OpenRouter chat/completions stream HTTP error")
         raise CustomResponseException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             code="AI_PROVIDER_UNAVAILABLE",
             message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
         )
-    _log_websochat_openrouter_usage(
-        operation="chat/completions stream",
-        response_json=latest_usage_event,
-        elapsed_seconds=monotonic() - started_at,
-        model=model,
-    )
-    reply = sanitize_websochat_model_text(accumulated)
-    if not reply:
-        raise CustomResponseException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            code="AI_PROVIDER_EMPTY_RESPONSE",
-            message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+    except asyncio.CancelledError:
+        attempt_status = "cancelled"
+        error_code = "CANCELLED"
+        raise
+    except BaseException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = type(exc).__name__
+        raise
+    else:
+        reply = sanitize_websochat_model_text(accumulated)
+        if not reply:
+            attempt_status = "empty_response"
+            error_code = "AI_PROVIDER_EMPTY_RESPONSE"
+            raise CustomResponseException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                code="AI_PROVIDER_EMPTY_RESPONSE",
+                message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+            )
+        attempt_status = _classify_websochat_reply_status(
+            reply,
+            usage_result_validator,
         )
-    return reply
+        return reply
+    finally:
+        _log_websochat_openrouter_usage(
+            operation="chat/completions stream",
+            response_json=latest_usage_event,
+            elapsed_seconds=monotonic() - usage_attempt.started_monotonic,
+            model=model,
+        )
+        await _persist_websochat_attempt(
+            usage_attempt,
+            attempt_status=attempt_status,
+            response_json=latest_usage_event,
+            response_headers=response_headers,
+            http_status=http_status,
+            error_code=error_code,
+        )
 
 
 async def call_websochat_openrouter(
@@ -346,6 +465,8 @@ async def call_websochat_openrouter(
     temperature: float = WEBSOCHAT_QA_TEMPERATURE,
     stream: bool | None = None,
     timeout_seconds: float = WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
+    usage_operation: AiProviderUsageOperation | None = None,
+    usage_result_validator: Callable[[str], bool] | None = None,
 ) -> str:
     if not settings.OPENROUTER_API_KEY:
         raise CustomResponseException(
@@ -361,6 +482,10 @@ async def call_websochat_openrouter(
         )
 
     stream_enabled = is_websochat_stream_enabled() if stream is None else stream
+    operation = usage_operation or AiProviderUsageOperation(
+        feature_key="websochat",
+        stage_key="chat",
+    )
     if stream_enabled:
         stream_state = {"emitted": False}
         try:
@@ -372,6 +497,8 @@ async def call_websochat_openrouter(
                 temperature=temperature,
                 timeout_seconds=timeout_seconds,
                 stream_state=stream_state,
+                usage_operation=operation,
+                usage_result_validator=usage_result_validator,
             )
         except CustomResponseException as exc:
             if stream_state["emitted"] or exc.code != "AI_PROVIDER_EMPTY_RESPONSE":
@@ -398,7 +525,16 @@ async def call_websochat_openrouter(
         "temperature": temperature,
         "stream": False,
     }
-    started_at = monotonic()
+    response_json: dict[str, Any] = {}
+    response_headers: object | None = None
+    http_status: int | None = None
+    attempt_status = "internal_error"
+    error_code: str | None = None
+    usage_attempt = operation.start_attempt(
+        provider="openrouter",
+        requested_model=model,
+        request_mode="nonstream",
+    )
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(
@@ -410,45 +546,84 @@ async def call_websochat_openrouter(
                 },
                 json=payload,
             )
-    except httpx.TimeoutException:
+        http_status = response.status_code
+        response_headers = getattr(response, "headers", None)
+        if response.status_code != 200:
+            error_code = _classify_websochat_provider_error(
+                response.status_code,
+                response.text,
+            )[0]
+            _raise_websochat_provider_error(
+                response.status_code,
+                response.text,
+                operation="chat/completions",
+                provider="OpenRouter",
+            )
+        response_json = response.json()
+        if response_json.get("error"):
+            error_code = "AI_PROVIDER_UNAVAILABLE"
+            _raise_websochat_openrouter_event_error(
+                response_json["error"],
+                operation="chat/completions",
+            )
+        reply = _extract_websochat_openrouter_text(response_json)
+        if not reply:
+            attempt_status = "empty_response"
+            error_code = "AI_PROVIDER_EMPTY_RESPONSE"
+            raise CustomResponseException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                code="AI_PROVIDER_EMPTY_RESPONSE",
+                message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+            )
+        attempt_status = _classify_websochat_reply_status(
+            reply,
+            usage_result_validator,
+        )
+        return reply
+    except httpx.TimeoutException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = "AI_PROVIDER_TIMEOUT"
         _raise_websochat_provider_timeout(
             operation="chat/completions",
             provider="OpenRouter",
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = "AI_PROVIDER_UNAVAILABLE"
         logger.exception("OpenRouter chat/completions HTTP error")
         raise CustomResponseException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             code="AI_PROVIDER_UNAVAILABLE",
             message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
         )
-    if response.status_code != 200:
-        _raise_websochat_provider_error(
-            response.status_code,
-            response.text,
+    except CustomResponseException as exc:
+        if attempt_status == "internal_error":
+            attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = error_code or exc.code
+        raise
+    except asyncio.CancelledError:
+        attempt_status = "cancelled"
+        error_code = "CANCELLED"
+        raise
+    except BaseException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = type(exc).__name__
+        raise
+    finally:
+        _log_websochat_openrouter_usage(
             operation="chat/completions",
-            provider="OpenRouter",
+            response_json=response_json,
+            elapsed_seconds=monotonic() - usage_attempt.started_monotonic,
+            model=model,
         )
-    response_json = response.json()
-    if response_json.get("error"):
-        _raise_websochat_openrouter_event_error(
-            response_json["error"],
-            operation="chat/completions",
+        await _persist_websochat_attempt(
+            usage_attempt,
+            attempt_status=attempt_status,
+            response_json=response_json,
+            response_headers=response_headers,
+            http_status=http_status,
+            error_code=error_code,
         )
-    _log_websochat_openrouter_usage(
-        operation="chat/completions",
-        response_json=response_json,
-        elapsed_seconds=monotonic() - started_at,
-        model=model,
-    )
-    reply = _extract_websochat_openrouter_text(response_json)
-    if not reply:
-        raise CustomResponseException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            code="AI_PROVIDER_EMPTY_RESPONSE",
-            message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
-        )
-    return reply
 
 
 async def _call_websochat_gemini_stream(
@@ -459,6 +634,8 @@ async def _call_websochat_gemini_stream(
     temperature: float,
     thinking_level: WebsochatThinkingLevel,
     timeout_seconds: float = WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
+    usage_operation: AiProviderUsageOperation,
+    usage_result_validator: Callable[[str], bool] | None,
 ) -> str:
     payload: dict[str, Any] = {
         "systemInstruction": {
@@ -473,49 +650,91 @@ async def _call_websochat_gemini_stream(
     }
     accumulated = ""
     latest_usage_event: dict[str, Any] = {}
-    started_at = monotonic()
-    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        async with client.stream(
-            "POST",
-            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.WEBSOCHAT_GEMINI_MODEL}:streamGenerateContent?alt=sse",
-            headers={
-                "content-type": "application/json",
-                "x-goog-api-key": settings.GEMINI_API_KEY,
-            },
-            json=payload,
-        ) as response:
-            if response.status_code != 200:
-                error_text = await response.aread()
-                _raise_websochat_provider_error(
-                    response.status_code,
-                    error_text,
-                    operation="streamGenerateContent",
-                )
-            async for raw_line in response.aiter_lines():
-                line = str(raw_line or "").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload_text = line[5:].strip()
-                if not payload_text:
-                    continue
-                try:
-                    event_json = json.loads(payload_text)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(event_json.get("usageMetadata"), dict):
-                    latest_usage_event = event_json
-                current_text = extract_websochat_gemini_text(event_json)
-                delta = _compute_websochat_stream_delta(accumulated, current_text)
-                if delta:
-                    await emit_websochat_stream_delta(delta)
-                    accumulated += delta
-    _log_websochat_gemini_usage(
-        operation="streamGenerateContent",
-        response_json=latest_usage_event,
-        elapsed_seconds=monotonic() - started_at,
-        thinking_level=thinking_level,
+    response_headers: object | None = None
+    http_status: int | None = None
+    attempt_status = "internal_error"
+    error_code: str | None = None
+    usage_attempt = usage_operation.start_attempt(
+        provider="gemini",
+        requested_model=settings.WEBSOCHAT_GEMINI_MODEL,
+        request_mode="stream",
     )
-    return accumulated.strip()
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            async with client.stream(
+                "POST",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{settings.WEBSOCHAT_GEMINI_MODEL}:streamGenerateContent?alt=sse",
+                headers={
+                    "content-type": "application/json",
+                    "x-goog-api-key": settings.GEMINI_API_KEY,
+                },
+                json=payload,
+            ) as response:
+                http_status = response.status_code
+                response_headers = getattr(response, "headers", None)
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    error_code = _classify_websochat_provider_error(
+                        response.status_code,
+                        error_text,
+                    )[0]
+                    _raise_websochat_provider_error(
+                        response.status_code,
+                        error_text,
+                        operation="streamGenerateContent",
+                    )
+                async for raw_line in response.aiter_lines():
+                    line = str(raw_line or "").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload_text = line[5:].strip()
+                    if not payload_text:
+                        continue
+                    try:
+                        event_json = json.loads(payload_text)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event_json.get("usageMetadata"), dict):
+                        latest_usage_event = event_json
+                    current_text = extract_websochat_gemini_text(event_json)
+                    delta = _compute_websochat_stream_delta(accumulated, current_text)
+                    if delta:
+                        await emit_websochat_stream_delta(delta)
+                        accumulated += delta
+        reply = accumulated.strip()
+        attempt_status = _classify_websochat_reply_status(
+            reply,
+            usage_result_validator,
+        )
+        error_code = None if reply else "AI_PROVIDER_EMPTY_RESPONSE"
+        return reply
+    except CustomResponseException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = error_code or exc.code
+        raise
+    except asyncio.CancelledError:
+        attempt_status = "cancelled"
+        error_code = "CANCELLED"
+        raise
+    except BaseException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = type(exc).__name__
+        raise
+    finally:
+        _log_websochat_gemini_usage(
+            operation="streamGenerateContent",
+            response_json=latest_usage_event,
+            elapsed_seconds=monotonic() - usage_attempt.started_monotonic,
+            thinking_level=thinking_level,
+        )
+        await _persist_websochat_attempt(
+            usage_attempt,
+            attempt_status=attempt_status,
+            response_json=latest_usage_event,
+            response_headers=response_headers,
+            http_status=http_status,
+            error_code=error_code,
+        )
 
 
 async def call_websochat_gemini(
@@ -527,6 +746,8 @@ async def call_websochat_gemini(
     stream: bool | None = None,
     timeout_seconds: float = WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
     thinking_level: WebsochatThinkingLevel = "minimal",
+    usage_operation: AiProviderUsageOperation | None = None,
+    usage_result_validator: Callable[[str], bool] | None = None,
 ) -> str:
     if not settings.GEMINI_API_KEY:
         raise CustomResponseException(
@@ -535,6 +756,10 @@ async def call_websochat_gemini(
             message=WEBSOCHAT_AI_PROVIDER_AUTH_MESSAGE,
         )
 
+    operation = usage_operation or AiProviderUsageOperation(
+        feature_key="websochat",
+        stage_key="chat",
+    )
     stream_enabled = is_websochat_stream_enabled() if stream is None else stream
     if stream_enabled:
         try:
@@ -545,6 +770,8 @@ async def call_websochat_gemini(
                 temperature=temperature,
                 thinking_level=thinking_level,
                 timeout_seconds=timeout_seconds,
+                usage_operation=operation,
+                usage_result_validator=usage_result_validator,
             )
         except CustomResponseException:
             raise
@@ -563,7 +790,16 @@ async def call_websochat_gemini(
         },
     }
 
-    started_at = monotonic()
+    response_json: dict[str, Any] = {}
+    response_headers: object | None = None
+    http_status: int | None = None
+    attempt_status = "internal_error"
+    error_code: str | None = None
+    usage_attempt = operation.start_attempt(
+        provider="gemini",
+        requested_model=settings.WEBSOCHAT_GEMINI_MODEL,
+        request_mode="nonstream",
+    )
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(
@@ -574,9 +810,41 @@ async def call_websochat_gemini(
                 },
                 json=payload,
             )
-    except httpx.TimeoutException:
+        http_status = response.status_code
+        response_headers = getattr(response, "headers", None)
+        if response.status_code != 200:
+            error_code = _classify_websochat_provider_error(
+                response.status_code,
+                response.text,
+            )[0]
+            _raise_websochat_provider_error(
+                response.status_code,
+                response.text,
+                operation="generateContent",
+            )
+
+        response_json = response.json()
+        reply = extract_websochat_gemini_text(response_json)
+        if not reply:
+            attempt_status = "empty_response"
+            error_code = "AI_PROVIDER_EMPTY_RESPONSE"
+            raise CustomResponseException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                code="AI_PROVIDER_EMPTY_RESPONSE",
+                message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+            )
+        attempt_status = _classify_websochat_reply_status(
+            reply,
+            usage_result_validator,
+        )
+        return reply
+    except httpx.TimeoutException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = "AI_PROVIDER_TIMEOUT"
         _raise_websochat_provider_timeout(operation="generateContent")
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = "AI_PROVIDER_UNAVAILABLE"
         logger.exception("Gemini generateContent API HTTP error")
         raise CustomResponseException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -584,28 +852,34 @@ async def call_websochat_gemini(
             message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
         )
 
-    if response.status_code != 200:
-        _raise_websochat_provider_error(
-            response.status_code,
-            response.text,
+    except CustomResponseException as exc:
+        if attempt_status == "internal_error":
+            attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = error_code or exc.code
+        raise
+    except asyncio.CancelledError:
+        attempt_status = "cancelled"
+        error_code = "CANCELLED"
+        raise
+    except BaseException as exc:
+        attempt_status = _websochat_attempt_status_from_exception(exc)
+        error_code = type(exc).__name__
+        raise
+    finally:
+        _log_websochat_gemini_usage(
             operation="generateContent",
+            response_json=response_json,
+            elapsed_seconds=monotonic() - usage_attempt.started_monotonic,
+            thinking_level=thinking_level,
         )
-
-    response_json = response.json()
-    _log_websochat_gemini_usage(
-        operation="generateContent",
-        response_json=response_json,
-        elapsed_seconds=monotonic() - started_at,
-        thinking_level=thinking_level,
-    )
-    reply = extract_websochat_gemini_text(response_json)
-    if not reply:
-        raise CustomResponseException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            code="AI_PROVIDER_EMPTY_RESPONSE",
-            message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+        await _persist_websochat_attempt(
+            usage_attempt,
+            attempt_status=attempt_status,
+            response_json=response_json,
+            response_headers=response_headers,
+            http_status=http_status,
+            error_code=error_code,
         )
-    return reply
 
 
 async def call_websochat_model(
@@ -617,9 +891,25 @@ async def call_websochat_model(
     temperature: float = WEBSOCHAT_QA_TEMPERATURE,
     stream: bool | None = None,
     timeout_seconds: float = WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
+    usage_feature_key: str = "websochat",
+    usage_stage_key: str = "chat",
+    usage_product_id: int | None = None,
+    usage_episode_id: int | None = None,
+    usage_session_id: str | None = None,
+    usage_scope_key: str | None = None,
+    usage_operation: AiProviderUsageOperation | None = None,
+    usage_result_validator: Callable[[str], bool] | None = None,
 ) -> str:
     spec = get_websochat_model_spec(model_key)
     generic_messages = _to_websochat_generic_messages(messages)
+    operation = usage_operation or AiProviderUsageOperation(
+        feature_key=usage_feature_key,
+        stage_key=usage_stage_key,
+        product_id=usage_product_id,
+        episode_id=usage_episode_id,
+        session_id=usage_session_id,
+        scope_key=usage_scope_key,
+    )
     if spec.provider == "openrouter":
         return await call_websochat_openrouter(
             model=spec.provider_model,
@@ -629,6 +919,8 @@ async def call_websochat_model(
             temperature=temperature,
             stream=stream,
             timeout_seconds=timeout_seconds,
+            usage_operation=operation,
+            usage_result_validator=usage_result_validator,
         )
     return await call_websochat_gemini(
         system_prompt=system_prompt,
@@ -638,4 +930,6 @@ async def call_websochat_model(
         stream=stream,
         timeout_seconds=timeout_seconds,
         thinking_level=spec.thinking_level or "minimal",
+        usage_operation=operation,
+        usage_result_validator=usage_result_validator,
     )

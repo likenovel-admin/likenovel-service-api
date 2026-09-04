@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, TypedDict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.common.ai_provider_usage import AiProviderUsageOperation
 from app.services.ai.ai_chat_service import _call_claude_messages, _extract_text, _extract_tool_use_blocks, _to_json_safe
 from app.services.websochat.websochat_contracts import (
     WebsochatEvidenceBundle,
@@ -1223,6 +1224,7 @@ async def _retry_websochat_next_episode_write_with_gemini(
     system_prompt: str,
     messages: list[dict[str, str]],
     model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
+    usage_operation: AiProviderUsageOperation | None = None,
 ) -> str:
     retry_messages = list(messages)
     retry_messages.append(
@@ -1241,6 +1243,8 @@ async def _retry_websochat_next_episode_write_with_gemini(
         max_tokens=WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS,
         temperature=WEBSOCHAT_CREATIVE_TEMPERATURE,
         timeout_seconds=WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS,
+        usage_operation=usage_operation,
+        usage_result_validator=lambda value: len(value) >= WEBSOCHAT_NEXT_EPISODE_WRITE_MIN_CHARS,
     )
 
 
@@ -1544,6 +1548,12 @@ async def _generate_websochat_reply_with_gemini(
     if is_next_episode_write_query:
         await db.rollback()
 
+    usage_operation = AiProviderUsageOperation(
+        feature_key="websochat",
+        stage_key="next_episode_write" if is_next_episode_write_query else "qa_reply",
+        product_id=int(product_row.get("productId") or 0) or None,
+        scope_key=str(qa_subtype or "") or None,
+    )
     reply = await call_websochat_model(
         model_key=model_key,
         system_prompt=system_prompt,
@@ -1551,6 +1561,12 @@ async def _generate_websochat_reply_with_gemini(
         max_tokens=WEBSOCHAT_NEXT_EPISODE_WRITE_MAX_TOKENS if is_next_episode_write_query else WEBSOCHAT_REPLY_MAX_TOKENS,
         temperature=WEBSOCHAT_CREATIVE_TEMPERATURE if (is_predict_query or is_next_episode_write_query) else WEBSOCHAT_QA_TEMPERATURE,
         timeout_seconds=WEBSOCHAT_NEXT_EPISODE_WRITE_TIMEOUT_SECONDS if is_next_episode_write_query else WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
+        usage_operation=usage_operation,
+        usage_result_validator=(
+            (lambda value: len(value) >= WEBSOCHAT_NEXT_EPISODE_WRITE_MIN_CHARS)
+            if is_next_episode_write_query
+            else None
+        ),
     )
     clarify_retry_count = 0
     entity_grounding_retry_count = 0
@@ -1576,6 +1592,7 @@ async def _generate_websochat_reply_with_gemini(
             messages=messages,
             max_tokens=WEBSOCHAT_REPLY_MAX_TOKENS,
             temperature=WEBSOCHAT_QA_TEMPERATURE,
+            usage_operation=usage_operation,
         )
     while (
         not is_predict_query
@@ -1609,6 +1626,7 @@ async def _generate_websochat_reply_with_gemini(
             messages=messages,
             max_tokens=WEBSOCHAT_REPLY_MAX_TOKENS,
             temperature=WEBSOCHAT_QA_TEMPERATURE,
+            usage_operation=usage_operation,
         )
     if (
         qa_subtype == "can_it_work_logic"
@@ -1629,6 +1647,7 @@ async def _generate_websochat_reply_with_gemini(
             system_prompt=system_prompt,
             messages=messages,
             model_key=model_key,
+            usage_operation=usage_operation,
         )
         if len(retry_reply) >= len(reply):
             return retry_reply, referenced_episode_nos

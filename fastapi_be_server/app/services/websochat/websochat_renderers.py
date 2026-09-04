@@ -15,12 +15,15 @@ async def call_websochat_game_host_model(
     system_prompt: str,
     user_prompt: str,
     model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
+    product_id: int | None = None,
 ) -> str:
     return await call_websochat_model(
         model_key=model_key,
         system_prompt=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
         max_tokens=640,
+        usage_stage_key="game_host_reply",
+        usage_product_id=product_id,
     )
 
 
@@ -69,6 +72,10 @@ async def generate_websochat_vs_comparison(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         model_key=model_key,
+        product_id=int(
+            product_row.get("productId") or product_row.get("product_id") or 0
+        )
+        or None,
     )
 
 

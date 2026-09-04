@@ -8,6 +8,7 @@ from fastapi import status
 
 from app.exceptions import CustomResponseException
 from app.services.ai.ai_chat_service import _call_claude_messages, _extract_text
+from app.services.common.ai_provider_usage import AiProviderUsageOperation
 from app.services.websochat.websochat_context_loader import (
     _is_websochat_character_entry_context_v2,
 )
@@ -563,6 +564,12 @@ async def generate_character_chat_adjacent_opening_with_gemini(
             message="이 읽은 범위의 캐릭터챗 시작 장면이 아직 준비되지 않았습니다.",
         )
     entry_context = rp_context["character_chat_entry_context"]
+    usage_operation = AiProviderUsageOperation(
+        feature_key="websochat",
+        stage_key="character_chat_opening",
+        product_id=int(entry_context.get("product_id") or 0) or None,
+        scope_key=str(rp_context.get("active_character") or "").strip() or None,
+    )
     for attempt in range(2):
         user_instruction = "요구한 캐릭터챗 첫 장면 본문을 생성해 주세요."
         if attempt:
@@ -577,6 +584,10 @@ async def generate_character_chat_adjacent_opening_with_gemini(
             max_tokens=WEBSOCHAT_CHARACTER_OPENING_MAX_TOKENS,
             temperature=0.7,
             stream=False,
+            usage_operation=usage_operation,
+            usage_result_validator=lambda value: bool(
+                _normalize_character_chat_opening_text(value)
+            ),
         )
         opening_text = _normalize_character_chat_opening_text(raw_reply)
         if opening_text:
@@ -1189,6 +1200,9 @@ async def generate_websochat_rp_reply_with_gemini(
 ) -> str:
     messages = list(recent_messages)
     messages.append({"role": "user", "content": user_prompt})
+    product_id = int(
+        product_row.get("productId") or product_row.get("product_id") or 0
+    )
     return await call_websochat_model(
         model_key=model_key,
         system_prompt=build_websochat_rp_system_prompt(
@@ -1200,6 +1214,9 @@ async def generate_websochat_rp_reply_with_gemini(
         messages=messages,
         max_tokens=WEBSOCHAT_RP_REPLY_MAX_TOKENS,
         temperature=WEBSOCHAT_RP_TEMPERATURE,
+        usage_stage_key="character_chat_reply",
+        usage_product_id=product_id or None,
+        usage_scope_key=str(rp_context.get("active_character") or "").strip() or None,
     )
 
 

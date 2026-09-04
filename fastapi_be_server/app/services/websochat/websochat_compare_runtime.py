@@ -242,6 +242,12 @@ async def select_websochat_game_candidates(
             system_prompt=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
             max_tokens=240,
+            usage_feature_key="websochat_eval",
+            usage_stage_key="game_candidate_selection",
+            usage_product_id=int(
+                product_row.get("productId") or product_row.get("product_id") or 0
+            )
+            or None,
         )
         payload = _extract_websochat_json_object(response) or {}
         selected_scope_keys = _normalize_websochat_string_list(payload.get("candidate_scope_keys"), limit=safe_count)

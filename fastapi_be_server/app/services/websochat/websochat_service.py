@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from app.const import ErrorMessages, settings
 from app.exceptions import CustomResponseException
 from app.rdb import likenovel_db_engine
+from app.services.common.ai_provider_usage import AiProviderUsageOperation
 from app.schemas.websochat import (
     PostWebsochatMessageReqBody,
     PostWebsochatCharacterChoicesReqBody,
@@ -246,6 +247,8 @@ async def _call_websochat_model_json(
     user_prompt: str,
     max_tokens: int,
     model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
+    usage_stage_key: str = "internal_json",
+    usage_product_id: int | None = None,
 ) -> dict[str, Any]:
     raw_reply = await call_websochat_model(
         model_key=model_key,
@@ -254,6 +257,12 @@ async def _call_websochat_model_json(
         max_tokens=max_tokens,
         temperature=0.1,
         stream=False,
+        usage_stage_key=usage_stage_key,
+        usage_product_id=usage_product_id,
+        usage_result_validator=lambda value: isinstance(
+            _extract_websochat_json_object(value),
+            dict,
+        ),
     )
     parsed = _extract_websochat_json_object(raw_reply)
     return parsed if isinstance(parsed, dict) else {}
@@ -1759,6 +1768,7 @@ async def _resolve_websochat_active_character_with_model(
             ),
             max_tokens=WEBSOCHAT_ACTIVE_CHARACTER_RESOLUTION_MAX_TOKENS,
             model_key=model_spec.model_key,
+            usage_stage_key="active_character_resolution",
         )
         raw_scope_key = str(tool_input.get("scope_key") or "").strip()
         try:
@@ -6136,6 +6146,11 @@ async def _resolve_websochat_reference(
         user_prompt="JSON만 반환해.",
         max_tokens=WEBSOCHAT_REFERENCE_RESOLUTION_MAX_TOKENS,
         model_key=model_key,
+        usage_stage_key="reference_resolution",
+        usage_product_id=int(
+            product_row.get("productId") or product_row.get("product_id") or 0
+        )
+        or None,
     )
     if not parsed:
         return None
@@ -6290,6 +6305,7 @@ async def _resolve_websochat_qa_corrections(
         user_prompt=f"현재 사용자 발화: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_QA_CORRECTION_MAX_TOKENS,
         model_key=model_key,
+        usage_stage_key="qa_correction",
     )
     raw_has_corrections = parsed.get("has_corrections")
     if isinstance(raw_has_corrections, bool):
@@ -6357,6 +6373,7 @@ async def _resolve_websochat_intent(
         user_prompt=f"질문: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_INTENT_MAX_TOKENS,
         model_key=model_key,
+        usage_stage_key="intent_routing",
     )
     intent = str(parsed.get("intent") or "").strip().lower()
     if intent not in WEBSOCHAT_ALLOWED_INTENTS:
@@ -6405,6 +6422,7 @@ async def _resolve_websochat_rp_recall_need(
         user_prompt=f"질문: {user_prompt}\n\nJSON만 반환해.",
         max_tokens=WEBSOCHAT_RP_RECALL_DECISION_MAX_TOKENS,
         model_key=model_key,
+        usage_stage_key="rp_recall_decision",
     )
     raw_needs_exact_recall = parsed.get("needs_exact_recall")
     if isinstance(raw_needs_exact_recall, bool):
@@ -8756,6 +8774,13 @@ async def post_character_chat_choices(
     choices: list[dict[str, str]] = []
     active_character_label = str(rp_context.get("display_name") or "").strip()
     generation_source = "none"
+    usage_operation = AiProviderUsageOperation(
+        feature_key="websochat",
+        stage_key="character_chat_choices",
+        product_id=int(session_row["product_id"]),
+        session_id=str(session_id),
+        scope_key=locked_character_scope_key,
+    )
     for attempt in range(2):
         attempt_user_prompt = prompt["user"]
         if attempt > 0:
@@ -8774,6 +8799,20 @@ async def post_character_chat_choices(
                 messages=[{"role": "user", "content": attempt_user_prompt}],
                 max_tokens=WEBSOCHAT_CHARACTER_CHAT_CHOICES_MAX_TOKENS,
                 temperature=0.5 if attempt == 0 else 0.65,
+                usage_stage_key="character_chat_choices",
+                usage_product_id=int(session_row["product_id"]),
+                usage_session_id=str(session_id),
+                usage_scope_key=locked_character_scope_key,
+                usage_operation=usage_operation,
+                usage_result_validator=lambda value: len(
+                    _parse_and_validate_websochat_character_chat_choices(
+                        _extract_websochat_json_object(value) or {},
+                        active_character_scope_key=locked_character_scope_key,
+                        active_character_label=active_character_label,
+                        source_assistant_text=str(latest_visible.get("content") or ""),
+                    )
+                )
+                >= 3,
             )
             extracted = _extract_websochat_json_object(raw_reply)
             parsed = extracted if isinstance(extracted, dict) else {}
