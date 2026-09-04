@@ -322,16 +322,161 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(strong_score, weak_score)
 
     def test_missing_product_axis_label_scores_preserves_legacy_match(self):
-        score = recommendation_service.score_taste_for_candidate(
+        candidate = {
+            "protagonist_type": "환생",
+            "protagonist_type_tags": ["환생", "성장형"],
+            "overall_confidence": 0.9,
+        }
+        profile = {"preferred_protagonist": {"환생": 1.0}}
+        score = recommendation_service.score_taste_for_candidate(candidate, profile)
+
+        self.assertGreater(score, 0.0)
+
+    def test_top_level_taste_score_rejects_invalid_overall_and_explicit_low_score(self):
+        profile = {"preferred_protagonist": {"환생": 1.0}}
+        for candidate in (
             {
-                "protagonist_type_tags": ["환생", "성장형"],
-                "overall_confidence": 0.9,
+                "protagonist_type": "환생",
+                "protagonist_type_tags": ["환생"],
+                "overall_confidence": None,
             },
-            {},
-            {"protagonist": {"환생": 6.0}},
+            {
+                "protagonist_type": "환생",
+                "protagonist_type_tags": ["환생"],
+                "overall_confidence": 0.9,
+                "axis_label_scores": {
+                    "타": [{"label": "환생", "score": 0.5}],
+                },
+            },
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    recommendation_service.score_taste_for_candidate(candidate, profile),
+                    0.0,
+                )
+
+    def test_scored_axis_does_not_blend_matching_legacy_field(self):
+        candidate = {
+            "protagonist_type": "환생",
+            "protagonist_type_tags": ["환생"],
+            "overall_confidence": 0.9,
+            "axis_label_scores": {
+                "타": [{"label": "환생", "score": 0.9}],
+            },
+        }
+        profile = {"preferred_protagonist": {"환생": 1.0}}
+
+        self.assertGreater(
+            recommendation_service._score_taste_for_candidate_legacy(candidate, profile),
+            0.0,
+        )
+        self.assertEqual(
+            recommendation_service.score_taste_for_candidate(candidate, profile),
+            recommendation_service._score_taste_for_candidate_by_axes(candidate, profile),
         )
 
-        self.assertEqual(score, 5.0)
+    def test_missing_overall_confidence_drops_product_axis_labels(self):
+        for value in (None, "bad", float("nan"), float("inf"), -0.1, 1.1):
+            with self.subTest(value=value):
+                labels = recommendation_service._collect_product_axis_labels(
+                    {"protagonist_type_tags": ["환생"], "overall_confidence": value},
+                    "type",
+                )
+                self.assertEqual(labels, {})
+
+    def test_invalid_overall_confidence_also_drops_goal_axis(self):
+        labels = recommendation_service._collect_product_axis_labels(
+            {
+                "protagonist_goal_primary": "생존",
+                "goal_confidence": 0.9,
+                "overall_confidence": None,
+            },
+            "goal",
+        )
+
+        self.assertEqual(labels, {})
+
+    def test_explicit_low_product_label_score_is_not_replaced_by_overall_fallback(self):
+        labels = recommendation_service._collect_product_axis_labels(
+            {
+                "protagonist_type_tags": ["환생"],
+                "overall_confidence": 0.9,
+                "axis_label_scores": {"타": [{"label": "환생", "score": 0.5}]},
+            },
+            "type",
+        )
+
+        self.assertEqual(labels, {})
+
+    def test_explicit_low_goal_score_is_not_replaced_by_goal_confidence(self):
+        labels = recommendation_service._collect_product_axis_labels(
+            {
+                "protagonist_goal_primary": "생존",
+                "goal_confidence": 0.9,
+                "overall_confidence": 0.9,
+                "axis_label_scores": {"목": [{"label": "생존", "score": 0.5}]},
+            },
+            "goal",
+        )
+
+        self.assertEqual(labels, {})
+
+    def test_nonempty_score_system_does_not_fallback_missing_or_invalid_labels(self):
+        base = {
+            "protagonist_type_tags": ["환생"],
+            "overall_confidence": 0.9,
+        }
+        for axis_label_scores in (
+            {"타": []},
+            {"세": []},
+            {"타": [{"label": "환생", "score": None}]},
+            {"타": [{"label": "환생", "score": float("nan")}]},
+            {"타": [{"label": "환생", "score": 1.1}]},
+            "not-json",
+            ["wrong-shape"],
+        ):
+            with self.subTest(axis_label_scores=axis_label_scores):
+                labels = recommendation_service._collect_product_axis_labels(
+                    {**base, "axis_label_scores": axis_label_scores},
+                    "type",
+                )
+                self.assertEqual(labels, {})
+
+    def test_axis_label_score_threshold_includes_exact_boundary(self):
+        base = {
+            "protagonist_type_tags": ["환생"],
+            "overall_confidence": 0.9,
+        }
+        below = recommendation_service._collect_product_axis_labels(
+            {
+                **base,
+                "axis_label_scores": {"타": [{"label": "환생", "score": 0.5499}]},
+            },
+            "type",
+        )
+        boundary = recommendation_service._collect_product_axis_labels(
+            {
+                **base,
+                "axis_label_scores": {"타": [{"label": "환생", "score": 0.55}]},
+            },
+            "type",
+        )
+
+        self.assertEqual(below, {})
+        self.assertEqual(boundary, {"환생": 0.55})
+
+    def test_empty_score_system_preserves_legacy_overall_fallback(self):
+        base = {
+            "protagonist_type_tags": ["환생"],
+            "overall_confidence": 0.9,
+        }
+        for axis_label_scores in (None, {}, "{}", ""):
+            with self.subTest(axis_label_scores=axis_label_scores):
+                labels = recommendation_service._collect_product_axis_labels(
+                    {**base, "axis_label_scores": axis_label_scores},
+                    "type",
+                )
+                self.assertEqual(labels, {"환생": 0.9})
 
     def test_product_axis_scores_cannot_inject_unselected_labels(self):
         score = recommendation_service.score_taste_for_candidate(
@@ -570,6 +715,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
             "protagonist_type": "전략가",
             "mood": "긴장감",
             "pacing": "fast",
+            "overall_confidence": 0.9,
             "taste_tags": ["회귀", "정치"],
             "reading_rate": 0.42,
             "writing_count_per_week": 3.0,
@@ -592,6 +738,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
             "protagonist_type": "먼치킨",
             "mood": "유쾌함",
             "pacing": "slow",
+            "overall_confidence": 0.9,
             "taste_tags": ["학원"],
             "reading_rate": 0.75,
             "writing_count_per_week": 4.0,
@@ -636,6 +783,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
             "protagonist_type": "전략가",
             "mood": "긴장감",
             "pacing": "fast",
+            "overall_confidence": 0.9,
             "taste_tags": ["회귀", "정치"],
             "reading_rate": 0.35,
             "writing_count_per_week": 3.0,
@@ -826,6 +974,85 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
         _, query_params = db.execute.await_args.args
         self.assertEqual(query_params["status_code_filter"], "end")
         self.assertEqual(result["product"]["productId"], 777)
+
+    async def test_preset_query_uses_explicit_low_axis_score_without_legacy_fallback(self):
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            return_value=self._FakeMappingsResult(
+                [
+                    {
+                        "product_id": 778,
+                        "title": "낮은 확신 후보",
+                        "status_code": "end",
+                        "count_hit": 700,
+                        "author_nickname": "작가C",
+                        "episode_count": 120,
+                        "cover_url": None,
+                        "protagonist_type": "환생자",
+                        "protagonist_desc": "",
+                        "protagonist_type_tags": ["환생"],
+                        "mood": "긴장감",
+                        "pacing": "fast",
+                        "premise": "완결 후보",
+                        "hook": "",
+                        "themes": [],
+                        "taste_tags": [],
+                        "overall_confidence": 0.9,
+                        "axis_label_scores": {
+                            "타": [{"label": "환생", "score": 0.5}],
+                        },
+                        "reading_rate": 0.41,
+                        "writing_count_per_week": 0.0,
+                        "binge_rate": 0.31,
+                        "total_next_clicks": 11,
+                        "total_readers": 16,
+                        "dropoff_7d": 4,
+                        "reengage_rate": 0.07,
+                        "avg_speed_cpm": 920,
+                        "evaluation_score": 7.0,
+                        "count_hit_indicator": 2,
+                        "count_bookmark_indicator": 1,
+                        "reading_rate_indicator": 0.01,
+                        "current_rank": 0,
+                        "rank_indicator": 0,
+                    }
+                ]
+            )
+        )
+        captured_scores = {}
+        original_builder = recommendation_service._build_preset_candidate_scores
+
+        def capture_scores(*args, **kwargs):
+            scores = original_builder(*args, **kwargs)
+            captured_scores.update(scores)
+            return scores
+
+        with (
+            patch.object(
+                recommendation_service,
+                "_build_preset_candidate_scores",
+                side_effect=capture_scores,
+            ),
+            patch.object(
+                recommendation_service,
+                "_get_condition_first_cohort_scores",
+                AsyncMock(return_value={}),
+            ),
+        ):
+            result = await recommendation_service._preset_recommend(
+                user_id=1,
+                profile={"preferred_protagonist": {"환생": 1.0}},
+                factor_scores={"protagonist": {"환생": 1.0}},
+                preset="completed",
+                exclude_ids=[],
+                adult_yn="N",
+                db=db,
+            )
+
+        query_sql = str(db.execute.await_args.args[0])
+        self.assertIn("m.axis_label_scores", query_sql)
+        self.assertEqual(captured_scores["taste_score"], 0.0)
+        self.assertEqual(result["product"]["productId"], 778)
 
     async def test_good_schedule_preset_fetches_broad_candidates_before_sampling(self):
         db = AsyncMock()

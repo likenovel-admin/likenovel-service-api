@@ -2995,29 +2995,42 @@ def _build_compact_taste_summary(axis_top3: dict[str, list[dict]]) -> str:
     return f"{', '.join(clauses[:-1])}이고, {clauses[-1]}인 작품을 좋아하시는 것 같아요."
 
 
-def _collect_product_axis_labels(dna: dict, axis: str) -> dict[str, float]:
-    if axis == "goal":
-        goal = _normalize_factor_key(dna.get("protagonist_goal_primary"))
-        goal_confidence = _safe_float(dna.get("goal_confidence"), 0.0)
-        if not goal:
-            return {}
-        if goal == "생존" and goal_confidence < 0.6:
-            return {}
-        if goal_confidence < AXIS_CONFIDENCE_THRESHOLD:
-            return {}
-        return {goal: _clamp(goal_confidence, AXIS_CONFIDENCE_THRESHOLD, 1.0)}
+def _valid_product_overall_confidence(dna: dict) -> float | None:
+    raw_overall_confidence = dna.get("overall_confidence")
+    if isinstance(raw_overall_confidence, bool) or not isinstance(
+        raw_overall_confidence, (int, float)
+    ):
+        return None
+    overall_confidence = float(raw_overall_confidence)
+    if (
+        not math.isfinite(overall_confidence)
+        or not 0 <= overall_confidence <= 1
+        or overall_confidence < AXIS_CONFIDENCE_THRESHOLD
+    ):
+        return None
+    return overall_confidence
 
-    overall_confidence = _safe_float(dna.get("overall_confidence"), 1.0)
-    if overall_confidence < AXIS_CONFIDENCE_THRESHOLD:
-        return {}
-    label_score = _clamp(overall_confidence, AXIS_CONFIDENCE_THRESHOLD, 1.0)
 
-    raw_axis_scores = dna.get("axis_label_scores")
-    if isinstance(raw_axis_scores, str):
+def _parse_product_axis_label_scores(raw_value: object) -> tuple[bool, dict | None]:
+    score_system_present = raw_value not in (None, "", {})
+    parsed = raw_value
+    if isinstance(raw_value, str):
         try:
-            raw_axis_scores = json.loads(raw_axis_scores)
+            parsed = json.loads(raw_value)
         except (json.JSONDecodeError, TypeError):
-            raw_axis_scores = {}
+            return score_system_present, None
+        score_system_present = parsed not in (None, "", {})
+    return score_system_present, parsed if isinstance(parsed, dict) else None
+
+
+def _collect_product_axis_labels(dna: dict, axis: str) -> dict[str, float]:
+    overall_confidence = _valid_product_overall_confidence(dna)
+    if overall_confidence is None:
+        return {}
+
+    score_system_present, raw_axis_scores = _parse_product_axis_label_scores(
+        dna.get("axis_label_scores")
+    )
     axis_entries = (
         raw_axis_scores.get(AXIS_CODEBOOK_KEY.get(axis, ""), [])
         if isinstance(raw_axis_scores, dict)
@@ -3029,14 +3042,46 @@ def _collect_product_axis_labels(dna: dict, axis: str) -> dict[str, float]:
             if not isinstance(entry, dict):
                 continue
             raw_label = _normalize_factor_key(entry.get("label"))
-            raw_score = _safe_float(entry.get("score"), 0.0)
-            if not raw_label or raw_score <= 0:
+            if not raw_label:
+                continue
+            raw_score_value = entry.get("score")
+            if isinstance(raw_score_value, bool) or not isinstance(raw_score_value, (int, float)):
+                continue
+            raw_score = float(raw_score_value)
+            if not math.isfinite(raw_score) or not 0 <= raw_score <= 1:
+                continue
+            if raw_score < AXIS_CONFIDENCE_THRESHOLD:
                 continue
             parsed_axis_scores[raw_label] = max(
                 parsed_axis_scores.get(raw_label, 0.0),
-                _clamp(raw_score, 0.0, 1.0),
+                raw_score,
             )
     product_axis_scores = _filter_axis_label_scores(axis, parsed_axis_scores)
+
+    if axis == "goal":
+        goal = _normalize_factor_key(dna.get("protagonist_goal_primary"))
+        if not goal:
+            return {}
+        if score_system_present:
+            goal_confidence = product_axis_scores.get(goal)
+            if goal_confidence is None:
+                return {}
+        else:
+            raw_goal_confidence = dna.get("goal_confidence")
+            if isinstance(raw_goal_confidence, bool) or not isinstance(
+                raw_goal_confidence, (int, float)
+            ):
+                return {}
+            goal_confidence = float(raw_goal_confidence)
+        if not math.isfinite(goal_confidence) or not 0 <= goal_confidence <= 1:
+            return {}
+        if goal == "생존" and goal_confidence < 0.6:
+            return {}
+        if goal_confidence < AXIS_CONFIDENCE_THRESHOLD:
+            return {}
+        return {goal: _clamp(goal_confidence, AXIS_CONFIDENCE_THRESHOLD, 1.0)}
+
+    label_score = _clamp(overall_confidence, AXIS_CONFIDENCE_THRESHOLD, 1.0)
 
     raw_values: list[str] = []
     if axis == "type":
@@ -3062,7 +3107,12 @@ def _collect_product_axis_labels(dna: dict, axis: str) -> dict[str, float]:
         normalized = _normalize_factor_key(raw)
         if not normalized:
             continue
-        score = product_axis_scores.get(normalized, label_score)
+        if score_system_present:
+            score = product_axis_scores.get(normalized)
+            if score is None:
+                continue
+        else:
+            score = label_score
         labels[normalized] = max(labels.get(normalized, 0.0), score)
     return labels
 
@@ -3722,8 +3772,17 @@ def score_taste_for_candidate(
     profile: dict | None,
     factor_scores: dict[str, dict[str, float]] | None = None,
 ) -> float:
-    legacy_score = _score_taste_for_candidate_legacy(candidate, profile)
+    if _valid_product_overall_confidence(candidate) is None:
+        return 0.0
+
+    score_system_present, _ = _parse_product_axis_label_scores(
+        candidate.get("axis_label_scores")
+    )
     axis_score = _score_taste_for_candidate_by_axes(candidate, profile, factor_scores)
+    if score_system_present:
+        return axis_score
+
+    legacy_score = _score_taste_for_candidate_legacy(candidate, profile)
     if axis_score > 0:
         return round(axis_score + (min(legacy_score, 1.5) * 0.2), 4)
     return legacy_score
@@ -4337,7 +4396,7 @@ async def _preset_recommend(
                   AND q.file_group_id = p.thumbnail_file_id)) AS cover_url,
             m.protagonist_type, m.protagonist_desc, m.mood, m.pacing,
             m.premise, m.hook, m.themes, m.taste_tags,
-            m.overall_confidence,
+            m.overall_confidence, m.axis_label_scores,
             m.protagonist_goal_primary, m.goal_confidence,
             m.protagonist_type_tags, m.protagonist_job_tags,
             m.protagonist_material_tags, m.worldview_tags,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -65,6 +66,7 @@ AXIS_LIMITS: dict[str, tuple[int, int]] = {
     "타": (0, 3),
     "목": (0, 1),
 }
+MAX_UNMAPPED_CONCEPTS = 10
 ALLOWED_HEROINE_WEIGHT = {"high", "mid", "low", "none"}
 ALLOWED_PACING = {"fast", "medium", "slow"}
 OPENROUTER_ALLOWED_FINISH_REASONS = {"stop"}
@@ -319,6 +321,7 @@ def get_products(conn, product_id: int | None = None, force: bool = False):
         where = f"""
             p.open_yn = 'Y'
             AND COALESCE(p.blind_yn, 'N') = 'N'
+            AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
             AND COALESCE(u.role_type, 'normal') != 'admin'
             AND COALESCE(TRIM(p.author_name), '') != ''
             AND COALESCE((
@@ -647,6 +650,8 @@ def _normalize_axis_label_scores(
     raw_scores: Any,
     axis_labels: dict[str, list[str]],
     axis_confidence: dict[str, float | None],
+    *,
+    allow_axis_confidence_fallback: bool = True,
 ) -> dict[str, list[dict[str, float]]]:
     if not isinstance(raw_scores, dict):
         raw_scores = {}
@@ -681,7 +686,13 @@ def _normalize_axis_label_scores(
         fallback = axis_confidence.get(axis)
         if fallback is None:
             fallback = 0.0
-        normalized_scores[axis] = [{"label": label, "score": parsed.get(label, fallback)} for label in labels]
+        normalized_scores[axis] = [
+            {"label": label, "score": parsed[label]}
+            if label in parsed
+            else {"label": label, "score": fallback}
+            for label in labels
+            if label in parsed or allow_axis_confidence_fallback
+        ]
 
     return normalized_scores
 
@@ -908,7 +919,7 @@ def _build_openrouter_response_format(allowed_labels: dict[str, set[str]]) -> di
                 "type": "array",
                 "items": {"type": "string"},
                 "minItems": 0,
-                "maxItems": 10,
+                "maxItems": MAX_UNMAPPED_CONCEPTS,
             },
         },
         "required": [
@@ -947,16 +958,206 @@ def _validate_runtime_config(allowed_labels: dict[str, set[str]]) -> None:
 
 # AI 사서 카피 금칙어. "결혼/축제" 같은 정상 단어 오탐을 피하려 결/축은 조사 패턴으로만 검사.
 _LIBRARIAN_BANNED_RE = re.compile(
-    r"결[이을의은]\s|축[이을의]\s|축으로|감각적|텍스트|콘텐츠|신호|라벨"
+    r"(?<![가-힣])결[이을의은](?![가-힣])|축(?:[이을의]|으로)(?![가-힣])|감각적|텍스트|콘텐츠|신호|라벨"
 )
-_SUSPICIOUS_GENERATED_TEXT_RE = re.compile(r"[\u0100-\u024f\u0370-\u052f]")
+_SUSPICIOUS_SCRIPT_TOKEN_RE = re.compile(
+    r"[가-힣A-Za-z\u00c0-\u024f\u0370-\u052f]*"
+    r"[\u00c0-\u024f\u0370-\u052f]"
+    r"[가-힣A-Za-z\u00c0-\u024f\u0370-\u052f]*"
+)
+_SUSPICIOUS_CJK_WINDOW_RE = re.compile(
+    r"(?=([가-힣][\u3400-\u4dbf\u4e00-\u9fff][가-힣]))"
+)
 
 
-def _has_suspicious_generated_text(value: str) -> bool:
-    return bool(_SUSPICIOUS_GENERATED_TEXT_RE.search(value))
+def _suspicious_generated_tokens(value: str) -> set[str]:
+    return {
+        match.group(0) for match in _SUSPICIOUS_SCRIPT_TOKEN_RE.finditer(value)
+    } | {
+        match.group(1) for match in _SUSPICIOUS_CJK_WINDOW_RE.finditer(value)
+    }
 
 
-def _normalize_librarian(summary: dict) -> dict[str, Any]:
+def _has_suspicious_generated_text(value: str, source_text: str = "") -> bool:
+    generated_tokens = _suspicious_generated_tokens(value)
+    if not generated_tokens:
+        return False
+    source_tokens = _suspicious_generated_tokens(source_text)
+    return not generated_tokens.issubset(source_tokens)
+
+
+def _require_payload_keys(value: Any, path: str, required_keys: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{path or 'payload'} must be object")
+    for key in required_keys:
+        if key not in value:
+            prefix = f"{path} " if path else ""
+            raise ValueError(f"{prefix}missing required key: {key}")
+    return value
+
+
+def _collect_unsupported_axis_labels(
+    payload: dict[str, Any],
+    allowed_labels: dict[str, set[str]],
+) -> list[str]:
+    raw_axis_labels = payload.get("axis_labels")
+    if not isinstance(raw_axis_labels, dict):
+        return []
+
+    unsupported: list[str] = []
+    for axis in AXIS_ORDER:
+        labels = raw_axis_labels.get(axis)
+        if not isinstance(labels, list):
+            continue
+        for label in labels:
+            if (
+                isinstance(label, str)
+                and label not in allowed_labels[axis]
+                and label not in unsupported
+            ):
+                unsupported.append(label)
+    return unsupported
+
+
+def _validate_llm_payload_contract(
+    payload: Any,
+    allowed_labels: dict[str, set[str]] | None = None,
+    source_text: str = "",
+) -> None:
+    core_summary_keys = (
+        "protagonist_type",
+        "protagonist_desc",
+        "heroine_type",
+        "heroine_weight",
+        "mood",
+        "pacing",
+        "premise",
+        "hook",
+        "themes",
+        "taste_tags",
+    )
+    payload = _require_payload_keys(
+        payload,
+        "",
+        (
+            "summary",
+            "axis_labels",
+            "axis_confidence",
+            "axis_label_scores",
+            "overall_confidence",
+            "evidence",
+            "unmapped_concepts",
+        ),
+    )
+    summary = _require_payload_keys(
+        payload["summary"],
+        "summary",
+        core_summary_keys,
+    )
+    for key in (
+        "protagonist_type",
+        "protagonist_desc",
+        "heroine_type",
+        "heroine_weight",
+        "mood",
+        "pacing",
+        "premise",
+        "hook",
+    ):
+        if not isinstance(summary[key], str):
+            raise ValueError(f"summary.{key} must be string")
+    for key in ("themes", "taste_tags"):
+        if not isinstance(summary[key], list) or any(not isinstance(item, str) for item in summary[key]):
+            raise ValueError(f"summary.{key} must be list")
+
+    for name in ("axis_labels", "axis_confidence", "axis_label_scores", "evidence"):
+        container = _require_payload_keys(payload[name], name, AXIS_ORDER)
+        for axis in AXIS_ORDER:
+            value = container[axis]
+            if name == "axis_confidence":
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(value)
+                    or not 0 <= value <= 1
+                ):
+                    raise ValueError(f"axis_confidence.{axis} must be finite number between 0 and 1")
+                continue
+            if not isinstance(value, list):
+                raise ValueError(f"{name}.{axis} must be list")
+            _, max_items = AXIS_LIMITS[axis]
+            if len(value) > max_items:
+                raise ValueError(f"{name}.{axis} exceeds maximum of {max_items}")
+            if name in ("axis_labels", "evidence") and any(not isinstance(item, str) for item in value):
+                raise ValueError(f"{name}.{axis} item must be string")
+
+    overall_confidence = payload["overall_confidence"]
+    if (
+        not isinstance(overall_confidence, (int, float))
+        or isinstance(overall_confidence, bool)
+        or not math.isfinite(overall_confidence)
+        or not 0 <= overall_confidence <= 1
+    ):
+        raise ValueError("overall_confidence must be number")
+    if not isinstance(payload["unmapped_concepts"], list) or any(
+        not isinstance(item, str) for item in payload["unmapped_concepts"]
+    ):
+        raise ValueError("unmapped_concepts must be list")
+    if len(payload["unmapped_concepts"]) > MAX_UNMAPPED_CONCEPTS:
+        raise ValueError(
+            f"unmapped_concepts exceeds maximum of {MAX_UNMAPPED_CONCEPTS}"
+        )
+
+    for axis in AXIS_ORDER:
+        labels = payload["axis_labels"][axis]
+        if len(labels) != len(set(labels)):
+            raise ValueError(f"axis_labels.{axis} contains duplicate label")
+        if allowed_labels is not None:
+            for label in labels:
+                if label not in allowed_labels[axis]:
+                    raise UnsupportedLabelError(axis, label)
+        scores = payload["axis_label_scores"][axis]
+        score_labels: list[str] = []
+        for entry in scores:
+            if not isinstance(entry, dict) or set(entry) != {"label", "score"}:
+                raise ValueError(f"axis_label_scores.{axis} item must contain only label and score")
+            label = entry["label"]
+            score = entry["score"]
+            if not isinstance(label, str):
+                raise ValueError(f"axis_label_scores.{axis}.label must be string")
+            if (
+                not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or not math.isfinite(score)
+                or not 0 <= score <= 1
+            ):
+                raise ValueError(f"axis_label_scores.{axis}.score must be finite number between 0 and 1")
+            score_labels.append(label)
+        if len(score_labels) != len(set(score_labels)):
+            raise ValueError(f"axis_label_scores.{axis} contains duplicate label")
+        if set(score_labels) != set(labels):
+            raise ValueError(f"axis_label_scores.{axis} labels must match axis_labels.{axis}")
+
+    core_payload = {
+        "summary": {key: summary[key] for key in core_summary_keys},
+        **{
+            key: payload[key]
+            for key in (
+                "axis_labels",
+                "axis_confidence",
+                "axis_label_scores",
+                "overall_confidence",
+                "evidence",
+                "unmapped_concepts",
+            )
+        },
+    }
+    for text in _flatten_text_values(core_payload):
+        if _has_suspicious_generated_text(text, source_text):
+            raise ValueError("payload contains suspicious generated text")
+
+
+def _normalize_librarian(summary: dict, source_text: str = "") -> dict[str, Any]:
     """AI 사서 노출용 카피 검증. 품질 미달 필드는 None으로 강등해 프론트 템플릿 fallback을 태운다.
 
     사서 카피 불량이 분석 전체 실패가 되지 않도록 ValueError를 밖으로 내보내지 않는다.
@@ -965,37 +1166,42 @@ def _normalize_librarian(summary: dict) -> dict[str, Any]:
     raw = summary.get("librarian")
     if not isinstance(raw, dict):
         return empty
+    raw_points = raw.get("points")
+    raw_chips = raw.get("chips")
+    if not isinstance(raw_points, list) or len(raw_points) != 3:
+        return empty
+    if not isinstance(raw_chips, list) or not 3 <= len(raw_chips) <= 4:
+        return empty
     try:
         intro = _safe_text(raw.get("intro"), "summary.librarian.intro", 300)
         points = _safe_list(raw.get("points"), "summary.librarian.points", max_items=3, max_item_length=200)
         chips = _safe_list(raw.get("chips"), "summary.librarian.chips", max_items=4, max_item_length=20)
     except ValueError:
         return empty
-    if intro and (
+    if not intro or (
         _LIBRARIAN_BANNED_RE.search(intro)
-        or _has_suspicious_generated_text(intro)
+        or _has_suspicious_generated_text(intro, source_text)
     ):
-        intro = None
-    if points and (
-        len(points) < 3
-        or any(
+        return empty
+    if len(points) != 3 or any(
             _LIBRARIAN_BANNED_RE.search(point)
-            or _has_suspicious_generated_text(point)
+            or _has_suspicious_generated_text(point, source_text)
             for point in points
-        )
-    ):
-        points = None
+        ):
+        return empty
     chips = [
         chip
         for chip in (chips or [])
         if not _LIBRARIAN_BANNED_RE.search(chip)
-        and not _has_suspicious_generated_text(chip)
+        and not _has_suspicious_generated_text(chip, source_text)
         and len(chip.split()) <= 2
     ]
+    if not 3 <= len(chips) <= 4:
+        return empty
     return {
         "librarian_intro": intro,
-        "librarian_points": points or None,
-        "librarian_chips": chips or None,
+        "librarian_points": points,
+        "librarian_chips": chips,
     }
 
 
@@ -1003,6 +1209,8 @@ def normalize_payload(
     payload: dict[str, Any],
     allowed_labels: dict[str, set[str]],
     source_text: str = "",
+    *,
+    allow_axis_confidence_score_fallback: bool = True,
 ) -> dict[str, Any]:
     summary = payload.get("summary")
     if not isinstance(summary, dict):
@@ -1038,9 +1246,13 @@ def normalize_payload(
         payload.get("axis_label_scores"),
         normalized_axis,
         normalized_confidence,
+        allow_axis_confidence_fallback=allow_axis_confidence_score_fallback,
     )
     unmapped_concepts = _safe_list(
-        payload.get("unmapped_concepts"), "unmapped_concepts", max_items=10, max_item_length=50
+        payload.get("unmapped_concepts"),
+        "unmapped_concepts",
+        max_items=MAX_UNMAPPED_CONCEPTS,
+        max_item_length=50,
     )
 
     protagonist_type = _safe_text(summary.get("protagonist_type"), "summary.protagonist_type", 200)
@@ -1053,7 +1265,9 @@ def normalize_payload(
     premise = _safe_text(summary.get("premise"), "summary.premise", 500, required=True)
 
     taste_tags = _safe_list(summary.get("taste_tags"), "summary.taste_tags", max_items=30)
-    taste_tags = [tag for tag in taste_tags if not _has_suspicious_generated_text(tag)]
+    taste_tags = [
+        tag for tag in taste_tags if not _has_suspicious_generated_text(tag, source_text)
+    ]
     if not taste_tags:
         merged = (
             normalized_axis["세"]
@@ -1098,7 +1312,7 @@ def normalize_payload(
         "protagonist_job_tags": normalized_axis["직"],
         "axis_style_tags": normalized_axis["작"],
         "axis_romance_tags": normalized_axis["연"],
-        **_normalize_librarian(summary),
+        **_normalize_librarian(summary, source_text),
     }
 
 
@@ -1327,7 +1541,7 @@ def analyze_product(
             str(product.get("title") or ""),
             str(product.get("genres") or ""),
             str(product.get("keywords") or ""),
-            str(product.get("synopsis_text") or ""),
+            str(product.get("synopsis_text") or "")[:1000],
             episodes_text,
         ]
     )
@@ -1336,8 +1550,15 @@ def analyze_product(
     llm_calls = [{"stage": "analysis", **call_meta}]
     parsed = parse_json(raw)
     try:
-        normalized = normalize_payload(parsed, allowed_labels, source_text=source_text)
+        _validate_llm_payload_contract(parsed, allowed_labels, source_text)
+        normalized = normalize_payload(
+            parsed,
+            allowed_labels,
+            source_text=source_text,
+            allow_axis_confidence_score_fallback=False,
+        )
     except UnsupportedLabelError as repair_error:
+        rejected_labels = _collect_unsupported_axis_labels(parsed, allowed_labels)
         repair_prompt = _build_repair_prompt(product, allowed_labels, parsed, repair_error)
         repaired_raw, repair_call_meta = _call_llm(DNA_SYSTEM_PROMPT, repair_prompt, allowed_labels)
         llm_calls.append(
@@ -1349,7 +1570,24 @@ def analyze_product(
             }
         )
         repaired_parsed = parse_json(repaired_raw)
-        normalized = normalize_payload(repaired_parsed, allowed_labels, source_text=source_text)
+        unmapped_concepts = repaired_parsed.get("unmapped_concepts")
+        if isinstance(unmapped_concepts, list):
+            merged_unmapped = list(
+                dict.fromkeys([*rejected_labels, *unmapped_concepts])
+            )
+            if len(merged_unmapped) > MAX_UNMAPPED_CONCEPTS:
+                raise ValueError(
+                    "repair unmapped_concepts cannot preserve every rejected label "
+                    f"within maximum of {MAX_UNMAPPED_CONCEPTS}"
+                )
+            repaired_parsed["unmapped_concepts"] = merged_unmapped
+        _validate_llm_payload_contract(repaired_parsed, allowed_labels, source_text)
+        normalized = normalize_payload(
+            repaired_parsed,
+            allowed_labels,
+            source_text=source_text,
+            allow_axis_confidence_score_fallback=False,
+        )
         parsed = repaired_parsed
     parsed = _attach_llm_meta(parsed, llm_calls)
     return normalized, parsed

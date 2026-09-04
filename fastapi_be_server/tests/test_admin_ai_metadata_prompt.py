@@ -48,6 +48,10 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
             summary_schema["properties"]["librarian"]["required"],
             ["intro", "points", "chips"],
         )
+        schema = response_format["json_schema"]["schema"]
+        self.assertIn("unmapped_concepts", schema["properties"])
+        self.assertIn("unmapped_concepts", schema["required"])
+        self.assertIn("unmapped_concepts", template)
 
     def test_librarian_filter_allows_editorial_terms_and_keeps_other_bans(self):
         prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
@@ -59,6 +63,141 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
             self.assertIsNone(admin_ai_metadata_service._LIBRARIAN_BANNED_RE.search(text), text)
         for text in ("이야기의 결이 좋아요.", "성장이 중심축으로 움직여요.", "텍스트를 분석해요."):
             self.assertIsNotNone(admin_ai_metadata_service._LIBRARIAN_BANNED_RE.search(text), text)
+        for text in ("숙명의 대결을 벌여요.", "한결은 끝까지 포기하지 않아요."):
+            self.assertIsNone(admin_ai_metadata_service._LIBRARIAN_BANNED_RE.search(text), text)
+
+    def test_llm_payload_contract_rejects_missing_and_garbled_fields(self):
+        axes = admin_ai_metadata_service.AXIS_ORDER
+        payload = {
+            "summary": {
+                "protagonist_type": "기자",
+                "protagonist_desc": "사건을 추적하는 전직 기자",
+                "heroine_type": "없음",
+                "heroine_weight": "none",
+                "mood": "긴장감 있는 분위기",
+                "pacing": "medium",
+                "premise": "카페를 운영하며 사건을 해결하는 이야기",
+                "hook": "이웃의 누명을 벗기기 위해 진범을 추적한다",
+                "episode_summary_text": "기자는 카페 주변에서 벌어진 사건의 진실을 추적한다.",
+                "themes": ["추리"],
+                "taste_tags": ["범죄 수사"],
+                "librarian": {
+                    "intro": "사건의 진실을 추적하는 이야기를 좋아하면 잘 맞아요.",
+                    "points": ["생활형 추리예요.", "주인공은 기자예요.", "반전을 따라가요."],
+                    "chips": ["추리", "기자", "반전"],
+                },
+            },
+            "axis_labels": {axis: [] for axis in axes},
+            "axis_confidence": {axis: 0.9 for axis in axes},
+            "axis_label_scores": {axis: [] for axis in axes},
+            "overall_confidence": 0.9,
+            "evidence": {axis: [] for axis in axes},
+            "unmapped_concepts": [],
+        }
+
+        allowed = admin_ai_metadata_service._load_allowed_labels_by_axis()
+        admin_ai_metadata_service._validate_llm_payload_contract(payload, allowed)
+
+        missing = json.loads(json.dumps(payload, ensure_ascii=False))
+        missing["librarían"] = missing["summary"].pop("librarian")
+        admin_ai_metadata_service._validate_llm_payload_contract(missing, allowed)
+        normalized = admin_ai_metadata_service._normalize_ai_payload(
+            missing,
+            enforce_axis_minimum=True,
+            enforce_legacy_required=True,
+        )
+        self.assertIsNone(normalized["librarian_intro"])
+        self.assertIsNone(normalized["librarian_points"])
+        self.assertIsNone(normalized["librarian_chips"])
+
+        garbled = json.loads(json.dumps(payload, ensure_ascii=False))
+        garbled["summary"]["themes"] = ["착各과 오해"]
+        with self.assertRaisesRegex(ValueError, "suspicious generated text"):
+            admin_ai_metadata_service._validate_llm_payload_contract(garbled, allowed)
+
+        self.assertTrue(
+            admin_ai_metadata_service._has_suspicious_generated_text(
+                "Beyoncé",
+                "원문 xBeyoncéy 표기",
+            )
+        )
+        self.assertFalse(
+            admin_ai_metadata_service._has_suspicious_generated_text(
+                "한中글",
+                "원문 한中글 표기",
+            )
+        )
+        self.assertTrue(
+            admin_ai_metadata_service._has_suspicious_generated_text(
+                "한中글文자",
+                "원문 한中글 표기",
+            )
+        )
+        self.assertFalse(
+            admin_ai_metadata_service._has_suspicious_generated_text(
+                "한中글文자",
+                "원문 한中글과 글文자가 모두 표기",
+            )
+        )
+
+    def test_llm_payload_contract_rejects_nonfinite_and_score_label_drift(self):
+        axes = admin_ai_metadata_service.AXIS_ORDER
+        allowed = admin_ai_metadata_service._load_allowed_labels_by_axis()
+        payload = {
+            "summary": {
+                "protagonist_type": "기자",
+                "protagonist_desc": "사건을 추적하는 전직 기자",
+                "heroine_type": "없음",
+                "heroine_weight": "none",
+                "mood": "긴장감 있는 분위기",
+                "pacing": "medium",
+                "premise": "카페를 운영하며 사건을 해결하는 이야기",
+                "hook": "이웃의 누명을 벗기기 위해 진범을 추적한다",
+                "episode_summary_text": "기자는 사건의 진실을 추적한다.",
+                "themes": ["추리"],
+                "taste_tags": ["범죄 수사"],
+            },
+            "axis_labels": {axis: [] for axis in axes},
+            "axis_confidence": {axis: 0.9 for axis in axes},
+            "axis_label_scores": {axis: [] for axis in axes},
+            "overall_confidence": 0.9,
+            "evidence": {axis: [] for axis in axes},
+            "unmapped_concepts": [],
+        }
+
+        nonfinite = json.loads(json.dumps(payload, ensure_ascii=False))
+        nonfinite["axis_confidence"]["세"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "axis_confidence.세"):
+            admin_ai_metadata_service._validate_llm_payload_contract(nonfinite, allowed)
+
+        label = next(iter(allowed["타"]))
+        mismatch = json.loads(json.dumps(payload, ensure_ascii=False))
+        mismatch["axis_labels"]["타"] = [label]
+        with self.assertRaisesRegex(ValueError, "labels must match"):
+            admin_ai_metadata_service._validate_llm_payload_contract(mismatch, allowed)
+
+        for container, values in (
+            ("axis_labels", ["생존", "성장"]),
+            (
+                "axis_label_scores",
+                [
+                    {"label": "생존", "score": 0.9},
+                    {"label": "성장", "score": 0.8},
+                ],
+            ),
+            ("evidence", ["첫 번째 근거", "두 번째 근거"]),
+        ):
+            with self.subTest(container=container):
+                over_limit = json.loads(json.dumps(payload, ensure_ascii=False))
+                over_limit[container]["목"] = values
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"{container}\.목 exceeds maximum of 1",
+                ):
+                    admin_ai_metadata_service._validate_llm_payload_contract(
+                        over_limit,
+                        allowed,
+                    )
 
     def test_reanalyze_upsert_persists_librarian_columns(self):
         source = inspect.getsource(admin_ai_metadata_service.reanalyze_ai_product_metadata)
@@ -66,6 +205,8 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
         for column in ("librarian_intro", "librarian_points", "librarian_chips"):
             self.assertIn(f":{column}", source)
             self.assertIn(f"{column} = VALUES({column})", source)
+        self.assertIn("_validate_llm_payload_contract(parsed, allowed_labels, source_text)", source)
+        self.assertIn("drop_unsupported_axis_labels=False", source)
 
     def test_normalize_payload_keeps_librarian_copy(self):
         normalized = admin_ai_metadata_service._normalize_ai_payload(
@@ -109,7 +250,36 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
         self.assertEqual(normalized["taste_tags"], ["범죄 수사"])
         self.assertIsNone(normalized["librarian_intro"])
         self.assertIsNone(normalized["librarian_points"])
-        self.assertEqual(normalized["librarian_chips"], ["미스터리"])
+        self.assertIsNone(normalized["librarian_chips"])
+
+    def test_librarian_copy_uses_exact_source_exception_and_atomic_chip_count(self):
+        base = {
+            "intro": "Beyoncé가 사건의 열쇠로 등장해요.",
+            "points": ["생활형 추리예요.", "주인공은 기자예요.", "반전을 따라가요."],
+        }
+        kept = admin_ai_metadata_service._normalize_librarian(
+            {"librarian": {**base, "chips": ["추리", "기자", "반전", "텍스트"]}},
+            source_text="원문에 Beyoncé가 등장한다.",
+        )
+        rejected_source = admin_ai_metadata_service._normalize_librarian(
+            {"librarian": {**base, "chips": ["추리", "기자", "반전"]}},
+            source_text="원문에는 Beyoncè만 등장한다.",
+        )
+        rejected_containing_token = admin_ai_metadata_service._normalize_librarian(
+            {"librarian": {**base, "chips": ["추리", "기자", "반전"]}},
+            source_text="원문 xBeyoncéy 표기",
+        )
+        too_few = admin_ai_metadata_service._normalize_librarian(
+            {"librarian": {**base, "chips": ["추리", "반전", "텍스트"]}},
+            source_text="원문에 Beyoncé가 등장한다.",
+        )
+
+        self.assertEqual(kept["librarian_chips"], ["추리", "기자", "반전"])
+        self.assertIsNone(rejected_source["librarian_intro"])
+        self.assertIsNone(rejected_containing_token["librarian_intro"])
+        self.assertIsNone(too_few["librarian_intro"])
+        self.assertIsNone(too_few["librarian_points"])
+        self.assertIsNone(too_few["librarian_chips"])
 
     def test_prompt_separates_ai_librarian_public_tone_from_internal_summary_style(self):
         prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
@@ -204,11 +374,13 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
             enforce_legacy_required=True,
             drop_unsupported_axis_labels=True,
             source_text="중세 제국의 전사 아카데미 입학 시험을 통과해야 한다.",
+            allow_axis_confidence_score_fallback=False,
         )
 
         self.assertEqual(normalized["worldview_tags"], ["중세", "아카데미"])
         self.assertEqual(normalized["protagonist_job_tags"], ["마법사"])
         self.assertEqual(normalized["axis_label_scores"]["직"], [{"label": "마법사", "score": 0.8}])
+        self.assertEqual(normalized["axis_label_scores"]["세"], [])
 
     def test_normalizer_replaces_status_window_with_buff_when_evidence_says_no_status_window(self):
         payload = {
@@ -252,10 +424,11 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
             enforce_legacy_required=True,
             drop_unsupported_axis_labels=True,
             source_text="다크엘프에게 버프를 받고 계약을 통해 힘을 얻는다.",
+            allow_axis_confidence_score_fallback=False,
         )
 
         self.assertEqual(normalized["protagonist_material_tags"], ["버프"])
-        self.assertEqual(normalized["axis_label_scores"]["능"], [{"label": "버프", "score": 0.7}])
+        self.assertEqual(normalized["axis_label_scores"]["능"], [])
 
     def test_normalizer_removes_explicit_false_possession_without_synthesizing_growth_type(self):
         payload = {
@@ -359,13 +532,44 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
             enforce_legacy_required=True,
             drop_unsupported_axis_labels=True,
             source_text="괴물사냥꾼이 되어 괴물을 사냥한다. 주인공의 아버지가 기사다.",
+            allow_axis_confidence_score_fallback=False,
         )
 
         self.assertEqual(normalized["protagonist_job_tags"], ["헌터"])
-        self.assertEqual(normalized["axis_label_scores"]["직"], [{"label": "헌터", "score": 0.7}])
+        self.assertEqual(normalized["axis_label_scores"]["직"], [])
 
 
 class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _valid_payload():
+        axes = admin_ai_metadata_service.AXIS_ORDER
+        return {
+            "summary": {
+                "protagonist_type": "기자",
+                "protagonist_desc": "사건의 진실을 추적하는 전직 기자다.",
+                "heroine_type": "없음",
+                "heroine_weight": "none",
+                "mood": "긴장감",
+                "pacing": "medium",
+                "premise": "카페를 운영하며 이웃의 사건을 해결한다.",
+                "hook": "누명을 벗기기 위해 진범을 추적한다.",
+                "episode_summary_text": "기자는 카페 주변 사건의 진실을 추적한다.",
+                "themes": ["추리"],
+                "taste_tags": ["범죄 수사"],
+                "librarian": {
+                    "intro": "생활형 추리를 좋아하면 잘 맞아요.",
+                    "points": ["사건을 추적해요.", "주인공은 기자예요.", "반전을 따라가요."],
+                    "chips": ["추리", "기자", "반전"],
+                },
+            },
+            "axis_labels": {axis: [] for axis in axes},
+            "axis_confidence": {axis: 0.9 for axis in axes},
+            "axis_label_scores": {axis: [] for axis in axes},
+            "overall_confidence": 0.9,
+            "evidence": {axis: [] for axis in axes},
+            "unmapped_concepts": [],
+        }
+
     async def test_dna_request_uses_openrouter_auto_routing_and_strict_schema(self):
         allowed = {axis: {f"{axis}-label"} for axis in admin_ai_metadata_service.AXIS_ORDER}
         response = unittest.mock.MagicMock()
@@ -437,6 +641,137 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
             await admin_ai_metadata_service._call_openrouter_dna("system", "user", allowed)
 
         self.assertEqual(post.await_count, 1)
+
+    async def test_reanalyze_saves_valid_core_once_and_clears_invalid_librarian_atomically(self):
+        payload = self._valid_payload()
+        typo_librarian = payload["summary"].pop("librarian")
+        typo_librarian["intro"] = "통쾌한 사ø다를 좋아하면 잘 맞아요."
+        payload["summary"]["librarían"] = typo_librarian
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+        db = AsyncMock()
+        db.execute.side_effect = [
+            _MappingsResult([{"analysis_attempt_count": 0}]),
+            None,
+        ]
+        episodes = [
+            {
+                "episode_no": episode_no,
+                "episode_title": f"{episode_no}화",
+                "episode_content": "기자가 사건을 추적한다.",
+            }
+            for episode_no in range(1, 4)
+        ]
+
+        with (
+            patch.object(
+                admin_ai_metadata_service,
+                "_get_product_for_analysis",
+                AsyncMock(
+                    return_value={
+                        "product_id": 200,
+                        "title": "테스트 작품",
+                        "genres": "추리",
+                        "keywords": "기자",
+                        "synopsis_text": "카페 주변 사건을 해결한다.",
+                        "episode_count": 3,
+                        "status_code": "serial",
+                    }
+                ),
+            ),
+            patch.object(
+                admin_ai_metadata_service,
+                "_get_episodes_for_analysis",
+                AsyncMock(return_value=episodes),
+            ),
+            patch.object(
+                admin_ai_metadata_service,
+                "_call_openrouter_dna",
+                AsyncMock(return_value=(json.dumps(payload, ensure_ascii=False), call_meta)),
+            ) as call_openrouter,
+        ):
+            result = await admin_ai_metadata_service.reanalyze_ai_product_metadata(200, db)
+
+        self.assertEqual(result["data"]["analysis_status"], "success")
+        self.assertEqual(call_openrouter.await_count, 1)
+        success_sql = str(db.execute.await_args_list[-1].args[0])
+        success_params = db.execute.await_args_list[-1].args[1]
+        self.assertIn("INSERT INTO tb_product_ai_metadata", success_sql)
+        self.assertIsNone(success_params["librarian_intro"])
+        self.assertIsNone(success_params["librarian_points"])
+        self.assertIsNone(success_params["librarian_chips"])
+        db.commit.assert_awaited_once()
+
+    async def test_reanalyze_never_success_upserts_malformed_core_after_three_calls(self):
+        payload = self._valid_payload()
+        del payload["overall_confidence"]
+        call_meta = {
+            "provider": "openrouter",
+            "model": "test-model",
+            "provider_only": [],
+            "response_format": "json_schema",
+            "usage": {},
+        }
+        db = AsyncMock()
+        db.execute.return_value = _MappingsResult([{"analysis_attempt_count": 0}])
+        episodes = [
+            {
+                "episode_no": episode_no,
+                "episode_title": f"{episode_no}화",
+                "episode_content": "기자가 사건을 추적한다.",
+            }
+            for episode_no in range(1, 4)
+        ]
+
+        with (
+            patch.object(
+                admin_ai_metadata_service,
+                "_get_product_for_analysis",
+                AsyncMock(
+                    return_value={
+                        "product_id": 200,
+                        "title": "테스트 작품",
+                        "genres": "추리",
+                        "keywords": "기자",
+                        "synopsis_text": "카페 주변 사건을 해결한다.",
+                        "episode_count": 3,
+                        "status_code": "serial",
+                    }
+                ),
+            ),
+            patch.object(
+                admin_ai_metadata_service,
+                "_get_episodes_for_analysis",
+                AsyncMock(return_value=episodes),
+            ),
+            patch.object(
+                admin_ai_metadata_service,
+                "_call_openrouter_dna",
+                AsyncMock(return_value=(json.dumps(payload, ensure_ascii=False), call_meta)),
+            ) as call_openrouter,
+            patch.object(
+                admin_ai_metadata_service,
+                "_mark_analysis_failed",
+                AsyncMock(),
+            ) as mark_failed,
+            self.assertRaisesRegex(Exception, "최대 3회 시도"),
+        ):
+            await admin_ai_metadata_service.reanalyze_ai_product_metadata(200, db)
+
+        self.assertEqual(call_openrouter.await_count, 3)
+        self.assertEqual(mark_failed.await_count, 1)
+        self.assertFalse(
+            any(
+                "INSERT INTO tb_product_ai_metadata" in str(call.args[0])
+                for call in db.execute.await_args_list
+            )
+        )
+        self.assertEqual(db.rollback.await_count, 3)
 
 
 class AdminAiMetadataReadTest(unittest.IsolatedAsyncioTestCase):
