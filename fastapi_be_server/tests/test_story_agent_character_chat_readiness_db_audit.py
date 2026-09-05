@@ -3,6 +3,11 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+import io
+import json
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -24,6 +29,72 @@ def load_module():
 
 
 class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
+    def test_scheduled_monitor_uses_same_cohort_and_excludes_disabled(self):
+        self.test_scheduled_manifest_classifies_without_mutation_and_skips_excluded_products(scheduled=True)
+
+    def test_scheduled_manifest_classifies_without_mutation_and_skips_excluded_products(self, scheduled=False):
+        module = load_module()
+        args = SimpleNamespace(env_file="/nonexistent", product_id=[], limit=0, include_closed=False, scheduled=scheduled, scheduled_action_ids=not scheduled, out="", summary_out="", fail_on_actionable=True)
+        story = MagicMock()
+        story.build_story_agent_collection_cohort_sql.return_value = "canonical_cohort"
+        story.fetch_character_chat_asset_readiness_verification.return_value = {"character_chat_status": "hold"}
+        story.build_scheduled_character_asset_policy.side_effect = [
+            {"blockers": [], "repairable": True, "rp_scope_keys": ["character:강현"], "scene_scope_keys": []},
+            {"blockers": ["missing_main"], "repairable": False, "rp_scope_keys": [], "scene_scope_keys": []},
+        ]
+        products = [
+            {"product_id": 1, "characterChatEligible": 1, "context_status": "ready", "status_code": "end"},
+            {"product_id": 2, "characterChatEligible": 1, "context_status": "ready"},
+            {"product_id": 3, "characterChatEligible": 0, "context_status": "ready"},
+            {"product_id": 4, "characterChatEligible": 1, "context_status": "disabled"},
+        ]
+        out = io.StringIO()
+        with patch.object(module, "parse_args", return_value=args), patch.object(module, "load_env_file"), patch.object(module, "load_story_agent_module", return_value=story), patch.object(module, "fetch_product_rows", return_value=products) as fetch, redirect_stdout(out):
+            self.assertEqual(module.main(), int(scheduled))
+        if scheduled:
+            summary = json.loads(out.getvalue())
+            self.assertEqual(summary["productCount"], 2)
+            self.assertEqual(summary["candidateProductIdsByAction"], {"generate_rp_profile_examples": [1], "repair_character_inventory": [2]})
+        else:
+            self.assertEqual(out.getvalue(), "v1|0,1|0,2\n")
+        self.assertEqual(story.fetch_character_chat_asset_readiness_verification.call_count, 2)
+        self.assertEqual(fetch.call_args.kwargs["batch_cohort_sql"], "canonical_cohort")
+        story.db_connect.assert_called_once_with(autocommit=True)
+        self.assertFalse(any("apply" in call[0] or "commit" == call[0] for call in story.mock_calls))
+
+    def test_scheduled_audit_observes_but_does_not_repair_unselected_legacy_scope(self):
+        module = load_module()
+        row = {
+            "context_status": "ready",
+            "automatic_policy": {"rp_scope_keys": [], "scene_scope_keys": [], "blockers": []},
+            "character_chat_asset_readiness": {
+                "character_chat_status": "ready",
+                "legacy_profile_scope_key_mismatch_scope_keys": ["character:김민"],
+                "legacy_examples_scope_key_mismatch_scope_keys": ["character:김민"],
+                "missing_profile_scope_keys": ["character:김민"],
+                "block_reason_counts": {"legacy_profile_scope_key_mismatch": 1, "missing_profile": 1},
+            },
+        }
+        self.assertEqual(module.build_asset_action_plan(row), ["ready"])
+        self.assertEqual(row["character_chat_asset_readiness"]["block_reason_counts"]["legacy_profile_scope_key_mismatch"], 1)
+        row["automatic_policy"]["rp_scope_keys"].append("character:김민")
+        self.assertEqual(module.build_asset_action_plan(row), ["generate_rp_profile_examples"])
+
+    def test_scheduled_audit_catches_selected_secondary_gap_with_ready_main(self):
+        module = load_module()
+        row = {"context_status": "ready", "automatic_policy": {"rp_scope_keys": ["character:이준"], "scene_scope_keys": ["character:이준"], "blockers": []}, "character_chat_asset_readiness": {
+            "character_chat_status": "ready", "missing_profile_scope_keys": ["character:이준"],
+            "missing_examples_scope_keys": ["character:이준"], "missing_usable_scene_scope_keys": ["character:이준"],
+        }}
+        self.assertEqual(module.build_asset_action_plan(row), ["generate_rp_profile_examples", "generate_episode_scene_extraction"])
+
+    def test_scheduled_audit_preserves_identity_failure(self):
+        module = load_module()
+        row = {"context_status": "ready", "automatic_policy": {"rp_scope_keys": [], "scene_scope_keys": [], "blockers": ["character:강현"]}, "character_chat_asset_readiness": {
+            "character_chat_status": "failed", "blocking_continuity_ambiguous_scope_keys": ["character:강현"],
+        }}
+        self.assertEqual(module.build_asset_action_plan(row), ["repair_character_inventory"])
+
     def test_dev_deploy_package_includes_character_chat_asset_audit(self):
         workflow = (
             BACKEND_ROOT / ".github" / "workflows" / "deploy_be_actions_dev.yml"

@@ -34,6 +34,45 @@ def _recommendation_service_py() -> str:
 
 
 class StoryAgentContextBatchSqlTest(unittest.TestCase):
+    def test_action_manifest_validation_fails_closed_before_candidate_selection(self):
+        script = _batch_sh()
+        manifest_guard = script[script.index('SCHEDULED_REPAIR_IDS_SQL=0'):script.index('if ! CANDIDATE_OUTPUT=')]
+        for manifest, provider_rc, expected_rc in (
+            ("v1|0|0", 0, 0),
+            ("v1|0,1174|0,1196", 0, 0),
+            ("v2|0|0", 0, 1),
+            ("v1|0,-1|0", 0, 1),
+            ("v1|0,1);DROP TABLE x|0", 0, 1),
+            ("", 0, 1),
+            ("v1|0|0", 42, 1),
+        ):
+            with self.subTest(manifest=manifest, provider_rc=provider_rc):
+                result = subprocess.run(
+                    ["bash", "-c", 'set -uo pipefail\nlog() { :; }\nfake_python() { printf "%s\\n" "$MANIFEST"; return "$PROVIDER_RC"; }\nPYTHON_BIN=fake_python\nAPI_ROOT=/nonexistent\n' + manifest_guard + '\nprintf "selected:%s|%s" "$SCHEDULED_REPAIR_IDS_SQL" "$SCHEDULED_BLOCKED_IDS_SQL"'],
+                    env={**os.environ, "BUILD_MODE": "delta", "MANIFEST": manifest, "PROVIDER_RC": str(provider_rc)},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, expected_rc, result.stderr)
+                if expected_rc:
+                    self.assertNotIn("selected:", result.stdout)
+                else:
+                    self.assertEqual(result.stdout, "selected:" + manifest.removeprefix("v1|"))
+
+    def test_guarded_full_does_not_invoke_scheduled_manifest(self):
+        script = _batch_sh()
+        guard = script[script.index('SCHEDULED_REPAIR_IDS_SQL=0'):script.index('if ! CANDIDATE_OUTPUT=')]
+        result = subprocess.run(
+            ["bash", "-c", 'set -uo pipefail\nfake_python() { echo unexpected-invocation; return 42; }\nlog() { :; }\nPYTHON_BIN=fake_python\nAPI_ROOT=/nonexistent\nBUILD_MODE=full\n' + guard + '\nprintf "%s|%s" "$SCHEDULED_REPAIR_IDS_SQL" "$SCHEDULED_BLOCKED_IDS_SQL"'],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "0|0")
+        self.assertIn("ELSE\n    CASE WHEN collection_cohort.product_id IS NULL THEN 0 ELSE (", script)
+        full_predicate = script.split("ELSE\n    CASE WHEN collection_cohort.product_id IS NULL", 1)[1].split("END AS character_asset_repair_needed", 1)[0]
+        self.assertIn("repair_inventory", full_predicate)
+        self.assertNotIn("SCHEDULED_", full_predicate)
+        self.assertNotIn("public_episode_rank", full_predicate)
+
     def test_candidate_query_failure_exits_nonzero(self):
         script = _batch_sh()
 
@@ -44,6 +83,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             bin_dir = root / "bin"
             batch_dir.mkdir(parents=True)
             scripts_dir.mkdir(parents=True)
+            (scripts_dir / "audit_character_chat_asset_readiness_db.py").write_text("print('v1|0|0')\n", encoding="utf-8")
             bin_dir.mkdir()
 
             batch_path = batch_dir / "build_story_agent_context_batch.sh"
@@ -112,9 +152,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             script,
         )
         self.assertIn(
-            "CASE WHEN collection_cohort.product_id IS NULL THEN 0 ELSE (\n"
-            "      SELECT COUNT(*)\n"
-            "      FROM tb_story_agent_context_summary repair_inventory",
+            "CASE WHEN p.product_id IN (${SCHEDULED_REPAIR_IDS_SQL}) THEN 1 ELSE 0 END",
             script,
         )
         self.assertIn(
@@ -152,14 +190,12 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
         self.assertIn("active_character_inventory_v3_count", script)
         self.assertIn("inventory_reaggregation_needed", script)
         self.assertIn("character_asset_repair_needed", script)
-        self.assertIn("character_rp_profile", script)
-        self.assertIn("character_rp_examples", script)
         self.assertIn("JSON_TABLE", script)
-        self.assertIn("repair_scene_participant.character_scope_key = repair_inventory.scope_key", script)
-        self.assertIn("repair_scene_actor.character_scope_key = repair_inventory.scope_key", script)
+        self.assertIn("--scheduled-action-ids", script)
+        self.assertIn("AND ('${BUILD_MODE}' = 'full' OR pe.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES})", script)
         self.assertNotIn("FROM tb_story_agent_context_summary capped_signal", script)
         self.assertNotIn("capped_character.character_scope_key = repair_inventory.scope_key", script)
-        self.assertIn("repair_example_item.example_text", script)
+        self.assertIn("CASE WHEN '${BUILD_MODE}' = 'delta' THEN", script)
         self.assertIn("--repair-character-assets", script)
         self.assertIn("--reaggregate-character-inventory", script)
         self.assertNotIn("MAX(pe.episode_no)", script)
@@ -207,7 +243,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             script.index("CANDIDATE_OUTPUT"),
         )
         self.assertIn(
-            "p.product_id IN (${REVIEW_REQUIRED_PRODUCT_IDS_SQL})",
+            "p.product_id IN (${REVIEW_REQUIRED_PRODUCT_IDS_SQL},${SCHEDULED_BLOCKED_IDS_SQL})",
             script,
         )
         self.assertIn(
@@ -227,6 +263,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             bin_dir = root / "bin"
             batch_dir.mkdir(parents=True)
             scripts_dir.mkdir(parents=True)
+            (scripts_dir / "audit_character_chat_asset_readiness_db.py").write_text("print('v1|0|0')\n", encoding="utf-8")
             bin_dir.mkdir()
 
             batch_path = batch_dir / "build_story_agent_context_batch.sh"
@@ -302,7 +339,8 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             args_path = root / "python-args.txt"
             python_path = venv_bin_dir / "python"
             python_path.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n",
+                "#!/bin/sh\ncase \"$1\" in *audit_character_chat*) echo 'v1|0|0'; exit 0 ;; esac\n"
+                "printf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n",
                 encoding="utf-8",
             )
             python_path.chmod(0o755)
@@ -548,7 +586,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             mysql_path.chmod(0o755)
 
             python_path = venv_bin_dir / "python"
-            python_path.write_text("#!/bin/sh\nexit 75\n", encoding="utf-8")
+            python_path.write_text("#!/bin/sh\ncase \"$1\" in *audit_character_chat*) echo 'v1|0|0'; exit 0 ;; esac\nexit 75\n", encoding="utf-8")
             python_path.chmod(0o755)
 
             log_path = root / "batch.log"
@@ -610,6 +648,7 @@ class StoryAgentContextBatchSqlTest(unittest.TestCase):
             python_path = venv_bin_dir / "python"
             python_path.write_text(
                 "#!/bin/sh\n"
+                "case \"$1\" in *audit_character_chat*) echo 'v1|0|0'; exit 0 ;; esac\n"
                 "product_id=''\n"
                 "while [ \"$#\" -gt 0 ]; do\n"
                 "  if [ \"$1\" = '--product-id' ]; then product_id=\"$2\"; break; fi\n"

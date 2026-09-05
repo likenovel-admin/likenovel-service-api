@@ -6173,7 +6173,10 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(results["products"][0]["context_status"], "ready")
         self.assertEqual(module.build_delta_exit_code(results, apply=True), 0)
 
-    async def test_character_asset_repair_stages_reaggregation_before_new_main_assets(self):
+    async def test_scheduled_repair_preserves_current_generation_rp_after_reaggregation(self):
+        await self.test_character_asset_repair_stages_reaggregation_before_new_main_assets(scheduled=True)
+
+    async def test_character_asset_repair_stages_reaggregation_before_new_main_assets(self, scheduled=False):
         module = load_module()
         conn = FakeConnection()
         results = module.build_empty_results()
@@ -6254,6 +6257,12 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             "missing_examples_scope_keys": [new_scope_key],
             "missing_usable_scene_scope_keys": [],
         }
+        if scheduled:
+            new_inventory_v3_map[new_scope_key]["display_name"] = "강현"
+            before_readiness["main_protagonist_scope_keys"] = [new_scope_key]
+            existing_scene_readiness["main_protagonist_scope_keys"] = [new_scope_key]
+            existing_scene_readiness["missing_profile_scope_keys"] = []
+            existing_scene_readiness["missing_examples_scope_keys"] = []
         missing_scene_after_readiness = {
             "character_chat_status": "hold",
             "public_candidate_count": 1,
@@ -6336,6 +6345,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                     verbose=False,
                     max_delta_episodes=2,
                     reaggregate_character_inventory=True,
+                    scheduled=scheduled,
                 ),
                 results=results,
             )
@@ -6365,10 +6375,12 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                     verbose=False,
                     max_delta_episodes=2,
                     reaggregate_character_inventory=True,
+                    scheduled=scheduled,
                 ),
                 results=results_with_existing_scene,
             )
             scene_builder.assert_not_awaited()
+            self.assertEqual(rp_builder.await_args.kwargs["affected_scope_keys"], {new_scope_key})
 
             async def keep_stale_scene(**_kwargs):
                 return 0, 1
@@ -6398,6 +6410,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                         verbose=False,
                         max_delta_episodes=2,
                         reaggregate_character_inventory=True,
+                        scheduled=scheduled,
                     ),
                     results=results_without_scene,
                 )

@@ -233,6 +233,19 @@ while IFS= read -r review_required_line; do
 done <<< "${REVIEW_REQUIRED_OUTPUT}"
 
 CANDIDATE_OUTPUT=""
+SCHEDULED_REPAIR_IDS_SQL=0
+SCHEDULED_BLOCKED_IDS_SQL=0
+if [ "${BUILD_MODE}" = "delta" ]; then
+if ! SCHEDULED_ACTION_IDS="$("${PYTHON_BIN}" "${API_ROOT}/scripts/audit_character_chat_asset_readiness_db.py" --env-file "${API_ROOT}/.env" --scheduled-action-ids)"; then
+  log "[error] scheduled character scope selection failed"
+  exit 1
+fi
+if ! [[ "${SCHEDULED_ACTION_IDS}" =~ ^v1\|0(,[1-9][0-9]*)*\|0(,[1-9][0-9]*)*$ ]]; then
+  log "[error] invalid scheduled character scope manifest"
+  exit 1
+fi
+IFS='|' read -r _manifest_version SCHEDULED_REPAIR_IDS_SQL SCHEDULED_BLOCKED_IDS_SQL <<< "${SCHEDULED_ACTION_IDS}"
+fi
 if ! CANDIDATE_OUTPUT="$("${MYSQL_CMD[@]}" <<SQL
 SELECT
   candidates.product_id,
@@ -318,96 +331,100 @@ FROM (
         AND civ3.is_active = 'Y'
     ) AS active_character_inventory_v3_count,
     CASE
-      WHEN p.product_id IN (${REVIEW_REQUIRED_PRODUCT_IDS_SQL}) THEN 1
+      WHEN p.product_id IN (${REVIEW_REQUIRED_PRODUCT_IDS_SQL},${SCHEDULED_BLOCKED_IDS_SQL}) THEN 1
       ELSE 0
     END AS character_identity_review_required,
+    CASE WHEN '${BUILD_MODE}' = 'delta' THEN
+      CASE WHEN p.product_id IN (${SCHEDULED_REPAIR_IDS_SQL}) THEN 1 ELSE 0 END
+    ELSE
     CASE WHEN collection_cohort.product_id IS NULL THEN 0 ELSE (
-      SELECT COUNT(*)
-      FROM tb_story_agent_context_summary repair_inventory
-      WHERE repair_inventory.product_id = p.product_id
-        AND repair_inventory.summary_type = 'character_inventory_v3'
-        AND repair_inventory.is_active = 'Y'
-        AND NULLIF(TRIM(repair_inventory.scope_key), '') IS NOT NULL
-        AND JSON_VALID(repair_inventory.summary_text)
-        AND NOT (
-          LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.continuity_status')), '')) = 'ambiguous'
-          OR JSON_CONTAINS(
-            COALESCE(JSON_EXTRACT(repair_inventory.summary_text, '$.identity_conflict_reasons'), JSON_ARRAY()),
-            JSON_QUOTE('identity_continuity_ambiguous')
-          ) = 1
-        )
-        AND (
-          LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.public_chat_eligible')), 'false')) = 'true'
-          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.public_slot_eligible')), 'false')) = 'true'
-          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.character_chat_allowed')), 'false')) = 'true'
-          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.public_slot_allowed')), 'false')) = 'true'
-          OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.exposure_decision')), '')) = 'eligible'
-        )
-        AND (
-          NOT EXISTS (
-            SELECT 1
-            FROM tb_story_agent_context_summary repair_profile
-            WHERE repair_profile.product_id = p.product_id
-              AND repair_profile.summary_type = 'character_rp_profile'
-              AND repair_profile.is_active = 'Y'
-              AND repair_profile.scope_key = repair_inventory.scope_key
-              AND JSON_VALID(repair_profile.summary_text)
-              AND JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_key')) = repair_inventory.scope_key
-          )
-          OR NOT EXISTS (
-            SELECT 1
-            FROM tb_story_agent_context_summary repair_examples
-            WHERE repair_examples.product_id = p.product_id
-              AND repair_examples.summary_type = 'character_rp_examples'
-              AND repair_examples.is_active = 'Y'
-              AND repair_examples.scope_key = repair_inventory.scope_key
-              AND JSON_VALID(repair_examples.summary_text)
-              AND JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_key')) = repair_inventory.scope_key
-              AND JSON_TYPE(JSON_EXTRACT(repair_examples.summary_text, '$.examples')) = 'ARRAY'
-              AND COALESCE(JSON_LENGTH(JSON_EXTRACT(repair_examples.summary_text, '$.examples')), 0) > 0
-              AND EXISTS (
+          SELECT COUNT(*)
+          FROM tb_story_agent_context_summary repair_inventory
+          WHERE repair_inventory.product_id = p.product_id
+            AND repair_inventory.summary_type = 'character_inventory_v3'
+            AND repair_inventory.is_active = 'Y'
+            AND NULLIF(TRIM(repair_inventory.scope_key), '') IS NOT NULL
+            AND JSON_VALID(repair_inventory.summary_text)
+            AND NOT (
+              LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.continuity_status')), '')) = 'ambiguous'
+              OR JSON_CONTAINS(
+                COALESCE(JSON_EXTRACT(repair_inventory.summary_text, '$.identity_conflict_reasons'), JSON_ARRAY()),
+                JSON_QUOTE('identity_continuity_ambiguous')
+              ) = 1
+            )
+            AND (
+              LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.public_chat_eligible')), 'false')) = 'true'
+              OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.public_slot_eligible')), 'false')) = 'true'
+              OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.character_chat_allowed')), 'false')) = 'true'
+              OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.public_slot_allowed')), 'false')) = 'true'
+              OR LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.chat_readiness_v1.exposure_decision')), '')) = 'eligible'
+            )
+            AND (
+              NOT EXISTS (
                 SELECT 1
-                FROM JSON_TABLE(
-                  repair_examples.summary_text,
-                  '$.examples[*]' COLUMNS (
-                    example_text TEXT PATH '$.text'
+                FROM tb_story_agent_context_summary repair_profile
+                WHERE repair_profile.product_id = p.product_id
+                  AND repair_profile.summary_type = 'character_rp_profile'
+                  AND repair_profile.is_active = 'Y'
+                  AND repair_profile.scope_key = repair_inventory.scope_key
+                  AND JSON_VALID(repair_profile.summary_text)
+                  AND JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_key')) = repair_inventory.scope_key
+              )
+              OR NOT EXISTS (
+                SELECT 1
+                FROM tb_story_agent_context_summary repair_examples
+                WHERE repair_examples.product_id = p.product_id
+                  AND repair_examples.summary_type = 'character_rp_examples'
+                  AND repair_examples.is_active = 'Y'
+                  AND repair_examples.scope_key = repair_inventory.scope_key
+                  AND JSON_VALID(repair_examples.summary_text)
+                  AND JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_key')) = repair_inventory.scope_key
+                  AND JSON_TYPE(JSON_EXTRACT(repair_examples.summary_text, '$.examples')) = 'ARRAY'
+                  AND COALESCE(JSON_LENGTH(JSON_EXTRACT(repair_examples.summary_text, '$.examples')), 0) > 0
+                  AND EXISTS (
+                    SELECT 1
+                    FROM JSON_TABLE(
+                      repair_examples.summary_text,
+                      '$.examples[*]' COLUMNS (
+                        example_text TEXT PATH '$.text'
+                      )
+                    ) repair_example_item
+                    WHERE NULLIF(TRIM(repair_example_item.example_text), '') IS NOT NULL
                   )
-                ) repair_example_item
-                WHERE NULLIF(TRIM(repair_example_item.example_text), '') IS NOT NULL
               )
-          )
-          OR NOT EXISTS (
-            SELECT 1
-            FROM tb_story_agent_context_summary repair_scene
-            WHERE repair_scene.product_id = p.product_id
-              AND repair_scene.summary_type = 'episode_scene_extraction'
-              AND repair_scene.is_active = 'Y'
-              AND JSON_VALID(repair_scene.summary_text)
-              AND (
-                EXISTS (
-                  SELECT 1
-                  FROM JSON_TABLE(
-                    repair_scene.summary_text,
-                    '$.scenes[*].participants[*]' COLUMNS (
-                      character_scope_key VARCHAR(255) PATH '$.scope_key'
+              OR NOT EXISTS (
+                SELECT 1
+                FROM tb_story_agent_context_summary repair_scene
+                WHERE repair_scene.product_id = p.product_id
+                  AND repair_scene.summary_type = 'episode_scene_extraction'
+                  AND repair_scene.is_active = 'Y'
+                  AND JSON_VALID(repair_scene.summary_text)
+                  AND (
+                    EXISTS (
+                      SELECT 1
+                      FROM JSON_TABLE(
+                        repair_scene.summary_text,
+                        '$.scenes[*].participants[*]' COLUMNS (
+                          character_scope_key VARCHAR(255) PATH '$.scope_key'
+                        )
+                      ) repair_scene_participant
+                      WHERE repair_scene_participant.character_scope_key = repair_inventory.scope_key
                     )
-                  ) repair_scene_participant
-                  WHERE repair_scene_participant.character_scope_key = repair_inventory.scope_key
-                )
-                OR EXISTS (
-                  SELECT 1
-                  FROM JSON_TABLE(
-                    repair_scene.summary_text,
-                    '$.scenes[*].action_ownership[*]' COLUMNS (
-                      character_scope_key VARCHAR(255) PATH '$.actor_scope_key'
+                    OR EXISTS (
+                      SELECT 1
+                      FROM JSON_TABLE(
+                        repair_scene.summary_text,
+                        '$.scenes[*].action_ownership[*]' COLUMNS (
+                          character_scope_key VARCHAR(255) PATH '$.actor_scope_key'
+                        )
+                      ) repair_scene_actor
+                      WHERE repair_scene_actor.character_scope_key = repair_inventory.scope_key
                     )
-                  ) repair_scene_actor
-                  WHERE repair_scene_actor.character_scope_key = repair_inventory.scope_key
-                )
+                  )
               )
-          )
-        )
-    ) END AS character_asset_repair_needed
+            )
+        ) END
+    END AS character_asset_repair_needed
   FROM tb_product p
   JOIN (
     SELECT
@@ -499,6 +516,7 @@ FROM (
          '$.scenes[0].scene_gist'
        )), '')), '') IS NOT NULL
   WHERE p.price_type IN ('free', 'paid')
+    AND ('${BUILD_MODE}' = 'full' OR pe.public_episode_rank <= ${CHAT_ASSET_TARGET_EPISODES})
     AND p.status_code IN ('ongoing', 'end')
     AND p.open_yn = 'Y'
     AND p.blind_yn = 'N'
@@ -607,6 +625,9 @@ run_product() {
     )
     if [ "${BUILD_MODE}" = "delta" ] && [ "${character_asset_repair_needed}" -gt 0 ]; then
       command+=(--repair-character-assets)
+    fi
+    if [ "${BUILD_MODE}" = "delta" ]; then
+      command+=(--scheduled)
     fi
     if [ "${BUILD_MODE}" = "delta" ] && [ "${inventory_reaggregation_needed}" -gt 0 ]; then
       command+=(--reaggregate-character-inventory)
