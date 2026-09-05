@@ -19,6 +19,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.services.websochat.character_chat_product_policy import (  # noqa: E402
+    CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
     build_correlated_character_chat_product_policy_sql,
     is_character_chat_product_eligible,
 )
@@ -108,6 +109,36 @@ def fetch_product_rows(cur, *, product_ids: list[int], limit: int, open_only: bo
     query, params = build_product_query(product_ids=product_ids, limit=limit, open_only=open_only, batch_cohort_sql=batch_cohort_sql)
     cur.execute(query, params)
     return [dict(row) for row in cur.fetchall()]
+
+
+def fetch_scheduled_foundation_missing_count(cur, *, product_id: int) -> int:
+    cur.execute(
+        """
+        SELECT COUNT(*) AS missing_count
+        FROM (
+            SELECT product_id, episode_id
+            FROM tb_product_episode
+            WHERE product_id = %s AND use_yn = 'Y' AND open_yn = 'Y'
+            ORDER BY episode_no, episode_id
+            LIMIT %s
+        ) episode
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tb_story_agent_context_summary summary
+            WHERE summary.product_id = episode.product_id
+              AND summary.scope_key = CONCAT('episode:', episode.episode_id)
+              AND summary.summary_type = 'episode_summary'
+              AND summary.is_active = 'Y'
+        ) OR NOT EXISTS (
+            SELECT 1 FROM tb_story_agent_context_summary source_signal
+            WHERE source_signal.product_id = episode.product_id
+              AND source_signal.scope_key = CONCAT('episode:', episode.episode_id)
+              AND source_signal.summary_type = 'episode_character_signals'
+              AND source_signal.is_active = 'Y'
+        )
+        """,
+        (product_id, CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES),
+    )
+    return int(cur.fetchone()["missing_count"])
 
 
 def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -205,7 +236,7 @@ def build_asset_action_plan(row: dict[str, Any]) -> list[str]:
     if "automatic_policy" in row:
         policy = row["automatic_policy"]
         actions = []
-        if context_status != "ready":
+        if row["scheduled_foundation_missing_count"] > 0 or context_status == "failed":
             actions.append("build_story_context_foundation")
         if policy["blockers"]:
             actions.append("repair_character_inventory")
@@ -333,6 +364,10 @@ def main() -> int:
                         readiness=readiness,
                     )
                     row["automatic_policy"] = policy
+                    if not args.scheduled_action_ids:
+                        row["scheduled_foundation_missing_count"] = fetch_scheduled_foundation_missing_count(
+                            cur, product_id=product_id,
+                        )
                     if product_id <= 0:
                         raise ValueError("scheduled manifest requires a positive product id")
                     if policy["blockers"]:

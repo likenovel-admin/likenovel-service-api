@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 import io
 import json
+import sqlite3
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -36,6 +37,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         module = load_module()
         args = SimpleNamespace(env_file="/nonexistent", product_id=[], limit=0, include_closed=False, scheduled=scheduled, scheduled_action_ids=not scheduled, out="", summary_out="", fail_on_actionable=True)
         story = MagicMock()
+        story.db_connect.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value.fetchone.return_value = {"missing_count": 0}
         story.build_story_agent_collection_cohort_sql.return_value = "canonical_cohort"
         story.fetch_character_chat_asset_readiness_verification.return_value = {"character_chat_status": "hold"}
         story.build_scheduled_character_asset_policy.side_effect = [
@@ -66,6 +68,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
         module = load_module()
         row = {
             "context_status": "ready",
+            "scheduled_foundation_missing_count": 0,
             "automatic_policy": {"rp_scope_keys": [], "scene_scope_keys": [], "blockers": []},
             "character_chat_asset_readiness": {
                 "character_chat_status": "ready",
@@ -82,7 +85,7 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
 
     def test_scheduled_audit_catches_selected_secondary_gap_with_ready_main(self):
         module = load_module()
-        row = {"context_status": "ready", "automatic_policy": {"rp_scope_keys": ["character:이준"], "scene_scope_keys": ["character:이준"], "blockers": []}, "character_chat_asset_readiness": {
+        row = {"context_status": "ready", "scheduled_foundation_missing_count": 0, "automatic_policy": {"rp_scope_keys": ["character:이준"], "scene_scope_keys": ["character:이준"], "blockers": []}, "character_chat_asset_readiness": {
             "character_chat_status": "ready", "missing_profile_scope_keys": ["character:이준"],
             "missing_examples_scope_keys": ["character:이준"], "missing_usable_scene_scope_keys": ["character:이준"],
         }}
@@ -90,10 +93,53 @@ class CharacterChatAssetReadinessDbAuditTest(unittest.TestCase):
 
     def test_scheduled_audit_preserves_identity_failure(self):
         module = load_module()
-        row = {"context_status": "ready", "automatic_policy": {"rp_scope_keys": [], "scene_scope_keys": [], "blockers": ["character:강현"]}, "character_chat_asset_readiness": {
+        row = {"context_status": "ready", "scheduled_foundation_missing_count": 0, "automatic_policy": {"rp_scope_keys": [], "scene_scope_keys": [], "blockers": ["character:강현"]}, "character_chat_asset_readiness": {
             "character_chat_status": "failed", "blocking_continuity_ambiguous_scope_keys": ["character:강현"],
         }}
         self.assertEqual(module.build_asset_action_plan(row), ["repair_character_inventory"])
+
+    def test_scheduled_foundation_uses_actual_first_30_coverage(self):
+        module = load_module()
+        for gap_rank, summary_type, active, expected in (
+            (None, "episode_summary", "Y", 0),
+            (31, "episode_summary", "N", 0),
+            (30, "episode_summary", "N", 1),
+            (30, "episode_character_signals", "N", 1),
+        ):
+            with self.subTest(gap_rank=gap_rank, summary_type=summary_type):
+                with sqlite3.connect(":memory:") as conn:
+                    conn.row_factory = sqlite3.Row
+                    conn.create_function("CONCAT", -1, lambda *args: "".join(map(str, args)))
+                    conn.executescript("""
+                        CREATE TABLE tb_product_episode (product_id INTEGER, episode_id INTEGER, episode_no INTEGER, use_yn TEXT, open_yn TEXT);
+                        CREATE TABLE tb_story_agent_context_summary (product_id INTEGER, scope_key TEXT, summary_type TEXT, is_active TEXT);
+                    """)
+                    for rank in range(1, 33):
+                        conn.execute("INSERT INTO tb_product_episode VALUES (1, ?, ?, 'Y', 'Y')", (rank, rank * 2))
+                        for kind in ("episode_summary", "episode_character_signals"):
+                            conn.execute("INSERT INTO tb_story_agent_context_summary VALUES (1, ?, ?, ?)", (f"episode:{rank}", kind, active if rank == gap_rank and kind == summary_type else "Y"))
+                    # Closed and deleted episodes must not consume a public ordinal.
+                    conn.execute("INSERT INTO tb_product_episode VALUES (1, 100, 1, 'Y', 'N')")
+                    conn.execute("INSERT INTO tb_product_episode VALUES (1, 101, 1, 'N', 'Y')")
+                    class Cursor:
+                        def execute(self, sql, params):
+                            self.result = conn.execute(sql.replace("%s", "?"), params)
+                        def fetchone(self):
+                            return self.result.fetchone()
+                    missing = module.fetch_scheduled_foundation_missing_count(Cursor(), product_id=1)
+                    self.assertEqual(missing, expected)
+                    for status in ("processing", "ready"):
+                        row = {"context_status": status, "scheduled_foundation_missing_count": missing, "automatic_policy": {"blockers": [], "rp_scope_keys": [], "scene_scope_keys": []}}
+                        self.assertEqual(module.build_asset_action_plan(row), ["build_story_context_foundation"] if expected else ["ready"])
+
+    def test_scheduled_foundation_does_not_hide_failed_or_unknown_coverage(self):
+        module = load_module()
+        row = {"context_status": "failed", "scheduled_foundation_missing_count": 0, "automatic_policy": {"blockers": [], "rp_scope_keys": [], "scene_scope_keys": []}}
+        self.assertEqual(module.build_asset_action_plan(row), ["build_story_context_foundation"])
+        row["context_status"] = "processing"
+        del row["scheduled_foundation_missing_count"]
+        with self.assertRaises(KeyError):
+            module.build_asset_action_plan(row)
 
     def test_dev_deploy_package_includes_character_chat_asset_audit(self):
         workflow = (
