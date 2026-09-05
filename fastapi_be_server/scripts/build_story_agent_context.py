@@ -966,6 +966,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-id", type=int, action="append", dest="episode_ids", help="대상 회차 ID. 여러 번 지정 가능")
     parser.add_argument("--episode-no", type=int, action="append", dest="episode_nos", help="delta 대상 회차 번호. 여러 번 지정 가능")
     parser.add_argument("--limit", type=int, default=0, help="대상 제한 건수")
+    parser.add_argument("--scheduled", action="store_true", help="정기 배치: 공개 순번 첫 30화와 현재 RP 선정 범위만 수집")
     parser.add_argument(
         "--max-delta-episodes",
         type=int,
@@ -1263,6 +1264,9 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
         placeholders = ", ".join(["%s"] * len(args.episode_nos))
         where.append(f"pe.episode_no IN ({placeholders})")
         params.extend(args.episode_nos)
+
+    if bool(getattr(args, "scheduled", False)):
+        where.append(f"asset_rank.public_episode_rank <= {CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES}")
 
     where_sql = " AND ".join(where)
     limit_sql = f" LIMIT {int(args.limit)}" if args.limit and args.limit > 0 else ""
@@ -6480,6 +6484,22 @@ def build_inventory_rp_targets(
             )
         )
     return [target for _, target in sorted(candidates, key=lambda item: item[0])[:limit]]
+
+
+def build_scheduled_character_asset_scope_keys(
+    *,
+    inventory_map: dict[str, dict[str, object]],
+    signal_rows: list[dict],
+) -> set[str]:
+    """The automatic repair/audit scope is the generator's existing target set."""
+    capped_inventory = filter_character_inventory_map_to_signal_scope(
+        inventory_map=inventory_map,
+        signal_rows=signal_rows,
+    )
+    return {
+        str(target["character_key"])
+        for target in build_inventory_rp_targets(capped_inventory)
+    }
 
 
 def build_inventory_rp_retained_scope_keys(
@@ -18298,6 +18318,38 @@ def filter_character_chat_asset_repair_plan_to_signal_scope(
     return filtered
 
 
+def build_scheduled_character_asset_policy(
+    *,
+    inventory_map: dict[str, dict[str, object]],
+    signal_rows: list[dict],
+    readiness: dict[str, object],
+) -> dict[str, object]:
+    """Automatic work only; never changes full consumer readiness or retention."""
+    selected = build_scheduled_character_asset_scope_keys(
+        inventory_map=inventory_map, signal_rows=signal_rows,
+    )
+    plan = build_character_chat_asset_repair_plan(readiness)
+    blockers = list(plan["blocked_scope_keys"])
+    if readiness.get("malformed_inventory_scope_keys"):
+        blockers.append("malformed_inventory")
+    main_scopes = set(readiness.get("main_protagonist_scope_keys") or [])
+    if int(readiness.get("public_candidate_count") or 0) > 0 and not main_scopes:
+        blockers.append("missing_main_protagonist")
+    if main_scopes - selected:
+        blockers.append("main_protagonist_not_selected")
+    rp_scopes = set(plan["rp_scope_keys"]) & selected
+    scene_scopes = set(plan["scene_scope_keys"]) & selected
+    return {
+        "selected_scope_keys": sorted(selected),
+        "rp_scope_keys": sorted(rp_scopes),
+        "scene_scope_keys": sorted(scene_scopes),
+        "blockers": sorted(set(blockers)),
+        "repairable": bool(rp_scopes or scene_scopes) and not blockers,
+        "residual_rp_scope_keys": sorted(set(plan["rp_scope_keys"]) - selected),
+        "residual_scene_scope_keys": sorted(set(plan["scene_scope_keys"]) - selected),
+    }
+
+
 def filter_character_chat_asset_repair_plan_to_requested_scopes(
     *,
     repair_plan: dict[str, object],
@@ -18951,6 +19003,21 @@ async def repair_character_chat_assets(
                             requested_scope_keys=requested_scope_keys,
                         )
                     )
+                    if bool(getattr(args, "scheduled", False)):
+                        policy = build_scheduled_character_asset_policy(
+                            inventory_map=inventory_map,
+                            signal_rows=active_signal_rows,
+                            readiness=before_readiness,
+                        )
+                        if policy["blockers"]:
+                            raise ValueError(f"scheduled character asset policy blocked: {policy['blockers']}")
+                        for field in ("rp_scope_keys", "scene_scope_keys"):
+                            repair_plan[field] = sorted(
+                                set(repair_plan[field]) & set(policy["selected_scope_keys"])
+                            )
+                        repair_plan["repairable"] = bool(
+                            repair_plan["rp_scope_keys"] or repair_plan["scene_scope_keys"]
+                        )
                     scene_scope_keys = set(repair_plan["scene_scope_keys"])
                     scene_rows, required_scope_keys_by_episode_no = (
                         select_character_chat_scene_repair_rows(

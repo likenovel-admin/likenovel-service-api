@@ -53,14 +53,14 @@ def load_story_agent_module():
         os.chdir(previous_cwd)
 
 
-def build_product_query(*, product_ids: list[int], limit: int, open_only: bool) -> tuple[str, list[Any]]:
+def build_product_query(*, product_ids: list[int], limit: int, open_only: bool, batch_cohort_sql: str | None = None) -> tuple[str, list[Any]]:
     where = ["1 = 1"]
     params: list[Any] = []
     if open_only:
         where.extend(
             [
                 "p.price_type IN ('free', 'paid')",
-                "p.status_code = 'ongoing'",
+                "p.status_code IN ('ongoing', 'end')" if batch_cohort_sql else "p.status_code = 'ongoing'",
                 "p.open_yn = 'Y'",
                 "COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'",
             ]
@@ -76,6 +76,9 @@ def build_product_query(*, product_ids: list[int], limit: int, open_only: bool) 
         product_alias="p",
         episode_alias="cohort_episode",
     )
+    if batch_cohort_sql:
+        character_chat_policy_sql = f"AND {batch_cohort_sql}"
+        where.append("COALESCE(p.blind_yn, 'N') = 'N'")
     return (
         f"""
         SELECT
@@ -101,8 +104,8 @@ def build_product_query(*, product_ids: list[int], limit: int, open_only: bool) 
     )
 
 
-def fetch_product_rows(cur, *, product_ids: list[int], limit: int, open_only: bool) -> list[dict[str, Any]]:
-    query, params = build_product_query(product_ids=product_ids, limit=limit, open_only=open_only)
+def fetch_product_rows(cur, *, product_ids: list[int], limit: int, open_only: bool, batch_cohort_sql: str | None = None) -> list[dict[str, Any]]:
+    query, params = build_product_query(product_ids=product_ids, limit=limit, open_only=open_only, batch_cohort_sql=batch_cohort_sql)
     cur.execute(query, params)
     return [dict(row) for row in cur.fetchall()]
 
@@ -120,8 +123,13 @@ def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
     public_slot_ready_total = 0
     ready_without_main_protagonist_product_ids: list[int] = []
     out_of_cohort_hold_product_ids: list[int] = []
+    automatic_scope_counts: Counter[str] = Counter()
 
     for row in rows:
+        if "automatic_policy" in row:
+            automatic_scope_counts["products"] += 1
+            for field in ("selected_scope_keys", "rp_scope_keys", "scene_scope_keys", "blockers", "residual_rp_scope_keys", "residual_scene_scope_keys"):
+                automatic_scope_counts[field] += len(row["automatic_policy"].get(field) or [])
         context_status_counts[str(row.get("context_status") or "missing")] += 1
         readiness = dict(row.get("character_chat_asset_readiness") or {})
         character_chat_status = str(
@@ -163,6 +171,7 @@ def summarize_verifications(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "productCount": len(rows),
+        "automaticPolicyCounts": dict(automatic_scope_counts),
         "contextStatusCounts": dict(sorted(context_status_counts.items())),
         "characterChatStatusCounts": dict(sorted(character_chat_status_counts.items())),
         "blockReasonCounts": dict(sorted(block_reason_counts.items())),
@@ -193,6 +202,19 @@ def build_asset_action_plan(row: dict[str, Any]) -> list[str]:
     readiness = dict(row.get("character_chat_asset_readiness") or {})
     status = str(readiness.get("character_chat_status") or "missing")
     context_status = str(row.get("context_status") or "").strip()
+    if "automatic_policy" in row:
+        policy = row["automatic_policy"]
+        actions = []
+        if context_status != "ready":
+            actions.append("build_story_context_foundation")
+        if policy["blockers"]:
+            actions.append("repair_character_inventory")
+        else:
+            if policy["rp_scope_keys"]:
+                actions.append("generate_rp_profile_examples")
+            if policy["scene_scope_keys"]:
+                actions.append("generate_episode_scene_extraction")
+        return actions or (["no_public_character_candidate"] if status == "none_eligible" else ["ready"])
     block_counts = dict(readiness.get("block_reason_counts") or {})
     has_legacy_scope_mismatch = bool(
         readiness.get("legacy_profile_scope_key_mismatch_scope_keys")
@@ -260,6 +282,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--product-id", action="append", type=int, default=[], help="Specific product_id. Repeatable.")
     parser.add_argument("--limit", type=int, default=0, help="Max products to audit. 0 means no limit.")
     parser.add_argument("--include-closed", action="store_true", help="Include closed/private/non-ongoing products.")
+    parser.add_argument("--scheduled", action="store_true", help="Limit automatic repair actions to the generator's current target scopes; retain full readiness diagnostics.")
+    parser.add_argument("--scheduled-action-ids", action="store_true", help="Read-only v1|repair-product-ids|blocked-product-ids manifest for the batch SQL.")
     parser.add_argument("--out", default="", help="Optional JSONL detail output path.")
     parser.add_argument("--summary-out", default="", help="Optional JSON summary output path.")
     parser.add_argument(
@@ -272,9 +296,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    scheduled_policy_mode = bool(args.scheduled or args.scheduled_action_ids)
     load_env_file(Path(args.env_file))
     story_agent = load_story_agent_module()
     rows: list[dict[str, Any]] = []
+    repair_ids: list[int] = []
+    blocked_ids: list[int] = []
     with story_agent.db_connect(autocommit=True) as conn:
         with conn.cursor() as cur:
             product_rows = fetch_product_rows(
@@ -282,16 +309,41 @@ def main() -> int:
                 product_ids=[int(value) for value in args.product_id if int(value) > 0],
                 limit=max(int(args.limit or 0), 0),
                 open_only=not bool(args.include_closed),
+                batch_cohort_sql=(story_agent.build_story_agent_collection_cohort_sql(product_alias="p", episode_alias="cohort_episode") if scheduled_policy_mode else None),
             )
             for product in product_rows:
                 product_id = int(product.get("product_id") or 0)
+                if scheduled_policy_mode and (not is_character_chat_product_eligible(product) or product.get("context_status") == "disabled"):
+                    continue
                 readiness = story_agent.fetch_character_chat_asset_readiness_verification(
                     cur,
                     product_id=product_id,
                     story_context_status=str(product.get("context_status") or ""),
                     total_episode_count=int(product.get("total_episode_count") or 0),
                 )
-                rows.append({**product, "character_chat_asset_readiness": readiness})
+                row = {**product, "character_chat_asset_readiness": readiness}
+                if scheduled_policy_mode:
+                    policy = story_agent.build_scheduled_character_asset_policy(
+                        inventory_map=story_agent.fetch_active_character_inventory_map(
+                            cur=cur, product_id=product_id, summary_type="character_inventory_v3",
+                        ),
+                        signal_rows=story_agent.fetch_active_character_asset_summary_rows(
+                            cur=cur, product_id=product_id, summary_type="episode_character_signals",
+                        ),
+                        readiness=readiness,
+                    )
+                    row["automatic_policy"] = policy
+                    if product_id <= 0:
+                        raise ValueError("scheduled manifest requires a positive product id")
+                    if policy["blockers"]:
+                        blocked_ids.append(product_id)
+                    elif policy["repairable"]:
+                        repair_ids.append(product_id)
+                rows.append(row)
+
+    if args.scheduled_action_ids:
+        print("v1|" + ",".join(map(str, [0, *repair_ids])) + "|" + ",".join(map(str, [0, *blocked_ids])))
+        return 0
 
     summary = summarize_verifications(rows)
     if args.out:
