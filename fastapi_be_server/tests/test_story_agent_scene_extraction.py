@@ -6,8 +6,12 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+from tests.test_character_asset_attempt import ReceiptConnection
+from tests.test_story_agent_context_cost_guard import FakeOpenRouterClient
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "build_story_agent_context.py"
@@ -45,10 +49,93 @@ def load_module():
             spec.loader.exec_module(module)
         finally:
             os.chdir(previous_cwd)
+    module._character_asset_attempt_store = module.CharacterAssetAttemptStore(ReceiptConnection())
+    module._character_asset_product_id.set(687)
     return module
 
 
 class StoryAgentSceneExtractionTest(unittest.TestCase):
+    def test_cached_superseded_scene_replacement_preserves_canonical_actors_and_receipts(self):
+        for receipt_version, omit_companion in ((None, False), ("receipt_v2", False), ("receipt_v1", False), (None, True), ("receipt_v2", True), ("receipt_v1", True)):
+            with self.subTest(receipt_version=receipt_version, omit_companion=omit_companion):
+                module = load_module()
+                conn = FakeConnection()
+                old, canonical, companion = "character:old", "character:new", "character:companion"
+                raw = "민서는 문을 닫았고 도윤은 출구를 지켰다."
+                packet = {"characters": [{"scope_key": canonical, "display_name": "민서"}, {"scope_key": companion, "display_name": "도윤"}]}
+                row = {"summary_id": 104, "scope_key": "episode:104", "episode_from": 5, "source_hash": "summary104", "summary_text": "[5화] 출구"}
+                payload = {"episode_no": 5, "scenes": [{"boundary_anchor_start": raw, "scene_gist": raw, "participants": [{"mention_label": "민서", "scope_key": canonical}], "action_ownership": []}]}
+                if not omit_companion:
+                    payload["scenes"][0]["participants"].append({"mention_label": "도윤", "scope_key": companion})
+                cached_payload = {"episode_no": 5, "status": "ok", "scene_count": 1, "scenes": [{"scene_gist": raw, "participants": [{"scope_key": old}, {"scope_key": companion}]}]}
+                cached = {"summary_id": 777, "scope_key": "episode:104", "episode_from": 5, "episode_to": 5, "source_hash": module.build_episode_scene_extraction_source_hash(row, packet, normalized_text=raw), "summary_text": json.dumps(cached_payload)}
+                client = FakeOpenRouterClient(payload)
+                store = module._character_asset_attempt_store
+
+                async def run():
+                    with patch.object(module, "OPENROUTER_API_KEY", "test-key"), patch.object(module, "work_cursor", fake_work_cursor), patch.object(module, "fetch_existing_summary", return_value=cached) as fetch, patch.object(module, "fetch_active_summary_by_scope", return_value=cached), patch.object(module, "activate_existing_summary") as activate, patch.object(module, "update_existing_summary_payload") as update, patch.object(module, "upsert_summary") as insert:
+                        before = None
+                        if receipt_version:
+                            prompt = module.build_episode_scene_extraction_user_prompt(product_title="합성 작품", episode_no=5, episode_title=module.parse_summary_text(row["summary_text"]).get("header") or "", normalized_text=raw, canonical_character_packet=packet)
+                            if receipt_version == "receipt_v2":
+                                constraints = {"episode_scope_key": "episode:104", "episode_no": 5, "required_scope_keys": sorted([canonical, companion]), "scope_key_replacements": {old: canonical}}
+                                prompt += "\n필수 장면 계약: " + json.dumps(constraints, ensure_ascii=False, sort_keys=True) + "\n원문에서 뒷받침되는 필수 인물을 장면에 포함하고, 근거 없는 인물은 만들지 마라."
+                            key = module.attempt_key(687, "scenes", "episode:104", module.EPISODE_SCENE_EXTRACTION_FORMAT_VERSION + ":" + receipt_version, {"provider": "openrouter", "body": module.build_episode_scene_extraction_openrouter_payload(user_prompt=prompt)})
+                            store.claim(key)
+                            store.accept(key, payload)
+                            before = deepcopy(store.connection.rows)
+                        for _ in range(2):
+                            kwargs = dict(product_id=687, product_title="합성 작품", episode_rows=[row], episode_scope_map={"episode:104": 5}, episode_texts_by_scope={"episode:104": raw}, summary_client=client, canonical_character_packet=packet, scope_key_replacements={old: canonical}, required_scope_keys_by_episode_scope={"episode:104": {canonical}}, cleanup_missing_scopes=False, commit_changes=False)
+                            if omit_companion:
+                                with self.assertRaises(module.CharacterAssetAttemptBlocked):
+                                    await module.build_episode_scene_extraction_summaries_nonblocking(conn, **kwargs)
+                            else:
+                                try:
+                                    result = await module.build_episode_scene_extraction_summaries_nonblocking(conn, **kwargs)
+                                except module.CharacterAssetAttemptBlocked:
+                                    self.assertEqual(next(iter(store.connection.rows.values()))["status"], "accepted")
+                                    update.assert_not_called()
+                                    raise
+                                self.assertEqual(result, (1, 0))
+                                replacement = update.call_args.kwargs
+                                self.assertEqual(replacement["summary_id"], 777)
+                                self.assertEqual(module.extract_episode_scene_character_scope_keys(json.loads(replacement["summary_text"])), {canonical, companion})
+                                episode_map = {**{f"episode:{200 + no}": no for no in range(1, 5)}, "episode:104": 5}
+                                prepared = [{"scope_key": f"episode:{200 + no}", "episode_from": no, "episode_to": no, "summary_text": json.dumps({"episode_no": no, "status": "ok", "scenes": [{"scene_gist": "민서는 문을 지켰다.", "participants": [{"scope_key": canonical}]}]})} for no in range(1, 5)]
+                                self.assertEqual(len(module.build_usable_character_scene_episodes_by_scope(prepared, episode_map)[canonical]), 4)
+                                coverage = module.build_usable_character_scene_episodes_by_scope([*prepared, replacement], episode_map)
+                                self.assertEqual(set(coverage[canonical]), set(episode_map))
+                                self.assertNotIn(old, coverage)
+                                conn.rollback()  # The next invocation still sees both original cache rows.
+                        self.assertEqual(fetch.call_args.kwargs["source_hash"], cached["source_hash"])
+                        activate.assert_not_called()
+                        insert.assert_not_called()
+                        self.assertEqual(update.call_count, 0 if omit_companion else 2)
+                        self.assertEqual(len(client.calls), 0 if receipt_version else 1)
+                        self.assertEqual(len(store.connection.rows), 1)
+                        if before is not None:
+                            self.assertEqual(store.connection.rows, before)
+                        else:
+                            self.assertEqual(next(iter(store.connection.rows.values()))["status"], "terminal_invalid" if omit_companion else "accepted")
+                asyncio.run(run())
+
+    def test_scene_packet_retains_anonymous_first_person_but_not_shared_roles(self):
+        module = load_module()
+        packet = module.build_episode_scene_canonical_character_packet({
+            "character:anonymous": {
+                "display_name": "나(주인공)", "entity_kind": "stable_role",
+                "is_protagonist": True, "first_person_evidence": {"episode_count": 2},
+                "work_role": "main_protagonist",
+                "source_character_keys": ["protagonist:generic"],
+            },
+            "character:role": {
+                "display_name": "경비원", "entity_kind": "stable_role",
+                "work_role": "major_character",
+            },
+            "character:민서": {"display_name": "민서", "entity_kind": "person"},
+        })
+        self.assertEqual({item["scope_key"] for item in packet["characters"]}, {"character:anonymous", "character:민서"})
+
     def test_usable_scene_payload_requires_known_status_and_scene_gist(self):
         module = load_module()
 
@@ -294,341 +381,6 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
             canonical_character_packet={"characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]},
         ))
 
-    def test_character_chat_prompt_accepts_scene_frame_context(self):
-        module = load_module()
-
-        prompt = module.build_character_chat_internal_prompt_user_prompt(
-            target={"display_name": "아델리트", "aliases": ["아델리트"], "is_protagonist": True},
-            profile_payload={"speech_style": {"tone": ["낮게 말함"]}},
-            example_payload={"examples": [{"episode_no": 1, "text": "문은 내가 연다."}]},
-            dialogue_items=[{"episode_no": 1, "kind": "dialogue", "context": "문 앞", "text": "문은 내가 연다."}],
-            summary_context_lines=["[1화] 아델리트가 문 앞에서 선택을 앞둔다."],
-            relation_context_lines=["아델리트 -> 경비병: 경계"],
-            scene_context_lines=[
-                "[1화] 압력=경비병 접근 | 유저역할=임시 동행자 | hook=소리 없이 잠금 장치를 확인"
-            ],
-        )
-
-        self.assertIn("[장면 프레임 근거]", prompt)
-        self.assertIn("유저역할=임시 동행자", prompt)
-        self.assertIn("hook=소리 없이 잠금 장치를 확인", prompt)
-
-    def test_character_chat_prompt_includes_identity_reveal_boundary(self):
-        module = load_module()
-
-        prompt = module.build_character_chat_internal_prompt_user_prompt(
-            target={"display_name": "조렌 테이머", "aliases": ["조렌 테이머"], "is_protagonist": True},
-            profile_payload={"speech_style": {"tone": ["낮고 계산적으로 말함"], "formality": "반말", "sentence_length": "짧게 끊는", "address": "전하"}},
-            example_payload={"examples": [{"episode_no": 2, "text": "지금은 조렌 테이머로 불린다."}]},
-            dialogue_items=[{"episode_no": 2, "kind": "dialogue", "context": "성문 앞", "text": "그 이름은 여기서 쓰지 마."}],
-            summary_context_lines=["[2화] 호영은 조렌 테이머라는 이름으로 움직인다."],
-            relation_context_lines=[],
-            inventory_item={
-                "display_name": "조렌 테이머",
-                "work_role": "main_protagonist",
-                "identity_surface": {
-                    "chat_display_name": "조렌 테이머",
-                    "addressable_names": ["조렌 테이머"],
-                    "private_identity_names": ["방호영"],
-                    "forbidden_until_revealed": ["방호영"],
-                    "reveal_state": "known_to_self",
-                },
-                "reveal_boundary": {
-                    "allowed_address_names": ["조렌 테이머"],
-                    "must_not_address_as": ["방호영"],
-                    "identity_spoiler_risk": "high",
-                },
-                "read_range_state_snapshot": {
-                    "as_of_episode_no": 2,
-                    "current_identity": {
-                        "display_name": "조렌 테이머",
-                        "private_true_name": "방호영",
-                        "identity_variant": "alternate_public_identity",
-                    },
-                    "forbidden_identity_terms": ["방호영"],
-                },
-                "interaction_affordance_v1": {
-                    "preferred_user_role_key": "scene_clue_holder",
-                    "user_role_options": [{"role_label_ko": "장면에 단서를 들고 엮인 임시 조력자"}],
-                },
-                "adjacent_event_seed_v1": {
-                    "new_incident_is_adjacent_not_canon": True,
-                    "conflict_vector": "hidden_clue",
-                    "protagonist_first_move": "현재 압력이나 단서를 먼저 짚는다.",
-                },
-                "pov_and_protagonist_centrality_v1": {
-                    "protagonist_presence": "late_entry_after_prologue",
-                    "hold_before_episode_no": 2,
-                    "expose_policy": "hold_until_presence_episode",
-                },
-                "voice_contract_v1": {
-                    "speech_register": "honorific_surface_present",
-                    "address_terms": ["전하"],
-                    "forbidden_speech_patterns": ["무엇을 도와드릴까요"],
-                },
-            },
-        )
-
-        self.assertIn("identity_surface", prompt)
-        self.assertIn("forbidden_until_revealed", prompt)
-        self.assertIn("reveal_boundary", prompt)
-        self.assertIn("must_not_address_as", prompt)
-        self.assertIn("read_range_state_snapshot", prompt)
-        self.assertIn("interaction_affordance_v1", prompt)
-        self.assertIn("adjacent_event_seed_v1", prompt)
-        self.assertIn("pov_and_protagonist_centrality_v1", prompt)
-        self.assertIn("late_entry_after_prologue", prompt)
-        self.assertIn("[보이스 계약]", prompt)
-        self.assertIn("profile_voice_contract", prompt)
-        self.assertIn("inventory_voice_contract", prompt)
-        self.assertIn("honorific_surface_present", prompt)
-        self.assertIn("casual", prompt)
-        self.assertIn("scene_clue_holder", prompt)
-        self.assertIn("hidden_clue", prompt)
-        self.assertIn("방호영", prompt)
-
-    def test_character_chat_internal_prompt_hash_changes_with_scene_context(self):
-        module = load_module()
-        base_kwargs = {
-            "character_key": "character:아델리트",
-            "inventory_item": {"display_name": "아델리트"},
-            "profile_payload": {"speech_style": {"tone": ["낮게 말함"]}},
-            "example_payload": {"examples": [{"text": "문은 내가 연다."}]},
-            "dialogue_items": [{"episode_no": 1, "text": "문은 내가 연다."}],
-            "summary_context_lines": ["[1화] 문 앞 장면"],
-            "relation_context_lines": ["아델리트 -> 경비병: 경계"],
-        }
-
-        without_scene = module.build_character_chat_internal_prompt_source_hash(**base_kwargs)
-        with_scene = module.build_character_chat_internal_prompt_source_hash(
-            **base_kwargs,
-            scene_context_lines=["[1화] 압력=경비병 접근 | hook=잠금 장치 확인"],
-        )
-
-        self.assertNotEqual(without_scene, with_scene)
-
-    def test_character_chat_internal_prompt_hash_changes_with_identity_boundary(self):
-        module = load_module()
-        base_kwargs = {
-            "character_key": "character:조렌테이머",
-            "profile_payload": {"speech_style": {"tone": ["낮게 말함"]}},
-            "example_payload": {"examples": [{"text": "성문을 닫아라."}]},
-            "dialogue_items": [{"episode_no": 2, "text": "성문을 닫아라."}],
-            "summary_context_lines": ["[2화] 성문 앞 장면"],
-            "relation_context_lines": [],
-            "scene_context_lines": ["[2화] 압력=병사 접근 | hook=성문 봉쇄"],
-        }
-
-        public_identity = module.build_character_chat_internal_prompt_source_hash(
-            **base_kwargs,
-            inventory_item={
-                "display_name": "조렌 테이머",
-                "identity_surface": {
-                    "chat_display_name": "조렌 테이머",
-                    "addressable_names": ["조렌 테이머", "방호영"],
-                    "forbidden_until_revealed": [],
-                    "reveal_state": "public",
-                },
-                "reveal_boundary": {
-                    "allowed_address_names": ["조렌 테이머", "방호영"],
-                    "must_not_address_as": [],
-                    "identity_spoiler_risk": "low",
-                },
-            },
-        )
-        hidden_identity = module.build_character_chat_internal_prompt_source_hash(
-            **base_kwargs,
-            inventory_item={
-                "display_name": "조렌 테이머",
-                "identity_surface": {
-                    "chat_display_name": "조렌 테이머",
-                    "addressable_names": ["조렌 테이머"],
-                    "private_identity_names": ["방호영"],
-                    "forbidden_until_revealed": ["방호영"],
-                    "reveal_state": "known_to_self",
-                },
-                "reveal_boundary": {
-                    "allowed_address_names": ["조렌 테이머"],
-                    "must_not_address_as": ["방호영"],
-                    "identity_spoiler_risk": "high",
-                },
-            },
-        )
-
-        self.assertNotEqual(public_identity, hidden_identity)
-
-    def test_character_chat_internal_prompt_hash_changes_with_runtime_contracts(self):
-        module = load_module()
-        base_kwargs = {
-            "character_key": "character:조렌테이머",
-            "profile_payload": {"speech_style": {"tone": ["낮게 말함"]}},
-            "example_payload": {"examples": [{"text": "성문을 닫아라."}]},
-            "dialogue_items": [{"episode_no": 2, "text": "성문을 닫아라."}],
-            "summary_context_lines": ["[2화] 성문 앞 장면"],
-            "relation_context_lines": [],
-            "scene_context_lines": ["[2화] 압력=병사 접근 | hook=성문 봉쇄"],
-        }
-
-        helper_contract = module.build_character_chat_internal_prompt_source_hash(
-            **base_kwargs,
-            inventory_item={
-                "display_name": "조렌 테이머",
-                "read_range_state_snapshot": {"as_of_episode_no": 2},
-                "interaction_affordance_v1": {"preferred_user_role_key": "temporary_helper_at_scene"},
-                "adjacent_event_seed_v1": {"conflict_vector": "unexpected_visitor"},
-                "pov_and_protagonist_centrality_v1": {"protagonist_presence": "active_from_start"},
-                "voice_contract_v1": {"speech_register": "dialogue_evidence_present"},
-            },
-        )
-        clue_contract = module.build_character_chat_internal_prompt_source_hash(
-            **base_kwargs,
-            inventory_item={
-                "display_name": "조렌 테이머",
-                "read_range_state_snapshot": {"as_of_episode_no": 2},
-                "interaction_affordance_v1": {"preferred_user_role_key": "scene_clue_holder"},
-                "adjacent_event_seed_v1": {"conflict_vector": "hidden_clue"},
-                "pov_and_protagonist_centrality_v1": {"protagonist_presence": "late_entry_after_prologue"},
-                "voice_contract_v1": {"speech_register": "honorific_surface_present"},
-            },
-        )
-
-        self.assertNotEqual(helper_contract, clue_contract)
-
-    def test_character_chat_opening_source_hash_includes_runtime_formula_contract(self):
-        module = load_module()
-        kwargs = {
-            "character_key": "character:아델리트",
-            "inventory_item": {
-                "display_name": "아델리트",
-                "read_range_state_snapshot": {"as_of_episode_no": 3},
-            },
-            "profile_row": {"source_hash": "profile-hash"},
-            "examples_row": {"source_hash": "examples-hash"},
-            "internal_prompt_row": {"source_hash": "internal-hash"},
-            "summary_context_lines": ["3화: 문 앞 압박"],
-            "relation_context_lines": ["아델리트 -> 문지기: 경계"],
-            "scene_context_lines": ["[3화] 압력=발소리 접근 | hook=문틈 확인"],
-        }
-
-        first_hash = module.build_character_chat_opening_source_hash(**kwargs)
-        module.CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION = "runtime_formula_seed_v2"
-        second_hash = module.build_character_chat_opening_source_hash(**kwargs)
-
-        self.assertNotEqual(first_hash, second_hash)
-
-    def test_character_chat_opening_payload_requires_narration_dialogue_and_objective(self):
-        module = load_module()
-        base_payload = {
-            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
-            "chat_target": {"scope_key": "character:아델리트", "display_name": "아델리트"},
-            "opening_scene": {"situation": "아델리트가 문 앞의 발소리를 듣는다."},
-            "opening_message": {
-                "narration": "문틈 아래로 새어 나온 빛이 낡은 바닥의 흠집을 길게 비춘다. 아델리트는 열쇠를 쥔 손을 천천히 내리고, 복도 끝에서 멎은 발소리를 가늠한다. 습기 밴 벽지 사이로 낮은 마찰음이 번지고, 문고리의 금속은 금방이라도 식은 숨을 토할 듯 흔들린다. 아델리트는 먼저 등불의 심지를 낮추고 바닥의 긁힌 자국을 따라 시선을 옮긴다. 지금 문을 열면 안쪽의 누군가가 움직이고, 그림자를 확인하면 발소리의 주인을 놓칠 수 있다. 잠긴 공기 속에서 선택을 미룰 여유가 없다.",
-                "dialogue": "\"발소리가 멎었어. 지금 열쇠를 돌릴지, 아니면 저쪽 그림자부터 확인할지 골라.\"",
-                "opening_text": "문틈 아래로 새어 나온 빛이 낡은 바닥의 흠집을 길게 비춘다. 아델리트는 열쇠를 쥔 손을 천천히 내리고, 복도 끝에서 멎은 발소리를 가늠한다. 습기 밴 벽지 사이로 낮은 마찰음이 번지고, 문고리의 금속은 금방이라도 식은 숨을 토할 듯 흔들린다. 아델리트는 먼저 등불의 심지를 낮추고 바닥의 긁힌 자국을 따라 시선을 옮긴다. 지금 문을 열면 안쪽의 누군가가 움직이고, 그림자를 확인하면 발소리의 주인을 놓칠 수 있다. 잠긴 공기 속에서 선택을 미룰 여유가 없다.\n\n\"발소리가 멎었어. 지금 열쇠를 돌릴지, 아니면 저쪽 그림자부터 확인할지 골라.\"",
-                "user_objective": "열쇠를 돌릴지 그림자를 확인할지 선택한다.",
-            },
-            "user_role": {"role_type": "임시 동행자"},
-            "character_drive": {"immediate_objective": "문 앞의 위험을 넘긴다."},
-            "agency_contract": {
-                "character_moves_first": True,
-                "non_user_dependent_action": "아델리트가 먼저 발소리의 위치를 확인한다.",
-            },
-            "progression_engine": {"scene_exit_condition": "문 앞 단서를 확인하면 다음 방으로 이동한다."},
-            "runtime_formula_seed": {
-                "formula_type": "FORMULA_PUBLIC_TEST_FLIP",
-                "p_to_user_request": "열쇠와 그림자 중 먼저 확인할 대상을 고르게 한다.",
-                "user_task_type": "UT_INSPECT_CLUE",
-                "user_task_success_condition": "유저가 열쇠 또는 그림자 중 하나를 선택한다.",
-                "protagonist_state_delta": "아델리트가 선택된 단서를 기준으로 문 앞 대응을 바꾼다.",
-                "open_loop": "문 안쪽의 움직임이 다음 압박으로 남는다.",
-                "mutation_policy": "MP_SAME_PRESSURE_NEW_ROUTE",
-            },
-        }
-
-        normalized = module.normalize_character_chat_opening_payload(
-            base_payload,
-            scope_key="character:아델리트",
-            display_name="아델리트",
-        )
-
-        self.assertIsNotNone(normalized)
-        self.assertIn("문틈 아래로", normalized["opening_message"]["opening_text"])
-        self.assertIn("\n\n", normalized["opening_message"]["opening_text"])
-        self.assertIn("\"발소리가 멎었어.", normalized["opening_message"]["opening_text"])
-        self.assertEqual(normalized["opening_message"]["user_objective"], "열쇠를 돌릴지 그림자를 확인할지 선택한다.")
-        self.assertEqual(normalized["runtime_formula_seed"]["user_task_type"], "UT_INSPECT_CLUE")
-
-        missing_formula_seed = dict(base_payload)
-        missing_formula_seed.pop("runtime_formula_seed")
-        self.assertIsNone(
-            module.normalize_character_chat_opening_payload(
-                missing_formula_seed,
-                scope_key="character:아델리트",
-                display_name="아델리트",
-            )
-        )
-
-        dialogue_only = dict(base_payload)
-        dialogue_only["opening_message"] = {
-            "dialogue": "\"열쇠를 돌릴지 골라.\"",
-            "opening_text": "\"열쇠를 돌릴지 골라.\"",
-            "user_objective": "열쇠를 돌린다.",
-        }
-        self.assertIsNone(
-            module.normalize_character_chat_opening_payload(
-                dialogue_only,
-                scope_key="character:아델리트",
-                display_name="아델리트",
-            )
-        )
-
-        narration_only = dict(base_payload)
-        narration_only["opening_message"] = {
-            "narration": "문틈 아래로 새어 나온 빛이 낡은 바닥의 흠집을 비춘다.",
-            "opening_text": "문틈 아래로 새어 나온 빛이 낡은 바닥의 흠집을 비춘다.",
-            "user_objective": "흠집을 확인한다.",
-        }
-        self.assertIsNone(
-            module.normalize_character_chat_opening_payload(
-                narration_only,
-                scope_key="character:아델리트",
-                display_name="아델리트",
-            )
-        )
-
-        agency_bad = dict(base_payload)
-        agency_bad["opening_message"] = dict(base_payload["opening_message"])
-        agency_bad["opening_message"]["dialogue"] = "\"거기, 멍하니 서 있지 말고 저 그림자부터 확인해.\""
-        agency_bad["opening_message"]["opening_text"] = (
-            agency_bad["opening_message"]["narration"]
-            + "\n\n"
-            + agency_bad["opening_message"]["dialogue"]
-        )
-        self.assertIsNone(
-            module.normalize_character_chat_opening_payload(
-                agency_bad,
-                scope_key="character:아델리트",
-                display_name="아델리트",
-            )
-        )
-
-        vague_address = dict(base_payload)
-        vague_address["opening_message"] = dict(base_payload["opening_message"])
-        vague_address["opening_message"]["dialogue"] = "\"거기, 저쪽 그림자와 문틈 아래 흔적 중 하나를 먼저 확인해.\""
-        vague_address["opening_message"]["opening_text"] = (
-            vague_address["opening_message"]["narration"]
-            + "\n\n"
-            + vague_address["opening_message"]["dialogue"]
-        )
-        self.assertIsNone(
-            module.normalize_character_chat_opening_payload(
-                vague_address,
-                scope_key="character:아델리트",
-                display_name="아델리트",
-            )
-        )
-
     def test_build_scene_context_lines_groups_by_scope_key(self):
         module = load_module()
         scene_payload = {
@@ -754,10 +506,12 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         first_hash = module.build_episode_scene_extraction_source_hash(
             row,
             {"characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]},
+            normalized_text="원문",
         )
         second_hash = module.build_episode_scene_extraction_source_hash(
             row,
             {"characters": [{"scope_key": "character:조연", "display_name": "조연"}]},
+            normalized_text="원문",
         )
 
         self.assertNotEqual(first_hash, second_hash)
@@ -786,6 +540,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                  patch.object(module, "upsert_summary") as upsert_summary:
                 inserted, reused = await module.build_episode_scene_extraction_summaries(
                     conn,
+                    episode_scope_map={"episode:1": 1},
                     product_id=687,
                     product_title="테스트 작품",
                     episode_rows=[
@@ -797,7 +552,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                             "summary_text": "[1화] 시작",
                         }
                     ],
-                    episode_texts_by_no={1: "아델리트는 문을 열었다."},
+                    episode_texts_by_scope={"episode:1": "아델리트는 문을 열었다."},
                     summary_client=object(),
                     canonical_character_packet={
                         "characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]
@@ -829,6 +584,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                  patch.object(module, "deactivate_active_scope") as deactivate_scope:
                 inserted, reused = await module.build_episode_scene_extraction_summaries(
                     conn,
+                    episode_scope_map={"episode:1": 1},
                     product_id=687,
                     product_title="테스트 작품",
                     episode_rows=[
@@ -840,7 +596,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                             "summary_text": "[1화] 시작",
                         }
                     ],
-                    episode_texts_by_no={1: "아델리트는 문을 열었다."},
+                    episode_texts_by_scope={"episode:1": "아델리트는 문을 열었다."},
                     summary_client=object(),
                     canonical_character_packet={
                         "characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]
@@ -872,7 +628,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                     product_id=687,
                     product_title="테스트 작품",
                     episode_rows=[],
-                    episode_texts_by_no={},
+                    episode_texts_by_scope={},
                     summary_client=object(),
                     canonical_character_packet={"characters": []},
                 )
@@ -920,6 +676,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                  patch.object(module, "update_existing_summary_payload") as update_existing:
                 inserted, reused = await module.build_episode_scene_extraction_summaries(
                     conn,
+                    episode_scope_map={"episode:1": 1},
                     product_id=687,
                     product_title="테스트 작품",
                     episode_rows=[
@@ -931,7 +688,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
                             "summary_text": "[1화] 시작",
                         }
                     ],
-                    episode_texts_by_no={1: "아델리트는 문을 열었다."},
+                    episode_texts_by_scope={"episode:1": "아델리트는 문을 열었다."},
                     summary_client=object(),
                     canonical_character_packet={
                         "characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]
@@ -949,51 +706,28 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         update_existing.assert_called_once()
         self.assertEqual(conn.commit_count, 1)
 
-    def test_scene_extraction_request_retries_incomplete_json_once(self):
+    def test_scene_extraction_request_blocks_incomplete_json_without_retry(self):
         module = load_module()
-        request_mock = AsyncMock(
-            side_effect=[
-                None,
-                {
-                    "schema_version": "episode_scene_extraction_v1",
-                    "status": "ok",
-                    "scenes": [
-                        {
-                            "scene_index": 1,
-                            "boundary_anchor_start": "아델리트는 문을 열었다.",
-                            "scene_kind": "action",
-                            "scene_gist": "아델리트가 문을 연다.",
-                            "participants": [
-                                {"mention_label": "아델리트", "scope_key": "character:아델리트"}
-                            ],
-                            "action_ownership": [
-                                {"actor_scope_key": "character:아델리트", "action": "문을 연다"}
-                            ],
-                        }
-                    ],
-                },
-            ]
-        )
+        client = FakeOpenRouterClient(None)
 
         async def run():
-            with patch.object(module, "request_episode_scene_extraction_openrouter_json_payload", request_mock):
-                return await module.request_episode_scene_extraction_payload(
-                    object(),
-                    product_title="테스트 작품",
-                    episode_no=1,
-                    episode_title="시작",
-                    normalized_text="아델리트는 문을 열었다.",
-                    canonical_character_packet={
-                        "characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]
-                    },
-                )
+            with patch.object(module, "OPENROUTER_API_KEY", "test-key"):
+                for _ in range(2):
+                    with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "terminal_invalid"):
+                        await module.request_episode_scene_extraction_payload(
+                            client, product_id=687, product_title="테스트 작품",
+                            episode_no=1, episode_title="시작",
+                            episode_scope_key="episode:1",
+                            normalized_text="아델리트는 문을 열었다.",
+                            canonical_character_packet={
+                                "characters": [{"scope_key": "character:아델리트", "display_name": "아델리트"}]
+                            },
+                        )
 
-        payload = asyncio.run(run())
-
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["scene_count"], 1)
-        self.assertEqual(request_mock.await_count, 2)
-        self.assertIn("이전 응답은 완전한 JSON object가 아니었다", request_mock.await_args_list[1].kwargs["user_prompt"])
+        asyncio.run(run())
+        self.assertEqual(len(client.calls), 1)
+        receipt = next(iter(module._character_asset_attempt_store.connection.rows.values()))
+        self.assertEqual(receipt["status"], "terminal_invalid")
 
 
 if __name__ == "__main__":

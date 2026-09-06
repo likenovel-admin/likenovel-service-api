@@ -363,33 +363,60 @@ FROM (
               NOT EXISTS (
                 SELECT 1
                 FROM tb_story_agent_context_summary repair_profile
+                JOIN tb_story_agent_context_summary repair_examples
+                  ON repair_examples.product_id = repair_profile.product_id
+                 AND repair_examples.scope_key = repair_profile.scope_key
+                 AND repair_examples.summary_type = 'character_rp_examples'
+                 AND repair_examples.is_active = 'Y'
                 WHERE repair_profile.product_id = p.product_id
                   AND repair_profile.summary_type = 'character_rp_profile'
                   AND repair_profile.is_active = 'Y'
                   AND repair_profile.scope_key = repair_inventory.scope_key
                   AND JSON_VALID(repair_profile.summary_text)
-                  AND JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_key')) = repair_inventory.scope_key
-              )
-              OR NOT EXISTS (
-                SELECT 1
-                FROM tb_story_agent_context_summary repair_examples
-                WHERE repair_examples.product_id = p.product_id
-                  AND repair_examples.summary_type = 'character_rp_examples'
-                  AND repair_examples.is_active = 'Y'
-                  AND repair_examples.scope_key = repair_inventory.scope_key
+                  AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_key')) = BINARY repair_inventory.scope_key
                   AND JSON_VALID(repair_examples.summary_text)
-                  AND JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_key')) = repair_inventory.scope_key
-                  AND JSON_TYPE(JSON_EXTRACT(repair_examples.summary_text, '$.examples')) = 'ARRAY'
-                  AND COALESCE(JSON_LENGTH(JSON_EXTRACT(repair_examples.summary_text, '$.examples')), 0) > 0
-                  AND EXISTS (
-                    SELECT 1
-                    FROM JSON_TABLE(
-                      repair_examples.summary_text,
-                      '$.examples[*]' COLUMNS (
-                        example_text TEXT PATH '$.text'
+                  AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_key')) = BINARY repair_inventory.scope_key
+                  AND (
+                    (
+                      JSON_CONTAINS_PATH(repair_inventory.summary_text, 'one', '$.character_contract') = 0
+                      AND JSON_CONTAINS_PATH(repair_profile.summary_text, 'one', '$.character_contract') = 0
+                      AND JSON_CONTAINS_PATH(repair_examples.summary_text, 'one', '$.character_contract') = 0
+                      AND JSON_TYPE(JSON_EXTRACT(repair_examples.summary_text, '$.examples')) = 'ARRAY'
+                      AND COALESCE(JSON_LENGTH(JSON_EXTRACT(repair_examples.summary_text, '$.examples')), 0) > 0
+                      AND EXISTS (
+                        SELECT 1
+                        FROM JSON_TABLE(
+                          repair_examples.summary_text,
+                          '$.examples[*]' COLUMNS (
+                            example_text TEXT PATH '$.text'
+                          )
+                        ) repair_example_item
+                        WHERE REGEXP_LIKE(repair_example_item.example_text, '[^[:space:]]')
                       )
-                    ) repair_example_item
-                    WHERE NULLIF(TRIM(repair_example_item.example_text), '') IS NOT NULL
+                    )
+                    OR (
+                      JSON_CONTAINS_PATH(repair_inventory.summary_text, 'one', '$.character_contract') = 1
+                      AND JSON_CONTAINS_PATH(repair_profile.summary_text, 'one', '$.character_contract') = 1
+                      AND JSON_CONTAINS_PATH(repair_examples.summary_text, 'one', '$.character_contract') = 1
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.character_contract.version')) = BINARY 'v1'
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_contract.version')) = BINARY 'v1'
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_contract.version')) = BINARY 'v1'
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.character_contract.character_key')) = BINARY repair_inventory.scope_key
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_contract.character_key')) = BINARY repair_inventory.scope_key
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_contract.character_key')) = BINARY repair_inventory.scope_key
+                      AND JSON_TYPE(JSON_EXTRACT(repair_inventory.summary_text, '$.character_contract.generation_hash')) = 'STRING'
+                      AND JSON_TYPE(JSON_EXTRACT(repair_profile.summary_text, '$.character_contract.generation_hash')) = 'STRING'
+                      AND JSON_TYPE(JSON_EXTRACT(repair_examples.summary_text, '$.character_contract.generation_hash')) = 'STRING'
+                      AND CHAR_LENGTH(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.character_contract.generation_hash'))) = 64
+                      AND REGEXP_LIKE(JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.character_contract.generation_hash')), '^[0-9a-f]{64}$', 'c')
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.character_contract.generation_hash')) = BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.character_contract.generation_hash'))
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_examples.summary_text, '$.character_contract.generation_hash')) = BINARY JSON_UNQUOTE(JSON_EXTRACT(repair_inventory.summary_text, '$.character_contract.generation_hash'))
+                      AND JSON_TYPE(JSON_EXTRACT(repair_profile.summary_text, '$.display_name')) = 'STRING'
+                      AND REGEXP_LIKE(JSON_UNQUOTE(JSON_EXTRACT(repair_profile.summary_text, '$.display_name')), '[^[:space:]]')
+                      AND JSON_TYPE(JSON_EXTRACT(repair_profile.summary_text, '$.identity_labels_v1')) = 'ARRAY'
+                      AND JSON_TYPE(JSON_EXTRACT(repair_examples.summary_text, '$.grounding_v1')) = 'ARRAY'
+                      AND COALESCE(JSON_LENGTH(JSON_EXTRACT(repair_examples.summary_text, '$.grounding_v1')), 0) > 0
+                    )
                   )
               )
               OR NOT EXISTS (

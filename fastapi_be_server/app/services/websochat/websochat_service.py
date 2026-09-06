@@ -30,8 +30,10 @@ from app.schemas.websochat import (
 )
 from app.services.websochat.character_chat_product_policy import (
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
+    is_character_chat_inventory_v1_decision_coherent,
     is_character_chat_rp_profile_payload_ready,
     is_character_chat_product_eligible,
+    select_character_chat_grounding_v1,
 )
 from app.services.websochat.websochat_compare import (
     _build_websochat_pair_key,
@@ -1125,16 +1127,21 @@ async def _get_websochat_authorized_read_scope(
     rows = [dict(row) for row in result.mappings().all()]
     expected_episode_no = 1
     contiguous_episode_to = 0
-    seen_episode_nos: set[int] = set()
-
+    authorized_by_episode_no: dict[int, bool] = {}
     for row in rows:
         episode_no = int(row.get("episodeNo") or 0)
-        if episode_no <= 0 or episode_no in seen_episode_nos:
+        if episode_no <= 0:
             continue
-        seen_episode_nos.add(episode_no)
+        # A scalar reader boundary admits every source sharing that number.
+        authorized_by_episode_no[episode_no] = (
+            authorized_by_episode_no.get(episode_no, True)
+            and int(row.get("authorizedYn") or 0) == 1
+        )
+
+    for episode_no, authorized in authorized_by_episode_no.items():
         if episode_no != expected_episode_no:
             break
-        if int(row.get("authorizedYn") or 0) != 1:
+        if not authorized:
             break
         contiguous_episode_to = episode_no
         expected_episode_no = episode_no + 1
@@ -4551,6 +4558,8 @@ def _is_websochat_inventory_rp_eligible(
         display_safety_status = str(display_safety.get("status") or "").strip().lower()
         if display_safety_status and display_safety_status != "pass":
             return False
+    if "character_contract" in payload:
+        return is_character_chat_inventory_v1_decision_coherent(payload)
     if payload.get("public_chat_eligible") is True:
         return True
     entity_kind = str(payload.get("entity_kind") or "").strip().lower()
@@ -4569,7 +4578,8 @@ def _has_websochat_inventory_public_gate(payload: dict[str, Any] | None) -> bool
     if not isinstance(payload, dict) or not payload:
         return False
     return (
-        isinstance(payload.get("display_safety"), dict)
+        "character_contract" in payload
+        or isinstance(payload.get("display_safety"), dict)
         or "public_chat_eligible" in payload
         or "public_slot_eligible" in payload
     )
@@ -5169,15 +5179,32 @@ def _is_websochat_character_chat_rp_context_ready(
     resolved_scope_key = str(resolved_active_character or "").strip()
     if not resolved_scope_key or not profile or examples_payload is None:
         return False
-    if not is_character_chat_rp_profile_payload_ready(profile):
-        return False
-    if not [item for item in list(examples_payload.get("examples") or []) if isinstance(item, dict)]:
+    has_character_contract = any(
+        "character_contract" in payload
+        for payload in (profile, examples_payload, inventory_payload or {})
+    )
+    if has_character_contract:
+        if (inventory_payload or {}).get("character_contract") != profile.get("character_contract"):
+            return False
+        if not select_character_chat_grounding_v1(
+            profile,
+            examples_payload,
+            expected_character_key=resolved_scope_key,
+            read_episode_to=int(read_episode_to or 0),
+        ):
+            return False
+    elif not is_character_chat_rp_profile_payload_ready(profile):
         return False
     if not _is_websochat_character_entry_context_v2(
         entry_context,
         expected_read_episode_to=read_episode_to,
         expected_product_id=product_id,
         expected_character_scope_key=resolved_scope_key,
+    ):
+        return False
+    if not has_character_contract and not _filter_websochat_character_chat_examples_by_read_scope(
+        examples_payload.get("examples"),
+        read_episode_to=int(entry_context["read_episode_to"]),
     ):
         return False
     if not _has_websochat_inventory_public_gate(inventory_payload):
@@ -5213,7 +5240,11 @@ def _filter_websochat_character_chat_examples_by_read_scope(
 ) -> list[dict[str, Any]]:
     bounded_examples: list[dict[str, Any]] = []
     for item in examples or []:
-        if not isinstance(item, dict) or "episode_no" not in item:
+        if (
+            not isinstance(item, dict)
+            or "episode_no" not in item
+            or not str(item.get("text") or "").strip()
+        ):
             continue
         try:
             episode_no = int(item.get("episode_no"))
@@ -5876,7 +5907,7 @@ async def _load_websochat_rp_context(
         )
         examples_payload = {
             **examples_payload,
-            "examples": bounded_examples or original_examples,
+            "examples": bounded_examples,
         }
     canonical_inventory_payload = dict(resolution.get("inventoryPayload") or {})
     canonical_inventory_has_public_gate = _has_websochat_inventory_public_gate(canonical_inventory_payload)
@@ -5943,6 +5974,26 @@ async def _load_websochat_rp_context(
     if not profile or examples_payload is None:
         return None
 
+    grounded_evidence = None
+    if is_character_chat_session and "character_contract" in profile:
+        grounded_evidence = select_character_chat_grounding_v1(
+            profile,
+            examples_payload,
+            expected_character_key=resolved_active_character,
+            read_episode_to=int(normalized_memory.get("read_episode_to") or 0),
+        )
+        if not grounded_evidence:
+            return None
+        # v1 voice examples come only from the validated, reader-bounded evidence.
+        examples_payload = {
+            **examples_payload,
+            "examples": [
+                {"episode_no": item["episode_no"], "text": item["quote"]}
+                for item in grounded_evidence
+                if item["kind"] in {"dialogue", "monologue"}
+            ],
+        }
+
     profile_display_name = str(profile.get("display_name") or "").strip()
     identity_surface_review = dict(
         (inventory_payload or {}).get("identity_surface_review_v1") or {}
@@ -5985,6 +6036,16 @@ async def _load_websochat_rp_context(
         if is_character_chat_session
         else profile.get("speech_style") or {}
     )
+    if grounded_evidence is not None:
+        safe_speech_style = {}
+        labels = [
+            item for item in profile["identity_labels_v1"]
+            if item["episode_no"] <= int(normalized_memory.get("read_episode_to") or 0)
+        ]
+        authoritative_display_name = (
+            max(labels, key=lambda item: item["episode_no"])["label"].strip()
+            if labels else "대화 상대"
+        )
     context: dict[str, Any] = {
         "active_character": resolved_active_character,
         "rp_mode": rp_mode,
@@ -6003,6 +6064,8 @@ async def _load_websochat_rp_context(
     }
     if is_character_chat_session:
         context["character_chat_entry_context"] = entry_context
+        if grounded_evidence is not None:
+            context["grounding_v1"] = grounded_evidence
 
     if not is_character_chat_session:
         relation_payloads = await _load_websochat_character_relation_payloads(
@@ -9102,6 +9165,39 @@ async def post_message(
             resolved_guest_key,
             db,
         )
+        session_row = locked_session_row
+        product_row = await _get_websochat_product(
+            product_id=int(session_row["product_id"]),
+            adult_yn=effective_adult_yn,
+            db=db,
+        )
+        if not product_row:
+            product_state = await _get_websochat_product_session_state(
+                product_id=int(session_row["product_id"]),
+                adult_yn=effective_adult_yn,
+                db=db,
+            )
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=product_state.get("unavailableMessage") or WEBSOCHAT_PRODUCT_UNAVAILABLE_MESSAGE,
+            )
+        if is_character_chat_session:
+            _assert_websochat_character_chat_product_eligible(product_row)
+        _assert_websochat_product_context_available(product_row)
+        synced_latest_episode_no = _resolve_websochat_synced_latest_episode_no(product_row)
+        latest_episode_no = max(int(product_row.get("latestEpisodeNo") or 0), 0)
+        authorized_scope = await _get_websochat_authorized_read_scope(
+            product_id=int(session_row["product_id"]),
+            user_id=user_id,
+            requested_episode_to=None,
+            synced_latest_episode_no=synced_latest_episode_no,
+            db=db,
+        )
+        if int(authorized_scope.get("maxAuthorizedEpisodeTo") or 0) <= 0:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message=WEBSOCHAT_ACCESS_REQUIRED_MESSAGE,
+            )
         locked_session_memory = _normalize_websochat_session_memory(
             locked_session_row.get("session_memory_json")
         )

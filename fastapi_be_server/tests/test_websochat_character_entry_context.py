@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import unittest
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -559,6 +560,67 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
             [13, 14],
         )
 
+    def test_built_entry_context_preserves_action_owner_and_read_scope_in_final_prompt(self):
+        scene = _character_scene("아델리트", gist="황제가 청동 종을 울리고 아델리트가 봉인을 살핀다.")
+        scene["action_ownership"] = [
+            {"actor_scope_key": "character:황제", "action": "청동 종을 울린다."},
+            {"actor_scope_key": "character:아델리트", "action": "은색 봉인을 확인한다."},
+        ]
+        scene.update(
+            user_entry_role="강제역할_황실밀사",
+            user_hook="강제소지품_암호밀서를 이미 들고 있다.",
+            user_can_do=["강제행동_밀서를 펼친다."],
+        )
+        context = _build_websochat_character_entry_context_v2(
+            product_id=1182,
+            read_episode_to=14,
+            character_scope_keys=["character:아델리트"],
+            plot_rows=[
+                _plot_row(13, "협상이 시작된다."),
+                _plot_row(14, "황제가 청동 종을 울리고 협상을 마친다."),
+                _plot_row(15, "미래줄거리_왕위찬탈"),
+            ],
+            scene_rows=[
+                _scene_row(14, [scene]),
+                _scene_row(15, [_character_scene("아델리트", gist="미래장면_왕관파괴")]),
+            ],
+        )
+
+        prompt = build_websochat_rp_system_prompt(
+            product_row={"productId": 1182, "title": "테스트 작품", "latestEpisodeNo": 30},
+            rp_context={
+                "display_name": "아델리트",
+                "active_character": "character:아델리트",
+                "rp_mode": "free",
+                "character_chat_entry_context": context,
+                "session_memory": {
+                    "session_kind": "character_chat",
+                    "locked_character_scope_key": "character:아델리트",
+                    "read_episode_to": 14,
+                },
+                "examples": [
+                    {"episode_no": 14, "text": "봉인은 내가 확인할게.", "confidence": 0.8},
+                    {"episode_no": 15, "text": "미래대사_새로운황제", "confidence": 1.0},
+                ],
+            },
+            recent_messages=[],
+        )
+
+        # Inspect the scene JSON delivered to the model, not the builder's intermediate value.
+        scene_line = next(line for line in prompt.splitlines() if line.startswith("{\""))
+        delivered_scene = json.loads(scene_line)
+        self.assertEqual(delivered_scene["selected_character_actions"], ["은색 봉인을 확인한다."])
+        self.assertEqual(delivered_scene["scene_gist"], "황제가 청동 종을 울리고 아델리트가 봉인을 살핀다.")
+        self.assertIn("봉인은 내가 확인할게.", prompt)
+        self.assertIn("읽은 범위의 마지막 회차: 14화", prompt)
+        for forbidden in (
+            "미래줄거리_왕위찬탈", "미래장면_왕관파괴", "미래대사_새로운황제",
+            "강제역할_황실밀사", "강제소지품_암호밀서", "강제행동_밀서",
+            "user_entry_role", "user_hook", "user_can_do",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, prompt)
+
     def test_missing_exact_read_boundary_is_not_ready(self):
         context = _build_websochat_character_entry_context_v2(
             product_id=1182,
@@ -734,6 +796,55 @@ class WebsochatCharacterEntryContextTests(unittest.TestCase):
 
 
 class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loader_accepts_gap_episodes_and_excludes_ineligible_summaries(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute("CREATE TABLE tb_story_agent_context_summary (summary_id INTEGER, product_id INTEGER, summary_type TEXT, is_active TEXT, episode_from INTEGER, episode_to INTEGER, summary_text TEXT)")
+        connection.executemany(
+            "INSERT INTO tb_story_agent_context_summary VALUES (?,1182,'episode_summary',?,?,?,?)",
+            [(1, "Y", 8, 8, "오래된 요약"), (2, "Y", 10, 10, "직전 공개 회차"),
+             (3, "N", 11, 11, "비활성 요약"), (4, "Y", 11, 11, "  "),
+             (5, "Y", 12, 12, "현재 회차"), (6, "Y", 12, 12, "현재 최신 요약"),
+             (7, "Y", 13, 13, "미래 요약")],
+        )
+
+        async def execute(statement, params):
+            if "'episode_summary'" in str(statement):
+                rows = [dict(row) for row in connection.execute(str(statement), params).fetchall()]
+            else:
+                rows = [_scene_row(12, [_character_scene("아델리트")])]
+            result = MagicMock()
+            result.mappings.return_value.all.return_value = rows
+            return result
+
+        db = AsyncMock()
+        db.execute.side_effect = execute
+        context = await load_websochat_character_entry_context_v2(
+            product_id=1182, read_episode_to=12, latest_episode_no=20,
+            character_scope_keys=["character:아델리트"], db=db,
+        )
+        self.assertTrue(context, "공개 회차 10, 12의 gap은 진입을 막지 않아야 합니다")
+        self.assertEqual([row["episode_no"] for row in context["recent_plot_rows"]], [10, 12])
+        self.assertEqual(context["recent_plot_rows"][-1]["summary_text"], "현재 최신 요약")
+        self.assertEqual(context["recent_episode_from"], 10)
+        self.assertTrue(_is_websochat_character_entry_context_v2(context))
+        self.assertEqual(db.execute.await_count, 2)
+
+    async def test_builder_accepts_gap_but_rejects_duplicate_or_future_context(self):
+        context = _build_websochat_character_entry_context_v2(
+            product_id=1182, read_episode_to=12,
+            character_scope_keys=["character:아델리트"],
+            plot_rows=[_plot_row(8, "이전"), _plot_row(13, "미래"), _plot_row(12, "현재"), _plot_row(10, "직전")],
+            scene_rows=[_scene_row(12, [_character_scene("아델리트")])],
+        )
+        self.assertTrue(context, "연속 번호 대신 최근 2개 회차를 선택해야 합니다")
+        self.assertEqual([row["episode_no"] for row in context["recent_plot_rows"]], [10, 12])
+        duplicated = dict(context, recent_plot_rows=[context["recent_plot_rows"][-1]] * 2)
+        future = dict(context, recent_plot_rows=[context["recent_plot_rows"][0], {"episode_no": 13, "summary_text": "미래"}])
+        self.assertFalse(_is_websochat_character_entry_context_v2(duplicated))
+        self.assertFalse(_is_websochat_character_entry_context_v2(future))
+
     async def test_loader_skips_fallback_query_when_exact_scene_is_ready(self):
         def result_for(rows: list[dict]) -> MagicMock:
             result = MagicMock()

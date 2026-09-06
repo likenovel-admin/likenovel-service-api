@@ -21,6 +21,54 @@ def _batch_sh() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _run_full_wrapper(candidate_rows: str, *, allow_full: bool = True):
+    """Run the shipped wrapper, replacing only its MySQL and builder processes."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        for directory in ("dist/batch", "scripts", ".venv/bin", "bin"):
+            (root / directory).mkdir(parents=True)
+        batch_path = root / "dist/batch/build_story_agent_context_batch.sh"
+        batch_path.write_text(_batch_sh(), encoding="utf-8")
+        (root / "scripts/build_story_agent_context.py").write_text("", encoding="utf-8")
+        mysql_path = root / "bin/mysql"
+        mysql_path.write_text(
+            "#!/bin/sh\nquery=$(cat)\n"
+            "case \"$query\" in *REVIEW_REQUIRED:*) exit 0 ;; esac\n"
+            "printf '%s' \"$CANDIDATE_ROWS\"\n",
+            encoding="utf-8",
+        )
+        mysql_path.chmod(0o755)
+        python_path = root / ".venv/bin/python"
+        python_path.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n",
+            encoding="utf-8",
+        )
+        python_path.chmod(0o755)
+        args_path = root / "python-args.txt"
+        log_path = root / "batch.log"
+        result = subprocess.run(
+            ["bash", str(batch_path)],
+            env={
+                **os.environ,
+                "PATH": f"{root / 'bin'}:{os.environ.get('PATH', '')}",
+                "ARGS_FILE": str(args_path), "CANDIDATE_ROWS": candidate_rows,
+                "DB_HOST": "example.invalid", "DB_PORT": "3306",
+                "DB_USER": "test-user", "DB_PW": "test-password",
+                "DB_NAME": "likenovel", "OPENROUTER_API_KEY": "test-key",
+                "STORYCTX_LOCK_DIR": str(root / "batch.lock"),
+                "STORYCTX_LOG_FILE": str(log_path),
+                "STORYCTX_BUILD_MODE": "full",
+                "STORYCTX_ALLOW_FULL": "1" if allow_full else "0",
+                "STORYCTX_MAX_PARALLEL": "1",
+                "STORYCTX_MAX_DELTA_EPISODES": "5",
+                "PUBLIC_CHARACTER_CATALOG_SNAPSHOT_AUTO_REFRESH_ENABLE": "0",
+            },
+            capture_output=True, text=True, check=False,
+        )
+        args = args_path.read_text(encoding="utf-8").splitlines() if args_path.exists() else []
+        return result, args, log_path.read_text(encoding="utf-8")
+
+
 def _builder_py() -> str:
     return (ROOT / "scripts" / "build_story_agent_context.py").read_text(
         encoding="utf-8"
@@ -34,6 +82,21 @@ def _recommendation_service_py() -> str:
 
 
 class StoryAgentContextBatchSqlTest(unittest.TestCase):
+    def test_full_candidate_launches_full_without_delta_only_flags(self):
+        result, args, log = _run_full_wrapper("1112\tTest title\t1\t1\t1.00\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(args[1:], [
+            "--product-id", "1112", "--build-mode", "full",
+            "--max-delta-episodes", "5", "--apply", "--verbose",
+        ])
+        self.assertIn("[done] product_id=1112", log)
+
+    def test_full_invocation_without_allow_flag_is_blocked_before_child(self):
+        result, args, log = _run_full_wrapper("1112\tTest title\t1\t1\t1.00\n", allow_full=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(args, [])
+        self.assertIn("full build blocked", log)
+
     def test_action_manifest_validation_fails_closed_before_candidate_selection(self):
         script = _batch_sh()
         manifest_guard = script[script.index('SCHEDULED_REPAIR_IDS_SQL=0'):script.index('if ! CANDIDATE_OUTPUT=')]

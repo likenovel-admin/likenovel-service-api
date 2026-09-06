@@ -3,6 +3,8 @@ import inspect
 import os
 import shutil
 import subprocess
+import sys
+import sysconfig
 import tempfile
 import textwrap
 import time
@@ -40,6 +42,76 @@ def test_prod_deploy_bundle_includes_ai_reader_worker_script():
     assert 'zip -r "$GITHUB_SHA.zip"' in content
     assert "verify_backend_prod_deploy.sh" in content
     assert "scripts/" in content
+
+
+def test_deploy_bundles_import_character_asset_attempt_outside_checkout():
+    failures = []
+    for workflow_name in ("deploy_be_actions_dev.yml", "deploy_be_actions.yml"):
+        content = (REPO_ROOT / ".github" / "workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        copy_commands = [
+            line.strip()
+            for line in content.splitlines()
+            if line.strip().startswith("cp ../scripts/")
+        ]
+        assert copy_commands, workflow_name
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkout = Path(temp_dir) / "checkout"
+            archive = checkout / "dist"
+            archive.mkdir(parents=True)
+            shutil.copytree(
+                PROJECT_ROOT / "scripts",
+                checkout / "scripts",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            packaged = subprocess.run(
+                ["bash", "-euc", "mkdir -p scripts\n" + "\n".join(copy_commands)],
+                cwd=archive,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert packaged.returncode == 0, (workflow_name, packaged.stderr)
+
+            imported = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    textwrap.dedent(
+                        """\
+                        import sys
+                        from pathlib import Path
+
+                        archive = Path(sys.argv[1])
+                        # Load installed dependencies without editable-checkout .pth files.
+                        sys.path[:0] = [str(archive), sys.argv[2]]
+                        from scripts import character_asset_attempt as helper
+
+                        assert Path(helper.__file__).resolve() == (
+                            archive / "scripts" / "character_asset_attempt.py"
+                        ).resolve()
+                        assert isinstance(helper.CharacterAssetAttemptStore, type)
+                        assert issubclass(helper.CharacterAssetAttemptBlocked, RuntimeError)
+                        """
+                    ),
+                    str(archive),
+                    sysconfig.get_path("purelib"),
+                ],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if imported.returncode != 0:
+                failures.append(f"{workflow_name}: {imported.stderr}")
+
+        assert not Path(temp_dir).exists()
+
+    assert not failures, "\n".join(failures)
 
 
 def test_prod_workflow_runs_pre_deploy_quality_gates_and_waits_for_codedeploy():

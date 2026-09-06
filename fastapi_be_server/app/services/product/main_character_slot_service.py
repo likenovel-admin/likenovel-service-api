@@ -11,12 +11,16 @@ import app.schemas.admin as admin_schema
 from app.exceptions import CustomResponseException
 from app.services.websochat.character_chat_product_policy import (
     CHARACTER_CHAT_FIRST_PUBLIC_EPISODE_AT,
+    CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES,
     CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT,
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
     build_character_chat_rp_profile_ready_sql,
+    build_character_chat_grounded_bundle_evidence_count_sql,
     build_correlated_character_chat_product_policy_sql,
     build_public_episode_opened_at_sql,
     is_character_chat_rp_profile_payload_ready,
+    is_character_chat_inventory_v1_decision_coherent,
+    select_character_chat_grounding_v1,
 )
 from app.services.websochat.websochat_utils import _extract_websochat_json_object
 from app.services.product.public_character_catalog_snapshot_service import (
@@ -147,10 +151,11 @@ def classify_main_character_chat_quality(
     distinct_episode_count: int,
     example_count: int,
     scene_count: int,
+    grounded_evidence_count: int = 0,
 ) -> tuple[str, str]:
     if distinct_episode_count < MAIN_CHARACTER_CHAT_MIN_DISTINCT_EPISODES:
         return "insufficient", "등장 회차 근거 부족"
-    if example_count < MAIN_CHARACTER_CHAT_MIN_EXAMPLES:
+    if example_count < MAIN_CHARACTER_CHAT_MIN_EXAMPLES and grounded_evidence_count <= 0:
         return "insufficient", "RP 예시 부족"
     if scene_count < MAIN_CHARACTER_CHAT_MIN_SCENES:
         return "insufficient", "캐릭터 장면 부족"
@@ -267,12 +272,22 @@ def build_character_chat_preview_payload(
     profile_row,
     scene_row,
     chunk_rows,
+    read_episode_to: int | None = None,
 ) -> dict | None:
     profile_data = dict(profile_row)
     scene_data = dict(scene_row)
     inventory = _extract_summary_payload(profile_data.get("inventorySummaryText"))
     profile = _extract_summary_payload(profile_data.get("profileSummaryText"))
     if not is_character_chat_rp_profile_payload_ready(profile):
+        return None
+    marked = "character_contract" in inventory or "character_contract" in profile
+    if marked and (
+        read_episode_to is None
+        or not isinstance(profile.get("character_contract"), dict)
+        or inventory.get("character_contract") != profile.get("character_contract")
+        or profile.get("character_key") != character_scope_key
+        or inventory.get("canonical_character_key") != character_scope_key
+    ):
         return None
     scene_payload = _extract_summary_payload(scene_data.get("sceneSummaryText"))
     scenes = scene_payload.get("scenes")
@@ -323,7 +338,7 @@ def build_character_chat_preview_payload(
         or episode_summary_raw
         or ""
     ).strip()
-    speech_style = profile.get("speech_style")
+    speech_style = {} if marked else profile.get("speech_style")
     if not isinstance(speech_style, dict):
         speech_style = {}
 
@@ -332,10 +347,13 @@ def build_character_chat_preview_payload(
         "episodeTitle": str(scene_data.get("episodeTitle") or "").strip(),
         "episodeSummary": episode_summary,
         "roleLabel": str(
-            profile.get("role_label") or inventory.get("work_role") or ""
+            (None if marked else profile.get("role_label")) or inventory.get("work_role") or ""
         ).strip(),
-        "aliases": _normalize_aliases(inventory.get("aliases")),
-        "personalityCore": _normalize_text_list(profile.get("personality_core")),
+        "aliases": _normalize_aliases(
+            [item["label"] for item in profile["identity_labels_v1"] if item["episode_no"] <= read_episode_to]
+            if marked else inventory.get("aliases")
+        ),
+        "personalityCore": [] if marked else _normalize_text_list(profile.get("personality_core")),
         "speechStyle": {
             "tone": _normalize_text_list(speech_style.get("tone")),
             "formality": str(speech_style.get("formality") or "").strip(),
@@ -357,36 +375,54 @@ def _canonical_character_scope_key_sql(inventory_alias: str) -> str:
     )"""
 
 
-def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
-    canonical_scope_key = _canonical_character_scope_key_sql(inventory_alias)
+def _character_rp_bundle_ready_sql(
+    inventory_alias: str, *, expected_character_key_sql: str,
+    read_episode_to_sql: str | None = None,
+) -> str:
+    grounded_count = build_character_chat_grounded_bundle_evidence_count_sql(
+        inventory_alias=inventory_alias, profile_alias="profile",
+        examples_alias="examples", expected_character_key_sql=expected_character_key_sql,
+        read_episode_to_sql=read_episode_to_sql,
+    )
     profile_ready_sql = build_character_chat_rp_profile_ready_sql(
         profile_alias="profile",
-        expected_character_key_sql=canonical_scope_key,
+    )
+    return f"""(
+        ({grounded_count}) > 0
+        OR (
+            JSON_CONTAINS_PATH({inventory_alias}.summary_text, 'one', '$.character_contract') = 0
+            AND JSON_CONTAINS_PATH(profile.summary_text, 'one', '$.character_contract') = 0
+            AND JSON_CONTAINS_PATH(examples.summary_text, 'one', '$.character_contract') = 0
+            AND {profile_ready_sql}
+            AND JSON_VALID(examples.summary_text)
+            AND JSON_TYPE(JSON_EXTRACT(examples.summary_text, '$.examples')) = 'ARRAY'
+            AND JSON_LENGTH(JSON_EXTRACT(examples.summary_text, '$.examples')) >= {MAIN_CHARACTER_CHAT_MIN_EXAMPLES}
+        )
+    )"""
+
+
+def _chat_ready_rp_assets_predicate(inventory_alias: str) -> str:
+    canonical_scope_key = _canonical_character_scope_key_sql(inventory_alias)
+    bundle_ready_sql = _character_rp_bundle_ready_sql(
+        inventory_alias, expected_character_key_sql=canonical_scope_key,
     )
     return f"""
         AND EXISTS (
             SELECT 1
             FROM tb_story_agent_context_summary profile
+            INNER JOIN tb_story_agent_context_summary examples
+                ON examples.product_id = profile.product_id
+               AND examples.scope_key = profile.scope_key
+               AND examples.summary_type = 'character_rp_examples'
+               AND examples.is_active = 'Y'
             WHERE profile.product_id = {inventory_alias}.product_id
               AND profile.scope_key = {canonical_scope_key}
               AND profile.summary_type = 'character_rp_profile'
               AND profile.is_active = 'Y'
-              AND {profile_ready_sql}
-        )
-        AND EXISTS (
-            SELECT 1
-            FROM tb_story_agent_context_summary examples
-            WHERE examples.product_id = {inventory_alias}.product_id
-              AND examples.scope_key = {canonical_scope_key}
-              AND examples.summary_type = 'character_rp_examples'
-              AND examples.is_active = 'Y'
-              AND JSON_VALID(examples.summary_text)
-              AND JSON_TYPE(JSON_EXTRACT(
-                  examples.summary_text, '$.examples'
-              )) = 'ARRAY'
-              AND JSON_LENGTH(JSON_EXTRACT(
-                  examples.summary_text, '$.examples'
-              )) >= {MAIN_CHARACTER_CHAT_MIN_EXAMPLES}
+              AND {bundle_ready_sql}
+              AND JSON_UNQUOTE(JSON_EXTRACT(
+                  profile.summary_text, '$.character_key'
+              )) = {canonical_scope_key}
               AND JSON_UNQUOTE(JSON_EXTRACT(
                   examples.summary_text, '$.character_key'
               )) = {canonical_scope_key}
@@ -432,6 +468,10 @@ def _public_character_slot_eligibility_predicate(
                       '$.display_safety.status'
                   )
               ) = 'pass'
+              AND (
+                  JSON_CONTAINS_PATH(inventory.summary_text, 'one', '$.character_contract') = 0
+                  OR JSON_EXTRACT(inventory.summary_text, '$.chat_readiness_v1.public_slot_allowed') = CAST('true' AS JSON)
+              )
               AND CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(
                   inventory.summary_text, '$.distinct_episode_count'
               )), '0') AS UNSIGNED) >= {MAIN_CHARACTER_CHAT_MIN_DISTINCT_EPISODES}
@@ -465,6 +505,10 @@ def _extract_eligible_character_payload(row) -> dict | None:
     if payload.get("public_chat_eligible") is not True:
         return None
     if payload.get("public_slot_eligible") is not True:
+        return None
+    if "character_contract" in payload and not is_character_chat_inventory_v1_decision_coherent(
+        payload, require_public_slot=True
+    ):
         return None
     return payload
 
@@ -503,6 +547,7 @@ def extract_eligible_main_character_roster(rows) -> list[dict]:
             distinct_episode_count=distinct_episode_count,
             example_count=example_count,
             scene_count=scene_count,
+            grounded_evidence_count=int(row_data.get("groundedEvidenceCount") or 0),
         )
         roster.append(
             (
@@ -556,6 +601,7 @@ def build_main_character_chat_quality_by_product(candidate_rows) -> dict[int, st
                         payload.get("distinct_episode_count") or 0
                     ),
                     "exampleCount": int(row_data.get("exampleCount") or 0),
+                    "groundedEvidenceCount": int(row_data.get("groundedEvidenceCount") or 0),
                     "sceneCount": int(row_data.get("sceneCount") or 0),
                 },
             )
@@ -572,6 +618,7 @@ def build_main_character_chat_quality_by_product(candidate_rows) -> dict[int, st
                 distinct_episode_count=int(candidate["distinctEpisodeCount"]),
                 example_count=int(candidate["exampleCount"]),
                 scene_count=int(candidate["sceneCount"]),
+                grounded_evidence_count=int(candidate["groundedEvidenceCount"]),
             )
             candidate_qualities.append(quality)
 
@@ -585,9 +632,14 @@ def build_main_character_chat_quality_by_product(candidate_rows) -> dict[int, st
 async def _load_eligible_main_character_roster(
     product_id: int, db: AsyncSession
 ) -> list[dict]:
+    grounded_count_sql = build_character_chat_grounded_bundle_evidence_count_sql(
+        inventory_alias="sacs", profile_alias="profile", examples_alias="examples",
+        expected_character_key_sql=_canonical_character_scope_key_sql("sacs"),
+    )
     result = await db.execute(
         text(f"""
             SELECT
+                sacs.summary_id AS characterSlotId,
                 sacs.scope_key AS scopeKey,
                 sacs.summary_text AS summaryText,
                 COALESCE((
@@ -609,22 +661,19 @@ async def _load_eligible_main_character_roster(
                           examples.summary_text, '$.examples'
                       )) = 'ARRAY'
                 ), 0) AS exampleCount,
-                (
-                    SELECT COUNT(*)
-                    FROM tb_story_agent_context_summary scene
-                    WHERE scene.product_id = sacs.product_id
-                      AND scene.summary_type = 'episode_scene_extraction'
-                      AND scene.is_active = 'Y'
-                      AND LOCATE(
-                          JSON_QUOTE(COALESCE(
-                              NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(
-                                  sacs.summary_text, '$.canonical_character_key'
-                              ))), ''),
-                              sacs.scope_key
-                          )),
-                          scene.summary_text
-                      ) > 0
-                ) AS sceneCount
+                COALESCE((
+                    SELECT MAX({grounded_count_sql})
+                    FROM tb_story_agent_context_summary profile
+                    INNER JOIN tb_story_agent_context_summary examples
+                        ON examples.product_id = profile.product_id
+                       AND examples.scope_key = profile.scope_key
+                       AND examples.summary_type = 'character_rp_examples'
+                       AND examples.is_active = 'Y'
+                    WHERE profile.product_id = sacs.product_id
+                      AND profile.scope_key = {_canonical_character_scope_key_sql("sacs")}
+                      AND profile.summary_type = 'character_rp_profile'
+                      AND profile.is_active = 'Y'
+                ), 0) AS groundedEvidenceCount
             FROM tb_story_agent_context_summary sacs
             INNER JOIN tb_product p ON p.product_id = sacs.product_id
             WHERE sacs.product_id = :product_id
@@ -649,7 +698,25 @@ async def _load_eligible_main_character_roster(
         """),
         {"product_id": product_id},
     )
-    return extract_eligible_main_character_roster(result.mappings().all())
+    rows = [dict(row) for row in result.mappings().all()]
+    if not rows:
+        return []
+    scene_result = await db.execute(
+        text(build_public_character_catalog_scene_query()),
+        {"candidate_json": json.dumps(build_public_character_catalog_scene_candidates([
+            {
+                "characterSlotId": row["characterSlotId"],
+                "productId": product_id,
+                "characterScopeKey": row["scopeKey"],
+                "_inventorySummaryText": row["summaryText"],
+            }
+            for row in rows
+        ]))},
+    )
+    scene_counts = {row["characterSlotId"]: int(row["sceneCount"] or 0) for row in scene_result.mappings().all()}
+    for row in rows:
+        row["sceneCount"] = scene_counts.get(row["characterSlotId"], 0)
+    return extract_eligible_main_character_roster(rows)
 
 
 async def get_admin_main_character_roster(product_id: int, db: AsyncSession):
@@ -910,6 +977,12 @@ def build_public_character_catalog_assets_query() -> str:
         profile_alias="profile",
         expected_character_key_sql="inventory.scope_key",
     )
+    grounded_count_sql = build_character_chat_grounded_bundle_evidence_count_sql(
+        inventory_alias="inventory", profile_alias="profile", examples_alias="examples",
+    )
+    bundle_ready_sql = _character_rp_bundle_ready_sql(
+        "inventory", expected_character_key_sql="inventory.scope_key",
+    )
     return f"""
         WITH inventory_assets AS (
             SELECT
@@ -923,7 +996,8 @@ def build_public_character_catalog_assets_query() -> str:
                 inventory.created_date AS createdDate,
                 inventory.created_date AS updatedDate,
                 inventory.source_doc_count AS _distinctEpisodeCount,
-                examples.source_doc_count AS _exampleCount,
+                COALESCE(JSON_LENGTH(JSON_EXTRACT(examples.summary_text, '$.examples')), 0) AS _exampleCount,
+                {grounded_count_sql} AS _groundedEvidenceCount,
                 CASE
                     WHEN JSON_UNQUOTE(JSON_EXTRACT(
                         inventory.summary_text, '$.is_protagonist'
@@ -946,12 +1020,11 @@ def build_public_character_catalog_assets_query() -> str:
                AND examples.scope_key = inventory.scope_key
                AND examples.is_active = 'Y'
                AND JSON_VALID(examples.summary_text)
-               AND JSON_TYPE(JSON_EXTRACT(
-                   examples.summary_text, '$.examples'
-               )) = 'ARRAY'
-               AND JSON_LENGTH(JSON_EXTRACT(
-                   examples.summary_text, '$.examples'
-               )) > 0
+               AND {bundle_ready_sql}
+               AND (
+                   JSON_CONTAINS_PATH(inventory.summary_text, 'one', '$.character_contract') = 1
+                   OR examples.source_doc_count > 0
+               )
                AND JSON_UNQUOTE(JSON_EXTRACT(
                    examples.summary_text, '$.character_key'
                )) = inventory.scope_key
@@ -980,9 +1053,10 @@ def build_public_character_catalog_assets_query() -> str:
             updatedDate,
             _distinctEpisodeCount,
             _exampleCount,
+            _groundedEvidenceCount,
             _isProtagonist
         FROM inventory_assets
-        WHERE _exampleCount > 0
+        WHERE _exampleCount > 0 OR _groundedEvidenceCount > 0
         ORDER BY productId ASC, characterSlotId DESC
     """
 
@@ -1031,6 +1105,13 @@ def build_public_character_catalog_alias_fallback_query() -> str:
     profile_ready_sql = build_character_chat_rp_profile_ready_sql(
         profile_alias="profile"
     )
+    grounded_count_sql = build_character_chat_grounded_bundle_evidence_count_sql(
+        inventory_alias="inventory", profile_alias="profile", examples_alias="examples",
+        expected_character_key_sql=asset_canonical_scope_key,
+    )
+    bundle_ready_sql = _character_rp_bundle_ready_sql(
+        "inventory", expected_character_key_sql=asset_canonical_scope_key,
+    )
     return f"""
         WITH inventory_ranked AS (
             SELECT
@@ -1058,6 +1139,7 @@ def build_public_character_catalog_alias_fallback_query() -> str:
                 inventory.summary_id AS characterSlotId,
                 inventory.product_id AS productId,
                 ranked.characterScopeKey,
+                inventory.scope_key,
                 TRIM(JSON_UNQUOTE(JSON_EXTRACT(
                     inventory.summary_text, '$.display_name'
                 ))) AS characterName,
@@ -1095,36 +1177,25 @@ def build_public_character_catalog_alias_fallback_query() -> str:
                 inventory.createdDate,
                 inventory.updatedDate,
                 inventory._distinctEpisodeCount,
-                COALESCE((
-                    SELECT MAX(JSON_LENGTH(JSON_EXTRACT(
-                        examples.summary_text, '$.examples'
-                    )))
-                    FROM tb_story_agent_context_summary examples
-                    WHERE examples.product_id = inventory.productId
-                      AND {example_scope_key}
-                      AND examples.summary_type = 'character_rp_examples'
-                      AND examples.is_active = 'Y'
-                      AND JSON_VALID(examples.summary_text)
-                      AND JSON_TYPE(JSON_EXTRACT(
-                          examples.summary_text, '$.examples'
-                      )) = 'ARRAY'
-                      AND JSON_LENGTH(JSON_EXTRACT(
-                          examples.summary_text, '$.examples'
-                      )) > 0
-                      AND {example_payload_key}
-                ), 0) AS _exampleCount,
+                COALESCE(JSON_LENGTH(JSON_EXTRACT(examples.summary_text, '$.examples')), 0) AS _exampleCount,
+                {grounded_count_sql} AS _groundedEvidenceCount,
                 inventory._isProtagonist
             FROM latest_inventory inventory
-            WHERE EXISTS (
-                  SELECT 1
-                  FROM tb_story_agent_context_summary profile
-                  WHERE profile.product_id = inventory.productId
-                    AND {profile_scope_key}
-                    AND profile.summary_type = 'character_rp_profile'
-                    AND profile.is_active = 'Y'
-                    AND {profile_ready_sql}
-                    AND {profile_payload_key}
-              )
+            INNER JOIN tb_story_agent_context_summary profile
+                ON profile.product_id = inventory.productId
+               AND {profile_scope_key}
+               AND profile.summary_type = 'character_rp_profile'
+               AND profile.is_active = 'Y'
+               AND {profile_ready_sql}
+               AND {profile_payload_key}
+            INNER JOIN tb_story_agent_context_summary examples
+                ON examples.product_id = inventory.productId
+               AND {example_scope_key}
+               AND examples.summary_type = 'character_rp_examples'
+               AND examples.is_active = 'Y'
+               AND JSON_VALID(examples.summary_text)
+               AND {example_payload_key}
+            WHERE {bundle_ready_sql}
         )
         SELECT
             characterSlotId,
@@ -1136,9 +1207,10 @@ def build_public_character_catalog_alias_fallback_query() -> str:
             updatedDate,
             _distinctEpisodeCount,
             _exampleCount,
+            _groundedEvidenceCount,
             _isProtagonist
         FROM inventory_assets
-        WHERE _exampleCount > 0
+        WHERE _exampleCount > 0 OR _groundedEvidenceCount > 0
         ORDER BY productId ASC, characterSlotId DESC
     """
 
@@ -1237,14 +1309,11 @@ def select_public_character_catalog_alias_fallback_product_ids(
         if (
             len(exact_candidates_by_product[product_id])
             < MAIN_CHARACTER_SLOT_MAX_CHARACTERS_PER_PRODUCT
-            or min(
-                (
-                    int(item.get("_exampleCount") or 0)
-                    for item in exact_candidates_by_product[product_id]
-                ),
-                default=0,
+            or any(
+                int(item.get("_groundedEvidenceCount") or 0) <= 0
+                and int(item.get("_exampleCount") or 0) <= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
+                for item in exact_candidates_by_product[product_id]
             )
-            <= MAIN_CHARACTER_CHAT_GOOD_MIN_EXAMPLES
         )
     ]
 
@@ -1275,10 +1344,14 @@ def merge_public_character_catalog_asset_candidates(
         }
     )
     for product_id in product_ids:
-        product_candidates = (
-            fallback_by_product[product_id]
-            if product_id in fallback_product_id_set
-            else exact_by_product[product_id]
+        product_candidates = list(exact_by_product[product_id])
+        if product_id in fallback_product_id_set:
+            product_candidates.extend(fallback_by_product[product_id])
+        product_candidates.sort(
+            key=lambda item: (
+                -int(item.get("_groundedEvidenceCount") or 0),
+                -int(item.get("_exampleCount") or 0),
+            )
         )
         seen_character_slot_ids: set[int] = set()
         for item in product_candidates:
@@ -1321,7 +1394,7 @@ def build_public_character_catalog_scene_candidates(candidate_items) -> list[dic
 
 
 def build_public_character_catalog_scene_query() -> str:
-    return """
+    return f"""
         WITH candidate_product AS (
             SELECT DISTINCT c.product_id
             FROM JSON_TABLE(
@@ -1353,11 +1426,21 @@ def build_public_character_catalog_scene_query() -> str:
             WHERE c.product_id IS NOT NULL
               AND TRIM(COALESCE(c.scope_key, '')) <> ''
         ),
+        public_episode_ranked AS (
+            SELECT pe.episode_id, pe.product_id, pe.episode_no, pe.use_yn, pe.open_yn, pe.price_type,
+                ROW_NUMBER() OVER (
+                    PARTITION BY pe.product_id ORDER BY pe.episode_no ASC, pe.episode_id ASC
+                ) AS public_episode_rank
+            FROM tb_product_episode pe
+            INNER JOIN candidate_product ON candidate_product.product_id = pe.product_id
+            WHERE pe.use_yn = 'Y' AND pe.open_yn = 'Y'
+        ),
         scene_scope AS (
             SELECT DISTINCT
                 scene.summary_id,
                 scene.product_id,
                 scene_episode.episode_no,
+                scene_episode.episode_id,
                 COALESCE(
                     IF(
                         JSON_TYPE(flat.participants) = 'ARRAY',
@@ -1375,9 +1458,14 @@ def build_public_character_catalog_scene_query() -> str:
                 ON scene.product_id = candidate_product.product_id
                AND scene.summary_type = 'episode_scene_extraction'
                AND scene.is_active = 'Y'
-            INNER JOIN tb_product_episode scene_episode
+            INNER JOIN public_episode_ranked scene_episode
                 ON scene_episode.product_id = scene.product_id
                AND scene_episode.episode_no = scene.episode_to
+               AND scene_episode.episode_no = scene.episode_from
+               AND JSON_TYPE(JSON_EXTRACT(IF(JSON_VALID(scene.summary_text), scene.summary_text, JSON_OBJECT()), '$.episode_no')) = 'INTEGER'
+               AND JSON_EXTRACT(IF(JSON_VALID(scene.summary_text), scene.summary_text, JSON_OBJECT()), '$.episode_no') = scene_episode.episode_no
+               AND scene.scope_key = CONCAT('episode:', scene_episode.episode_id)
+               AND scene_episode.public_episode_rank <= {CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES}
                AND scene_episode.episode_no >= 1
                AND scene_episode.use_yn = 'Y'
                AND scene_episode.open_yn = 'Y'
@@ -1432,7 +1520,7 @@ def build_public_character_catalog_scene_query() -> str:
         )
         SELECT
             candidate_scope.character_slot_id AS characterSlotId,
-            COUNT(DISTINCT scene_scope.summary_id) AS sceneCount,
+            COUNT(DISTINCT scene_scope.episode_id) AS sceneCount,
             MIN(scene_scope.episode_no) AS entryEpisodeNo
         FROM candidate_scope
         INNER JOIN scene_scope
@@ -1585,6 +1673,7 @@ def filter_public_character_catalog_candidates(
             distinct_episode_count=int(item.get("_distinctEpisodeCount") or 0),
             example_count=int(item.get("_exampleCount") or 0),
             scene_count=scene_count,
+            grounded_evidence_count=int(item.get("_groundedEvidenceCount") or 0),
         )
         if quality == "insufficient":
             continue
@@ -1806,10 +1895,12 @@ async def _load_public_character_catalog_base(
         distinct_episode_count = int(item.pop("_distinctEpisodeCount", 0) or 0)
         example_count = int(item.pop("_exampleCount", 0) or 0)
         scene_count = int(item.pop("_sceneCount", 0) or 0)
+        grounded_evidence_count = int(item.pop("_groundedEvidenceCount", 0) or 0)
         chat_quality, _ = classify_main_character_chat_quality(
             distinct_episode_count=distinct_episode_count,
             example_count=example_count,
             scene_count=scene_count,
+            grounded_evidence_count=grounded_evidence_count,
         )
         item["fullReady"] = (
             total_episode_count > 0 and ready_episode_count >= total_episode_count
@@ -1940,10 +2031,15 @@ async def get_public_character_chat_preview(
     example_payload_key = compatible_scope_key(
         "JSON_UNQUOTE(JSON_EXTRACT(examples.summary_text, '$.character_key'))"
     )
+    bundle_ready_sql = _character_rp_bundle_ready_sql(
+        "inventory", expected_character_key_sql=canonical_scope_key,
+        read_episode_to_sql=":episode_no",
+    )
     profile_result = await db.execute(
         text(f"""
             SELECT
                 inventory.summary_text AS inventorySummaryText,
+                inventory.summary_id AS characterSlotId,
                 profile.summary_text AS profileSummaryText
             FROM tb_story_agent_context_summary inventory
             INNER JOIN tb_product p ON p.product_id = inventory.product_id
@@ -1968,13 +2064,7 @@ async def get_public_character_chat_preview(
               AND p.open_yn = 'Y'
               AND COALESCE(p.blind_yn, 'N') = 'N'
               AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
-              AND (
-                  SELECT COUNT(DISTINCT public_episode.episode_id)
-                  FROM tb_product_episode public_episode
-                  WHERE public_episode.product_id = inventory.product_id
-                    AND public_episode.use_yn = 'Y'
-                    AND public_episode.open_yn = 'Y'
-              ) >= {MAIN_CHARACTER_SLOT_MINIMUM_OPEN_EPISODE_COUNT}
+              {_main_character_product_policy_sql(product_alias="p", episode_alias="preview_policy_episode")}
               AND NOT EXISTS (
                   SELECT 1
                   FROM tb_story_agent_context_summary newer_inventory
@@ -1995,13 +2085,8 @@ async def get_public_character_chat_preview(
                     AND examples.summary_type = 'character_rp_examples'
                     AND examples.is_active = 'Y'
                     AND JSON_VALID(examples.summary_text)
-                    AND JSON_TYPE(JSON_EXTRACT(
-                        examples.summary_text, '$.examples'
-                    )) = 'ARRAY'
-                    AND JSON_LENGTH(JSON_EXTRACT(
-                        examples.summary_text, '$.examples'
-                    )) > 0
                     AND {example_payload_key}
+                    AND {bundle_ready_sql}
               )
               AND EXISTS (
                   SELECT 1
@@ -2011,6 +2096,7 @@ async def get_public_character_chat_preview(
                           eligible_episode_summary.product_id
                      AND summary_episode.episode_no =
                           eligible_episode_summary.episode_to
+                     AND eligible_episode_summary.scope_key = CONCAT('episode:', summary_episode.episode_id)
                      AND summary_episode.use_yn = 'Y'
                      AND summary_episode.open_yn = 'Y'
                   WHERE eligible_episode_summary.product_id =
@@ -2027,6 +2113,7 @@ async def get_public_character_chat_preview(
         {
             "product_id": product_id,
             "character_scope_key": character_scope_key,
+            "episode_no": episode_no,
         },
     )
     profile_row = profile_result.mappings().one_or_none()
@@ -2053,18 +2140,47 @@ async def get_public_character_chat_preview(
             if scope_key
         }
     )
+    scene_readiness_result = await db.execute(
+        text(build_public_character_catalog_scene_query()),
+        {
+            "candidate_json": json.dumps([{
+                "characterSlotId": dict(profile_row)["characterSlotId"],
+                "productId": product_id,
+                "compatibleScopeKeys": compatible_character_scope_keys,
+            }]),
+        },
+    )
+    scene_readiness = scene_readiness_result.mappings().one_or_none()
+    if not scene_readiness or int(scene_readiness["sceneCount"] or 0) < MAIN_CHARACTER_CHAT_MIN_SCENES:
+        raise CustomResponseException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="공개 가능한 캐릭터 장면이 충분하지 않습니다.",
+        )
     scene_result = await db.execute(
-        text("""
-            WITH matched_scene AS (
+        text(f"""
+            WITH public_episode_ranked AS (
+                SELECT pe.episode_id, pe.product_id, pe.episode_no, pe.use_yn, pe.open_yn, pe.price_type,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY pe.product_id ORDER BY pe.episode_no ASC, pe.episode_id ASC
+                    ) AS public_episode_rank
+                FROM tb_product_episode pe
+                WHERE pe.product_id = :product_id
+                  AND pe.use_yn = 'Y' AND pe.open_yn = 'Y'
+            ), matched_scene AS (
                 SELECT
                     scene.summary_id AS summaryId,
                     scene.product_id AS productId,
                     scene.episode_to AS episodeNo,
-                    MIN(pe.episode_id) AS episodeId
+                    pe.episode_id AS episodeId
                 FROM tb_story_agent_context_summary scene
-                INNER JOIN tb_product_episode pe
+                INNER JOIN public_episode_ranked pe
                     ON pe.product_id = scene.product_id
                    AND pe.episode_no = scene.episode_to
+                   AND pe.episode_no = scene.episode_from
+                   AND JSON_TYPE(JSON_EXTRACT(IF(JSON_VALID(scene.summary_text), scene.summary_text, JSON_OBJECT()), '$.episode_no')) = 'INTEGER'
+                   AND JSON_EXTRACT(IF(JSON_VALID(scene.summary_text), scene.summary_text, JSON_OBJECT()), '$.episode_no') = pe.episode_no
+                   AND scene.scope_key = CONCAT('episode:', pe.episode_id)
+                   AND pe.public_episode_rank <= {CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES}
                 CROSS JOIN JSON_TABLE(
                     IF(
                         JSON_VALID(scene.summary_text),
@@ -2135,8 +2251,9 @@ async def get_public_character_chat_preview(
                 GROUP BY
                     scene.summary_id,
                     scene.product_id,
-                    scene.episode_to
-                ORDER BY scene.episode_to DESC, scene.summary_id DESC
+                    scene.episode_to,
+                    pe.episode_id
+                ORDER BY scene.episode_to DESC, pe.episode_id DESC, scene.summary_id DESC
                 LIMIT 5
             )
             SELECT
@@ -2161,7 +2278,7 @@ async def get_public_character_chat_preview(
                 ON scene.summary_id = matched_scene.summaryId
             INNER JOIN tb_product_episode pe
                 ON pe.episode_id = matched_scene.episodeId
-            ORDER BY matched_scene.episodeNo DESC, matched_scene.summaryId DESC
+            ORDER BY matched_scene.episodeNo DESC, matched_scene.episodeId DESC, matched_scene.summaryId DESC
         """).bindparams(bindparam("character_scope_keys", expanding=True)),
         {
             "product_id": product_id,
@@ -2196,6 +2313,7 @@ async def get_public_character_chat_preview(
             profile_row=profile_row,
             scene_row=scene_data,
             chunk_rows=chunk_result.mappings().all(),
+            read_episode_to=episode_no,
         )
         if payload:
             return {"data": payload}
@@ -2391,6 +2509,7 @@ async def _load_main_character_chat_quality(
 
     candidate_query = text("""
         SELECT
+            inventory.summary_id AS characterSlotId,
             inventory.product_id AS productId,
             inventory.summary_text AS summaryText
         FROM tb_story_agent_context_summary inventory
@@ -2434,17 +2553,8 @@ async def _load_main_character_chat_quality(
     """).bindparams(bindparam("product_ids", expanding=True))
     asset_result = await db.execute(asset_query, {"product_ids": product_ids})
 
-    scene_query = text("""
-        SELECT product_id AS productId, summary_text AS summaryText
-        FROM tb_story_agent_context_summary
-        WHERE product_id IN :product_ids
-          AND summary_type = 'episode_scene_extraction'
-          AND is_active = 'Y'
-    """).bindparams(bindparam("product_ids", expanding=True))
-    scene_result = await db.execute(scene_query, {"product_ids": product_ids})
-
-    profile_keys: set[tuple[int, str]] = set()
-    example_counts: dict[tuple[int, str], int] = defaultdict(int)
+    profiles: dict[tuple[int, str], dict] = {}
+    examples_by_key: dict[tuple[int, str], dict] = {}
     for row in asset_result.mappings().all():
         row_data = dict(row)
         key = (
@@ -2459,18 +2569,9 @@ async def _load_main_character_chat_quality(
                 profile_payload,
                 expected_character_key=key[1],
             ):
-                profile_keys.add(key)
+                profiles[key] = profile_payload
         elif row_data.get("summaryType") == "character_rp_examples":
-            example_counts[key] = max(
-                example_counts[key], int(row_data.get("exampleCount") or 0)
-            )
-
-    scene_texts: dict[int, list[str]] = defaultdict(list)
-    for row in scene_result.mappings().all():
-        row_data = dict(row)
-        scene_texts[int(row_data.get("productId") or 0)].append(
-            str(row_data.get("summaryText") or "")
-        )
+            examples_by_key[key] = _extract_summary_payload(row_data.get("summaryText"))
 
     enriched_candidates: list[dict] = []
     for row in candidate_result.mappings().all():
@@ -2481,21 +2582,46 @@ async def _load_main_character_chat_quality(
         product_id = int(row_data.get("productId") or 0)
         scope_key = str(payload.get("canonical_character_key") or "").strip()
         key = (product_id, scope_key)
-        example_count = example_counts.get(key, 0)
-        if key not in profile_keys or example_count <= 0:
+        profile = profiles.get(key, {})
+        examples = examples_by_key.get(key, {})
+        actual_examples = examples.get("examples")
+        example_count = len(actual_examples) if isinstance(actual_examples, list) else 0
+        marked = any("character_contract" in asset for asset in (payload, profile, examples))
+        grounded_evidence_count = 0
+        if marked:
+            if (
+                not is_character_chat_inventory_v1_decision_coherent(payload, require_public_slot=True)
+                or profile.get("character_contract") != payload.get("character_contract")
+            ):
+                continue
+            grounding = select_character_chat_grounding_v1(
+                profile, examples, expected_character_key=scope_key,
+                read_episode_to=None,
+            )
+            if not grounding:
+                continue
+            grounded_evidence_count = len(grounding)
+        elif not profile or example_count <= 0 or examples.get("character_key") != scope_key:
             continue
-        scope_token = json.dumps(scope_key, ensure_ascii=False)
         enriched_candidates.append(
             {
                 **row_data,
+                "characterScopeKey": scope_key,
+                "_inventorySummaryText": row_data["summaryText"],
                 "exampleCount": example_count,
-                "sceneCount": sum(
-                    scope_token in scene_text
-                    for scene_text in scene_texts.get(product_id, [])
-                ),
+                "groundedEvidenceCount": grounded_evidence_count,
             }
         )
 
+    if not enriched_candidates:
+        return {}
+    scene_result = await db.execute(
+        text(build_public_character_catalog_scene_query()),
+        {"candidate_json": json.dumps(build_public_character_catalog_scene_candidates(enriched_candidates))},
+    )
+    scene_counts = {row["characterSlotId"]: int(row["sceneCount"] or 0) for row in scene_result.mappings().all()}
+    for candidate in enriched_candidates:
+        candidate["sceneCount"] = scene_counts.get(candidate["characterSlotId"], 0)
     return build_main_character_chat_quality_by_product(
         enriched_candidates
     )

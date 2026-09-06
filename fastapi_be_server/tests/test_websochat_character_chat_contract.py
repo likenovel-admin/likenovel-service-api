@@ -477,7 +477,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             ),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
-                "examples": [{"text": "가자."}],
+                "examples": [{"episode_no": 1, "text": "가자."}],
             },
             internal_prompt_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
@@ -508,7 +508,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             ),
             examples_payload={
                 "character_key": previous_identity_scope_key,
-                "examples": [{"text": "가자."}],
+                "examples": [{"episode_no": 1, "text": "가자."}],
             },
             internal_prompt_payload=None,
             internal_prompt="",
@@ -527,7 +527,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
     def test_character_chat_context_requires_character_key_on_all_assets(self):
         scope_key = "character:신미아:dup:be14d6b7"
         base_profile = _complete_profile(scope_key)
-        base_examples_payload = {"character_key": scope_key, "examples": [{"text": "가자."}]}
+        base_examples_payload = {"character_key": scope_key, "examples": [{"episode_no": 1, "text": "가자."}]}
         base_internal_prompt_payload = {
             "character_key": scope_key,
             "internal_prompt": "[핵심 정체성] 신미아",
@@ -566,7 +566,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             profile=_complete_profile("character:신미아:dup:be14d6b7"),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
-                "examples": [{"text": "가자."}],
+                "examples": [{"episode_no": 1, "text": "가자."}],
             },
             internal_prompt_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
@@ -588,7 +588,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             profile=_complete_profile("character:신미아:dup:be14d6b7"),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
-                "examples": [{"text": "가자."}],
+                "examples": [{"episode_no": 1, "text": "가자."}],
             },
             internal_prompt_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
@@ -627,7 +627,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
                     profile=_complete_profile("character:신미아:dup:be14d6b7"),
                     examples_payload={
                         "character_key": "character:신미아:dup:be14d6b7",
-                        "examples": [{"text": "가자."}],
+                        "examples": [{"episode_no": 1, "text": "가자."}],
                     },
                     internal_prompt_payload=None,
                     internal_prompt="",
@@ -649,7 +649,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             profile=_complete_profile("character:신미아:dup:be14d6b7"),
             examples_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
-                "examples": [{"text": "가자."}],
+                "examples": [{"episode_no": 1, "text": "가자."}],
             },
             internal_prompt_payload={
                 "character_key": "character:신미아:dup:be14d6b7",
@@ -683,7 +683,7 @@ class WebsochatCharacterChatContractTest(unittest.TestCase):
             profile=incomplete_profile,
             examples_payload={
                 "character_key": scope_key,
-                "examples": [{"text": "가자."}],
+                "examples": [{"episode_no": 1, "text": "가자."}],
             },
             internal_prompt_payload=None,
             internal_prompt="",

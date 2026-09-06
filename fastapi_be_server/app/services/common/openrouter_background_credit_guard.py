@@ -243,16 +243,27 @@ async def post_openrouter_background_chat_completion_async(
     priority_headroom_usd: Any | None = None,
     **request_kwargs: Any,
 ) -> httpx.Response:
-    async with _background_credit_lock_async():
-        await assert_openrouter_background_credit_available_async(
-            client,
-            base_url=base_url,
-            api_key=api_key,
-            priority_headroom_usd=priority_headroom_usd,
-        )
+    async with openrouter_background_credit_reservation_async(
+        client, base_url=base_url, api_key=api_key,
+        priority_headroom_usd=priority_headroom_usd,
+    ):
         return await client.post(
             f"{base_url.rstrip('/')}/chat/completions",
             headers=headers,
             json=json,
             **request_kwargs,
         )
+
+
+@asynccontextmanager
+async def openrouter_background_credit_reservation_async(
+    client: Any, *, base_url: str, api_key: str,
+    priority_headroom_usd: Any | None = None,
+) -> AsyncIterator[None]:
+    """Keep the existing shared lock through submit; allow durable claim after reserve."""
+    async with _background_credit_lock_async():
+        await assert_openrouter_background_credit_available_async(
+            client, base_url=base_url, api_key=api_key,
+            priority_headroom_usd=priority_headroom_usd,
+        )
+        yield

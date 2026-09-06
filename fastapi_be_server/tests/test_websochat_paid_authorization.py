@@ -48,6 +48,37 @@ class _CountingDb:
 
 
 class WebsochatPaidAuthorizationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_same_number_requires_every_exact_episode_authorized(self):
+        for lower_authorized, higher_authorized, expected in ((1, 0, 4), (0, 1, 4), (1, 1, 5)):
+            with self.subTest(lower=lower_authorized, higher=higher_authorized):
+                db = _FakeDb([
+                    {"episodeId": no, "episodeNo": no, "authorizedYn": 1}
+                    for no in range(1, 5)
+                ] + [
+                    {"episodeId": 101, "episodeNo": 5, "priceType": "free" if lower_authorized else "paid", "authorizedYn": lower_authorized},
+                    {"episodeId": 104, "episodeNo": 5, "priceType": "free" if not lower_authorized else "paid", "authorizedYn": higher_authorized},
+                ])
+                scope = await websochat_service._get_websochat_authorized_read_scope(
+                    product_id=100, user_id=200, requested_episode_to=5,
+                    synced_latest_episode_no=5, db=db,
+                )
+                self.assertEqual(scope["contiguousAuthorizedEpisodeTo"], expected)
+                self.assertEqual(scope["authorizedReadEpisodeTo"], expected)
+
+    async def test_grouped_authorization_preserves_zero_gap_request_and_sync_boundaries(self):
+        rows = [{"episodeNo": 0, "authorizedYn": 0}, {"episodeNo": 1, "authorizedYn": 1},
+                {"episodeNo": 1, "authorizedYn": 1}, {"episodeNo": 2, "authorizedYn": 1},
+                {"episodeNo": 4, "authorizedYn": 1}]
+        for requested, synced, expected_max, expected_read in ((4, 4, 2, 2), (1, 4, 2, 1), (4, 1, 1, 1), (4, 0, 0, None)):
+            with self.subTest(requested=requested, synced=synced):
+                scope = await websochat_service._get_websochat_authorized_read_scope(
+                    product_id=100, user_id=200, requested_episode_to=requested,
+                    synced_latest_episode_no=synced, db=_FakeDb(rows),
+                )
+                self.assertEqual(scope["contiguousAuthorizedEpisodeTo"], 2)
+                self.assertEqual(scope["maxAuthorizedEpisodeTo"], expected_max)
+                self.assertEqual(scope["authorizedReadEpisodeTo"], expected_read)
+
     def test_legacy_server_authorized_prompt_source_normalizes_to_prompt(self):
         memory = _normalize_websochat_session_memory(
             {

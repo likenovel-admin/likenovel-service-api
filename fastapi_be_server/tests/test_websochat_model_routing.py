@@ -1221,6 +1221,79 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("검을 들었다", context["raw_recall_context"])
         search_episode_contents.assert_not_awaited()
 
+    async def test_exact_episode_recall_reaches_provider_with_bounded_database_queries(self):
+        product_row = {"productId": 1182, "title": "테스트 작품", "latestEpisodeNo": 10}
+        user_prompt = "2화에서 은색 봉인을 어떻게 확인했어?"
+        recent_messages = [{"role": "assistant", "content": '"무슨 일이 궁금해?"'}]
+        rp_context = {
+            "display_name": "아델리트",
+            "active_character": "character:아델리트",
+            "anchor_episode_no": 3,
+            "trajectory_history": [
+                {"episode_no": 4, "summary": "미래회상_왕관파괴"},
+            ],
+            "session_memory": {
+                "session_kind": "character_chat",
+                "locked_character_scope_key": "character:아델리트",
+                "read_episode_to": 3,
+            },
+            "character_chat_entry_context": _character_chat_entry_context(3),
+        }
+        db = AsyncMock()
+        db.execute.side_effect = [
+            _FakeResult([{
+                "episodeFrom": 2, "episodeTo": 2,
+                "summaryText": "아델리트가 은색 봉인을 확인한다.",
+            }]),
+            _FakeResult([{"episodeNo": 3, "chunkText": "광장에서 장터가 열린다."}]),
+            _FakeResult([
+                {"episodeNo": 2, "chunkText": "아델리트가 은색 봉인의 홈을 짚었다."},
+                {"episodeNo": 2, "chunkText": '"톱니가 맞물렸어." 아델리트가 말했다.'},
+            ]),
+        ]
+        with (
+            patch.object(
+                websochat_service, "call_websochat_model", new_callable=AsyncMock,
+                return_value='{"needs_exact_recall":true,"search_query":"은색 봉인"}',
+            ) as classify,
+            patch.object(
+                websochat_rp_renderer, "call_websochat_model", new_callable=AsyncMock,
+                return_value='"홈을 짚어서 톱니를 확인했어."',
+            ) as provider,
+        ):
+            recall = await websochat_service._build_websochat_rp_exact_recall_context(
+                product_row=product_row, user_prompt=user_prompt,
+                recent_messages=recent_messages, rp_context=rp_context, db=db,
+            )
+            reply = await websochat_rp_renderer.generate_websochat_rp_reply_with_gemini(
+                product_row=product_row, user_prompt=user_prompt,
+                rp_context={**rp_context, **recall}, recent_messages=recent_messages,
+            )
+
+        self.assertEqual(db.execute.await_count, 3)
+        summary_query, summary_params = db.execute.await_args_list[0].args
+        self.assertIn("episode_to <= :latest_episode_no", str(summary_query))
+        self.assertEqual(summary_params["latest_episode_no"], 3)
+        self.assertIn("%봉인%", summary_params.values())
+        for query_call, expected_episode in zip(db.execute.await_args_list[1:], (3, 2)):
+            chunk_query, chunk_params = query_call.args
+            self.assertIn("c.episode_no BETWEEN :episode_from AND :episode_to", str(chunk_query))
+            self.assertEqual(chunk_params, {
+                "product_id": 1182, "episode_from": expected_episode, "episode_to": expected_episode,
+            })
+        self.assertIn(user_prompt, classify.await_args.kwargs["messages"][-1]["content"])
+        provider.assert_awaited_once()
+        delivered = provider.await_args.kwargs
+        self.assertEqual(delivered["usage_product_id"], 1182)
+        self.assertEqual(delivered["usage_scope_key"], "character:아델리트")
+        self.assertEqual(delivered["messages"], [*recent_messages, {"role": "user", "content": user_prompt}])
+        self.assertIn("[2화 원문 일부]", delivered["system_prompt"])
+        self.assertIn("아델리트가 은색 봉인의 홈을 짚었다.", delivered["system_prompt"])
+        self.assertIn('"톱니가 맞물렸어." 아델리트가 말했다.', delivered["system_prompt"])
+        self.assertNotIn("미래회상_왕관파괴", delivered["system_prompt"])
+        self.assertNotIn("광장에서 장터가 열린다.", delivered["system_prompt"])
+        self.assertEqual(reply, '"홈을 짚어서 톱니를 확인했어."')
+
     async def test_read_scope_guard_marks_session_after_first_unknown_prompt(self):
         reply, model_used, route_mode, _, intent, next_memory = await websochat_service._generate_websochat_reply(
             session_id=123,

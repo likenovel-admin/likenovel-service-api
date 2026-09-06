@@ -236,12 +236,11 @@ def _is_websochat_character_entry_context_v2(
 
     recent_episode_from = _coerce_int(payload.get("recent_episode_from"))
     recent_episode_to = _coerce_int(payload.get("recent_episode_to"))
-    if recent_episode_from != max(1, read_episode_to - 1) or recent_episode_to != read_episode_to:
+    if not 0 < recent_episode_from <= read_episode_to or recent_episode_to != read_episode_to:
         return False
 
-    required_episode_nos = set(range(recent_episode_from, read_episode_to + 1))
     recent_plot_rows = payload.get("recent_plot_rows")
-    if not isinstance(recent_plot_rows, list):
+    if not isinstance(recent_plot_rows, list) or not 1 <= len(recent_plot_rows) <= 2:
         return False
     plot_episode_nos: set[int] = set()
     for row in recent_plot_rows:
@@ -249,10 +248,10 @@ def _is_websochat_character_entry_context_v2(
             return False
         episode_no = _coerce_int(row.get("episode_no"))
         summary_text = str(row.get("summary_text") or "").strip()
-        if episode_no not in required_episode_nos or not summary_text:
+        if not recent_episode_from <= episode_no <= read_episode_to or episode_no in plot_episode_nos or not summary_text:
             return False
         plot_episode_nos.add(episode_no)
-    if plot_episode_nos != required_episode_nos:
+    if min(plot_episode_nos) != recent_episode_from or max(plot_episode_nos) != read_episode_to:
         return False
 
     anchor_episode_no = _coerce_int(payload.get("character_anchor_episode_no"))
@@ -285,8 +284,6 @@ def _build_websochat_character_entry_context_v2(
     if int(product_id or 0) <= 0 or safe_read_episode_to <= 0 or not scope_keys:
         return {}
 
-    recent_episode_from = max(1, safe_read_episode_to - 1)
-    required_episode_nos = set(range(recent_episode_from, safe_read_episode_to + 1))
     recent_plot_by_episode: dict[int, dict[str, Any]] = {}
     for row in plot_rows:
         episode_no = _coerce_int(
@@ -295,7 +292,7 @@ def _build_websochat_character_entry_context_v2(
             or row.get("episode_from")
             or row.get("episodeFrom")
         )
-        if episode_no not in required_episode_nos or episode_no in recent_plot_by_episode:
+        if not 0 < episode_no <= safe_read_episode_to or episode_no in recent_plot_by_episode:
             continue
         summary_text = str(row.get("summary_text") or row.get("summaryText") or "").strip()[
             :WEBSOCHAT_CHARACTER_ENTRY_SUMMARY_MAX_CHARS
@@ -306,8 +303,10 @@ def _build_websochat_character_entry_context_v2(
             "episode_no": episode_no,
             "summary_text": summary_text,
         }
-    if set(recent_plot_by_episode) != required_episode_nos:
+    if safe_read_episode_to not in recent_plot_by_episode:
         return {}
+    recent_episode_nos = sorted(recent_plot_by_episode)[-2:]
+    recent_episode_from = recent_episode_nos[0]
 
     character_scene_candidates: list[tuple[int, int, dict[str, Any]]] = []
     read_scope_scene_candidates: list[tuple[int, int, dict[str, Any]]] = []
@@ -361,7 +360,7 @@ def _build_websochat_character_entry_context_v2(
         "recent_episode_to": safe_read_episode_to,
         "recent_plot_rows": [
             recent_plot_by_episode[episode_no]
-            for episode_no in sorted(recent_plot_by_episode)
+            for episode_no in recent_episode_nos
         ],
         "character_anchor_episode_no": anchor_episode_no,
         "character_scene_source": character_scene_source,
@@ -397,24 +396,31 @@ async def load_websochat_character_entry_context_v2(
     if safe_scope <= 0 or not normalized_scope_keys:
         return {}
 
-    recent_episode_from = max(1, safe_scope - 1)
     plot_result = await db.execute(
         text(
             """
             SELECT episode_from AS episodeFrom,
                    episode_to AS episodeTo,
                    summary_text AS summaryText
-            FROM tb_story_agent_context_summary
-            WHERE product_id = :product_id
-              AND summary_type = 'episode_summary'
-              AND is_active = 'Y'
-              AND episode_to BETWEEN :episode_from AND :episode_to
+            FROM (
+                SELECT episode_from, episode_to, summary_text, summary_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY episode_to ORDER BY summary_id DESC
+                       ) AS episode_rank
+                FROM tb_story_agent_context_summary
+                WHERE product_id = :product_id
+                  AND summary_type = 'episode_summary'
+                  AND is_active = 'Y'
+                  AND episode_to > 0 AND episode_to <= :episode_to
+                  AND TRIM(summary_text) <> ''
+            ) AS eligible_summaries
+            WHERE episode_rank = 1
             ORDER BY episode_to DESC, summary_id DESC
+            LIMIT 2
             """
         ),
         {
             "product_id": product_id,
-            "episode_from": recent_episode_from,
             "episode_to": safe_scope,
         },
     )

@@ -3,8 +3,10 @@ import asyncio
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
+from copy import deepcopy
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from unittest import TestCase
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
+from tests.test_character_asset_attempt import ReceiptConnection
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "build_story_agent_context.py"
@@ -33,7 +36,128 @@ def load_module():
             spec.loader.exec_module(module)
         finally:
             os.chdir(previous_cwd)
+    module._character_asset_attempt_store = module.CharacterAssetAttemptStore(ReceiptConnection())
+    module._character_asset_product_id.set(687)
     return module
+
+
+class EpisodeSummaryNamePreservationTest(IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module()
+
+    def test_prompt_contract_and_version_invalidate_old_summary_hash(self):
+        m = self.module
+        prompt = m.build_episode_summary_user_prompt({}, "세린은 돌아왔다.")
+        self.assertIn("대명사(나/그/당신)", prompt)
+        self.assertIn("원문 표기 그대로 보존", prompt)
+        self.assertEqual(m.EPISODE_SUMMARY_FORMAT_VERSION, "episode_summary_v13")
+        self.assertNotEqual(m.build_summary_source_hash("body", "title"), m.sha256_text("episode_summary_v12:body:title"))
+
+    def test_no_candidates_is_unassessable_not_perfect_preservation(self):
+        result = self.module.evaluate_episode_summary_name_preservation("", "이동했다.")
+        self.assertEqual(result["candidate_count"], 0)
+        self.assertIsNone(result["preservation_rate"])
+        self.assertEqual(result["status"], "not_applicable")
+
+    def test_first_person_name_and_role_alias_do_not_count_as_equivalent(self):
+        source = '"세린은 나야." 세린을 마법사라고 불렀다. 마법사는 돌아왔다. 마법사는 쉬었다.'
+        result = self.module.evaluate_episode_summary_name_preservation(source, "나는 마법사로 돌아왔다.")
+        self.assertEqual(result["candidates"], ["세린"])
+        self.assertEqual(result["preservation_rate"], 0.0)
+        self.assertEqual(result["status"], "below_threshold")
+
+    def test_empty_summary_and_keyword_only_name_fail(self):
+        source = "세린은 문을 열었다. 세린을 불렀다."
+        for summary in ("", "[1화] 세린\n주인공이 돌아왔다.\n핵심:세린, 문, 귀환, 호출, 시작, 이동"):
+            with self.subTest(summary=summary):
+                result = self.module.evaluate_episode_summary_name_preservation(source, summary)
+                self.assertEqual(result["preservation_rate"], 0.0)
+
+    def test_substring_is_not_a_preserved_name(self):
+        result = self.module.evaluate_episode_summary_name_preservation("세린은 웃었다. 세린을 불렀다.", "카세린이 웃었다.")
+        self.assertEqual(result["preserved_names"], [])
+
+    async def test_low_preservation_only_warns_and_does_not_retry(self):
+        m = self.module
+        row = {"product_id": 1, "episode_id": 2, "episode_no": 1, "episode_title": "귀환"}
+        summary = "[1화] 귀환\n주인공이 돌아왔다.\n핵심:세린, 귀환, 문, 호출, 시작, 이동"
+        request = AsyncMock(return_value=summary)
+        with patch.object(m, "OPENROUTER_API_KEY", "test"), patch.object(m, "request_episode_summary_text", request), redirect_stdout(io.StringIO()) as output:
+            text, meta = await m.generate_episode_summary_text(client=object(), row=row, normalized_text="세린은 문을 열었다. 세린을 불렀다.")
+        self.assertEqual(request.await_count, 1)
+        self.assertEqual(text, summary)
+        self.assertEqual(meta["name_preservation"]["status"], "below_threshold")
+        self.assertEqual(meta["name_preservation"]["enforcement"], "diagnostic_only")
+        self.assertEqual(meta["retry_count"], 0)
+        self.assertNotIn("quality_issues", meta)
+        self.assertIn("[summary-name-preservation-warning]", output.getvalue())
+
+    async def test_missing_real_names_are_diagnostic_without_retry(self):
+        m = self.module
+        row = {"product_id": 1, "episode_id": 2, "episode_no": 1, "episode_title": "귀환"}
+        bad = "[1화] 귀환\n주인공이 돌아왔다.\n핵심:세린, 귀환, 문, 호출, 시작, 이동"
+        request = AsyncMock(return_value=bad)
+        with patch.object(m, "OPENROUTER_API_KEY", "test"), patch.object(m, "request_episode_summary_text", request), redirect_stdout(io.StringIO()):
+            text, meta = await m.generate_episode_summary_text(client=object(), row=row, normalized_text="세린은 문을 열었다. 세린을 불렀다. 다온은 웃었다. 다온을 불렀다.")
+        self.assertEqual(request.await_count, 1)
+        self.assertEqual(text, bad)
+        self.assertEqual(meta["name_preservation"]["enforcement"], "diagnostic_only")
+        self.assertIn("missing_name_anchor_in_body", meta["name_preservation"]["semantic_issues"])
+        self.assertEqual(meta["retry_count"], 0)
+
+    async def test_noisy_nouns_nameless_speaker_shared_title_and_pov_do_not_retry(self):
+        m = self.module
+        row = {"product_id": 1, "episode_id": 2, "episode_no": 1, "episode_title": "귀환"}
+        summary = "[1화] 귀환\n성문을 열고 돌아왔다.\n핵심:귀환, 성문, 호출, 시작, 이동, 인사"
+        sources = {
+            "noisy_nouns": "고개를 들었다. 소리가 났다. 시선을 옮겼다. 얼굴을 돌렸다.",
+            "nameless_first_person": "나는 이름이 없다. 고개를 들고 소리를 따라갔다.",
+            "shared_title": "단장은 두 명이다. 북쪽 단장이 남쪽 단장을 보았다. 기사는 기다렸다.",
+            "pov_shift": "세린은 문을 열었다. 다온은 다른 곳에서 기다렸다. 그의 시점으로 이야기가 바뀌었다.",
+        }
+        for label, source in sources.items():
+            with self.subTest(label=label):
+                request = AsyncMock(return_value=summary)
+                with patch.object(m, "OPENROUTER_API_KEY", "test"), patch.object(m, "request_episode_summary_text", request), redirect_stdout(io.StringIO()) as output:
+                    text, meta = await m.generate_episode_summary_text(client=object(), row=row, normalized_text=source)
+                self.assertEqual(request.await_count, 1)
+                self.assertEqual(text, summary)
+                self.assertEqual(meta["name_preservation"]["enforcement"], "diagnostic_only")
+                self.assertIn("missing_name_anchor_in_body", meta["name_preservation"]["semantic_issues"])
+                self.assertIn("diagnostic_only=True", output.getvalue())
+                self.assertFalse(meta["fallback_used"])
+
+    async def test_structural_invalid_still_retries_then_recovers_or_falls_back(self):
+        m = self.module
+        row = {"product_id": 1, "episode_id": 2, "episode_no": 1, "episode_title": "귀환"}
+        good = "[1화] 귀환\n성문을 열고 돌아왔다.\n핵심:귀환, 성문, 호출, 시작, 이동, 인사"
+        for second in (good, ""):
+            with self.subTest(recovered=bool(second)):
+                request = AsyncMock(side_effect=["", second])
+                with patch.object(m, "OPENROUTER_API_KEY", "test"), patch.object(m, "request_episode_summary_text", request), redirect_stdout(io.StringIO()):
+                    text, meta = await m.generate_episode_summary_text(client=object(), row=row, normalized_text="고개를 들었다. 소리가 났다.")
+                self.assertEqual(request.await_count, 2)
+                self.assertEqual(meta["retry_count"], 1)
+                self.assertEqual(meta["fallback_used"], not bool(second))
+                if second:
+                    self.assertEqual(text, good)
+                else:
+                    self.assertEqual(meta["fallback_reason"], "validation_failed")
+
+    async def test_common_noun_false_positive_cannot_trigger_new_retry(self):
+        m = self.module
+        row = {"product_id": 1, "episode_id": 2, "episode_no": 1, "episode_title": "귀환"}
+        summary = "[1화] 귀환\n조용히 돌아왔다.\n핵심:귀환, 문, 호출, 시작, 이동, 인사"
+        request = AsyncMock(return_value=summary)
+        with patch.object(m, "OPENROUTER_API_KEY", "test"), patch.object(m, "request_episode_summary_text", request), redirect_stdout(io.StringIO()):
+            text, meta = await m.generate_episode_summary_text(client=object(), row=row, normalized_text="고개를 들었다. 고개를 돌렸다.")
+        self.assertEqual(meta["name_preservation"]["candidates"], ["고개"])
+        self.assertEqual(meta["name_preservation"]["candidate_basis"], "unverified_lexical_hints")
+        self.assertEqual(meta["name_preservation"]["status"], "below_threshold")
+        self.assertEqual(request.await_count, 1)
+        self.assertEqual(text, summary)
+        self.assertFalse(meta["fallback_used"])
 
 
 def signal_row(summary_id: int, episode_no: int, characters: list[dict]) -> dict:
@@ -171,6 +295,1000 @@ class FakeOpenRouterClient:
                 ]
             }
         )
+
+
+class EpisodeCharacterSignalsContractTests(IsolatedAsyncioTestCase):
+    async def test_invalid_marked_signal_stops_inventory_writes_and_preserves_old_assets(self):
+        with self.environment(self.response_payload()) as state:
+            module = state.module
+            await module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[state.row],
+                summary_client=state.client, cleanup_missing_scopes=False,
+            )
+            good_row = {**state.upsert.call_args.kwargs, "summary_id": 456}
+            good_payload = json.loads(good_row["summary_text"])
+            for failure in ("input_hash", "payload_hash", "null_marker", "shape", "episode_no"):
+                with self.subTest(failure=failure):
+                    bad = deepcopy(good_payload)
+                    bad["mentioned_characters"][0].update(display_name="민서의 새 신분", is_work_protagonist=True)
+                    if failure == "input_hash":
+                        bad["signal_contract"]["input_hash"] = "wrong-input"
+                    elif failure == "shape":
+                        bad["mentioned_characters"][0]["is_first_person"] = "true"
+                    elif failure == "episode_no":
+                        bad["episode_no"] = 2
+                    content = {key: value for key, value in bad.items() if key != "signal_contract"}
+                    bad["signal_contract"]["payload_hash"] = module.sha256_text(json.dumps(content, ensure_ascii=False, sort_keys=True))
+                    if failure == "payload_hash":
+                        bad["signal_contract"]["payload_hash"] = "wrong-payload"
+                    elif failure == "null_marker":
+                        bad["signal_contract"] = None
+                    bad_row = {**good_row, "summary_id": 999, "summary_text": json.dumps(bad, ensure_ascii=False)}
+                    old_assets = {
+                        "character_inventory_v3": {"scope_key": "character:old", "summary_text": json.dumps({"display_name": "기존 인물", "work_role": "minor_character"})},
+                        "character_rp_profile": {"generation": "old-profile"},
+                        "character_rp_examples": {"generation": "old-examples"},
+                    }
+                    serving = deepcopy(old_assets)
+                    writes = []
+                    cur = MagicMock()
+                    cur.lastrowid = 1
+                    cur.rowcount = 1
+                    cur.fetchone.return_value = None
+
+                    def execute(sql, params=()):
+                        if sql.lstrip().upper().startswith("SELECT"):
+                            cur.fetchall.return_value = [serving["character_inventory_v3"]] if serving else []
+                        else:
+                            writes.append((sql, params))
+                            serving.clear()
+                        return 1
+
+                    cur.execute.side_effect = execute
+                    with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "marked_signal_invalid"):
+                        module.build_character_inventory_v3_summaries_from_signal_rows(
+                            cur, product_id=687, signal_rows=[good_row, bad_row],
+                        )
+                    self.assertEqual(writes, [])
+                    self.assertEqual(serving, old_assets)
+
+            legacy = deepcopy(good_payload)
+            legacy.pop("signal_contract")
+            legacy_row = {**good_row, "summary_text": json.dumps(legacy, ensure_ascii=False)}
+            inventory = module.aggregate_character_inventory_v3_rows([legacy_row])
+            self.assertEqual(len(inventory), 1)
+            self.assertEqual(inventory[0]["display_name"], "민서")
+            self.assertNotIn("character_contract", inventory[0])
+
+    async def test_possession_target_with_two_same_label_people_stays_unresolved(self):
+        payload = self.response_payload()
+        first = payload["mentioned_characters"][0]
+        first["evidence"] = [{"kind": "presence", "source_part": "episode_summary", "quote": "북쪽 민서가 문을 연다.", "counterpart_label": ""}]
+        second = deepcopy(first)
+        second["evidence"][0]["quote"] = "남쪽 민서는 창문을 닫는다."
+        claimant = deepcopy(first)
+        claimant.update(display_name="도윤", aliases=["도윤"], identity_claims=[{
+            "claim_type": "possessed_as", "target_label": "민서", "evidence": "도윤은 민서의 몸에 들어갔다고 말한다.",
+        }])
+        claimant["evidence"][0]["quote"] = "도윤은 민서의 몸에 들어갔다고 말한다."
+        payload["mentioned_characters"] = [first, second, claimant]
+        with self.environment(payload) as state:
+            state.row["summary_text"] = "북쪽 민서가 문을 연다. 남쪽 민서는 창문을 닫는다. 도윤은 민서의 몸에 들어갔다고 말한다."
+            await state.module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[state.row],
+                summary_client=state.client, cleanup_missing_scopes=False,
+            )
+            stored_row = {**state.upsert.call_args.kwargs, "summary_id": 456}
+            normalized = json.loads(stored_row["summary_text"])["mentioned_characters"]
+            self.assertEqual([item["character_key"] for item in normalized], ["named:민서", "named:민서:2", "named:도윤"])
+            self.assertIsNone(normalized[2]["identity_claims"][0]["target_key"])
+            inventory = state.module.aggregate_character_inventory_v3_rows([stored_row])
+            self.assertEqual(len(inventory), 3)
+            for key in ("named:민서", "named:민서:2"):
+                target = next(item for item in inventory if key in item["source_character_keys"])
+                self.assertNotIn("named:도윤", target["source_character_keys"])
+                self.assertEqual(len(target["source_observation_refs"]), 1)
+                self.assertNotIn(claimant["evidence"][0]["quote"], [item["quote"] for item in target["grounding_v1"]])
+
+    async def test_ungrounded_signal_cannot_replace_an_active_asset(self):
+        payload = self.response_payload()
+        payload["mentioned_characters"][0].pop("evidence", None)
+        with self.environment(payload) as state:
+            for _ in range(2):
+                with self.assertRaises(state.module.CharacterAssetAttemptBlocked):
+                    await state.module.build_episode_character_signals_summaries(
+                        state.conn, product_id=687, episode_rows=[state.row],
+                        episode_texts_by_scope={state.row["scope_key"]: "민서는 창문을 닫았다."},
+                        summary_client=state.client, processed_scope_keys=state.processed,
+                        cleanup_missing_scopes=False, commit_changes=False,
+                    )
+            self.assertEqual(len(state.client.calls), 1)
+            self.assertEqual(state.processed, set())
+            state.upsert.assert_not_called()
+            state.activate.assert_not_called()
+
+    @staticmethod
+    def response_payload(episode_no=1):
+        character = signal_character(character_key="ignored", display_name="민서")
+        character.pop("character_key")
+        character.pop("episode_no")
+        character["evidence"] = [{"kind": "presence", "source_part": "episode_summary", "quote": "민서가 사건을 지켜본다.", "counterpart_label": ""}]
+        return {
+            "episode_no": episode_no,
+            "mentioned_characters": [character],
+            "cliffhanger_hooks": [],
+        }
+
+    @contextmanager
+    def environment(self, payload, *, episode_no=1):
+        module = load_module()
+        state = SimpleNamespace(
+            module=module,
+            conn=FakeConnection(),
+            client=FakeOpenRouterClient(payload),
+            processed=set(),
+            row={
+                "summary_id": 777,
+                "scope_key": "episode:1001",
+                "episode_from": episode_no,
+                "source_hash": "episode-summary-hash",
+                "summary_text": "[회차] 민서가 사건을 지켜본다.",
+            },
+        )
+        with ExitStack() as stack:
+            for name, value in (
+                ("OPENROUTER_API_KEY", "openrouter-key"),
+                ("RP_REASONING_MODEL", ""),
+                ("EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro-0813"),
+                ("DEEPSEEK_OPENROUTER_PROVIDER_ONLY", ""),
+            ):
+                stack.enter_context(patch.object(module, name, value))
+            stack.enter_context(patch.object(module, "work_cursor", fake_work_cursor))
+            state.fetch = stack.enter_context(patch.object(module, "fetch_existing_summary", return_value=None))
+            state.activate = stack.enter_context(patch.object(module, "activate_existing_summary"))
+            state.upsert = stack.enter_context(patch.object(module, "upsert_summary", return_value=(456, True)))
+            state.cleanup = stack.enter_context(patch.object(module, "deactivate_missing_active_scopes"))
+            yield state
+
+    @staticmethod
+    async def accepted_cache_row(module, row):
+        client = FakeOpenRouterClient({"episode_no": row["episode_from"], "mentioned_characters": [], "cliffhanger_hooks": []})
+        with patch.object(module, "OPENROUTER_API_KEY", "test"), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "test-model"), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_existing_summary", return_value=None), \
+             patch.object(module, "upsert_summary", return_value=(123, True)) as upsert:
+            await module.build_episode_character_signals_summaries(
+                FakeConnection(), product_id=687, episode_rows=[row],
+                summary_client=client, cleanup_missing_scopes=False,
+            )
+            stored = upsert.call_args.kwargs
+        return {"summary_id": 123, "summary_text": stored["summary_text"], "source_hash": stored["source_hash"]}
+
+    async def test_openrouter_body_includes_bounded_source_for_every_episode(self):
+        for episode_no in (1, 2, 3, 4):
+            with self.subTest(episode_no=episode_no), self.environment(
+                self.response_payload(episode_no), episode_no=episode_no
+            ) as state:
+                await state.module.build_episode_character_signals_summaries(
+                    state.conn,
+                    product_id=687,
+                    episode_rows=[state.row],
+                    episode_texts_by_scope={state.row["scope_key"]: "OPENING_SENTINEL" + "가" * 10000 + "TRUNCATED_SENTINEL"},
+                    summary_client=state.client,
+                    cleanup_missing_scopes=False,
+                )
+                self.assertEqual(len(state.client.calls), 1)
+                body = state.client.calls[0]["json"]
+                message = body["messages"][1]["content"]
+                self.assertIn("OPENING_SENTINEL", message)
+                self.assertNotIn("TRUNCATED_SENTINEL", message)
+
+    async def test_contract_invalid_response_preserves_old_scope_and_blocks_replay(self):
+        good = self.response_payload()
+        cases = [
+            ("empty_object", {}, "episode_no"),
+            ("display_name_only", {"episode_no": 1, "mentioned_characters": [{"display_name": "민서"}], "cliffhanger_hooks": []}, "mentioned_characters[0]."),
+        ]
+        for key in good:
+            payload = deepcopy(good)
+            del payload[key]
+            cases.append((f"missing_{key}", payload, key))
+        for key in good["mentioned_characters"][0]:
+            payload = deepcopy(good)
+            del payload["mentioned_characters"][0][key]
+            cases.append((f"missing_character_{key}", payload, f"mentioned_characters[0].{key}"))
+        for label, field, value in (
+            ("empty_name", "display_name", "  "),
+            ("wrong_flag_type", "is_work_protagonist", "false"),
+            ("wrong_enum", "voice_mode", "unknown"),
+            ("wrong_array_type", "aliases", "민서"),
+            ("wrong_tag_type", "action_tags", [False]),
+            ("too_many_tags", "action_tags", ["행동"] * 5),
+            ("bad_relation", "relation_edges", [{"target_label": "지수", "relation_tag": "동료"}]),
+            ("bad_identity", "identity_claims", [{"target_label": "지수", "claim_type": "alias_of"}]),
+            ("extra_field", "unexpected", True),
+        ):
+            payload = deepcopy(good)
+            payload["mentioned_characters"][0][field] = value
+            cases.append((label, payload, f"mentioned_characters[0].{field}"))
+        for label, characters in (
+            ("too_many", good["mentioned_characters"] * 7),
+            ("not_array", {}),
+            ("mixed_invalid", good["mentioned_characters"] + [{"display_name": "지수"}]),
+        ):
+            cases.append((label, {**good, "mentioned_characters": characters}, "mentioned_characters"))
+        cases.extend([
+            ("wrong_episode", {**good, "episode_no": 2}, "episode_no"),
+            ("bool_episode", {**good, "episode_no": True}, "episode_no"),
+            ("extra_root", {**good, "unexpected": True}, "unexpected"),
+        ])
+
+        for label, payload, error_path in cases:
+            with self.subTest(case=label), self.environment(payload) as state:
+                for attempt in range(2):
+                    with self.assertRaises(state.module.CharacterAssetAttemptBlocked) as captured:
+                        await state.module.build_episode_character_signals_summaries(
+                            state.conn, product_id=687, episode_rows=[state.row],
+                            summary_client=state.client, processed_scope_keys=state.processed,
+                            commit_changes=False,
+                        )
+                    if attempt == 0:
+                        self.assertIn(error_path, str(captured.exception.__cause__))
+                    self.assertIn("terminal_invalid", str(captured.exception))
+                self.assertEqual(len(state.client.calls), 1)
+                state.upsert.assert_not_called()
+                state.activate.assert_not_called()
+                self.assertEqual(state.processed, set())
+                self.assertEqual(state.conn.commit_count, 0)
+                state.cleanup.assert_not_called()
+
+    async def test_contract_accepts_explicit_false_flags_and_empty_optional_evidence(self):
+        with self.environment(self.response_payload()) as state:
+            counts = await state.module.build_episode_character_signals_summaries(
+                state.conn,
+                product_id=687,
+                episode_rows=[state.row],
+                summary_client=state.client,
+                processed_scope_keys=state.processed,
+                cleanup_missing_scopes=False,
+            )
+            self.assertEqual(counts, (1, 0))
+            stored = json.loads(state.upsert.call_args.kwargs["summary_text"])
+            character = stored["mentioned_characters"][0]
+            self.assertIs(character["is_work_protagonist"], False)
+            self.assertEqual(character["action_tags"], [])
+            self.assertEqual(character["identity_claims"], [])
+            self.assertEqual(state.processed, {"episode:1001"})
+
+    async def test_v4_contract_does_not_reuse_v3_signal_cache(self):
+        with self.environment(self.response_payload(4), episode_no=4) as state:
+            old_hash = state.module.build_compound_summary_source_hash(
+                "episode_character_signals_v3",
+                ["777:episode-summary-hash", state.module.build_rp_reasoning_signature()],
+            )
+            state.fetch.side_effect = lambda **kwargs: {"summary_id": 123} if kwargs["source_hash"] == old_hash else None
+            counts = await state.module.build_episode_character_signals_summaries(
+                state.conn,
+                product_id=687,
+                episode_rows=[state.row],
+                summary_client=state.client,
+                cleanup_missing_scopes=False,
+            )
+            self.assertEqual(counts, (1, 0))
+            state.activate.assert_not_called()
+            self.assertEqual(len(state.client.calls), 1)
+            self.assertNotEqual(state.upsert.call_args.kwargs["source_hash"], old_hash)
+
+    async def test_fourth_episode_source_change_invalidates_signal_hash(self):
+        hashes = []
+        for text in ("OLD_OPENING", "NEW_OPENING"):
+            with self.environment(self.response_payload(4), episode_no=4) as state:
+                await state.module.build_episode_character_signals_summaries(
+                    state.conn,
+                    product_id=687,
+                    episode_rows=[state.row],
+                    episode_texts_by_scope={state.row["scope_key"]: text},
+                    summary_client=state.client,
+                    cleanup_missing_scopes=False,
+                )
+                hashes.append(state.upsert.call_args.kwargs["source_hash"])
+        self.assertNotEqual(hashes[0], hashes[1])
+
+    async def test_fabricated_quote_is_not_accepted_as_narration(self):
+        payload = self.response_payload()
+        payload["mentioned_characters"][0]["evidence"][0]["quote"] = "민서는 왕을 죽였다."
+        with self.environment(payload) as state:
+            with self.assertRaises(state.module.CharacterAssetAttemptBlocked):
+                await state.module.build_episode_character_signals_summaries(
+                    state.conn, product_id=687, episode_rows=[state.row],
+                    summary_client=state.client, cleanup_missing_scopes=False,
+                )
+            self.assertEqual(len(state.client.calls), 1)
+            state.upsert.assert_not_called()
+
+    async def test_silent_episode_preserves_positive_action_and_source_basis(self):
+        payload = self.response_payload(4)
+        payload["mentioned_characters"][0]["evidence"] = [{
+            "kind": "narrated_action", "source_part": "episode_source",
+            "quote": "민서는 창문을 닫았다.", "counterpart_label": "",
+        }]
+        with self.environment(payload, episode_no=4) as state:
+            counts = await state.module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[state.row],
+                episode_texts_by_scope={state.row["scope_key"]: "민서는 창문을 닫았다. 아무도 말하지 않았다."},
+                summary_client=state.client, cleanup_missing_scopes=False,
+            )
+            self.assertEqual(counts, (1, 0))
+            stored = json.loads(state.upsert.call_args.kwargs["summary_text"])
+            evidence = stored["mentioned_characters"][0]["evidence"]
+            self.assertEqual(evidence[0]["quote"], "민서는 창문을 닫았다.")
+            self.assertEqual(evidence[0]["source_part"], "episode_source")
+            self.assertEqual(stored["coverage"]["observation_state"], "observations_present")
+
+    async def test_producer_stored_signal_inventory_and_grounded_rp_pair_round_trip(self):
+        payload = self.response_payload(4)
+        character = payload["mentioned_characters"][0]
+        character.update(is_first_person=True, is_work_protagonist=False, is_episode_focal=True)
+        character["evidence"] = [{
+            "kind": "narrated_action", "source_part": "episode_source",
+            "quote": "민서는 창문을 닫았다.", "counterpart_label": "",
+        }]
+        with self.environment(payload, episode_no=4) as state:
+            module = state.module
+            for _ in range(2):
+                counts = await module.build_episode_character_signals_summaries(
+                    state.conn, product_id=687, episode_rows=[state.row],
+                    episode_texts_by_scope={state.row["scope_key"]: "민서는 창문을 닫았다. 아무도 말하지 않았다."},
+                    summary_client=state.client, cleanup_missing_scopes=False,
+                )
+                self.assertEqual(counts, (1, 0))
+            self.assertEqual(len(state.client.calls), 1)
+            stored_row = {**state.upsert.call_args.kwargs, "summary_id": 456}
+            stored = json.loads(stored_row["summary_text"])
+            stored_character = stored["mentioned_characters"][0]
+            self.assertIs(stored_character["is_first_person"], True)
+            self.assertIs(stored_character["is_work_protagonist"], False)
+            inventory = module.aggregate_character_inventory_v3_rows([stored_row])
+            self.assertEqual(len(inventory), 1)
+            item = inventory[0]
+            self.assertNotEqual(item["work_role"], "main_protagonist")
+            self.assertEqual(item["grounding_v1"][0]["quote"], "민서는 창문을 닫았다.")
+            self.assertEqual(item["grounding_v1"][0]["episode_no"], 4)
+            self.assertEqual(item["identity_labels_v1"], [{"episode_no": 4, "label": "민서"}])
+            # One observed episode is not enough to publish a major character.
+            state.upsert.reset_mock()
+            with self.assertRaises(module.CharacterAssetAttemptBlocked):
+                module.upsert_grounded_rp_pair(object(), product_id=687, inventory=item)
+            state.upsert.assert_not_called()
+            payload["episode_no"] = 5
+            next_row = {**state.row, "scope_key": "episode:5", "episode_from": 5, "episode_to": 5, "source_hash": "next-episode"}
+            await module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[next_row],
+                episode_texts_by_scope={next_row["scope_key"]: "민서는 창문을 닫았다. 아무도 말하지 않았다."},
+                summary_client=state.client, cleanup_missing_scopes=False,
+            )
+            item = module.aggregate_character_inventory_v3_rows([
+                stored_row, {**state.upsert.call_args.kwargs, "summary_id": 457},
+            ])[0]
+            state.upsert.reset_mock()
+            pair_counts = module.upsert_grounded_rp_pair(object(), product_id=687, inventory=item)
+            self.assertEqual(pair_counts, {"profile": True, "examples": True})
+            stored_pair = {
+                call.kwargs["summary_type"]: json.loads(call.kwargs["summary_text"])
+                for call in state.upsert.call_args_list
+            }
+            profile = stored_pair["character_rp_profile"]
+            examples = stored_pair["character_rp_examples"]
+            self.assertEqual(profile["character_contract"], examples["character_contract"])
+            self.assertEqual(examples["examples"], [])
+            self.assertNotIn("speech_style", profile)
+            self.assertTrue(module.select_character_chat_grounding_v1(
+                profile, examples, expected_character_key=item["canonical_character_key"], read_episode_to=4,
+            ))
+            self.assertFalse(module.select_character_chat_grounding_v1(
+                profile, examples, expected_character_key=item["canonical_character_key"], read_episode_to=3,
+            ))
+            self.assertEqual(len(state.client.calls), 2)
+
+    async def test_empty_coverage_is_not_a_missing_source_or_a_fabricated_character(self):
+        payload = {"episode_no": 1, "mentioned_characters": [], "cliffhanger_hooks": []}
+        with self.environment(payload) as state:
+            counts = await state.module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[state.row],
+                summary_client=state.client, cleanup_missing_scopes=False,
+            )
+            self.assertEqual(counts, (1, 0))
+            stored = json.loads(state.upsert.call_args.kwargs["summary_text"])
+            self.assertEqual(stored["mentioned_characters"], [])
+            self.assertEqual(stored["coverage"]["observation_state"], "no_entity_observed_in_supplied_coverage")
+
+    async def test_missing_source_refresh_does_not_cleanup_active_assets(self):
+        with self.environment(self.response_payload()) as state:
+            state.row["summary_text"] = ""
+            counts = await state.module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[state.row],
+                summary_client=state.client, cleanup_missing_scopes=True,
+            )
+            self.assertEqual(counts, (0, 0))
+            self.assertEqual(len(state.client.calls), 0)
+            state.cleanup.assert_not_called()
+            state.activate.assert_not_called()
+
+    async def test_unvalidated_cached_signal_is_not_reactivated(self):
+        with self.environment(self.response_payload()) as state:
+            state.fetch.return_value = {"summary_id": 91, "summary_text": json.dumps(self.response_payload())}
+            counts = await state.module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[state.row],
+                summary_client=state.client, cleanup_missing_scopes=False,
+                processed_scope_keys=state.processed,
+            )
+            self.assertEqual(counts, (0, 0))
+            self.assertEqual(state.processed, set())
+            self.assertEqual(len(state.client.calls), 0)
+            state.activate.assert_not_called()
+
+    async def test_nonblocking_contract_rejection_propagates_durable_block(self):
+        payload = {"episode_no": 1, "mentioned_characters": [{"display_name": "민서"}], "cliffhanger_hooks": []}
+        with self.environment(payload) as state:
+            with self.assertLogs(state.module.logger, level="INFO") as captured:
+                with self.assertRaisesRegex(state.module.CharacterAssetAttemptBlocked, "terminal_invalid"):
+                    await state.module.build_episode_character_signals_summaries_nonblocking(
+                        state.conn, product_id=687, episode_rows=[state.row],
+                        summary_client=state.client, processed_scope_keys=state.processed,
+                        cleanup_missing_scopes=False, commit_changes=False,
+                    )
+            self.assertEqual(state.processed, set())
+            state.upsert.assert_not_called()
+            self.assertIn("terminal_invalid", "\n".join(captured.output))
+            self.assertNotIn("provider_unavailable", "\n".join(captured.output))
+
+    async def test_full_and_delta_contract_rejection_stops_downstream_bundle(self):
+        payload = {"episode_no": 1, "mentioned_characters": [{"display_name": "민서"}], "cliffhanger_hooks": []}
+        for mode in ("full", "delta"):
+            with self.subTest(mode=mode), self.environment(payload) as state, ExitStack() as stack:
+                module = state.module
+                state.client.aclose = AsyncMock()
+                state.fetch.side_effect = lambda **kwargs: {"summary_id": 777} if kwargs["summary_type"] == "episode_summary" else None
+                for name, value in (
+                    ("AsyncClient", state.client),
+                    ("db_connect", state.conn),
+                    ("product_lock_connection", module.nullcontext(object())),
+                    ("fetch_total_episode_count", 1),
+                    ("fetch_existing_doc", {"context_doc_id": 1}),
+                    ("insert_doc_and_chunks", 1),
+                    ("fetch_active_summary_rows", [state.row]),
+                    ("fetch_active_summary_rows_for_episode_nos", [state.row]),
+                    ("fetch_active_character_inventory_map", {}),
+                    ("fetch_active_relation_inventory_by_relation_key_map", {}),
+                    ("fetch_active_summary_state_map", {}),
+                    ("build_compound_summaries", {"range": (0, 0), "product": (0, 0), "character": (0, 0)}),
+                    ("build_compound_summaries_delta", {"range": (0, 0), "product": (0, 0)}),
+                    ("refresh_product_context_status", {"product_id": 687, "context_status": "ready"}),
+                    ("mark_product_context_failed", 1),
+                ):
+                    stack.enter_context(patch.object(module, name, return_value=value))
+                stack.enter_context(patch.object(module, "touch_product_context_build_attempt"))
+                stack.enter_context(patch.object(module, "assert_storyctx_apply_providers_ready", AsyncMock()))
+                stack.enter_context(patch.object(module, "attach_character_chat_asset_readiness_to_status_row", side_effect=lambda cur, row: row))
+                resolver = stack.enter_context(patch.object(module, "build_work_protagonist_resolution_for_inventory_v3", AsyncMock(side_effect=AssertionError("incomplete signals reached downstream"))))
+                row = {
+                    "product_id": 687,
+                    "episode_id": 1001,
+                    "episode_no": 1,
+                    "episode_content": "<p>민서가 사건을 지켜본다.</p>",
+                    "title": "테스트 작품",
+                    "episode_title": "1화",
+                    "character_asset_episode_eligible": 1,
+                    "_character_asset_collection_eligible": True,
+                }
+                builder = module.build_context_rows if mode == "full" else module.build_context_rows_delta
+                with self.assertLogs(module.logger, level="INFO") as captured:
+                    results = await builder(
+                        rows=[row],
+                        args=SimpleNamespace(apply=True, verbose=False, use_epub_fallback=False, refresh_rp=False),
+                    )
+                resolver.assert_not_awaited()
+                state.upsert.assert_not_called()
+                self.assertEqual(len(state.client.calls), 1)
+                self.assertEqual(state.conn.rollback_count, 1)
+                self.assertEqual(results["inserted_episode_character_signals"], 0)
+                self.assertIn("terminal_invalid", "\n".join(captured.output))
+                self.assertEqual(results["products"][0]["context_status"], "failed")
+                module.mark_product_context_failed.assert_called_once()
+                self.assertIn("terminal_invalid", module.mark_product_context_failed.call_args.kwargs["error_message"])
+
+
+async def produce_grounded_inventory_fixture(
+    *, anonymous=False, episode_count=5, evidence_kind="narrated_action",
+    speaking_episode_count=0, relation_episode_count=0, display_name=None,
+    entity_kind=None,
+    start_episode_no=1,
+    episode_ids_by_no=None,
+):
+    """Real producer and aggregation, with only HTTP and serving-storage boundaries faked."""
+    fixture = EpisodeCharacterSignalsContractTests()
+    name = display_name or ("나(주인공)" if anonymous else "민서")
+    payload = fixture.response_payload()
+    character = payload["mentioned_characters"][0]
+    character.update(
+        display_name=name, aliases=[name], is_protagonist=anonymous,
+        is_work_protagonist=anonymous, is_episode_focal=anonymous,
+        is_first_person=anonymous, entity_kind=entity_kind or ("stable_role" if anonymous else "person"),
+        role_in_episode="lead" if anonymous else "counterpart", scene_weight="high",
+    )
+    if not anonymous:
+        main = deepcopy(character)
+        main.update(display_name="도윤", aliases=["도윤"], entity_kind="person", is_protagonist=True, is_work_protagonist=True, is_episode_focal=True, role_in_episode="lead")
+        main["evidence"] = [{"kind": "narrated_action", "source_part": "episode_summary", "quote": "도윤은 출구를 지켰다.", "counterpart_label": ""}]
+        payload["mentioned_characters"].append(main)
+    with fixture.environment(payload) as state:
+        rows = []
+        for episode_no in range(start_episode_no, start_episode_no + episode_count):
+            kind = "dialogue" if episode_no <= speaking_episode_count else evidence_kind
+            quote = "나는 문을 닫았다." if anonymous else f"{name}는 창문을 닫았다."
+            if kind == "dialogue":
+                quote = "서두르면 흔적을 놓쳐."
+            character["voice_mode"] = kind if kind in {"dialogue", "monologue"} else "narration_only"
+            character["evidence"] = [{"kind": kind, "source_part": "episode_summary", "quote": quote, "counterpart_label": ""}]
+            character["relation_edges"] = ([{"target_label": "지수", "relation_tag": "동료", "direction": "mutual"}] if episode_no <= relation_episode_count else [])
+            payload["episode_no"] = episode_no
+            source = f"{name}가 말했다. {quote}" if kind == "dialogue" else quote
+            if not anonymous:
+                source += " 도윤은 출구를 지켰다."
+            row = {**state.row, "scope_key": f"episode:{(episode_ids_by_no or {}).get(episode_no, episode_no)}", "episode_from": episode_no, "summary_text": source, "source_hash": f"episode-{episode_no}"}
+            await state.module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=[row], summary_client=state.client,
+                cleanup_missing_scopes=False,
+            )
+            rows.append({**state.upsert.call_args.kwargs, "summary_id": episode_no})
+        inventory = state.module.aggregate_character_inventory_v3_rows(rows)
+        assert len(state.client.calls) == episode_count
+        matches = [item for item in inventory if item["display_name"] == name]
+        assert len(matches) == 1
+        return state.module, matches[0]
+
+
+class CharacterAssetSourceOwnershipTests(IsolatedAsyncioTestCase):
+    async def test_marked_planner_uses_exact_grounding_and_never_partial_marker_legacy(self):
+        module, inventory = await produce_grounded_inventory_fixture(episode_ids_by_no={1: 201, 2: 202, 3: 203, 4: 204, 5: 104})
+        scope = inventory["canonical_character_key"]
+        inventory["evidence_episode_nos"] = ["stale diagnostic"]
+        episode_map = {**{f"episode:{200 + no}": no for no in range(1, 5)}, "episode:101": 5, "episode:104": 5}
+        kwargs = dict(episode_summary_rows=[{"scope_key": key, "episode_from": no} for key, no in episode_map.items()], scene_scope_keys={scope}, usable_scene_episode_scope_keys_by_scope={scope: {f"episode:{200 + no}" for no in range(1, 5)}}, episode_scope_map=episode_map, limit=1)
+        selected, required = module.select_character_chat_scene_repair_rows(inventory_map={scope: inventory}, **kwargs)
+        self.assertEqual([row["scope_key"] for row in selected], ["episode:104"])
+        self.assertEqual(required, {"episode:104": {scope}})
+        for marker in ("grounding_v1", "identity_labels_v1"):
+            with self.subTest(marker=marker), self.assertRaises(module.CharacterAssetAttemptBlocked):
+                module.select_character_chat_scene_repair_rows(inventory_map={scope: {marker: inventory[marker], "evidence_episode_nos": [5]}}, **kwargs)
+
+    async def test_marked_same_input_observations_keep_exact_sources_and_stable_generation(self):
+        fixture = EpisodeCharacterSignalsContractTests()
+        payload = fixture.response_payload(episode_no=5)
+        with fixture.environment(payload, episode_no=5) as state:
+            state.row["summary_text"] = "민서는 A문을 닫았다. 민서는 B창문을 열었다."
+            stored = []
+            for scope, quote in (("episode:101", "민서는 A문을 닫았다."), ("episode:104", "민서는 B창문을 열었다.")):
+                payload["mentioned_characters"][0]["evidence"] = [{"kind": "narrated_action", "source_part": "episode_summary", "quote": quote, "counterpart_label": ""}]
+                await state.module.build_episode_character_signals_summaries(state.conn, product_id=687, episode_rows=[{**state.row, "scope_key": scope}], summary_client=state.client, cleanup_missing_scopes=False)
+                stored.append({**state.upsert.call_args.kwargs, "summary_id": len(stored) + 1})
+            module = state.module
+            observations = module.build_character_inventory_v3_observations(stored)
+            self.assertEqual(len({item["observation_id"] for item in observations}), 2)
+            first = module.aggregate_character_inventory_v3_rows(stored)[0]
+            self.assertEqual({item["episode_scope_key"]: item["quote"] for item in first["grounding_v1"]}, {"episode:101": "민서는 A문을 닫았다.", "episode:104": "민서는 B창문을 열었다."})
+            reordered = module.aggregate_character_inventory_v3_rows([{**row, "summary_id": 999 + index} for index, row in enumerate(reversed(stored))])[0]
+            self.assertEqual(first["character_contract"], reordered["character_contract"])
+            conflicting = {**stored[1], "scope_key": "episode:101"}
+            with self.assertRaises(module.CharacterAssetAttemptBlocked):
+                module.build_character_inventory_v3_observations([stored[0], conflicting])
+
+    def test_legacy_number_projection_is_one_way_and_exact_selected_sources_only(self):
+        module = load_module()
+        rows = [{"scope_key": "episode:101", "episode_from": 5}, {"scope_key": "episode:104", "episode_from": 5}]
+        sources = {"episode:101": "PUBLIC_A", "episode:104": "PUBLIC_D", "episode:102": "UNSELECTED_B"}
+        selected = module.filter_episode_texts_to_summary_rows(episode_texts_by_scope=sources, episode_summary_rows=rows)
+        self.assertEqual(selected, {"episode:101": "PUBLIC_A", "episode:104": "PUBLIC_D"})
+        self.assertEqual(module.build_legacy_rp_episode_texts_by_no(episode_texts_by_scope=selected, episode_summary_rows=rows), {5: "PUBLIC_A\n\nPUBLIC_D"})
+        self.assertEqual(module.filter_episode_texts_to_summary_rows(episode_texts_by_scope={5: "WRONG_NUMBER_KEY"}, episode_summary_rows=rows), {})
+
+    async def test_same_number_signals_use_only_their_exact_source_and_hash(self):
+        fixture = EpisodeCharacterSignalsContractTests()
+        with fixture.environment({"episode_no": 5, "mentioned_characters": [], "cliffhanger_hooks": []}, episode_no=5) as state:
+            sources = {"episode:101": "PUBLIC_A_101", "episode:104": "PUBLIC_D_104"}
+            rows = [{**state.row, "scope_key": scope, "summary_id": 10 + index} for index, scope in enumerate(sources)]
+            await state.module.build_episode_character_signals_summaries(
+                state.conn, product_id=687, episode_rows=rows, episode_texts_by_scope=sources,
+                summary_client=state.client, cleanup_missing_scopes=False,
+            )
+            self.assertEqual(len(state.client.calls), 2)
+            for row, call in zip(rows, state.client.calls):
+                body = call["json"]["messages"][1]["content"]
+                self.assertIn(sources[row["scope_key"]], body)
+                self.assertNotIn(next(text for scope, text in sources.items() if scope != row["scope_key"]), body)
+            self.assertEqual(len({call.kwargs["source_hash"] for call in state.upsert.call_args_list}), 2)
+            receipts = state.module._character_asset_attempt_store.connection.rows
+            self.assertEqual({key[2] for key in receipts}, set(sources))
+
+    async def test_same_number_scene_requests_keep_exact_raw_and_scope(self):
+        module = load_module()
+        sources = {"episode:101": "민서는 PUBLIC_A_101 문을 닫았다.", "episode:104": "민서는 PUBLIC_D_104 문을 닫았다."}
+        rows = [{"scope_key": scope, "summary_id": 10 + index, "episode_from": 5, "source_hash": "same-summary-hash", "summary_text": "[5화] 민서의 행동"} for index, scope in enumerate(sources)]
+        class Client(FakeOpenRouterClient):
+            async def post(self, url, **kwargs):
+                body = kwargs["json"]["messages"][1]["content"]
+                raw = next(text for text in sources.values() if text in body)
+                self.content = {"scenes": [{"boundary_anchor_start": raw, "scene_gist": raw, "participants": [{"mention_label": "민서", "scope_key": "character:민서"}], "action_ownership": [{"actor_scope_key": "character:민서", "action": "문을 닫는다"}]}]}
+                return await super().post(url, **kwargs)
+        client = Client(None)
+        with patch.object(module, "OPENROUTER_API_KEY", "test"), patch.object(module, "work_cursor", fake_work_cursor), patch.object(module, "fetch_existing_summary", return_value=None), patch.object(module, "fetch_active_summary_by_scope", return_value=None), patch.object(module, "upsert_summary", return_value=(1, True)) as upsert:
+            self.assertEqual(await module.build_episode_scene_extraction_summaries(
+                FakeConnection(), product_id=687, product_title="test", episode_rows=rows,
+                episode_scope_map={"episode:101": 5, "episode:104": 5},
+                episode_texts_by_scope=sources, summary_client=client,
+                canonical_character_packet={"characters": [{"scope_key": "character:민서", "display_name": "민서"}]}, cleanup_missing_scopes=False,
+            ), (2, 0))
+        self.assertEqual(len(client.calls), 2)
+        for row, call, stored in zip(rows, client.calls, upsert.call_args_list):
+            body = call["json"]["messages"][1]["content"]
+            self.assertIn(sources[row["scope_key"]], body)
+            self.assertNotIn(next(text for scope, text in sources.items() if scope != row["scope_key"]), body)
+            self.assertEqual(stored.kwargs["scope_key"], row["scope_key"])
+            self.assertEqual(json.loads(stored.kwargs["summary_text"])["scenes"][0]["scene_gist"], sources[row["scope_key"]])
+        self.assertEqual(len({call.kwargs["source_hash"] for call in upsert.call_args_list}), 2)
+        original_hash = module.build_episode_scene_extraction_source_hash(rows[0], {"characters": []}, normalized_text=sources["episode:101"])
+        changed_hash = module.build_episode_scene_extraction_source_hash(rows[0], {"characters": []}, normalized_text=sources["episode:104"])
+        self.assertNotEqual(original_hash, changed_hash)
+
+    async def test_mismatched_cached_scene_cannot_activate_and_valid_replacement_is_source_bound(self):
+        for field in ("episode_from", "episode_to", "payload_episode_no"):
+            with self.subTest(field=field):
+                module = load_module()
+                raw, scope = "민서는 출구를 지켰다.", "character:민서"
+                payload = {"episode_no": 5, "status": "ok", "scene_count": 1, "scenes": [{"boundary_anchor_start": raw, "scene_gist": raw, "participants": [{"mention_label": "민서", "scope_key": scope}]}]}
+                cached = {"summary_id": 777, "scope_key": "episode:104", "episode_from": 5, "episode_to": 5, "summary_text": json.dumps(payload)}
+                if field == "payload_episode_no":
+                    cached["summary_text"] = json.dumps({**payload, "episode_no": 999})
+                else:
+                    cached[field] = 999
+                client = FakeOpenRouterClient(payload)
+                with patch.object(module, "OPENROUTER_API_KEY", "test"), patch.object(module, "work_cursor", fake_work_cursor), patch.object(module, "fetch_existing_summary", return_value=cached), patch.object(module, "fetch_active_summary_by_scope", return_value=cached), patch.object(module, "activate_existing_summary") as activate, patch.object(module, "update_existing_summary_payload") as update:
+                    result = await module.build_episode_scene_extraction_summaries(FakeConnection(), product_id=687, product_title="합성 작품", episode_rows=[{"summary_id": 104, "scope_key": "episode:104", "episode_from": 5, "source_hash": "source104", "summary_text": "출구"}], episode_scope_map={"episode:104": 5}, episode_texts_by_scope={"episode:104": raw}, summary_client=client, canonical_character_packet={"characters": [{"scope_key": scope, "display_name": "민서"}]}, cleanup_missing_scopes=False)
+                self.assertEqual(result, (1, 0))
+                self.assertEqual(len(client.calls), 1)
+                activate.assert_not_called()
+                self.assertTrue(module.is_episode_scene_source_bound(update.call_args.kwargs, {"episode:104": 5}))
+
+    def test_scene_repair_does_not_overwrite_same_number_or_authorize_paid_sibling(self):
+        module = load_module()
+        rows = [{"scope_key": f"episode:{episode_id}", "episode_from": 5} for episode_id in (101, 102, 104)]
+        selected, required = module.select_character_chat_scene_repair_rows(
+            inventory_map={"character:민서": {"work_role": "main_protagonist", "evidence_episode_nos": [5]}},
+            episode_summary_rows=rows, scene_scope_keys={"character:민서"},
+            usable_scene_episode_scope_keys_by_scope={}, episode_scope_map={"episode:101": 5, "episode:104": 5}, limit=5,
+        )
+        self.assertEqual([row["scope_key"] for row in selected], ["episode:101", "episode:104"])
+        self.assertEqual(required, {"episode:101": {"character:민서"}, "episode:104": {"character:민서"}})
+
+
+class GroundedInventoryReadinessTests(IsolatedAsyncioTestCase):
+    async def test_actual_anonymous_inventory_enters_scene_packet_only_with_canonical_first_person_sources(self):
+        module, inventory = await produce_grounded_inventory_fixture(anonymous=True)
+        scope = inventory["canonical_character_key"]
+        self.assertNotIn("is_first_person", inventory)
+        self.assertGreater(inventory["first_person_evidence"]["episode_count"], 0)
+        packet = module.build_episode_scene_canonical_character_packet({scope: inventory})
+        self.assertEqual([item["scope_key"] for item in packet["characters"]], [scope])
+        mutations = {
+            "shared_role": {"source_character_keys": ["role:경비원"]},
+            "mixed_sources": {"source_character_keys": ["protagonist:generic", "role:경비원"]},
+            "fake_generic_prefix": {"source_character_keys": ["protagonist:generic_fake"]},
+            **{f"suffix_{suffix}": {"source_character_keys": [f"protagonist:generic:{suffix}"]} for suffix in ("", "fake", "0", "1", "01", "+2", "２", "2:fake")},
+            "missing_sources": {"source_character_keys": []},
+            "zero_first_person": {"first_person_evidence": {"episode_count": 0}},
+            "missing_first_person": {"first_person_evidence": {}},
+            "nonmain": {"work_role": "major_character"},
+        }
+        for case, changes in mutations.items():
+            with self.subTest(case=case):
+                row = {**deepcopy(inventory), "is_first_person": True, **changes}
+                self.assertEqual(module.build_episode_scene_canonical_character_packet({scope: row}), {"characters": []})
+        for source in ("protagonist:first_person", "protagonist:generic", "protagonist:generic:2", "protagonist:generic:10", "protagonist:generic:11"):
+            self.assertTrue(module._is_generic_protagonist_source_key(source))
+
+    async def test_repair_postcondition_requires_the_exact_free_source_for_requested_and_automatic_work(self):
+        for anonymous, requested, has_raw in ((anonymous, requested, has_raw) for anonymous in (False, True) for requested, has_raw in ((True, False), (True, True), (False, True))):
+            with self.subTest(anonymous=anonymous, requested=requested, has_raw=has_raw):
+                module, inventory = await produce_grounded_inventory_fixture(anonymous=True, episode_ids_by_no={1: 201, 2: 202, 3: 203, 4: 204, 5: 101}, **({} if anonymous else {"display_name": "도윤", "entity_kind": "person"}))
+                scope = inventory["canonical_character_key"]
+                rows = {"character_inventory_v3": [{"scope_key": scope, "summary_text": json.dumps(inventory)}]}
+                with patch.object(module, "upsert_summary", return_value=(1, True)) as pair_upsert:
+                    module.upsert_grounded_rp_pair(object(), product_id=687, inventory=inventory)
+                for call in pair_upsert.call_args_list:
+                    rows[call.kwargs["summary_type"]] = [call.kwargs]
+                source_pairs = [(201, 1), (202, 2), (203, 3), (204, 4), (101, 5)]
+                rows["episode_summary"] = [
+                    {"summary_id": episode_id, "scope_key": f"episode:{episode_id}", "episode_from": number, "episode_to": number, "source_hash": f"summary-{episode_id}", "summary_text": f"[{number}화] 출구를 지켰다."}
+                    for episode_id, number in source_pairs
+                ]
+                rows["episode_character_signals"] = [
+                    {**signal_row(episode_id, number, [signal_character(character_key=scope, display_name=str(inventory["display_name"]))]), "scope_key": f"episode:{episode_id}"}
+                    for episode_id, number in source_pairs
+                ]
+                rows["episode_scene_extraction"] = [
+                    {"scope_key": f"episode:{episode_id}", "episode_from": number, "episode_to": number, "summary_text": json.dumps({"status": "ok", "episode_no": number, "scenes": [{"scene_gist": "나는 출구를 지켰다.", "participants": [{"scope_key": scope}]}]})}
+                    for episode_id, number in [*source_pairs[:4], (102, 5), (999, 6)]
+                ]
+                raw = "나는 FREE_101 출구를 지켰다."
+
+                class Client(FakeOpenRouterClient):
+                    async def aclose(self):
+                        pass
+
+                client = Client({"scenes": [{"boundary_anchor_start": raw, "scene_gist": raw, "participants": [{"mention_label": inventory["display_name"], "scope_key": scope}], "action_ownership": [{"actor_scope_key": scope, "action": "출구를 지켰다"}]}]})
+                conn = FakeConnection()
+                results = module.build_empty_results()
+                writes = []
+
+                def store_summary(cur, **kwargs):
+                    writes.append(kwargs)
+                    rows.setdefault(kwargs["summary_type"], []).append(kwargs)
+                    return len(writes), True
+
+                with ExitStack() as stack:
+                    for name, kwargs in (
+                        ("OPENROUTER_API_KEY", {"new": "test"}),
+                        ("AsyncClient", {"return_value": client}),
+                        ("db_connect", {"return_value": conn}),
+                        ("work_cursor", {"new": lambda conn: module.nullcontext(FakeRowsCursor([{"episode_id": episode_id, "episode_no": number} for episode_id, number in source_pairs]))}),
+                        ("product_lock_connection", {"return_value": module.nullcontext(object())}),
+                        ("fetch_total_episode_count", {"return_value": 40}),
+                        ("fetch_product_context_status", {"return_value": "ready"}),
+                        ("fetch_product_ready_episode_count", {"return_value": 40}),
+                        ("fetch_character_identity_review", {"return_value": None}),
+                        ("fetch_active_character_inventory_map", {"return_value": {scope: inventory}}),
+                        ("fetch_active_character_asset_summary_rows", {"side_effect": lambda **kw: rows.get(kw["summary_type"], [])}),
+                        ("fetch_active_summary_rows", {"side_effect": lambda **kw: rows.get(kw["summary_type"], [])}),
+                        ("fetch_active_character_asset_episode_texts_by_scope", {"return_value": {"episode:101": raw} if has_raw else {}}),
+                        ("fetch_rp_ready_character_inventory_history_state_map", {"return_value": {}}),
+                        ("fetch_existing_summary", {"return_value": None}),
+                        ("fetch_active_summary_by_scope", {"return_value": None}),
+                        ("upsert_summary", {"side_effect": store_summary}),
+                        ("touch_product_context_build_attempt", {}),
+                    ):
+                        stack.enter_context(patch.object(module, name, **kwargs))
+                    await module.repair_character_chat_assets(
+                        rows=[{"product_id": 687, "title": "합성 작품", "_character_asset_collection_eligible": True}],
+                        args=SimpleNamespace(apply=True, verbose=False, max_delta_episodes=5, character_scope_keys=[scope] if requested else []),
+                        results=results,
+                    )
+                self.assertEqual(len(client.calls), int(has_raw), results)
+                self.assertEqual([write["scope_key"] for write in writes], ["episode:101"] if has_raw else [])
+                self.assertEqual(results["character_asset_repair_failed"], int(not has_raw))
+                self.assertEqual(results["character_asset_repair_recovered"], int(has_raw))
+                if has_raw:
+                    request_body = client.calls[0]["json"]["messages"][1]["content"]
+                    self.assertIn(scope, request_body)
+                    self.assertIn(raw, request_body)
+                    self.assertEqual(conn.commit_count, 1)
+                    self.assertEqual(results["character_asset_repairs"][0]["after_status"], "ready")
+                else:
+                    self.assertGreater(conn.rollback_count, 0)
+                    self.assertIn("requested scene repair remains below minimum", results["character_asset_repairs"][0]["error"])
+
+    async def test_exact_scene_coverage_counts_five_sources_even_with_same_number(self):
+        module, inventory = await produce_grounded_inventory_fixture(anonymous=True)
+        scope = inventory["canonical_character_key"]
+        sources = [(101, 1), (102, 2), (103, 3), (104, 4), (105, 4)]
+        rows = {"character_inventory_v3": [{"scope_key": scope, "summary_text": json.dumps(inventory)}]}
+        with patch.object(module, "upsert_summary", return_value=(1, True)) as upsert:
+            module.upsert_grounded_rp_pair(object(), product_id=687, inventory=inventory)
+        for call in upsert.call_args_list:
+            rows[call.kwargs["summary_type"]] = [call.kwargs]
+        rows["episode_scene_extraction"] = [{"scope_key": f"episode:{episode_id}", "episode_from": episode_no, "episode_to": episode_no, "summary_text": json.dumps({"status": "ok", "episode_no": episode_no, "scenes": [{"scene_gist": "나는 출구를 지켰다.", "participants": [{"scope_key": scope}]}]})} for episode_id, episode_no in sources]
+        eligible = {f"episode:{episode_id}": episode_no for episode_id, episode_no in sources}
+        readiness = module.build_character_chat_asset_readiness_verification(product_id=687, summary_rows_by_type=rows, episode_scope_map=eligible)
+        self.assertEqual(readiness["character_chat_status"], "ready")
+        self.assertEqual(readiness["usable_scene_episode_nos_by_scope"][scope], [1, 2, 3, 4])
+        self.assertEqual(set(readiness["usable_scene_episode_scope_keys_by_scope"][scope]), set(eligible))
+        coverage = readiness["usable_scene_episode_scope_keys_by_scope"]
+        self.assertEqual(module.select_requested_scene_repair_scope_keys(requested_scope_keys={scope}, inventory_map={scope: inventory}, usable_scene_episode_scope_keys_by_scope=coverage), set())
+        self.assertEqual(module.select_character_chat_scene_repair_rows(inventory_map={scope: inventory}, episode_summary_rows=rows["episode_scene_extraction"], scene_scope_keys={scope}, usable_scene_episode_scope_keys_by_scope=coverage, episode_scope_map=eligible, limit=5), ([], {}))
+
+        # Duplicate rows and missing/invalid source IDs cannot manufacture coverage.
+        scenes = rows["episode_scene_extraction"]
+        rows["episode_scene_extraction"] = [*scenes[:4], scenes[3], *({**scenes[4], "scope_key": bad_scope} for bad_scope in ("", "episode:0", "episode:bad"))]
+        invalid = module.build_character_chat_asset_readiness_verification(product_id=687, summary_rows_by_type=rows, episode_scope_map=eligible)
+        self.assertEqual(invalid["character_chat_status"], "hold")
+        self.assertEqual(len(invalid["usable_scene_episode_scope_keys_by_scope"][scope]), 4)
+
+    async def test_paid_sibling_cannot_hide_missing_free_scene_before_or_after_repair(self):
+        module, inventory = await produce_grounded_inventory_fixture(anonymous=True, episode_ids_by_no={1: 201, 2: 202, 3: 203, 4: 204, 5: 101})
+        scope = inventory["canonical_character_key"]
+        source_pairs = [(201, 1), (202, 2), (203, 3), (204, 4), (102, 5)]
+        rows = {"character_inventory_v3": [{"scope_key": scope, "summary_text": json.dumps(inventory)}]}
+        with patch.object(module, "upsert_summary", return_value=(1, True)) as upsert:
+            module.upsert_grounded_rp_pair(object(), product_id=687, inventory=inventory)
+        for call in upsert.call_args_list:
+            rows[call.kwargs["summary_type"]] = [call.kwargs]
+        rows["episode_scene_extraction"] = [{"scope_key": f"episode:{episode_id}", "episode_from": episode_no, "episode_to": episode_no, "summary_text": json.dumps({"status": "ok", "episode_no": episode_no, "scenes": [{"scene_gist": "나는 출구를 지켰다.", "participants": [{"scope_key": scope}]}]})} for episode_id, episode_no in source_pairs]
+        eligible = {"episode:201": 1, "episode:202": 2, "episode:203": 3, "episode:204": 4, "episode:101": 5}
+        free_source = {**rows["episode_scene_extraction"][-1], "scope_key": "episode:101"}
+        summary_rows = [*rows["episode_scene_extraction"][:4], free_source]
+        before = module.build_character_chat_asset_readiness_verification(product_id=687, summary_rows_by_type=rows, episode_scope_map=eligible)
+        self.assertEqual(before["character_chat_status"], "hold")
+        self.assertEqual(module.build_character_chat_asset_repair_plan(before)["scene_scope_keys"], [scope])
+        selected, required = module.select_character_chat_scene_repair_rows(inventory_map={scope: inventory}, episode_summary_rows=summary_rows, scene_scope_keys={scope}, usable_scene_episode_scope_keys_by_scope=before["usable_scene_episode_scope_keys_by_scope"], episode_scope_map=eligible, limit=5)
+        self.assertEqual([row["scope_key"] for row in selected], ["episode:101"])
+        self.assertEqual(required, {"episode:101": {scope}})
+        self.assertEqual(module.select_requested_scene_repair_scope_keys(requested_scope_keys={scope}, inventory_map={scope: inventory}, usable_scene_episode_scope_keys_by_scope=before["usable_scene_episode_scope_keys_by_scope"]), {scope})
+        rows["episode_scene_extraction"].append(free_source)
+        after = module.build_character_chat_asset_readiness_verification(product_id=687, summary_rows_by_type=rows, episode_scope_map=eligible)
+        self.assertEqual(after["character_chat_status"], "ready")
+        self.assertEqual(set(after["usable_scene_episode_scope_keys_by_scope"][scope]), set(eligible))
+        self.assertEqual(module.select_requested_scene_repair_scope_keys(requested_scope_keys={scope}, inventory_map={scope: inventory}, usable_scene_episode_scope_keys_by_scope=after["usable_scene_episode_scope_keys_by_scope"]), set())
+
+        for field, value in (("episode_from", 999), ("episode_to", 999), ("episode_to", "5"), ("episode_to", True), ("payload_episode_no", 999), ("payload_episode_no", "5"), ("payload_episode_no", True)):
+            with self.subTest(field=field, value=value):
+                corrupt = deepcopy(free_source)
+                if field == "payload_episode_no":
+                    payload = json.loads(corrupt["summary_text"])
+                    payload["episode_no"] = value
+                    corrupt["summary_text"] = json.dumps(payload)
+                else:
+                    corrupt[field] = value
+                rows["episode_scene_extraction"][-1] = corrupt
+                verification = module.build_character_chat_asset_readiness_verification(product_id=687, summary_rows_by_type=rows, episode_scope_map=eligible)
+                self.assertEqual(verification["character_chat_status"], "hold")
+                self.assertEqual(len(verification["usable_scene_episode_scope_keys_by_scope"][scope]), 4)
+                selected, _ = module.select_character_chat_scene_repair_rows(inventory_map={scope: inventory}, episode_summary_rows=summary_rows, scene_scope_keys={scope}, usable_scene_episode_scope_keys_by_scope=verification["usable_scene_episode_scope_keys_by_scope"], episode_scope_map=eligible, limit=5)
+                self.assertEqual([row["scope_key"] for row in selected], ["episode:101"])
+
+    async def test_actual_producer_accepts_public_ordinal_evidence_above_episode_thirty(self):
+        module, inventory = await produce_grounded_inventory_fixture(start_episode_no=41)
+        self.assertEqual({entry["episode_no"] for entry in inventory["grounding_v1"]}, {41, 42, 43, 44, 45})
+        self.assertTrue(module.is_character_inventory_grounding_contract_ready(inventory))
+        self.assertTrue(module.is_batch_rp_candidate(inventory))
+        with patch.object(module, "upsert_summary", return_value=(1, True)) as upsert:
+            self.assertEqual(module.upsert_grounded_rp_pair(object(), product_id=687, inventory=inventory), {"profile": True, "examples": True})
+        pair = {call.kwargs["summary_type"]: json.loads(call.kwargs["summary_text"]) for call in upsert.call_args_list}
+        profile, examples = pair["character_rp_profile"], pair["character_rp_examples"]
+        self.assertEqual(module.select_character_chat_grounding_v1(profile, examples, expected_character_key=inventory["canonical_character_key"], read_episode_to=40), [])
+        self.assertEqual([entry["episode_no"] for entry in module.select_character_chat_grounding_v1(profile, examples, expected_character_key=inventory["canonical_character_key"], read_episode_to=42)], [42, 41])
+
+    async def test_stable_job_identity_requires_two_labels_and_no_shared_or_relationship_label(self):
+        module, original = await produce_grounded_inventory_fixture(display_name="기사단장", entity_kind="stable_role")
+        self.assertEqual(original["identity_status"], "RESOLVED_STABLE_ROLE")
+        self.assertTrue(module.is_batch_rp_candidate(original))
+        for case in ("one_label", "shared_label", "relationship_label"):
+            row = deepcopy(original)
+            if case == "one_label":
+                row["identity_labels_v1"] = row["identity_labels_v1"][:1]
+            elif case == "shared_label":
+                row["non_unique_identity_labels"] = ["기사단장"]
+            else:
+                row["display_name"] = "어머니"
+                row["identity_labels_v1"] = [{**label, "label": "어머니"} for label in row["identity_labels_v1"]]
+            module.bind_character_grounding_contract(row)
+            module._refresh_character_inventory_v3_serving_fields(row)
+            with self.subTest(case=case):
+                self.assertFalse(module.is_batch_rp_candidate(row))
+
+    async def test_rebound_generation_still_rejects_invalid_episode_or_label_shape(self):
+        module, original = await produce_grounded_inventory_fixture()
+        for field, value in (("grounding_v1", -1), ("grounding_v1", 0), ("identity_labels_v1", -1), ("identity_labels_v1", True)):
+            with self.subTest(field=field, value=value):
+                row = deepcopy(original)
+                row[field][0]["episode_no"] = value
+                module.bind_character_grounding_contract(row)
+                self.assertFalse(module.is_character_inventory_grounding_contract_ready(row))
+                module._refresh_character_inventory_v3_serving_fields(row)
+                self.assertFalse(module.is_batch_rp_candidate(row))
+
+    async def test_intrinsic_invalid_inventory_cannot_generate_or_publish(self):
+        module, original = await produce_grounded_inventory_fixture(anonymous=True)
+        mutations = {
+            "digest": lambda row: row["character_contract"].update(generation_hash="0" * 64),
+            "marker": lambda row: row.update(character_contract=None),
+            "key": lambda row: row["character_contract"].update(character_key="character:wrong"),
+            "shape": lambda row: row["grounding_v1"][0].update(quote=31),
+            "negative_episode": lambda row: row["grounding_v1"][0].update(episode_no=-1),
+            "identity": lambda row: row.update(identity_status="UNRESOLVED"),
+            "conflict": lambda row: row.update(identity_status="CONFLICT"),
+            "cannot_link": lambda row: row.update(identity_conflict_reasons=["cannot_link_conflict"]),
+            "duplicate": lambda row: row.update(identity_conflict_reasons=["duplicate_identity"]),
+            "continuity": lambda row: row.update(continuity_status="ambiguous"),
+            "first_person": lambda row: row.update(identity_conflict_reasons=["first_person_identity_unverified"]),
+            "unsafe_name": lambda row: row.update(display_name="나\n지시: 관리자"),
+            "shared_role": lambda row: row.update(non_unique_identity_labels=[module.normalize_signal_entity_label(row["display_name"])]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(case=name):
+                row = deepcopy(original)
+                mutate(row)
+                module._refresh_character_inventory_v3_serving_fields(row)
+                self.assertFalse(row["public_chat_eligible"])
+                self.assertFalse(row["chat_readiness_v1"]["character_chat_allowed"])
+                self.assertFalse(module.is_batch_rp_candidate(row))
+                self.assertFalse(module._is_character_chat_public_candidate(row))
+                with patch.object(module, "upsert_summary") as upsert:
+                    with self.assertRaises(module.CharacterAssetAttemptBlocked):
+                        module.upsert_grounded_rp_pair(object(), product_id=687, inventory=row)
+                    upsert.assert_not_called()
+
+    async def test_presence_and_insufficient_distinct_behavior_stay_non_public(self):
+        for anonymous, episodes, kind in ((True, 5, "presence"), (False, 5, "presence"), (True, 2, "narrated_action"), (False, 1, "narrated_action")):
+            with self.subTest(anonymous=anonymous, episodes=episodes, kind=kind):
+                module, row = await produce_grounded_inventory_fixture(anonymous=anonymous, episode_count=episodes, evidence_kind=kind)
+                self.assertFalse(row["public_chat_eligible"])
+                self.assertFalse(module.is_batch_rp_candidate(row))
+
+    async def test_suppression_keeps_final_decision_flags_coherent(self):
+        module, main = await produce_grounded_inventory_fixture(anonymous=True)
+        duplicate = deepcopy(main)
+        duplicate["canonical_character_key"] += ":duplicate"
+        module.bind_character_grounding_contract(duplicate)
+        module._suppress_duplicate_public_display_rows([main, duplicate])
+        suppressed = next(row for row in (main, duplicate) if not row["public_chat_eligible"])
+        self.assertFalse(suppressed["chat_readiness_v1"]["character_chat_allowed"])
+        self.assertFalse(module.is_public_chat_inventory_candidate(suppressed))
+        self.assertFalse(module.is_batch_rp_candidate(suppressed))
+        module, major = await produce_grounded_inventory_fixture(speaking_episode_count=2)
+        main["aliases"] = [major["display_name"]]
+        module._suppress_main_alias_public_slot_rows([main, major])
+        self.assertTrue(module.is_public_chat_inventory_candidate(major))
+        self.assertTrue(module.is_batch_rp_candidate(major))
+        self.assertFalse(major["public_slot_eligible"])
+        self.assertFalse(major["chat_readiness_v1"]["public_slot_allowed"])
+        self.assertFalse(module.is_public_slot_inventory_candidate(major))
+
+    async def test_scene_readiness_requires_five_without_circular_rp_generation_gate(self):
+        module, inventory = await produce_grounded_inventory_fixture(anonymous=True)
+        scope = inventory["canonical_character_key"]
+        rows = {"character_inventory_v3": [{"scope_key": scope, "summary_text": json.dumps(inventory)}]}
+        with patch.object(module, "upsert_summary", return_value=(1, True)) as upsert:
+            module.upsert_grounded_rp_pair(object(), product_id=687, inventory=inventory)
+        for call in upsert.call_args_list:
+            rows[call.kwargs["summary_type"]] = [call.kwargs]
+        for count, expected in ((4, "hold"), (5, "ready")):
+            rows["episode_scene_extraction"] = [
+                {"scope_key": f"episode:{episode_no}", "episode_from": episode_no, "episode_to": episode_no, "summary_text": json.dumps({
+                    "status": "ok", "episode_no": episode_no, "scenes": [{
+                        "scene_gist": "나는 출구를 지켰다.", "participants": [{"scope_key": scope}],
+                    }],
+                })}
+                for episode_no in range(1, count + 1)
+            ]
+            result = module.build_character_chat_asset_readiness_verification(product_id=687, summary_rows_by_type=rows, episode_scope_map={f"episode:{no}": no for no in range(1, 6)})
+            self.assertEqual(result["character_chat_status"], expected)
+            self.assertEqual(result["ready_public_candidate_count"], int(count == 5))
+            self.assertTrue(module.is_batch_rp_candidate(inventory))
+
+    async def test_producer_grounded_behavior_finalizes_chat_and_stricter_slot_readiness(self):
+        for anonymous, speaking, relations, expected_slot in ((True, 0, 0, True), (False, 0, 0, False), (False, 2, 0, True), (False, 0, 2, True)):
+            with self.subTest(anonymous=anonymous, speaking=speaking, relations=relations):
+                module, inventory = await produce_grounded_inventory_fixture(
+                    anonymous=anonymous, speaking_episode_count=speaking, relation_episode_count=relations,
+                )
+                self.assertEqual(inventory["identity_status"], "RESOLVED_STABLE_ROLE" if anonymous else "RESOLVED_NAMED")
+                self.assertEqual(inventory["work_role"], "main_protagonist" if anonymous else "major_character")
+                self.assertTrue(inventory["public_chat_eligible"])
+                self.assertEqual(inventory["public_slot_eligible"], expected_slot)
+                self.assertTrue(inventory["chat_readiness_v1"]["character_chat_allowed"])
+                self.assertEqual(inventory["chat_readiness_v1"]["exposure_decision"], "eligible")
+                self.assertEqual(inventory["chat_readiness_v1"]["public_slot_allowed"], expected_slot)
+                self.assertTrue(module.is_batch_rp_candidate(inventory))
+                self.assertTrue(module._is_character_chat_public_candidate(inventory))
+                with patch.object(module, "upsert_summary", return_value=(1, True)) as upsert:
+                    self.assertEqual(module.upsert_grounded_rp_pair(object(), product_id=687, inventory=inventory), {"profile": True, "examples": True})
+                pair = {call.kwargs["summary_type"]: json.loads(call.kwargs["summary_text"]) for call in upsert.call_args_list}
+                self.assertNotIn("speech_style", pair["character_rp_profile"])
+                self.assertNotIn("personality_core", pair["character_rp_profile"])
+                self.assertEqual(pair["character_rp_examples"]["examples"], [])
+                if not speaking:
+                    self.assertEqual(inventory["voice_contract_v1"]["speech_register"], "direct_voice_unobserved")
 
 
 class FakeHangingOpenRouterClient:
@@ -1230,7 +2348,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             patch.object(module, "cleanup_duplicate_relation_inventory_rows"),
             patch.object(module, "fetch_active_relation_inventory_map", return_value={}),
             patch.object(module, "build_canonical_relation_inventory_map", return_value={}),
-            patch.object(module, "fetch_active_episode_texts_by_no", return_value={16: "본문"}),
+            patch.object(module, "fetch_active_character_asset_episode_texts_by_scope", return_value={"episode:101": "본문"}),
             patch.object(module, "build_episode_scene_extraction_summaries_nonblocking", scene_builder),
             patch.object(module, "compute_rp_affected_scope_keys", compute_rp),
             patch.object(module, "build_rp_summaries_delta", rp_builder),
@@ -1344,7 +2462,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             patch.object(module, "build_character_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}),
             patch.object(module, "build_character_inventory_v3_summaries", return_value=(1, 0)),
             patch.object(module, "build_relation_inventory_summaries_delta", return_value={"inserted_count": 1, "reused_count": 0}),
-            patch.object(module, "fetch_active_episode_texts_by_no", return_value={16: "본문"}),
+            patch.object(module, "fetch_active_character_asset_episode_texts_by_scope", return_value={"episode:101": "본문"}),
             patch.object(module, "build_episode_scene_extraction_summaries_nonblocking", scene_builder),
             patch.object(module, "compute_rp_affected_scope_keys", return_value={scope_key}),
             patch.object(module, "select_delta_rp_scope_keys", return_value={scope_key}),
@@ -1826,6 +2944,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "request_episode_scene_extraction_payload", request_mock):
             counts = await module.build_episode_scene_extraction_summaries(
                 conn,
+                episode_scope_map={"episode:1001": 1},
                 product_id=687,
                 product_title="테스트 작품",
                 episode_rows=[
@@ -1837,7 +2956,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                         "summary_text": "[1화] 테스트",
                     }
                 ],
-                episode_texts_by_no={1: "야율천은 문 앞에 섰다."},
+                episode_texts_by_scope={"episode:1001": "야율천은 문 앞에 섰다."},
                 summary_client=object(),
                 canonical_character_packet={"characters": [{"display_name": "야율천"}]},
             )
@@ -1847,87 +2966,48 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(conn.commit_count, 0)
 
     async def test_scene_repair_keeps_old_when_regeneration_drops_existing_character(self):
-        module = load_module()
-        conn = FakeConnection()
-        required_scope_key = "protagonist:named:데시"
-        other_scope_key = "supporting:named:오리온"
-        existing_payload = {
-            "episode_no": 1,
-            "status": "ok",
-            "scene_count": 1,
-            "scenes": [
-                {
-                    "scene_gist": "오리온이 문을 연다.",
-                    "participants": [{"scope_key": other_scope_key}],
-                    "action_ownership": [],
-                }
-            ],
-        }
-        regenerated_payload = {
-            **existing_payload,
-            "scenes": [
-                {
-                    "scene_gist": "데시가 문을 연다.",
-                    "participants": [{"scope_key": required_scope_key}],
-                    "action_ownership": [],
-                }
-            ],
-        }
-        request_mock = AsyncMock(return_value=regenerated_payload)
-        upsert_mock = MagicMock()
-
-        with patch.object(module, "OPENROUTER_API_KEY", "test-key"), \
-             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "test-model"), \
-             patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(
-                 module,
-                 "fetch_existing_summary",
-                 return_value=None,
-             ), \
-             patch.object(
-                 module,
-                 "fetch_active_summary_by_scope",
-                 return_value={
-                     "summary_id": 9,
-                     "source_hash": "previous-source-hash",
-                     "summary_text": json.dumps(existing_payload, ensure_ascii=False),
-                 },
-             ), \
-             patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
-             patch.object(module, "upsert_summary", upsert_mock), \
-             self.assertLogs(module.logger, level="WARNING") as captured_logs:
-            counts = await module.build_episode_scene_extraction_summaries(
-                conn,
-                product_id=687,
-                product_title="테스트 작품",
-                episode_rows=[
-                    {
-                        "summary_id": 1,
-                        "scope_key": "episode:1001",
-                        "episode_from": 1,
-                        "source_hash": "hash",
-                        "summary_text": "[1화] 테스트",
-                    }
-                ],
-                episode_texts_by_no={1: "데시와 오리온은 문 앞에 섰다."},
-                summary_client=object(),
-                canonical_character_packet={
-                    "characters": [{"scope_key": required_scope_key, "display_name": "데시"}]
-                },
-                required_scope_keys_by_episode_no={1: {required_scope_key}},
-                cleanup_missing_scopes=False,
-            )
-
-        self.assertEqual(counts, (0, 0))
-        request_mock.assert_awaited_once()
-        upsert_mock.assert_not_called()
-        self.assertIn("reason=required_scope_missing", captured_logs.output[0])
-        self.assertIn(
-            "required=protagonist:named:데시,supporting:named:오리온",
-            captured_logs.output[0],
-        )
-        self.assertIn("generated=protagonist:named:데시", captured_logs.output[0])
-
+        for mode in ("fresh", "old_invalid_payload", "old_valid", "old_inflight", "old_terminal", "preserved", "replacement", "wrong_episode"):
+            with self.subTest(mode=mode):
+                module = load_module()
+                conn = FakeConnection()
+                raw = "민서와 도윤은 출구를 지켰다."
+                wanted, other = "character:도윤", "character:민서"
+                payload = {"scenes": [{"boundary_anchor_start": raw, "scene_gist": raw, "participants": [{"mention_label": "민서", "scope_key": other}], "action_ownership": []}]}
+                if mode in {"old_valid", "replacement"}:
+                    payload["scenes"][0]["participants"].append({"mention_label": "도윤", "scope_key": "character:old" if mode == "replacement" else wanted})
+                if mode == "wrong_episode":
+                    payload["episode_no"] = 999
+                client = FakeOpenRouterClient(payload)
+                packet = {"characters": [{"scope_key": wanted, "display_name": "도윤"}, {"scope_key": other, "display_name": "민서"}]}
+                row = {"summary_id": 101, "scope_key": "episode:101", "episode_from": 5, "source_hash": "source101", "summary_text": "[5화] 출구"}
+                active = {"scope_key": "episode:101", "episode_from": 5, "episode_to": 5, "summary_text": json.dumps({"status": "ok", "scene_count": 1, "episode_no": 5, "scenes": [{"scene_gist": raw, "participants": [{"scope_key": wanted}]}]})} if mode == "preserved" else None
+                store = module._character_asset_attempt_store
+                before = None
+                with patch.object(module, "OPENROUTER_API_KEY", "test"), patch.object(module, "work_cursor", fake_work_cursor), patch.object(module, "fetch_existing_summary", return_value=None), patch.object(module, "fetch_active_summary_by_scope", return_value=active), patch.object(module, "upsert_summary", return_value=(1, True)) as upsert:
+                    if mode.startswith("old_"):
+                        # Use exactly the existing request identity, not the new contract.
+                        prompt = module.build_episode_scene_extraction_user_prompt(product_title="합성 작품", episode_no=5, episode_title=module.parse_summary_text(row["summary_text"]).get("header") or "", normalized_text=raw, canonical_character_packet=packet)
+                        old_key = module.attempt_key(687, "scenes", "episode:101", module.EPISODE_SCENE_EXTRACTION_FORMAT_VERSION + ":receipt_v1", {"provider": "openrouter", "body": module.build_episode_scene_extraction_openrouter_payload(user_prompt=prompt)})
+                        store.claim(old_key)
+                        if mode == "old_terminal":
+                            store.reject(old_key, "prior_invalid")
+                        elif mode != "old_inflight":
+                            store.accept(old_key, payload)
+                        before = deepcopy(store.connection.rows)
+                    for _ in range(2):
+                        kwargs = dict(product_id=687, product_title="합성 작품", episode_rows=[row], episode_scope_map={"episode:101": 5}, episode_texts_by_scope={"episode:101": raw}, summary_client=client, canonical_character_packet=packet, required_scope_keys_by_episode_scope={"episode:101": {other if mode == "preserved" else wanted}}, scope_key_replacements={"character:old": wanted} if mode == "replacement" else {}, cleanup_missing_scopes=False)
+                        if mode in {"old_valid", "replacement"}:
+                            self.assertEqual(await module.build_episode_scene_extraction_summaries_nonblocking(conn, **kwargs), (1, 0))
+                            conn.rollback()
+                        else:
+                            with self.assertRaises(module.CharacterAssetAttemptBlocked):
+                                await module.build_episode_scene_extraction_summaries_nonblocking(conn, **kwargs)
+                    self.assertEqual(len(client.calls), 0 if mode.startswith("old_") else 1)
+                    self.assertEqual(upsert.call_count, 2 if mode in {"old_valid", "replacement"} else 0)
+                    if before is not None:
+                        self.assertEqual(store.connection.rows, before)
+                    elif mode not in {"replacement"}:
+                        self.assertEqual(next(iter(store.connection.rows.values()))["status"], "terminal_invalid")
     async def test_scene_repair_replaces_superseded_scope_with_canonical_character(self):
         module = load_module()
         conn = FakeConnection()
@@ -1997,6 +3077,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "upsert_summary", upsert_mock):
             counts = await module.build_episode_scene_extraction_summaries(
                 conn,
+                episode_scope_map={"episode:29879": 27},
                 product_id=1225,
                 product_title="아저씨의 요술램프",
                 episode_rows=[
@@ -2008,11 +3089,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                         "summary_text": "[27화] 테스트",
                     }
                 ],
-                episode_texts_by_no={27: "김태식은 배를 샀다."},
+                episode_texts_by_scope={"episode:29879": "김태식은 배를 샀다."},
                 summary_client=object(),
                 canonical_character_packet=canonical_character_packet,
                 scope_key_replacements=scope_key_replacements,
-                required_scope_keys_by_episode_no={27: {canonical_scope_key}},
+                required_scope_keys_by_episode_scope={"episode:29879": {canonical_scope_key}},
                 cleanup_missing_scopes=False,
             )
 
@@ -2041,6 +3122,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(TypeError, "scene normalization bug"):
                 await module.build_episode_scene_extraction_summaries(
                     conn,
+                    episode_scope_map={"episode:1001": 1},
                     product_id=687,
                     product_title="테스트 작품",
                     episode_rows=[
@@ -2052,7 +3134,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                             "summary_text": "[1화] 테스트",
                         }
                     ],
-                    episode_texts_by_no={1: "데시가 문을 연다."},
+                    episode_texts_by_scope={"episode:1001": "데시가 문을 연다."},
                     summary_client=object(),
                     canonical_character_packet={
                         "characters": [
@@ -2066,20 +3148,18 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
     async def test_scene_repair_strict_mode_propagates_unexpected_value_error(self):
         module = load_module()
         conn = FakeConnection()
+        client = FakeOpenRouterClient({})
+        client.post = AsyncMock(side_effect=ValueError("unexpected scene invariant failure"))
 
         with patch.object(module, "OPENROUTER_API_KEY", "test-key"), \
              patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "test-model"), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "fetch_existing_summary", return_value=None), \
-             patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
-             patch.object(
-                 module,
-                 "request_episode_scene_extraction_openrouter_json_payload",
-                 AsyncMock(side_effect=ValueError("unexpected scene invariant failure")),
-             ):
+             patch.object(module, "fetch_active_summary_by_scope", return_value=None):
             with self.assertRaisesRegex(ValueError, "unexpected scene invariant failure"):
                 await module.build_episode_scene_extraction_summaries(
                     conn,
+                    episode_scope_map={"episode:1001": 1},
                     product_id=687,
                     product_title="테스트 작품",
                     episode_rows=[
@@ -2091,8 +3171,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                             "summary_text": "[1화] 테스트",
                         }
                     ],
-                    episode_texts_by_no={1: "데시가 문을 연다."},
-                    summary_client=object(),
+                    episode_texts_by_scope={"episode:1001": "데시가 문을 연다."},
+                    summary_client=client,
                     canonical_character_packet={
                         "characters": [
                             {"scope_key": "character:main", "display_name": "데시"}
@@ -2101,6 +3181,9 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                     cleanup_missing_scopes=False,
                     raise_unexpected_errors=True,
                 )
+        client.post.assert_awaited_once()
+        receipt = next(iter(module._character_asset_attempt_store.connection.rows.values()))
+        self.assertEqual(receipt["status"], "inflight")
 
     def test_inventory_v3_does_not_link_previous_first_person_by_episode_order(self):
         module = load_module()
@@ -2199,61 +3282,8 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 module.build_character_inventory_v3_hash_payload(row),
             )
 
-    def test_character_chat_internal_prompt_system_prefers_new_side_event(self):
+    async def test_rp_openrouter_request_uses_default_timeout(self):
         module = load_module()
-        prompt = module.CHARACTER_CHAT_INTERNAL_PROMPT_SYSTEM
-
-        self.assertIn("[원작 기반 새 사건 운용]", prompt)
-        self.assertIn("런타임의 하드 렌더링 가드가 이 내부 프롬프트보다 우선한다", prompt)
-        self.assertIn("원작 플롯은 앵커로만 쓰고", prompt)
-        self.assertIn("원작에서 파생된 새 사이드 사건/새 변수/새 단서", prompt)
-        self.assertIn("새 사건의 비중을 원작 요약보다 높게", prompt)
-        self.assertIn("원작은 대본이 아니라 제약 조건", prompt)
-        self.assertIn("장면 압력, 협력 요청, 자연스러운 1~2개 행동 방향", prompt)
-        self.assertIn("관계 반응을 최소 하나 포함", prompt)
-        self.assertIn("이미 장면에 엮인 비네임드 조력자/동행자/관계자", prompt)
-        self.assertIn("사용자의 정체를 심문하는 반복 전개", prompt)
-        self.assertIn("정체 심문을 사건 엔진으로 쓰지 마라", prompt)
-        self.assertIn("현재 사건의 목적, 위기, 행동 hook", prompt)
-        self.assertIn("원작 기존 네임드/짐승/환자/포로로 확정하지 마라", prompt)
-        self.assertIn("[사용자 agency]", prompt)
-        self.assertIn("사용자가 직전 입력에서 직접 밝힌 행동/말/상태만 이어받는다", prompt)
-        self.assertIn("사용자가 직전 입력에서 직접 묘사한 행동과 상태는 이어받을 수 있지만", prompt)
-        self.assertIn("캐릭터 자신의 접근/시선/접촉은 캐릭터 행동으로 쓸 수 있으나", prompt)
-        self.assertIn("협력 요청은 대사 안에서 선택 가능하게 남기고", prompt)
-        self.assertIn("구체적인 금지 표현 목록을 만들지 마라", prompt)
-        self.assertIn("사용자에 관한 서술마다 직전 입력의 근거가 있는지 확인", prompt)
-        self.assertNotIn("곁에 선 이", prompt)
-        self.assertNotIn("네가 가리킨", prompt)
-        self.assertNotIn("잡아채", prompt)
-        self.assertNotIn("첫 대사의 압박/질문/명령 hook", prompt)
-
-    async def test_character_chat_internal_prompt_uses_dedicated_timeout(self):
-        module = load_module()
-        client = FakeOpenRouterClient(
-            {"internal_prompt": "[핵심 정체성] 이시혁은 상황을 직접 판단하고 움직인다."}
-        )
-
-        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"):
-            payload = await module.request_character_chat_internal_prompt_payload(
-                client,
-                target={"character_key": "character:이시혁", "display_name": "이시혁", "aliases": ["이시혁"]},
-                profile_payload={"display_name": "이시혁", "speech_style": {}, "personality_core": []},
-                example_payload={"examples": []},
-                dialogue_items=[],
-                summary_context_lines=[],
-            )
-
-        self.assertIsNotNone(payload)
-        self.assertGreater(
-            module.CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS,
-            module.RP_OPENROUTER_TIMEOUT_SECONDS,
-        )
-        self.assertEqual(
-            client.calls[0]["timeout"],
-            module.CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS,
-        )
-
         default_client = FakeOpenRouterClient({"ok": True})
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"):
             await module.request_rp_openrouter_json_payload(
@@ -2288,8 +3318,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "fetch_existing_summary", return_value={"summary_id": 123, "version_no": 1, "is_active": "Y"}), \
+        with patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "test-model"), patch.object(module, "RP_REASONING_MODEL", ""):
+            cached = await EpisodeCharacterSignalsContractTests.accepted_cache_row(module, row)
+        with patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "test-model"), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_existing_summary", return_value=cached), \
              patch.object(module, "activate_existing_summary") as activate_existing, \
              patch.object(module, "request_episode_character_signals_payload", request_mock):
             inserted, reused = await module.build_episode_character_signals_summaries(
@@ -2324,18 +3358,15 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 module.build_rp_reasoning_signature(),
             ],
         )
-        request_mock = AsyncMock(
-            return_value={
-                "mentioned_characters": [
-                    signal_character(
-                        character_key="ignored",
-                        display_name="추종자",
-                        real_names=["추종자"],
-                        is_work_protagonist=True,
-                    )
-                ]
-            }
+        response_payload = EpisodeCharacterSignalsContractTests.response_payload()
+        response_payload["mentioned_characters"][0].update(
+            display_name="추종자",
+            aliases=["추종자"],
+            real_names=["추종자"],
+            is_work_protagonist=True,
+            evidence=[{"kind": "narrated_state", "source_part": "episode_source", "quote": "내 이름은 추종자다.", "counterpart_label": ""}],
         )
+        request_mock = AsyncMock(return_value=response_payload)
 
         def fetch_existing(*, source_hash, **kwargs):
             return {"summary_id": 123} if source_hash == old_source_hash else None
@@ -2349,7 +3380,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 conn,
                 product_id=687,
                 episode_rows=[row],
-                episode_texts_by_no={1: opening_text},
+                episode_texts_by_scope={row["scope_key"]: opening_text},
                 summary_client=object(),
                 cleanup_missing_scopes=False,
             )
@@ -2416,8 +3447,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "summary_text": "[4화] 현재 요약",
         }
 
-        with patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "fetch_existing_summary", return_value={"summary_id": 123}), \
+        with patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "test-model"), patch.object(module, "RP_REASONING_MODEL", ""):
+            cached = await EpisodeCharacterSignalsContractTests.accepted_cache_row(module, row)
+        with patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "test-model"), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "fetch_existing_summary", return_value=cached), \
              patch.object(module, "activate_existing_summary"):
             counts = await module.build_episode_character_signals_summaries(
                 conn,
@@ -2471,7 +3506,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         deactivate_scope.assert_not_called()
         self.assertEqual(conn.commit_count, 0)
 
-    async def test_episode_character_signals_429_honors_retry_after_before_retry(self):
+    async def test_episode_character_signals_429_blocks_same_input_without_retry(self):
         module = load_module()
         client = FakeRateLimitedOpenRouterClient(
             {
@@ -2487,15 +3522,16 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
              patch.object(module.asyncio, "sleep", AsyncMock()) as sleep_mock:
-            payload = await module.request_episode_character_signals_payload(
-                client,
-                row={"episode_no": 1, "title": "테스트", "episode_title": "1화"},
-                summary_text="[1화] 테스트\n주인공이 움직인다.",
-            )
+            for _ in range(2):
+                with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "inflight"):
+                    await module.request_episode_character_signals_payload(
+                        client,
+                        row={"episode_id": 1001, "episode_no": 1, "title": "테스트", "episode_title": "1화"},
+                        summary_text="[1화] 테스트\n주인공이 움직인다.",
+                    )
 
-        self.assertEqual(payload["episode_no"], 1)
-        self.assertEqual(len(client.calls), 2)
-        sleep_mock.assert_awaited_once_with(7.0)
+        self.assertEqual(len(client.calls), 1)
+        sleep_mock.assert_not_awaited()
 
     def test_openrouter_retry_delay_is_bounded_and_rate_limit_only(self):
         module = load_module()
@@ -2713,16 +3749,23 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                     {
                         "display_name": "백이현",
                         "aliases": ["백이현"],
+                        "narration_names": ["백이현"],
+                        "social_call_names": [],
+                        "persona_names": [],
+                        "real_names": ["백이현"],
                         "is_protagonist": True,
+                        "is_work_protagonist": True,
+                        "is_episode_focal": True,
                         "is_first_person": False,
                         "entity_kind": "person",
                         "scene_weight": "high",
                         "role_in_episode": "lead",
-                        "voice_mode": "dialogue",
+                        "voice_mode": "narration_only",
                         "action_tags": ["질문"],
                         "affect_tags": ["경계"],
                         "relation_edges": [],
                         "identity_claims": [],
+                        "evidence": [{"kind": "narrated_action", "source_part": "episode_summary", "quote": "백이현이 경계하며 질문한다.", "counterpart_label": ""}],
                     }
                 ],
                 "cliffhanger_hooks": ["다음 선택이 남는다."],
@@ -2736,7 +3779,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"):
             payload = await module.request_episode_character_signals_payload(
                 client,
-                row={"episode_no": 1, "title": "테스트", "episode_title": "1화"},
+                row={"episode_id": 1001, "episode_no": 1, "title": "테스트", "episode_title": "1화"},
                 summary_text="[1화] 테스트\n백이현이 경계하며 질문한다.\n핵심: 백이현, 경계, 질문, 선택, 사건, 단서",
             )
 
@@ -2745,17 +3788,26 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0]["url"], "https://openrouter.ai/api/v1/chat/completions")
         self.assertEqual(client.calls[0]["json"]["model"], "deepseek/deepseek-v4-pro")
         self.assertEqual(client.calls[0]["json"]["max_tokens"], module.EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS)
-        self.assertEqual(client.calls[0]["json"]["response_format"], {"type": "json_object"})
+        response_format = client.calls[0]["json"]["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertIs(response_format["json_schema"]["strict"], True)
+        self.assertEqual(response_format["json_schema"]["name"], module.EPISODE_CHARACTER_SIGNALS_TOOL_NAME)
+        self.assertEqual(response_format["json_schema"]["schema"], module.EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA["input_schema"])
+        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["mentioned_characters"]["minItems"], 0)
+        self.assertIs(client.calls[0]["json"]["provider"]["require_parameters"], True)
         call_messages = client.calls[0]["json"]["messages"]
         self.assertIn("JSON schema", call_messages[1]["content"])
         self.assertNotIn("라인 포맷", call_messages[1]["content"])
-        self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals OpenRouter")
+        self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals")
 
-    async def test_character_signals_records_anthropic_parse_failure_and_openrouter_fallback(self):
+    async def test_character_signals_records_anthropic_invalid_without_provider_fallback(self):
         module = load_module()
         request = httpx.Request("POST", "https://provider.test")
 
         class FallbackClient:
+            def __init__(self):
+                self.calls = []
+
             async def get(self, url, **kwargs):
                 return httpx.Response(
                     200,
@@ -2764,6 +3816,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 )
 
             async def post(self, url, **kwargs):
+                self.calls.append(url)
                 if "anthropic.com" in url:
                     return httpx.Response(
                         200,
@@ -2804,36 +3857,31 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                     },
                 )
 
+        client = FallbackClient()
         with patch.object(module.settings, "ANTHROPIC_API_KEY", "anthropic-key"), \
              patch.object(module, "RP_REASONING_MODEL", "claude-haiku-4-5-20251001"), \
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
              patch.object(module, "_storyctx_usage_connection", object()), \
              patch.object(module, "persist_ai_provider_usage_pymysql", return_value=True) as persist_usage:
-            payload = await module.request_episode_character_signals_payload(
-                FallbackClient(),
-                row={
-                    "product_id": 687,
-                    "episode_id": 1001,
-                    "episode_no": 1,
-                    "title": "테스트",
-                    "episode_title": "1화",
-                },
-                summary_text="[1화] 테스트\n주인공이 움직인다.",
-            )
+            for _ in range(2):
+                with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "terminal_invalid"):
+                    await module.request_episode_character_signals_payload(
+                        client,
+                        row={"product_id": 687, "episode_id": 1001, "episode_no": 1, "title": "테스트", "episode_title": "1화"},
+                        summary_text="[1화] 테스트\n주인공이 움직인다.",
+                    )
 
-        self.assertEqual(payload["episode_no"], 1)
+        self.assertEqual(client.calls, ["https://api.anthropic.com/v1/messages"])
         records = [call.args[1] for call in persist_usage.call_args_list]
-        self.assertEqual(len(records), 2)
-        self.assertEqual([record.provider for record in records], ["anthropic", "openrouter"])
+        self.assertEqual(len(records), 1)
+        self.assertEqual([record.provider for record in records], ["anthropic"])
         self.assertEqual(
             [record.attempt_status for record in records],
-            ["parse_error", "success"],
+            ["validation_error"],
         )
-        self.assertEqual([record.attempt_no for record in records], [1, 2])
+        self.assertEqual([record.attempt_no for record in records], [1])
         self.assertEqual(records[0].cost_source, "rate_card")
-        self.assertEqual(records[1].cost_source, "provider_reported")
-        self.assertEqual(str(records[1].cost_usd), "0.000420000")
 
     async def test_episode_character_signals_uses_configured_openrouter_model(self):
         module = load_module()
@@ -2844,16 +3892,23 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                     {
                         "display_name": "야율천",
                         "aliases": ["야율천"],
+                        "narration_names": ["야율천"],
+                        "social_call_names": [],
+                        "persona_names": [],
+                        "real_names": ["야율천"],
                         "is_protagonist": True,
+                        "is_work_protagonist": True,
+                        "is_episode_focal": True,
                         "is_first_person": False,
                         "entity_kind": "person",
                         "scene_weight": "high",
                         "role_in_episode": "lead",
-                        "voice_mode": "dialogue",
+                        "voice_mode": "narration_only",
                         "action_tags": ["판단"],
                         "affect_tags": ["침착"],
                         "relation_edges": [],
                         "identity_claims": [],
+                        "evidence": [{"kind": "narrated_action", "source_part": "episode_summary", "quote": "야율천이 침착하게 판단한다.", "counterpart_label": ""}],
                     }
                 ],
                 "cliffhanger_hooks": ["다음 진료 판단이 남는다."],
@@ -2869,7 +3924,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "DEEPSEEK_OPENROUTER_PROVIDER_ONLY", "together"):
             payload = await module.request_episode_character_signals_payload(
                 client,
-                row={"episode_no": 1, "title": "테스트", "episode_title": "1화"},
+                row={"episode_id": 1001, "episode_no": 1, "title": "테스트", "episode_title": "1화"},
                 summary_text="[1화] 테스트\n야율천이 침착하게 판단한다.\n핵심: 야율천, 판단, 진료, 선택, 사건, 단서",
             )
 
@@ -2886,7 +3941,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 "allow_fallbacks": False,
             },
         )
-        self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals OpenRouter")
+        self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent Episode Character Signals")
 
     async def test_episode_character_signals_openrouter_timeout_does_not_hang(self):
         module = load_module()
@@ -2897,14 +3952,15 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS", 0.01):
-            with self.assertRaises(module.EpisodeCharacterSignalsParseError):
-                await module.request_episode_character_signals_payload(
-                    client,
-                    row={"episode_no": 1, "title": "테스트", "episode_title": "1화"},
-                    summary_text="[1화] 테스트\n야율천이 침착하게 판단한다.",
-                )
+            for _ in range(2):
+                with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "inflight"):
+                    await module.request_episode_character_signals_payload(
+                        client,
+                        row={"episode_id": 1001, "episode_no": 1, "title": "테스트", "episode_title": "1화"},
+                        summary_text="[1화] 테스트\n야율천이 침착하게 판단한다.",
+                    )
 
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(client.calls), 1)
 
     async def test_episode_scene_extraction_openrouter_timeout_does_not_hang(self):
         module = load_module()
@@ -2915,19 +3971,17 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "DEEPSEEK_OPENROUTER_PROVIDER_ONLY", "together"), \
              patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS", 0.01):
-            payload = await module.request_episode_scene_extraction_payload(
-                client,
-                product_title="테스트 작품",
-                episode_no=1,
-                episode_title="1화",
-                normalized_text="야율천은 의방 문을 열고 약재 냄새를 확인했다.",
-                canonical_character_packet={
-                    "characters": [{"scope_key": "character:야율천", "display_name": "야율천"}]
-                },
-            )
+            for _ in range(2):
+                with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "inflight"):
+                    await module.request_episode_scene_extraction_payload(
+                        client, product_title="테스트 작품", episode_no=1, episode_title="1화", episode_scope_key="episode:1001",
+                        normalized_text="야율천은 의방 문을 열고 약재 냄새를 확인했다.",
+                        canonical_character_packet={
+                            "characters": [{"scope_key": "character:야율천", "display_name": "야율천"}]
+                        },
+                    )
 
-        self.assertEqual(payload, {})
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["json"]["model"], "google/gemma-4-31b-it")
         self.assertEqual(
             client.calls[0]["json"]["provider"],
@@ -2939,7 +3993,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_episode_scene_extraction_429_honors_retry_after_before_retry(self):
+    async def test_episode_scene_extraction_429_blocks_same_input_without_retry(self):
         module = load_module()
         normalized_text = '루벤은 검을 들었다. "문을 열어."'
         client = FakeRateLimitedOpenRouterClient(
@@ -2960,19 +4014,18 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
              patch.object(module.asyncio, "sleep", AsyncMock()) as sleep_mock:
-            await module.request_episode_scene_extraction_payload(
-                client,
-                product_title="테스트 작품",
-                episode_no=1,
-                episode_title="1화",
-                normalized_text=normalized_text,
-                canonical_character_packet={
-                    "characters": [{"scope_key": "character:루벤", "display_name": "루벤"}]
-                },
-            )
+            for _ in range(2):
+                with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "inflight"):
+                    await module.request_episode_scene_extraction_payload(
+                        client, product_title="테스트 작품", episode_no=1, episode_title="1화", episode_scope_key="episode:1001",
+                        normalized_text=normalized_text,
+                        canonical_character_packet={
+                            "characters": [{"scope_key": "character:루벤", "display_name": "루벤"}]
+                        },
+                    )
 
-        self.assertEqual(len(client.calls), 2)
-        sleep_mock.assert_awaited_once_with(5.0)
+        self.assertEqual(len(client.calls), 1)
+        sleep_mock.assert_not_awaited()
 
     def test_episode_scene_extraction_defaults_to_compact_deepseek_request(self):
         with patch.dict(
@@ -3130,7 +4183,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 "speech_style": {"tone": ["차분한"], "formality": "반말", "sentence_length": "보통", "habit": [], "address": ""},
                 "personality_core": ["경계심이 강함"],
                 "baseline_attitude": "경계",
-                "example_dialogues": ["그게 정말 가능하다고?"],
+                "example_dialogues": ["그게 정말 가능하다고?", "그 판단의 근거를 알려줘."],
             }
         )
 
@@ -3139,8 +4192,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"):
             payload = await module.request_rp_profile_payload(
                 client,
-                target={"display_name": "백이현", "aliases": ["백이현"]},
-                dialogue_items=[{"kind": "dialogue", "context": "질문", "text": "그게 정말 가능하다고?", "example_score": 8}],
+                target={"character_key": "character:백이현", "display_name": "백이현", "aliases": ["백이현"]},
+                dialogue_items=[
+                    {"kind": "dialogue", "context": "질문", "text": "그게 정말 가능하다고?", "example_score": 8},
+                    {"kind": "dialogue", "context": "확인", "text": "그 판단의 근거를 알려줘.", "example_score": 8},
+                ],
                 summary_context_lines=["[1화] 백이현이 상황을 의심한다."],
             )
 
@@ -3217,16 +4273,17 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             items = await module.request_rp_dialogue_items(
                 client,
                 target={
+                    "character_key": "character:백이현",
                     "display_name": "백이현",
                     "reference_name": "백이현",
                     "aliases": ["백이현"],
                 },
-                normalized_text='<episode no="1">백이현이 말했다. "나는 여기서 물러서지 않아."</episode>',
+                normalized_text='<episode no="1">\n백이현이 말했다. "나는 여기서 물러서지 않아."\n</episode>',
             )
 
         self.assertEqual(
             items,
-            [{"episode_no": 1, "kind": "dialogue", "context": "문 앞", "text": "나는 여기서 물러서지 않아.", "confidence": 0.95}],
+            [{"episode_no": 1, "kind": "dialogue", "context": "문 앞", "text": "나는 여기서 물러서지 않아.", "speaker_label": "백이현", "confidence": 0.95}],
         )
         self.assertEqual(
             client.calls[0]["json"]["provider"],
@@ -3412,7 +4469,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "baseline_attitude": "경계",
             "example_dialogues": [],
         }
-        internal_prompt_payload = {"internal_prompt": "[핵심 정체성] 전승택은 직접 판단하고 움직인다."}
         upserted_types = []
 
         def fake_upsert(cur, **kwargs):
@@ -3427,7 +4483,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                  for index in range(80)
              ]), \
              patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
-             patch.object(module, "request_character_chat_internal_prompt_payload", AsyncMock(return_value=internal_prompt_payload)), \
              patch.object(module, "fetch_active_summary_state_map", return_value={
                  legacy_scope_key: {
                      "scope_key": legacy_scope_key,
@@ -3466,10 +4521,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts, {"profile": (1, 0), "examples": (1, 0)})
         self.assertEqual(
             upserted_types,
-            ["character_rp_profile", "character_rp_examples", "character_chat_internal_prompt"],
+            ["character_rp_profile", "character_rp_examples"],
         )
 
-    async def test_rp_build_upserts_character_chat_internal_prompt_when_generated(self):
+    async def test_rp_build_persists_profile_and_examples_with_one_provider_call(self):
         module = load_module()
         conn = FakeConnection()
         episode_texts_by_no = {
@@ -3497,9 +4552,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         }
         profile_payload = {
             "speech_style": {
-                "tone": "단호",
+                "tone": ["단호"],
                 "formality": "반말",
                 "sentence_length": "보통",
+                "habit": [],
+                "address": "",
             },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
@@ -3509,24 +4566,17 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 "이 기록은 내가 맡을게, 누구에게도 넘기지 마.",
             ],
         }
-        scene_context_lines = ["[1화] 압력=경비병 접근 | hook=잠금 장치 확인"]
-        internal_prompt_mock = AsyncMock(
-            return_value={
-                "internal_prompt": "[핵심 정체성] 백이현은 물러서지 않는 주인공이다.\n[짧은 입력 처리] 사용자가 짧게 답해도 장면을 전진시킨다."
-            }
-        )
         upserted_types = []
 
         def fake_upsert(cur, **kwargs):
             upserted_types.append(kwargs["summary_type"])
             return {"summary_id": len(upserted_types)}, True
 
+        client = FakeOpenRouterClient(profile_payload)
+
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "request_rp_character_plan_payload", AsyncMock(return_value={"characters": []})), \
-             patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
-             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={"character:백이현": scene_context_lines}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", side_effect=fake_upsert), \
              patch.object(module, "deactivate_missing_active_scopes"):
@@ -3535,7 +4585,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 product_id=687,
                 episode_rows=[],
                 episode_texts_by_no=episode_texts_by_no,
-                summary_client=object(),
+                summary_client=client,
                 inventory_map={
                     "character:백이현": {
                         "canonical_character_key": "character:백이현",
@@ -3551,12 +4601,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(counts, {"profile": (1, 0), "examples": (1, 0)})
-        internal_prompt_mock.assert_awaited_once()
-        self.assertEqual(internal_prompt_mock.await_args.kwargs["scene_context_lines"], scene_context_lines)
         self.assertEqual(
             upserted_types,
-            ["character_rp_profile", "character_rp_examples", "character_chat_internal_prompt"],
+            ["character_rp_profile", "character_rp_examples"],
         )
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent RP Profile Batch")
 
     async def test_delta_rp_build_uses_v3_inventory_without_plan_call(self):
         module = load_module()
@@ -3586,9 +4636,11 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         }
         profile_payload = {
             "speech_style": {
-                "tone": "단호",
+                "tone": ["단호"],
                 "formality": "반말",
                 "sentence_length": "보통",
+                "habit": [],
+                "address": "",
             },
             "personality_core": ["원칙적"],
             "baseline_attitude": "경계",
@@ -3599,15 +4651,13 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             ],
         }
         plan_mock = AsyncMock(return_value={"characters": []})
-        profile_mock = AsyncMock(return_value=profile_payload)
         dialogue_fallback = AsyncMock()
-        scene_context_lines = ["[2화] 압력=문서 봉인 | hook=기록 확인"]
-        internal_prompt_mock = AsyncMock(return_value={"internal_prompt": "[현재 장면] 문서 봉인을 확인한다."})
+
+        client = FakeOpenRouterClient(profile_payload)
 
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "request_rp_character_plan_payload", plan_mock), \
-             patch.object(module, "request_rp_profile_payload", profile_mock), \
              patch.object(
                  module,
                  "build_direct_voice_evidence_quality",
@@ -3617,11 +4667,9 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                  },
              ), \
              patch.object(module, "collect_llm_rp_dialogue_items", dialogue_fallback), \
-             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
              patch.object(module, "fetch_active_summary_state_map", return_value={}), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={"character:백이현": scene_context_lines}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True), ({"summary_id": 3}, True)]), \
+             patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True)]) as upsert_mock, \
              patch.object(module, "deactivate_active_scope", return_value=1) as deactivate_scope:
             counts = await module.build_rp_summaries_delta(
                 conn,
@@ -3629,7 +4677,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 affected_scope_keys={"character:백이현", "protagonist:named:백이현"},
                 episode_rows=[],
                 episode_texts_by_no=episode_texts_by_no,
-                summary_client=object(),
+                summary_client=client,
                 inventory_map={
                     "character:백이현": {
                         "canonical_character_key": "character:백이현",
@@ -3649,12 +4697,12 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["examples"], [1, 0])
         plan_mock.assert_not_called()
         dialogue_fallback.assert_not_awaited()
-        profile_mock.assert_awaited_once()
-        internal_prompt_mock.assert_awaited_once()
-        self.assertEqual(internal_prompt_mock.await_args.kwargs["scene_context_lines"], scene_context_lines)
         self.assertEqual(counts["deactivated_profile_count"], 0)
         self.assertEqual(counts["deactivated_examples_count"], 0)
         deactivate_scope.assert_not_called()
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["headers"]["X-Title"], "LikeNovel Story Agent RP Profile Batch")
+        self.assertEqual([call.kwargs["summary_type"] for call in upsert_mock.call_args_list], ["character_rp_profile", "character_rp_examples"])
 
     async def test_delta_rp_build_accepts_two_grounded_examples_below_strict_distribution_gate(self):
         module = load_module()
@@ -3691,9 +4739,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
              patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=dialogue_items)), \
              patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=profile_payload)), \
-             patch.object(module, "request_character_chat_internal_prompt_payload", AsyncMock(return_value=None)), \
              patch.object(module, "fetch_active_summary_state_map", return_value={}), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True)]), \
              patch.object(module, "deactivate_active_scope", return_value=0):
@@ -3746,7 +4792,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
             "baseline_attitude": "보호",
             "example_dialogues": [item["text"] for item in dialogue_items],
         }
-        prompt_mock = AsyncMock(return_value={"internal_prompt": "사용되지 않아야 한다."})
         upsert_mock = MagicMock()
 
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
@@ -3755,9 +4800,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
              patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=dialogue_items)), \
              patch.object(module, "request_rp_profile_payload", AsyncMock(return_value=incomplete_profile)), \
-             patch.object(module, "request_character_chat_internal_prompt_payload", prompt_mock), \
              patch.object(module, "fetch_active_summary_state_map", return_value={}), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", upsert_mock), \
              patch.object(module, "deactivate_active_scope", return_value=0):
@@ -3782,7 +4825,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(counts["profile"], [0, 0])
         self.assertEqual(counts["examples"], [0, 0])
-        prompt_mock.assert_not_awaited()
         upsert_mock.assert_not_called()
 
     async def test_delta_rp_monologue_ready_main_extracts_grounded_dialogue_examples(self):
@@ -3846,13 +4888,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              ), \
              patch.object(module, "collect_llm_rp_dialogue_items", dialogue_fallback), \
              patch.object(module, "request_rp_profile_payload", profile_mock), \
-             patch.object(
-                 module,
-                 "request_character_chat_internal_prompt_payload",
-                 AsyncMock(return_value=None),
-             ), \
              patch.object(module, "fetch_active_summary_state_map", return_value={}), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", side_effect=fake_upsert), \
              patch.object(module, "deactivate_active_scope", return_value=0):
@@ -3989,15 +5025,9 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "request_rp_profile_payload", profile_mock), \
              patch.object(
                  module,
-                 "request_character_chat_internal_prompt_payload",
-                 AsyncMock(return_value=None),
-             ), \
-             patch.object(
-                 module,
                  "fetch_active_summary_state_map",
                  side_effect=fake_fetch_state_map,
              ), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(
                  module,
@@ -4057,7 +5087,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
              patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(side_effect=TypeError("dialogue parser bug"))), \
              patch.object(module, "fetch_active_summary_state_map", return_value={}), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor):
             with self.assertRaisesRegex(TypeError, "dialogue parser bug"):
                 await module.build_rp_summaries_delta(
@@ -4098,7 +5127,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "collect_rule_based_rp_dialogue_items_by_episode", return_value=[]), \
              patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(side_effect=provider_error)), \
              patch.object(module, "fetch_active_summary_state_map", return_value={}), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={}), \
              patch.object(module, "work_cursor", fake_work_cursor):
             counts = await module.build_rp_summaries_delta(
                 conn,
@@ -4167,9 +5195,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 }
             },
         }
-        internal_prompt_mock = AsyncMock(
-            return_value={"internal_prompt": "[핵심] 백이현은 기존 RP 자료를 바탕으로 먼저 움직인다."}
-        )
         profile_mock = AsyncMock(return_value={"speech_style": {"tone": "unused"}})
         upserted = []
 
@@ -4184,9 +5209,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_MODEL", ""), \
              patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
              patch.object(module, "request_rp_profile_payload", profile_mock), \
-             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
              patch.object(module, "collect_llm_rp_dialogue_items", AsyncMock(return_value=[])) as dialogue_mock, \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["[1화] 압력=문서 봉인 | hook=흔적 확인"]}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", side_effect=fake_upsert), \
              patch.object(module, "deactivate_active_scope", return_value=1) as deactivate_scope:
@@ -4216,7 +5239,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["keep_old_dialogue_missing_count"], 0)
         dialogue_mock.assert_not_awaited()
         profile_mock.assert_not_awaited()
-        internal_prompt_mock.assert_not_awaited()
         self.assertEqual([item["summary_type"] for item in upserted], [
             "character_rp_profile",
             "character_rp_examples",
@@ -4726,7 +5748,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                 ],
             }
         )
-        internal_prompt_mock = AsyncMock(return_value={"internal_prompt": "[핵심] 새 대사 근거로 다시 조립한다."})
 
         def fake_fetch_state_map(*, summary_type, **_kwargs):
             return state_maps.get(summary_type, {})
@@ -4735,8 +5756,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
              patch.object(module, "request_rp_profile_payload", profile_mock), \
-             patch.object(module, "request_character_chat_internal_prompt_payload", internal_prompt_mock), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["[1화] 압력=문서 봉인 | hook=흔적 확인"]}), \
              patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "upsert_summary", side_effect=[({"summary_id": 1}, True), ({"summary_id": 2}, True), ({"summary_id": 3}, True)]) as upsert_mock, \
              patch.object(module, "deactivate_active_scope", return_value=1):
@@ -4765,7 +5784,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["profile"], [0, 1])
         self.assertEqual(counts["examples"], [0, 1])
         profile_mock.assert_not_awaited()
-        internal_prompt_mock.assert_not_awaited()
         upsert_mock.assert_not_called()
 
     async def test_delta_rp_current_generation_does_not_accept_stale_exact_rows(self):
@@ -4824,346 +5842,6 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(counts["examples"], [0, 0])
         self.assertEqual(processed_scope_keys, set())
         upsert_mock.assert_not_called()
-
-    async def test_character_chat_opening_build_upserts_exact_v3_scope_only(self):
-        module = load_module()
-        conn = FakeConnection()
-        scope_key = "character:백이현"
-        profile_payload = {
-            "character_key": scope_key,
-            "display_name": "백이현",
-            "aliases": ["백이현"],
-            "speech_style": {
-                "tone": "단호",
-                "formality": "반말",
-                "sentence_length": "보통",
-            },
-        }
-        example_payload = {
-            "character_key": scope_key,
-            "examples": [{"episode_no": 1, "text": "나는 여기서 물러서지 않을 거야."}],
-        }
-        internal_prompt_payload = {"internal_prompt": "[핵심 정체성] 백이현은 물러서지 않는다."}
-        opening_payload = {
-            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
-            "chat_target": {"scope_key": scope_key, "display_name": "백이현"},
-            "opening_scene": {"situation": "백이현이 봉인된 문서 앞에서 멈춘다."},
-            "user_role": {"role_type": "임시 조력자"},
-            "character_drive": {"immediate_objective": "문서의 흔적을 확인한다."},
-            "agency_contract": {"character_moves_first": True},
-            "progression_engine": {"short_term_goal": "봉인 문서를 확인한다."},
-            "runtime_formula_seed": {
-                "formula_type": "FORMULA_CASE_TO_NETWORK",
-                "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
-                "user_task_type": "UT_INSPECT_CLUE",
-                "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
-                "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
-                "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
-                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
-            },
-        }
-        state_maps = {
-            "character_rp_profile": {
-                scope_key: {
-                    "scope_key": scope_key,
-                    "source_hash": "profile-hash",
-                    "payload": profile_payload,
-                }
-            },
-            "character_rp_examples": {
-                scope_key: {
-                    "scope_key": scope_key,
-                    "source_hash": "examples-hash",
-                    "payload": example_payload,
-                }
-            },
-            "character_chat_internal_prompt": {
-                scope_key: {
-                    "scope_key": scope_key,
-                    "source_hash": "internal-hash",
-                    "payload": internal_prompt_payload,
-                }
-            },
-        }
-        request_mock = AsyncMock(return_value=opening_payload)
-        upserted = []
-
-        def fake_fetch_state_map(*, summary_type, **_kwargs):
-            return state_maps.get(summary_type, {})
-
-        def fake_upsert(_cur, **kwargs):
-            upserted.append(kwargs)
-            return 77, True
-
-        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
-             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
-             patch.object(module, "fetch_existing_summary", return_value=None), \
-             patch.object(module, "request_character_chat_opening_payload", request_mock), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["- 1화 장면1: 압력=문서 봉인 | hook=흔적 확인"]}), \
-             patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "upsert_summary", side_effect=fake_upsert), \
-             patch.object(module, "deactivate_missing_active_scopes") as deactivate_missing:
-            counts = await module.build_character_chat_opening_summaries(
-                conn=conn,
-                product_id=687,
-                episode_rows=[],
-                summary_client=object(),
-                inventory_map={
-                    scope_key: {
-                        "canonical_character_key": scope_key,
-                        "source_character_keys": ["protagonist:named:백이현"],
-                        "display_name": "백이현",
-                        "aliases": ["백이현"],
-                        "is_protagonist": True,
-                        "distinct_episode_count": 3,
-                        "voice_evidence_count": 6,
-                        "public_chat_eligible": True,
-                    }
-                },
-                relation_map={},
-            )
-
-        self.assertEqual(counts, (1, 0))
-        request_mock.assert_awaited_once()
-        self.assertEqual(request_mock.await_args.kwargs["scene_context_lines"], ["- 1화 장면1: 압력=문서 봉인 | hook=흔적 확인"])
-        self.assertEqual(len(upserted), 1)
-        self.assertEqual(upserted[0]["summary_type"], "character_chat_opening_v1")
-        self.assertEqual(upserted[0]["scope_key"], scope_key)
-        saved_payload = json.loads(upserted[0]["summary_text"])
-        self.assertEqual(saved_payload["chat_target"]["scope_key"], scope_key)
-        deactivate_missing.assert_called_once()
-
-    async def test_character_chat_opening_build_uses_legacy_alias_summary_rows(self):
-        module = load_module()
-        conn = FakeConnection()
-        scope_key = "character:백이현"
-        legacy_scope_key = "named:백이현"
-        profile_payload = {
-            "character_key": legacy_scope_key,
-            "display_name": "백이현",
-            "aliases": ["백이현"],
-            "speech_style": {
-                "tone": "단호",
-                "formality": "반말",
-                "sentence_length": "보통",
-            },
-        }
-        example_payload = {
-            "character_key": legacy_scope_key,
-            "examples": [{"episode_no": 1, "text": "나는 여기서 물러서지 않을 거야."}],
-        }
-        internal_prompt_payload = {"character_key": legacy_scope_key, "internal_prompt": "[핵심] 백이현은 물러서지 않는다."}
-        opening_payload = {
-            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
-            "chat_target": {"scope_key": scope_key, "display_name": "백이현"},
-            "opening_scene": {"situation": "백이현이 봉인된 문서 앞에서 멈춘다."},
-            "user_role": {"role_type": "임시 조력자"},
-            "character_drive": {"immediate_objective": "문서의 흔적을 확인한다."},
-            "agency_contract": {"character_moves_first": True},
-            "progression_engine": {"short_term_goal": "봉인 문서를 확인한다."},
-            "runtime_formula_seed": {
-                "formula_type": "FORMULA_CASE_TO_NETWORK",
-                "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
-                "user_task_type": "UT_INSPECT_CLUE",
-                "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
-                "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
-                "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
-                "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
-            },
-        }
-        state_maps = {
-            "character_rp_profile": {
-                legacy_scope_key: {
-                    "scope_key": legacy_scope_key,
-                    "source_hash": "legacy-profile-hash",
-                    "payload": profile_payload,
-                }
-            },
-            "character_rp_examples": {
-                legacy_scope_key: {
-                    "scope_key": legacy_scope_key,
-                    "source_hash": "legacy-examples-hash",
-                    "payload": example_payload,
-                }
-            },
-            "character_chat_internal_prompt": {
-                legacy_scope_key: {
-                    "scope_key": legacy_scope_key,
-                    "source_hash": "legacy-internal-hash",
-                    "payload": internal_prompt_payload,
-                }
-            },
-        }
-        request_mock = AsyncMock(return_value=opening_payload)
-        upserted = []
-
-        def fake_fetch_state_map(*, summary_type, **_kwargs):
-            return state_maps.get(summary_type, {})
-
-        def fake_upsert(_cur, **kwargs):
-            upserted.append(kwargs)
-            return 88, True
-
-        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
-             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
-             patch.object(module, "fetch_existing_summary", return_value=None), \
-             patch.object(module, "request_character_chat_opening_payload", request_mock), \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["- 1화 장면1: 압력=문서 봉인 | hook=흔적 확인"]}), \
-             patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "upsert_summary", side_effect=fake_upsert), \
-             patch.object(module, "deactivate_missing_active_scopes"):
-            counts = await module.build_character_chat_opening_summaries(
-                conn=conn,
-                product_id=687,
-                episode_rows=[],
-                summary_client=object(),
-                inventory_map={
-                    scope_key: {
-                        "canonical_character_key": scope_key,
-                        "source_character_keys": [legacy_scope_key],
-                        "display_name": "백이현",
-                        "aliases": ["백이현"],
-                        "is_protagonist": True,
-                        "distinct_episode_count": 3,
-                        "voice_evidence_count": 6,
-                        "public_chat_eligible": True,
-                    }
-                },
-                relation_map={},
-            )
-
-        self.assertEqual(counts, (1, 0))
-        request_mock.assert_awaited_once()
-        self.assertEqual(request_mock.await_args.kwargs["profile_payload"]["character_key"], scope_key)
-        self.assertEqual(request_mock.await_args.kwargs["example_payload"]["character_key"], scope_key)
-        self.assertEqual(request_mock.await_args.kwargs["internal_prompt_payload"]["character_key"], scope_key)
-        self.assertEqual(request_mock.await_args.kwargs["scene_context_lines"], ["- 1화 장면1: 압력=문서 봉인 | hook=흔적 확인"])
-        self.assertEqual(len(upserted), 1)
-        self.assertEqual(upserted[0]["summary_type"], "character_chat_opening_v1")
-        self.assertEqual(upserted[0]["scope_key"], scope_key)
-
-    def test_opening_payload_normalization_rejects_scope_mismatch(self):
-        module = load_module()
-
-        normalized = module.normalize_character_chat_opening_payload(
-            {
-                "readiness": {"status": "ready"},
-                "chat_target": {"scope_key": "character:다른인물", "display_name": "다른 인물"},
-                "opening_scene": {"situation": "문 앞에서 멈춘다."},
-                "user_role": {"role_type": "임시 조력자"},
-                "character_drive": {"immediate_objective": "흔적을 확인한다."},
-                "agency_contract": {"character_moves_first": True},
-                "progression_engine": {"short_term_goal": "문을 확인한다."},
-            },
-            scope_key="character:백이현",
-            display_name="백이현",
-        )
-
-        self.assertIsNone(normalized)
-
-    async def test_character_chat_opening_regenerates_legacy_summary_without_runtime_formula_seed(self):
-        module = load_module()
-        conn = FakeConnection()
-        scope_key = "character:백이현"
-        profile_payload = {"character_key": scope_key, "display_name": "백이현"}
-        example_payload = {"character_key": scope_key, "examples": [{"episode_no": 1, "text": "물러서지 않아."}]}
-        internal_prompt_payload = {"internal_prompt": "[핵심] 백이현은 먼저 판단한다."}
-        state_maps = {
-            "character_rp_profile": {
-                scope_key: {
-                    "scope_key": scope_key,
-                    "source_hash": "profile-hash",
-                    "payload": profile_payload,
-                }
-            },
-            "character_rp_examples": {
-                scope_key: {
-                    "scope_key": scope_key,
-                    "source_hash": "examples-hash",
-                    "payload": example_payload,
-                }
-            },
-            "character_chat_internal_prompt": {
-                scope_key: {
-                    "scope_key": scope_key,
-                    "source_hash": "internal-hash",
-                    "payload": internal_prompt_payload,
-                }
-            },
-        }
-        existing_opening_payload = {
-            "readiness": {"status": "ready", "confidence": 0.9, "block_reasons": []},
-            "chat_target": {"scope_key": scope_key, "display_name": "백이현"},
-            "opening_scene": {"situation": "백이현이 문서 앞에서 멈춘다."},
-            "opening_message": {
-                "narration": "봉인된 문서가 놓인 탁자 위로 낮은 등잔불이 흔들리고, 백이현은 손끝에 묻은 먹물을 닦지 않은 채 서류의 끊어진 끈을 내려다본다. 창밖에서는 발소리가 한 번 가까워졌다가 멎고, 젖은 종이 냄새와 식은 쇠 냄새가 좁은 방 안에 가라앉는다. 백이현은 먼저 문서 가장자리의 찢어진 방향을 확인하고, 봉인이 깨진 시점을 가늠하듯 숨을 낮춘다. 지금 봉인을 다시 묶으면 안쪽 기록이 사라질 수 있고, 문밖의 기척을 놓치면 누가 이 일을 벌였는지 알 수 없게 된다. 등잔불은 더 짧게 떨리고, 그의 손은 아직 문서에 닿지 않은 채 멈춰 있다.",
-                "dialogue": "\"문서의 끈이 끊어진 방향과 문밖 발소리 중 하나를 먼저 확인해야 해. 어느 쪽이 더 급하다고 보지?\"",
-                "opening_text": "봉인된 문서가 놓인 탁자 위로 낮은 등잔불이 흔들리고, 백이현은 손끝에 묻은 먹물을 닦지 않은 채 서류의 끊어진 끈을 내려다본다. 창밖에서는 발소리가 한 번 가까워졌다가 멎고, 젖은 종이 냄새와 식은 쇠 냄새가 좁은 방 안에 가라앉는다. 백이현은 먼저 문서 가장자리의 찢어진 방향을 확인하고, 봉인이 깨진 시점을 가늠하듯 숨을 낮춘다. 지금 봉인을 다시 묶으면 안쪽 기록이 사라질 수 있고, 문밖의 기척을 놓치면 누가 이 일을 벌였는지 알 수 없게 된다. 등잔불은 더 짧게 떨리고, 그의 손은 아직 문서에 닿지 않은 채 멈춰 있다.\n\n\"문서의 끈이 끊어진 방향과 문밖 발소리 중 하나를 먼저 확인해야 해. 어느 쪽이 더 급하다고 보지?\"",
-                "user_objective": "문서의 끈 방향을 볼지 문밖 발소리를 확인할지 선택한다.",
-            },
-            "user_role": {"role_type": "임시 조력자"},
-            "character_drive": {"immediate_objective": "봉인된 문서가 훼손된 이유를 확인한다."},
-            "agency_contract": {"character_moves_first": True},
-            "progression_engine": {"short_term_goal": "문서 훼손 단서를 확인한다."},
-        }
-        regenerated_opening_payload = dict(existing_opening_payload)
-        regenerated_opening_payload["runtime_formula_seed"] = {
-            "formula_type": "FORMULA_CASE_TO_NETWORK",
-            "p_to_user_request": "문서 끈 방향과 문밖 발소리 중 하나를 먼저 확인하게 한다.",
-            "user_task_type": "UT_INSPECT_CLUE",
-            "user_task_success_condition": "유저가 끈 방향 또는 발소리 중 하나를 선택한다.",
-            "protagonist_state_delta": "백이현이 선택된 단서에 따라 문서 또는 문밖을 먼저 확인한다.",
-            "open_loop": "봉인 훼손자가 가까이에 있다는 압박이 남는다.",
-            "mutation_policy": "MP_SAME_ASSET_NEW_CLUE",
-        }
-        upserted = []
-
-        def fake_fetch_state_map(*, summary_type, **_kwargs):
-            return state_maps.get(summary_type, {})
-
-        def fake_upsert(_cur, **kwargs):
-            upserted.append(kwargs)
-            return 92, True
-
-        with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
-             patch.object(module, "fetch_active_summary_state_map", side_effect=fake_fetch_state_map), \
-             patch.object(
-                 module,
-                 "fetch_existing_summary",
-                 return_value={"summary_id": 91, "summary_text": json.dumps(existing_opening_payload, ensure_ascii=False)},
-             ), \
-             patch.object(module, "activate_existing_summary") as activate_existing, \
-             patch.object(module, "request_character_chat_opening_payload", AsyncMock(return_value=regenerated_opening_payload)) as request_mock, \
-             patch.object(module, "load_character_chat_scene_context_lines_by_scope", return_value={scope_key: ["- 1화 장면1: 압력=문서 봉인"]}), \
-             patch.object(module, "work_cursor", fake_work_cursor), \
-             patch.object(module, "upsert_summary", side_effect=fake_upsert) as upsert_mock, \
-             patch.object(module, "deactivate_missing_active_scopes"):
-            counts = await module.build_character_chat_opening_summaries(
-                conn=conn,
-                product_id=687,
-                episode_rows=[],
-                summary_client=object(),
-                inventory_map={
-                    scope_key: {
-                        "canonical_character_key": scope_key,
-                        "display_name": "백이현",
-                        "aliases": ["백이현"],
-                        "is_protagonist": True,
-                        "distinct_episode_count": 3,
-                        "voice_evidence_count": 6,
-                    }
-                },
-                relation_map={},
-            )
-
-        self.assertEqual(counts, (1, 0))
-        request_mock.assert_awaited_once()
-        upsert_mock.assert_called_once()
-        activate_existing.assert_not_called()
-        self.assertEqual(json.loads(upserted[0]["summary_text"])["runtime_formula_seed"]["user_task_type"], "UT_INSPECT_CLUE")
 
     async def test_rp_build_preserves_keep_old_scope_when_another_v3_target_succeeds(self):
         module = load_module()
@@ -5434,6 +6112,87 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
 
 class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
+    async def test_full_cli_reports_failed_deferred_success_and_dry_run(self):
+        for scenario, expected_code in (("failed", 1), ("failed_budget", 1), ("budget", 75), ("success", 0), ("dry", 0)):
+            with self.subTest(scenario=scenario):
+                module = load_module()
+                row = {
+                    "product_id": 687, "episode_id": 1001, "episode_no": 1,
+                    "title": "테스트 작품", "episode_title": "시작",
+                    "episode_content": "<p>민서는 창문을 닫았다.</p>",
+                }
+                rows = [row]
+                if scenario == "failed_budget":
+                    rows.append({**row, "product_id": 688, "episode_id": 1002})
+                connections = []
+                failure_writes = []
+                client = FakeOpenRouterClient({})
+                client.aclose = AsyncMock()
+                # Preflight is solvent; after the first product fails, the next
+                # product's real credit guard sees insufficient remaining credit.
+                client.get = AsyncMock(side_effect=[
+                    FakeResponse({"data": {"total_credits": 100, "total_usage": 100 if scenario == "budget" else 0}}),
+                    FakeResponse({"data": {"total_credits": 100, "total_usage": 100}}),
+                ])
+
+                def connect(**kwargs):
+                    conn = MagicMock()
+                    cur = conn.cursor.return_value.__enter__.return_value
+                    cur.lastrowid = 1
+                    cur.fetchall.return_value = rows if not connections else []
+
+                    def execute(sql, params=()):
+                        cur.fetchone.return_value = None
+                        if "GET_LOCK(" in sql:
+                            cur.fetchone.return_value = {"locked": 1}
+                        elif "AS total_episode_count" in sql:
+                            cur.fetchone.return_value = {"total_episode_count": 1}
+                        elif "AS ready_episode_count" in sql and scenario == "success":
+                            cur.fetchone.return_value = {"ready_episode_count": 1}
+                        elif "INSERT INTO tb_story_agent_context_doc" in sql and scenario.startswith("failed") and params[0] == 687:
+                            raise module.pymysql.err.OperationalError(1205, "document write timed out")
+                        elif "INSERT INTO tb_story_agent_context_product" in sql and "'failed'" in sql:
+                            failure_writes.append(params)
+                        return 0
+
+                    cur.execute.side_effect = execute
+                    connections.append(conn)
+                    return conn
+
+                argv = [str(MODULE_PATH), "--build-mode", "full", "--product-id", "687"]
+                if scenario != "dry":
+                    argv.append("--apply")
+                if scenario == "failed_budget":
+                    argv.extend(["--product-id", "688"])
+                with patch.object(module.pymysql, "connect", side_effect=connect), \
+                     patch.object(module, "OPENROUTER_API_KEY", "test" if "budget" in scenario else ""), \
+                     patch.object(module, "EPISODE_SUMMARY_MODEL", "test-model"), \
+                     patch.object(module, "AsyncClient", return_value=client), \
+                     patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
+                     patch.object(sys, "argv", argv), \
+                     redirect_stdout(io.StringIO()) as output:
+                    exit_code = await module.main()
+
+                self.assertEqual(exit_code, expected_code)
+                if scenario.startswith("failed"):
+                    self.assertIn("product product_id=687 status=failed", output.getvalue())
+                    self.assertEqual(len(failure_writes), 1)
+                    self.assertEqual(failure_writes[0][0], 687)
+                    self.assertIn("document write timed out", failure_writes[0][3])
+                else:
+                    self.assertEqual(failure_writes, [])
+                if "budget" in scenario:
+                    deferred_product = 688 if scenario == "failed_budget" else 687
+                    self.assertIn(f"product product_id={deferred_product} status=deferred_budget", output.getvalue())
+                    self.assertEqual(client.get.await_count, 2 if scenario == "failed_budget" else 1)
+                if scenario == "dry":
+                    self.assertIn("product product_id=687 status=dry-run", output.getvalue())
+                if scenario == "success":
+                    self.assertIn("product product_id=687 status=ready ready=1 total=1", output.getvalue())
+                self.assertEqual(client.calls, [])
+                self.assertTrue(all(conn.close.called for conn in connections))
+                self.assertIsNone(module._character_asset_attempt_store)
+
     def test_mark_failure_preserves_last_ready_context_status(self):
         module = load_module()
         cursor = MagicMock()
@@ -5840,44 +6599,6 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(filtered, {"character:main": inventory_map["character:main"]})
 
-    def test_character_scene_context_loader_uses_first_thirty_public_episodes(self):
-        module = load_module()
-
-        class PingConnection:
-            def ping(self, reconnect=False):
-                return None
-
-        capped_scene_rows = [
-            {
-                "scope_key": "episode:130",
-                "episode_from": 30,
-                "summary_text": '{"episode_no":30,"scenes":[]}',
-            }
-        ]
-        with patch.object(
-            module,
-            "fetch_active_character_asset_summary_rows",
-            return_value=capped_scene_rows,
-        ) as capped_fetch, patch.object(
-            module,
-            "fetch_active_summary_rows",
-        ) as uncapped_fetch, patch.object(
-            module,
-            "work_cursor",
-            fake_work_cursor,
-        ):
-            module.load_character_chat_scene_context_lines_by_scope(
-                PingConnection(),
-                product_id=687,
-            )
-
-        capped_fetch.assert_called_once_with(
-            cur=ANY,
-            product_id=687,
-            summary_type="episode_scene_extraction",
-        )
-        uncapped_fetch.assert_not_called()
-
     def test_scene_repair_selection_prioritizes_main_and_caps_rows(self):
         module = load_module()
         rows, required = module.select_character_chat_scene_repair_rows(
@@ -5897,12 +6618,13 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 {"episode_from": 3, "scope_key": "episode:103"},
             ],
             scene_scope_keys={"character:main", "character:support"},
-            usable_scene_episode_nos_by_scope={},
+            usable_scene_episode_scope_keys_by_scope={},
+            episode_scope_map={"episode:101": 1, "episode:102": 2, "episode:103": 3},
             limit=1,
         )
 
         self.assertEqual([row["episode_from"] for row in rows], [3])
-        self.assertEqual(required, {3: {"character:main"}})
+        self.assertEqual(required, {"episode:103": {"character:main"}})
 
     def test_scene_repair_selection_fills_only_the_five_episode_deficit(self):
         module = load_module()
@@ -5918,7 +6640,8 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 for episode_no in range(1, 7)
             ],
             scene_scope_keys={"character:main"},
-            usable_scene_episode_nos_by_scope={"character:main": [1]},
+            usable_scene_episode_scope_keys_by_scope={"character:main": ["episode:1"]},
+            episode_scope_map={f"episode:{no}": no for no in range(1, 7)},
             limit=5,
         )
 
@@ -5929,10 +6652,10 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(
             required,
             {
-                3: {"character:main"},
-                4: {"character:main"},
-                5: {"character:main"},
-                6: {"character:main"},
+                "episode:3": {"character:main"},
+                "episode:4": {"character:main"},
+                "episode:5": {"character:main"},
+                "episode:6": {"character:main"},
             },
         )
 
@@ -5950,10 +6673,10 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 for episode_no in [2, 5, 6, 7, 8, 30, 40]
             ],
             scene_scope_keys={"character:main"},
-            usable_scene_episode_nos_by_scope={
-                "character:main": [2, 5, 30, 40]
+            usable_scene_episode_scope_keys_by_scope={
+                "character:main": ["episode:2", "episode:5", "episode:30", "episode:40"]
             },
-            eligible_scene_episode_nos={2, 5, 6, 7, 8},
+            episode_scope_map={f"episode:{no}": no for no in (2, 5, 6, 7, 8)},
             limit=5,
         )
 
@@ -5964,23 +6687,23 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(
             required,
             {
-                6: {"character:main"},
-                7: {"character:main"},
-                8: {"character:main"},
+                "episode:6": {"character:main"},
+                "episode:7": {"character:main"},
+                "episode:8": {"character:main"},
             },
         )
 
-    def test_fetch_catalog_scene_episode_nos_uses_public_free_gate(self):
+    def test_fetch_catalog_scene_episode_scopes_uses_public_free_gate(self):
         module = load_module()
-        cursor = FakeRowsCursor([{"episode_no": 3}, {"episode_no": 4}])
+        cursor = FakeRowsCursor([{"episode_id": 103, "episode_no": 3}, {"episode_id": 104, "episode_no": 4}])
 
-        result = module.fetch_character_chat_catalog_scene_episode_nos(
+        result = module.fetch_character_chat_catalog_scene_episode_scope_map(
             cursor,
             product_id=1225,
         )
 
-        self.assertEqual(result, {3, 4})
-        self.assertEqual(cursor.params, (1225,))
+        self.assertEqual(result, {"episode:103": 3, "episode:104": 4})
+        self.assertEqual(cursor.params, (1225, 30))
         query = " ".join(cursor.query.split())
         self.assertIn("use_yn = 'Y'", query)
         self.assertIn("open_yn = 'Y'", query)
@@ -5995,9 +6718,9 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 "character:main": {},
                 "character:ready": {},
             },
-            usable_scene_episode_nos_by_scope={
-                "character:main": [1, 2],
-                "character:ready": [1, 2, 3, 4, 5],
+            usable_scene_episode_scope_keys_by_scope={
+                "character:main": ["episode:1", "episode:2"],
+                "character:ready": [f"episode:{value}" for value in range(1, 6)],
             },
         )
 
@@ -6006,7 +6729,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             module.select_requested_scene_repair_scope_keys(
                 requested_scope_keys=["character:missing"],
                 inventory_map={"character:main": {}},
-                usable_scene_episode_nos_by_scope={},
+                usable_scene_episode_scope_keys_by_scope={},
             )
 
     def test_exact_scope_repair_allows_existing_legacy_character(self):
@@ -6114,7 +6837,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "OPENROUTER_API_KEY", ""), \
              patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
              patch.object(module, "db_connect", return_value=conn), \
-             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "work_cursor", lambda conn: module.nullcontext(FakeRowsCursor([{"episode_id": 101, "episode_no": 1}]))), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
              patch.object(module, "fetch_total_episode_count", return_value=1), \
              patch.object(module, "fetch_product_context_status", return_value="ready"), \
@@ -6143,7 +6866,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                      episode_rows,
                  ],
              ), \
-             patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
+             patch.object(module, "fetch_active_character_asset_episode_texts_by_scope", return_value={"episode:101": "데시가 문을 연다."}), \
              patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
              patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
              patch.object(module, "build_episode_scene_extraction_summaries", scene_builder), \
@@ -6310,7 +7033,8 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                     "fetch_active_character_asset_summary_rows",
                     {"side_effect": [signal_rows, episode_rows]},
                 ),
-                ("fetch_active_episode_texts_by_no", {"return_value": {1: "새 주인공이 문을 연다."}}),
+                ("fetch_character_chat_catalog_scene_episode_scope_map", {"return_value": {"episode:101": 1}}),
+                ("fetch_active_character_asset_episode_texts_by_scope", {"return_value": {"episode:101": "새 주인공이 문을 연다."}}),
                 ("fetch_rp_ready_character_inventory_history_state_map", {"return_value": {}}),
                 (
                     "build_character_inventory_summaries_delta",
@@ -6492,7 +7216,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                      ],
                  ],
              ), \
-             patch.object(module, "fetch_active_episode_texts_by_no") as episode_texts, \
+             patch.object(module, "fetch_active_character_asset_episode_texts_by_scope") as episode_texts, \
              patch.object(module, "build_episode_scene_extraction_summaries", scene_builder), \
              patch.object(module, "build_rp_summaries_delta", rp_builder), \
              patch.object(module, "touch_product_context_build_attempt") as touch:
@@ -6631,7 +7355,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         with patch.object(module, "OPENROUTER_API_KEY", ""), \
              patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
              patch.object(module, "db_connect", return_value=conn), \
-             patch.object(module, "work_cursor", fake_work_cursor), \
+             patch.object(module, "work_cursor", lambda conn: module.nullcontext(FakeRowsCursor([{"episode_id": 101, "episode_no": 1}]))), \
              patch.object(module, "product_lock_connection", return_value=module.nullcontext(object())), \
              patch.object(module, "fetch_total_episode_count", return_value=30), \
              patch.object(module, "fetch_product_context_status", return_value="ready"), \
@@ -6656,7 +7380,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                      [{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}],
                  ],
              ), \
-             patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
+             patch.object(module, "fetch_active_character_asset_episode_texts_by_scope", return_value={"episode:101": "데시가 문을 연다."}), \
              patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
              patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
              patch.object(module, "build_episode_scene_extraction_summaries", AsyncMock(side_effect=reserve_error)), \
@@ -6722,7 +7446,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                      [{"summary_id": 1, "scope_key": "episode:101", "episode_from": 1, "source_hash": "summary-hash", "summary_text": "[1화] 테스트"}],
                  ],
              ), \
-             patch.object(module, "fetch_active_episode_texts_by_no", return_value={1: "데시가 문을 연다."}), \
+             patch.object(module, "fetch_active_character_asset_episode_texts_by_scope", return_value={"episode:101": "데시가 문을 연다."}), \
              patch.object(module, "fetch_active_relation_inventory_map", return_value={}), \
              patch.object(module, "fetch_rp_ready_character_inventory_history_state_map", return_value={}), \
              patch.object(module, "build_episode_scene_extraction_summaries", AsyncMock(side_effect=RuntimeError("scene storage failed"))), \
@@ -7178,7 +7902,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(resolution["decision"], "UNRESOLVED")
         self.assertEqual(resolution["work_protagonist_keys"], [])
 
-    async def test_possessed_opening_name_transition_keeps_one_work_role_without_identity_merge(self):
+    async def test_possessed_opening_name_transition_requires_identity_review(self):
         module = load_module()
         rows = [
             signal_row(
@@ -7296,6 +8020,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(len(client.calls), 1)
         request_payload = client.calls[0]["json"]
         self.assertEqual(request_payload["reasoning"]["effort"], "low")
+        self.assertEqual(request_payload["max_tokens"], 1200)
         self.assertTrue(request_payload["provider"]["require_parameters"])
         response_format = request_payload["response_format"]
         self.assertEqual(response_format["type"], "json_schema")
@@ -7324,23 +8049,24 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             [item["episode_no"] for item in request_input["episode_summary_evidence"]],
             [1, 2, 3],
         )
-        self.assertEqual(resolution["decision"], "RESOLVED")
-        self.assertEqual(resolution["work_protagonist_key"], "character:백선우")
-        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+        self.assertEqual(resolution["decision"], "UNRESOLVED")
+        self.assertEqual(resolution["reason_code"], "requires_identity_merge")
+        self.assertFalse(any(row["work_role"] == "main_protagonist" for row in inventory))
+        current = next(row for row in inventory if row["canonical_character_key"] == "character:백선우")
         internal_identity = next(
             row
             for row in inventory
             if row["canonical_character_key"] == "character:차태석"
         )
-        self.assertEqual(main["canonical_character_key"], "character:백선우")
-        self.assertEqual(main["display_name"], "백선우")
-        self.assertEqual(main["evidence_episode_nos"], [1, 2, 3])
-        self.assertEqual(main["work_protagonist_evidence"]["episode_count"], 3)
-        self.assertIn("protagonist:named:백선우", main["source_character_keys"])
-        self.assertNotIn("protagonist:named:차태석", main["source_character_keys"])
+        # The current identity is itself mentioned in episode 1 as the body owner.
+        self.assertEqual(current["evidence_episode_nos"], [1, 2, 3])
+        self.assertEqual(current["work_protagonist_evidence"]["episode_count"], 2)
+        self.assertTrue(set(current["source_observation_refs"]).isdisjoint(internal_identity["source_observation_refs"]))
+        self.assertIn("protagonist:named:백선우", current["source_character_keys"])
+        self.assertNotIn("protagonist:named:차태석", current["source_character_keys"])
         self.assertNotEqual(internal_identity["work_role"], "main_protagonist")
         self.assertNotEqual(
-            main["canonical_character_key"],
+            current["canonical_character_key"],
             internal_identity["canonical_character_key"],
         )
 
@@ -7421,7 +8147,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertEqual(side["evidence_episode_nos"], [3])
         self.assertEqual(side["dominant_action_tags"], ["조력"])
 
-    async def test_opening_transition_does_not_fold_member_with_later_evidence(self):
+    async def test_opening_pov_transition_does_not_fold_member_with_later_evidence(self):
         module = load_module()
         rows = [
             signal_row(
@@ -7452,8 +8178,8 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             "work_protagonist_keys": ["character:현재정체"],
             "role_evidence_keys": ["character:이전정체", "character:현재정체"],
             "confidence": "high",
-            "reason_code": "persona_rename_same_person",
-            "rationale": "opening의 이전정체와 현재정체는 같은 주인공 역할이다.",
+            "reason_code": "pov_shift_same_protagonist",
+            "rationale": "opening의 POV만 전환되며 별도 identity를 병합하지 않는다.",
             "rejected": [],
             "safety_flags": {
                 "requires_identity_merge": False,
@@ -7489,7 +8215,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
         self.assertNotIn("후반별도행동", main["dominant_action_tags"])
         self.assertEqual(previous["evidence_episode_nos"], [1, 50])
 
-    async def test_opening_joint_transition_folds_only_explicit_role_evidence_keys(self):
+    async def test_opening_named_transition_does_not_fold_role_evidence_as_identity(self):
         module = load_module()
         rows = [
             signal_row(
@@ -7549,11 +8275,14 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
             protagonist_resolution=resolution,
         )
 
-        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+        self.assertEqual(resolution["decision"], "UNRESOLVED")
+        self.assertEqual(resolution["reason_code"], "requires_identity_merge")
+        self.assertFalse(any(row["work_role"] == "main_protagonist" for row in inventory))
+        current = next(row for row in inventory if row["display_name"] == "현재정체")
         side = next(row for row in inventory if row["display_name"] == "사이드인물")
-        self.assertEqual(main["evidence_episode_nos"], [1, 3])
-        self.assertIn("이전행동", main["dominant_action_tags"])
-        self.assertNotIn("사이드행동", main["dominant_action_tags"])
+        self.assertEqual(current["evidence_episode_nos"], [3])
+        self.assertNotIn("이전행동", current["dominant_action_tags"])
+        self.assertNotIn("사이드행동", current["dominant_action_tags"])
         self.assertEqual(side["evidence_episode_nos"], [2])
 
     async def test_opening_joint_resolution_rejects_later_only_candidate(self):
@@ -9129,7 +9858,7 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertFalse(character["is_protagonist"])
         self.assertFalse(character["is_work_protagonist"])
         self.assertFalse(character["is_episode_focal"])
-        self.assertFalse(character["is_first_person"])
+        self.assertTrue(character["is_first_person"])
         self.assertEqual(
             character["identity_claims"],
             [
@@ -13933,6 +14662,47 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
         self.assertIn("asset_rank.public_episode_rank", query)
         self.assertIn("AS character_asset_episode_eligible", query)
 
+    def test_actual_selection_sql_caps_public_ordinal_with_prologue_and_gap(self):
+        module = load_module()
+        with sqlite3.connect(":memory:") as database:
+            database.row_factory = sqlite3.Row
+            database.create_function("CONCAT", -1, lambda *values: "".join(map(str, values)))
+            database.executescript("""
+                CREATE TABLE tb_product (product_id INTEGER, title TEXT, price_type TEXT, status_code TEXT, open_yn TEXT, blind_yn TEXT, ai_content_service_enabled_yn TEXT);
+                CREATE TABLE tb_product_episode (product_id INTEGER, episode_id INTEGER, episode_no INTEGER, episode_title TEXT, episode_content TEXT, episode_text_count INTEGER, epub_file_id INTEGER, use_yn TEXT, open_yn TEXT, open_changed_date TEXT, publish_reserve_date TEXT, created_date TEXT);
+                CREATE TABLE tb_story_agent_context_product (product_id INTEGER, context_status TEXT);
+                CREATE TABLE tb_story_agent_context_summary (summary_id INTEGER, product_id INTEGER, scope_key TEXT, summary_type TEXT, episode_from INTEGER, episode_to INTEGER, source_hash TEXT, summary_text TEXT, created_date TEXT, is_active TEXT);
+                INSERT INTO tb_product VALUES (687, 'test', 'free', 'ongoing', 'Y', 'N', 'Y');
+            """)
+            for episode_no in [0, *range(1, 27), 28, 29, 30, 31, 32]:
+                episode_id = episode_no + 100
+                database.execute("INSERT INTO tb_product_episode VALUES (?, ?, ?, '', 'source', 10, NULL, 'Y', 'Y', '2026-09-01', NULL, '2026-09-01')", (687, episode_id, episode_no))
+                database.execute("INSERT INTO tb_story_agent_context_summary VALUES (?, 687, ?, 'episode_summary', ?, ?, 'source', 'text', '2026-09-01', 'Y')", (episode_id, f"episode:{episode_id}", episode_no, episode_no))
+            class Cursor:
+                def execute(self, query, params):
+                    self.cursor = database.execute(query.replace("%s", "?"), params)
+                def fetchall(self):
+                    return [dict(row) for row in self.cursor.fetchall()]
+            for has_prologue in (True, False):
+                if not has_prologue:
+                    database.execute("DELETE FROM tb_product_episode WHERE episode_no = 0")
+                expected_episodes = set(([0] if has_prologue else []) + [*range(1, 27), 28, 29, 30] + ([] if has_prologue else [31]))
+                for scheduled in (False, True):
+                    with self.subTest(scheduled=scheduled, has_prologue=has_prologue):
+                        query, params = module.build_target_query(SimpleNamespace(product_ids=[687], episode_ids=[], episode_nos=[], limit=0, scheduled=scheduled), use_epub_fallback=False)
+                        rows = [dict(row) for row in database.execute(query.replace("%s", "?"), params)]
+                        self.assertEqual({row["episode_no"] for row in rows if row["character_asset_episode_eligible"]}, expected_episodes)
+                        self.assertEqual(31 in {row["episode_no"] for row in rows}, not scheduled or not has_prologue)
+                        self.assertEqual(32 in {row["episode_no"] for row in rows}, not scheduled)
+                        if not scheduled:
+                            if not has_prologue:
+                                self.assertEqual(next(row["public_episode_rank"] for row in rows if row["episode_no"] == 31), 30)
+                            selected, cleanup = module.select_character_asset_episode_rows(product_rows=rows, episode_summary_rows=[{"scope_key": f"episode:{row['episode_id']}", "episode_from": row["episode_no"]} for row in rows])
+                            self.assertEqual({row["episode_from"] for row in selected}, expected_episodes)
+                            self.assertFalse(cleanup)
+                active = module.fetch_active_character_asset_summary_rows(Cursor(), product_id=687, summary_type="episode_summary")
+                self.assertEqual({row["episode_from"] for row in active}, expected_episodes)
+
     def test_scene_repair_episode_id_set_requires_usable_active_scene(self):
         module = load_module()
         cur = object()
@@ -14354,7 +15124,7 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
 
         self.assertEqual(affected, {"protagonist:named:hero"})
 
-    def test_missing_character_chat_internal_prompt_rebuilds_touched_scope(self):
+    def test_existing_rp_assets_do_not_rebuild_unchanged_touched_scope(self):
         module = load_module()
         signal_row = {
             "summary_id": 10,
@@ -14390,10 +15160,9 @@ class StoryAgentCharacterInventoryV3Test(TestCase):
             new_touched_signal_rows=[signal_row],
             old_profile_map={"protagonist:named:hero": {"source_hash": "profile-hash"}},
             old_examples_map={"protagonist:named:hero": {"source_hash": "examples-hash"}},
-            old_internal_prompt_map={},
         )
 
-        self.assertEqual(affected, {"protagonist:named:hero"})
+        self.assertEqual(affected, set())
 
     def test_changed_rp_inventory_is_rebuilt(self):
         module = load_module()
@@ -14825,9 +15594,10 @@ class InventoryReaggregationTest(IsolatedAsyncioTestCase):
                 "protagonist:named:레이븐",
             },
         )
+        # 4화의 1인칭 '소년'은 일반 라벨 주인공 파편이라 레이븐에 흡수되고 별도 행으로 남지 않는다.
         self.assertEqual(
             len([row for row in inventory if row["display_name"] == "소년"]),
-            1,
+            0,
         )
 
     def test_same_episode_same_label_distinct_source_keys_remain_separate(self):

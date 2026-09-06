@@ -150,7 +150,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
             row(
                 "episode_scene_extraction",
                 f"episode:{episode_no}",
-                scene_payload(scene_scope_key),
+                {**scene_payload(scene_scope_key), "episode_no": episode_no},
                 episode_from=episode_no,
                 summary_id=episode_no,
             )
@@ -173,6 +173,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         )
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=101,
             summary_rows_by_type={
                 "character_inventory_v3": [
@@ -199,6 +200,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         }
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=109,
             story_context_status="ready",
             total_episode_count=3,
@@ -234,6 +236,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         module = load_module()
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=100,
             story_context_status="ready",
             total_episode_count=3,
@@ -263,6 +266,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         scope_key = "protagonist:named:데시"
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=101,
             story_context_status="ready",
             total_episode_count=3,
@@ -286,6 +290,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         scope_key = "protagonist:named:데시"
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=108,
             story_context_status="ready",
             total_episode_count=3,
@@ -334,6 +339,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         invalid_opening = opening_payload("protagonist:named:다른인물")
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=106,
             story_context_status="ready",
             total_episode_count=3,
@@ -360,6 +366,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         legacy_opening.pop("runtime_formula_seed")
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=107,
             story_context_status="ready",
             total_episode_count=3,
@@ -387,6 +394,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         payload["source_character_keys"] = [legacy_scope_key]
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=105,
             story_context_status="ready",
             total_episode_count=3,
@@ -420,6 +428,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         scope_key = "protagonist:named:데시"
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=104,
             story_context_status="ready",
             total_episode_count=3,
@@ -449,6 +458,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         supporting_scope_key = "character:소년"
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=1103,
             story_context_status="ready",
             total_episode_count=12,
@@ -508,6 +518,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         supporting_scope_key = "character:소년"
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=1103,
             story_context_status="ready",
             total_episode_count=12,
@@ -565,6 +576,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         supporting_scope_key = "character:소년"
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=1164,
             story_context_status="ready",
             total_episode_count=15,
@@ -616,6 +628,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         missing_main_scope_key = "character:설총"
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=1127,
             story_context_status="ready",
             total_episode_count=20,
@@ -669,6 +682,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         module = load_module()
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=102,
             story_context_status="ready",
             summary_rows_by_type={
@@ -695,6 +709,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         payload["identity_conflict_reasons"] = ["identity_continuity_ambiguous"]
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=1103,
             story_context_status="ready",
             summary_rows_by_type={
@@ -722,6 +737,7 @@ class StoryAgentCharacterChatReadinessTest(unittest.TestCase):
         payload["identity_conflict_reasons"] = ["identity_continuity_ambiguous"]
 
         verification = module.build_character_chat_asset_readiness_verification(
+            episode_scope_map={"episode:1": 1, "episode:2": 2, "episode:3": 3},
             product_id=1103,
             story_context_status="ready",
             summary_rows_by_type={

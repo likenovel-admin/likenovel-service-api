@@ -21,6 +21,7 @@ import re
 import sys
 from collections import Counter
 from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -49,6 +50,10 @@ from app.services.common.openrouter_background_credit_guard import (  # noqa: E4
     OpenRouterBackgroundCreditReserveError,
     assert_openrouter_background_credit_available_async,
     post_openrouter_background_chat_completion_async,
+    openrouter_background_credit_reservation_async,
+)
+from scripts.character_asset_attempt import (  # noqa: E402
+    CharacterAssetAttemptBlocked, CharacterAssetAttemptStore, attempt_key,
 )
 from app.services.product.episode_service import _extract_epub_payload_from_epub  # noqa: E402
 from app.services.websochat.character_chat_product_policy import (  # noqa: E402
@@ -57,11 +62,16 @@ from app.services.websochat.character_chat_product_policy import (  # noqa: E402
     CHARACTER_CHAT_MINIMUM_OPEN_EPISODE_COUNT,
     CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT,
     is_character_chat_rp_profile_payload_ready,
+    is_character_chat_single_line_label,
+    is_character_chat_inventory_v1_decision_coherent,
+    select_character_chat_grounding_v1,
 )
 
 logger = logging.getLogger(__name__)
 
 _storyctx_usage_connection = None
+_character_asset_attempt_store = None
+_character_asset_product_id = ContextVar("character_asset_product_id", default=0)
 
 DB_HOST = os.getenv("BATCH_DB_HOST", settings.DB_IP)
 DB_PORT = int(os.getenv("BATCH_DB_PORT", str(settings.DB_PORT)))
@@ -96,9 +106,6 @@ DEEPSEEK_OPENROUTER_PROVIDER_ONLY = os.getenv(
     "",
 ).strip()
 RP_OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("STORY_AGENT_RP_OPENROUTER_TIMEOUT_SECONDS", "90"))
-CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS = float(
-    os.getenv("STORY_AGENT_CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS", "180")
-)
 RP_PROFILE_MIN_EXAMPLE_TEXTS = int(os.getenv("STORY_AGENT_RP_PROFILE_MIN_EXAMPLES", "2"))
 RP_PROFILE_MAX_TARGETS_PER_PRODUCT = int(os.getenv("STORY_AGENT_RP_PROFILE_MAX_TARGETS_PER_PRODUCT", "2"))
 RP_DIALOGUE_FALLBACK_MAX_EPISODES = int(os.getenv("STORY_AGENT_RP_DIALOGUE_FALLBACK_MAX_EPISODES", "18"))
@@ -132,8 +139,11 @@ TARGET_CHUNK_LEN = 1600
 MAX_CHUNK_LEN = 2500
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|(?<=다\.)\s+|(?<=요\.)\s+")
 KEYWORD_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
-EPISODE_SUMMARY_FORMAT_VERSION = "episode_summary_v12"
-EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION = "episode_character_signals_v3"
+EPISODE_SUMMARY_FORMAT_VERSION = "episode_summary_v13"
+# Lexical hints are not verified names. The 50% marker only highlights possible
+# loss for diagnosis; it must not trigger retries or determine output acceptance.
+EPISODE_SUMMARY_NAME_PRESERVATION_MIN_RATE = 0.5
+EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION = "episode_character_signals_v5"
 LEGACY_ANONYMOUS_WORK_PROTAGONIST_CUTOFF = "2026-08-17 00:00:00"
 RANGE_SUMMARY_FORMAT_VERSION = "range_summary_v1"
 PRODUCT_SUMMARY_FORMAT_VERSION = "product_summary_v1"
@@ -166,18 +176,6 @@ class CharacterIdentityReviewStaleError(ValueError):
 RELATION_INVENTORY_FORMAT_VERSION = "relation_inventory_v1"
 CHARACTER_RP_PROFILE_FORMAT_VERSION = "character_rp_profile_v4"
 CHARACTER_RP_EXAMPLES_FORMAT_VERSION = "character_rp_examples_v3"
-CHARACTER_CHAT_INTERNAL_PROMPT_FORMAT_VERSION = "character_chat_internal_prompt_v1"
-CHARACTER_CHAT_OPENING_FORMAT_VERSION = "character_chat_opening_v1"
-CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION = "runtime_formula_seed_v1"
-CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS = (
-    "formula_type",
-    "p_to_user_request",
-    "user_task_type",
-    "user_task_success_condition",
-    "protagonist_state_delta",
-    "open_loop",
-    "mutation_policy",
-)
 EPISODE_SCENE_EXTRACTION_FORMAT_VERSION = "episode_scene_extraction_v1"
 EPISODE_SCENE_EXTRACTION_MAX_INPUT_CHARS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_INPUT_CHARS", "18000"))
 EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS", "5000"))
@@ -465,49 +463,6 @@ RP_PROFILE_RESPONSE_FORMAT: dict[str, object] = {
     },
 }
 
-CHARACTER_CHAT_INTERNAL_PROMPT_SYSTEM = """너는 웹소설 원고 기반 캐릭터챗 내부 프롬프트 설계자다.
-반드시 JSON만 반환하라. 원문/요약/관계/대사 근거에 없는 설정을 만들지 마라.
-
-목표:
-- 아래 입력만으로 매 턴 캐릭터 답변을 밀어주는 '1:1 캐릭터챗 내부 프롬프트'를 작성한다.
-- 출력 형식 가드가 아니라, 캐릭터의 정체성/말투/상황 반응/관계 리듬을 유지하는 본체 프롬프트여야 한다.
-- 작품 Q&A가 아니라 사용자가 캐릭터와 같은 장면에 이미 엮인 듯한 역할극을 전제로 한다.
-- 런타임의 하드 렌더링 가드가 이 내부 프롬프트보다 우선한다. 내부 프롬프트도 그 가드를 거스르지 않게 작성한다.
-
-출력 스키마:
-{"internal_prompt":"1600~3200자 한국어 내부 프롬프트"}
-
-internal_prompt 필수 구성:
-1. [핵심 정체성]: 이름/별칭/작품 속 역할. 회빙환/빙의/가명/호칭이 있으면 등장인물이 실제로 부르는 이름을 우선하되, 근거가 있는 별칭만 쓴다.
-2. [캐릭터성/말투]: 성격, 판단 기준, 말투, 호칭, 문장 리듬. 실제 대사 근거와 모순되면 안 된다.
-3. [관계와 거리감]: 사용자를 이미 장면에 엮인 비네임드 조력자/동행자/관계자로 대하는 기본 거리감, 경계/호감/협력 변화 조건. 사용자의 정체를 캐묻는 미스터리로 만들지 않는다.
-4. [첫인사 오프닝]: 사용자가 아직 말하기 전 캐릭터가 먼저 말을 거는 장면을 어떻게 열지 쓴다. 장소의 공기/소리/빛, 캐릭터의 자세/시선/거리, 사용자를 붙잡는 즉각적 긴장, 첫 대사의 상황 질문/협력 요청/선택 여지 hook을 포함한다.
-5. [시작/현재 장면 운용]: 읽은 범위 기준 앵커를 받아 그 시점에서 확인 가능한 장소, 긴장, 행동만 사용한다. 시작 장면을 매 턴 리셋하지 않는다.
-6. [원작 기반 새 사건 운용]: 원작 세계관, 설정, 인물성, 읽은 범위의 갈등은 최대한 유지하되 원작 사건을 그대로 재연하지 않는다. 원작 플롯은 앵커로만 쓰고, 답변의 중심은 원작에서 파생된 새 사이드 사건/새 변수/새 단서여야 한다. 새 사건의 비중을 원작 요약보다 높게 두되, 새 사건은 기존 세계관과 캐릭터 동기에서 자연스럽게 생긴 작은 위기, 요청, 방해, 단서, 관계 압력이어야 한다. 원작 결말/배후/미래 사건을 새로 확정하지 않는다.
-7. [런타임 전개 공식]: 캐릭터가 유저에게 맡길 1~3턴짜리 구체 작업, 그 작업이 영향을 줄 주인공의 다음 행동, 작업 뒤 생길 state_delta/open_loop를 함께 둔다. 유저 작업은 관찰/추론/타이밍/선택/증거/경로/반응 읽기처럼 즉시 답할 수 있어야 하며 최종 승리나 결말이 아니어야 한다.
-8. [짧은 입력 처리]: 사용자가 '응', '그래', '뭐야?'처럼 짧게 말해도 캐릭터가 지문+대사로 반응하고 작은 사건/질문/행동 하나, 또는 새 변수/관계 반응/장면 변화 하나로 장면을 전진시킨다.
-9. [사용자 agency]: 사용자가 직전 입력에서 직접 밝힌 행동/말/상태만 이어받는다. 캐릭터는 자신의 행동을 먼저 할 수 있지만 사용자의 감정/반응/성공/다음 행동은 확정하지 않는다. 협력 요청은 선택 가능하게 남긴다. 사용자의 정체를 심문하는 반복 전개, 원작 기존 인물로의 확정, 공개 읽은 범위 밖 스포일러, 메타 발언, 원문 대사 복붙은 만들지 않는다.
-10. [응답 감각]: 첫인사는 5~8문장 지문 + 2~3문장 대사로 장면을 충분히 연다. 이후 답변은 지문 2~4문장 뒤 캐릭터 대사 1~3문장을 기본으로 하되, 매 턴 물리적 행동/새 변수/관계 반응/장면 변화/hook 하나를 둔다.
-
-규칙:
-- 정보가 부족하면 모른다고 해설하지 말고, 확인 가능한 현재 장면의 반응으로 좁혀라.
-- 단순 목록보다 실제 런타임에서 바로 먹히는 지시문 문체로 작성하라.
-- 예시는 말투 기준으로만 짧게 포함하고, 원문 대사를 길게 인용하지 마라.
-- 첫인사는 일반 인사말이 아니라 독자가 스크롤을 멈출 만큼 구체적인 장면 진입이어야 한다.
-- 사용자는 원작 기존 네임드가 아니라 이미 장면에 엮인 비네임드 조력자/동행자/관계자다. 기본 역할은 낮은 신뢰의 협력자, 임시 동행자, 현장 보조자, 목격자, 같이 휘말린 사람 중 장면에 맞게 약하게만 둔다.
-- 캐릭터가 경계심이 강해도 의심은 말투 한 줄 이하로만 두고, 정체 심문을 사건 엔진으로 쓰지 마라. 첫인사는 현재 사건의 목적, 위기, 행동 hook으로 열어라.
-- 치료 보조, 기록 담당, 임시 동행자, 현장 보조자처럼 장면을 돕는 약한 역할 라벨은 가능하지만 사용자를 원작 기존 네임드/짐승/환자/포로로 확정하지 마라.
-- 원작은 대본이 아니라 제약 조건이다. 원작 장면을 요약하거나 반복하지 말고, 읽은 범위의 갈등/관계/장소/물건에서 파생된 새 곁가지 사건으로 시작하라.
-- 전개 공식은 `공개 평가 뒤집기`, `초기 자원 확보`, `전투 패턴 깨기`, `불확실한 인물의 신뢰 전환`, `작은 사건의 확장` 중 입력 근거와 가장 가까운 것을 우선 사용하라. 장면마다 유저에게 관찰/단서 확인/타이밍 콜/선택지 계산/답변 작성/경로 파악/증거 준비 중 하나를 맡기고, 캐릭터가 그 결과를 자신의 행동 변화로 받아 장면을 전진시키게 하라.
-- 캐릭터는 장면 목적과 stake를 제공하되, 사용자를 심부름시키는 명령문보다 장면 압력, 협력 요청, 자연스러운 1~2개 행동 방향으로 유도하라.
-- 사건 진행만 밀지 말고, 사용자의 말에 대한 캐릭터의 관계 반응을 최소 하나 포함하게 하라.
-- 압박감과 관계 반응은 캐릭터 자신의 자세/행동/판단, 주변 사물, 출입구, 환경 변화, 대사로 만든다.
-- 사용자가 직전 입력에서 직접 묘사한 행동과 상태는 이어받을 수 있지만, 입력에 없는 사용자 행동/상태/소지품/관계/결과를 덧붙이지 않는다.
-- 캐릭터 자신의 접근/시선/접촉은 캐릭터 행동으로 쓸 수 있으나, 그에 대한 사용자의 감정과 반응은 다음 입력 전에 확정하지 않는다.
-- 사용자의 말에 대한 협력 요청은 대사 안에서 선택 가능하게 남기고, 사용자의 실행과 결과는 다음 입력 전에 확정하지 않는다.
-- 내부 프롬프트에 구체적인 금지 표현 목록을 만들지 마라. 출력 전에는 사용자에 관한 서술마다 직전 입력의 근거가 있는지 확인하게 하라.
-"""
-
 EPISODE_SCENE_EXTRACTION_SYSTEM = """너는 웹소설 원문을 캐릭터챗용 장면 단위로 나누는 전처리기다.
 반드시 JSON만 반환하라. 첫인사, RP 대사, 새 사건, 감상평을 만들지 마라.
 
@@ -605,100 +560,6 @@ EPISODE_SCENE_EXTRACTION_SYSTEM = """너는 웹소설 원문을 캐릭터챗용 
 20. conversation_fuel_tags는 장면을 오래 끌 수 있는 루프만 최대 3개 고른다. 태그를 많이 붙이지 마라.
 21. knowledge_boundary는 읽은 범위에서 암시 가능한 것과 직접 말하면 안 되는 것을 분리한다. 원작 미래 사건을 새로 확정하지 마라.
 22. progression_seed는 원작 장면 복붙이 아니라 3~5턴 안에 새 곁가지 사건, 관계 반응, 위치 변화, 단서, 방해로 장면을 전진시킬 씨앗만 쓴다.
-"""
-
-CHARACTER_CHAT_OPENING_SYSTEM = """너는 웹소설 원작 기반 캐릭터챗의 첫 진입 자산 생성기다.
-반드시 JSON object 하나만 반환하라. 코드블록, 설명, 머리말 금지.
-
-목표:
-- 입력된 캐릭터 인벤토리, RP 프로필, 대표 대사, 내부 프롬프트, 장면 프레임만 사용한다.
-- 캐릭터가 먼저 말을 걸 수 있는 몰입형 opening asset을 만든다.
-- 원작 세계관과 읽은 범위의 사실은 유지하되, 원작 사건 복붙이 아니라 장면에서 자연스럽게 파생되는 작은 새 사건/압박/hook을 중심에 둔다.
-- 유저는 원작 네임드가 아니라 장면에 약하게 엮인 비네임드 조력자/동행자/목격자다.
-- 유저 정체 추궁, 심문 루프, "무엇을 도와줄까"식 일반 인사는 금지다.
-- 사용자의 행동, 감정, 자세, 소지품, 신체 반응을 지문에서 확정하지 않는다.
-
-출력 스키마:
-{
-  "readiness": {"status": "ready|needs_review|not_ready", "confidence": 0.0, "block_reasons": []},
-  "chat_target": {"scope_key": "입력 scope_key", "display_name": "캐릭터명", "aliases": []},
-  "opening_scene": {
-    "situation": "첫 진입 장면",
-    "immediate_conflict": "즉시 압박",
-    "props_or_anchors": [],
-    "nearby_characters": []
-  },
-  "opening_message": {
-    "narration": "첫 화면에 그대로 쓸 300~500자 서술형 지문. 캐릭터/환경/사물/사건만 묘사",
-    "dialogue": "캐릭터가 직접 말하는 1~3문장의 첫 대사",
-    "opening_text": "서술형 지문 문단 + 빈 줄 + 큰따옴표 대사로 합친 첫 assistant 응답 초안",
-    "user_objective": "유저가 첫 답변에서 무엇을 하면 되는지"
-  },
-  "user_role": {
-    "role_type": "임시 조력자|동행자|목격자|의뢰인|동료|불명",
-    "relationship_to_character": "약한 관계",
-    "scene_entry_reason": "유저가 지금 장면에 있는 이유",
-    "first_turn_affordance": "첫 답변에서 할 수 있는 약한 선택"
-  },
-  "character_drive": {
-    "immediate_objective": "캐릭터의 지금 목표",
-    "pressure": "압박/위험/제약",
-    "longer_desire": "초반 큰 욕망"
-  },
-  "agency_contract": {
-    "character_moves_first": true,
-    "non_user_dependent_action": "유저가 침묵해도 캐릭터가 다음에 할 행동",
-    "decision_character_must_make": "캐릭터가 곧 선택할 결정",
-    "user_influence_boundary": "유저가 영향을 줄 수 있지만 대신 주도하지 않는 범위"
-  },
-  "progression_engine": {
-    "short_term_goal": "첫 5~10턴 목표",
-    "mid_term_escalation": "10~30턴 사이 새 압박",
-    "scene_exit_condition": "다음 국면으로 넘어가는 조건"
-  },
-  "runtime_formula_seed": {
-    "formula_type": "FORMULA_* 라벨. 우선 후보: FORMULA_PUBLIC_TEST_FLIP|FORMULA_RESOURCE_BOOTSTRAP|FORMULA_COMBAT_PATTERN_BREAK|FORMULA_ALLY_TRUST_CONVERSION|FORMULA_CASE_TO_NETWORK",
-    "p_to_user_request": "캐릭터가 유저에게 맡기는 1~3턴짜리 구체 작업",
-    "user_task_type": "UT_* 라벨. 우선 후보: UT_MONITOR_REACTION|UT_INSPECT_CLUE|UT_CALL_TIMING|UT_CALCULATE_OPTION|UT_CRAFT_RESPONSE|UT_MAP_ROUTE|UT_PREPARE_EVIDENCE|UT_MONITOR_STATUS",
-    "user_task_success_condition": "유저가 짧은 응답으로 달성할 수 있는 즉시 성공조건",
-    "protagonist_state_delta": "유저 응답 뒤 캐릭터가 행동으로 만들 상태 변화",
-    "open_loop": "다음 3~5턴으로 남길 새 변수/위험/단서",
-    "mutation_policy": "MP_SAME_RELATION_NEW_TEST|MP_SAME_PRESSURE_NEW_ROUTE|MP_SAME_CASE_NEW_SCOPE|MP_SAME_ASSET_NEW_CLUE|MP_SAME_HAZARD_NEW_LOCATION|MP_SAME_RULE_NEW_EXCEPTION|MP_SAME_DEADLINE_NEW_OBSTACLE|MP_SAME_RIVAL_NEW_MOVE"
-  },
-  "user_affordance_contract": {
-    "primary_affordances": [],
-    "forbidden_agency_load": [],
-    "safe_response_examples": []
-  },
-  "canon_safe_expansion": {
-    "safe_new_event_pattern": "읽은 범위에서 파생 가능한 새 사건 패턴",
-    "allowed_inventions": [],
-    "forbidden_inventions": [],
-    "must_preserve_facts": []
-  },
-  "progression": {
-    "opening_greeting_intent": "첫 인사가 달성할 목적",
-    "next_beats": [{"beat": "다음 전개", "trigger": "유저 반응 조건", "avoid_repeating": "반복 금지"}],
-    "anti_loop_rules": []
-  }
-}
-
-규칙:
-1. readiness.status는 장면 프레임, 캐릭터 목표, 유저 역할, 다음 전개가 모두 있을 때만 ready다.
-2. chat_target.scope_key는 입력 scope_key와 정확히 같아야 한다.
-3. opening_message는 실제 첫 assistant 응답 초안이다. 일반 캐릭터챗 위저드의 첫시작처럼 intro(서술형 지문) + first_line(첫대사) 구조로 만든다. 대사만 있거나 지문만 있으면 ready가 아니다.
-4. 유저를 특정 원작 인물, 연인, 가족, 포로, 환자, 짐승, 주인공으로 확정하지 마라.
-5. 캐릭터가 장면 목적과 stake를 제공하고, 대화가 20~30턴 반복되지 않게 progression_engine을 채워라.
-6. runtime_formula_seed는 반드시 progression_engine과 같은 사건을 가리켜야 한다. 첫 턴에서 유저가 할 일은 최종 payoff가 아니라 관찰/단서 확인/타이밍 콜/선택지 계산/답변 작성/경로 파악/증거 준비처럼 1~3턴 안에 끝나는 작은 작업이어야 한다. 그 작업 뒤 캐릭터가 어떻게 움직일지 protagonist_state_delta와 open_loop를 채워라.
-7. runtime_formula_seed.formula_type은 장르가 아니라 장면을 움직이는 행동 공식이다. 공개 평가를 뒤집는 장면은 FORMULA_PUBLIC_TEST_FLIP, 첫 자원/장비/접근권을 만드는 장면은 FORMULA_RESOURCE_BOOTSTRAP, 적의 패턴/위험 동선을 깨는 장면은 FORMULA_COMBAT_PATTERN_BREAK, 불확실한 인물을 협력자로 바꾸는 장면은 FORMULA_ALLY_TRUST_CONVERSION, 작은 단서가 더 큰 사건으로 번지는 장면은 FORMULA_CASE_TO_NETWORK를 우선 고른다. 이 다섯 가지가 맞지 않으면 입력 근거에 가장 가까운 다른 FORMULA_* 라벨을 사용하되 새 라벨을 만들지 마라.
-8. opening_message.narration은 300~500자 분량의 서술형 지문이다. 사건 한복판에서 시작하고, 빛/소리/온도/냄새 중 1~2개 감각 디테일, 캐릭터의 3인칭 행동, 즉시 압박, 관계 훅을 넣어라.
-9. opening_message.narration은 캐릭터/환경/사물/사건만 묘사한다. 지문에서 사용자의 행동, 감정, 자세, 소지품, 신체 반응, 위치를 확정하지 마라.
-10. opening_message.dialogue는 chat_target 캐릭터가 직접 말하는 1~3문장 대사여야 한다. 대사 안에는 유저가 지금 할 수 있는 구체 행동/선택/협력 요청을 넣어라.
-   단, 대사에서도 사용자가 이미 멍하니 서 있다/숨어 있다/어슬렁거린다/침입했다/허가받지 않았다/목적을 숨긴다/대답해야 한다고 단정하지 마라.
-   협력 요청은 "저 박스 근처로 누가 다가오면 알려", "왼쪽 문양과 오른쪽 발소리 중 하나를 확인해"처럼 외부 사물과 선택지를 향해야 한다.
-   첫 대사는 "거기,"로 시작하지 마라. 사용자를 부르는 대신 곧바로 외부 사건/사물/선택지를 제시하라.
-   좋은 형식: "저 박스 근처로 누가 다가오면 바로 알려. 나는 이 상태창부터 확인할게." / "왼쪽 문양과 오른쪽 발소리 중 하나를 먼저 봐. 둘 다 놓치면 늦어."
-11. opening_message.opening_text는 첫 화면에 그대로 띄울 순수 본문이다. 반드시 `narration` 문단, 빈 줄, 큰따옴표 대사 순서로 작성하라. 단답 대사, 안내문, 자기소개, "무엇을 도와줄까"식 일반 인사는 금지다.
 """
 
 RP_CHARACTER_PLAN_PROMPT = """너는 웹소설 episode_summary를 보고 RP용 중심인물 계획을 세우는 추론기다.
@@ -803,6 +664,7 @@ EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA = {
             "episode_no": {"type": "integer"},
             "mentioned_characters": {
                 "type": "array",
+                "minItems": 0,
                 "maxItems": 6,
                 "items": {
                     "type": "object",
@@ -853,6 +715,22 @@ EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA = {
                         "voice_mode": {
                             "type": "string",
                             "enum": ["dialogue", "monologue", "narration_only"],
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 4,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["dialogue", "monologue", "narrated_action", "narrated_state", "presence", "relation"]},
+                                    "source_part": {"type": "string", "enum": ["episode_source", "episode_summary"]},
+                                    "quote": {"type": "string"},
+                                    "counterpart_label": {"type": "string"},
+                                },
+                                "required": ["kind", "source_part", "quote", "counterpart_label"],
+                            },
                         },
                         "action_tags": {
                             "type": "array",
@@ -924,6 +802,7 @@ EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA = {
                         "scene_weight",
                         "role_in_episode",
                         "voice_mode",
+                        "evidence",
                         "action_tags",
                         "affect_tags",
                         "relation_edges",
@@ -1165,6 +1044,9 @@ async def storyctx_provider_attempt(
     except json.JSONDecodeError:
         tracked.finish("parse_error", error_code="JSON_DECODE_ERROR")
         raise
+    except CharacterAssetAttemptBlocked:
+        # Request owner already distinguished provider/contract failure from no submit.
+        raise
     except ValueError as exc:
         tracked.finish("validation_error", error_code=type(exc).__name__)
         raise
@@ -1186,6 +1068,7 @@ def work_cursor(conn):
 def product_lock_connection(product_id: int):
     lock_conn = db_connect(autocommit=True)
     acquired = False
+    product_token = _character_asset_product_id.set(product_id)
     try:
         with lock_conn.cursor() as cur:
             acquired = acquire_product_lock(cur, product_id)
@@ -1198,6 +1081,7 @@ def product_lock_connection(product_id: int):
             except Exception:
                 pass
         lock_conn.close()
+        _character_asset_product_id.reset(product_token)
 
 
 def acquire_product_lock(cur, product_id: int) -> bool:
@@ -1330,7 +1214,7 @@ def build_target_query(args: argparse.Namespace, use_epub_fallback: bool) -> tup
           ON sacp.product_id = p.product_id
         {file_join_sql}
         WHERE {where_sql}
-        ORDER BY p.product_id ASC, pe.episode_no ASC
+        ORDER BY p.product_id ASC, pe.episode_no ASC, pe.episode_id ASC
         {limit_sql}
     """
     return query, params
@@ -1536,7 +1420,8 @@ def build_episode_summary_user_prompt(row: dict, normalized_text: str) -> str:
         "- 마지막 줄은 반드시 \"핵심:\"으로 시작\n"
         "- 핵심 항목은 정확히 6~8개\n"
         "- 추상 표현 대신 누가 무엇을 했고 어떤 결과가 났는지 적기\n"
-        "- 고유명사, 능력명, 수치, 제약, 장비명은 원문 그대로 최대한 보존\n\n"
+        "- 고유명사, 능력명, 수치, 제약, 장비명은 원문 그대로 최대한 보존\n"
+        "- 원문에 등장한 인물 고유명(이름/호칭 포함)은 대명사(나/그/당신)·역할명(주인공/마법사/종자 등)으로 치환하지 말고 원문 표기 그대로 보존\n\n"
         f"작품명: {title}\n"
         f"회차 제목: {episode_title}\n"
         f"등장 인물/고유 호칭 후보(soft hint): {name_candidate_line}\n"
@@ -1570,6 +1455,44 @@ def extract_episode_summary_name_candidates(normalized_text: str, limit: int = 6
         key=lambda item: (-item[1], len(item[0]), item[0]),
     )
     return [item[0] for item in ranked[:limit]]
+
+
+def evaluate_episode_summary_name_preservation(normalized_text: str, summary_text: str) -> dict[str, object]:
+    # Match the actual model input. Header/core names can be inserted by repair,
+    # so only narrative body evidence counts toward preservation.
+    source = str(normalized_text or "")[:EPISODE_SUMMARY_MAX_INPUT_CHARS]
+    body = "\n".join(
+        line for line in str(summary_text or "").splitlines()
+        if not line.strip().startswith("핵심:")
+        and not EPISODE_SUMMARY_FIRST_LINE_RE.match(line.strip())
+    )
+    candidates: list[str] = []
+    preserved: list[str] = []
+    for name in extract_episode_summary_name_candidates(source):
+        if is_generic_character_label(name):
+            continue
+        pattern = re.compile(
+            rf"(?<![가-힣A-Za-z0-9]){re.escape(name)}"
+            rf"(?=$|[^가-힣A-Za-z0-9]|(?:은|는|이|가|을|를|과|와|의|에게|한테|아|야|도|만|로|라고))"
+        )
+        if len(pattern.findall(source)) < 2:
+            continue
+        candidates.append(name)
+        if pattern.search(body):
+            preserved.append(name)
+    rate = len(preserved) / len(candidates) if candidates else None
+    return {
+        "candidate_basis": "unverified_lexical_hints",
+        "enforcement": "diagnostic_only",
+        "candidates": candidates,
+        "candidate_count": len(candidates),
+        "preserved_names": preserved,
+        "missing_names": [name for name in candidates if name not in preserved],
+        "preservation_rate": rate,
+        "threshold": EPISODE_SUMMARY_NAME_PRESERVATION_MIN_RATE,
+        "status": ("not_applicable" if rate is None else
+                   "preserved" if rate >= EPISODE_SUMMARY_NAME_PRESERVATION_MIN_RATE else "below_threshold"),
+    }
 
 
 def extract_openrouter_message_text(payload: dict) -> str:
@@ -1687,7 +1610,14 @@ def build_character_signals_openrouter_payload(*, user_prompt: str) -> dict[str,
         "model": require_paid_character_signals_openrouter_model(),
         "temperature": 0.0,
         "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
-        "response_format": {"type": "json_object"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA["name"],
+                "strict": True,
+                "schema": EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA["input_schema"],
+            },
+        },
         "reasoning": {"effort": "none", "exclude": True},
         "messages": [
             {
@@ -1738,6 +1668,75 @@ def build_episode_scene_extraction_openrouter_payload(*, user_prompt: str) -> di
     return payload
 
 
+async def _request_character_asset_json(
+    client, *, stage: str, scope: str, contract: str, request_payload: dict,
+    validate, title: str, product_id: int | None = None,
+    timeout: float | None = None, provider: str = "openrouter",
+) -> dict:
+    """One physical request per durable input; serving promotion belongs to the caller."""
+    store = _character_asset_attempt_store
+    if store is None:
+        raise CharacterAssetAttemptBlocked("character_asset_attempt_store_not_initialized")
+    key = attempt_key(
+        int(product_id or _character_asset_product_id.get()), stage, scope,
+        contract, {"provider": provider, "body": request_payload},
+    )
+    cached = store.load(key, validate)
+    if cached is not None:
+        return cached
+    operation = AiProviderUsageOperation(
+        feature_key="storyctx", stage_key={
+            "signals": "episode_character_signals", "scenes": "episode_scene_extraction",
+            "protagonist_resolution": "work_protagonist_resolution", "rp_dialogue": "rp_dialogue_collection",
+        }.get(stage, stage), product_id=key[0], scope_key=scope,
+    )
+    reservation = (
+        openrouter_background_credit_reservation_async(
+            client, base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY,
+            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+        ) if provider == "openrouter" else nullcontext()
+    )
+    async with reservation:
+        store.claim(key)
+        async with storyctx_provider_attempt(operation, provider=provider, model=str(request_payload["model"])) as usage:
+            try:
+                response = await asyncio.wait_for(
+                    client.post(
+                        f"{OPENROUTER_BASE_URL}/chat/completions" if provider == "openrouter" else "https://api.anthropic.com/v1/messages",
+                        headers={
+                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                            "Content-Type": "application/json", "X-Title": title,
+                        } if provider == "openrouter" else {
+                            "x-api-key": settings.ANTHROPIC_API_KEY,
+                            "anthropic-version": "2023-06-01", "content-type": "application/json",
+                        },
+                        json=request_payload, timeout=timeout or RP_OPENROUTER_TIMEOUT_SECONDS,
+                    ), timeout=timeout or RP_OPENROUTER_TIMEOUT_SECONDS,
+                )
+                usage.observe_response(response)
+                response.raise_for_status()
+            except (asyncio.TimeoutError, HTTPStatusError, RequestError) as exc:
+                # Submit outcome is ambiguous: never delete/reset the durable claim.
+                usage.finish("provider_error", error_code=type(exc).__name__)
+                raise CharacterAssetAttemptBlocked("character_asset_attempt:inflight:transport_attention") from exc
+            try:
+                envelope = usage.capture_response(response)
+                parsed = (
+                    extract_json_object(extract_openrouter_message_text(envelope))
+                    if provider == "openrouter" else
+                    extract_anthropic_tool_input(envelope, tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME)
+                    or extract_json_object(extract_anthropic_message_text(envelope))
+                )
+                accepted = validate(parsed)
+            except (ValueError, TypeError, KeyError) as exc:
+                store.reject(key, str(exc) or type(exc).__name__)
+                usage.finish("validation_error", error_code=type(exc).__name__)
+                raise CharacterAssetAttemptBlocked("character_asset_attempt:terminal_invalid:contract") from exc
+            store.accept(key, accepted)
+            usage.finish("success")
+            return accepted
+
+
 async def request_rp_openrouter_json_payload(
     client: AsyncClient,
     *,
@@ -1754,6 +1753,22 @@ async def request_rp_openrouter_json_payload(
 ) -> dict | None:
     request_timeout_seconds = timeout_seconds or RP_OPENROUTER_TIMEOUT_SECONDS
     requested_model = model or RP_OPENROUTER_MODEL
+    if stage_key == "rp_profile":
+        def validate(payload):
+            error = get_structured_payload_contract_error(payload, RP_PROFILE_RESPONSE_FORMAT["json_schema"]["schema"])
+            if error or not is_character_chat_rp_profile_payload_ready(
+                {**(payload or {}), "character_key": scope_key}, expected_character_key=scope_key,
+            ):
+                raise ValueError(error or "profile_incomplete")
+            return payload
+        return await _request_character_asset_json(
+            client, stage="rp_profile", scope=scope_key or "", product_id=product_id,
+            contract=CHARACTER_RP_PROFILE_FORMAT_VERSION + ":receipt_v1",
+            request_payload=build_rp_openrouter_payload(
+                system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=max_tokens,
+                model=model, response_format=response_format,
+            ), validate=validate, title=title, timeout=request_timeout_seconds,
+        )
     operation = AiProviderUsageOperation(
         feature_key="storyctx",
         stage_key=stage_key,
@@ -1795,46 +1810,6 @@ async def request_rp_openrouter_json_payload(
         return parsed
 
 
-async def request_episode_scene_extraction_openrouter_json_payload(
-    client: AsyncClient,
-    *,
-    user_prompt: str,
-    usage_operation: AiProviderUsageOperation | None = None,
-    product_id: int | None = None,
-    episode_id: int | None = None,
-) -> dict | None:
-    operation = usage_operation or AiProviderUsageOperation(
-        feature_key="storyctx",
-        stage_key="episode_scene_extraction",
-        product_id=product_id,
-        episode_id=episode_id,
-    )
-    async with storyctx_provider_attempt(
-        operation,
-        provider="openrouter",
-        model=EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL,
-    ) as usage:
-        response = await asyncio.wait_for(
-            post_openrouter_background_chat_completion_async(
-                client,
-                base_url=OPENROUTER_BASE_URL,
-                api_key=OPENROUTER_API_KEY,
-                priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "X-Title": "LikeNovel Story Agent Episode Scene Extraction Batch",
-                },
-                json=build_episode_scene_extraction_openrouter_payload(user_prompt=user_prompt),
-            ),
-            timeout=EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS,
-        )
-        usage.observe_response(response)
-        response.raise_for_status()
-        response_json = usage.capture_response(response)
-        parsed = extract_json_object(extract_openrouter_message_text(response_json))
-        usage.finish("success" if parsed else "parse_error")
-        return parsed
 
 
 class EpisodeCharacterSignalsParseError(ValueError):
@@ -2142,6 +2117,7 @@ async def generate_episode_summary_text(
         "fallback_used": True,
         "fallback_reason": "llm_unavailable",
         "repaired_output": False,
+        "name_preservation": evaluate_episode_summary_name_preservation(normalized_text, fallback_text),
     }
     if client is None or not OPENROUTER_API_KEY or not EPISODE_SUMMARY_MODEL:
         return fallback_text, fallback_meta
@@ -2178,17 +2154,26 @@ async def generate_episode_summary_text(
             repaired_text,
             soft_name_candidates=soft_name_candidates,
         )
-        if has_semantic_issue:
-            issues = [*issues, *semantic_issues]
+        name_preservation = evaluate_episode_summary_name_preservation(normalized_text, repaired_text)
+        name_preservation["semantic_issues"] = semantic_issues
+        if has_semantic_issue or name_preservation["status"] == "below_threshold":
+            print(
+                f"[summary-name-preservation-warning] product_id={row.get('product_id')} "
+                f"episode_id={row.get('episode_id')} attempt={attempt + 1} diagnostic_only=True "
+                f"preservation_rate={name_preservation['preservation_rate']} "
+                f"missing_candidates={name_preservation['missing_names']} "
+                f"semantic_issues={semantic_issues}"
+            )
         last_candidate = repaired_text
         last_issues = issues
-        if valid and not has_semantic_issue:
+        if valid:
             return repaired_text, {
                 "used_llm": True,
                 "retry_count": attempt,
                 "fallback_used": False,
                 "fallback_reason": "",
                 "repaired_output": repaired_text != str(summary_text or "").strip(),
+                "name_preservation": name_preservation,
             }
 
         if verbose:
@@ -2197,13 +2182,14 @@ async def generate_episode_summary_text(
                 f"attempt={attempt + 1} issues={','.join(issues)} critical={is_critical}"
             )
 
-        if not is_critical and not has_semantic_issue and repaired_text:
+        if not is_critical and repaired_text:
             return repaired_text, {
                 "used_llm": True,
                 "retry_count": attempt,
                 "fallback_used": False,
                 "fallback_reason": "",
                 "repaired_output": True,
+                "name_preservation": name_preservation,
             }
 
     if last_candidate:
@@ -2214,6 +2200,7 @@ async def generate_episode_summary_text(
             "fallback_reason": "stored_noncritical_invalid",
             "repaired_output": True,
             "quality_issues": ",".join(last_issues),
+            "name_preservation": name_preservation,
         }
 
     return fallback_text, {
@@ -2222,6 +2209,7 @@ async def generate_episode_summary_text(
         "fallback_used": True,
         "fallback_reason": "validation_failed",
         "repaired_output": False,
+        "name_preservation": fallback_meta["name_preservation"],
     }
 
 
@@ -2245,7 +2233,7 @@ def build_rp_reasoning_signature() -> str:
                 RP_REASONING_THINKING_DISPLAY,
             ]
         )
-    if not OPENROUTER_API_KEY or not EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
+    if not EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
         return "none"
     return "|".join(
         [
@@ -2372,27 +2360,29 @@ def fetch_active_summary_rows(cur, product_id: int, summary_type: str) -> list[d
     return list(cur.fetchall())
 
 
-def fetch_character_chat_catalog_scene_episode_nos(
+def fetch_character_chat_catalog_scene_episode_scope_map(
     cur,
     *,
     product_id: int,
-) -> set[int]:
+) -> dict[str, int]:
     cur.execute(
         """
-        SELECT DISTINCT episode_no
-          FROM tb_product_episode
-         WHERE product_id = %s
-           AND use_yn = 'Y'
-           AND open_yn = 'Y'
-           AND episode_no >= 1
-           AND COALESCE(price_type, 'free') = 'free'
+        SELECT episode_id, episode_no
+          FROM (
+                SELECT episode_id, episode_no, price_type,
+                       ROW_NUMBER() OVER (ORDER BY episode_no ASC, episode_id ASC) AS public_episode_rank
+                  FROM tb_product_episode
+                 WHERE product_id = %s AND use_yn = 'Y' AND open_yn = 'Y'
+               ) public_episode
+         WHERE public_episode_rank <= %s
+           AND episode_no > 0 AND COALESCE(price_type, 'free') = 'free'
         """,
-        (product_id,),
+        (product_id, CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES),
     )
     return {
-        int(row.get("episode_no") or 0)
+        f"episode:{int(row['episode_id'])}": int(row["episode_no"])
         for row in cur.fetchall()
-        if int(row.get("episode_no") or 0) > 0
+        if int(row.get("episode_id") or 0) > 0
     }
 
 
@@ -2438,11 +2428,12 @@ def fetch_active_character_asset_summary_rows(
                summary.source_hash,
                summary.summary_text,
                summary.created_date
+               , capped_episode.episode_no AS source_episode_no
           FROM tb_story_agent_context_summary summary
           JOIN (
-                SELECT ranked_episode.episode_id
+                SELECT ranked_episode.episode_id, ranked_episode.episode_no
                   FROM (
-                        SELECT public_episode.episode_id,
+                        SELECT public_episode.episode_id, public_episode.episode_no,
                                ROW_NUMBER() OVER (
                                    PARTITION BY public_episode.product_id
                                    ORDER BY public_episode.episode_no ASC,
@@ -2773,19 +2764,35 @@ def select_character_asset_episode_rows(
 
 def filter_episode_texts_to_summary_rows(
     *,
-    episode_texts_by_no: dict[int, str],
+    episode_texts_by_scope: dict[str, str],
     episode_summary_rows: list[dict],
-) -> dict[int, str]:
-    allowed_episode_nos = {
-        int(row.get("episode_from") or row.get("episode_no") or 0)
+) -> dict[str, str]:
+    allowed_scopes = {
+        str(row.get("scope_key") or "")
         for row in episode_summary_rows
-        if int(row.get("episode_from") or row.get("episode_no") or 0) > 0
     }
     return {
-        episode_no: text_value
-        for episode_no, text_value in episode_texts_by_no.items()
-        if int(episode_no) in allowed_episode_nos
+        scope_key: text_value
+        for scope_key, text_value in episode_texts_by_scope.items()
+        if scope_key in allowed_scopes
     }
+
+
+def build_legacy_rp_episode_texts_by_no(
+    *, episode_texts_by_scope: dict[str, str], episode_summary_rows: list[dict],
+) -> dict[int, str]:
+    """Legacy RP consumers require numeric episode inputs; remove with legacy RP.
+
+    Only already-selected exact public sources are projected. V5 signals and
+    scenes must never consume this lossy, same-number projection.
+    """
+    texts_by_no: dict[int, list[str]] = {}
+    for row in episode_summary_rows:
+        scope = str(row.get("scope_key") or "")
+        episode_no = int(row.get("episode_from") or row.get("episode_no") or 0)
+        if scope in episode_texts_by_scope and episode_no > 0:
+            texts_by_no.setdefault(episode_no, []).append(episode_texts_by_scope[scope])
+    return {episode_no: "\n\n".join(texts) for episode_no, texts in texts_by_no.items()}
 
 
 def filter_delta_candidate_rows(
@@ -3157,6 +3164,12 @@ def build_protagonist_scope_key(name: str | None = None, *, first_person: bool =
         return "protagonist:first_person"
     slug = re.sub(r"[^가-힣A-Za-z0-9]", "", (name or "").strip().lower())
     return f"protagonist:named:{slug}" if slug else "protagonist:first_person"
+
+
+# LLM이 실명 대신 일반 라벨(주인공/그/당신 등)을 주인공 항목으로 낸 회차의 소스키.
+GENERIC_LABEL_PROTAGONIST_SOURCE_KEYS = frozenset(
+    build_protagonist_scope_key(label) for label in GENERIC_CHARACTER_LABELS
+)
 
 
 def looks_like_first_person_narrative(episode_texts_by_no: dict[int, str]) -> bool:
@@ -3623,7 +3636,7 @@ def build_episode_character_signals_user_prompt(
     episode_title = str(row.get("episode_title") or "").strip()
     opening_source = str(opening_text or "").strip()[:EPISODE_SUMMARY_MAX_INPUT_CHARS]
     opening_context = (
-        "\n\n아래는 opening 회차 원문이다. 인물 이름과 동일인 판정은 요약보다 원문을 우선하라.\n"
+        "\n\n아래는 해당 회차의 제한된 원문(episode_source)이다. 인물 이름과 동일인 판정은 요약보다 원문을 우선하라.\n"
         "상태창의 임시 이름, 일반 역할어, 몸 주인의 이름과 화자의 실제 자칭을 구분하라.\n\n"
         f"{opening_source}"
         if opening_source
@@ -3635,6 +3648,9 @@ def build_episode_character_signals_user_prompt(
         f"회차 제목: {episode_title}\n"
         "아래는 해당 회차의 episode_summary다.\n"
         "아래 입력에서 드러나는 캐릭터/관계/행동 신호만 지정된 JSON schema로 추출하라.\n"
+        "각 인물의 evidence에는 제공된 입력의 정확한 인용과 source_part를 넣어라. 원문이 있으면 원문을 우선하고, 요약 인용은 episode_summary로 구분하라.\n"
+        "직접 발화가 없어도 서술된 행동·상태·등장은 근거가 된다. narration_only는 누락의 기본값이 아니다.\n"
+        "인물 근거를 관측하지 못했다면 mentioned_characters를 빈 배열로 반환하라. 이는 제공된 범위에 한한 미관측이며 전체 회차에 인물이 없다는 뜻이 아니다.\n"
         "코드블록, 설명문은 쓰지 마라.\n\n"
         f"{summary_text}"
         f"{opening_context}"
@@ -3647,6 +3663,124 @@ def normalize_signal_entity_label(value: str) -> str:
         return ""
     stripped = re.sub(r"[!?.…~]+$", "", normalized)
     return stripped
+
+
+def get_structured_payload_contract_error(value: object, schema: dict, path: str = "") -> str | None:
+    if "anyOf" in schema:
+        return None if any(get_structured_payload_contract_error(value, option, path) is None for option in schema["anyOf"]) else path or "$"
+    expected_type = {
+        "object": dict,
+        "array": list,
+        "string": str,
+        "integer": int,
+        "boolean": bool,
+        "null": type(None),
+        "number": (int, float),
+    }[schema["type"]]
+    if (type(value) not in expected_type if isinstance(expected_type, tuple) else type(value) is not expected_type):
+        return path or "$"
+    if "enum" in schema and value not in schema["enum"]:
+        return path
+    if isinstance(value, dict):
+        properties = schema["properties"]
+        for key in schema["required"]:
+            if key not in value:
+                return f"{path}.{key}" if path else key
+        for key, item in value.items():
+            item_path = f"{path}.{key}" if path else key
+            if key not in properties:
+                return item_path
+            error = get_structured_payload_contract_error(item, properties[key], item_path)
+            if error:
+                return error
+    elif isinstance(value, list):
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", len(value)):
+            return path
+        for index, item in enumerate(value):
+            error = get_structured_payload_contract_error(item, schema["items"], f"{path}[{index}]")
+            if error:
+                return error
+    return None
+
+
+
+def get_episode_character_signals_contract_error(payload: object, *, episode_no: int) -> str | None:
+    """Validate new provider output only; persisted legacy signals remain readable."""
+    error = get_structured_payload_contract_error(payload, EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA["input_schema"], "")
+    if error:
+        return error
+    if payload["episode_no"] != episode_no:
+        return "episode_no"
+    for index, character in enumerate(payload["mentioned_characters"]):
+        if not character["display_name"].strip():
+            return f"mentioned_characters[{index}].display_name"
+    return None
+
+
+def get_episode_character_signals_grounding_error(
+    payload: dict,
+    *,
+    source_parts: dict[str, str],
+) -> str | None:
+    """Check supplied-source anchors, not semantic truth of the model's attribution."""
+    for index, character in enumerate(payload["mentioned_characters"]):
+        kinds: set[str] = set()
+        for evidence_index, evidence in enumerate(character["evidence"]):
+            quote = evidence["quote"].strip()
+            source = source_parts.get(evidence["source_part"], "")
+            if not quote or len(quote) > 400 or quote not in source:
+                return f"mentioned_characters[{index}].evidence[{evidence_index}].quote"
+            kinds.add(evidence["kind"])
+        voice_mode = character["voice_mode"]
+        if voice_mode in {"dialogue", "monologue"} and voice_mode not in kinds:
+            return f"mentioned_characters[{index}].voice_mode"
+        if voice_mode == "narration_only" and not kinds.intersection(
+            {"narrated_action", "narrated_state", "presence", "relation"}
+        ):
+            return f"mentioned_characters[{index}].voice_mode"
+        for claim_index, claim in enumerate(character["identity_claims"]):
+            quote = claim["evidence"].strip()
+            if not quote or not any(quote in source for source in source_parts.values()):
+                return f"mentioned_characters[{index}].identity_claims[{claim_index}].evidence"
+    return None
+
+
+def get_stored_character_signals_error(
+    payload: object,
+    *,
+    episode_no: int,
+    source_hash: str,
+    source_parts: dict[str, str] | None = None,
+) -> str | None:
+    if not isinstance(payload, dict):
+        return "payload"
+    contract = payload.get("signal_contract")
+    if not isinstance(contract, dict) or contract.get("version") != EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION:
+        return "signal_contract.version"
+    if contract.get("input_hash") != source_hash:
+        return "signal_contract.input_hash"
+    content = {key: value for key, value in payload.items() if key != "signal_contract"}
+    if contract.get("payload_hash") != sha256_text(json.dumps(content, ensure_ascii=False, sort_keys=True)):
+        return "signal_contract.payload_hash"
+    raw_characters = payload.get("mentioned_characters")
+    if not isinstance(raw_characters, list) or not all(isinstance(item, dict) for item in raw_characters):
+        return "mentioned_characters"
+    properties = EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA["input_schema"]["properties"]["mentioned_characters"]["items"]["properties"]
+    characters = []
+    for item in raw_characters:
+        character = {key: item[key] for key in properties if key in item}
+        for field in ("relation_edges", "identity_claims"):
+            nested = character.get(field)
+            if isinstance(nested, list) and all(isinstance(value, dict) for value in nested):
+                allowed = properties[field]["items"]["properties"]
+                character[field] = [{key: value[key] for key in allowed if key in value} for value in nested]
+        characters.append(character)
+    provider_shape = {"episode_no": payload.get("episode_no"), "mentioned_characters": characters, "cliffhanger_hooks": payload.get("cliffhanger_hooks")}
+    contract_error = get_episode_character_signals_contract_error(provider_shape, episode_no=episode_no)
+    if contract_error or source_parts is None:
+        # Inventory reads rely on the writer's anchor attestation; activation supplies sources.
+        return contract_error
+    return get_episode_character_signals_grounding_error(provider_shape, source_parts=source_parts)
 
 
 def normalize_episode_character_signals_payload(
@@ -3669,7 +3803,7 @@ def normalize_episode_character_signals_payload(
         is_work_protagonist = parse_yes_no_flag(item.get("is_work_protagonist"), default=legacy_is_protagonist)
         is_episode_focal = parse_yes_no_flag(item.get("is_episode_focal"), default=legacy_is_protagonist)
         is_protagonist = is_work_protagonist
-        is_first_person = parse_yes_no_flag(item.get("is_first_person")) if is_work_protagonist else False
+        is_first_person = parse_yes_no_flag(item.get("is_first_person"))
         entity_kind = str(item.get("entity_kind") or "person").strip().lower() or "person"
         if entity_kind not in {"person", "stable_role", "collective", "other"}:
             entity_kind = "person"
@@ -3725,12 +3859,11 @@ def normalize_episode_character_signals_payload(
         if not character_key:
             continue
         if character_key in seen_keys:
-            if character_key != "protagonist:generic":
-                continue
+            base_key = character_key
             occurrence = 2
-            while f"protagonist:generic:{occurrence}" in seen_keys:
+            while f"{base_key}:{occurrence}" in seen_keys:
                 occurrence += 1
-            character_key = f"protagonist:generic:{occurrence}"
+            character_key = f"{base_key}:{occurrence}"
         seen_keys.add(character_key)
 
         aliases = []
@@ -3823,6 +3956,10 @@ def normalize_episode_character_signals_payload(
                 "relation_edges": [],
                 "identity_claims": [],
                 "episode_no": episode_no,
+                **({
+                    "evidence": [dict(evidence) for evidence in item["evidence"]],
+                    "observed_display_name": str(item.get("display_name") or ""),
+                } if "evidence" in item else {}),
             }
         )
         raw_relation_edges_by_key[character_key] = relation_edges
@@ -3834,6 +3971,14 @@ def normalize_episode_character_signals_payload(
         normalized_display_name = normalize_signal_entity_label(display_name)
         if normalized_display_name:
             alias_to_character_key.setdefault(normalized_display_name, character_key)
+
+    alias_owners: dict[str, set[str]] = {}
+    for character in normalized_characters:
+        for alias in [character["display_name"], *character["aliases"]]:
+            alias_owners.setdefault(normalize_signal_entity_label(alias), set()).add(character["character_key"])
+    alias_to_character_key = {
+        alias: next(iter(owners)) for alias, owners in alias_owners.items() if len(owners) == 1
+    }
 
     for character in normalized_characters:
         character_key = str(character.get("character_key") or "").strip()
@@ -3867,16 +4012,6 @@ def normalize_episode_character_signals_payload(
             target_key = str(
                 alias_to_character_key.get(normalized_target_label) or ""
             ).strip()
-            named_target_key = build_named_character_scope_key(target_label)
-            if (
-                claim_type == "possessed_as"
-                and named_target_key != character_key
-                and any(
-                    str(item.get("character_key") or "") == named_target_key
-                    for item in normalized_characters
-                )
-            ):
-                target_key = named_target_key
             normalized_identity_claims.append(
                 {
                     "target_label": target_label[:40],
@@ -4172,97 +4307,6 @@ def build_profile_voice_contract_v1(profile_payload: dict[str, object] | None) -
             "작품에 대해 설명하자면",
         ],
     }
-
-
-def build_character_chat_internal_prompt_user_prompt(
-    *,
-    target: dict[str, object],
-    profile_payload: dict[str, object],
-    example_payload: dict[str, object],
-    dialogue_items: list[dict[str, object]],
-    summary_context_lines: list[str],
-    inventory_item: dict[str, object] | None = None,
-    relation_context_lines: list[str] | None = None,
-    scene_context_lines: list[str] | None = None,
-) -> str:
-    dialogue_lines: list[str] = []
-    for item in dialogue_items[:40]:
-        text_value = normalize_rp_text(str(item.get("text") or ""), limit=220)
-        if not text_value:
-            continue
-        episode_no = int(item.get("episode_no") or 0)
-        kind = str(item.get("kind") or "dialogue").strip()
-        context = str(item.get("context") or "").strip()[:20]
-        dialogue_lines.append(f"- {episode_no}화 | {kind} | {context} | {text_value}")
-
-    example_lines = [
-        f"- {int(item.get('episode_no') or 0)}화 | {normalize_rp_text(str(item.get('text') or ''), limit=220)}"
-        for item in list(example_payload.get("examples") or [])[:5]
-        if str(item.get("text") or "").strip()
-    ]
-
-    compact_inventory = {
-        key: inventory_item.get(key)
-        for key in [
-            "display_name",
-            "aliases",
-            "is_protagonist",
-            "is_first_person",
-            "work_role",
-            "identity_surface",
-            "reveal_boundary",
-            "read_range_state_snapshot",
-            "interaction_affordance_v1",
-            "adjacent_event_seed_v1",
-            "pov_and_protagonist_centrality_v1",
-            "voice_contract_v1",
-            "chat_readiness_v1",
-            "dominant_action_tags",
-            "dominant_affect_tags",
-            "relation_presence",
-            "action_presence",
-            "first_seen_episode_no",
-            "distinct_episode_count",
-        ]
-        if inventory_item and inventory_item.get(key) not in (None, "", [])
-    }
-    profile_voice_contract = build_profile_voice_contract_v1(profile_payload)
-
-    return (
-        "[대상 캐릭터]\n"
-        + json.dumps(
-            {
-                "display_name": str(target.get("display_name") or "").strip(),
-                "aliases": [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()],
-                "is_protagonist": bool(target.get("is_protagonist")),
-                "is_first_person": bool(target.get("is_first_person")),
-            },
-            ensure_ascii=False,
-        )
-        + "\n\n[인벤토리 근거]\n"
-        + json.dumps(compact_inventory, ensure_ascii=False)
-        + "\n\n[RP 프로필]\n"
-        + json.dumps(profile_payload, ensure_ascii=False)
-        + "\n\n[보이스 계약]\n"
-        + json.dumps(
-            {
-                "profile_voice_contract": profile_voice_contract,
-                "inventory_voice_contract": compact_inventory.get("voice_contract_v1") if compact_inventory else None,
-            },
-            ensure_ascii=False,
-        )
-        + "\n\n[대표 대사]\n"
-        + ("\n".join(example_lines) if example_lines else "없음")
-        + "\n\n[대사 후보]\n"
-        + ("\n".join(dialogue_lines) if dialogue_lines else "없음")
-        + "\n\n[회차 요약 근거]\n"
-        + ("\n".join(f"- {line}" for line in summary_context_lines[:8]) if summary_context_lines else "없음")
-        + "\n\n[관계 근거]\n"
-        + ("\n".join(str(line).strip() for line in (relation_context_lines or [])[:8] if str(line).strip()) or "없음")
-        + "\n\n[장면 프레임 근거]\n"
-        + ("\n".join(str(line).strip() for line in (scene_context_lines or [])[:8] if str(line).strip()) or "없음")
-        + "\n\n위 근거만 사용해 character_chat 내부 프롬프트를 작성하라."
-    )
 
 
 def split_text_lines(normalized_text: str) -> list[str]:
@@ -5491,66 +5535,42 @@ def collect_rp_summary_context_lines(
 
 
 async def request_rp_dialogue_items(
-    client: AsyncClient,
-    *,
-    target: dict[str, object],
-    normalized_text: str,
+    client: AsyncClient, *, target: dict[str, object], normalized_text: str,
 ) -> list[dict[str, object]]:
-    operation = AiProviderUsageOperation(
-        feature_key="storyctx",
-        stage_key="rp_dialogue_collection",
-        scope_key=str(target.get("scope_key") or target.get("character_key") or "").strip() or None,
-    )
-    async with storyctx_provider_attempt(
-        operation,
-        provider="openrouter",
-        model=RP_OPENROUTER_MODEL,
-    ) as usage:
-        response = await post_openrouter_background_chat_completion_async(
-            client,
-            base_url=OPENROUTER_BASE_URL,
-            api_key=OPENROUTER_API_KEY,
-            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "X-Title": "LikeNovel Story Agent RP Dialogue Batch",
-            },
-            json=build_rp_openrouter_payload(
-                system_prompt=RP_DIALOGUE_COLLECTION_PROMPT,
-                user_prompt=build_rp_dialogue_collection_user_prompt(target, normalized_text),
-                max_tokens=1800,
-            ),
+    sources = {
+        int(no): text for no, text in re.findall(
+            r'<episode no="(\d+)">\n(.*?)\n</episode>', normalized_text, re.DOTALL,
         )
-        usage.observe_response(response)
-        response.raise_for_status()
-        response_json = usage.capture_response(response)
-        parsed = extract_json_object(extract_openrouter_message_text(response_json)) or {}
-        items = parsed.get("items") or []
-        cleaned: list[dict[str, object]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            text_value = str(item.get("text") or "").strip()
-            if not text_value:
-                continue
-            try:
-                episode_no = int(item.get("episode_no") or 0)
-                confidence = float(item.get("confidence") or 0.0)
-            except (TypeError, ValueError):
-                episode_no = 0
-                confidence = 0.0
-            cleaned.append(
-                {
-                    "kind": str(item.get("kind") or "dialogue").strip().lower() or "dialogue",
-                    "context": str(item.get("context") or "").strip()[:20],
-                    "text": text_value[:300],
-                    "episode_no": episode_no,
-                    "confidence": confidence,
-                }
-            )
-        usage.finish("success" if cleaned else "validation_error")
-        return cleaned
+    }
+
+    def validate(payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise ValueError("dialogue_items")
+        for item in payload["items"]:
+            if (
+                not isinstance(item, dict) or type(item.get("episode_no")) is not int
+                or item["episode_no"] not in sources
+                or not isinstance(item.get("text"), str) or not item["text"].strip()
+                or len(item["text"]) > 300
+                or item["text"].strip() not in sources[item["episode_no"]]
+                or item.get("kind") not in {"dialogue", "monologue"}
+                or type(item.get("confidence")) not in (int, float)
+                or not 0 <= item["confidence"] <= 1
+            ):
+                raise ValueError("dialogue_source_anchor")
+        return payload
+
+    payload = await _request_character_asset_json(
+        client, stage="rp_dialogue",
+        scope=str(target.get("scope_key") or target.get("character_key") or ""),
+        contract="rp_dialogue_grounding_v1",
+        request_payload=build_rp_openrouter_payload(
+            system_prompt=RP_DIALOGUE_COLLECTION_PROMPT,
+            user_prompt=build_rp_dialogue_collection_user_prompt(target, normalized_text),
+            max_tokens=1800,
+        ), validate=validate, title="LikeNovel Story Agent RP Dialogue Batch",
+    )
+    return payload["items"]
 
 
 async def request_rp_character_plan_payload(
@@ -5571,195 +5591,42 @@ async def request_rp_character_plan_payload(
 
 
 async def request_episode_character_signals_payload(
-    client: AsyncClient,
-    *,
-    row: dict[str, object],
-    summary_text: str,
-    opening_text: str = "",
-) -> dict | None:
-    user_prompt = build_episode_character_signals_user_prompt(
-        row,
-        summary_text,
-        opening_text,
-    )
+    client: AsyncClient, *, row: dict[str, object], summary_text: str, opening_text: str = "",
+) -> dict:
+    user_prompt = build_episode_character_signals_user_prompt(row, summary_text, opening_text)
     episode_no = int(row.get("episode_no") or 0)
-    usage_operation = AiProviderUsageOperation(
-        feature_key="storyctx",
-        stage_key="episode_character_signals",
-        product_id=int(row.get("product_id") or 0) or None,
-        episode_id=int(row.get("episode_id") or 0) or None,
-        scope_key=f"episode:{episode_no}" if episode_no else None,
-    )
 
-    response_payload: dict | None = None
-    request_id = ""
+    def validate(payload):
+        error = get_episode_character_signals_contract_error(payload, episode_no=episode_no)
+        if not error:
+            error = get_episode_character_signals_grounding_error(payload, source_parts={
+                "episode_summary": summary_text,
+                "episode_source": opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS],
+            })
+        if error:
+            raise ValueError(error)
+        return payload
+
     if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
-        request_headers = {
-            "x-api-key": settings.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        request_payload = {
-            "model": RP_REASONING_MODEL,
-            "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
+        provider = "anthropic"
+        body = {
+            "model": RP_REASONING_MODEL, "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
             "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
             "messages": [{"role": "user", "content": user_prompt}],
             "tools": [EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA],
             "tool_choice": {"type": "tool", "name": EPISODE_CHARACTER_SIGNALS_TOOL_NAME},
             **build_anthropic_reasoning_options(RP_REASONING_MODEL),
         }
-
-        try:
-            async with storyctx_provider_attempt(
-                usage_operation,
-                provider="anthropic",
-                model=RP_REASONING_MODEL,
-            ) as usage:
-                response = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=request_headers,
-                    json=request_payload,
-                )
-                usage.observe_response(response)
-                response.raise_for_status()
-                response_payload = usage.capture_response(response)
-                request_id = (
-                    response.headers.get("request-id")
-                    or response.headers.get("x-request-id")
-                    or response.headers.get("anthropic-request-id")
-                    or ""
-                ).strip()
-                parsed_response = (
-                    extract_anthropic_tool_input(
-                        response_payload,
-                        tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME,
-                    )
-                    or extract_json_object(extract_anthropic_message_text(response_payload))
-                    or parse_episode_character_signals_structured_text(
-                        extract_anthropic_message_text(response_payload)
-                    )
-                )
-                usage.finish("success" if parsed_response else "parse_error")
-        except (HTTPStatusError, RequestError) as exc:
-            try:
-                async with storyctx_provider_attempt(
-                    usage_operation,
-                    provider="anthropic",
-                    model=RP_REASONING_MODEL,
-                ) as usage:
-                    response = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=request_headers,
-                        json={
-                            "model": RP_REASONING_MODEL,
-                            "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
-                            "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
-                            "messages": [{"role": "user", "content": user_prompt}],
-                            **build_anthropic_reasoning_options(RP_REASONING_MODEL),
-                        },
-                    )
-                    usage.observe_response(response)
-                    response.raise_for_status()
-                    response_payload = usage.capture_response(response)
-                    request_id = (
-                        response.headers.get("request-id")
-                        or response.headers.get("x-request-id")
-                        or response.headers.get("anthropic-request-id")
-                        or ""
-                    ).strip()
-                    parsed_response = (
-                        extract_json_object(extract_anthropic_message_text(response_payload))
-                        or parse_episode_character_signals_structured_text(
-                            extract_anthropic_message_text(response_payload)
-                        )
-                    )
-                    usage.finish("success" if parsed_response else "parse_error")
-            except (HTTPStatusError, RequestError) as retry_exc:
-                logger.warning(
-                    "[storyctx] episode_character_signals anthropic failed episode_no=%s: %s / retry=%s",
-                    episode_no,
-                    exc,
-                    retry_exc,
-                )
-
-    tool_payload = extract_anthropic_tool_input(response_payload or {}, tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME)
-    if tool_payload:
-        return tool_payload
-
-    raw_text = extract_anthropic_message_text(response_payload or {})
-    parsed_json = extract_json_object(raw_text)
-    if parsed_json:
-        return parsed_json
-
-    parsed_text = parse_episode_character_signals_structured_text(raw_text)
-    if parsed_text:
-        return parsed_text
-
-    if OPENROUTER_API_KEY and EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
-        for attempt in range(2):
-            try:
-                async with storyctx_provider_attempt(
-                    usage_operation,
-                    provider="openrouter",
-                    model=EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
-                ) as usage:
-                    response = await asyncio.wait_for(
-                        post_openrouter_background_chat_completion_async(
-                            client,
-                            base_url=OPENROUTER_BASE_URL,
-                            api_key=OPENROUTER_API_KEY,
-                            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-                            headers={
-                                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                                "Content-Type": "application/json",
-                                "X-Title": "LikeNovel Story Agent Episode Character Signals OpenRouter",
-                            },
-                            json=build_character_signals_openrouter_payload(
-                                user_prompt=(
-                                    build_episode_character_signals_user_prompt(row, summary_text)
-                                    + "\n\nJSON object must satisfy the episode_character_signals schema exactly."
-                                ),
-                            ),
-                        ),
-                        timeout=EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS,
-                    )
-                    usage.observe_response(response)
-                    response.raise_for_status()
-                    response_json = usage.capture_response(response)
-                    openrouter_payload = extract_json_object(
-                        extract_openrouter_message_text(response_json)
-                    )
-                    usage.finish("success" if openrouter_payload else "parse_error")
-                    if openrouter_payload:
-                        logger.info(
-                            "[storyctx] episode_character_signals provider=openrouter model=%s episode_no=%s",
-                            EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
-                            episode_no,
-                        )
-                        return openrouter_payload
-            except (asyncio.TimeoutError, HTTPStatusError, RequestError, ValueError, json.JSONDecodeError) as exc:
-                logger.warning(
-                    "[storyctx] episode_character_signals openrouter fallback failed episode_no=%s attempt=%s: %s",
-                    episode_no,
-                    attempt + 1,
-                    exc,
-                )
-                retry_delay = get_openrouter_retry_delay_seconds(exc)
-                if attempt == 0 and retry_delay is not None:
-                    await asyncio.sleep(retry_delay)
-
-    diagnostics = build_episode_character_signals_parse_diagnostics(raw_text)
-    raise EpisodeCharacterSignalsParseError(
-        episode_no=episode_no,
-        model=RP_REASONING_MODEL or EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
-        request_id=request_id,
-        json_parse_ok=bool(diagnostics["json_parse_ok"]),
-        line_parse_ok=bool(diagnostics["line_parse_ok"]),
-        char_count=int(diagnostics["char_count"]),
-        rel_count=int(diagnostics["rel_count"]),
-        hook_count=int(diagnostics["hook_count"]),
-        raw_sha256=str(diagnostics["raw_sha256"]),
-        raw_preview=str(diagnostics["raw_preview"]),
+    else:
+        provider = "openrouter"
+        body = build_character_signals_openrouter_payload(user_prompt=user_prompt)
+    return await _request_character_asset_json(
+        client, stage="signals", scope=f"episode:{int(row['episode_id'])}",
+        contract=EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION + ":grounding_v1",
+        request_payload=body, validate=validate, provider=provider,
+        product_id=int(row.get("product_id") or 0) or None,
+        title="LikeNovel Story Agent Episode Character Signals",
+        timeout=EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS,
     )
 
 
@@ -5791,354 +5658,72 @@ async def request_rp_profile_payload(
     )
 
 
-def normalize_character_chat_internal_prompt_payload(payload: dict | None) -> dict[str, str] | None:
-    if not isinstance(payload, dict):
-        return None
-    internal_prompt = str(payload.get("internal_prompt") or "").strip()
-    if not internal_prompt:
-        return None
-    return {"internal_prompt": internal_prompt[:4000]}
-
-
-async def request_character_chat_internal_prompt_payload(
-    client: AsyncClient,
-    *,
-    target: dict[str, object],
-    profile_payload: dict[str, object],
-    example_payload: dict[str, object],
-    dialogue_items: list[dict[str, object]],
-    summary_context_lines: list[str],
-    inventory_item: dict[str, object] | None = None,
-    relation_context_lines: list[str] | None = None,
-    scene_context_lines: list[str] | None = None,
-) -> dict[str, str] | None:
-    payload = await request_rp_openrouter_json_payload(
-        client,
-        system_prompt=CHARACTER_CHAT_INTERNAL_PROMPT_SYSTEM,
-        user_prompt=build_character_chat_internal_prompt_user_prompt(
-            target=target,
-            profile_payload=profile_payload,
-            example_payload=example_payload,
-            dialogue_items=dialogue_items,
-            summary_context_lines=summary_context_lines,
-            inventory_item=inventory_item,
-            relation_context_lines=relation_context_lines,
-            scene_context_lines=scene_context_lines,
-        ),
-        max_tokens=3200,
-        title="LikeNovel Story Agent Character Chat Internal Prompt Batch",
-        timeout_seconds=CHARACTER_CHAT_INTERNAL_PROMPT_TIMEOUT_SECONDS,
-        stage_key="character_chat_internal_prompt",
-        scope_key=str(target.get("scope_key") or target.get("character_key") or "").strip() or None,
-    )
-    return normalize_character_chat_internal_prompt_payload(payload)
-
-
-def build_character_chat_opening_user_prompt(
-    *,
-    scope_key: str,
-    target: dict[str, object],
-    profile_payload: dict[str, object],
-    example_payload: dict[str, object],
-    internal_prompt_payload: dict[str, object],
-    summary_context_lines: list[str],
-    inventory_item: dict[str, object] | None = None,
-    relation_context_lines: list[str] | None = None,
-    scene_context_lines: list[str] | None = None,
-) -> str:
-    compact_inventory = {
-        key: inventory_item.get(key)
-        for key in [
-            "display_name",
-            "aliases",
-            "is_protagonist",
-            "is_first_person",
-            "work_role",
-            "identity_surface",
-            "reveal_boundary",
-            "read_range_state_snapshot",
-            "interaction_affordance_v1",
-            "adjacent_event_seed_v1",
-            "chat_readiness_v1",
-            "public_chat_eligible",
-            "public_slot_eligible",
-        ]
-        if inventory_item and inventory_item.get(key) not in (None, "", [])
-    }
-    return (
-        "[필수 scope_key]\n"
-        + scope_key
-        + "\n\n[대상 캐릭터]\n"
-        + json.dumps(
-            {
-                "display_name": str(target.get("display_name") or "").strip(),
-                "aliases": [str(alias).strip() for alias in (target.get("aliases") or []) if str(alias).strip()],
-                "is_protagonist": bool(target.get("is_protagonist")),
-                "is_first_person": bool(target.get("is_first_person")),
-            },
-            ensure_ascii=False,
-        )
-        + "\n\n[인벤토리]\n"
-        + json.dumps(compact_inventory, ensure_ascii=False)
-        + "\n\n[RP 프로필]\n"
-        + json.dumps(profile_payload, ensure_ascii=False)
-        + "\n\n[대표 대사]\n"
-        + json.dumps(example_payload, ensure_ascii=False)
-        + "\n\n[내부 프롬프트]\n"
-        + json.dumps(internal_prompt_payload, ensure_ascii=False)
-        + "\n\n[회차 요약 근거]\n"
-        + ("\n".join(f"- {line}" for line in summary_context_lines[:8]) if summary_context_lines else "없음")
-        + "\n\n[관계 근거]\n"
-        + ("\n".join(str(line).strip() for line in (relation_context_lines or [])[:8] if str(line).strip()) or "없음")
-        + "\n\n[장면 프레임 근거]\n"
-        + ("\n".join(str(line).strip() for line in (scene_context_lines or [])[:8] if str(line).strip()) or "없음")
-        + "\n\n위 근거만 사용해 character_chat_opening_v1 JSON을 작성하라."
-    )
-
-
-def normalize_character_chat_opening_payload(
-    payload: dict | None,
-    *,
-    scope_key: str,
-    display_name: str,
-) -> dict[str, object] | None:
-    if not isinstance(payload, dict):
-        return None
-    readiness = dict(payload.get("readiness") or {})
-    if str(readiness.get("status") or "").strip() != "ready":
-        return None
-    chat_target = dict(payload.get("chat_target") or {})
-    payload_scope_key = str(chat_target.get("scope_key") or "").strip()
-    if payload_scope_key and payload_scope_key != scope_key:
-        return None
-    chat_target["scope_key"] = scope_key
-    chat_target["display_name"] = str(chat_target.get("display_name") or "").strip() or display_name
-    if not chat_target["display_name"]:
-        return None
-    required_dict_fields = [
-        "opening_message",
-        "opening_scene",
-        "user_role",
-        "character_drive",
-        "agency_contract",
-        "progression_engine",
-        "runtime_formula_seed",
-    ]
-    if any(not isinstance(payload.get(field_name), dict) or not payload.get(field_name) for field_name in required_dict_fields):
-        return None
-    opening_message = normalize_character_chat_opening_message(payload.get("opening_message"))
-    if opening_message is None:
-        return None
-    runtime_formula_seed = normalize_character_chat_runtime_formula_seed(
-        payload.get("runtime_formula_seed")
-    )
-    if runtime_formula_seed is None:
-        return None
-    normalized = dict(payload)
-    normalized["schema_version"] = CHARACTER_CHAT_OPENING_FORMAT_VERSION
-    normalized["readiness"] = readiness
-    normalized["chat_target"] = chat_target
-    normalized["opening_message"] = opening_message
-    normalized["runtime_formula_seed"] = runtime_formula_seed
-    return normalized
-
-
-def normalize_character_chat_runtime_formula_seed(value: object) -> dict[str, str] | None:
-    if not isinstance(value, dict) or not value:
-        return None
-    normalized: dict[str, str] = {}
-    for field_name in CHARACTER_CHAT_RUNTIME_FORMULA_REQUIRED_FIELDS:
-        field_value = normalize_rp_text(str(value.get(field_name) or ""), limit=700)
-        if not field_value:
-            return None
-        normalized[field_name] = field_value
-    return normalized
-
-
-def normalize_character_chat_opening_message(value: object) -> dict[str, str] | None:
-    if not isinstance(value, dict):
-        return None
-    narration = normalize_rp_text(str(value.get("narration") or ""), limit=900)
-    dialogue = normalize_rp_text(str(value.get("dialogue") or ""), limit=600)
-    if dialogue and not any(mark in dialogue for mark in ('"', "“", "”")):
-        dialogue = f'"{dialogue.strip(chr(34)).strip("“”")}"'
-    opening_text = normalize_character_chat_opening_block(str(value.get("opening_text") or ""), limit=1800)
-    user_objective = normalize_rp_text(str(value.get("user_objective") or ""), limit=220)
-    if not opening_text and narration and dialogue:
-        opening_text = f"{narration}\n\n{dialogue}"
-    elif opening_text and "\n" not in opening_text and narration and dialogue:
-        opening_text = f"{narration}\n\n{dialogue}"
-    if not narration or not dialogue or not opening_text or not user_objective:
-        return None
-    if len(narration) < 220 or len(dialogue) < 20 or len(opening_text) < 280:
-        return None
-    if dialogue not in opening_text and dialogue.strip('"“”') not in opening_text:
-        return None
-    if dialogue.strip().lstrip('"“').startswith("거기"):
-        return None
-    if has_character_chat_opening_agency_violation(f"{dialogue}\n{opening_text}"):
-        return None
-    return {
-        "narration": narration,
-        "dialogue": dialogue,
-        "opening_text": opening_text,
-        "user_objective": user_objective,
-    }
-
-
-def has_character_chat_opening_agency_violation(text: str) -> bool:
-    normalized = normalize_rp_text(str(text or ""), limit=2200)
-    if not normalized:
-        return False
-    forbidden_fragments = [
-        "멍하니 서",
-        "멍하니 있",
-        "숨어서",
-        "숨어 있",
-        "눈치만 보",
-        "튀어나와",
-        "어슬렁",
-        "허가받지 않은",
-        "침입자",
-        "침입했",
-        "목적이 뭐",
-        "정체가 뭐",
-        "누구냐",
-        "왜 여기",
-        "대답해",
-        "네가 가리킨",
-        "네가 들고",
-        "네가 내민",
-        "네 손",
-        "네 발치",
-        "너를 향해",
-        "너에게",
-        "너를 쏘아보",
-        "너를 힐끗",
-        "너를 쳐다",
-    ]
-    return any(fragment in normalized for fragment in forbidden_fragments)
-
-
-def normalize_character_chat_opening_block(value: str, *, limit: int) -> str:
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u3000", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    lines: list[str] = []
-    blank_seen = False
-    for raw_line in text.split("\n"):
-        line = raw_line.strip()
-        if not line:
-            if lines and not blank_seen:
-                lines.append("")
-            blank_seen = True
-            continue
-        lines.append(line)
-        blank_seen = False
-    normalized = "\n".join(lines).strip()
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    if len(normalized) > limit:
-        normalized = normalized[:limit].rstrip()
-    return normalized
-
-
-async def request_character_chat_opening_payload(
-    client: AsyncClient,
-    *,
-    scope_key: str,
-    target: dict[str, object],
-    profile_payload: dict[str, object],
-    example_payload: dict[str, object],
-    internal_prompt_payload: dict[str, object],
-    summary_context_lines: list[str],
-    inventory_item: dict[str, object] | None = None,
-    relation_context_lines: list[str] | None = None,
-    scene_context_lines: list[str] | None = None,
-) -> dict[str, object] | None:
-    display_name = str(target.get("display_name") or "").strip()
-    payload = await request_rp_openrouter_json_payload(
-        client,
-        system_prompt=CHARACTER_CHAT_OPENING_SYSTEM,
-        user_prompt=build_character_chat_opening_user_prompt(
-            scope_key=scope_key,
-            target=target,
-            profile_payload=profile_payload,
-            example_payload=example_payload,
-            internal_prompt_payload=internal_prompt_payload,
-            summary_context_lines=summary_context_lines,
-            inventory_item=inventory_item,
-            relation_context_lines=relation_context_lines,
-            scene_context_lines=scene_context_lines,
-        ),
-        max_tokens=3000,
-        title="LikeNovel Story Agent Character Chat Opening Batch",
-        stage_key="character_chat_opening",
-        scope_key=scope_key,
-    )
-    return normalize_character_chat_opening_payload(
-        payload,
-        scope_key=scope_key,
-        display_name=display_name,
-    )
-
-
 async def request_episode_scene_extraction_payload(
-    client: AsyncClient,
-    *,
-    product_title: str,
-    episode_no: int,
-    episode_title: str,
-    normalized_text: str,
-    canonical_character_packet: object | None = None,
+    client: AsyncClient, *, product_title: str, episode_no: int, episode_title: str,
+    episode_scope_key: str,
+    normalized_text: str, canonical_character_packet: object | None = None,
     product_id: int | None = None,
+    required_scope_keys: set[str] | None = None,
+    scope_key_replacements: dict[str, str] | None = None,
 ) -> dict[str, object]:
     user_prompt = build_episode_scene_extraction_user_prompt(
-        product_title=product_title,
-        episode_no=episode_no,
-        episode_title=episode_title,
-        normalized_text=normalized_text,
-        canonical_character_packet=canonical_character_packet,
+        product_title=product_title, episode_no=episode_no, episode_title=episode_title,
+        normalized_text=normalized_text, canonical_character_packet=canonical_character_packet,
     )
-    normalized_payload: dict[str, object] = {}
-    usage_operation = AiProviderUsageOperation(
-        feature_key="storyctx",
-        stage_key="episode_scene_extraction",
-        product_id=product_id,
-        scope_key=f"episode:{episode_no}" if episode_no else None,
+
+    replacements = dict(scope_key_replacements or {})
+    required = {replacements.get(key, key) for key in required_scope_keys or set()}
+    packet_scopes = set(_build_episode_scene_canonical_map(canonical_character_packet))
+    if not re.fullmatch(r"episode:[1-9][0-9]*", episode_scope_key) or type(episode_no) is not int or episode_no <= 0 or not required.issubset(packet_scopes):
+        raise CharacterAssetAttemptBlocked("scene_impossible_source_or_required_actor")
+
+    def normalized_payload(payload):
+        if not isinstance(payload, dict):
+            raise ValueError("scene_parse")
+        if "episode_no" in payload and (type(payload["episode_no"]) is not int or payload["episode_no"] != episode_no):
+            raise ValueError("scene_source_episode_mismatch")
+        copied = json.loads(json.dumps(payload))
+        for scene in copied.get("scenes") or []:
+            if not isinstance(scene, dict):
+                continue
+            for field, actor_field in (("participants", "scope_key"), ("action_ownership", "actor_scope_key")):
+                for actor in scene.get(field) or []:
+                    if isinstance(actor, dict) and actor.get(actor_field) in replacements:
+                        actor[actor_field] = replacements[actor[actor_field]]
+        normalized = normalize_episode_scene_extraction_payload(
+            copied, normalized_text=normalized_text,
+            canonical_character_packet=canonical_character_packet, episode_no=episode_no,
+        )
+        if not _is_usable_episode_scene_payload(normalized):
+            raise ValueError("scene_contract")
+        missing = required - extract_episode_scene_character_scope_keys(normalized)
+        if missing:
+            raise ValueError("scene_required_scope_missing:" + ",".join(sorted(missing)))
+        return normalized
+
+    def validate(payload):
+        normalized_payload(payload)
+        return payload
+
+    # Preserve the existing receipt identity: a contract upgrade is not retry authority.
+    store = _character_asset_attempt_store
+    if store is None:
+        raise CharacterAssetAttemptBlocked("character_asset_attempt_store_not_initialized")
+    old_request = build_episode_scene_extraction_openrouter_payload(user_prompt=user_prompt)
+    old_key = attempt_key(int(product_id or _character_asset_product_id.get()), "scenes", episode_scope_key, EPISODE_SCENE_EXTRACTION_FORMAT_VERSION + ":receipt_v1", {"provider": "openrouter", "body": old_request})
+    old_payload = store.load(old_key, validate)
+    if old_payload is not None:
+        return normalized_payload(old_payload)
+    constraints = {"episode_scope_key": episode_scope_key, "episode_no": episode_no, "required_scope_keys": sorted(required), "scope_key_replacements": dict(sorted(replacements.items()))}
+    user_prompt += "\n필수 장면 계약: " + json.dumps(constraints, ensure_ascii=False, sort_keys=True) + "\n원문에서 뒷받침되는 필수 인물을 장면에 포함하고, 근거 없는 인물은 만들지 마라."
+    payload = await _request_character_asset_json(
+        client, stage="scenes", scope=episode_scope_key, product_id=product_id,
+        contract=EPISODE_SCENE_EXTRACTION_FORMAT_VERSION + ":receipt_v2",
+        request_payload=build_episode_scene_extraction_openrouter_payload(user_prompt=user_prompt),
+        validate=validate, title="LikeNovel Story Agent Episode Scene Extraction Batch",
+        timeout=EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS,
     )
-    for attempt in range(2):
-        retry_suffix = (
-            "\n\n이전 응답은 완전한 JSON object가 아니었다. "
-            "이번에는 반드시 닫힌 JSON object 하나만 끝까지 반환하라."
-            if attempt
-            else ""
-        )
-        try:
-            payload = await request_episode_scene_extraction_openrouter_json_payload(
-                client,
-                user_prompt=user_prompt + retry_suffix,
-                usage_operation=usage_operation,
-                product_id=product_id,
-            )
-        except (asyncio.TimeoutError, HTTPStatusError, RequestError, json.JSONDecodeError) as exc:
-            logger.warning(
-                "[storyctx] episode_scene_extraction openrouter failed episode_no=%s attempt=%s: %s",
-                episode_no,
-                attempt + 1,
-                exc,
-            )
-            retry_delay = get_openrouter_retry_delay_seconds(exc)
-            if attempt == 0 and retry_delay is not None:
-                await asyncio.sleep(retry_delay)
-            continue
-        normalized_payload = normalize_episode_scene_extraction_payload(
-            payload,
-            normalized_text=normalized_text,
-            canonical_character_packet=canonical_character_packet,
-            episode_no=episode_no,
-        )
-        if _is_usable_episode_scene_payload(normalized_payload):
-            return normalized_payload
-    return normalized_payload
+    return normalized_payload(payload)
 
 
 def build_rp_inventory_signature_parts(inventory_item: dict[str, object] | None) -> list[str]:
@@ -6147,30 +5732,6 @@ def build_rp_inventory_signature_parts(inventory_item: dict[str, object] | None)
     return [
         "inventory_v3:"
         + build_character_inventory_v3_source_hash(inventory_item)
-    ]
-
-
-def build_character_chat_inventory_signature_parts(inventory_item: dict[str, object] | None) -> list[str]:
-    if not inventory_item:
-        return []
-    return [
-        *build_rp_inventory_signature_parts(inventory_item),
-        "inv:identity_surface:"
-        + json.dumps(dict(inventory_item.get("identity_surface") or {}), ensure_ascii=False, sort_keys=True),
-        "inv:reveal_boundary:"
-        + json.dumps(dict(inventory_item.get("reveal_boundary") or {}), ensure_ascii=False, sort_keys=True),
-        "inv:read_range_state:"
-        + json.dumps(dict(inventory_item.get("read_range_state_snapshot") or {}), ensure_ascii=False, sort_keys=True),
-        "inv:interaction_affordance:"
-        + json.dumps(dict(inventory_item.get("interaction_affordance_v1") or {}), ensure_ascii=False, sort_keys=True),
-        "inv:adjacent_event_seed:"
-        + json.dumps(dict(inventory_item.get("adjacent_event_seed_v1") or {}), ensure_ascii=False, sort_keys=True),
-        "inv:pov_centrality:"
-        + json.dumps(dict(inventory_item.get("pov_and_protagonist_centrality_v1") or {}), ensure_ascii=False, sort_keys=True),
-        "inv:voice_contract:"
-        + json.dumps(dict(inventory_item.get("voice_contract_v1") or {}), ensure_ascii=False, sort_keys=True),
-        "inv:chat_readiness:"
-        + json.dumps(dict(inventory_item.get("chat_readiness_v1") or {}), ensure_ascii=False, sort_keys=True),
     ]
 
 
@@ -6222,61 +5783,6 @@ def build_rp_examples_source_hash(
                 for item in list(example_payload.get("examples") or [])
                 if isinstance(item, dict)
             ),
-        ],
-    )
-
-
-def build_character_chat_internal_prompt_source_hash(
-    *,
-    character_key: str,
-    inventory_item: dict[str, object] | None,
-    profile_payload: dict[str, object],
-    example_payload: dict[str, object],
-    dialogue_items: list[dict[str, object]],
-    summary_context_lines: list[str],
-    relation_context_lines: list[str],
-    scene_context_lines: list[str] | None = None,
-) -> str:
-    return build_compound_summary_source_hash(
-        CHARACTER_CHAT_INTERNAL_PROMPT_FORMAT_VERSION,
-        [
-            character_key,
-            build_rp_profile_model_signature(),
-            *build_character_chat_inventory_signature_parts(inventory_item),
-            json.dumps(profile_payload, ensure_ascii=False, sort_keys=True),
-            *(str(item.get("text") or "") for item in list(example_payload.get("examples") or [])),
-            *(f"summary:{line}" for line in summary_context_lines[:8]),
-            *(f"relation:{line}" for line in relation_context_lines[:8]),
-            *(f"scene:{line}" for line in list(scene_context_lines or [])[:8]),
-            *(f"{int(item.get('episode_no') or 0)}:{str(item.get('text') or '')}" for item in dialogue_items[:40]),
-        ],
-    )
-
-
-def build_character_chat_opening_source_hash(
-    *,
-    character_key: str,
-    inventory_item: dict[str, object] | None,
-    profile_row: dict[str, object],
-    examples_row: dict[str, object],
-    internal_prompt_row: dict[str, object],
-    summary_context_lines: list[str],
-    relation_context_lines: list[str],
-    scene_context_lines: list[str] | None = None,
-) -> str:
-    return build_compound_summary_source_hash(
-        CHARACTER_CHAT_OPENING_FORMAT_VERSION,
-        [
-            CHARACTER_CHAT_OPENING_RUNTIME_FORMULA_CONTRACT_VERSION,
-            character_key,
-            build_rp_profile_model_signature(),
-            *build_character_chat_inventory_signature_parts(inventory_item),
-            f"profile:{str(profile_row.get('source_hash') or '')}",
-            f"examples:{str(examples_row.get('source_hash') or '')}",
-            f"internal:{str(internal_prompt_row.get('source_hash') or '')}",
-            *(f"summary:{line}" for line in summary_context_lines[:8]),
-            *(f"relation:{line}" for line in relation_context_lines[:8]),
-            *(f"scene:{line}" for line in list(scene_context_lines or [])[:8]),
         ],
     )
 
@@ -6465,7 +5971,7 @@ def build_inventory_rp_targets(
         if not is_batch_rp_candidate(inventory_payload):
             continue
         target = build_inventory_rp_target(scope_key=str(scope_key), inventory_item=inventory_payload)
-        if not target or get_rp_target_skip_reason(target):
+        if not target or ("character_contract" not in inventory_payload and get_rp_target_skip_reason(target)):
             continue
         target = attach_competing_speaker_anchors(
             target,
@@ -6761,6 +6267,17 @@ def select_delta_rp_scope_keys(
             continue
         profile_payload = dict(dict((profile_map or {}).get(scope_key) or {}).get("payload") or {})
         examples_payload = dict(dict((examples_map or {}).get(scope_key) or {}).get("payload") or {})
+        inventory = dict(inventory_map.get(scope_key) or {})
+        if any("character_contract" in item for item in (inventory, profile_payload, examples_payload)):
+            if not (
+                inventory.get("character_contract") == profile_payload.get("character_contract")
+                and select_character_chat_grounding_v1(
+                    profile_payload, examples_payload, expected_character_key=scope_key,
+                    read_episode_to=None,
+                )
+            ):
+                missing_scope_keys.add(scope_key)
+            continue
         if not is_character_chat_rp_profile_payload_ready(
             profile_payload,
             expected_character_key=scope_key,
@@ -6772,6 +6289,8 @@ def select_delta_rp_scope_keys(
 def is_batch_rp_candidate(inventory_item: dict[str, object] | None) -> bool:
     if not inventory_item:
         return False
+    if any(key in inventory_item for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        return is_character_inventory_grounding_contract_ready(inventory_item) and is_character_chat_inventory_v1_decision_coherent(inventory_item)
     if bool(inventory_item.get("is_protagonist")):
         return True
     identity_conflict_reasons = {
@@ -6885,11 +6404,8 @@ def compute_rp_affected_scope_keys(
     new_touched_signal_rows: list[dict],
     old_profile_map: dict[str, dict[str, object]],
     old_examples_map: dict[str, dict[str, object]],
-    old_internal_prompt_map: dict[str, dict[str, object]] | None = None,
     cleanup_scope_keys: set[str] | None = None,
 ) -> set[str]:
-    internal_prompt_gate_enabled = old_internal_prompt_map is not None
-    old_internal_prompt_map = old_internal_prompt_map or {}
     touched_character_keys = extract_character_keys_from_signal_rows(old_touched_signal_rows) | extract_character_keys_from_signal_rows(new_touched_signal_rows)
     touched_relation_keys = extract_relation_keys_from_signal_rows(old_touched_signal_rows) | extract_relation_keys_from_signal_rows(new_touched_signal_rows)
     changed_relation_keys = {
@@ -6928,7 +6444,6 @@ def compute_rp_affected_scope_keys(
                 and (
                     source_key in old_profile_map
                     or source_key in old_examples_map
-                    or source_key in old_internal_prompt_map
                 )
             ):
                 resolved_scope_keys.add(source_key)
@@ -6944,7 +6459,6 @@ def compute_rp_affected_scope_keys(
             or new_inventory_item
             or scope_key in old_profile_map
             or scope_key in old_examples_map
-            or scope_key in old_internal_prompt_map
         )
         if not known_scope:
             continue
@@ -6953,14 +6467,12 @@ def compute_rp_affected_scope_keys(
             or scope_key in resolved_relation_scope_keys
             or (new_inventory_item and scope_key not in old_profile_map)
             or (new_inventory_item and scope_key not in old_examples_map)
-            or (internal_prompt_gate_enabled and new_inventory_item and scope_key not in old_internal_prompt_map)
             or (
                 not old_inventory_item
                 and not new_inventory_item
                 and (
                     scope_key in old_profile_map
                     or scope_key in old_examples_map
-                    or scope_key in old_internal_prompt_map
                 )
             )
         ):
@@ -7126,7 +6638,8 @@ async def build_rp_summaries(
         "profile": [0, 0],
         "examples": [0, 0],
     }
-    if summary_client is None or not OPENROUTER_API_KEY or not RP_OPENROUTER_MODEL:
+    provider_available = bool(summary_client is not None and OPENROUTER_API_KEY and RP_OPENROUTER_MODEL)
+    if not provider_available and not any("character_contract" in item for item in (inventory_map or {}).values()):
         return {key: (value[0], value[1]) for key, value in counts.items()}
 
     inventory_source_provided = inventory_map is not None
@@ -7148,10 +6661,6 @@ async def build_rp_summaries(
         logger.info("story_agent_rp_keep_old product_id=%s reason=%s", product_id, "plan_targets_missing")
         return {key: (value[0], value[1]) for key, value in counts.items()}
 
-    scene_context_lines_by_scope = load_character_chat_scene_context_lines_by_scope(
-        conn,
-        product_id=product_id,
-    )
     existing_example_rows_by_scope: dict[str, dict[str, object]] | None = None
     source_scope_key_map = build_inventory_source_scope_key_map(inventory_map or {})
     valid_scope_keys = build_inventory_rp_retained_scope_keys(inventory_map or {})
@@ -7161,6 +6670,16 @@ async def build_rp_summaries(
             continue
         inventory_item = dict((inventory_map or {}).get(character_key) or {})
         valid_scope_keys.update(build_inventory_scope_alias_keys(character_key, inventory_item))
+        if "character_contract" in inventory_item:
+            with work_cursor(conn) as cur:
+                grounded_counts = upsert_grounded_rp_pair(cur, product_id=product_id, inventory=inventory_item)
+            for name, inserted in grounded_counts.items():
+                counts[name][0 if inserted else 1] += 1
+            if processed_scope_keys is not None:
+                processed_scope_keys.add(character_key)
+            continue
+        if not provider_available:
+            continue
         skip_reason = get_rp_target_skip_reason(target)
         if skip_reason:
             logger.info(
@@ -7206,7 +6725,7 @@ async def build_rp_summaries(
                     episode_texts_by_no=episode_texts_by_no,
                     aliases=aliases,
                 )
-            except OpenRouterBackgroundCreditReserveError:
+            except (OpenRouterBackgroundCreditReserveError, CharacterAssetAttemptBlocked):
                 raise
             except Exception as exc:
                 if verbose:
@@ -7294,7 +6813,6 @@ async def build_rp_summaries(
             character_key=character_key,
             relation_map=relation_map or {},
         )
-        scene_context_lines = scene_context_lines_by_scope.get(character_key, [])
 
         if not dialogue_items:
             logger.info(
@@ -7314,7 +6832,7 @@ async def build_rp_summaries(
                 inventory_item=inventory_item,
                 relation_context_lines=relation_context_lines,
             )
-        except OpenRouterBackgroundCreditReserveError:
+        except (OpenRouterBackgroundCreditReserveError, CharacterAssetAttemptBlocked):
             raise
         except Exception as exc:
             if verbose:
@@ -7372,37 +6890,6 @@ async def build_rp_summaries(
                     "confidence": 0.9 if matched_item else 0.7,
                 }
             )
-        internal_prompt_payload: dict[str, str] | None = None
-        try:
-            internal_prompt_payload = await request_character_chat_internal_prompt_payload(
-                summary_client,
-                target=target,
-                profile_payload=profile_payload,
-                example_payload=example_payload,
-                dialogue_items=dialogue_items,
-                summary_context_lines=summary_context_lines,
-                inventory_item=inventory_item,
-                relation_context_lines=relation_context_lines,
-                scene_context_lines=scene_context_lines,
-            )
-        except OpenRouterBackgroundCreditReserveError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "story_agent_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
-                product_id,
-                character_key,
-                repr(exc)[:200],
-            )
-            if verbose:
-                print(f"[character-chat-prompt-skip] product_id={product_id} character={character_key} error={repr(exc)[:160]}")
-        if internal_prompt_payload:
-            internal_prompt_payload = {
-                "character_key": character_key,
-                "display_name": str(profile_payload.get("display_name") or "").strip(),
-                **internal_prompt_payload,
-            }
-
         profile_source_hash = build_rp_profile_source_hash(
             character_key=character_key,
             inventory_item=inventory_item,
@@ -7417,18 +6904,6 @@ async def build_rp_summaries(
             summary_context_lines=summary_context_lines,
             relation_context_lines=relation_context_lines,
         )
-        internal_prompt_source_hash = ""
-        if internal_prompt_payload:
-            internal_prompt_source_hash = build_character_chat_internal_prompt_source_hash(
-                character_key=character_key,
-                inventory_item=inventory_item,
-                profile_payload=profile_payload,
-                example_payload=example_payload,
-                dialogue_items=dialogue_items,
-                summary_context_lines=summary_context_lines,
-                relation_context_lines=relation_context_lines,
-                scene_context_lines=scene_context_lines,
-            )
         with work_cursor(conn) as cur:
             _, profile_inserted = upsert_summary(
                 cur,
@@ -7448,16 +6923,6 @@ async def build_rp_summaries(
                 source_doc_count=len(example_payload["examples"]),
                 summary_text=json.dumps(example_payload, ensure_ascii=False),
             )
-            if internal_prompt_payload:
-                upsert_summary(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_chat_internal_prompt",
-                    scope_key=character_key,
-                    source_hash=internal_prompt_source_hash,
-                    source_doc_count=len(dialogue_items),
-                    summary_text=json.dumps(internal_prompt_payload, ensure_ascii=False),
-                )
         if commit_changes:
             conn.commit()
         if processed_scope_keys is not None:
@@ -7470,7 +6935,6 @@ async def build_rp_summaries(
         with work_cursor(conn) as cur:
             deactivate_missing_active_scopes(cur, product_id, "character_rp_profile", valid_scope_keys)
             deactivate_missing_active_scopes(cur, product_id, "character_rp_examples", valid_scope_keys)
-            deactivate_missing_active_scopes(cur, product_id, "character_chat_internal_prompt", valid_scope_keys)
         if commit_changes:
             conn.commit()
     return {key: (value[0], value[1]) for key, value in counts.items()}
@@ -7541,14 +7005,6 @@ async def build_rp_summaries_delta(
         and OPENROUTER_API_KEY
         and RP_OPENROUTER_MODEL
     )
-    scene_context_lines_by_scope = (
-        load_character_chat_scene_context_lines_by_scope(
-            conn,
-            product_id=product_id,
-        )
-        if provider_available
-        else {}
-    )
     with work_cursor(conn) as cur:
         existing_profile_rows_by_scope = fetch_active_summary_state_map(
             cur=cur,
@@ -7609,6 +7065,15 @@ async def build_rp_summaries_delta(
                 product_id,
                 scope_key,
             )
+            continue
+
+        if "character_contract" in inventory_item:
+            with work_cursor(conn) as cur:
+                grounded_counts = upsert_grounded_rp_pair(cur, product_id=product_id, inventory=inventory_item)
+            for name, inserted in grounded_counts.items():
+                counts[name][0 if inserted else 1] += 1
+            if processed_scope_keys is not None:
+                processed_scope_keys.add(scope_key)
             continue
 
         target = dict(build_inventory_rp_target(scope_key=scope_key, inventory_item=inventory_item) or {})
@@ -7892,7 +7357,6 @@ async def build_rp_summaries_delta(
             character_key=scope_key,
             relation_map=relation_map,
         )
-        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
 
         direct_dialogue_items = collect_rule_based_rp_dialogue_items_by_episode(target, episode_texts_by_no)
         direct_voice_quality = build_direct_voice_evidence_quality(target, episode_texts_by_no)
@@ -7927,7 +7391,7 @@ async def build_rp_summaries_delta(
             except Exception as exc:
                 if isinstance(
                     exc,
-                    OpenRouterBackgroundCreditReserveError,
+                    (OpenRouterBackgroundCreditReserveError, CharacterAssetAttemptBlocked),
                 ) or (
                     raise_unexpected_errors
                     and not is_expected_story_asset_provider_error(exc)
@@ -7987,7 +7451,7 @@ async def build_rp_summaries_delta(
                 relation_context_lines=relation_context_lines,
             )
         except Exception as exc:
-            if isinstance(exc, OpenRouterBackgroundCreditReserveError) or (
+            if isinstance(exc, (OpenRouterBackgroundCreditReserveError, CharacterAssetAttemptBlocked)) or (
                 raise_unexpected_errors
                 and not is_expected_story_asset_provider_error(exc)
             ):
@@ -8043,40 +7507,6 @@ async def build_rp_summaries_delta(
                     "confidence": 0.9 if matched_item else 0.7,
                 }
             )
-        internal_prompt_payload: dict[str, str] | None = None
-        try:
-            internal_prompt_payload = await request_character_chat_internal_prompt_payload(
-                summary_client,
-                target=target,
-                profile_payload=profile_payload,
-                example_payload=example_payload,
-                dialogue_items=dialogue_items,
-                summary_context_lines=summary_context_lines,
-                inventory_item=inventory_item,
-                relation_context_lines=relation_context_lines,
-                scene_context_lines=scene_context_lines,
-            )
-        except Exception as exc:
-            if isinstance(exc, OpenRouterBackgroundCreditReserveError) or (
-                raise_unexpected_errors
-                and not is_expected_story_asset_provider_error(exc)
-            ):
-                raise
-            logger.warning(
-                "story_agent_delta_character_chat_prompt_keep_old product_id=%s scope_key=%s error=%s",
-                product_id,
-                scope_key,
-                repr(exc)[:200],
-            )
-            if verbose:
-                print(f"[character-chat-delta-prompt-skip] product_id={product_id} character={scope_key} error={repr(exc)[:160]}")
-        if internal_prompt_payload:
-            internal_prompt_payload = {
-                "character_key": scope_key,
-                "display_name": str(profile_payload.get("display_name") or "").strip(),
-                **internal_prompt_payload,
-            }
-
         profile_source_hash = build_rp_profile_source_hash(
             character_key=scope_key,
             inventory_item=inventory_item,
@@ -8091,19 +7521,6 @@ async def build_rp_summaries_delta(
             summary_context_lines=summary_context_lines,
             relation_context_lines=relation_context_lines,
         )
-        internal_prompt_source_hash = ""
-        if internal_prompt_payload:
-            internal_prompt_source_hash = build_character_chat_internal_prompt_source_hash(
-                character_key=scope_key,
-                inventory_item=inventory_item,
-                profile_payload=profile_payload,
-                example_payload=example_payload,
-                dialogue_items=dialogue_items,
-                summary_context_lines=summary_context_lines,
-                relation_context_lines=relation_context_lines,
-                scene_context_lines=scene_context_lines,
-            )
-
         with work_cursor(conn) as cur:
             profile_inserted = False
             examples_inserted = False
@@ -8127,16 +7544,6 @@ async def build_rp_summaries_delta(
                     source_doc_count=len(example_payload["examples"]),
                     summary_text=json.dumps(example_payload, ensure_ascii=False),
                 )
-            if internal_prompt_payload:
-                upsert_summary(
-                    cur,
-                    product_id=product_id,
-                    summary_type="character_chat_internal_prompt",
-                    scope_key=scope_key,
-                    source_hash=internal_prompt_source_hash,
-                    source_doc_count=len(dialogue_items),
-                    summary_text=json.dumps(internal_prompt_payload, ensure_ascii=False),
-                )
         counts["profile"][0 if profile_inserted else 1] += 1
         counts["examples"][0 if examples_inserted else 1] += 1
         if processed_scope_keys is not None:
@@ -8145,223 +7552,12 @@ async def build_rp_summaries_delta(
     return counts
 
 
-async def build_character_chat_opening_summaries(
-    conn,
-    *,
-    product_id: int,
-    episode_rows: list[dict[str, object]],
-    summary_client: AsyncClient | None,
-    inventory_map: dict[str, dict[str, object]],
-    relation_map: dict[str, list[dict[str, object]]],
-    affected_scope_keys: set[str] | None = None,
-    cleanup_missing_scopes: bool = True,
-    verbose: bool = False,
-) -> tuple[int, int]:
-    if summary_client is None or not OPENROUTER_API_KEY or not EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL:
-        return 0, 0
-
-    with work_cursor(conn) as cur:
-        profile_rows_by_scope = fetch_active_summary_state_map(
-            cur=cur,
-            product_id=product_id,
-            summary_type="character_rp_profile",
-        )
-        example_rows_by_scope = fetch_active_summary_state_map(
-            cur=cur,
-            product_id=product_id,
-            summary_type="character_rp_examples",
-        )
-        internal_prompt_rows_by_scope = fetch_active_summary_state_map(
-            cur=cur,
-            product_id=product_id,
-            summary_type="character_chat_internal_prompt",
-        )
-
-    scene_context_lines_by_scope = load_character_chat_scene_context_lines_by_scope(
-        conn,
-        product_id=product_id,
-    )
-    source_scope_key_map = build_inventory_source_scope_key_map(inventory_map or {})
-    normalized_affected_scope_keys: set[str] | None = None
-    if affected_scope_keys is not None:
-        normalized_affected_scope_keys = {
-            source_scope_key_map.get(str(scope_key or "").strip(), str(scope_key or "").strip())
-            for scope_key in affected_scope_keys
-            if str(scope_key or "").strip()
-        }
-
-    inserted_count = 0
-    reused_count = 0
-    valid_scope_keys: set[str] = set()
-    for scope_key, inventory_item in sorted((inventory_map or {}).items()):
-        scope_key = str(scope_key or "").strip()
-        if not scope_key:
-            continue
-        if normalized_affected_scope_keys is not None and scope_key not in normalized_affected_scope_keys:
-            continue
-        inventory_item = dict(inventory_item or {})
-        if not is_batch_rp_candidate(inventory_item):
-            continue
-        target = dict(build_inventory_rp_target(scope_key=scope_key, inventory_item=inventory_item) or {})
-        if not target:
-            continue
-        target = attach_competing_speaker_anchors(
-            target,
-            current_scope_key=scope_key,
-            inventory_map=inventory_map,
-        )
-        if get_rp_target_skip_reason(target):
-            continue
-        profile_row = fetch_summary_state_for_inventory_alias(
-            profile_rows_by_scope,
-            scope_key=scope_key,
-            inventory_item=inventory_item,
-            allowed_alias_keys={
-                alias_key
-                for alias_key, owner_scope_key in source_scope_key_map.items()
-                if owner_scope_key == scope_key
-            },
-        )
-        example_row = fetch_summary_state_for_inventory_alias(
-            example_rows_by_scope,
-            scope_key=scope_key,
-            inventory_item=inventory_item,
-            allowed_alias_keys={
-                alias_key
-                for alias_key, owner_scope_key in source_scope_key_map.items()
-                if owner_scope_key == scope_key
-            },
-        )
-        internal_prompt_row = fetch_summary_state_for_inventory_alias(
-            internal_prompt_rows_by_scope,
-            scope_key=scope_key,
-            inventory_item=inventory_item,
-            allowed_alias_keys={
-                alias_key
-                for alias_key, owner_scope_key in source_scope_key_map.items()
-                if owner_scope_key == scope_key
-            },
-        )
-        scene_context_lines = scene_context_lines_by_scope.get(scope_key, [])
-        if not profile_row or not example_row or not internal_prompt_row or not scene_context_lines:
-            continue
-
-        display_name = str(target.get("display_name") or target.get("reference_name") or "").strip()
-        profile_payload = canonicalize_character_chat_payload_scope(
-            dict(profile_row.get("payload") or {}),
-            scope_key=scope_key,
-            display_name=display_name,
-        )
-        example_payload = canonicalize_character_chat_payload_scope(
-            dict(example_row.get("payload") or {}),
-            scope_key=scope_key,
-            display_name=display_name,
-        )
-        internal_prompt_payload = canonicalize_character_chat_payload_scope(
-            dict(internal_prompt_row.get("payload") or {}),
-            scope_key=scope_key,
-            display_name=display_name,
-        )
-        if not profile_payload or not example_payload or not internal_prompt_payload:
-            continue
-
-        summary_context_lines = collect_rp_summary_context_lines(target, episode_rows)
-        relation_context_lines = build_rp_relation_context_lines(
-            character_key=scope_key,
-            relation_map=relation_map,
-        )
-        source_hash = build_character_chat_opening_source_hash(
-            character_key=scope_key,
-            inventory_item=inventory_item,
-            profile_row=profile_row,
-            examples_row=example_row,
-            internal_prompt_row=internal_prompt_row,
-            summary_context_lines=summary_context_lines,
-            relation_context_lines=relation_context_lines,
-            scene_context_lines=scene_context_lines,
-        )
-        reused_existing = False
-        with work_cursor(conn) as cur:
-            existing = fetch_existing_summary(
-                cur=cur,
-                product_id=product_id,
-                summary_type="character_chat_opening_v1",
-                scope_key=scope_key,
-                source_hash=source_hash,
-            )
-            if existing and _is_character_chat_opening_row_ready(existing, scope_key=scope_key):
-                activate_existing_summary(
-                    cur,
-                    int(existing["summary_id"]),
-                    product_id,
-                    "character_chat_opening_v1",
-                    scope_key,
-                )
-                reused_existing = True
-        if reused_existing:
-            conn.commit()
-            valid_scope_keys.add(scope_key)
-            reused_count += 1
-            continue
-
-        try:
-            opening_payload = await request_character_chat_opening_payload(
-                summary_client,
-                scope_key=scope_key,
-                target=target,
-                profile_payload=profile_payload,
-                example_payload=example_payload,
-                internal_prompt_payload=internal_prompt_payload,
-                summary_context_lines=summary_context_lines,
-                inventory_item=inventory_item,
-                relation_context_lines=relation_context_lines,
-                scene_context_lines=scene_context_lines,
-            )
-        except OpenRouterBackgroundCreditReserveError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "story_agent_character_chat_opening_keep_old product_id=%s scope_key=%s error=%s",
-                product_id,
-                scope_key,
-                str(exc)[:200],
-            )
-            if verbose:
-                print(f"[character-chat-opening-skip] product_id={product_id} character={scope_key} error={str(exc)[:160]}")
-            continue
-        if not opening_payload:
-            continue
-
-        valid_scope_keys.add(scope_key)
-        with work_cursor(conn) as cur:
-            _, inserted = upsert_summary(
-                cur,
-                product_id=product_id,
-                summary_type="character_chat_opening_v1",
-                scope_key=scope_key,
-                source_hash=source_hash,
-                source_doc_count=len(scene_context_lines),
-                summary_text=json.dumps(opening_payload, ensure_ascii=False),
-            )
-        conn.commit()
-        if inserted:
-            inserted_count += 1
-        else:
-            reused_count += 1
-
-    if cleanup_missing_scopes and (inserted_count + reused_count) > 0:
-        with work_cursor(conn) as cur:
-            deactivate_missing_active_scopes(cur, product_id, "character_chat_opening_v1", valid_scope_keys)
-        conn.commit()
-    return inserted_count, reused_count
-
-
 async def build_episode_character_signals_summaries(
     conn,
     *,
     product_id: int,
     episode_rows: list[dict[str, object]],
-    episode_texts_by_no: dict[int, str] | None = None,
+    episode_texts_by_scope: dict[str, str] | None = None,
     summary_client: AsyncClient | None,
     cleanup_missing_scopes: bool = True,
     verbose: bool = False,
@@ -8374,25 +7570,33 @@ async def build_episode_character_signals_summaries(
 
     inserted_count = 0
     reused_count = 0
+    skipped_count = 0
     valid_scope_keys: set[str] = set()
+    staged = []
     for row in episode_rows:
         summary_id = int(row.get("summary_id") or 0)
         episode_no = int(row.get("episode_from") or 0)
         summary_text = str(row.get("summary_text") or "").strip()
         if not summary_id or episode_no <= 0 or not summary_text:
+            skipped_count += 1
             continue
         scope_key = str(row.get("scope_key") or "").strip()
         if not scope_key:
+            skipped_count += 1
             continue
         valid_scope_keys.add(scope_key)
-        opening_text = (
-            str((episode_texts_by_no or {}).get(episode_no) or "").strip()
-            if episode_no <= 3
-            else ""
-        )
+        if not re.fullmatch(r"episode:[1-9][0-9]*", scope_key):
+            raise CharacterAssetAttemptBlocked("invalid_episode_source_scope")
+        opening_text = str((episode_texts_by_scope or {}).get(scope_key) or "").strip()
         source_components = [
-            f"{summary_id}:{str(row.get('source_hash') or '').strip()}",
+            str(row.get('source_hash') or '').strip(),
             build_rp_reasoning_signature(),
+            sha256_text(json.dumps(EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA, ensure_ascii=False, sort_keys=True)),
+            sha256_text(EPISODE_CHARACTER_SIGNALS_PROMPT),
+            sha256_text(build_episode_character_signals_user_prompt(
+                {"episode_no": episode_no, "episode_title": parse_summary_text(summary_text).get("header") or ""},
+                summary_text, opening_text,
+            )),
         ]
         if opening_text:
             source_components.append(
@@ -8402,7 +7606,12 @@ async def build_episode_character_signals_summaries(
             EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION,
             source_components,
         )
+        source_parts = {
+            "episode_summary": summary_text,
+            "episode_source": opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS],
+        }
         existing_summary_id = 0
+        cached_error = None
         with work_cursor(conn) as cur:
             existing = fetch_existing_summary(
                 cur=cur,
@@ -8412,22 +7621,21 @@ async def build_episode_character_signals_summaries(
                 source_hash=source_hash,
             )
             if existing:
-                existing_summary_id = int(existing["summary_id"])
-                activate_existing_summary(
-                    cur,
-                    existing_summary_id,
-                    product_id,
-                    "episode_character_signals",
-                    scope_key,
+                cached_error = get_stored_character_signals_error(
+                    extract_json_object(str(existing.get("summary_text") or "")),
+                    episode_no=episode_no, source_hash=source_hash, source_parts=source_parts,
                 )
+                if not cached_error:
+                    existing_summary_id = int(existing["summary_id"])
+        if cached_error:
+            skipped_count += 1
+            logger.warning("story_agent_character_signals_keep_old product_id=%s episode_no=%s reason=cache_invalid field=%s", product_id, episode_no, cached_error)
+            continue
         if existing_summary_id:
-            if processed_scope_keys is not None:
-                processed_scope_keys.add(scope_key)
-            if commit_changes:
-                conn.commit()
-            reused_count += 1
+            staged.append((scope_key, source_hash, episode_no, existing_summary_id, None))
             continue
         if not provider_available:
+            skipped_count += 1
             if verbose:
                 print(
                     f"[character-signals-keep-old] product_id={product_id} "
@@ -8444,6 +7652,8 @@ async def build_episode_character_signals_summaries(
             payload = await request_episode_character_signals_payload(
                 summary_client,
                 row={
+                    "product_id": product_id,
+                    "episode_id": int(scope_key.removeprefix("episode:")),
                     "episode_no": episode_no,
                     "title": "",
                     "episode_title": parse_summary_text(summary_text).get("header") or "",
@@ -8474,33 +7684,72 @@ async def build_episode_character_signals_summaries(
                     )
                 print(f"[character-signals-skip] product_id={product_id} episode_no={episode_no} error={str(exc)[:240]}")
             raise
-        normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
-        with work_cursor(conn) as cur:
-            _, inserted = upsert_summary(
-                cur,
-                product_id=product_id,
-                summary_type="episode_character_signals",
-                scope_key=scope_key,
-                source_hash=source_hash,
-                source_doc_count=1,
-                summary_text=json.dumps(normalized_payload, ensure_ascii=False),
-                episode_from=episode_no,
-                episode_to=episode_no,
+        contract_error = get_episode_character_signals_contract_error(payload, episode_no=episode_no)
+        if not contract_error:
+            contract_error = get_episode_character_signals_grounding_error(
+                payload,
+                source_parts={
+                    "episode_summary": summary_text,
+                    "episode_source": opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS],
+                },
             )
-        if processed_scope_keys is not None:
-            processed_scope_keys.add(scope_key)
-        if commit_changes:
-            conn.commit()
-        if inserted:
-            inserted_count += 1
-        else:
-            reused_count += 1
+        normalized_payload = None
+        if not contract_error:
+            normalized_payload = normalize_episode_character_signals_payload(payload, episode_no=episode_no)
+            normalized_payload["coverage"] = {
+                "observation_state": "observations_present" if normalized_payload["mentioned_characters"] else "no_entity_observed_in_supplied_coverage",
+                "source_parts": {
+                    "episode_summary": {"sha256": sha256_text(summary_text), "supplied_chars": len(summary_text)},
+                    "episode_source": {
+                        "sha256": sha256_text(opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS]),
+                        "supplied_chars": len(opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS]),
+                        "source_chars": len(opening_text),
+                    },
+                },
+            }
+            normalized_payload["signal_contract"] = {
+                "version": EPISODE_CHARACTER_SIGNALS_FORMAT_VERSION,
+                "input_hash": source_hash,
+                "payload_hash": sha256_text(json.dumps(normalized_payload, ensure_ascii=False, sort_keys=True)),
+            }
+        if contract_error:
+            skipped_count += 1
+            logger.warning(
+                "story_agent_character_signals_keep_old product_id=%s episode_no=%s "
+                "reason=contract_invalid field=%s requested_episode_no=%s response_episode_no=%s",
+                product_id,
+                episode_no,
+                contract_error,
+                episode_no,
+                str(payload.get("episode_no") if isinstance(payload, dict) else None)[:80],
+            )
+            continue
+        staged.append((scope_key, source_hash, episode_no, 0, normalized_payload))
 
-    if cleanup_missing_scopes:
-        with work_cursor(conn) as cur:
+    if skipped_count:
+        logger.warning("story_agent_character_signals_incomplete product_id=%s skipped_count=%s", product_id, skipped_count)
+        return 0, 0
+    # No serving write or activation occurs until every requested scope is accepted.
+    with work_cursor(conn) as cur:
+        for scope_key, source_hash, episode_no, existing_id, payload in staged:
+            if existing_id:
+                activate_existing_summary(cur, existing_id, product_id, "episode_character_signals", scope_key)
+                reused_count += 1
+            else:
+                _, inserted = upsert_summary(
+                    cur, product_id=product_id, summary_type="episode_character_signals",
+                    scope_key=scope_key, source_hash=source_hash, source_doc_count=1,
+                    summary_text=json.dumps(payload, ensure_ascii=False),
+                    episode_from=episode_no, episode_to=episode_no,
+                )
+                inserted_count += int(inserted)
+                reused_count += int(not inserted)
+        if cleanup_missing_scopes:
             deactivate_missing_active_scopes(cur, product_id, "episode_character_signals", valid_scope_keys)
-        if commit_changes:
-            conn.commit()
+    if commit_changes:
+        conn.commit()
+    if processed_scope_keys is not None:
+        processed_scope_keys.update(scope for scope, *_ in staged)
     return inserted_count, reused_count
 
 
@@ -8509,7 +7758,7 @@ async def build_episode_character_signals_summaries_nonblocking(
     *,
     product_id: int,
     episode_rows: list[dict[str, object]],
-    episode_texts_by_no: dict[int, str] | None = None,
+    episode_texts_by_scope: dict[str, str] | None = None,
     summary_client: AsyncClient | None,
     cleanup_missing_scopes: bool = True,
     verbose: bool = False,
@@ -8524,7 +7773,7 @@ async def build_episode_character_signals_summaries_nonblocking(
             conn=conn,
             product_id=product_id,
             episode_rows=episode_rows,
-            episode_texts_by_no=episode_texts_by_no,
+            episode_texts_by_scope=episode_texts_by_scope,
             summary_client=summary_client,
             cleanup_missing_scopes=cleanup_missing_scopes,
             verbose=verbose,
@@ -8550,7 +7799,7 @@ async def build_episode_character_signals_summaries_nonblocking(
     complete = expected_scope_keys.issubset(current_processed_scope_keys)
     if not complete:
         logger.info(
-            "story_agent_character_signals_deferred product_id=%s reason=provider_unavailable",
+            "story_agent_character_signals_deferred product_id=%s reason=signals_incomplete",
             product_id,
         )
     return inserted_count, reused_count, complete
@@ -8596,7 +7845,13 @@ def build_episode_scene_canonical_character_packet(
         display_name = str(item.get("display_name") or "").strip()
         if not scope_key or not display_name:
             continue
-        if str(item.get("entity_kind") or "person").strip().lower() != "person":
+        entity_kind = str(item.get("entity_kind") or "person").strip().lower()
+        anonymous_first_person_main = (
+            entity_kind == "stable_role"
+            and str(item.get("work_role") or "") == "main_protagonist"
+            and _inventory_row_uses_only_generic_first_person_source(item)
+        )
+        if entity_kind != "person" and not anonymous_first_person_main:
             continue
         aliases = [
             str(alias).strip()
@@ -8629,11 +7884,14 @@ def build_episode_scene_canonical_character_packet(
 def build_episode_scene_extraction_source_hash(
     row: dict[str, object],
     canonical_character_packet: object | None,
+    *, normalized_text: str,
 ) -> str:
     return build_compound_summary_source_hash(
         EPISODE_SCENE_EXTRACTION_FORMAT_VERSION,
         [
             f"{int(row.get('summary_id') or 0)}:{str(row.get('source_hash') or '').strip()}",
+            str(row.get("scope_key") or ""),
+            sha256_text(normalized_text),
             json.dumps(canonical_character_packet or {"characters": []}, ensure_ascii=False, sort_keys=True),
         ],
     )
@@ -8666,16 +7924,18 @@ async def build_episode_scene_extraction_summaries(
     product_id: int,
     product_title: str,
     episode_rows: list[dict[str, object]],
-    episode_texts_by_no: dict[int, str],
+    episode_texts_by_scope: dict[str, str],
     summary_client: AsyncClient | None,
     canonical_character_packet: object | None,
     scope_key_replacements: dict[str, str] | None = None,
-    required_scope_keys_by_episode_no: dict[int, set[str]] | None = None,
+    required_scope_keys_by_episode_scope: dict[str, set[str]] | None = None,
     cleanup_missing_scopes: bool = True,
     raise_unexpected_errors: bool = False,
     verbose: bool = False,
     commit_changes: bool = True,
     processed_character_scope_keys: set[str] | None = None,
+    episode_scope_map: dict[str, int] | None = None,
+    production_inventory_map: dict[str, dict] | None = None,
 ) -> tuple[int, int]:
     if summary_client is None or not OPENROUTER_API_KEY or not EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL:
         return 0, 0
@@ -8686,6 +7946,23 @@ async def build_episode_scene_extraction_summaries(
     )
     if not packet_characters:
         return 0, 0
+    if episode_scope_map is None:
+        with work_cursor(conn) as cur:
+            episode_scope_map = fetch_character_chat_catalog_scene_episode_scope_map(cur, product_id=product_id)
+    required_scope_keys_by_episode_scope = {
+        scope: set(keys) for scope, keys in (required_scope_keys_by_episode_scope or {}).items()
+    }
+    for character_scope, inventory in (production_inventory_map or {}).items():
+        if not any(key in inventory for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+            continue
+        if not is_character_inventory_grounding_contract_ready(inventory):
+            raise CharacterAssetAttemptBlocked("scene_production_marked_grounding_invalid")
+        if not is_batch_rp_candidate(inventory):
+            continue
+        for evidence in inventory["grounding_v1"]:
+            source_scope = evidence["episode_scope_key"]
+            if episode_scope_map.get(source_scope) == evidence["episode_no"]:
+                required_scope_keys_by_episode_scope.setdefault(source_scope, set()).add(character_scope)
     resolved_scope_key_replacements = {
         str(scope_key or "").strip(): str(replacement_scope_key or "").strip()
         for scope_key, replacement_scope_key in dict(
@@ -8700,13 +7977,19 @@ async def build_episode_scene_extraction_summaries(
     valid_scope_keys: set[str] = set()
     for row in episode_rows:
         summary_id = int(row.get("summary_id") or 0)
-        episode_no = int(row.get("episode_from") or row.get("episode_no") or 0)
-        normalized_text = str(episode_texts_by_no.get(episode_no) or "").strip()
         scope_key = str(row.get("scope_key") or "").strip()
+        if not re.fullmatch(r"episode:[1-9][0-9]*", scope_key):
+            raise CharacterAssetAttemptBlocked("invalid_episode_source_scope")
+        if scope_key not in episode_scope_map:
+            continue
+        episode_no = episode_scope_map[scope_key]
+        if type(episode_no) is not int or episode_no <= 0 or row.get("episode_from") != episode_no:
+            raise CharacterAssetAttemptBlocked("scene_source_episode_mismatch")
+        normalized_text = str(episode_texts_by_scope.get(scope_key) or "").strip()
         required_scope_keys = {
             resolved_scope_key_replacements.get(scope_key, scope_key)
             for scope_key in set(
-                (required_scope_keys_by_episode_no or {}).get(episode_no)
+                (required_scope_keys_by_episode_scope or {}).get(scope_key)
                 or set()
             )
         }
@@ -8714,7 +7997,7 @@ async def build_episode_scene_extraction_summaries(
         if not summary_id or episode_no <= 0 or not normalized_text or not scope_key:
             continue
         valid_scope_keys.add(scope_key)
-        source_hash = build_episode_scene_extraction_source_hash(row, canonical_character_packet)
+        source_hash = build_episode_scene_extraction_source_hash(row, canonical_character_packet, normalized_text=normalized_text)
         existing_summary_id = 0
         existing_scope_keys: set[str] = set()
         replace_existing_summary_id = 0
@@ -8735,7 +8018,7 @@ async def build_episode_scene_extraction_summaries(
             active_payload = extract_json_object(
                 str(dict(active or {}).get("summary_text") or "")
             ) or {}
-            if _is_usable_episode_scene_payload(active_payload):
+            if active and is_episode_scene_source_bound(active, episode_scope_map) and _is_usable_episode_scene_payload(active_payload):
                 preserved_scope_keys.update(
                     resolved_scope_key_replacements.get(scope_key, scope_key)
                     for scope_key in extract_episode_scene_character_scope_keys(
@@ -8756,6 +8039,7 @@ async def build_episode_scene_extraction_summaries(
                 )
                 if (
                     existing_payload_usable
+                    and is_episode_scene_source_bound(existing, episode_scope_map)
                     and not existing_has_superseded_scope
                     and required_existing_scope_keys.issubset(existing_scope_keys)
                 ):
@@ -8769,8 +8053,11 @@ async def build_episode_scene_extraction_summaries(
                     )
                 else:
                     replace_existing_summary_id = int(existing["summary_id"])
-                    if existing_payload_usable:
-                        preserved_scope_keys.update(existing_scope_keys)
+                    if existing_payload_usable and is_episode_scene_source_bound(existing, episode_scope_map):
+                        preserved_scope_keys.update(
+                            resolved_scope_key_replacements.get(key, key)
+                            for key in existing_scope_keys
+                        )
         if existing_summary_id:
             if processed_character_scope_keys is not None:
                 processed_character_scope_keys.update(existing_scope_keys)
@@ -8779,6 +8066,7 @@ async def build_episode_scene_extraction_summaries(
             reused_count += 1
             continue
 
+        required_output_scope_keys = required_scope_keys | preserved_scope_keys
         try:
             if verbose:
                 print(
@@ -8789,13 +8077,16 @@ async def build_episode_scene_extraction_summaries(
                 summary_client,
                 product_title=product_title,
                 episode_no=episode_no,
+                episode_scope_key=scope_key,
                 episode_title=parse_summary_text(str(row.get("summary_text") or "")).get("header") or "",
                 normalized_text=normalized_text,
                 canonical_character_packet=canonical_character_packet,
                 product_id=product_id,
+                required_scope_keys=required_output_scope_keys,
+                scope_key_replacements=resolved_scope_key_replacements,
             )
         except Exception as exc:
-            if isinstance(exc, OpenRouterBackgroundCreditReserveError) or (
+            if isinstance(exc, (OpenRouterBackgroundCreditReserveError, CharacterAssetAttemptBlocked)) or (
                 raise_unexpected_errors
                 and not is_expected_story_asset_provider_error(exc)
             ):
@@ -8819,16 +8110,8 @@ async def build_episode_scene_extraction_summaries(
                 )
             continue
         generated_scope_keys = extract_episode_scene_character_scope_keys(payload)
-        required_output_scope_keys = required_scope_keys | preserved_scope_keys
         if not required_output_scope_keys.issubset(generated_scope_keys):
-            logger.warning(
-                "story_agent_scene_extraction_keep_old product_id=%s episode_no=%s reason=required_scope_missing required=%s generated=%s",
-                product_id,
-                episode_no,
-                ",".join(sorted(required_output_scope_keys)),
-                ",".join(sorted(generated_scope_keys)),
-            )
-            continue
+            raise CharacterAssetAttemptBlocked("scene_required_scope_missing_after_validation")
 
         if processed_character_scope_keys is not None:
             processed_character_scope_keys.update(generated_scope_keys)
@@ -8880,7 +8163,7 @@ async def build_episode_scene_extraction_summaries_nonblocking(
 ) -> tuple[int, int]:
     try:
         return await build_episode_scene_extraction_summaries(conn, **kwargs)
-    except OpenRouterBackgroundCreditReserveError:
+    except (OpenRouterBackgroundCreditReserveError, CharacterAssetAttemptBlocked):
         raise
     except Exception as exc:
         try:
@@ -9915,16 +9198,39 @@ def _normalize_legacy_anonymous_work_protagonist_signal_payload(
 
 def build_character_inventory_v3_observations(signal_rows: list[dict]) -> list[dict[str, object]]:
     observations: list[dict[str, object]] = []
+    marked_rows: dict[str, dict] = {}
     for row in signal_rows:
-        payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
-            extract_json_object(str(row.get("summary_text") or "")) or {},
-            created_date=row.get("created_date"),
-        )
-        episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
+        payload = extract_json_object(str(row.get("summary_text") or "")) or {}
         source_hash = str(row.get("source_hash") or "").strip()
+        verified = "signal_contract" in payload
+        if verified:
+            episode_no = int(row.get("episode_from") or 0)
+            episode_scope_key = str(row.get("scope_key") or "")
+            if not re.fullmatch(r"episode:[1-9][0-9]*", episode_scope_key):
+                raise CharacterAssetAttemptBlocked("marked_signal_invalid:episode_scope")
+            if "source_episode_no" in row and row["source_episode_no"] != episode_no:
+                raise CharacterAssetAttemptBlocked("marked_signal_invalid:source_episode_no")
+            error = get_stored_character_signals_error(
+                payload, episode_no=episode_no, source_hash=source_hash,
+            )
+            if error:
+                raise CharacterAssetAttemptBlocked(f"marked_signal_invalid:{error}")
+            row_identity = f"{episode_scope_key}:hash:{source_hash}"
+            if row_identity in marked_rows:
+                if marked_rows[row_identity] != payload:
+                    raise CharacterAssetAttemptBlocked("marked_signal_invalid:conflicting_observation_identity")
+                continue
+            marked_rows[row_identity] = payload
+        else:
+            payload = _normalize_legacy_anonymous_work_protagonist_signal_payload(
+                payload, created_date=row.get("created_date"),
+            )
+            episode_no = int(payload.get("episode_no") or row.get("episode_from") or 0)
         summary_id = str(row.get("summary_id") or "").strip()
         episode_id = str(row.get("episode_id") or "").strip()
         observation_row_key = (
+            row_identity
+            if verified else
             f"summary:{summary_id}"
             if summary_id and summary_id != "0"
             else f"episode:{episode_id}"
@@ -10048,6 +9354,11 @@ def build_character_inventory_v3_observations(signal_rows: list[dict]) -> list[d
                     "scene_weight": scene_weight,
                     "role_in_episode": role_in_episode,
                     "voice_mode": voice_mode,
+                    **({
+                        "episode_scope_key": episode_scope_key,
+                        "grounding_v1": [dict(evidence) for evidence in item.get("evidence", [])],
+                        "observed_display_name": str(item.get("observed_display_name") or ""),
+                    } if verified else {}),
                     "action_tags": [
                         str(tag).strip()[:20]
                         for tag in list(item.get("action_tags") or [])
@@ -10134,7 +9445,7 @@ def _union_observations_with_cannot_link_indexes(
 
 def _is_generic_protagonist_source_key(source_key: str) -> bool:
     text = str(source_key or "").strip().lower()
-    return text in {"protagonist:first_person", "protagonist:generic"} or text.startswith("protagonist:generic:")
+    return re.fullmatch(r"protagonist:(?:first_person|generic(?::(?:[2-9]|[1-9][0-9]+))?)", text) is not None
 
 
 def _generic_source_key_observations_can_union(
@@ -10568,6 +9879,28 @@ def _mark_unverified_first_person_identity_rows(rows: list[dict[str, object]]) -
 
 def _has_strong_role_like_persona_evidence(row: dict[str, object]) -> bool:
     display_name = str(row.get("display_name") or "").strip()
+    if any(key in row for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        label = normalize_signal_entity_label(display_name)
+        if (
+            row.get("entity_kind") != "stable_role"
+            or row.get("identity_status") != "RESOLVED_STABLE_ROLE"
+            or not is_character_chat_single_line_label(row.get("display_name"))
+            or not is_character_inventory_grounding_contract_ready(row)
+            or _inventory_identity_blocking_conflict_reasons(row)
+            or label in set(row.get("non_unique_identity_labels") or [])
+        ):
+            return False
+        if (
+            row.get("display_name_source") == "stable_work_role"
+            and row.get("work_role") == "main_protagonist"
+            and int(dict(row.get("first_person_evidence") or {}).get("episode_count") or 0) >= 2
+            and int(dict(row.get("work_protagonist_evidence") or {}).get("episode_count") or 0) >= 2
+        ):
+            return True
+        return _is_role_like_persona_label_candidate(display_name) and len({
+            item["episode_no"] for item in row["identity_labels_v1"]
+            if normalize_signal_entity_label(item["label"]) == label
+        }) >= 2
     if not _is_role_like_persona_label_candidate(display_name):
         return False
     if _inventory_identity_blocking_conflict_reasons(row):
@@ -11236,9 +10569,14 @@ def resolve_character_inventory_v3_clusters(
         for claim in list(observation.get("identity_claims") or []):
             if str(claim.get("claim_type") or "") != "possessed_as":
                 continue
-            for target_index in source_key_to_indexes.get(
-                str(claim.get("target_key") or ""), []
-            ):
+            target_key = str(claim.get("target_key") or "")
+            target_indexes = (
+                source_key_to_indexes.get(target_key, [])
+                if target_key else
+                label_to_indexes.get(str(claim.get("normalized_target_label") or ""), [])
+            )
+            # An unresolved possession target cannot authorize merging any same-label person.
+            for target_index in target_indexes:
                 if (
                     source_index != target_index
                     and int(observations[source_index].get("episode_no") or 0)
@@ -11804,7 +11142,9 @@ def resolve_character_inventory_v3_clusters(
                 and str(claim.get("target_key") or "").strip()
                 and str(claim.get("target_label") or "").strip()
             }
-            if len(possessed_display_names) == 1:
+            if len(possessed_display_names) == 1 and not _display_label_has_hard_public_block(
+                next(iter(possessed_display_names.values()))
+            ):
                 display_name = next(iter(possessed_display_names.values()))
                 display_name_source = "possessed_as_persona"
         if (
@@ -12202,8 +11542,9 @@ def _refresh_character_inventory_v3_serving_fields(
     row: dict[str, object],
 ) -> None:
     row["display_safety"] = build_inventory_display_safety(row)
-    row["public_chat_eligible"] = is_public_chat_inventory_candidate(row)
-    row["public_slot_eligible"] = is_public_slot_inventory_candidate(row)
+    if not any(key in row for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        row["public_chat_eligible"] = is_public_chat_inventory_candidate(row)
+        row["public_slot_eligible"] = is_public_slot_inventory_candidate(row)
     row["identity_surface"] = build_inventory_identity_surface(row)
     row["reveal_boundary"] = build_inventory_reveal_boundary(row)
     row["read_range_state_snapshot"] = build_inventory_read_range_state_snapshot(
@@ -12218,6 +11559,9 @@ def _refresh_character_inventory_v3_serving_fields(
     )
     row["voice_contract_v1"] = build_inventory_voice_contract_v1(row)
     row["chat_readiness_v1"] = build_inventory_chat_readiness_v1(row)
+    if any(key in row for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        row["public_chat_eligible"] = row["chat_readiness_v1"]["character_chat_allowed"]
+        row["public_slot_eligible"] = row["chat_readiness_v1"]["public_slot_allowed"]
 
 
 def _episode_count(observations: list[dict[str, object]], predicate=None) -> int:
@@ -12310,6 +11654,8 @@ def build_inventory_display_safety(row: dict[str, object]) -> dict[str, object]:
     identity_status = str(row.get("identity_status") or "")
     entity_kind = str(row.get("entity_kind") or "").strip().lower()
     role_like_persona_ready = _has_strong_role_like_persona_evidence(row)
+    if "character_contract" in row and role_like_persona_ready:
+        return {"status": "pass", "reason": "grounded_stable_role_identity"}
     if _display_label_has_hard_public_block(display_name):
         return {"status": "fail", "reason": "generic_display_name" if is_generic_character_label(display_name) else "role_or_relation_label"}
     if is_generic_character_label(display_name):
@@ -12342,6 +11688,8 @@ def build_inventory_display_safety(row: dict[str, object]) -> dict[str, object]:
 
 
 def is_public_chat_inventory_candidate(row: dict[str, object]) -> bool:
+    if any(key in row for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        return is_character_inventory_grounding_contract_ready(row) and is_character_chat_inventory_v1_decision_coherent(row)
     display_safety = dict(row.get("display_safety") or build_inventory_display_safety(row))
     if str(display_safety.get("status") or "") != "pass":
         return False
@@ -12367,6 +11715,8 @@ def is_public_chat_inventory_candidate(row: dict[str, object]) -> bool:
 
 
 def is_public_slot_inventory_candidate(row: dict[str, object]) -> bool:
+    if any(key in row for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        return is_character_inventory_grounding_contract_ready(row) and is_character_chat_inventory_v1_decision_coherent(row, require_public_slot=True)
     if not is_public_chat_inventory_candidate(row):
         return False
     if bool(dict(row.get("rp_signal_quality") or {}).get("needs_review")):
@@ -12658,6 +12008,19 @@ def build_inventory_pov_and_protagonist_centrality_v1(row: dict[str, object]) ->
 
 
 def build_inventory_voice_contract_v1(row: dict[str, object]) -> dict[str, object]:
+    if any(key in row for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        evidence = row.get("grounding_v1") if is_character_inventory_grounding_contract_ready(row) else []
+        dialogue_episodes = {item["episode_no"] for item in evidence if item["kind"] == "dialogue"}
+        monologue_episodes = {item["episode_no"] for item in evidence if item["kind"] == "monologue"}
+        return {
+            "schema_version": "voice_contract_v1", "stage": "grounded_inventory",
+            "speech_register": "direct_voice_observed" if dialogue_episodes or monologue_episodes else "direct_voice_unobserved",
+            "evidence_counts": {
+                "dialogue_episode_count": len(dialogue_episodes),
+                "monologue_episode_count": len(monologue_episodes),
+                "speaking_episode_count": len(dialogue_episodes | monologue_episodes),
+            },
+        }
     voice_counts = dict(row.get("voice_mode_counts") or {})
     identity_surface = dict(row.get("identity_surface") or build_inventory_identity_surface(row))
     reveal_boundary = dict(row.get("reveal_boundary") or build_inventory_reveal_boundary(row))
@@ -12715,6 +12078,40 @@ def build_inventory_voice_contract_v1(row: dict[str, object]) -> dict[str, objec
 
 
 def build_inventory_chat_readiness_v1(row: dict[str, object]) -> dict[str, object]:
+    if any(key in row for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        contract_ready = is_character_inventory_grounding_contract_ready(row)
+        evidence = row["grounding_v1"] if contract_ready else []
+        behavior_episodes = {item["episode_no"] for item in evidence if item["kind"] in {"dialogue", "monologue", "narrated_action", "narrated_state"}}
+        speaking_episodes = {item["episode_no"] for item in evidence if item["kind"] in {"dialogue", "monologue"}}
+        identity_ready = bool(
+            row.get("identity_status") in {"RESOLVED_NAMED", "RESOLVED_STABLE_ROLE"}
+            and not _inventory_identity_blocking_conflict_reasons(row)
+            and row.get("continuity_status") != "ambiguous"
+            and not any(any(token in str(reason) for token in ("duplicate", "cannot_link", "continuity", "first_person_identity_unverified")) for reason in row.get("identity_conflict_reasons", []))
+        )
+        work_role = row.get("work_role")
+        required_passes = {
+            "grounding_contract_invalid": contract_ready,
+            "identity_not_resolved": identity_ready,
+            "display_safety_not_pass": build_inventory_display_safety(row)["status"] == "pass",
+            "not_major_character": work_role in {"main_protagonist", "major_character"},
+            "insufficient_grounded_behavior": len(behavior_episodes) >= (3 if work_role == "main_protagonist" else 2),
+        }
+        block_reasons = [reason for reason, passed in required_passes.items() if not passed]
+        chat_allowed = not block_reasons
+        slot_allowed = bool(
+            chat_allowed and dict(row.get("rp_signal_quality") or {}).get("needs_review") is not True
+            and int(row.get("distinct_episode_count") or 0) >= 3
+            and (work_role == "main_protagonist" or len(speaking_episodes) >= 2 or int(row.get("relation_episode_count") or 0) >= 2)
+        )
+        return {
+            "schema_version": "chat_readiness_v1", "stage": "grounded_inventory",
+            "exposure_decision": "eligible" if chat_allowed else "hold",
+            "character_chat_allowed": chat_allowed, "public_slot_allowed": slot_allowed,
+            "confidence": 0.9 if slot_allowed else 0.75 if chat_allowed else 0.0,
+            "block_reasons": block_reasons, "required_passes": required_passes,
+            "evidence_counts": {"grounded_behavior_episode_count": len(behavior_episodes), "speaking_episode_count": len(speaking_episodes)},
+        }
     voice_counts = dict(row.get("voice_mode_counts") or {})
     scene_counts = dict(row.get("scene_weight_counts") or {})
     role_counts = dict(row.get("episode_role_counts") or {})
@@ -12916,6 +12313,27 @@ def validate_work_protagonist_resolution_payload(
             normalized["reason_code"] = "role_evidence_keys_missing"
             return normalized
         normalized["role_evidence_keys"] = role_evidence_keys
+
+    if reason_code == "persona_rename_same_person":
+        if any(_inventory_identity_blocking_conflict_reasons(row) for row in selected_rows):
+            normalized["reason_code"] = "requires_identity_merge"
+            normalized["safety_flags"]["requires_identity_merge"] = True
+            return normalized
+        # Role continuity does not establish that separate named rows are one person.
+        for key in role_evidence_keys:
+            row = row_by_key[key]
+            if key in selected_keys or _is_generic_label_protagonist_fragment_row(row) or (
+                str(row.get("display_name") or "") == "나(주인공)"
+                and not list(row.get("real_names") or [])
+            ):
+                continue
+            if not any(
+                _work_protagonist_rows_share_identity(selected_row, row)
+                for selected_row in selected_rows
+            ):
+                normalized["reason_code"] = "requires_identity_merge"
+                normalized["safety_flags"]["requires_identity_merge"] = True
+                return normalized
 
     normalized["decision"] = "RESOLVED"
     normalized["work_protagonist_key"] = selected_keys[0]
@@ -13345,6 +12763,12 @@ def _build_cumulative_work_protagonist_resolution(
         if unresolved_fallback is not None:
             return unresolved_fallback
         return _unresolved_opening_work_protagonist_resolution(reason_code)
+
+    if unresolved_fallback and (
+        str(unresolved_fallback.get("reason_code") or "") == "requires_identity_merge"
+        or bool(dict(unresolved_fallback.get("safety_flags") or {}).get("requires_identity_merge"))
+    ):
+        return unresolved_fallback
 
     candidates = _cumulative_work_protagonist_candidates(rows)
     if not candidates:
@@ -13777,39 +13201,23 @@ async def request_work_protagonist_resolution_payload(
             },
         },
     }
-    request_timeout_seconds = EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS
-    operation = AiProviderUsageOperation(
-        feature_key="storyctx",
-        stage_key="work_protagonist_resolution",
-        product_id=product_id,
-    )
-    async with storyctx_provider_attempt(
-        operation,
-        provider="openrouter",
-        model=EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
-    ) as usage:
-        response = await asyncio.wait_for(
-            post_openrouter_background_chat_completion_async(
-                client,
-                base_url=OPENROUTER_BASE_URL,
-                api_key=OPENROUTER_API_KEY,
-                priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "X-Title": "LikeNovel Story Agent Opening Protagonist Resolution",
-                },
-                json=request_payload,
-                timeout=request_timeout_seconds,
-            ),
-            timeout=request_timeout_seconds,
+    def validate(payload):
+        schema_error = get_structured_payload_contract_error(
+            payload, request_payload["response_format"]["json_schema"]["schema"],
         )
-        usage.observe_response(response)
-        response.raise_for_status()
-        response_json = usage.capture_response(response)
-        parsed = extract_json_object(extract_openrouter_message_text(response_json))
-        usage.finish("success" if parsed else "parse_error")
-        return parsed
+        if schema_error:
+            raise ValueError(schema_error)
+        # A schema-valid receipt is not a role decision. The existing canonical
+        # resolver may conservatively downgrade this to UNRESOLVED before promotion.
+        return payload
+
+    return await _request_character_asset_json(
+        client, stage="protagonist_resolution", scope="work", product_id=product_id,
+        contract=WORK_PROTAGONIST_RESOLUTION_FORMAT_VERSION + ":receipt_v1",
+        request_payload=request_payload, validate=validate,
+        title="LikeNovel Story Agent Opening Protagonist Resolution",
+        timeout=EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS,
+    )
 
 
 def _build_opening_work_protagonist_resolution(
@@ -14065,6 +13473,8 @@ def _fold_work_protagonist_evidence_into_selected_main(
     protagonist_resolution: dict[str, object] | None,
 ) -> None:
     resolution = dict(protagonist_resolution or {})
+    if str(resolution.get("reason_code") or "") == "persona_rename_same_person":
+        resolution = validate_work_protagonist_resolution_payload(resolution, rows)
     if str(resolution.get("decision") or "").upper() != "RESOLVED":
         return
     selected_keys = list(
@@ -14137,6 +13547,15 @@ def _fold_work_protagonist_evidence_into_selected_main(
     ]
 
     def can_fold_role_evidence(row: dict[str, object]) -> bool:
+        if str(resolution.get("reason_code") or "") == "persona_rename_same_person":
+            if not _is_generic_label_protagonist_fragment_row(row) and not (
+                str(row.get("display_name") or "") == "나(주인공)"
+                and not list(row.get("real_names") or [])
+            ):
+                return (
+                    not _inventory_identity_blocking_conflict_reasons(selected_row)
+                    and _work_protagonist_rows_share_identity(selected_row, row)
+                )
         source_keys = [
             str(value or "").strip()
             for value in list(row.get("source_character_keys") or [])
@@ -14145,6 +13564,8 @@ def _fold_work_protagonist_evidence_into_selected_main(
         if source_keys and all(
             _is_generic_protagonist_source_key(value) for value in source_keys
         ):
+            return True
+        if _is_generic_label_protagonist_fragment_row(row):
             return True
         row_identity_names = [
             str(value or "").strip()
@@ -14259,10 +13680,34 @@ def _fold_work_protagonist_evidence_into_selected_main(
         row
         for row in rows
         if row not in evidence_rows
-        or str(row.get("canonical_character_key") or "") != "character:나(주인공)"
+        or not (
+            str(row.get("canonical_character_key") or "") == "character:나(주인공)"
+            or _is_generic_label_protagonist_fragment_row(row)
+        )
     ]
 
     selected_row["preferred_legacy_character_key"] = None
+
+
+def _is_generic_label_protagonist_fragment_row(row: dict[str, object]) -> bool:
+    """display가 일반 라벨이고 실명이 없으며 소스키가 전부 generic 주인공 키
+    (또는 일반 라벨의 named 키)인 행. 확정 주인공의 회차 파편으로 보고
+    근거를 흡수한 뒤 행을 제거한다. display가 일반 라벨이 아닌 1인칭 행은
+    근거만 흡수하고 행은 남긴다."""
+    if not is_generic_character_label(str(row.get("display_name") or "")):
+        return False
+    if any(str(value or "").strip() for value in list(row.get("real_names") or [])):
+        return False
+    source_keys = [
+        str(value or "").strip()
+        for value in list(row.get("source_character_keys") or [])
+        if str(value or "").strip()
+    ]
+    return bool(source_keys) and all(
+        _is_generic_protagonist_source_key(value)
+        or value in GENERIC_LABEL_PROTAGONIST_SOURCE_KEYS
+        for value in source_keys
+    )
 
 
 def _public_inventory_duplicate_rank(row: dict[str, object]) -> tuple[int, int, int, int, str]:
@@ -14299,6 +13744,12 @@ def _suppress_duplicate_public_display_rows(rows: list[dict[str, object]]) -> No
             row["review_reasons"] = sorted(
                 set(list(row.get("review_reasons") or []) + ["DUPLICATE_PUBLIC_DISPLAY_NAME"])
             )
+            if "character_contract" in row:
+                row["chat_readiness_v1"].update(
+                    character_chat_allowed=False, public_slot_allowed=False,
+                    exposure_decision="hold", confidence=0.0,
+                    block_reasons=[*row["chat_readiness_v1"].get("block_reasons", []), "duplicate_public_display_name"],
+                )
 
 
 def _suppress_main_alias_public_slot_rows(rows: list[dict[str, object]]) -> None:
@@ -14329,6 +13780,8 @@ def _suppress_main_alias_public_slot_rows(rows: list[dict[str, object]]) -> None
         row["review_reasons"] = sorted(
             set(list(row.get("review_reasons") or []) + ["MAIN_ALIAS_PUBLIC_SLOT_DUPLICATE"])
         )
+        if "character_contract" in row:
+            row["chat_readiness_v1"]["public_slot_allowed"] = False
 
 
 def _character_inventory_continuity_aliases(
@@ -14757,6 +14210,25 @@ def aggregate_character_inventory_v3_rows(
         protagonist_resolution=protagonist_resolution,
         locked_protagonist_rows=locked_protagonist_rows,
     )
+    observation_map = {str(observation["observation_id"]): observation for observation in observations}
+    for item in rows:
+        grounding = []
+        labels = []
+        for ref in item.get("source_observation_refs", []):
+            observation = observation_map.get(ref, {})
+            episode_no = int(observation.get("episode_no") or 0)
+            observed_name = str(observation.get("observed_display_name") or "").strip()
+            for evidence in observation.get("grounding_v1", []):
+                grounding.append({**evidence, "episode_no": episode_no, "episode_scope_key": observation["episode_scope_key"]})
+                if observed_name and len(observed_name) <= 100 and observed_name in evidence["quote"]:
+                    label = {"episode_no": episode_no, "label": observed_name}
+                    if label not in labels:
+                        labels.append(label)
+        if grounding:
+            item["grounding_v1"] = grounding
+            item["identity_labels_v1"] = labels
+            bind_character_grounding_contract(item)
+        _refresh_character_inventory_v3_serving_fields(item)
     _suppress_duplicate_public_display_rows(rows)
     _suppress_main_alias_public_slot_rows(rows)
     return sorted(
@@ -14768,6 +14240,68 @@ def aggregate_character_inventory_v3_rows(
             str(item.get("display_name") or ""),
         ),
     )
+
+
+def build_character_grounding_contract(*, scope_key: str, grounding: list, labels: list) -> dict:
+    return {
+        "version": "v1", "character_key": scope_key,
+        "generation_hash": sha256_text(json.dumps({"scope": scope_key, "grounding": grounding, "labels": labels}, ensure_ascii=False, sort_keys=True)),
+    }
+
+
+def is_character_inventory_grounding_contract_ready(item: dict[str, object]) -> bool:
+    scope = item.get("canonical_character_key")
+    contract = item.get("character_contract")
+    grounding = item.get("grounding_v1")
+    labels = item.get("identity_labels_v1")
+    if not isinstance(scope, str) or not scope or not isinstance(contract, dict) or not isinstance(grounding, list) or not isinstance(labels, list):
+        return False
+    profile = {"character_key": scope, "display_name": item.get("display_name"), "character_contract": contract, "identity_labels_v1": labels}
+    examples = {"character_key": scope, "character_contract": contract, "grounding_v1": grounding}
+    if not select_character_chat_grounding_v1(profile, examples, expected_character_key=scope, read_episode_to=None):
+        return False
+    return contract == build_character_grounding_contract(scope_key=scope, grounding=grounding, labels=labels)
+
+
+def bind_character_grounding_contract(item: dict[str, object]) -> None:
+    """Rebind after canonical continuity remaps; no surrogate IDs enter the digest."""
+    if "grounding_v1" not in item:
+        return
+    scope_key = str(item.get("canonical_character_key") or item.get("character_key") or "")
+    grounding = [{**evidence, "character_key": scope_key} for evidence in item["grounding_v1"]]
+    grounding = sorted(grounding, key=lambda evidence: (evidence["episode_no"], str(evidence.get("episode_scope_key") or ""), json.dumps(evidence, ensure_ascii=False, sort_keys=True)))
+    labels = sorted(item.get("identity_labels_v1", []), key=lambda label: (label["episode_no"], label["label"]))
+    item["grounding_v1"] = grounding
+    item["identity_labels_v1"] = labels
+    item["character_contract"] = build_character_grounding_contract(scope_key=scope_key, grounding=grounding, labels=labels)
+
+
+def upsert_grounded_rp_pair(cur, *, product_id: int, inventory: dict) -> dict[str, bool]:
+    """v1 has no unconsumed LLM profile: assemble only anchored runtime fields."""
+    if not is_character_inventory_grounding_contract_ready(inventory) or not is_character_chat_inventory_v1_decision_coherent(inventory):
+        raise CharacterAssetAttemptBlocked("grounded_rp_inventory_not_ready")
+    scope = str(inventory.get("canonical_character_key") or "")
+    contract = inventory["character_contract"]
+    profile = {
+        "character_key": scope, "display_name": str(inventory.get("display_name") or ""),
+        "character_contract": dict(contract), "identity_labels_v1": list(inventory["identity_labels_v1"]),
+    }
+    examples = {
+        "character_key": scope, "character_contract": dict(contract),
+        "grounding_v1": list(inventory["grounding_v1"]), "examples": [],
+    }
+    if not select_character_chat_grounding_v1(profile, examples, expected_character_key=scope, read_episode_to=None):
+        raise CharacterAssetAttemptBlocked("grounded_rp_bundle_invalid")
+    counts = {}
+    for name, payload in (("profile", profile), ("examples", examples)):
+        _, inserted = upsert_summary(
+            cur, product_id=product_id, summary_type=f"character_rp_{name}", scope_key=scope,
+            source_hash=sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+            source_doc_count=len({entry["episode_no"] for entry in examples["grounding_v1"]}),
+            summary_text=json.dumps(payload, ensure_ascii=False),
+        )
+        counts[name] = inserted
+    return counts
 
 
 def build_character_inventory_v3_hash_payload(item: dict[str, object]) -> dict[str, object]:
@@ -14820,6 +14354,11 @@ def build_character_inventory_v3_hash_payload(item: dict[str, object]) -> dict[s
         "evidence_episode_nos": list(item.get("evidence_episode_nos") or []),
     }
     optional_identity_fields = {
+        **({
+            "character_contract": item["character_contract"],
+            "grounding_v1": item["grounding_v1"],
+            "identity_labels_v1": item["identity_labels_v1"],
+        } if "character_contract" in item else {}),
         "identity_group_key": str(item.get("identity_group_key") or ""),
         "identity_group_role": str(item.get("identity_group_role") or ""),
         "identity_linked_to_scope_key": str(item.get("identity_linked_to_scope_key") or ""),
@@ -14873,6 +14412,7 @@ def build_character_inventory_v3_source_hash(item: dict[str, object]) -> str:
 
 
 def upsert_character_inventory_v3_item(cur, *, product_id: int, item: dict[str, object]) -> bool:
+    bind_character_grounding_contract(item)
     scope_key = str(item.get("canonical_character_key") or "").strip()
     if not scope_key:
         return False
@@ -15021,6 +14561,7 @@ def build_character_inventory_v3_summaries_from_signal_rows(
     _prefer_source_backed_canonical_display_names(inventory_rows)
     _remove_competing_character_aliases(inventory_rows)
     for item in inventory_rows:
+        bind_character_grounding_contract(item)
         _refresh_character_inventory_v3_serving_fields(item)
     _suppress_duplicate_public_display_rows(inventory_rows)
     _suppress_main_alias_public_slot_rows(inventory_rows)
@@ -16346,29 +15887,43 @@ def fetch_active_summary_state_map(
     return state_map
 
 
-def fetch_active_episode_texts_by_no(cur, *, product_id: int) -> dict[int, str]:
+def fetch_active_character_asset_episode_texts_by_scope(cur, *, product_id: int) -> dict[str, str]:
     cur.execute(
         """
-        SELECT d.episode_no, c.chunk_no, c.text
+        SELECT CONCAT('episode:', d.episode_id) AS scope_key, c.chunk_no, c.text
           FROM tb_story_agent_context_doc d
+          JOIN (
+                SELECT episode_id, episode_no,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY product_id ORDER BY episode_no ASC, episode_id ASC
+                       ) AS public_episode_rank
+                  FROM tb_product_episode
+                 WHERE product_id = %s AND use_yn = 'Y' AND open_yn = 'Y'
+               ) source_episode
+            ON source_episode.episode_id = d.episode_id
+           AND source_episode.episode_no = d.episode_no
+           AND source_episode.public_episode_rank <= %s
           JOIN tb_story_agent_context_chunk c
             ON c.context_doc_id = d.context_doc_id
+           AND c.episode_id = d.episode_id
+           AND c.product_id = d.product_id
+           AND c.episode_no = d.episode_no
          WHERE d.product_id = %s
            AND d.is_active = 'Y'
-         ORDER BY d.episode_no ASC, c.chunk_no ASC
+         ORDER BY d.episode_no ASC, d.episode_id ASC, c.chunk_no ASC
         """,
-        (product_id,),
+        (product_id, CHARACTER_CHAT_MAX_COLLECTED_PUBLIC_EPISODES, product_id),
     )
-    chunks_by_episode_no: dict[int, list[str]] = {}
+    chunks_by_scope: dict[str, list[str]] = {}
     for row in cur.fetchall():
-        episode_no = int(row.get("episode_no") or 0)
+        scope_key = str(row.get("scope_key") or "")
         text_value = str(row.get("text") or "").strip()
-        if episode_no <= 0 or not text_value:
+        if not re.fullmatch(r"episode:[1-9][0-9]*", scope_key) or not text_value:
             continue
-        chunks_by_episode_no.setdefault(episode_no, []).append(text_value)
+        chunks_by_scope.setdefault(scope_key, []).append(text_value)
     return {
-        episode_no: "\n\n".join(chunks)
-        for episode_no, chunks in chunks_by_episode_no.items()
+        scope_key: "\n\n".join(chunks)
+        for scope_key, chunks in chunks_by_scope.items()
         if chunks
     }
 
@@ -16839,22 +16394,36 @@ def build_character_chat_scene_context_lines_by_scope(
     return lines_by_scope
 
 
-def build_usable_character_scene_episode_nos_by_scope(
+def is_episode_scene_source_bound(row: dict, episode_scope_map: dict[str, int]) -> bool:
+    scope = row.get("scope_key")
+    expected = episode_scope_map.get(scope)
+    payload = extract_json_object(str(row.get("summary_text") or "")) or {}
+    return (
+        isinstance(scope, str) and re.fullmatch(r"episode:[1-9][0-9]*", scope) is not None
+        and type(expected) is int and expected > 0 and isinstance(payload, dict)
+        and all(type(value) is int and value == expected for value in (
+            row.get("episode_from"), row.get("episode_to"), payload.get("episode_no"),
+        ))
+    )
+
+
+def build_usable_character_scene_episodes_by_scope(
     scene_rows: list[dict[str, object]],
-) -> dict[str, list[int]]:
-    episode_nos_by_scope: dict[str, set[int]] = {}
+    episode_scope_map: dict[str, int],
+) -> dict[str, dict[str, int]]:
+    episodes_by_scope: dict[str, dict[str, int]] = {}
     for row in scene_rows:
+        if not is_episode_scene_source_bound(row, episode_scope_map):
+            continue
+        episode_scope_key = str(row.get("scope_key") or "")
+        if not re.fullmatch(r"episode:[1-9][0-9]*", episode_scope_key):
+            continue
         payload = extract_json_object(str(row.get("summary_text") or "")) or {}
         if not isinstance(payload, dict):
             continue
         if str(payload.get("status") or "").strip().lower() not in {"ok", "partial"}:
             continue
-        episode_no = int(
-            row.get("episode_to")
-            or payload.get("episode_no")
-            or row.get("episode_from")
-            or 0
-        )
+        episode_no = episode_scope_map[episode_scope_key]
         if episode_no <= 0:
             continue
         for scene in list(payload.get("scenes") or []):
@@ -16875,41 +16444,25 @@ def build_usable_character_scene_episode_nos_by_scope(
                 and str(item.get("actor_scope_key") or "").strip()
             )
             for scope_key in scope_keys:
-                episode_nos_by_scope.setdefault(scope_key, set()).add(episode_no)
-    return {
-        scope_key: sorted(episode_nos)
-        for scope_key, episode_nos in sorted(episode_nos_by_scope.items())
-    }
+                episodes_by_scope.setdefault(scope_key, {})[episode_scope_key] = episode_no
+    return episodes_by_scope
 
 
-def filter_usable_character_scene_episode_nos(
-    episode_nos_by_scope: dict[str, list[int]],
+def filter_usable_character_scene_episode_scope_keys(
+    episode_scope_keys_by_scope: dict[str, list[str]],
     *,
-    eligible_episode_nos: set[int],
-) -> dict[str, list[int]]:
+    eligible_episode_scope_keys: set[str],
+) -> dict[str, list[str]]:
     return {
         scope_key: sorted(
             {
-                int(value)
-                for value in list(episode_nos or [])
-                if int(value) in eligible_episode_nos
+                value
+                for value in list(episode_scope_keys or [])
+                if value in eligible_episode_scope_keys
             }
         )
-        for scope_key, episode_nos in episode_nos_by_scope.items()
+        for scope_key, episode_scope_keys in episode_scope_keys_by_scope.items()
     }
-
-
-def load_character_chat_scene_context_lines_by_scope(conn, *, product_id: int) -> dict[str, list[str]]:
-    if not hasattr(conn, "ping"):
-        return {}
-    with work_cursor(conn) as cur:
-        return build_character_chat_scene_context_lines_by_scope(
-            fetch_active_character_asset_summary_rows(
-                cur=cur,
-                product_id=product_id,
-                summary_type="episode_scene_extraction",
-            )
-        )
 
 
 CHARACTER_CHAT_ASSET_READINESS_SUMMARY_TYPES = (
@@ -16976,6 +16529,8 @@ def _inventory_row_scope_key(row: dict[str, object], payload: dict[str, object])
 
 
 def _is_character_chat_public_candidate(payload: dict[str, object]) -> bool:
+    if any(key in payload for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+        return is_character_inventory_grounding_contract_ready(payload) and is_character_chat_inventory_v1_decision_coherent(payload)
     readiness = dict(payload.get("chat_readiness_v1") or {})
     if str(readiness.get("exposure_decision") or "").strip() == "eligible":
         return True
@@ -16996,28 +16551,13 @@ def _has_summary_row_for_inventory_alias(
     return any(alias_key in rows_by_scope for alias_key in alias_keys)
 
 
-def _is_character_chat_opening_row_ready(row: dict[str, object] | None, *, scope_key: str) -> bool:
-    if not row:
-        return False
-    payload = _summary_row_payload(row)
-    readiness = dict(payload.get("readiness") or {})
-    if str(readiness.get("status") or "").strip() != "ready":
-        return False
-    chat_target = dict(payload.get("chat_target") or {})
-    payload_scope_key = str(chat_target.get("scope_key") or "").strip()
-    return normalize_character_chat_opening_payload(
-        payload,
-        scope_key=scope_key,
-        display_name=str(chat_target.get("display_name") or ""),
-    ) is not None and payload_scope_key == scope_key
-
-
 def build_character_chat_asset_readiness_verification(
     *,
     product_id: int,
     summary_rows_by_type: dict[str, list[dict[str, object]]],
     story_context_status: str = "",
     total_episode_count: int = 0,
+    episode_scope_map: dict[str, int] | None = None,
 ) -> dict[str, object]:
     """Verify that story-agent summaries are sufficient for character-chat exposure.
 
@@ -17032,13 +16572,14 @@ def build_character_chat_asset_readiness_verification(
     }
     profile_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_profile"])
     example_rows_by_scope = _summary_rows_by_scope(rows_by_type["character_rp_examples"])
-    scene_scope_keys = set(build_character_chat_scene_context_lines_by_scope(rows_by_type["episode_scene_extraction"]).keys())
-    raw_scene_episode_nos_by_scope = (
-        build_usable_character_scene_episode_nos_by_scope(
+    raw_scene_episodes_by_scope = (
+        build_usable_character_scene_episodes_by_scope(
             rows_by_type["episode_scene_extraction"]
+            , episode_scope_map or {}
         )
     )
     usable_scene_episode_nos_by_scope: dict[str, list[int]] = {}
+    usable_scene_episode_scope_keys_by_scope: dict[str, list[str]] = {}
 
     public_candidates: list[dict[str, object]] = []
     block_reason_counts: dict[str, int] = {}
@@ -17096,15 +16637,17 @@ def build_character_chat_asset_readiness_verification(
                 for value in list(payload.get("source_character_keys") or [])
             ),
         } - {""}
-        usable_scene_episode_nos_by_scope[scope_key] = sorted(
-            {
-                episode_no
-                for compatible_scope_key in compatible_scene_scope_keys
-                for episode_no in raw_scene_episode_nos_by_scope.get(
-                    compatible_scope_key, []
-                )
-            }
-        )
+        usable_episodes = {
+            episode_scope_key: episode_no
+            for compatible_scope_key in compatible_scene_scope_keys
+            for episode_scope_key, episode_no in raw_scene_episodes_by_scope.get(
+                compatible_scope_key, {}
+            ).items()
+            if episode_scope_key in (episode_scope_map or {})
+        }
+        usable_scene_episode_scope_keys_by_scope[scope_key] = sorted(usable_episodes)
+        # Kept for existing readiness JSON diagnostics; never a coverage identity.
+        usable_scene_episode_nos_by_scope[scope_key] = sorted(set(usable_episodes.values()))
 
         missing_reasons: list[str] = []
         profile_row = profile_rows_by_scope.get(scope_key)
@@ -17135,12 +16678,27 @@ def build_character_chat_asset_readiness_verification(
                 missing_reasons.append("legacy_examples_scope_key_mismatch")
             else:
                 missing_reasons.append("missing_examples")
+        elif any("character_contract" in item for item in (payload, _summary_row_payload(profile_row or {}), _summary_row_payload(examples_row))):
+            profile_payload = _summary_row_payload(profile_row or {})
+            examples_payload = _summary_row_payload(examples_row)
+            if not (
+                payload.get("character_contract") == profile_payload.get("character_contract")
+                and select_character_chat_grounding_v1(
+                    profile_payload, examples_payload, expected_character_key=scope_key,
+                    read_episode_to=None,
+                )
+            ):
+                invalid_examples_scope_keys.append(scope_key)
+                missing_reasons.append("incompatible_grounding_generation")
         elif not _is_character_chat_examples_row_ready(examples_row, scope_key=scope_key):
             invalid_examples_scope_keys.append(scope_key)
             missing_reasons.append("invalid_examples_payload")
-        if scope_key not in scene_scope_keys:
+        if not usable_scene_episode_scope_keys_by_scope[scope_key]:
             missing_usable_scene_scope_keys.append(scope_key)
             missing_reasons.append("missing_usable_scene")
+        elif "character_contract" in payload and len(usable_scene_episode_scope_keys_by_scope[scope_key]) < CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT:
+            missing_usable_scene_scope_keys.append(scope_key)
+            missing_reasons.append("insufficient_usable_scenes")
         for reason in missing_reasons:
             _increment_reason(block_reason_counts, reason)
         if is_main_protagonist and missing_reasons:
@@ -17151,7 +16709,11 @@ def build_character_chat_asset_readiness_verification(
             if is_main_protagonist:
                 ready_main_protagonist_scope_keys.append(scope_key)
             readiness = dict(payload.get("chat_readiness_v1") or {})
-            if bool(payload.get("public_slot_eligible")) or bool(readiness.get("public_slot_allowed")):
+            if (
+                is_character_chat_inventory_v1_decision_coherent(payload, require_public_slot=True)
+                if "character_contract" in payload else
+                bool(payload.get("public_slot_eligible")) or bool(readiness.get("public_slot_allowed"))
+            ):
                 public_slot_ready_scope_keys.append(scope_key)
 
         public_candidates.append(
@@ -17209,6 +16771,7 @@ def build_character_chat_asset_readiness_verification(
         "invalid_opening_scope_keys": sorted(set(invalid_opening_scope_keys)),
         "missing_usable_scene_scope_keys": sorted(set(missing_usable_scene_scope_keys)),
         "usable_scene_episode_nos_by_scope": usable_scene_episode_nos_by_scope,
+        "usable_scene_episode_scope_keys_by_scope": usable_scene_episode_scope_keys_by_scope,
         "invalid_profile_scope_keys": sorted(set(invalid_profile_scope_keys)),
         "invalid_examples_scope_keys": sorted(set(invalid_examples_scope_keys)),
         "legacy_profile_scope_key_mismatch_scope_keys": sorted(set(legacy_profile_scope_key_mismatch_scope_keys)),
@@ -17227,11 +16790,13 @@ def fetch_character_chat_asset_readiness_verification(
     product_id: int,
     story_context_status: str = "",
     total_episode_count: int = 0,
+    episode_scope_map: dict[str, int] | None = None,
 ) -> dict[str, object]:
     return build_character_chat_asset_readiness_verification(
         product_id=product_id,
         story_context_status=story_context_status,
         total_episode_count=total_episode_count,
+        episode_scope_map=(fetch_character_chat_catalog_scene_episode_scope_map(cur, product_id=product_id) if episode_scope_map is None else episode_scope_map),
         summary_rows_by_type={
             summary_type: fetch_active_summary_rows(
                 cur=cur,
@@ -18405,7 +17970,7 @@ def select_requested_scene_repair_scope_keys(
     *,
     requested_scope_keys: Iterable[str],
     inventory_map: dict[str, dict[str, object]],
-    usable_scene_episode_nos_by_scope: dict[str, list[int]],
+    usable_scene_episode_scope_keys_by_scope: dict[str, list[str]],
 ) -> set[str]:
     normalized_scope_keys = {
         str(scope_key or "").strip()
@@ -18421,7 +17986,7 @@ def select_requested_scene_repair_scope_keys(
     return {
         scope_key
         for scope_key in normalized_scope_keys
-        if len(set(usable_scene_episode_nos_by_scope.get(scope_key) or []))
+        if len(set(usable_scene_episode_scope_keys_by_scope.get(scope_key) or []))
         < CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT
     }
 
@@ -18454,38 +18019,25 @@ def select_character_chat_scene_repair_rows(
     inventory_map: dict[str, dict[str, object]],
     episode_summary_rows: list[dict[str, object]],
     scene_scope_keys: set[str],
-    usable_scene_episode_nos_by_scope: dict[str, list[int]],
+    usable_scene_episode_scope_keys_by_scope: dict[str, list[str]],
     limit: int,
-    eligible_scene_episode_nos: set[int] | None = None,
-) -> tuple[list[dict[str, object]], dict[int, set[str]]]:
-    eligible_episode_nos = (
-        None
-        if eligible_scene_episode_nos is None
-        else {
-            int(value)
-            for value in eligible_scene_episode_nos
-            if int(value) > 0
-        }
-    )
-    filtered_scene_episode_nos_by_scope = (
-        usable_scene_episode_nos_by_scope
-        if eligible_episode_nos is None
-        else filter_usable_character_scene_episode_nos(
-            usable_scene_episode_nos_by_scope,
-            eligible_episode_nos=eligible_episode_nos,
-        )
-    )
-    episode_rows_by_no = {
-        int(row.get("episode_from") or row.get("episode_no") or 0): row
+    episode_scope_map: dict[str, int],
+) -> tuple[list[dict[str, object]], dict[str, set[str]]]:
+    episode_rows_by_scope = {
+        str(row.get("scope_key") or ""): row
         for row in episode_summary_rows
         if int(row.get("episode_from") or row.get("episode_no") or 0) > 0
-        and (
-            eligible_episode_nos is None
-            or int(row.get("episode_from") or row.get("episode_no") or 0)
-            in eligible_episode_nos
-        )
+        and re.fullmatch(r"episode:[1-9][0-9]*", str(row.get("scope_key") or ""))
+        and row.get("episode_from") == episode_scope_map.get(row["scope_key"])
     }
-    required_scope_keys_by_episode_no: dict[int, set[str]] = {}
+    filtered_scene_episode_scope_keys_by_scope = (
+        filter_usable_character_scene_episode_scope_keys(
+            usable_scene_episode_scope_keys_by_scope,
+            eligible_episode_scope_keys=set(episode_rows_by_scope),
+        )
+    )
+    available_episode_nos = {int(row.get("episode_from") or row.get("episode_no") or 0) for row in episode_rows_by_scope.values()}
+    required_scope_keys_by_episode_scope: dict[str, set[str]] = {}
     ordered_scope_keys = sorted(
         scene_scope_keys,
         key=lambda scope_key: (
@@ -18499,59 +18051,66 @@ def select_character_chat_scene_repair_rows(
     max_rows = max(int(limit or 0), 0)
     for scope_key in ordered_scope_keys:
         inventory_item = dict(inventory_map.get(scope_key) or {})
-        existing_scene_episode_nos = {
-            int(value)
-            for value in list(
-                filtered_scene_episode_nos_by_scope.get(scope_key) or []
-            )
-            if int(value) > 0
-        }
+        existing_scene_episode_scope_keys = set(
+            filtered_scene_episode_scope_keys_by_scope.get(scope_key) or []
+        )
         missing_scene_episode_count = max(
             CHARACTER_CHAT_MINIMUM_USABLE_SCENE_EPISODE_COUNT
-            - len(existing_scene_episode_nos),
+            - len(existing_scene_episode_scope_keys),
             0,
         )
         if missing_scene_episode_count <= 0:
             continue
-        evidence_episode_nos = sorted(
-            {
-                int(value)
-                for value in list(inventory_item.get("evidence_episode_nos") or [])
-                if int(value) in episode_rows_by_no
-                and int(value) not in existing_scene_episode_nos
-            },
-            reverse=True,
-        )
-        if not evidence_episode_nos:
-            fallback_episode_no = int(
-                inventory_item.get("latest_seen_episode_no")
-                or inventory_item.get("first_seen_episode_no")
-                or 0
+        if any(key in inventory_item for key in ("character_contract", "grounding_v1", "identity_labels_v1")):
+            if not is_character_inventory_grounding_contract_ready(inventory_item):
+                raise CharacterAssetAttemptBlocked("scene_repair_marked_grounding_invalid")
+            grounded_scopes = {
+                evidence["episode_scope_key"] for evidence in inventory_item["grounding_v1"]
+                if episode_scope_map.get(evidence["episode_scope_key"]) == evidence["episode_no"]
+            }
+        else:
+            grounded_scopes = None
+            evidence_episode_nos = sorted(
+                {
+                    int(value)
+                    for value in list(inventory_item.get("evidence_episode_nos") or [])
+                    if int(value) in available_episode_nos
+                },
+                reverse=True,
             )
-            if (
-                fallback_episode_no in episode_rows_by_no
-                and fallback_episode_no not in existing_scene_episode_nos
-            ):
-                evidence_episode_nos = [fallback_episode_no]
+            if not evidence_episode_nos:
+                fallback_episode_no = int(
+                    inventory_item.get("latest_seen_episode_no")
+                    or inventory_item.get("first_seen_episode_no")
+                    or 0
+                )
+                if fallback_episode_no in available_episode_nos:
+                    evidence_episode_nos = [fallback_episode_no]
         selected_for_scope = 0
-        for episode_no in evidence_episode_nos:
+        candidate_rows = sorted(
+            (row for row in episode_rows_by_scope.values() if row["scope_key"] not in existing_scene_episode_scope_keys and (row["scope_key"] in grounded_scopes if grounded_scopes is not None else int(row.get("episode_from") or row.get("episode_no") or 0) in evidence_episode_nos)),
+            key=lambda row: (-int(row.get("episode_from") or row.get("episode_no") or 0), int(row["scope_key"].removeprefix("episode:"))),
+        )
+        for row in candidate_rows:
+            episode_scope = row["scope_key"]
             if (
-                episode_no not in required_scope_keys_by_episode_no
+                episode_scope not in required_scope_keys_by_episode_scope
                 and max_rows > 0
-                and len(required_scope_keys_by_episode_no) >= max_rows
+                and len(required_scope_keys_by_episode_scope) >= max_rows
             ):
                 continue
-            required_scope_keys_by_episode_no.setdefault(episode_no, set()).add(
+            required_scope_keys_by_episode_scope.setdefault(episode_scope, set()).add(
                 scope_key
             )
             selected_for_scope += 1
             if selected_for_scope >= missing_scene_episode_count:
                 break
     selected_rows = [
-        episode_rows_by_no[episode_no]
-        for episode_no in sorted(required_scope_keys_by_episode_no)
+        episode_rows_by_scope[scope]
+        for scope in required_scope_keys_by_episode_scope
     ]
-    return selected_rows, required_scope_keys_by_episode_no
+    selected_rows.sort(key=lambda row: (int(row.get("episode_from") or row.get("episode_no") or 0), int(row["scope_key"].removeprefix("episode:"))))
+    return selected_rows, required_scope_keys_by_episode_scope
 
 
 def touch_product_context_build_attempt(cur, *, product_id: int) -> None:
@@ -18768,7 +18327,7 @@ async def repair_character_chat_assets(
                 continue
             results["character_asset_repair_attempted"] += 1
             repair_record: dict[str, object] = {"product_id": product_id}
-            catalog_scene_episode_nos: set[int] | None = None
+            episode_scope_map: dict[str, int] = {}
             combine_reaggregation = bool(
                 getattr(args, "reaggregate_character_inventory", False)
             )
@@ -18816,13 +18375,6 @@ async def repair_character_chat_assets(
                             product_id=product_id,
                             summary_type="episode_summary",
                         )
-                        if requested_scope_keys:
-                            catalog_scene_episode_nos = (
-                                fetch_character_chat_catalog_scene_episode_nos(
-                                    cur,
-                                    product_id=product_id,
-                                )
-                            )
                         missing_required_signal_scope_keys = (
                             build_missing_required_signal_scope_keys(
                                 episode_summary_rows=episode_summary_rows,
@@ -18850,6 +18402,12 @@ async def repair_character_chat_assets(
                             )
                             continue
 
+                        episode_scope_map = (
+                            fetch_character_chat_catalog_scene_episode_scope_map(
+                                cur,
+                                product_id=product_id,
+                            )
+                        )
                         bundle_scope_keys: set[str] = set()
                         inventory_stats: dict[str, object] | None = None
                         inventory_v3_counts: tuple[int, int] | None = None
@@ -18918,17 +18476,18 @@ async def repair_character_chat_assets(
                             product_id=product_id,
                             story_context_status=context_status,
                             total_episode_count=total_episode_count,
+                            episode_scope_map=episode_scope_map,
                         )
                         capped_inventory_map = filter_character_inventory_map_to_signal_scope(
                             inventory_map=inventory_map,
                             signal_rows=active_signal_rows,
                         )
-                        episode_texts_by_no = fetch_active_episode_texts_by_no(
+                        episode_texts_by_scope = fetch_active_character_asset_episode_texts_by_scope(
                             cur,
                             product_id=product_id,
                         )
-                        episode_texts_by_no = filter_episode_texts_to_summary_rows(
-                            episode_texts_by_no=episode_texts_by_no,
+                        episode_texts_by_scope = filter_episode_texts_to_summary_rows(
+                            episode_texts_by_scope=episode_texts_by_scope,
                             episode_summary_rows=episode_summary_rows,
                         )
                         relation_map = build_character_asset_relation_inventory_map(
@@ -18957,27 +18516,18 @@ async def repair_character_chat_assets(
                             inventory_map=capped_inventory_map,
                         )
                     )
-                    usable_scene_episode_nos_by_scope = dict(
+                    usable_scene_episode_scope_keys_by_scope = dict(
                         before_readiness.get(
-                            "usable_scene_episode_nos_by_scope"
+                            "usable_scene_episode_scope_keys_by_scope"
                         )
                         or {}
                     )
-                    if catalog_scene_episode_nos is not None:
-                        usable_scene_episode_nos_by_scope = (
-                            filter_usable_character_scene_episode_nos(
-                                usable_scene_episode_nos_by_scope,
-                                eligible_episode_nos=(
-                                    catalog_scene_episode_nos
-                                ),
-                            )
-                        )
                     requested_scene_repair_scope_keys = (
                         select_requested_scene_repair_scope_keys(
                             requested_scope_keys=requested_scope_keys,
                             inventory_map=capped_inventory_map,
-                            usable_scene_episode_nos_by_scope=(
-                                usable_scene_episode_nos_by_scope
+                            usable_scene_episode_scope_keys_by_scope=(
+                                usable_scene_episode_scope_keys_by_scope
                             ),
                         )
                     )
@@ -19019,17 +18569,15 @@ async def repair_character_chat_assets(
                             repair_plan["rp_scope_keys"] or repair_plan["scene_scope_keys"]
                         )
                     scene_scope_keys = set(repair_plan["scene_scope_keys"])
-                    scene_rows, required_scope_keys_by_episode_no = (
+                    scene_rows, required_scope_keys_by_episode_scope = (
                         select_character_chat_scene_repair_rows(
                             inventory_map=inventory_map,
                             episode_summary_rows=episode_summary_rows,
                             scene_scope_keys=scene_scope_keys,
-                            usable_scene_episode_nos_by_scope=(
-                                usable_scene_episode_nos_by_scope
+                            usable_scene_episode_scope_keys_by_scope=(
+                                usable_scene_episode_scope_keys_by_scope
                             ),
-                            eligible_scene_episode_nos=(
-                                catalog_scene_episode_nos
-                            ),
+                            episode_scope_map=episode_scope_map,
                             limit=int(getattr(args, "max_delta_episodes", 0) or 0),
                         )
                     )
@@ -19041,7 +18589,7 @@ async def repair_character_chat_assets(
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),
                             episode_rows=scene_rows,
-                            episode_texts_by_no=episode_texts_by_no,
+                            episode_texts_by_scope=episode_texts_by_scope,
                             summary_client=summary_client,
                             canonical_character_packet=build_episode_scene_canonical_character_packet(
                                 capped_inventory_map
@@ -19049,7 +18597,8 @@ async def repair_character_chat_assets(
                             scope_key_replacements=build_character_identity_scope_replacements(
                                 capped_inventory_map
                             ),
-                            required_scope_keys_by_episode_no=required_scope_keys_by_episode_no,
+                            required_scope_keys_by_episode_scope=required_scope_keys_by_episode_scope,
+                            episode_scope_map=episode_scope_map,
                             cleanup_missing_scopes=False,
                             raise_unexpected_errors=True,
                             verbose=args.verbose,
@@ -19063,7 +18612,10 @@ async def repair_character_chat_assets(
                         product_id=product_id,
                         affected_scope_keys=set(repair_plan["rp_scope_keys"]),
                         episode_rows=episode_summary_rows,
-                        episode_texts_by_no=episode_texts_by_no,
+                        episode_texts_by_no=build_legacy_rp_episode_texts_by_no(
+                            episode_texts_by_scope=episode_texts_by_scope,
+                            episode_summary_rows=episode_summary_rows,
+                        ),
                         summary_client=summary_client,
                         inventory_map=capped_inventory_map,
                         relation_map=relation_map,
@@ -19082,6 +18634,7 @@ async def repair_character_chat_assets(
                             product_id=product_id,
                             story_context_status=context_status,
                             total_episode_count=total_episode_count,
+                            episode_scope_map=episode_scope_map,
                         )
                         touch_product_context_build_attempt(
                             cur,
@@ -19096,27 +18649,18 @@ async def repair_character_chat_assets(
                                 "requested RP refresh made no progress: "
                                 f"{','.join(sorted(missing_requested_rp_refresh_scope_keys))}"
                             )
-                        after_scene_episode_nos_by_scope = dict(
+                        after_scene_episode_scope_keys_by_scope = dict(
                             after_readiness.get(
-                                "usable_scene_episode_nos_by_scope"
+                                "usable_scene_episode_scope_keys_by_scope"
                             )
                             or {}
                         )
-                        if catalog_scene_episode_nos is not None:
-                            after_scene_episode_nos_by_scope = (
-                                filter_usable_character_scene_episode_nos(
-                                    after_scene_episode_nos_by_scope,
-                                    eligible_episode_nos=(
-                                        catalog_scene_episode_nos
-                                    ),
-                                )
-                            )
                         incomplete_requested_scene_scope_keys = {
                             scope_key
                             for scope_key in requested_scene_repair_scope_keys
                             if len(
                                 set(
-                                    after_scene_episode_nos_by_scope.get(
+                                    after_scene_episode_scope_keys_by_scope.get(
                                         scope_key, []
                                     )
                                 )
@@ -19763,7 +19307,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
             failed_ready_episode_count = 0
             with work_cursor(work_conn) as cur:
                 total_episode_count = fetch_total_episode_count(cur=cur, product_id=product_id)
-            episode_texts_by_no: dict[int, str] = {}
+            episode_texts_by_scope: dict[str, str] = {}
 
             with product_lock_connection(product_id) if args.apply else nullcontext(None) as lock_conn:
                 if args.apply and lock_conn is None:
@@ -19798,7 +19342,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                     f"[skip] product_id={row['product_id']} episode_id={row['episode_id']} normalized text empty"
                                 )
                             continue
-                        episode_texts_by_no[int(row["episode_no"])] = normalized_text
+                        episode_texts_by_scope[f"episode:{int(row['episode_id'])}"] = normalized_text
 
                         chunks = build_chunks(normalized_text)
                         if not chunks:
@@ -19924,8 +19468,8 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                                 episode_summary_rows=episode_processing_rows,
                             )
                         )
-                        character_episode_texts_by_no = filter_episode_texts_to_summary_rows(
-                            episode_texts_by_no=episode_texts_by_no,
+                        character_episode_texts_by_scope = filter_episode_texts_to_summary_rows(
+                            episode_texts_by_scope=episode_texts_by_scope,
                             episode_summary_rows=character_episode_processing_rows,
                         )
                         withdraw_summary_id = int(
@@ -19954,7 +19498,7 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             conn=work_conn,
                             product_id=product_id,
                             episode_rows=character_episode_processing_rows,
-                            episode_texts_by_no=character_episode_texts_by_no,
+                            episode_texts_by_scope=character_episode_texts_by_scope,
                             summary_client=summary_client,
                             verbose=args.verbose,
                             cleanup_missing_scopes=cleanup_character_episode_scopes,
@@ -20039,9 +19583,10 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             product_id=product_id,
                             product_title=str(product_rows[0].get("title") or ""),
                             episode_rows=character_episode_processing_rows,
-                            episode_texts_by_no=character_episode_texts_by_no,
+                            episode_texts_by_scope=character_episode_texts_by_scope,
                             summary_client=summary_client,
                             canonical_character_packet=build_episode_scene_canonical_character_packet(capped_inventory_v3_map),
+                            production_inventory_map=capped_inventory_v3_map,
                             scope_key_replacements=build_character_identity_scope_replacements(
                                 capped_inventory_v3_map
                             ),
@@ -20056,7 +19601,10 @@ async def build_context_rows(rows: Iterable[dict], args: argparse.Namespace) -> 
                             conn=work_conn,
                             product_id=product_id,
                             episode_rows=character_episode_processing_rows,
-                            episode_texts_by_no=character_episode_texts_by_no,
+                            episode_texts_by_no=build_legacy_rp_episode_texts_by_no(
+                                episode_texts_by_scope=character_episode_texts_by_scope,
+                                episode_summary_rows=character_episode_processing_rows,
+                            ),
                             summary_client=summary_client,
                             inventory_map=capped_inventory_v3_map,
                             relation_map=relation_map,
@@ -20310,7 +19858,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                 }
             )
             touched_range_scopes = select_touched_range_scopes(touched_episode_nos)
-            touched_episode_texts_by_no: dict[int, str] = {}
+            touched_episode_texts_by_scope: dict[str, str] = {}
             with work_cursor(work_conn) as cur:
                 total_episode_count = fetch_total_episode_count(cur=cur, product_id=product_id)
 
@@ -20345,11 +19893,6 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             product_id=product_id,
                             summary_type="character_rp_examples",
                         )
-                        old_internal_prompt_map = fetch_active_summary_state_map(
-                            cur=cur,
-                            product_id=product_id,
-                            summary_type="character_chat_internal_prompt",
-                        )
                         old_touched_signal_rows = fetch_active_summary_rows_for_episode_nos(
                             cur,
                             product_id=product_id,
@@ -20367,7 +19910,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                         if not normalized_text:
                             results["skipped_rows"] += 1
                             continue
-                        touched_episode_texts_by_no[int(row["episode_no"])] = normalized_text
+                        touched_episode_texts_by_scope[f"episode:{int(row['episode_id'])}"] = normalized_text
 
                         chunks = build_chunks(normalized_text)
                         if not chunks:
@@ -20471,7 +20014,7 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                             conn=work_conn,
                             product_id=product_id,
                             episode_rows=touched_character_episode_summary_rows,
-                            episode_texts_by_no=touched_episode_texts_by_no,
+                            episode_texts_by_scope=touched_episode_texts_by_scope,
                             summary_client=summary_client,
                             cleanup_missing_scopes=False,
                             verbose=args.verbose,
@@ -20629,12 +20172,12 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 signal_rows=active_signal_rows_for_resolution,
                                 inventory_map=capped_new_inventory_v3_map,
                             )
-                            episode_texts_by_no = fetch_active_episode_texts_by_no(
+                            episode_texts_by_scope = fetch_active_character_asset_episode_texts_by_scope(
                                 cur,
                                 product_id=product_id,
                             )
-                            episode_texts_by_no = filter_episode_texts_to_summary_rows(
-                                episode_texts_by_no=episode_texts_by_no,
+                            episode_texts_by_scope = filter_episode_texts_to_summary_rows(
+                                episode_texts_by_scope=episode_texts_by_scope,
                                 episode_summary_rows=all_episode_summary_rows,
                             )
                             bundle_scope_keys = (
@@ -20655,11 +20198,12 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 product_id=product_id,
                                 product_title=str(product_rows[0].get("title") or ""),
                                 episode_rows=touched_character_episode_summary_rows,
-                                episode_texts_by_no=episode_texts_by_no,
+                                episode_texts_by_scope=episode_texts_by_scope,
                                 summary_client=summary_client,
-                                canonical_character_packet=build_episode_scene_canonical_character_packet(
-                                    capped_new_inventory_v3_map
-                                ),
+                            canonical_character_packet=build_episode_scene_canonical_character_packet(
+                                capped_new_inventory_v3_map
+                            ),
+                            production_inventory_map=capped_new_inventory_v3_map,
                                 scope_key_replacements=build_character_identity_scope_replacements(
                                     capped_new_inventory_v3_map
                                 ),
@@ -20689,7 +20233,6 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                 new_touched_signal_rows=new_touched_signal_rows,
                                 old_profile_map=old_profile_map,
                                 old_examples_map=old_examples_map,
-                                old_internal_prompt_map=old_internal_prompt_map,
                                 cleanup_scope_keys=set(
                                     character_cleanup.get("touched_scope_keys") or []
                                 ),
@@ -20721,7 +20264,10 @@ async def build_context_rows_delta(rows: Iterable[dict], args: argparse.Namespac
                                     product_id=product_id,
                                     affected_scope_keys=rp_scope_keys_to_build,
                                     episode_rows=all_episode_summary_rows,
-                                    episode_texts_by_no=episode_texts_by_no,
+                                    episode_texts_by_no=build_legacy_rp_episode_texts_by_no(
+                                        episode_texts_by_scope=episode_texts_by_scope,
+                                        episode_summary_rows=all_episode_summary_rows,
+                                    ),
                                     summary_client=summary_client,
                                     inventory_map=capped_new_inventory_v3_map,
                                     relation_map=new_relation_scope_map,
@@ -21088,6 +20634,7 @@ def write_delta_verification_json(path_str: str, results: dict[str, object]) -> 
 
 
 async def main() -> int:
+    global _character_asset_attempt_store
     args = parse_args()
     validate_delta_args(args)
     query, params = build_target_query(args=args, use_epub_fallback=args.use_epub_fallback)
@@ -21124,7 +20671,11 @@ async def main() -> int:
 
     if args.apply:
         _open_storyctx_usage_connection()
+    attempt_conn = None
     try:
+        if args.apply:
+            attempt_conn = db_connect(autocommit=True, timeout_seconds=5)
+            _character_asset_attempt_store = CharacterAssetAttemptStore(attempt_conn)
         if args.build_mode == "delta":
             results = (
                 await build_context_rows_delta(rows=rows, args=args)
@@ -21166,10 +20717,11 @@ async def main() -> int:
 
         results = await build_context_rows(rows=rows, args=args)
         print_summary(results=results, apply=args.apply)
-        if int(results.get("deferred_budget") or 0) > 0:
-            return STORYCTX_DEFERRED_BUDGET_EXIT_CODE
-        return 0
+        return build_delta_exit_code(results, apply=args.apply)
     finally:
+        _character_asset_attempt_store = None
+        if attempt_conn is not None:
+            attempt_conn.close()
         _close_storyctx_usage_connection()
 
 

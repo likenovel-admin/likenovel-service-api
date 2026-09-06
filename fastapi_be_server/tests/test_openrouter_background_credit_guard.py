@@ -159,20 +159,21 @@ class OpenRouterBackgroundCreditGuardTest(TestCase):
             self.assertIn(variable_name, cron_env)
             self.assertIn(variable_name, ai_dna_batch)
 
-    def test_story_context_passes_its_lower_priority_headroom_to_every_request(self):
-        root = Path(__file__).resolve().parents[1]
-        source = (root / "scripts" / "build_story_agent_context.py").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn('"STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD"', source)
-        self.assertIn('Decimal("1.00")', source)
-        self.assertEqual(
-            source.count(
-                "priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD"
-            ),
-            6,
-        )
+    def test_character_asset_reservation_preserves_story_context_headroom(self):
+        from tests.test_story_agent_context_cost_guard import load_module
+        module = load_module()
+        client = FakeAsyncClient(build_response(
+            200, {"data": {"total_credits": 20.0, "total_usage": 16.5}},
+        ))
+        with patch.object(module, "OPENROUTER_API_KEY", "test"), \
+             patch.object(module, "RP_REASONING_MODEL", ""), \
+             patch.object(module, "STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD", "1.00"):
+            with self.assertRaises(OpenRouterBackgroundCreditReserveError):
+                asyncio.run(module.request_episode_character_signals_payload(
+                    client, row={"episode_id": 1001, "episode_no": 1}, summary_text="bounded source",
+                ))
+        self.assertEqual(client.post_calls, [])
+        self.assertEqual(module._character_asset_attempt_store.connection.rows, {})
 
 
 class OpenRouterBackgroundCreditGuardAsyncTest(IsolatedAsyncioTestCase):
