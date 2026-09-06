@@ -1,5 +1,6 @@
 import json
 import unittest
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 from fastapi import status
@@ -61,6 +62,87 @@ class _FakeDb:
 
 
 class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_post_message_refreshes_product_and_scope_before_model_after_lock(self):
+        await self._assert_post_message_lock_refresh("scope")
+
+    async def test_post_message_rejects_revoked_product_or_access_before_model_after_lock(self):
+        for scenario in ("hidden", "ineligible", "disabled", "access", "decreased"):
+            with self.subTest(scenario=scenario):
+                await self._assert_post_message_lock_refresh(scenario)
+
+    async def _assert_post_message_lock_refresh(self, scenario):
+        model_boundary = CustomResponseException(status_code=418, message="model boundary")
+        db = _FakeDb(authorized_episode_to=[50, 0 if scenario == "access" else 30])
+        session_lock = object()
+        memory = {
+            "session_kind": "character_chat", "locked_character_scope_key": "named:test",
+            "allowed_modes": ["rp"], "active_mode": "rp", "rp_mode": "free",
+            "active_character": "named:test", "read_episode_to": 50 if scenario == "decreased" else 20,
+            "read_scope_state": "known", "read_scope_source": "account",
+        }
+        product = {"productId": 987, "title": "테스트 작품", "contextStatus": "ready",
+                   "latestEpisodeNo": 50, "syncedLatestEpisodeNo": 50, "characterChatEligible": True}
+        boundary_names = (
+            "_resolve_actor", "_get_session_row", "_resolve_websochat_active_character_resolution",
+            "_resolve_effective_adult_yn", "_get_websochat_product", "_resolve_websochat_prompt_read_episode_to",
+            "_get_websochat_product_session_state",
+            "_acquire_websochat_session_lock", "_release_websochat_session_lock",
+            "_acquire_websochat_actor_lock_on_connection", "_release_websochat_actor_lock_on_connection",
+            "_get_websochat_latest_visible_episode_no", "_get_existing_turn_messages",
+            "_resolve_websochat_message_charge_required", "_ensure_websochat_character_chat_entry_context",
+            "_generate_websochat_reply",
+        )
+        with ExitStack() as stack:
+            mocks = {name: stack.enter_context(patch.object(websochat_service, name, new_callable=AsyncMock)) for name in boundary_names}
+            mocks["_resolve_actor"].return_value = (321, None)
+            mocks["_get_session_row"].return_value = {"product_id": 987, "session_memory_json": memory, "title": "테스트"}
+            mocks["_resolve_websochat_active_character_resolution"].return_value = {"scopeKey": "named:test", "displayName": "테스트"}
+            mocks["_resolve_effective_adult_yn"].return_value = "Y"
+
+            async def get_product(**kwargs):
+                if not db.rolled_back:
+                    return product
+                if scenario == "hidden":
+                    return None
+                return dict(product, latestEpisodeNo=30, syncedLatestEpisodeNo=30,
+                            characterChatEligible=scenario != "ineligible",
+                            contextStatus="disabled" if scenario == "disabled" else "ready")
+
+            mocks["_get_websochat_product"].side_effect = get_product
+            mocks["_get_websochat_product_session_state"].return_value = {"unavailableMessage": "비공개 전환"}
+            mocks["_resolve_websochat_prompt_read_episode_to"].return_value = 49
+            mocks["_acquire_websochat_session_lock"].return_value = session_lock
+            mocks["_acquire_websochat_actor_lock_on_connection"].return_value = True
+            mocks["_get_websochat_latest_visible_episode_no"].return_value = 30
+            mocks["_get_existing_turn_messages"].return_value = None
+            mocks["_resolve_websochat_message_charge_required"].return_value = False
+            mocks["_ensure_websochat_character_chat_entry_context"].side_effect = lambda *, session_memory, **kwargs: session_memory
+            mocks["_generate_websochat_reply"].side_effect = model_boundary
+            with self.assertRaises(CustomResponseException) as captured:
+                await websochat_service.post_message(
+                    session_id=123, kc_user_id="kc-user-id", db=db,
+                    req_body=PostWebsochatMessageReqBody(client_message_id="fresh-scope", content="49화 기준으로 대화해줘", account_read_episode_to=50),
+                )
+
+            if scenario != "scope":
+                self.assertIsNot(captured.exception, model_boundary)
+                self.assertEqual(captured.exception.status_code, 409 if scenario == "decreased" else 400)
+                if scenario == "ineligible":
+                    self.assertEqual(captured.exception.code, "CHARACTER_CHAT_PRODUCT_INELIGIBLE")
+                elif scenario == "decreased":
+                    self.assertEqual(captured.exception.code, "CHARACTER_CHAT_READ_SCOPE_DECREASE_REQUIRES_NEW_SESSION")
+                mocks["_generate_websochat_reply"].assert_not_awaited()
+                self.assertFalse(db.committed)
+                mocks["_release_websochat_session_lock"].assert_awaited_once_with(session_id=123, conn=session_lock)
+                return
+            self.assertIs(captured.exception, model_boundary)
+            request = mocks["_generate_websochat_reply"].await_args.kwargs
+            self.assertEqual(request["session_memory"]["read_episode_to"], 30)
+            self.assertEqual(request["product_row"]["latestEpisodeNo"], 30)
+            self.assertEqual(db.authorization_query_count, 2)
+            self.assertEqual(mocks["_get_websochat_product"].await_count, 2)
+            mocks["_release_websochat_session_lock"].assert_awaited_once_with(session_id=123, conn=session_lock)
+
     async def test_post_message_acquires_actor_lock_for_billing_window(self):
         req_body = PostWebsochatMessageReqBody(
             client_message_id="client-actor-lock-1",
@@ -501,7 +583,8 @@ class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
             account_read_episode_to=50,
             model_key="deep",
         )
-        db = _FakeDb(authorized_episode_to=[50, 30])
+        # Initial read and locked pre-model refresh agree; access shrinks after generation.
+        db = _FakeDb(authorized_episode_to=[50, 50, 30])
         session_lock = object()
         existing_memory = {
             "session_kind": "character_chat",
@@ -674,7 +757,7 @@ class WebsochatActorLockTests(unittest.IsolatedAsyncioTestCase):
             for args, _kwargs in db.executions
             if args and "FROM tb_product_episode pe" in str(args[0]) and "authorizedYn" in str(args[0])
         ]
-        self.assertEqual(len(authorization_queries), 2)
+        self.assertEqual(len(authorization_queries), 3)
         release_actor_lock_on_connection.assert_awaited_once_with(
             user_id=321,
             guest_key=None,

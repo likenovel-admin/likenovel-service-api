@@ -3,7 +3,7 @@ import copy
 import unittest
 from types import SimpleNamespace
 
-from test_story_agent_context_cost_guard import load_module, signal_row, signal_character
+from tests.test_story_agent_context_cost_guard import load_module, signal_row, signal_character
 
 
 class ScheduledCollectionScopeTest(unittest.TestCase):
@@ -37,6 +37,19 @@ class ScheduledCollectionScopeTest(unittest.TestCase):
             args.scheduled = False
             query, params = self.module.build_target_query(args, False)
             self.assertEqual(len(db.execute(query.replace("%s", "?"), params).fetchall()), 31)
+            db.execute("INSERT INTO tb_product_episode VALUES(1,1000,60, 'duplicate','body',4,NULL,'Y','Y','2026-09-01',NULL,'2026-09-01')")
+            db.execute("INSERT INTO tb_product_episode VALUES(1,99,1, 'private','body',4,NULL,'Y','N','2026-09-01',NULL,'2026-09-01')")
+            db.execute("INSERT INTO tb_product_episode VALUES(1,100,0, 'inactive','body',4,NULL,'N','Y','2026-09-01',NULL,'2026-09-01')")
+            args.scheduled = True
+            query, params = self.module.build_target_query(args, False)
+            rows = db.execute(query.replace("%s", "?"), params).fetchall()
+            self.assertEqual(len(rows), 30)
+            self.assertEqual({row[2] for row in rows}, set(range(1, 31)))
+            self.assertEqual(rows[-1][3], 60)
+            args.scheduled, args.episode_nos, args.limit = False, [60], 1
+            query, params = self.module.build_target_query(args, False)
+            limited = db.execute(query.replace("%s", "?"), params).fetchall()
+            self.assertEqual([row[2] for row in limited], [30])
 
     def test_scheduled_targets_reuse_generator_top_two_after_signal_scope_filter(self):
         names = ["강현", "이준", "김민", "박서윤"]

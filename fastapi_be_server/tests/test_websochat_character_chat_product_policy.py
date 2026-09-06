@@ -1,14 +1,45 @@
 import json
 import unittest
+import pytest
 from unittest.mock import AsyncMock, patch
 
 from app.exceptions import CustomResponseException
 from app.schemas.websochat import PostWebsochatMessageReqBody, PostWebsochatSessionReqBody
 from app.services.websochat import websochat_service
+from app.services.websochat.websochat_rp_renderer import _select_rp_examples
 from app.services.websochat.character_chat_product_policy import (
     build_character_chat_rp_profile_ready_sql,
     is_character_chat_rp_profile_payload_ready,
+    select_character_chat_grounding_v1,
 )
+
+
+@pytest.mark.parametrize("scope", [None, "", "episode:0", "episode:01", "episode:-1", "episode:+1", "episode:１", "Episode:1", "episode:1:extra", "episode:1\n", " episode:1", 1])
+@pytest.mark.parametrize("invalid_episode_no, read_to", [(1, None), (60, 5), (1, 60)])
+def test_marked_grounding_rejects_invalid_exact_provenance_before_selection(scope, invalid_episode_no, read_to):
+    contract = {"version": "v1", "character_key": "character:lead", "generation_hash": "a" * 64}
+    profile = {"character_key": "character:lead", "display_name": "주인공", "character_contract": contract, "identity_labels_v1": []}
+    evidence = {"episode_no": 2, "episode_scope_key": "episode:101", "character_key": "character:lead", "kind": "narrated_action", "quote": "그는 문을 살폈다.", "source_part": "episode_source", "counterpart_label": ""}
+    items = [{**evidence, "episode_no": no} for no in range(2, 15)]
+    invalid = {**evidence, "episode_no": invalid_episode_no}
+    if scope is None:
+        invalid.pop("episode_scope_key")
+    else:
+        invalid["episode_scope_key"] = scope
+    examples = {"character_key": "character:lead", "character_contract": contract, "grounding_v1": items + [invalid]}
+    assert select_character_chat_grounding_v1(profile, examples, expected_character_key="character:lead", read_episode_to=read_to) is None
+
+
+@pytest.mark.parametrize("read_to, expected", [(None, [60, 31]), (31, [31]), (30, [])])
+def test_marked_grounding_exact_provenance_preserves_unbounded_episode_numbers(read_to, expected):
+    contract = {"version": "v1", "character_key": "character:lead", "generation_hash": "a" * 64}
+    profile = {"character_key": "character:lead", "display_name": "주인공", "character_contract": contract, "identity_labels_v1": []}
+    examples = {"character_key": "character:lead", "character_contract": contract, "grounding_v1": [
+        {"episode_no": no, "episode_scope_key": f"episode:{episode_id}", "character_key": "character:lead", "kind": "narrated_action", "quote": "그는 문을 살폈다.", "source_part": "episode_source", "counterpart_label": ""}
+        for episode_id, no in [(101, 31), (104, 60)]
+    ]}
+    selected = select_character_chat_grounding_v1(profile, examples, expected_character_key="character:lead", read_episode_to=read_to)
+    assert [item["episode_no"] for item in selected] == expected
 
 
 class _Mappings:
@@ -175,19 +206,43 @@ class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("e.open_changed_date", query)
         self.assertNotIn("2026-03-01", query)
 
-    async def test_character_chat_rp_examples_fall_back_only_when_filter_is_empty(self):
+    async def test_character_chat_readiness_requires_usable_turn_examples(self):
+        profile = {
+            "character_key": "character:adelite",
+            "display_name": "아델리트",
+            "personality_core": ["신중함"],
+            "speech_style": {
+                "tone": ["차분함"],
+                "formality": "존댓말",
+                "sentence_length": "보통",
+            },
+        }
+        inventory = {
+            "display_name": "아델리트",
+            "public_chat_eligible": True,
+            "display_safety": {"status": "pass"},
+        }
+        entry_context = {
+            "schema_version": "character_chat_entry_context_v2",
+            "product_id": 1182,
+            "character_scope_key": "character:adelite",
+            "read_episode_to": 1,
+            "recent_episode_from": 1,
+            "recent_episode_to": 1,
+            "recent_plot_rows": [{"episode_no": 1, "summary_text": "첫 회차의 현재 상태"}],
+            "character_anchor_episode_no": 1,
+            "character_scene": {"scene_gist": "아델리트가 다음 행동을 준비한다."},
+        }
+
         async def load_context(examples):
             async def get_summary_row(*, summary_type, **_kwargs):
                 payloads = {
-                    "character_rp_profile": {
-                        "scope_key": "character:adelite",
-                        "display_name": "아델리트",
-                        "speech_style": {"tone": "차분함"},
-                    },
+                    "character_rp_profile": profile,
                     "character_rp_examples": {
-                        "scope_key": "character:adelite",
+                        "character_key": "character:adelite",
                         "examples": examples,
                     },
+                    "character_inventory_v3": inventory,
                 }
                 payload = payloads.get(summary_type)
                 return (
@@ -211,11 +266,6 @@ class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch.object(
                     websochat_service,
-                    "_is_websochat_character_chat_rp_context_ready",
-                    return_value=True,
-                ),
-                patch.object(
-                    websochat_service,
                     "_build_websochat_rp_trajectory_context",
                     new_callable=AsyncMock,
                     return_value={},
@@ -234,17 +284,53 @@ class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
                         "active_character": "character:adelite",
                         "rp_mode": "free",
                         "read_episode_to": 1,
+                        "character_chat_entry_context": entry_context,
                     },
                     db=AsyncMock(),
                 )
 
-        out_of_scope_example = {"episode_no": 7, "text": "후반부 말투 예시"}
-        fallback_context = await load_context([out_of_scope_example])
-        self.assertEqual(fallback_context["examples"], [out_of_scope_example])
-
-        in_scope_example = {"episode_no": 1, "text": "첫 화 말투 예시"}
-        bounded_context = await load_context([in_scope_example, out_of_scope_example])
-        self.assertEqual(bounded_context["examples"], [in_scope_example])
+        future = {"episode_no": 7, "text": "후반부 말투 예시"}
+        current = {"episode_no": 1, "text": "첫 화 말투 예시"}
+        prologue = {"episode_no": 0, "text": "프롤로그 말투 예시"}
+        cases = [
+            ("future_only", [future], []),
+            ("mixed", [current, future], [current]),
+            ("blank", [{"episode_no": 1, "text": "   "}], []),
+            ("empty", [], []),
+            ("malformed", [{"episode_no": "unknown", "text": "잘못된 회차"}], []),
+            ("missing_episode", [{"text": "회차 없음"}], []),
+            ("negative_episode", [{"episode_no": -1, "text": "잘못된 회차"}], []),
+            ("prologue_zero", [prologue], [prologue]),
+        ]
+        for label, examples, expected in cases:
+            with self.subTest(label=label):
+                ready = websochat_service._is_websochat_character_chat_rp_context_ready(
+                    product_id=1182,
+                    read_episode_to=1,
+                    resolved_active_character="character:adelite",
+                    profile=profile,
+                    examples_payload={"character_key": "character:adelite", "examples": examples},
+                    internal_prompt_payload=None,
+                    internal_prompt="",
+                    inventory_payload=inventory,
+                    entry_context=entry_context,
+                )
+                context = await load_context(examples)
+                self.assertEqual(ready, bool(expected))
+                if not expected:
+                    self.assertIsNone(context)
+                    continue
+                self.assertIsNotNone(context)
+                self.assertEqual(context["examples"], expected)
+                selected = _select_rp_examples(
+                    examples_payload=context["examples"],
+                    anchor_episode_no=1,
+                    recent_messages=[],
+                    scene_summary_text="",
+                    relationship_stage="",
+                    read_episode_to=1,
+                )
+                self.assertEqual(selected, [f"- {item['text']}" for item in expected])
 
     def test_only_character_chat_uses_product_policy_for_send_permission(self):
         product = {"canSendMessage": True, "characterChatEligible": 0}

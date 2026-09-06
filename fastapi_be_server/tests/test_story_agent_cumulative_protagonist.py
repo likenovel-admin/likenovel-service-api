@@ -81,6 +81,127 @@ def anonymous_protagonist_item(*, first_person=True):
     }
 
 
+def generic_label_protagonist_item(label, *, first_person=False):
+    """LLM이 실명 대신 일반 라벨(주인공/그/당신)을 주인공 항목으로 낸 회차를 재현한다."""
+    return {
+        "character_key": (
+            "protagonist:first_person"
+            if first_person
+            else story.build_protagonist_scope_key(label)
+        ),
+        "display_name": label,
+        "aliases": [label],
+        "entity_kind": "person",
+        "real_names": [],
+        "narration_names": [label] if first_person else [],
+        "role_in_episode": "lead",
+        "scene_weight": "high",
+        "voice_mode": "monologue" if first_person else "narration_only",
+        "is_work_protagonist": "Y",
+        "episode_focal": "Y",
+        "is_first_person": "Y" if first_person else "N",
+    }
+
+
+def build_generic_label_gap_signal_rows():
+    """1~3화 실명 주인공(레이븐)이 확정된 뒤, 일부 회차에서 주인공이
+    '주인공'/'그'/'소년' 같은 일반 라벨로만 나오는 작품을 재현한다.
+    실명 조연(소리)은 4화와 9화에만 등장하고, 10화의 1인칭 항목은
+    일반 라벨이 아닌 호칭('당신')으로 나온다."""
+    rows = []
+    for episode_no in (1, 2, 3):
+        rows.append(
+            signal_row(
+                episode_no,
+                [character_item("character:레이븐", "레이븐", work_protagonist=True)],
+            )
+        )
+    rows.append(
+        signal_row(
+            4,
+            [
+                character_item("character:레이븐", "레이븐", work_protagonist=True),
+                character_item(
+                    "character:소리",
+                    "소리",
+                    role_in_episode="counterpart",
+                    scene_weight="medium",
+                ),
+            ],
+        )
+    )
+    rows.append(signal_row(5, [generic_label_protagonist_item("주인공")]))
+    rows.append(signal_row(6, [generic_label_protagonist_item("그")]))
+    rows.append(
+        signal_row(7, [generic_label_protagonist_item("소년", first_person=True)])
+    )
+    rows.append(
+        signal_row(
+            8,
+            [character_item("character:레이븐", "레이븐", work_protagonist=True)],
+        )
+    )
+    rows.append(
+        signal_row(
+            9,
+            [
+                character_item("character:레이븐", "레이븐", work_protagonist=True),
+                character_item(
+                    "character:소리",
+                    "소리",
+                    role_in_episode="counterpart",
+                    scene_weight="medium",
+                ),
+            ],
+        )
+    )
+    rows.append(
+        signal_row(10, [generic_label_protagonist_item("당신", first_person=True)])
+    )
+    return rows
+
+
+class GenericLabelProtagonistFoldTest(unittest.TestCase):
+    def test_generic_label_protagonist_rows_fold_into_resolved_main(self):
+        rows = story.aggregate_character_inventory_v3_rows(
+            build_generic_label_gap_signal_rows()
+        )
+        by_display = {str(row.get("display_name") or ""): row for row in rows}
+        main = by_display["레이븐"]
+        self.assertEqual(str(main.get("work_role") or ""), "main_protagonist")
+        self.assertEqual(
+            list(main.get("evidence_episode_nos") or []),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        )
+        self.assertNotIn("주인공", by_display)
+        self.assertNotIn("그", by_display)
+        self.assertNotIn("소년", by_display)
+
+    def test_non_generic_first_person_label_row_is_absorbed_but_kept(self):
+        """일반 라벨이 아닌 1인칭 호칭 행은 근거만 흡수되고 행은 남는다."""
+        rows = story.aggregate_character_inventory_v3_rows(
+            build_generic_label_gap_signal_rows()
+        )
+        by_display = {str(row.get("display_name") or ""): row for row in rows}
+        self.assertIn("당신", by_display)
+        self.assertNotEqual(
+            str(by_display["당신"].get("work_role") or ""), "main_protagonist"
+        )
+
+    def test_generic_label_fold_keeps_named_side_character(self):
+        rows = story.aggregate_character_inventory_v3_rows(
+            build_generic_label_gap_signal_rows()
+        )
+        by_display = {str(row.get("display_name") or ""): row for row in rows}
+        self.assertIn("소리", by_display)
+        self.assertEqual(
+            list(by_display["소리"].get("evidence_episode_nos") or []), [4, 9]
+        )
+        self.assertNotEqual(
+            str(by_display["소리"].get("work_role") or ""), "main_protagonist"
+        )
+
+
 def build_conflicting_opening_signal_rows(total_episodes=30, protagonist_episodes=26):
     """1~3화에 주인공 주장이 겹쳐 오프닝 판정이 실패하지만,
     누적으로는 차우진이 압도적인 작품을 재현한다."""
@@ -115,6 +236,57 @@ def build_conflicting_opening_signal_rows(total_episodes=30, protagonist_episode
 
 
 class CumulativeWorkProtagonistFallbackTest(unittest.TestCase):
+    def test_resolver_keeps_shared_occupation_separate_until_explicit_self_identification(self):
+        for case, has_named_observation, has_identity_edge in (
+            ("anonymous_shared_occupation", False, False),
+            ("name_without_identity_edge", True, False),
+            ("explicit_self_identification", True, True),
+        ):
+            with self.subTest(case=case):
+                signals = []
+                for episode_no in range(1, 9):
+                    narrator = anonymous_protagonist_item()
+                    narrator["social_call_names"] = ["정찰병"]
+                    if has_identity_edge and episode_no == 3:
+                        narrator["identity_claims"] = [{
+                            "target_key": "named:윤하람", "target_label": "윤하람",
+                            "claim_type": "self_reference_as", "evidence": "나는 윤하람이다.",
+                        }]
+                    if has_named_observation and episode_no >= 4:
+                        narrator = character_item(
+                            "named:윤하람", "윤하람", work_protagonist=True, voice_mode="monologue",
+                        )
+                        narrator["is_first_person"] = "Y"
+                    items = [narrator]
+                    if episode_no in (2, 3):
+                        other = character_item(
+                            "named:다른정찰병", "정찰병", role_in_episode="support", voice_mode="narration_only",
+                        )
+                        other.update(real_names=[], entity_kind="stable_role")
+                        other["action_tags"] = ["사망"] if episode_no == 3 else ["순찰"]
+                        items.append(other)
+                    signals.append(signal_row(episode_no, items))
+                resolution = story.asyncio.run(story.build_work_protagonist_resolution_for_inventory_v3(
+                    product_id=1, product_title="", signal_rows=signals,
+                    summary_client=None, episode_summary_rows=[],
+                ))
+                inventory = story.aggregate_character_inventory_v3_rows(signals, protagonist_resolution=resolution)
+                main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+                other = next(row for row in inventory if "named:다른정찰병" in row["source_character_keys"])
+                self.assertNotEqual(other["work_role"], "main_protagonist")
+                self.assertEqual(other["evidence_episode_nos"], [2, 3])
+                self.assertIn("사망", other["dominant_action_tags"])
+                self.assertNotIn("사망", main["dominant_action_tags"])
+                self.assertTrue(set(main["source_observation_refs"]).isdisjoint(other["source_observation_refs"]))
+                if has_identity_edge:
+                    self.assertEqual(main["display_name"], "윤하람")
+                    self.assertEqual(set(main["source_character_keys"]), {"protagonist:generic", "named:윤하람"})
+                    self.assertEqual(main["evidence_episode_nos"], list(range(1, 9)))
+                else:
+                    self.assertEqual(main["canonical_character_key"], "character:나(주인공)")
+                    self.assertEqual(main["source_character_keys"], ["protagonist:generic"])
+                    self.assertFalse(main["public_chat_eligible"])
+
     def test_opening_rejects_one_named_claim_after_anonymous_non_pov_claims(self):
         """1101: 단발성 네아보다 누적 근거가 압도적인 원유성을 우선한다."""
         signal_rows = [
@@ -267,6 +439,44 @@ class CumulativeWorkProtagonistFallbackTest(unittest.TestCase):
 
         self.assertEqual(opening.get("decision"), "RESOLVED")
         self.assertEqual(opening.get("work_protagonist_key"), "character:진프라흐")
+
+    def test_possessed_relation_target_preserves_name_without_merging_body_owner(self):
+        for target_name, expected_display in (("영주의 동생", "서도윤"), ("테오라", "테오라")):
+            with self.subTest(target_name=target_name):
+                protagonist = character_item(
+                    "protagonist:named:서도윤", "서도윤", work_protagonist=True,
+                )
+                protagonist.update(
+                    real_names=[], aliases=["서도윤"], narration_names=["서도윤"],
+                    persona_names=["서도윤"],
+                )
+                target_key = story.build_named_character_scope_key(target_name)
+                possessed = {
+                    **protagonist,
+                    "identity_claims": [{
+                        "claim_type": "possessed_as", "target_key": target_key,
+                        "target_label": target_name,
+                        "normalized_target_label": story.normalize_signal_entity_label(target_name),
+                        "evidence": "다른 육체에 혼이 깃들었다.",
+                    }],
+                }
+                original_owner = character_item(
+                    target_key, target_name, role_in_episode="counterpart", scene_weight="low",
+                )
+                rows = story.aggregate_character_inventory_v3_rows([
+                    signal_row(1, [possessed, original_owner]),
+                    signal_row(2, [protagonist]),
+                    signal_row(3, [protagonist]),
+                ])
+                main = next(row for row in rows if "protagonist:named:서도윤" in row["source_character_keys"])
+                body_owner = next(row for row in rows if target_key in row["source_character_keys"])
+
+                self.assertEqual(main["display_name"], expected_display)
+                self.assertEqual(main["work_role"], "main_protagonist")
+                self.assertTrue(main["public_chat_eligible"])
+                self.assertIsNot(main, body_owner)
+                self.assertNotIn(target_key, main["source_character_keys"])
+                self.assertNotEqual(body_owner["work_role"], "main_protagonist")
 
     def test_opening_does_not_replace_dominant_possessed_identity(self):
         """빙의 전 이름보다 이후 누적된 빙의 대상의 정체성을 유지한다."""
@@ -835,6 +1045,161 @@ class CumulativeWorkProtagonistFallbackTest(unittest.TestCase):
             if str(row.get("work_role") or "") == "main_protagonist"
         ]
         self.assertIn("차우진", promoted)
+
+class PersonaRenameIdentityGuardTest(unittest.TestCase):
+    def test_selected_identity_conflict_cannot_skip_rename_validation_or_fold(self):
+        unverified = character_item(
+            "protagonist:first_person", "가온", work_protagonist=True, voice_mode="monologue",
+        )
+        unverified.update(real_names=[], is_first_person="Y")
+        signals = [
+            signal_row(1, [anonymous_protagonist_item()]),
+            signal_row(2, [unverified]),
+            signal_row(3, [character_item("named:다온", "다온", work_protagonist=True)]),
+        ]
+        base = story.aggregate_character_inventory_v3_rows(
+            signals, protagonist_resolution=story._unresolved_opening_work_protagonist_resolution("base"),
+        )
+        conflicting = next(row for row in base if row["canonical_character_key"] == "character:가온")
+        self.assertIn("first_person_identity_unverified", conflicting["identity_conflict_reasons"])
+        for case, selected, evidence in (
+            ("selected_only", ["character:가온"], ["character:가온"]),
+            ("with_generic", ["character:가온"], ["character:가온", "character:나(주인공)"]),
+            ("multiple_one_conflict", ["character:다온", "character:가온"], ["character:다온", "character:가온"]),
+        ):
+            payload = {
+                "decision": "RESOLVED", "confidence": "high",
+                "work_protagonist_keys": selected, "role_evidence_keys": evidence,
+                "reason_code": "persona_rename_same_person",
+            }
+            with self.subTest(case=case, boundary="validator"):
+                resolution = story.validate_work_protagonist_resolution_payload(payload, base)
+                self.assertEqual(resolution["decision"], "UNRESOLVED")
+                self.assertEqual(resolution["reason_code"], "requires_identity_merge")
+                self.assertTrue(resolution["safety_flags"]["requires_identity_merge"])
+            with self.subTest(case=case, boundary="aggregate"):
+                inventory = story.aggregate_character_inventory_v3_rows(signals, protagonist_resolution=payload)
+                self.assertFalse(any(row["work_role"] == "main_protagonist" for row in inventory))
+                current = next(row for row in inventory if row["canonical_character_key"] == "character:가온")
+                generic = next(row for row in inventory if row["canonical_character_key"] == "character:나(주인공)")
+                self.assertEqual(current["evidence_episode_nos"], [2])
+                self.assertEqual(generic["evidence_episode_nos"], [1])
+                self.assertTrue(set(current["source_observation_refs"]).isdisjoint(generic["source_observation_refs"]))
+
+    def test_named_identity_group_requires_no_conflict_on_either_member(self):
+        rows = story.aggregate_character_inventory_v3_rows([
+            signal_row(1, [character_item("character:이전인물", "이전인물", work_protagonist=True)]),
+            signal_row(2, [character_item("character:현재인물", "현재인물", work_protagonist=True)]),
+        ], protagonist_resolution=story._unresolved_opening_work_protagonist_resolution("base"))
+        payload = {
+            "decision": "RESOLVED", "confidence": "high",
+            "work_protagonist_keys": ["character:현재인물"],
+            "role_evidence_keys": ["character:현재인물", "character:이전인물"],
+            "reason_code": "persona_rename_same_person",
+        }
+        for row in rows:
+            # Existing locked/reviewed identity-group shape, not a name alias.
+            row["identity_group_key"] = "character:확정동일인"
+        self.assertEqual(story.validate_work_protagonist_resolution_payload(payload, rows)["decision"], "RESOLVED")
+        for conflicting_row in rows:
+            with self.subTest(conflicting=conflicting_row["canonical_character_key"]):
+                conflicting_row["identity_conflict_reasons"] = ["same_name_distinct_people"]
+                self.assertEqual(story.validate_work_protagonist_resolution_payload(payload, rows)["decision"], "UNRESOLVED")
+                conflicting_row["identity_conflict_reasons"] = []
+        # Same spelling/source overlap alone must not create an identity group.
+        for row in rows:
+            row.pop("identity_group_key")
+            row["aliases"] = ["공통호칭"]
+            row["source_character_keys"] = ["character:동명이인"]
+        self.assertEqual(story.validate_work_protagonist_resolution_payload(payload, rows)["decision"], "UNRESOLVED")
+        for row in rows:
+            row["source_character_keys"] = ["protagonist:generic"]
+        self.assertEqual(story.validate_work_protagonist_resolution_payload(payload, rows)["decision"], "UNRESOLVED")
+        payload["role_evidence_keys"] = ["character:현재인물"]
+        story._fold_work_protagonist_evidence_into_selected_main(rows, payload)
+        current = next(row for row in rows if row["canonical_character_key"] == "character:현재인물")
+        self.assertEqual(current["evidence_episode_nos"], [2])
+
+    def test_generic_fragments_keep_rename_role_continuity(self):
+        signals = [signal_row(1, [anonymous_protagonist_item()])]
+        signals.extend(signal_row(no, [character_item("character:현재인물", "현재인물", work_protagonist=True)]) for no in (2, 3))
+        payload = {
+            "decision": "RESOLVED", "confidence": "high",
+            "work_protagonist_keys": ["character:현재인물"],
+            "role_evidence_keys": ["character:현재인물"],
+            "reason_code": "persona_rename_same_person",
+        }
+        inventory = story.aggregate_character_inventory_v3_rows(signals, protagonist_resolution=payload)
+        main = next(row for row in inventory if row["work_role"] == "main_protagonist")
+        self.assertEqual(main["evidence_episode_nos"], [1, 2, 3])
+
+    def test_source_backed_identity_cluster_can_still_be_selected(self):
+        short_name = character_item("named:현태", "현태", work_protagonist=True)
+        short_name["identity_claims"] = [{
+            "target_label": "서현태", "claim_type": "real_name_of",
+            "evidence": "현태의 풀네임은 서현태였다.",
+        }]
+        signals = [signal_row(1, [short_name])]
+        signals.extend(signal_row(no, [character_item("named:서현태", "서현태", work_protagonist=True)]) for no in (2, 3))
+        base = story.aggregate_character_inventory_v3_rows(
+            signals, protagonist_resolution=story._unresolved_opening_work_protagonist_resolution("base"),
+        )
+        self.assertEqual(len(base), 1)
+        self.assertEqual(set(base[0]["source_character_keys"]), {"named:현태", "named:서현태"})
+        key = base[0]["canonical_character_key"]
+        payload = {
+            "decision": "RESOLVED", "confidence": "high",
+            "work_protagonist_keys": [key], "role_evidence_keys": [key],
+            "reason_code": "persona_rename_same_person",
+        }
+        inventory = story.aggregate_character_inventory_v3_rows(signals, protagonist_resolution=payload)
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["work_role"], "main_protagonist")
+        self.assertEqual(inventory[0]["evidence_episode_nos"], [1, 2, 3])
+
+    def test_unsupported_named_rename_is_not_folded_or_repromoted(self):
+        signals = [
+            signal_row(episode_no, [character_item(
+                "character:이전인물" if episode_no == 1 else "character:현재인물",
+                "이전인물" if episode_no == 1 else "현재인물",
+                work_protagonist=True,
+            )])
+            for episode_no in range(1, 13)
+        ]
+        payload = {
+            "decision": "RESOLVED",
+            "work_protagonist_keys": ["character:현재인물"],
+            "role_evidence_keys": ["character:이전인물", "character:현재인물"],
+            "reason_code": "persona_rename_same_person",
+            "confidence": "high",
+        }
+        base = story.aggregate_character_inventory_v3_rows(
+            signals,
+            protagonist_resolution=story._unresolved_opening_work_protagonist_resolution("base"),
+        )
+        resolution = story.validate_work_protagonist_resolution_payload(payload, base)
+        self.assertEqual(resolution["decision"], "UNRESOLVED")
+        self.assertEqual(resolution["reason_code"], "requires_identity_merge")
+        self.assertTrue(resolution["safety_flags"]["requires_identity_merge"])
+        cumulative = story._build_cumulative_work_protagonist_resolution(
+            base, total_signal_episodes=12, unresolved_fallback=resolution,
+        )
+        self.assertEqual(cumulative["reason_code"], "requires_identity_merge")
+        self.assertEqual(cumulative["decision"], "UNRESOLVED")
+        # A raw caller cannot bypass validation by entering aggregation directly.
+        inventory = story.aggregate_character_inventory_v3_rows(signals, protagonist_resolution=payload)
+        self.assertFalse(any(row["work_role"] == "main_protagonist" for row in inventory))
+        previous = next(row for row in inventory if row["display_name"] == "이전인물")
+        current = next(row for row in inventory if row["display_name"] == "현재인물")
+        self.assertEqual(previous["evidence_episode_nos"], [1])
+        self.assertEqual(current["evidence_episode_nos"], list(range(2, 13)))
+        self.assertTrue(set(previous["source_observation_refs"]).isdisjoint(current["source_observation_refs"]))
+        # No retirement or blanket public deactivation is part of this guard.
+        self.assertEqual(
+            {row["canonical_character_key"]: row["public_chat_eligible"] for row in inventory},
+            {row["canonical_character_key"]: row["public_chat_eligible"] for row in base},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
