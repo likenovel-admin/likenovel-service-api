@@ -8009,6 +8009,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("p.paid_episode_no", target_sql)
         self.assertIn("recent_ai_view_count", target_sql)
         self.assertIn("ps.read_episode_count", target_sql)
+        self.assertIn("open_episode_count", target_sql)
+        self.assertIn("p.created_date", target_sql)
         self.assertIn("order by e_next.episode_no, e_next.episode_id", target_sql)
         self.assertIn("limit 1", target_sql)
 
@@ -8188,6 +8190,45 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(selected_product_ids - {100})
 
     def test_reader_candidate_choice_avoids_recently_overexposed_new_product(self):
+        from app.services.ai import reader_agent_session_service as service
+
+        _ = service
+        return self._run_overexposed_new_product_case()
+
+    def test_overexposed_continuing_work_releases_readers_to_other_works(self):
+        """A work already saturated with AI reads must not keep every reader."""
+        from app.services.ai import reader_agent_session_service as service
+
+        quiet = [{"read_episode_count": 10, "recent_ai_view_count": 0}]
+        saturated = [{"read_episode_count": 10, "recent_ai_view_count": 1400}]
+        persona = {"novelty_seeking": 0.0}
+        sessions = [
+            service.ReaderClaimedSession(
+                ai_reader_schedule_id=n,
+                ai_reader_agent_id=n,
+                user_id=n,
+                age_group="30s",
+                gender="M",
+                persona_json="{}",
+                taste_memory_json="{}",
+                activity_pattern_json="{}",
+            )
+            for n in range(1, 401)
+        ]
+        quiet_explore = sum(
+            service._should_explore_new_reader_candidate(quiet, persona=persona, session=s)
+            for s in sessions
+        )
+        saturated_explore = sum(
+            service._should_explore_new_reader_candidate(saturated, persona=persona, session=s)
+            for s in sessions
+        )
+        self.assertGreater(saturated_explore, quiet_explore * 1.4,
+                           f"quiet={quiet_explore} saturated={saturated_explore}")
+        self.assertLess(saturated_explore, len(sessions),
+                        "saturated works must still keep some of their readers")
+
+    def _run_overexposed_new_product_case(self):
         from app.services.ai import reader_agent_session_service as service
 
         popular_match = {

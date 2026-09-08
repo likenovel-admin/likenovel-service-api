@@ -87,6 +87,24 @@ BASE_NEW_PRODUCT_EXPLORATION_RATE = 0.35
 NOVELTY_NEW_PRODUCT_EXPLORATION_RATE = 0.20
 MIN_NEW_PRODUCT_EXPLORATION_READ_EPISODES = 3
 RECENT_AI_VIEW_SCORE_PENALTY_WEIGHT = 0.10
+# Saturated works release more readers, but never all of them: a reader should
+# still be able to keep following a work it already started. Ordinary exposure
+# stays near the base rate; the bonus only ramps up well past it.
+SATURATION_EXPLORATION_BONUS = 0.25
+SATURATION_FREE_AI_VIEW_COUNT = 200.0
+SATURATION_REFERENCE_AI_VIEW_COUNT = 1200.0
+MAX_NEW_PRODUCT_EXPLORATION_RATE = 0.80
+# Editorial preference: ongoing works, works with a real backlog, and recent
+# arrivals. Each signal is capped so it tilts the order without creating a new
+# pile-up on whichever work scores highest.
+ONGOING_STATUS_SCORE = 0.25
+BACKLOG_SCORE_WEIGHT = 0.30
+BACKLOG_SATURATION_EPISODE_COUNT = 60
+RECENCY_SCORE_WEIGHT = 0.25
+RECENCY_FULL_SCORE_DAYS = 30
+RECENCY_FADE_OUT_DAYS = 180
+# Applied to continuing works too, so a single work cannot absorb every reader.
+CONTINUING_AI_VIEW_PENALTY_WEIGHT = 0.35
 DEFAULT_PRODUCT_TYPE_WEIGHTS = {
     "free_serial": 100,
     "paid_serial": 0,
@@ -1379,6 +1397,8 @@ async def _select_reader_target_episode(
                  , p.count_hit
                  , p.count_bookmark
                  , p.count_recommend
+                 , p.created_date
+                 , coalesce(open_eps.open_episode_count, 0) as open_episode_count
                  , e.episode_id
                  , e.episode_no
                  , e.episode_title
@@ -1408,6 +1428,15 @@ async def _select_reader_target_episode(
                      group by product_id
               ) recent_ai
                 on recent_ai.product_id = p.product_id
+              left join (
+                    select product_id
+                         , count(*) as open_episode_count
+                      from tb_product_episode
+                     where use_yn = 'Y' and open_yn = 'Y'
+                       and (publish_reserve_date is null or publish_reserve_date <= current_timestamp)
+                     group by product_id
+              ) open_eps
+                on open_eps.product_id = p.product_id
              where p.open_yn = 'Y'
                and coalesce(p.blind_yn, 'N') = 'N'
                and e.use_yn = 'Y'
@@ -1549,18 +1578,50 @@ def _score_reader_candidate(
         min(float(row.get("count_hit") or 0) / 100000.0, 1.0)
         * POPULARITY_SCORE_WEIGHT
     )
-    recent_ai_view_penalty = 0.0
-    if not row.get("ai_reader_product_state_id"):
-        recent_ai_view_penalty = math.log1p(
-            max(0.0, _safe_float(row.get("recent_ai_view_count"), 0.0))
-        ) * RECENT_AI_VIEW_SCORE_PENALTY_WEIGHT
+    weight = (
+        CONTINUING_AI_VIEW_PENALTY_WEIGHT
+        if row.get("ai_reader_product_state_id")
+        else RECENT_AI_VIEW_SCORE_PENALTY_WEIGHT
+    )
+    recent_ai_view_penalty = math.log1p(
+        max(0.0, _safe_float(row.get("recent_ai_view_count"), 0.0))
+    ) * weight
     return (
         state_score
         + persona_score
         + taste_score
         + popularity_score
+        + _score_candidate_editorial_fit(row)
         - recent_ai_view_penalty
     )
+
+
+def _score_candidate_editorial_fit(row: dict[str, Any]) -> float:
+    """Small, capped tilt toward ongoing works, real backlogs, and new arrivals."""
+    ongoing_score = (
+        ONGOING_STATUS_SCORE if str(row.get("status_code") or "") == "ongoing" else 0.0
+    )
+    open_episode_count = max(0.0, _safe_float(row.get("open_episode_count"), 0.0))
+    backlog_score = (
+        min(open_episode_count / BACKLOG_SATURATION_EPISODE_COUNT, 1.0)
+        * BACKLOG_SCORE_WEIGHT
+    )
+    return ongoing_score + backlog_score + _score_candidate_recency(row)
+
+
+def _score_candidate_recency(row: dict[str, Any]) -> float:
+    created_date = row.get("created_date")
+    if not isinstance(created_date, datetime):
+        return 0.0
+    age_days = (datetime.now() - created_date).total_seconds() / 86400.0
+    if age_days <= RECENCY_FULL_SCORE_DAYS:
+        return RECENCY_SCORE_WEIGHT
+    if age_days >= RECENCY_FADE_OUT_DAYS:
+        return 0.0
+    remaining = (RECENCY_FADE_OUT_DAYS - age_days) / (
+        RECENCY_FADE_OUT_DAYS - RECENCY_FULL_SCORE_DAYS
+    )
+    return RECENCY_SCORE_WEIGHT * remaining
 
 
 def _choose_reader_candidate(
@@ -1661,8 +1722,26 @@ def _should_explore_new_reader_candidate(
     exploration_rate = (
         BASE_NEW_PRODUCT_EXPLORATION_RATE
         + novelty_seeking * NOVELTY_NEW_PRODUCT_EXPLORATION_RATE
+        + _reader_saturation_exploration_bonus(continuing_rows)
     )
+    exploration_rate = min(exploration_rate, MAX_NEW_PRODUCT_EXPLORATION_RATE)
     return _stable_reader_new_product_exploration_selector(session) < exploration_rate
+
+
+def _reader_saturation_exploration_bonus(continuing_rows: list[dict[str, Any]]) -> float:
+    """Extra chance to look elsewhere when the current works are AI-saturated."""
+    if not continuing_rows:
+        return 0.0
+    lowest_exposure = min(
+        max(0.0, _safe_float(row.get("recent_ai_view_count"), 0.0))
+        for row in continuing_rows
+    )
+    if lowest_exposure <= SATURATION_FREE_AI_VIEW_COUNT:
+        return 0.0
+    saturation = math.log1p(lowest_exposure - SATURATION_FREE_AI_VIEW_COUNT) / math.log1p(
+        SATURATION_REFERENCE_AI_VIEW_COUNT
+    )
+    return min(saturation, 1.0) * SATURATION_EXPLORATION_BONUS
 
 
 def _filter_reader_candidates_by_product_type_weight(
