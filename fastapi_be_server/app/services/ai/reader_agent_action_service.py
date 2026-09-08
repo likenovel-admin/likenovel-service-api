@@ -10,7 +10,8 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.const import settings
-from app.services.ai.reader_agent_decision_service import EVALUATION_CODES
+from app.services.ai.reader_agent_decision_service import EVALUATION_CODES, build_active_action_scope_key
+from app.services.ai import reader_agent_comment_policy as comment_policy
 
 
 YN_VALUES = {"Y", "N"}
@@ -210,6 +211,12 @@ async def _process_claimed_action_in_session(
             return result
     except ReaderActionLockBusyError:
         async with db.begin():
+            if action.action_type == "comment":
+                await mark_action_skipped(
+                    db, action_id=action.ai_reader_action_id, worker_id=worker_id,
+                    skip_reason="comment_lock_busy",
+                )
+                return _result(action, applied=False, reason="comment_lock_busy")
             await mark_action_retry_later(
                 db,
                 action_id=action.ai_reader_action_id,
@@ -971,6 +978,8 @@ async def _dispatch_reader_action(
         return await _apply_evaluate_action(action, db)
     if action.action_type == "recommend":
         return await _apply_recommend_action(action, db)
+    if action.action_type == "comment":
+        return await _apply_comment_action(action, db)
     if action.action_type == "drop":
         return await _apply_drop_action(action, db)
     if action.action_type == "next_episode":
@@ -1167,6 +1176,195 @@ async def _apply_read_action(
         db,
         event_type="episode_view",
     )
+    if not rows:
+        await _enqueue_comment_after_read(action, db)
+    return _result(action, applied=True, reason="applied")
+
+
+async def _enqueue_comment_after_read(action: ReaderQueuedAction, db: AsyncSession) -> None:
+    if action.episode_id is None:
+        raise InvalidReaderActionError("comment requires episode_id")
+    if not comment_policy.is_regular_commenter(action.user_id, action.product_id):
+        if comment_policy.choose_comment(
+            action.user_id, action.product_id, action.episode_id, first_read=False, finished=False,
+        ) is None:
+            return
+    result = await db.execute(
+        text("""
+            select e.comment_open_yn,
+                   s.read_episode_count,
+                   (p.status_code in ('end', 'completed') and not exists (
+                       select 1 from tb_product_episode n
+                        where n.product_id = e.product_id and n.episode_no > e.episode_no
+                          and n.use_yn = 'Y' and n.open_yn = 'Y'
+                          and (n.publish_reserve_date is null or n.publish_reserve_date <= current_timestamp)
+                   )) as finished
+              from tb_product_episode e
+              join tb_product p on p.product_id = e.product_id
+              join tb_ai_reader_product_state s
+                on s.product_id = e.product_id and s.ai_reader_agent_id = :agent_id
+             where e.episode_id = :episode_id and e.product_id = :product_id
+        """),
+        {"agent_id": action.ai_reader_agent_id, "episode_id": action.episode_id, "product_id": action.product_id},
+    )
+    row = result.mappings().one_or_none()
+    if not row or row.get("comment_open_yn") != "Y":
+        return
+    choice = comment_policy.choose_comment(
+        action.user_id, action.product_id, action.episode_id,
+        first_read=int(row.get("read_episode_count") or 0) == 1,
+        finished=bool(row.get("finished")),
+    )
+    if choice is None:
+        return
+    content, delay = choice
+    fingerprint = f"ai-reader-comment|{action.user_id}|{action.product_id}|{action.episode_id}"
+    await db.execute(
+        text("""
+            insert into tb_ai_reader_action_queue (
+                idempotency_key, active_scope_key, ai_reader_agent_id, user_id,
+                product_id, episode_id, action_type, target_value, llm_decision_id, available_at
+            ) values (
+                :idempotency_key, :active_scope_key, :agent_id, :user_id,
+                :product_id, :episode_id, 'comment', :content, :decision_id,
+                timestampadd(second, :delay, current_timestamp)
+            )
+            on duplicate key update active_scope_key = active_scope_key
+        """),
+        {
+            "idempotency_key": hashlib.sha256(fingerprint.encode()).hexdigest(),
+            "active_scope_key": build_active_action_scope_key(
+                agent_id=action.ai_reader_agent_id, user_id=action.user_id,
+                product_id=action.product_id, episode_id=action.episode_id,
+                action_type="comment", target_value=content,
+            ),
+            "agent_id": action.ai_reader_agent_id, "user_id": action.user_id,
+            "product_id": action.product_id, "episode_id": action.episode_id,
+            "content": content, "decision_id": action.llm_decision_id, "delay": delay,
+        },
+    )
+
+
+async def _apply_comment_action(action: ReaderQueuedAction, db: AsyncSession) -> ReaderActionApplyResult:
+    if action.episode_id is None or action.target_value not in comment_policy.COMMENT_TEXTS:
+        raise InvalidReaderActionError("comment requires an episode and an approved exact text")
+    params = {
+        "episode_id": action.episode_id, "product_id": action.product_id,
+        "user_id": action.user_id, "agent_id": action.ai_reader_agent_id,
+        "action_id": action.ai_reader_action_id,
+        "content": action.target_value,
+    }
+    # Hold the episode row until the OUTER transaction commits. Normal comment
+    # inserts also read this row; all AI quota/repetition reads below are current reads.
+    result = await db.execute(text("""
+        select e.product_id, e.comment_open_yn,
+               (select s.state from tb_ai_reader_product_state s
+                 where s.ai_reader_agent_id = :agent_id and s.product_id = :product_id) as reader_state,
+               (p.status_code in ('end', 'completed') and not exists (
+                   select 1 from tb_product_episode n
+                    where n.product_id = e.product_id and n.episode_no > e.episode_no
+                      and n.use_yn = 'Y' and n.open_yn = 'Y'
+                      and (n.publish_reserve_date is null or n.publish_reserve_date <= current_timestamp)
+               )) as finished
+          from tb_product_episode e
+          join tb_product p on p.product_id = e.product_id
+         where e.episode_id = :episode_id and e.product_id = :product_id
+           and e.use_yn = 'Y' and e.open_yn = 'Y'
+           and (e.publish_reserve_date is null or e.publish_reserve_date <= current_timestamp)
+           and p.open_yn = 'Y' and coalesce(p.blind_yn, 'N') = 'N'
+           and (coalesce(e.price_type, 'free') = 'free' or (
+               p.price_type = 'paid' and p.paid_episode_no > 0 and e.episode_no < p.paid_episode_no
+           ))
+         for update
+    """), params)
+    episode = result.mappings().one_or_none()
+    if not episode:
+        return _result(action, applied=False, reason="comment_episode_unavailable")
+    if episode.get("comment_open_yn") != "Y":
+        return _result(action, applied=False, reason="comment_closed")
+    if episode.get("reader_state") == "dropped":
+        return _result(action, applied=False, reason="product_dropped")
+    if episode.get("finished") and action.target_value in {"다음화 기대됩니다.", "계속 볼게요."}:
+        return _result(action, applied=False, reason="comment_finished_work")
+    result = await db.execute(text("""
+        select timestampdiff(second, available_at, current_timestamp) as due_age
+          from tb_ai_reader_action_queue
+         where ai_reader_action_id = :action_id and action_type = 'comment'
+           and ai_reader_agent_id = :agent_id and user_id = :user_id
+           and product_id = :product_id and episode_id = :episode_id
+           and target_value = :content
+           and status in ('queued', 'running')
+         for update
+    """), params)
+    queued = result.mappings().one_or_none()
+    if not queued:
+        return _result(action, applied=False, reason="comment_queue_unavailable")
+    if int(queued["due_age"]) < 0:
+        return _result(action, applied=False, reason="comment_not_due")
+    if int(queued["due_age"]) > comment_policy.COMMENT_EXPIRY_GRACE_SECONDS:
+        return _result(action, applied=False, reason="comment_expired")
+    if not await _has_ai_reader_read_episode(action, db):
+        return _result(action, applied=False, reason="episode_not_read")
+    result = await db.execute(text("""
+        select comment_id from tb_product_comment
+         where user_id = :user_id and product_id = :product_id and episode_id = :episode_id
+         limit 1 for update
+    """), params)
+    if result.mappings().one_or_none():
+        return _result(action, applied=False, reason="already_in_target_state")
+    # Count even hidden/deleted AI comments so moderation cannot refill the quota.
+    result = await db.execute(text("""
+        select timestampdiff(second, c.created_date, current_timestamp) as age_seconds
+          from tb_product_comment c
+         where c.episode_id = :episode_id and c.product_id = :product_id
+           and c.created_date > timestampadd(hour, -24, current_timestamp)
+           and exists (select 1 from tb_ai_reader_agent a where a.user_id = c.user_id)
+         order by c.created_date desc, c.comment_id desc
+         limit :rolling_limit for update
+    """), {**params, "rolling_limit": comment_policy.COMMENT_24H_LIMIT})
+    recent_ai = result.mappings().all()
+    if len(recent_ai) >= comment_policy.COMMENT_24H_LIMIT:
+        return _result(action, applied=False, reason="comment_24h_limit")
+    if recent_ai and int(recent_ai[0]["age_seconds"]) < comment_policy.COMMENT_MIN_INTERVAL_SECONDS:
+        return _result(action, applied=False, reason="comment_interval_limit")
+    result = await db.execute(text("""
+        select content from tb_product_comment
+         where product_id = :product_id and episode_id = :episode_id
+           and use_yn = 'Y' and open_yn = 'Y'
+         order by created_date desc, comment_id desc limit 2 for update
+    """), params)
+    if comment_policy.is_repeated_comment(action.target_value, [r["content"] for r in result.mappings().all()]):
+        return _result(action, applied=False, reason="comment_repeated")
+    result = await db.execute(text("""
+        select profile_id from tb_user_profile
+         where user_id = :user_id and default_yn = 'Y' and role_type = 'user'
+         limit 1
+    """), params)
+    profile = result.mappings().one_or_none()
+    if not profile:
+        return _result(action, applied=False, reason="profile_not_found")
+    result = await db.execute(text("""
+        insert into tb_product_comment
+            (product_id, episode_id, user_id, profile_id, content, created_id, updated_id)
+        select e.product_id, e.episode_id, :user_id, :profile_id, :content, :created_id, :created_id
+          from tb_product_episode e
+          join tb_ai_reader_action_queue q on q.ai_reader_action_id = :action_id
+         where e.episode_id = :episode_id and e.product_id = :product_id and e.comment_open_yn = 'Y'
+           and timestampdiff(second, q.available_at, current_timestamp) between 0 and :expiry_seconds
+    """), {**params, "profile_id": profile["profile_id"], "content": action.target_value,
+           "created_id": settings.DB_DML_DEFAULT_ID,
+           "expiry_seconds": comment_policy.COMMENT_EXPIRY_GRACE_SECONDS})
+    # Both source rows are already locked; zero rows means the original queue
+    # deadline expired while later admission reads were waiting.
+    if result.rowcount == 0:
+        return _result(action, applied=False, reason="comment_expired")
+    _ensure_rows_changed(result, "insert_ai_reader_comment")
+    await db.execute(text("""
+        update tb_product_episode
+           set count_comment = (select count(*) from tb_product_comment
+                                 where episode_id = :episode_id and use_yn = 'Y')
+         where episode_id = :episode_id
+    """), params)
     return _result(action, applied=True, reason="applied")
 
 

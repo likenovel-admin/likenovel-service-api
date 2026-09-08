@@ -7040,6 +7040,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                         }
                     ]
                 )
+            if "join tb_story_agent_context_summary" in sql:
+                return self._FakeMappingsResult([])
             if "from tb_ai_reader_product_state" in sql:
                 return self._FakeMappingsResult([])
             if "select a.daily_llm_budget" in sql:
@@ -7520,6 +7522,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                     }
                 ]
             ),
+            self._FakeMappingsResult([]),  # Current/early storyctx summaries.
             self._FakeMappingsResult([]),
             self._FakeMappingsResult(
                 [{"daily_llm_budget": 1, "used_llm_count": 0}]
@@ -7878,6 +7881,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
                     },
                 ]
             ),
+            self._FakeMappingsResult([]),  # Current/early storyctx summaries.
             self._FakeMappingsResult([]),
             self._FakeMappingsResult(
                 [{"daily_llm_budget": 1, "used_llm_count": 0}]
