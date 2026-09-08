@@ -31,11 +31,32 @@ class CommentPolicyTest(unittest.TestCase):
 
     def test_quiet_reader_sometimes_comments_and_reread_does_not_reroll(self):
         user = next(u for u in range(1, 1000) if not policy.is_regular_commenter(u, 200))
-        choices = [policy.choose_comment(user, 200, ep, first_read=False, finished=False)
+        # Early-run episodes keep the agreed 1% occasional rate.
+        choices = [policy.choose_comment(user, 200, ep, first_read=False, finished=False, episode_no=1)
                    for ep in range(1, 10001)]
         self.assertTrue(60 <= sum(c is not None for c in choices) <= 140)
         for ep, choice in enumerate(choices, 1):
-            self.assertEqual(choice, policy.choose_comment(user, 200, ep, first_read=False, finished=False))
+            self.assertEqual(choice, policy.choose_comment(user, 200, ep, first_read=False, finished=False, episode_no=1))
+
+    def test_quiet_readers_concentrate_on_early_episodes(self):
+        """Occasional readers should look like real drop-in readers: mostly early."""
+        quiet = [u for u in range(1, 4001) if not policy.is_regular_commenter(u, 400)]
+        early = sum(
+            policy.choose_comment(u, 400, 10_000 + n, first_read=False, finished=False, episode_no=n) is not None
+            for u in quiet for n in range(1, 26)
+        )
+        late = sum(
+            policy.choose_comment(u, 400, 20_000 + n, first_read=False, finished=False, episode_no=n) is not None
+            for u in quiet for n in range(51, 76)
+        )
+        self.assertGreater(early, 0)
+        self.assertGreater(early, late * 3, f"early={early} late={late}")
+
+    def test_regular_reader_keeps_following_late_episodes(self):
+        user = next(u for u in range(1, 1000) if policy.is_regular_commenter(u, 400))
+        late = [policy.choose_comment(user, 400, 30_000 + n, first_read=False, finished=False, episode_no=n)
+                for n in range(70, 170)]
+        self.assertGreater(sum(c is not None for c in late), 60)
 
     def test_choices_are_bounded_and_finished_work_never_expects_next_episode(self):
         for user in range(1, 1001):
@@ -168,10 +189,13 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         user = next(u for u in range(1, 1000) if policy.is_regular_commenter(u, 200))
         action = replace(self.action, action_type="read", user_id=user)
         db = AsyncMock()
-        db.execute.side_effect = [Result([{"comment_open_yn": "Y", "read_episode_count": 1, "finished": 0}]), Result()]
+        db.execute.side_effect = [
+            Result([{"comment_open_yn": "Y", "read_episode_count": 1, "finished": 0, "episode_no": 1}]),
+            Result(),
+        ]
         await actions._enqueue_comment_after_read(action, db)
         statement, params = db.execute.await_args.args
-        choice = policy.choose_comment(user, 200, 300, first_read=True, finished=False)
+        choice = policy.choose_comment(user, 200, 300, first_read=True, finished=False, episode_no=1)
         self.assertEqual((params["content"], params["delay"]), choice)
         self.assertIn("timestampadd(second, :delay, current_timestamp)", str(statement))
         self.assertNotIn("least(", str(statement).lower())
@@ -180,9 +204,30 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
     async def test_queue_skips_closed_comments_even_for_regular_reader(self):
         user = next(u for u in range(1, 1000) if policy.is_regular_commenter(u, 200))
         db = AsyncMock()
-        db.execute.side_effect = [Result([{"comment_open_yn": "N", "read_episode_count": 1, "finished": 0}])]
+        db.execute.side_effect = [Result([{"comment_open_yn": "N", "read_episode_count": 1, "finished": 0, "episode_no": 1}])]
         await actions._enqueue_comment_after_read(replace(self.action, action_type="read", user_id=user), db)
         self.assertEqual(db.execute.await_count, 1)
+
+    async def test_queue_uses_the_real_episode_number_for_quiet_readers(self):
+        """A late episode must be judged as late, not as an opening episode."""
+        user = next(
+            u for u in range(1, 4000)
+            if not policy.is_regular_commenter(u, 200)
+            and policy.choose_comment(u, 200, 300, first_read=False, finished=False, episode_no=1) is not None
+            and policy.choose_comment(u, 200, 300, first_read=False, finished=False, episode_no=70) is None
+        )
+        db = AsyncMock()
+        db.execute.side_effect = [
+            Result([{"comment_open_yn": "Y", "read_episode_count": 9, "finished": 0, "episode_no": 70}]),
+        ]
+        await actions._enqueue_comment_after_read(
+            replace(self.action, action_type="read", user_id=user), db
+        )
+        self.assertEqual(db.execute.await_count, 1)
+        self.assertFalse(
+            any("insert into tb_ai_reader_action_queue" in str(c.args[0])
+                for c in db.execute.await_args_list)
+        )
 
     async def test_future_comment_cannot_be_applied_early(self):
         result = await actions._apply_comment_action(self.action, self.db_for_comment(due_age=-1))
