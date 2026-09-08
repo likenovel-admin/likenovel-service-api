@@ -93,8 +93,9 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
     def db_for_comment(self, *, episode=None, due_age=0, duplicate=False,
                        recent_ai=(), recent_public=(), read=True, profile=True, inserted=1):
         db = AsyncMock()
+        base_episode = {"product_id": 200, "comment_open_yn": "Y", "finished": 0, "count_hit": 50}
         db.execute.side_effect = [
-            Result([episode or {"product_id": 200, "comment_open_yn": "Y", "finished": 0}]),
+            Result([{**base_episode, **(episode or {})}]),
             Result([{"due_age": due_age}]),
             Result([{"read_count": int(read)}]),
             Result([{"comment_id": 99}] if duplicate else []),
@@ -115,7 +116,7 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inserts[0].args[1]["content"], "건필하세요.")
 
     async def test_closed_episode_never_inserts(self):
-        db = self.db_for_comment(episode={"product_id": 200, "comment_open_yn": "N", "finished": 0})
+        db = self.db_for_comment(episode={"comment_open_yn": "N"})
         result = await actions._apply_comment_action(self.action, db)
         self.assertEqual(result.reason, "comment_closed")
         self.assertEqual(db.execute.await_count, 1)
@@ -127,15 +128,29 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.execute.await_count, 2)
 
     async def test_reader_who_dropped_work_does_not_post_delayed_comment(self):
-        db = self.db_for_comment(episode={"product_id": 200, "comment_open_yn": "Y", "reader_state": "dropped"})
+        db = self.db_for_comment(episode={"reader_state": "dropped"})
         result = await actions._apply_comment_action(self.action, db)
         self.assertEqual(result.reason, "product_dropped")
         self.assertEqual(db.execute.await_count, 1)
 
     async def test_finished_work_rejects_queued_next_episode_expectation(self):
-        db = self.db_for_comment(episode={"product_id": 200, "comment_open_yn": "Y", "finished": 1})
+        db = self.db_for_comment(episode={"finished": 1})
         result = await actions._apply_comment_action(replace(self.action, target_value="다음화 기대됩니다."), db)
         self.assertEqual(result.reason, "comment_finished_work")
+
+    async def test_barely_viewed_episode_does_not_get_a_comment(self):
+        # A comment under a near-zero view count reads as fake, so skip it.
+        for count_hit in (0, 1, policy.COMMENT_MIN_EPISODE_VIEW_COUNT - 1):
+            with self.subTest(count_hit=count_hit):
+                db = self.db_for_comment(episode={"count_hit": count_hit})
+                result = await actions._apply_comment_action(self.action, db)
+                self.assertEqual(result.reason, "comment_view_count_too_low")
+                self.assertEqual(db.execute.await_count, 1)
+
+    async def test_minimum_view_count_boundary_allows_the_comment(self):
+        db = self.db_for_comment(episode={"count_hit": policy.COMMENT_MIN_EPISODE_VIEW_COUNT})
+        result = await actions._apply_comment_action(self.action, db)
+        self.assertTrue(result.applied)
 
     async def test_final_insert_expiry_does_not_update_episode_count(self):
         db = self.db_for_comment(inserted=0)

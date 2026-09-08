@@ -66,7 +66,7 @@ def mysql():
                     cur.execute(ddl.group())
             cur.execute((ROOT / "dist/init/60-alter_product_add_blind_yn.sql").read_text())
             cur.execute("INSERT INTO tb_product (product_id,title,price_type,status_code,ratings_code,user_id,author_id,publish_days,primary_genre_id,open_yn) VALUES (200,'test','free','ongoing','all',1,1,'',1,'Y')")
-            cur.execute("INSERT INTO tb_product_episode (episode_id,product_id,episode_no,price_type,open_yn,comment_open_yn) VALUES (300,200,1,'free','Y','Y')")
+            cur.execute("INSERT INTO tb_product_episode (episode_id,product_id,episode_no,price_type,open_yn,comment_open_yn,count_hit) VALUES (300,200,1,'free','Y','Y',50)")
             for user in range(1, 5):
                 cur.execute("INSERT INTO tb_user (user_id,kc_user_id,email,latest_signed_type) VALUES (%s,%s,%s,'likenovel')",
                             (user, f"comment-test-{user}", f"test-{user}@ai-reader.likenovel.dev"))
@@ -151,6 +151,21 @@ async def check_committed_close(mysql):
 
 def test_expired_queue_is_terminal_without_a_comment(mysql):
     asyncio.run(check_expired_queue(mysql))
+
+
+@pytest.mark.parametrize("count_hit,expected", [(19, "comment_view_count_too_low"), (20, "applied")])
+def test_barely_viewed_episode_is_skipped(mysql, count_hit, expected):
+    asyncio.run(check_low_view_episode(mysql, count_hit, expected))
+
+
+async def check_low_view_episode(mysql, count_hit, expected):
+    async with mysql.begin() as db:
+        await db.execute(text("UPDATE tb_product_episode SET count_hit=:hit WHERE episode_id=300"), {"hit": count_hit})
+    result = await post(mysql, 1)
+    assert result.reason == expected
+    async with mysql.connect() as db:
+        assert (await db.execute(text("SELECT COUNT(*) FROM tb_product_comment"))).scalar_one() == int(expected == "applied")
+        assert (await db.execute(text("SELECT status FROM tb_ai_reader_action_queue WHERE ai_reader_action_id=1"))).scalar_one() == ("applied" if expected == "applied" else "skipped")
 
 
 async def check_expired_queue(mysql):
