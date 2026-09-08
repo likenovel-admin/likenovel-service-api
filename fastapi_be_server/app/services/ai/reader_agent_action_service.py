@@ -1185,13 +1185,17 @@ async def _enqueue_comment_after_read(action: ReaderQueuedAction, db: AsyncSessi
     if action.episode_id is None:
         raise InvalidReaderActionError("comment requires episode_id")
     if not comment_policy.is_regular_commenter(action.user_id, action.product_id):
+        # Cheap pre-check at the most permissive early-run rate; the episode
+        # number below applies the real taper for later episodes.
         if comment_policy.choose_comment(
-            action.user_id, action.product_id, action.episode_id, first_read=False, finished=False,
+            action.user_id, action.product_id, action.episode_id,
+            first_read=False, finished=False, episode_no=1,
         ) is None:
             return
     result = await db.execute(
         text("""
             select e.comment_open_yn,
+                   e.episode_no,
                    s.read_episode_count,
                    (p.status_code in ('end', 'completed') and not exists (
                        select 1 from tb_product_episode n
@@ -1214,6 +1218,7 @@ async def _enqueue_comment_after_read(action: ReaderQueuedAction, db: AsyncSessi
         action.user_id, action.product_id, action.episode_id,
         first_read=int(row.get("read_episode_count") or 0) == 1,
         finished=bool(row.get("finished")),
+        episode_no=row.get("episode_no"),
     )
     if choice is None:
         return
