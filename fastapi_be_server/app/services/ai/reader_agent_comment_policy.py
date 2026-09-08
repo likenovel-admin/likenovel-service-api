@@ -16,7 +16,7 @@ COMMENT_MIN_INTERVAL_SECONDS = 1800
 COMMENT_EXPIRY_GRACE_SECONDS = 300
 # A comment under a near-empty view count looks artificial to readers, so the
 # episode must already have a plausible audience before an AI reader comments.
-COMMENT_MIN_EPISODE_VIEW_COUNT = 20
+COMMENT_MIN_EPISODE_VIEW_COUNT = 5
 # Real drop-in readers overwhelmingly comment while sampling the opening run, so
 # occasional readers keep a normal rate there and taper off deeper into a work.
 COMMENT_EARLY_EPISODE_LIMIT = 25

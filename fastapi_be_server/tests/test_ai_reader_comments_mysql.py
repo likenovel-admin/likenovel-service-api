@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.services.ai.reader_agent_action_service import ReaderQueuedAction, process_claimed_action
+from app.services.ai import reader_agent_comment_policy as policy
 from app.services.product.product_comment_service import delete_products_comments_comment_id
 
 
@@ -153,7 +154,11 @@ def test_expired_queue_is_terminal_without_a_comment(mysql):
     asyncio.run(check_expired_queue(mysql))
 
 
-@pytest.mark.parametrize("count_hit,expected", [(19, "comment_view_count_too_low"), (20, "applied")])
+@pytest.mark.parametrize(
+    "count_hit,expected",
+    [(policy.COMMENT_MIN_EPISODE_VIEW_COUNT - 1, "comment_view_count_too_low"),
+     (policy.COMMENT_MIN_EPISODE_VIEW_COUNT, "applied")],
+)
 def test_barely_viewed_episode_is_skipped(mysql, count_hit, expected):
     asyncio.run(check_low_view_episode(mysql, count_hit, expected))
 
