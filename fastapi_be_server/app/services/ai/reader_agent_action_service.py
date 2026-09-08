@@ -1257,7 +1257,7 @@ async def _apply_comment_action(action: ReaderQueuedAction, db: AsyncSession) ->
     # Hold the episode row until the OUTER transaction commits. Normal comment
     # inserts also read this row; all AI quota/repetition reads below are current reads.
     result = await db.execute(text("""
-        select e.product_id, e.comment_open_yn,
+        select e.product_id, e.comment_open_yn, e.count_hit,
                (select s.state from tb_ai_reader_product_state s
                  where s.ai_reader_agent_id = :agent_id and s.product_id = :product_id) as reader_state,
                (p.status_code in ('end', 'completed') and not exists (
@@ -1284,6 +1284,8 @@ async def _apply_comment_action(action: ReaderQueuedAction, db: AsyncSession) ->
         return _result(action, applied=False, reason="comment_closed")
     if episode.get("reader_state") == "dropped":
         return _result(action, applied=False, reason="product_dropped")
+    if int(episode.get("count_hit") or 0) < comment_policy.COMMENT_MIN_EPISODE_VIEW_COUNT:
+        return _result(action, applied=False, reason="comment_view_count_too_low")
     if episode.get("finished") and action.target_value in {"다음화 기대됩니다.", "계속 볼게요."}:
         return _result(action, applied=False, reason="comment_finished_work")
     result = await db.execute(text("""
