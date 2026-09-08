@@ -37,7 +37,7 @@ EVALUATION_CODES = {
     "verynegative",
     "highlynegative",
 }
-EPISODE_SCOPED_ACTIONS = {"read", "recommend", "evaluate", "next_episode"}
+EPISODE_SCOPED_ACTIONS = {"read", "recommend", "evaluate", "next_episode", "comment"}
 
 
 @dataclass(frozen=True)
@@ -362,7 +362,7 @@ def build_active_action_scope_key(
         if action_type in EPISODE_SCOPED_ACTIONS
         else 0
     )
-    scoped_target_value = "" if action_type == "evaluate" else (target_value or "")
+    scoped_target_value = "" if action_type in {"evaluate", "comment"} else (target_value or "")
     raw = "|".join(
         [
             "ai-reader-active",

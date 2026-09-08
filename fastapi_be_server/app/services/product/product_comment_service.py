@@ -981,6 +981,20 @@ async def delete_products_comments_comment_id(
                 message=ErrorMessages.LOGIN_REQUIRED,
             )
 
+        # Match AI insertion's episode -> comment lock order. The scalar
+        # lookup resolves ownership without locking the comment first.
+        await db.execute(
+            text("""
+                select episode_id from tb_product_episode
+                 where episode_id = (
+                     select episode_id from tb_product_comment
+                      where comment_id = :comment_id and user_id = :user_id
+                 )
+                 for update
+            """),
+            {"comment_id": comment_id_to_int, "user_id": user_id},
+        )
+
         query = text("""
                          update tb_product_comment a
                             set a.use_yn = 'N'
