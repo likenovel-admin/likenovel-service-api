@@ -56,7 +56,7 @@ def mysql():
             for filename, tables in (
                 ("02-create_tables.sql", ("tb_user", "tb_user_social", "tb_user_profile", "tb_product",
                                           "tb_product_episode", "tb_product_comment", "tb_user_product_usage")),
-                ("87-create-ai-reader-agent-phase1-tables.sql", ("tb_ai_reader_agent", "tb_ai_reader_product_state",
+                ("87-create-ai-reader-agent-phase1-tables.sql", ("tb_ai_reader_agent", "tb_ai_reader_daily_schedule", "tb_ai_reader_product_state",
                                                                "tb_ai_reader_action_queue")),
             ):
                 source = (ROOT / "dist/init" / filename).read_text()
@@ -248,3 +248,53 @@ async def check_delete_lock_order(mysql):
     finally:
         resume_ai.set()
         await asyncio.gather(*[task for task in (ai, deletion) if task is not None], return_exceptions=True)
+
+
+def test_worker_recovers_invalidated_session_before_processing_comments(mysql, monkeypatch):
+    monkeypatch.setenv("AI_READER_WORKER_ENABLED", "Y")
+    asyncio.run(check_worker_invalidated_session(mysql))
+
+
+async def check_worker_invalidated_session(mysql):
+    from app.services.ai import reader_agent_session_service as sessions
+    from app.services.ai import reader_agent_worker_service as worker
+
+    async with mysql.begin() as db:
+        await db.execute(text("UPDATE tb_ai_reader_action_queue SET status='queued',locked_by=NULL"))
+        await db.execute(text("INSERT INTO tb_ai_reader_daily_schedule (ai_reader_schedule_id,ai_reader_agent_id,schedule_date,active_start_at,active_end_at,status,locked_by) VALUES (1,1,CURRENT_DATE,CURRENT_TIMESTAMP,timestampadd(hour,1,current_timestamp),'running','mysql-test')"))
+    claimed = sessions.ReaderClaimedSession(1, 1, 1, "30s", "M", "{}", "{}", "{}")
+
+    async def claim_session(db, **kwargs):
+        return [claimed]
+
+    async def no_setup(db):
+        return None
+
+    async def broken_connection(session, db):
+        await db.execute(text("SELECT 1"))
+        connection = await db.connection()
+        await connection.invalidate()
+        raise ConnectionError("test-only DB connection lost inside reader decision")
+
+    async def process_session(session, db, *, worker_id):
+        return await sessions.process_claimed_reader_session(
+            session, db, worker_id=worker_id, decision_func=broken_connection,
+        )
+
+    worker.reset_reader_session_credit_cooldown_for_tests()
+    async with AsyncSession(mysql) as db:
+        result = await worker.run_reader_worker_cycle(
+            db, worker_id="mysql-test", session_claimer=claim_session,
+            session_processor=process_session, schema_guard=no_setup, expired_agent_pauser=no_setup,
+        )
+    assert result.failed_session_count == 1
+    assert result.claimed_action_count == 4
+    assert result.processed_action_count == 4
+    assert result.failed_action_count == 0
+    async with mysql.connect() as db:
+        failed = (await db.execute(text("SELECT status,error_message FROM tb_ai_reader_daily_schedule WHERE ai_reader_schedule_id=1"))).mappings().one()
+        assert failed["status"] == "failed"
+        assert failed["error_message"] == "test-only DB connection lost inside reader decision"
+        assert (await db.execute(text("SELECT COUNT(*) FROM tb_product_comment"))).scalar_one() == 1
+        assert (await db.execute(text("SELECT COUNT(*) FROM tb_ai_reader_action_queue WHERE status='applied'"))).scalar_one() == 1
+        assert (await db.execute(text("SELECT COUNT(*) FROM tb_ai_reader_action_queue WHERE status='skipped'"))).scalar_one() == 3
