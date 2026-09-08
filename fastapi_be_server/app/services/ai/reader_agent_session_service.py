@@ -967,6 +967,9 @@ async def process_claimed_reader_session(
             )
         return result
     except Exception as exc:
+        # A disconnected connection may still own an invalid transaction.
+        # Clear it before recording failure or reusing this session for actions.
+        await db.rollback()
         async with _transaction_scope(db):
             await mark_failed_func(
                 db,
