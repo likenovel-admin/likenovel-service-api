@@ -113,10 +113,11 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
 
     def db_for_comment(self, *, episode=None, due_age=0, duplicate=False,
                        recent_ai=(), reader_recent=(), recent_public=(),
-                       read=True, profile=True, inserted=1):
+                       read=True, profile=True, inserted=1, comment_allow="Y"):
         db = AsyncMock()
         base_episode = {"product_id": 200, "comment_open_yn": "Y", "finished": 0, "count_hit": 50}
         db.execute.side_effect = [
+            Result([{"comment_allow_yn": comment_allow}]),
             Result([{**base_episode, **(episode or {})}]),
             Result([{"due_age": due_age}]),
             Result([{"read_count": int(read)}]),
@@ -142,19 +143,19 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         db = self.db_for_comment(episode={"comment_open_yn": "N"})
         result = await actions._apply_comment_action(self.action, db)
         self.assertEqual(result.reason, "comment_closed")
-        self.assertEqual(db.execute.await_count, 1)
+        self.assertEqual(db.execute.await_count, 2)
 
     async def test_delayed_backlog_expires_instead_of_catching_up(self):
         db = self.db_for_comment(due_age=301)
         result = await actions._apply_comment_action(self.action, db)
         self.assertEqual(result.reason, "comment_expired")
-        self.assertEqual(db.execute.await_count, 2)
+        self.assertEqual(db.execute.await_count, 3)
 
     async def test_reader_who_dropped_work_does_not_post_delayed_comment(self):
         db = self.db_for_comment(episode={"reader_state": "dropped"})
         result = await actions._apply_comment_action(self.action, db)
         self.assertEqual(result.reason, "product_dropped")
-        self.assertEqual(db.execute.await_count, 1)
+        self.assertEqual(db.execute.await_count, 2)
 
     async def test_finished_work_rejects_queued_next_episode_expectation(self):
         db = self.db_for_comment(episode={"finished": 1})
@@ -168,7 +169,7 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
                 db = self.db_for_comment(episode={"count_hit": count_hit})
                 result = await actions._apply_comment_action(self.action, db)
                 self.assertEqual(result.reason, "comment_view_count_too_low")
-                self.assertEqual(db.execute.await_count, 1)
+                self.assertEqual(db.execute.await_count, 2)
 
     async def test_minimum_view_count_boundary_allows_the_comment(self):
         db = self.db_for_comment(episode={"count_hit": policy.COMMENT_MIN_EPISODE_VIEW_COUNT})
@@ -192,6 +193,7 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         action = replace(self.action, action_type="read", user_id=user)
         db = AsyncMock()
         db.execute.side_effect = [
+            Result([{"comment_allow_yn": "Y"}]),
             Result([{"comment_open_yn": "Y", "read_episode_count": 1, "finished": 0, "episode_no": 1}]),
             Result(),
         ]
@@ -206,9 +208,12 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
     async def test_queue_skips_closed_comments_even_for_regular_reader(self):
         user = next(u for u in range(1, 1000) if policy.is_regular_commenter(u, 200))
         db = AsyncMock()
-        db.execute.side_effect = [Result([{"comment_open_yn": "N", "read_episode_count": 1, "finished": 0, "episode_no": 1}])]
+        db.execute.side_effect = [
+            Result([{"comment_allow_yn": "Y"}]),
+            Result([{"comment_open_yn": "N", "read_episode_count": 1, "finished": 0, "episode_no": 1}]),
+        ]
         await actions._enqueue_comment_after_read(replace(self.action, action_type="read", user_id=user), db)
-        self.assertEqual(db.execute.await_count, 1)
+        self.assertEqual(db.execute.await_count, 2)
 
     async def test_queue_uses_the_real_episode_number_for_quiet_readers(self):
         """A late episode must be judged as late, not as an opening episode."""
@@ -220,12 +225,13 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         )
         db = AsyncMock()
         db.execute.side_effect = [
+            Result([{"comment_allow_yn": "Y"}]),
             Result([{"comment_open_yn": "Y", "read_episode_count": 9, "finished": 0, "episode_no": 70}]),
         ]
         await actions._enqueue_comment_after_read(
             replace(self.action, action_type="read", user_id=user), db
         )
-        self.assertEqual(db.execute.await_count, 1)
+        self.assertEqual(db.execute.await_count, 2)
         self.assertFalse(
             any("insert into tb_ai_reader_action_queue" in str(c.args[0])
                 for c in db.execute.await_args_list)
@@ -280,10 +286,32 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         db = self.db_for_comment(reader_recent=({"age_seconds": 60},))
         result = await actions._apply_comment_action(self.action, db)
         self.assertEqual(result.reason, "reader_comment_interval_limit")
-        statement = str(db.execute.await_args_list[5].args[0])
+        statement = str(db.execute.await_args_list[6].args[0])
         self.assertIn("c.user_id = :user_id", statement)
         self.assertIn("c.product_id = :product_id", statement)
         self.assertNotIn("episode_id", statement)
+
+    async def test_disabled_switch_stops_writes_and_leaves_reads_alone(self):
+        db = self.db_for_comment(comment_allow="N")
+        result = await actions._apply_comment_action(self.action, db)
+        self.assertEqual((result.applied, result.reason), (False, "comment_disabled"))
+        # Only the switch is read; no episode, quota or insert query runs.
+        self.assertEqual(db.execute.await_count, 1)
+
+    async def test_disabled_switch_does_not_burn_the_queue_idempotency_key(self):
+        user = next(u for u in range(1, 1000) if policy.is_regular_commenter(u, 200))
+        db = AsyncMock()
+        db.execute.side_effect = [Result([{"comment_allow_yn": "N"}])]
+        await actions._enqueue_comment_after_read(
+            replace(self.action, action_type="read", user_id=user), db)
+        self.assertEqual(db.execute.await_count, 1)
+        self.assertFalse(any("insert into tb_ai_reader_action_queue" in str(c.args[0])
+                             for c in db.execute.await_args_list))
+
+    async def test_missing_switch_row_keeps_comments_running(self):
+        db = AsyncMock()
+        db.execute.side_effect = [Result([])]
+        self.assertTrue(await actions.is_ai_reader_comment_allowed(db))
 
     async def test_quiet_episode_still_blocks_a_bursting_reader(self):
         # Episode-scoped history is empty, so only the reader guard can stop this.

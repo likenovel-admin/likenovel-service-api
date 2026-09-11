@@ -481,6 +481,13 @@ class PutMainCharacterSlotConfigReqBody(AdminBase):
     )
 
 
+class PutAiReaderCommentConfigReqBody(AdminBase):
+    comment_allow_yn: Literal["Y", "N"] = Field(
+        examples=["Y"],
+        description="AI 독자 댓글 작성 허용 여부(Y | N). N이면 읽기는 유지하고 댓글만 멈춘다.",
+    )
+
+
 class PostMainCharacterSlotPublishNowReqBody(MainCharacterSlotReqBody):
     pass
 

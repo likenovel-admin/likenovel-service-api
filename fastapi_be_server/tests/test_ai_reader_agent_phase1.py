@@ -1499,6 +1499,9 @@ class AiReaderActionApplierTest(unittest.IsolatedAsyncioTestCase):
             ),
             self._FakeMappingsResult([], lastrowid=51),
             self._FakeMappingsResult([], rowcount=2),
+            # comment switch read that runs before the post-read comment enqueue
+            self._FakeMappingsResult([{"comment_allow_yn": "Y"}]),
+            self._FakeMappingsResult([]),
         ]
 
         result = await service._dispatch_reader_action(
