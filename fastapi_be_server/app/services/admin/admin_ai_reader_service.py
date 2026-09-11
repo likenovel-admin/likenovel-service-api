@@ -18,6 +18,7 @@ from app.exceptions import CustomResponseException
 from app.services.auth import auth_service
 from app.services.ai import reader_agent_persona_service
 from app.services.ai import reader_agent_session_service
+from app.services.ai import reader_agent_action_service
 
 
 IMMEDIATE_SCHEDULE_MIN_WINDOW_MINUTES = 30
@@ -3144,3 +3145,23 @@ async def update_ai_reader_agent_schedule(
         "upserted_schedule_count": replace_result["upserted_count"],
         "schedules": _schedule_window_payload(windows),
     }
+
+
+async def get_admin_ai_reader_comment_config(*, db: AsyncSession):
+    allowed = await reader_agent_action_service.is_ai_reader_comment_allowed(db)
+    return {"data": {"commentAllowYn": "Y" if allowed else "N"}}
+
+
+async def update_admin_ai_reader_comment_config(
+    *,
+    req_body: admin_schema.PutAiReaderCommentConfigReqBody,
+    admin_user_id: int | None,
+    db: AsyncSession,
+):
+    comment_allow_yn = await reader_agent_action_service.set_ai_reader_comment_allowed(
+        allow_yn=req_body.comment_allow_yn,
+        admin_user_id=admin_user_id,
+        db=db,
+    )
+    await db.commit()
+    return {"data": {"commentAllowYn": comment_allow_yn}}

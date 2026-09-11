@@ -1181,9 +1181,54 @@ async def _apply_read_action(
     return _result(action, applied=True, reason="applied")
 
 
+AI_READER_COMMENT_CONFIG_ID = 1
+
+
+async def is_ai_reader_comment_allowed(db: AsyncSession) -> bool:
+    """CMS-owned switch that stops comment writes while reads keep running."""
+    result = await db.execute(
+        text("""
+            select comment_allow_yn
+              from tb_ai_reader_comment_config
+             where config_id = :config_id
+        """),
+        {"config_id": AI_READER_COMMENT_CONFIG_ID},
+    )
+    row = result.mappings().one_or_none()
+    return str(dict(row or {}).get("comment_allow_yn") or "Y").strip().upper() != "N"
+
+
+async def set_ai_reader_comment_allowed(
+    *, allow_yn: str, admin_user_id: int | None, db: AsyncSession
+) -> str:
+    normalized = "N" if str(allow_yn).strip().upper() == "N" else "Y"
+    await db.execute(
+        text("""
+            insert into tb_ai_reader_comment_config (
+                config_id, comment_allow_yn, created_id, updated_id
+            ) values (
+                :config_id, :comment_allow_yn, :admin_user_id, :admin_user_id
+            )
+            on duplicate key update
+                comment_allow_yn = values(comment_allow_yn),
+                updated_id = values(updated_id)
+        """),
+        {
+            "config_id": AI_READER_COMMENT_CONFIG_ID,
+            "comment_allow_yn": normalized,
+            "admin_user_id": admin_user_id,
+        },
+    )
+    return normalized
+
+
 async def _enqueue_comment_after_read(action: ReaderQueuedAction, db: AsyncSession) -> None:
     if action.episode_id is None:
         raise InvalidReaderActionError("comment requires episode_id")
+    # A held read must not consume the permanent per-episode idempotency key, so
+    # leave before the queue insert and let a later read enqueue once reopened.
+    if not await is_ai_reader_comment_allowed(db):
+        return
     if not comment_policy.is_regular_commenter(action.user_id, action.product_id):
         # Cheap pre-check at the most permissive early-run rate; the episode
         # number below applies the real taper for later episodes.
@@ -1253,6 +1298,8 @@ async def _enqueue_comment_after_read(action: ReaderQueuedAction, db: AsyncSessi
 async def _apply_comment_action(action: ReaderQueuedAction, db: AsyncSession) -> ReaderActionApplyResult:
     if action.episode_id is None or action.target_value not in comment_policy.COMMENT_TEXTS:
         raise InvalidReaderActionError("comment requires an episode and an approved exact text")
+    if not await is_ai_reader_comment_allowed(db):
+        return _result(action, applied=False, reason="comment_disabled")
     params = {
         "episode_id": action.episode_id, "product_id": action.product_id,
         "user_id": action.user_id, "agent_id": action.ai_reader_agent_id,

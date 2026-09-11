@@ -126,6 +126,27 @@ async def delete_main_character_slot(
     )
 
 
+@router.put(
+    "/ai-readers/comment-config",
+    tags=["CMS - AI 독자"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_ai_reader_comment_config(
+    req_body: admin_schema.PutAiReaderCommentConfigReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    AI 독자 댓글 작성을 즉시 중지하거나 재개한다. 읽기 활동은 그대로 유지된다.
+    """
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await admin_ai_reader_service.update_admin_ai_reader_comment_config(
+        req_body=req_body,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
 @router.post(
     "/ai-readers/bootstrap",
     tags=["CMS - AI 독자"],
