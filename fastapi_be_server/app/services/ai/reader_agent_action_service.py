@@ -1334,6 +1334,22 @@ async def _apply_comment_action(action: ReaderQueuedAction, db: AsyncSession) ->
         return _result(action, applied=False, reason="comment_24h_limit")
     if recent_ai and int(recent_ai[0]["age_seconds"]) < comment_policy.COMMENT_MIN_INTERVAL_SECONDS:
         return _result(action, applied=False, reason="comment_interval_limit")
+    # The reads above are episode-scoped, so a reader binge-reading a work would
+    # post the same greeting on consecutive episodes minutes apart.
+    result = await db.execute(text("""
+        select timestampdiff(second, c.created_date, current_timestamp) as age_seconds
+          from tb_product_comment c
+         where c.user_id = :user_id and c.product_id = :product_id
+           and c.created_date > timestampadd(hour, -24, current_timestamp)
+         order by c.created_date desc, c.comment_id desc
+         limit :reader_limit for update
+    """), {**params, "reader_limit": comment_policy.READER_COMMENT_24H_LIMIT})
+    reader_recent = result.mappings().all()
+    if len(reader_recent) >= comment_policy.READER_COMMENT_24H_LIMIT:
+        return _result(action, applied=False, reason="reader_comment_24h_limit")
+    if (reader_recent
+            and int(reader_recent[0]["age_seconds"]) < comment_policy.READER_COMMENT_MIN_INTERVAL_SECONDS):
+        return _result(action, applied=False, reason="reader_comment_interval_limit")
     result = await db.execute(text("""
         select content from tb_product_comment
          where product_id = :product_id and episode_id = :episode_id
