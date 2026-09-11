@@ -112,7 +112,8 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         self.action = actions.ReaderQueuedAction(10, 1, 2, 200, 300, "comment", "건필하세요.", 20)
 
     def db_for_comment(self, *, episode=None, due_age=0, duplicate=False,
-                       recent_ai=(), recent_public=(), read=True, profile=True, inserted=1):
+                       recent_ai=(), reader_recent=(), recent_public=(),
+                       read=True, profile=True, inserted=1):
         db = AsyncMock()
         base_episode = {"product_id": 200, "comment_open_yn": "Y", "finished": 0, "count_hit": 50}
         db.execute.side_effect = [
@@ -121,6 +122,7 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
             Result([{"read_count": int(read)}]),
             Result([{"comment_id": 99}] if duplicate else []),
             Result(recent_ai),
+            Result(reader_recent),
             Result([{"content": text} for text in recent_public]),
             Result([{"profile_id": 501}] if profile else []),
             Result(rowcount=inserted),
@@ -262,6 +264,34 @@ class CommentActionTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(actions.InvalidReaderActionError):
             await actions._apply_comment_action(replace(self.action, target_value="자의적인 새 문장"), db)
         db.execute.assert_not_awaited()
+
+    async def test_reader_cap_and_spacing_bound_one_reader_across_episodes(self):
+        cases = [((), True, "applied"),
+                 (({"age_seconds": 1800},), True, "applied"),
+                 (({"age_seconds": 1799},), False, "reader_comment_interval_limit"),
+                 (({"age_seconds": 1800}, {"age_seconds": 7200}), False, "reader_comment_24h_limit")]
+        for reader_recent, applied, reason in cases:
+            with self.subTest(reader_recent=reader_recent):
+                result = await actions._apply_comment_action(
+                    self.action, self.db_for_comment(reader_recent=reader_recent))
+                self.assertEqual((result.applied, result.reason), (applied, reason))
+
+    async def test_reader_scope_counts_the_whole_work_not_one_episode(self):
+        db = self.db_for_comment(reader_recent=({"age_seconds": 60},))
+        result = await actions._apply_comment_action(self.action, db)
+        self.assertEqual(result.reason, "reader_comment_interval_limit")
+        statement = str(db.execute.await_args_list[5].args[0])
+        self.assertIn("c.user_id = :user_id", statement)
+        self.assertIn("c.product_id = :product_id", statement)
+        self.assertNotIn("episode_id", statement)
+
+    async def test_quiet_episode_still_blocks_a_bursting_reader(self):
+        # Episode-scoped history is empty, so only the reader guard can stop this.
+        db = self.db_for_comment(recent_ai=(), reader_recent=({"age_seconds": 180},))
+        result = await actions._apply_comment_action(self.action, db)
+        self.assertFalse(result.applied)
+        self.assertFalse(any("insert into tb_product_comment" in str(c.args[0])
+                             for c in db.execute.await_args_list))
 
     async def test_worker_skips_lock_contention_without_rescheduling_comment(self):
         db = AsyncMock()

@@ -14,6 +14,10 @@ COMMENT_TEXTS = REPEATABLE_GREETINGS + (
 COMMENT_24H_LIMIT = 3
 COMMENT_MIN_INTERVAL_SECONDS = 1800
 COMMENT_EXPIRY_GRACE_SECONDS = 300
+# The limits above are per episode, so one reader could still greet every episode
+# of a work in a single sitting. Bound the reader on the work as well.
+READER_COMMENT_24H_LIMIT = 2
+READER_COMMENT_MIN_INTERVAL_SECONDS = 1800
 # A comment under a near-empty view count looks artificial to readers, so the
 # episode must already have a plausible audience before an AI reader comments.
 COMMENT_MIN_EPISODE_VIEW_COUNT = 5
