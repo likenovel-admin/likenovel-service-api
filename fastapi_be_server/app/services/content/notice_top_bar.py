@@ -27,9 +27,9 @@ _UNSAFE_LINK_CHARS = re.compile(
     r"[\\\x00-\x20\x7f-\xa0\xad\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\ufeff\ufff0-\uffff]"
 )
 # https host: letters, digits, hyphens, and dots, ending in a label that starts with a letter
-# (no port, IP address, or user info such as "@").
+# (no port, IP address, user info such as "@", or punycode "xn--" labels).
 _HTTPS_LINK = re.compile(
-    r"https://(?:[a-z0-9-]+\.)*[a-z][a-z0-9-]*(?:[/?#]|$)", re.IGNORECASE | re.ASCII
+    r"https://(?:(?!xn--)[a-z0-9-]+\.)*(?!xn--)[a-z][a-z0-9-]*(?:[/?#]|$)", re.IGNORECASE | re.ASCII
 )
 _DOT_SEGMENT = re.compile(r"/\.\.?(?:/|$)")
 # Characters JavaScript String.prototype.trim() removes, so the CMS and the backend trim alike.
