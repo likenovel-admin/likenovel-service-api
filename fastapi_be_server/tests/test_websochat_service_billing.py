@@ -226,6 +226,12 @@ class WebsochatBillingTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
                 return_value=100,
             ),
+            patch.object(
+                websochat_service,
+                "get_user_event_cash_balance",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
         ):
             tenth_message_charge_required = (
                 await websochat_service._resolve_websochat_message_charge_required(
@@ -261,6 +267,12 @@ class WebsochatBillingTests(unittest.IsolatedAsyncioTestCase):
                 "_get_user_cash_balance_for_websochat",
                 new_callable=AsyncMock,
                 return_value=100,
+            ),
+            patch.object(
+                websochat_service,
+                "get_user_event_cash_balance",
+                new_callable=AsyncMock,
+                return_value=0,
             ),
         ):
             first_message_charge_required = (
