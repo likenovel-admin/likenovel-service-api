@@ -880,6 +880,18 @@ class PostNoticeReqBody(AdminBase):
     file_id: Optional[int] = Field(
         default=None, examples=[1], description="첨부 파일 id"
     )
+    top_bar_yn: Optional[str] = Field(
+        default=None, examples=["Y"], description="상단 띠 공지 노출 여부(Y/N), 미전송 시 변경 없음"
+    )
+    top_bar_text: Optional[str] = Field(
+        default=None, examples=["웹소챗 장애 보상 안내"], description="상단 띠 문구(80자 이내)"
+    )
+    top_bar_start_date: Optional[str] = Field(
+        default=None, examples=["2026-09-30 18:00"], description="상단 띠 노출 시작(KST), 비우면 즉시"
+    )
+    top_bar_end_date: Optional[str] = Field(
+        default=None, examples=["2026-10-07 23:59"], description="상단 띠 노출 종료(KST), 비우면 계속"
+    )
 
 
 class PutNoticeReqBody(AdminBase):
@@ -891,6 +903,18 @@ class PutNoticeReqBody(AdminBase):
     )
     file_id: Optional[int] = Field(
         default=None, examples=[1], description="첨부 파일 id"
+    )
+    top_bar_yn: Optional[str] = Field(
+        default=None, examples=["Y"], description="상단 띠 공지 노출 여부(Y/N), 미전송 시 변경 없음"
+    )
+    top_bar_text: Optional[str] = Field(
+        default=None, examples=["웹소챗 장애 보상 안내"], description="상단 띠 문구(80자 이내)"
+    )
+    top_bar_start_date: Optional[str] = Field(
+        default=None, examples=["2026-09-30 18:00"], description="상단 띠 노출 시작(KST), 비우면 즉시"
+    )
+    top_bar_end_date: Optional[str] = Field(
+        default=None, examples=["2026-10-07 23:59"], description="상단 띠 노출 종료(KST), 비우면 계속"
     )
 
 

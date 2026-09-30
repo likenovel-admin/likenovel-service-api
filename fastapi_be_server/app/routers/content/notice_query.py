@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.rdb import get_likenovel_db
 from app.utils.auth import analysis_logger
 import app.services.content.notice_service as notices_service
+from app.services.content.notice_top_bar import get_active_notice_top_bar
 from app.exceptions import CustomResponseException
 from app.const import ErrorMessages
 
@@ -283,6 +284,18 @@ async def notices_all(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             message=ErrorMessages.INTERNAL_SERVER_ERROR,
         )
+
+
+@router.get(
+    "/top-bar",
+    tags=["공지사항"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def notice_top_bar(db: AsyncSession = Depends(get_likenovel_db)):
+    """
+    노출 중인 상단 띠 공지 1건 조회. 없으면 data=null
+    """
+    return await get_active_notice_top_bar(db)
 
 
 @router.get(
