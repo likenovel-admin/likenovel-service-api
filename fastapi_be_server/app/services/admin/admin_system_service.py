@@ -20,6 +20,7 @@ from app.utils.response import (
 )
 from app.const import CommonConstants
 from app.const import ErrorMessages
+from app.services.content.notice_top_bar import resolve_notice_top_bar_columns
 
 logger = logging.getLogger("admin_app")
 
@@ -631,6 +632,11 @@ async def post_general_notice(
     value_list.append(":use_yn")
     db_execute_params["use_yn"] = CommonConstants.YES
 
+    for column, value in (resolve_notice_top_bar_columns(req_body) or {}).items():
+        column_list.append(column)
+        value_list.append(f":{column}")
+        db_execute_params[column] = value
+
     columns = ",".join(column_list)
     values = ",".join(value_list)
 
@@ -665,6 +671,11 @@ async def put_general_notice(
     set_clause, params = build_update_query(
         req_body, allowed_fields=["subject", "content", "primary_yn", "file_id"]
     )
+    top_bar_columns = resolve_notice_top_bar_columns(req_body)
+    if top_bar_columns:
+        # Set all four explicitly so turning the bar off clears text and period.
+        set_clause += ", " + ", ".join(f"{column} = :{column}" for column in top_bar_columns)
+        params.update(top_bar_columns)
     params["id"] = id
 
     query = text(f"UPDATE tb_notice SET {set_clause} WHERE id = :id")
