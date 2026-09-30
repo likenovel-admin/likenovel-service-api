@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import status
 from sqlalchemy import text
@@ -17,6 +18,12 @@ from app.exceptions import CustomResponseException
 
 TOP_BAR_TEXT_MAX_LENGTH = 80
 _DATETIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M")
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def _now_kst() -> datetime:
+    # tb_notice top-bar times are stored as naive KST, matching the DB NOW().
+    return datetime.now(_KST).replace(tzinfo=None, microsecond=0)
 
 
 def _bad_request(message: str) -> CustomResponseException:
@@ -64,8 +71,16 @@ def resolve_notice_top_bar_columns(req_body: Any) -> dict[str, Any] | None:
         raise _bad_request(f"상단 띠 문구는 {TOP_BAR_TEXT_MAX_LENGTH}자 이내로 입력해주세요.")
     start_date = _parse_datetime(getattr(req_body, "top_bar_start_date", None), label="시작 시각")
     end_date = _parse_datetime(getattr(req_body, "top_bar_end_date", None), label="종료 시각")
-    if start_date and end_date and end_date <= start_date:
-        raise _bad_request("상단 띠 종료 시각은 시작 시각보다 뒤여야 합니다.")
+    start_defaulted = start_date is None
+    if start_defaulted:
+        # "비우면 저장 즉시": record the save time so the newest bar wins ordering.
+        start_date = _now_kst()
+    if end_date and end_date <= start_date:
+        raise _bad_request(
+            "상단 띠 종료 시각은 지금보다 뒤여야 합니다."
+            if start_defaulted
+            else "상단 띠 종료 시각은 시작 시각보다 뒤여야 합니다."
+        )
     return {
         "top_bar_yn": "Y",
         "top_bar_text": bar_text,

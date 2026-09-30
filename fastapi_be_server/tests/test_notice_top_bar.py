@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 from app.exceptions import CustomResponseException
 import app.schemas.admin as admin_schema
@@ -83,6 +84,29 @@ class NoticeTopBarValidationTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(CustomResponseException) as raised:
                 notice_top_bar.resolve_notice_top_bar_columns(body)
             self.assertEqual(raised.exception.status_code, 400)
+
+
+class NoticeTopBarStartDefaultTests(unittest.TestCase):
+    def test_empty_start_records_the_save_time_in_kst(self):
+        with patch.object(notice_top_bar, "_now_kst", return_value=datetime(2026, 9, 30, 18, 30)):
+            columns = notice_top_bar.resolve_notice_top_bar_columns(
+                _put_body(top_bar_yn="Y", top_bar_text="안내")
+            )
+        self.assertEqual(columns["top_bar_start_date"], datetime(2026, 9, 30, 18, 30))
+        self.assertIsNone(columns["top_bar_end_date"])
+
+    def test_end_before_now_is_rejected_when_start_is_empty(self):
+        with patch.object(notice_top_bar, "_now_kst", return_value=datetime(2026, 9, 30, 18, 30)):
+            with self.assertRaises(CustomResponseException) as raised:
+                notice_top_bar.resolve_notice_top_bar_columns(
+                    _put_body(top_bar_yn="Y", top_bar_text="안내", top_bar_end_date="2026-09-30 18:00")
+                )
+        self.assertIn("지금보다", raised.exception.message)
+
+    def test_kst_now_is_naive_seconds_precision(self):
+        now = notice_top_bar._now_kst()
+        self.assertIsNone(now.tzinfo)
+        self.assertEqual(now.microsecond, 0)
 
 
 class NoticeTopBarPersistenceTests(unittest.IsolatedAsyncioTestCase):
