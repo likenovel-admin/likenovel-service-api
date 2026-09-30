@@ -3,9 +3,9 @@
 Dry-run is the default. --apply grants once per (user_id, grant_key) inside one
 transaction, so re-running the same command never double-grants.
 
-Example:
-  python scripts/grant_event_cash.py --user-ids 971,1127 --amount 300 \\
-    --grant-key websochat-outage-20260930 --memo "웹소챗 장애 보상"
+Run from the backend root (fastapi_be_server) or the deployed api directory
+with the app package importable and the DB env loaded, for example:
+  PYTHONPATH=. python scripts/grant_event_cash.py --user-ids 971,1127 --amount 300 --grant-key websochat-outage-20260930 --memo "웹소챗 장애 보상"
   (add --apply to write)
 """
 

@@ -15,6 +15,8 @@ from app.const import settings
 
 EVENT_CASH_REASON_GRANT = "grant"
 EVENT_CASH_REASON_WEBSOCHAT_MESSAGE = "websochat_message"
+EVENT_CASH_GRANT_KEY_MAX_LENGTH = 100
+EVENT_CASH_MEMO_MAX_LENGTH = 255
 
 
 async def get_user_event_cash_balance(user_id: int, db: AsyncSession) -> int:
@@ -95,10 +97,30 @@ async def grant_event_cash(
     normalized_key = grant_key.strip()
     if not normalized_key:
         raise ValueError("event cash grant_key is required")
-    ledger = await db.execute(
+    if len(normalized_key) > EVENT_CASH_GRANT_KEY_MAX_LENGTH:
+        raise ValueError("event cash grant_key must be at most 100 characters")
+    if len(memo) > EVENT_CASH_MEMO_MAX_LENGTH:
+        raise ValueError("event cash memo must be at most 255 characters")
+    existing = await db.execute(
         text(
             """
-            INSERT IGNORE INTO tb_user_event_cash_transaction
+            SELECT id
+            FROM tb_user_event_cash_transaction
+            WHERE user_id = :user_id
+              AND grant_key = :grant_key
+            FOR UPDATE
+            """
+        ),
+        {"user_id": user_id, "grant_key": normalized_key},
+    )
+    if existing.mappings().one_or_none() is not None:
+        return False
+    # A concurrent grant with the same key hits the unique key and raises, so a
+    # race can never be reported as a successful or skipped grant.
+    await db.execute(
+        text(
+            """
+            INSERT INTO tb_user_event_cash_transaction
             (user_id, amount, reason_code, grant_key, memo, created_id)
             VALUES (:user_id, :amount, :reason_code, :grant_key, :memo, :created_id)
             """
@@ -112,8 +134,6 @@ async def grant_event_cash(
             "created_id": settings.DB_DML_DEFAULT_ID,
         },
     )
-    if int(getattr(ledger, "rowcount", 0) or 0) != 1:
-        return False
     await db.execute(
         text(
             """
@@ -121,8 +141,8 @@ async def grant_event_cash(
             (user_id, balance, created_id, updated_id)
             VALUES (:user_id, :amount, :created_id, :created_id)
             ON DUPLICATE KEY UPDATE
-                balance = balance + VALUES(balance),
-                updated_id = VALUES(updated_id)
+                balance = balance + :amount,
+                updated_id = :created_id
             """
         ),
         {

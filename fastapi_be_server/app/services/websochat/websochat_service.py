@@ -7292,6 +7292,34 @@ async def _charge_websochat_cash(
     )
 
 
+async def _charge_websochat_message_cost(
+    *,
+    user_id: int,
+    session_id: int,
+    product_id: int,
+    cost: int,
+    db: AsyncSession,
+) -> int:
+    """Charge one message. Event cash pays first when it covers the full cost;
+    otherwise paid cash is charged. Returns the paid cash amount charged."""
+    if await try_spend_event_cash(
+        user_id=user_id,
+        amount=cost,
+        product_id=product_id,
+        session_id=session_id,
+        db=db,
+    ):
+        return 0
+    await _charge_websochat_cash(
+        user_id=user_id,
+        session_id=session_id,
+        product_id=product_id,
+        db=db,
+        cash_cost=cost,
+    )
+    return cost
+
+
 async def _insert_websochat_usage_log(
     session_id: int,
     user_message_id: int,
@@ -9637,24 +9665,14 @@ async def post_message(
         )
 
         if should_charge_cash:
-            paid_with_event_cash = await try_spend_event_cash(
+            # Event cash is not revenue; the usage log keeps paid cash only.
+            charged_cash = await _charge_websochat_message_cost(
                 user_id=int(user_id),
-                amount=charged_cash,
-                product_id=int(session_row["product_id"]),
                 session_id=session_id,
+                product_id=int(session_row["product_id"]),
+                cost=charged_cash,
                 db=db,
             )
-            if paid_with_event_cash:
-                # Event cash is not revenue; the usage log keeps paid cash only.
-                charged_cash = 0
-            else:
-                await _charge_websochat_cash(
-                    user_id=int(user_id),
-                    session_id=session_id,
-                    product_id=int(session_row["product_id"]),
-                    db=db,
-                    cash_cost=charged_cash,
-                )
 
         await _insert_websochat_usage_log(
             session_id=session_id,
