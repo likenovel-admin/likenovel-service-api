@@ -311,6 +311,23 @@ def _raise_websochat_openrouter_event_error(error: Any, *, operation: str) -> No
     )
 
 
+# Reasoning tokens count against max_tokens. Small structured calls (routing,
+# recall decisions, choices) would be truncated by medium/high reasoning, so the
+# tier's thinking level only applies to calls with room for a full reply.
+WEBSOCHAT_TIER_REASONING_MIN_MAX_TOKENS = 1024
+
+
+def _resolve_websochat_reasoning_effort(
+    thinking_level: str | None,
+    max_tokens: int,
+) -> str | None:
+    if not thinking_level:
+        return None
+    if max_tokens < WEBSOCHAT_TIER_REASONING_MIN_MAX_TOKENS:
+        return "minimal"
+    return thinking_level
+
+
 def _openrouter_reasoning_payload(reasoning_effort: str | None) -> dict[str, Any]:
     if not reasoning_effort:
         return {}
@@ -932,7 +949,10 @@ async def call_websochat_model(
             timeout_seconds=timeout_seconds,
             usage_operation=operation,
             usage_result_validator=usage_result_validator,
-            reasoning_effort=spec.thinking_level,
+            reasoning_effort=_resolve_websochat_reasoning_effort(
+                spec.thinking_level,
+                max_tokens,
+            ),
         )
     return await call_websochat_gemini(
         system_prompt=system_prompt,
