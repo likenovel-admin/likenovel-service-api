@@ -93,7 +93,9 @@ async def get_active_notice_top_bar(db: AsyncSession) -> dict[str, Any]:
     result = await db.execute(
         text(
             """
-            SELECT id AS noticeId, top_bar_text AS text
+            SELECT id AS noticeId,
+                   top_bar_text AS text,
+                   DATE_FORMAT(top_bar_end_date, '%Y-%m-%d %H:%i:%s') AS endAt
             FROM tb_notice
             WHERE use_yn = 'Y'
               AND top_bar_yn = 'Y'
