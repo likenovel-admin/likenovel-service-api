@@ -50,8 +50,8 @@ class WebsochatModelCatalogTests(unittest.TestCase):
                 (
                     "speed",
                     "스피드",
-                    "gemini",
-                    websochat_service.settings.WEBSOCHAT_GEMINI_MODEL,
+                    "openrouter",
+                    websochat_service.settings.WEBSOCHAT_OPENROUTER_MODEL,
                     20,
                     10,
                     "minimal",
@@ -59,8 +59,8 @@ class WebsochatModelCatalogTests(unittest.TestCase):
                 (
                     "balance",
                     "밸런스",
-                    "gemini",
-                    websochat_service.settings.WEBSOCHAT_GEMINI_MODEL,
+                    "openrouter",
+                    websochat_service.settings.WEBSOCHAT_OPENROUTER_MODEL,
                     25,
                     5,
                     "medium",
@@ -68,13 +68,19 @@ class WebsochatModelCatalogTests(unittest.TestCase):
                 (
                     "deep",
                     "딥",
-                    "gemini",
-                    websochat_service.settings.WEBSOCHAT_GEMINI_MODEL,
+                    "openrouter",
+                    websochat_service.settings.WEBSOCHAT_OPENROUTER_MODEL,
                     35,
                     1,
                     "high",
                 ),
             ],
+        )
+
+    def test_openrouter_model_defaults_to_the_same_gemini_flash_lite(self):
+        self.assertEqual(
+            websochat_service.settings.WEBSOCHAT_OPENROUTER_MODEL,
+            "google/gemini-3.1-flash-lite",
         )
 
     def test_api_accepts_only_stable_model_keys(self):
@@ -314,7 +320,8 @@ class WebsochatSessionModelPatchTests(unittest.IsolatedAsyncioTestCase):
 class WebsochatModelExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_character_chat_balance_preserves_selected_tier(self):
         with (
-            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(websochat_service.settings, "GEMINI_API_KEY", ""),
+            patch.object(websochat_service.settings, "OPENROUTER_API_KEY", "test-key"),
             patch.object(
                 websochat_service,
                 "_load_websochat_rp_context",

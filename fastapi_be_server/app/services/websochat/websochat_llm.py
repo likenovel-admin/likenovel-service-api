@@ -311,6 +311,12 @@ def _raise_websochat_openrouter_event_error(error: Any, *, operation: str) -> No
     )
 
 
+def _openrouter_reasoning_payload(reasoning_effort: str | None) -> dict[str, Any]:
+    if not reasoning_effort:
+        return {}
+    return {"reasoning": {"effort": reasoning_effort}}
+
+
 async def _call_websochat_openrouter_stream(
     *,
     model: str,
@@ -322,6 +328,7 @@ async def _call_websochat_openrouter_stream(
     stream_state: dict[str, bool],
     usage_operation: AiProviderUsageOperation,
     usage_result_validator: Callable[[str], bool] | None,
+    reasoning_effort: str | None = None,
 ) -> str:
     payload = {
         "model": model,
@@ -330,6 +337,7 @@ async def _call_websochat_openrouter_stream(
         "temperature": temperature,
         "stream": True,
         "stream_options": {"include_usage": True},
+        **_openrouter_reasoning_payload(reasoning_effort),
     }
     accumulated = ""
     latest_usage_event: dict[str, Any] = {}
@@ -467,6 +475,7 @@ async def call_websochat_openrouter(
     timeout_seconds: float = WEBSOCHAT_GEMINI_TIMEOUT_SECONDS,
     usage_operation: AiProviderUsageOperation | None = None,
     usage_result_validator: Callable[[str], bool] | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     if not settings.OPENROUTER_API_KEY:
         raise CustomResponseException(
@@ -499,6 +508,7 @@ async def call_websochat_openrouter(
                 stream_state=stream_state,
                 usage_operation=operation,
                 usage_result_validator=usage_result_validator,
+                reasoning_effort=reasoning_effort,
             )
         except CustomResponseException as exc:
             if stream_state["emitted"] or exc.code != "AI_PROVIDER_EMPTY_RESPONSE":
@@ -524,6 +534,7 @@ async def call_websochat_openrouter(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
+        **_openrouter_reasoning_payload(reasoning_effort),
     }
     response_json: dict[str, Any] = {}
     response_headers: object | None = None
@@ -921,6 +932,7 @@ async def call_websochat_model(
             timeout_seconds=timeout_seconds,
             usage_operation=operation,
             usage_result_validator=usage_result_validator,
+            reasoning_effort=spec.thinking_level,
         )
     return await call_websochat_gemini(
         system_prompt=system_prompt,

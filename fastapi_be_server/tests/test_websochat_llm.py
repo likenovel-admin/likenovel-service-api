@@ -445,18 +445,18 @@ class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exc.exception.code, "AI_PROVIDER_NOT_CONFIGURED")
         gemini.assert_not_awaited()
 
-    async def test_speed_balance_and_deep_use_gemini_catalog_thinking(self):
+    async def test_speed_balance_and_deep_use_openrouter_catalog_reasoning(self):
         with (
             patch.object(
                 websochat_llm,
                 "call_websochat_gemini",
                 new_callable=AsyncMock,
-                return_value="응답",
             ) as gemini,
             patch.object(
                 websochat_llm,
                 "call_websochat_openrouter",
                 new_callable=AsyncMock,
+                return_value="응답",
             ) as openrouter,
         ):
             await websochat_llm.call_websochat_model(
@@ -476,10 +476,50 @@ class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(
-            [call.kwargs["thinking_level"] for call in gemini.await_args_list],
+            [call.kwargs["reasoning_effort"] for call in openrouter.await_args_list],
             ["minimal", "medium", "high"],
         )
-        openrouter.assert_not_awaited()
+        self.assertEqual(
+            {call.kwargs["model"] for call in openrouter.await_args_list},
+            {websochat_llm.settings.WEBSOCHAT_OPENROUTER_MODEL},
+        )
+        gemini.assert_not_awaited()
+
+    async def test_openrouter_sends_reasoning_effort_in_stream_and_nonstream(self):
+        _FakeOpenRouterAsyncClient.calls = []
+        _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(
+            lines=[
+                'data: {"choices":[{"delta":{"content":"스트림"}}]}',
+                "data: [DONE]",
+            ]
+        )
+        _FakeOpenRouterAsyncClient.post_response = _FakeOpenRouterResponse(
+            payload={"choices": [{"message": {"content": "일반"}}]}
+        )
+        with (
+            patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
+            patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
+        ):
+            streamed = await websochat_llm.call_websochat_openrouter(
+                model="google/gemini-3.1-flash-lite",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+                stream=True,
+                reasoning_effort="high",
+            )
+            plain = await websochat_llm.call_websochat_openrouter(
+                model="google/gemini-3.1-flash-lite",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+                stream=False,
+                reasoning_effort="minimal",
+            )
+
+        self.assertEqual((streamed, plain), ("스트림", "일반"))
+        self.assertEqual(
+            [call["json"].get("reasoning") for call in _FakeOpenRouterAsyncClient.calls],
+            [{"effort": "high"}, {"effort": "minimal"}],
+        )
 
 
 if __name__ == "__main__":
