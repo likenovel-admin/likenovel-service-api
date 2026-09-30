@@ -485,6 +485,32 @@ class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
         )
         gemini.assert_not_awaited()
 
+    async def test_small_structured_calls_use_minimal_reasoning_for_every_tier(self):
+        with patch.object(
+            websochat_llm,
+            "call_websochat_openrouter",
+            new_callable=AsyncMock,
+            return_value="{}",
+        ) as openrouter:
+            for model_key in ("speed", "balance", "deep"):
+                await websochat_llm.call_websochat_model(
+                    model_key=model_key,
+                    system_prompt="system",
+                    messages=[{"role": "user", "content": "질문"}],
+                    max_tokens=120,
+                )
+            await websochat_llm.call_websochat_model(
+                model_key="deep",
+                system_prompt="system",
+                messages=[{"role": "user", "content": "질문"}],
+                max_tokens=4096,
+            )
+
+        self.assertEqual(
+            [call.kwargs["reasoning_effort"] for call in openrouter.await_args_list],
+            ["minimal", "minimal", "minimal", "high"],
+        )
+
     async def test_openrouter_sends_reasoning_effort_in_stream_and_nonstream(self):
         _FakeOpenRouterAsyncClient.calls = []
         _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(
