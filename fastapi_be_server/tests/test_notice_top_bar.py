@@ -84,6 +84,8 @@ class NoticeTopBarValidationTests(unittest.TestCase):
             "https://www.likenovel.net/event/12?utm=bar": "https://www.likenovel.net/event/12?utm=bar",
             "HTTPS://example.com/path": "HTTPS://example.com/path",
             "https://www.likenovel.net/x#y": "https://www.likenovel.net/x#y",
+            # Length counts characters, like the utf8mb4 VARCHAR(500) column.
+            "/search?q=" + "\U0001F600" * 246: "/search?q=" + "\U0001F600" * 246,
         }
         for link, expected in cases.items():
             with self.subTest(link=link):
@@ -113,6 +115,8 @@ class NoticeTopBarValidationTests(unittest.TestCase):
             "https://\u017fite.example",
             "https://b.1",
             "https://127.0.0.1/x",
+            "https://xn--",
+            "https://xn--a.example",
             "https://www.likenovel.net/a b",
             "/%2e%2e//evil.example",
             "/a//b",
@@ -123,6 +127,7 @@ class NoticeTopBarValidationTests(unittest.TestCase):
             "/a\ufeffb",
             "/a\u200bb",
             "/" + "a" * 500,
+            "/" + "\U0001F600" * 500,
         ]:
             with self.subTest(link=link), self.assertRaises(CustomResponseException) as raised:
                 notice_top_bar.resolve_notice_top_bar_columns(
