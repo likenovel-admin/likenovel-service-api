@@ -44,10 +44,16 @@ class NoticeTopBarValidationTests(unittest.TestCase):
         self.assertIsNone(notice_top_bar.resolve_notice_top_bar_columns(body))
 
     def test_turning_off_clears_text_and_period(self):
-        body = _put_body(top_bar_yn="N", top_bar_text="남은 문구")
+        body = _put_body(top_bar_yn="N", top_bar_text="남은 문구", top_bar_link_url="/event/1")
         self.assertEqual(
             notice_top_bar.resolve_notice_top_bar_columns(body),
-            {"top_bar_yn": "N", "top_bar_text": None, "top_bar_start_date": None, "top_bar_end_date": None},
+            {
+                "top_bar_yn": "N",
+                "top_bar_text": None,
+                "top_bar_start_date": None,
+                "top_bar_end_date": None,
+                "top_bar_link_url": None,
+            },
         )
 
     def test_turning_on_normalizes_text_and_parses_period(self):
@@ -64,8 +70,42 @@ class NoticeTopBarValidationTests(unittest.TestCase):
                 "top_bar_text": "웹소챗 장애 보상 안내",
                 "top_bar_start_date": datetime(2026, 9, 30, 18, 0),
                 "top_bar_end_date": datetime(2026, 10, 7, 23, 59),
+                "top_bar_link_url": None,
             },
         )
+
+    def test_link_accepts_site_paths_and_https_urls(self):
+        cases = {
+            "": None,
+            "   ": None,
+            "/event/12": "/event/12",
+            " /product/1231?tab=episode ": "/product/1231?tab=episode",
+            "https://www.likenovel.net/event/12?utm=bar": "https://www.likenovel.net/event/12?utm=bar",
+        }
+        for link, expected in cases.items():
+            with self.subTest(link=link):
+                columns = notice_top_bar.resolve_notice_top_bar_columns(
+                    _put_body(top_bar_yn="Y", top_bar_text="안내", top_bar_link_url=link)
+                )
+                self.assertEqual(columns["top_bar_link_url"], expected)
+
+    def test_unsafe_or_malformed_links_are_rejected(self):
+        for link in [
+            "javascript:alert(1)",
+            "http://example.com",
+            "//evil.example",
+            "/\\evil.example",
+            "event/12",
+            "https://",
+            "https:evil",
+            "https://www.likenovel.net/a b",
+            "/" + "a" * 500,
+        ]:
+            with self.subTest(link=link), self.assertRaises(CustomResponseException) as raised:
+                notice_top_bar.resolve_notice_top_bar_columns(
+                    _put_body(top_bar_yn="Y", top_bar_text="안내", top_bar_link_url=link)
+                )
+            self.assertEqual(raised.exception.status_code, 400)
 
     def test_invalid_top_bar_requests_are_rejected(self):
         invalid_bodies = [
@@ -118,9 +158,10 @@ class NoticeTopBarPersistenceTests(unittest.IsolatedAsyncioTestCase):
             db=db,
         )
         query = db.queries[0]
-        for column in ("top_bar_yn", "top_bar_text", "top_bar_start_date", "top_bar_end_date"):
+        for column in ("top_bar_yn", "top_bar_text", "top_bar_start_date", "top_bar_end_date", "top_bar_link_url"):
             self.assertIn(f"{column} = :{column}", query)
         self.assertIsNone(db.params[0]["top_bar_text"])
+        self.assertIsNone(db.params[0]["top_bar_link_url"])
         self.assertEqual(db.params[0]["id"], 89)
 
     async def test_edit_without_top_bar_fields_keeps_existing_bar(self):
@@ -153,6 +194,7 @@ class NoticeTopBarPersistenceTests(unittest.IsolatedAsyncioTestCase):
         db = _RecordingDb()
         await notice_top_bar.get_active_notice_top_bar(db)
         self.assertIn("DATE_FORMAT(top_bar_end_date, '%Y-%m-%d %H:%i:%s') AS endAt", db.queries[0])
+        self.assertIn("top_bar_link_url AS linkUrl", db.queries[0])
 
 
 class NoticeTopBarRouteTests(unittest.TestCase):
