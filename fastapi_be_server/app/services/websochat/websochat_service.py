@@ -106,6 +106,7 @@ from app.services.websochat.websochat_model_catalog import (
     WebsochatModelKey,
     build_websochat_model_used,
     get_websochat_model_spec,
+    is_websochat_model_provider_configured,
     normalize_websochat_model_key,
 )
 from app.services.websochat.websochat_qa_executor import (
@@ -1727,11 +1728,7 @@ async def _resolve_websochat_active_character_with_model(
     model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
 ) -> dict[str, Any] | None:
     model_spec = get_websochat_model_spec(model_key)
-    provider_configured = (
-        bool(settings.OPENROUTER_API_KEY)
-        if model_spec.provider == "openrouter"
-        else bool(settings.GEMINI_API_KEY)
-    )
+    provider_configured = is_websochat_model_provider_configured(model_spec.model_key)
     if not provider_configured or not candidates:
         return None
 
@@ -6594,7 +6591,7 @@ async def _generate_websochat_reply(
     model_spec = get_websochat_model_spec(
         model_key if is_character_chat else WEBSOCHAT_DEFAULT_MODEL_KEY
     )
-    gemini_enabled = bool(settings.GEMINI_API_KEY)
+    gemini_enabled = is_websochat_model_provider_configured(model_spec.model_key)
     scope_state = _resolve_websochat_read_scope_state(normalized_memory)
     normalized_forced_route = str(forced_route or "").strip().lower() or None
 

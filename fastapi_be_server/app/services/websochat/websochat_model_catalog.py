@@ -19,6 +19,9 @@ class WebsochatModelSpec:
     cash_cost: int
     character_chat_daily_free_limit: int
     thinking_level: WebsochatThinkingLevel | None
+    # Usage-log label family. It names the model family, not the transport, so
+    # daily free limits, billing, and stats keep counting "gemini:<tier>" rows.
+    model_family: str = "gemini"
 
 
 WEBSOCHAT_DEFAULT_MODEL_KEY: WebsochatModelKey = "speed"
@@ -26,8 +29,8 @@ WEBSOCHAT_MODEL_CATALOG: tuple[WebsochatModelSpec, ...] = (
     WebsochatModelSpec(
         "speed",
         "스피드",
-        "gemini",
-        settings.WEBSOCHAT_GEMINI_MODEL,
+        "openrouter",
+        settings.WEBSOCHAT_OPENROUTER_MODEL,
         20,
         10,
         "minimal",
@@ -35,8 +38,8 @@ WEBSOCHAT_MODEL_CATALOG: tuple[WebsochatModelSpec, ...] = (
     WebsochatModelSpec(
         "balance",
         "밸런스",
-        "gemini",
-        settings.WEBSOCHAT_GEMINI_MODEL,
+        "openrouter",
+        settings.WEBSOCHAT_OPENROUTER_MODEL,
         25,
         5,
         "medium",
@@ -44,8 +47,8 @@ WEBSOCHAT_MODEL_CATALOG: tuple[WebsochatModelSpec, ...] = (
     WebsochatModelSpec(
         "deep",
         "딥",
-        "gemini",
-        settings.WEBSOCHAT_GEMINI_MODEL,
+        "openrouter",
+        settings.WEBSOCHAT_OPENROUTER_MODEL,
         35,
         1,
         "high",
@@ -69,4 +72,11 @@ def get_websochat_model_spec(model_key: object) -> WebsochatModelSpec:
 
 def build_websochat_model_used(model_key: object) -> str:
     spec = get_websochat_model_spec(model_key)
-    return f"{spec.provider}:{spec.model_key}"
+    return f"{spec.model_family}:{spec.model_key}"
+
+
+def is_websochat_model_provider_configured(model_key: object) -> bool:
+    spec = get_websochat_model_spec(model_key)
+    if spec.provider == "openrouter":
+        return bool(settings.OPENROUTER_API_KEY)
+    return bool(settings.GEMINI_API_KEY)

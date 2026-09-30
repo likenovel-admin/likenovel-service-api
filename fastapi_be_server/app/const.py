@@ -262,6 +262,10 @@ class Settings(BaseSettings):
         ),
     )
     STORY_AGENT_GEMINI_MODEL: str = WEBSOCHAT_GEMINI_MODEL
+    WEBSOCHAT_OPENROUTER_MODEL: str = os.getenv(
+        "WEBSOCHAT_OPENROUTER_MODEL",
+        "google/gemini-3.1-flash-lite",
+    )
     AI_CHAT_GEMINI_MODEL: str = os.getenv("AI_CHAT_GEMINI_MODEL", WEBSOCHAT_GEMINI_MODEL)
     AI_PROVIDER_HEALTH_OPENROUTER_DEEPSEEK_MODEL: str = os.getenv(
         "AI_PROVIDER_HEALTH_OPENROUTER_DEEPSEEK_MODEL",
