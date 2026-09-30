@@ -7,9 +7,9 @@ notice detail page when the link is empty.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import status
@@ -21,6 +21,19 @@ from app.exceptions import CustomResponseException
 TOP_BAR_TEXT_MAX_LENGTH = 80
 TOP_BAR_LINK_MAX_LENGTH = 500
 _LINK_FORMAT_MESSAGE = "상단 띠 링크는 /로 시작하는 사이트 주소나 https:// 주소만 넣을 수 있습니다."
+# Same link rule as the CMS (noticeTopBar.ts) and the service web (topNoticeBar.ts); change all three together.
+# Backslashes read like slashes in browsers; spaces, controls, and invisible format characters are rejected.
+_UNSAFE_LINK_CHARS = re.compile(
+    r"[\\\x00-\x20\x7f-\xa0\xad\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\ufeff\ufff0-\uffff]"
+)
+# https host: letters, digits, hyphens, and dots, ending in a label that starts with a letter
+# (no port, IP address, or user info such as "@").
+_HTTPS_LINK = re.compile(
+    r"https://(?:[a-z0-9-]+\.)*[a-z][a-z0-9-]*(?:[/?#]|$)", re.IGNORECASE | re.ASCII
+)
+_DOT_SEGMENT = re.compile(r"/\.\.?(?:/|$)")
+# Characters JavaScript String.prototype.trim() removes, so the CMS and the backend trim alike.
+_LINK_TRIM_CHARS = "\t\n\v\f\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 _DATETIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M")
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -49,22 +62,28 @@ def _parse_datetime(value: str | None, *, label: str) -> datetime | None:
     raise _bad_request(f"상단 띠 {label} 형식이 올바르지 않습니다.")
 
 
+def _is_allowed_link(link: str) -> bool:
+    if _UNSAFE_LINK_CHARS.search(link):
+        return False
+    if _HTTPS_LINK.match(link):
+        return True
+    if not link.startswith("/") or link.startswith("//"):
+        return False
+    # Keep site paths on this site: no "//", dot segments, or encoded dots before the query.
+    path = re.split(r"[?#]", link, maxsplit=1)[0]
+    return "//" not in path and "%2e" not in path.lower() and not _DOT_SEGMENT.search(path)
+
+
 def _normalize_link_url(value: Any) -> str | None:
     """Empty means the notice detail page. Only site paths and https URLs are allowed."""
-    link = str(value or "").strip()
+    link = str(value or "").strip(_LINK_TRIM_CHARS)
     if not link:
         return None
     if len(link) > TOP_BAR_LINK_MAX_LENGTH:
         raise _bad_request(f"상단 띠 링크는 {TOP_BAR_LINK_MAX_LENGTH}자 이내로 입력해주세요.")
-    # Browsers read a backslash like a slash, so "/" + backslash + "host" would leave the site.
-    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in link):
+    if not _is_allowed_link(link):
         raise _bad_request(_LINK_FORMAT_MESSAGE)
-    if link.startswith("/") and not link.startswith("//"):
-        return link
-    parsed = urlsplit(link)
-    if link.lower().startswith("https://") and parsed.netloc:
-        return link
-    raise _bad_request(_LINK_FORMAT_MESSAGE)
+    return link
 
 
 def resolve_notice_top_bar_columns(req_body: Any) -> dict[str, Any] | None:
