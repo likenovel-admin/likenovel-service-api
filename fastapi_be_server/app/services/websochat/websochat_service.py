@@ -72,6 +72,10 @@ from app.services.websochat.websochat_game_adapter import (
     has_websochat_worldcup_followup_signal,
     resolve_websochat_worldcup_followup,
 )
+from app.services.websochat.websochat_event_cash import (
+    get_user_event_cash_balance,
+    try_spend_event_cash,
+)
 from app.services.websochat.websochat_game_memory import (
     WEBSOCHAT_ALLOWED_GAME_CATEGORIES,
     WEBSOCHAT_ALLOWED_GAME_GENDER_SCOPES,
@@ -742,6 +746,7 @@ def _build_websochat_billing_status_payload(
     is_character_chat: bool = False,
     selected_model_key: object = WEBSOCHAT_DEFAULT_MODEL_KEY,
     used_counts_by_model: dict[str, int] | None = None,
+    event_cash_balance: int | None = None,
 ) -> dict[str, Any]:
     normalized_selected_model_key = (
         normalize_websochat_model_key(selected_model_key)
@@ -802,6 +807,9 @@ def _build_websochat_billing_status_payload(
         "requiresCashForNextMessage": requires_cash,
         "requiresLoginForNextMessage": bool(requires_cash and user_id is None),
         "cashBalance": int(cash_balance or 0) if user_id is not None else None,
+        "eventCashBalance": (
+            int(event_cash_balance or 0) if user_id is not None else None
+        ),
     }
 
 
@@ -7427,6 +7435,9 @@ async def _resolve_websochat_message_charge_required(
         )
 
     cash_cost = _resolve_websochat_message_cash_cost(qa_action_key, model_key)
+    event_cash_balance = await get_user_event_cash_balance(user_id=user_id, db=db)
+    if event_cash_balance >= cash_cost:
+        return True
     balance = await _get_user_cash_balance_for_websochat(user_id=user_id, db=db)
     if balance < cash_cost:
         raise CustomResponseException(
@@ -8063,8 +8074,10 @@ async def get_billing_status(
             is_character_chat=False,
         )
     cash_balance = None
+    event_cash_balance = None
     if user_id is not None:
         cash_balance = await _get_user_cash_balance_for_websochat(user_id=user_id, db=db)
+        event_cash_balance = await get_user_event_cash_balance(user_id=user_id, db=db)
 
     return {
         "data": _build_websochat_billing_status_payload(
@@ -8075,6 +8088,7 @@ async def get_billing_status(
             is_character_chat=is_character_chat,
             selected_model_key=selected_model_key,
             used_counts_by_model=used_counts_by_model,
+            event_cash_balance=event_cash_balance,
         )
     }
 
@@ -9623,13 +9637,24 @@ async def post_message(
         )
 
         if should_charge_cash:
-            await _charge_websochat_cash(
+            paid_with_event_cash = await try_spend_event_cash(
                 user_id=int(user_id),
-                session_id=session_id,
+                amount=charged_cash,
                 product_id=int(session_row["product_id"]),
+                session_id=session_id,
                 db=db,
-                cash_cost=charged_cash,
             )
+            if paid_with_event_cash:
+                # Event cash is not revenue; the usage log keeps paid cash only.
+                charged_cash = 0
+            else:
+                await _charge_websochat_cash(
+                    user_id=int(user_id),
+                    session_id=session_id,
+                    product_id=int(session_row["product_id"]),
+                    db=db,
+                    cash_cost=charged_cash,
+                )
 
         await _insert_websochat_usage_log(
             session_id=session_id,

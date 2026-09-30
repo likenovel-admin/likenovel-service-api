@@ -994,7 +994,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(websochat_service.settings, "OPENROUTER_API_KEY", "test-key"),
             patch.object(
                 websochat_service,
                 "_load_websochat_rp_context",
@@ -1071,7 +1071,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(websochat_service.settings, "OPENROUTER_API_KEY", "test-key"),
             patch.object(
                 websochat_service,
                 "_load_websochat_rp_context",
@@ -1129,7 +1129,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(websochat_service.settings, "OPENROUTER_API_KEY", "test-key"),
             patch.object(
                 websochat_service,
                 "_load_websochat_rp_context",
@@ -1331,7 +1331,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(websochat_service.settings, "OPENROUTER_API_KEY", "test-key"),
             patch.object(
                 websochat_service,
                 "_get_websochat_recent_messages",
@@ -1407,7 +1407,7 @@ class WebsochatModelRoutingTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch.object(websochat_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(websochat_service.settings, "OPENROUTER_API_KEY", "test-key"),
             patch.object(
                 websochat_service,
                 "_get_websochat_recent_messages",
