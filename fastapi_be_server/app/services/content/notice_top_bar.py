@@ -1,13 +1,15 @@
 """상단 띠 공지(site-wide top bar) attached to a general notice.
 
 Operators turn it on while writing or editing a notice in CMS. The service web
-shows the single active bar and links it to the notice detail page.
+shows the single active bar and links it to the operator's link, or to the
+notice detail page when the link is empty.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import status
@@ -17,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.exceptions import CustomResponseException
 
 TOP_BAR_TEXT_MAX_LENGTH = 80
+TOP_BAR_LINK_MAX_LENGTH = 500
+_LINK_FORMAT_MESSAGE = "상단 띠 링크는 /로 시작하는 사이트 주소나 https:// 주소만 넣을 수 있습니다."
 _DATETIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M")
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -45,10 +49,28 @@ def _parse_datetime(value: str | None, *, label: str) -> datetime | None:
     raise _bad_request(f"상단 띠 {label} 형식이 올바르지 않습니다.")
 
 
-def resolve_notice_top_bar_columns(req_body: Any) -> dict[str, Any] | None:
-    """Return all four top-bar column values, or None when the request omits them.
+def _normalize_link_url(value: Any) -> str | None:
+    """Empty means the notice detail page. Only site paths and https URLs are allowed."""
+    link = str(value or "").strip()
+    if not link:
+        return None
+    if len(link) > TOP_BAR_LINK_MAX_LENGTH:
+        raise _bad_request(f"상단 띠 링크는 {TOP_BAR_LINK_MAX_LENGTH}자 이내로 입력해주세요.")
+    # Browsers read a backslash like a slash, so "/" + backslash + "host" would leave the site.
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in link):
+        raise _bad_request(_LINK_FORMAT_MESSAGE)
+    if link.startswith("/") and not link.startswith("//"):
+        return link
+    parsed = urlsplit(link)
+    if link.lower().startswith("https://") and parsed.netloc:
+        return link
+    raise _bad_request(_LINK_FORMAT_MESSAGE)
 
-    Turning the bar off clears its text and period so a stale bar never returns.
+
+def resolve_notice_top_bar_columns(req_body: Any) -> dict[str, Any] | None:
+    """Return all top-bar column values, or None when the request omits them.
+
+    Turning the bar off clears its text, period, and link so a stale bar never returns.
     """
     top_bar_yn = getattr(req_body, "top_bar_yn", None)
     if top_bar_yn is None:
@@ -62,6 +84,7 @@ def resolve_notice_top_bar_columns(req_body: Any) -> dict[str, Any] | None:
             "top_bar_text": None,
             "top_bar_start_date": None,
             "top_bar_end_date": None,
+            "top_bar_link_url": None,
         }
 
     bar_text = " ".join(str(getattr(req_body, "top_bar_text", "") or "").split())
@@ -86,6 +109,7 @@ def resolve_notice_top_bar_columns(req_body: Any) -> dict[str, Any] | None:
         "top_bar_text": bar_text,
         "top_bar_start_date": start_date,
         "top_bar_end_date": end_date,
+        "top_bar_link_url": _normalize_link_url(getattr(req_body, "top_bar_link_url", None)),
     }
 
 
@@ -95,6 +119,7 @@ async def get_active_notice_top_bar(db: AsyncSession) -> dict[str, Any]:
             """
             SELECT id AS noticeId,
                    top_bar_text AS text,
+                   top_bar_link_url AS linkUrl,
                    DATE_FORMAT(top_bar_end_date, '%Y-%m-%d %H:%i:%s') AS endAt
             FROM tb_notice
             WHERE use_yn = 'Y'

@@ -892,6 +892,11 @@ class PostNoticeReqBody(AdminBase):
     top_bar_end_date: Optional[str] = Field(
         default=None, examples=["2026-10-07 23:59"], description="상단 띠 노출 종료(KST), 비우면 계속"
     )
+    top_bar_link_url: Optional[str] = Field(
+        default=None,
+        examples=["/event/12"],
+        description="상단 띠 링크(/로 시작하는 사이트 주소나 https:// 주소), 비우면 공지 상세",
+    )
 
 
 class PutNoticeReqBody(AdminBase):
@@ -915,6 +920,11 @@ class PutNoticeReqBody(AdminBase):
     )
     top_bar_end_date: Optional[str] = Field(
         default=None, examples=["2026-10-07 23:59"], description="상단 띠 노출 종료(KST), 비우면 계속"
+    )
+    top_bar_link_url: Optional[str] = Field(
+        default=None,
+        examples=["/event/12"],
+        description="상단 띠 링크(/로 시작하는 사이트 주소나 https:// 주소), 비우면 공지 상세",
     )
 
 
