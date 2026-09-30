@@ -128,6 +128,8 @@ class NoticeTopBarValidationTests(unittest.TestCase):
             "/a\u200bb",
             "/" + "a" * 500,
             "/" + "\U0001F600" * 500,
+            "/\ud800",
+            "/a\udfffb",
         ]:
             with self.subTest(link=link), self.assertRaises(CustomResponseException) as raised:
                 notice_top_bar.resolve_notice_top_bar_columns(
