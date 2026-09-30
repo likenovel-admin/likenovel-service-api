@@ -22,9 +22,10 @@ TOP_BAR_TEXT_MAX_LENGTH = 80
 TOP_BAR_LINK_MAX_LENGTH = 500
 _LINK_FORMAT_MESSAGE = "상단 띠 링크는 /로 시작하는 사이트 주소나 https:// 주소만 넣을 수 있습니다."
 # Same link rule as the CMS (noticeTopBar.ts) and the service web (topNoticeBar.ts); change all three together.
-# Backslashes read like slashes in browsers; spaces, controls, and invisible format characters are rejected.
+# Backslashes read like slashes in browsers; spaces, controls, invisible format characters, and
+# lone surrogates (which cannot be stored as utf8mb4) are rejected.
 _UNSAFE_LINK_CHARS = re.compile(
-    r"[\\\x00-\x20\x7f-\xa0\xad\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\ufeff\ufff0-\uffff]"
+    r"[\\\x00-\x20\x7f-\xa0\xad\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\ud800-\udfff\ufeff\ufff0-\uffff]"
 )
 # https host: letters, digits, hyphens, and dots, ending in a label that starts with a letter
 # (no port, IP address, user info such as "@", or punycode "xn--" labels).
