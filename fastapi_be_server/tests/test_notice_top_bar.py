@@ -143,11 +143,16 @@ class NoticeTopBarPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_active_bar_query_returns_null_without_a_row(self):
         self.assertEqual(await notice_top_bar.get_active_notice_top_bar(_RecordingDb()), {"data": None})
-        row = {"noticeId": 89, "text": "안내"}
+        row = {"noticeId": 89, "text": "안내", "endAt": "2026-10-07 23:59:00"}
         self.assertEqual(
             await notice_top_bar.get_active_notice_top_bar(_RecordingDb(row)),
             {"data": row},
         )
+
+    async def test_active_bar_query_returns_the_kst_end_time(self):
+        db = _RecordingDb()
+        await notice_top_bar.get_active_notice_top_bar(db)
+        self.assertIn("DATE_FORMAT(top_bar_end_date, '%Y-%m-%d %H:%i:%s') AS endAt", db.queries[0])
 
 
 class NoticeTopBarRouteTests(unittest.TestCase):
