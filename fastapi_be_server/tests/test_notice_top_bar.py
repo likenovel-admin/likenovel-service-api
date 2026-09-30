@@ -80,7 +80,10 @@ class NoticeTopBarValidationTests(unittest.TestCase):
             "   ": None,
             "/event/12": "/event/12",
             " /product/1231?tab=episode ": "/product/1231?tab=episode",
+            "/search?keyword=회귀&next=https://x.example//y": "/search?keyword=회귀&next=https://x.example//y",
             "https://www.likenovel.net/event/12?utm=bar": "https://www.likenovel.net/event/12?utm=bar",
+            "HTTPS://example.com/path": "HTTPS://example.com/path",
+            "https://www.likenovel.net/x#y": "https://www.likenovel.net/x#y",
         }
         for link, expected in cases.items():
             with self.subTest(link=link):
@@ -98,7 +101,27 @@ class NoticeTopBarValidationTests(unittest.TestCase):
             "event/12",
             "https://",
             "https:evil",
+            "https:/x",
+            "https://[",
+            "https://[bad]",
+            "https://@",
+            "https://:443",
+            "https://example.com:bad",
+            "https://www.likenovel.net:443/x",
+            "https://%09.example",
+            "https://www.likenovel.net@evil.example",
+            "https://\u017fite.example",
+            "https://b.1",
+            "https://127.0.0.1/x",
             "https://www.likenovel.net/a b",
+            "/%2e%2e//evil.example",
+            "/a//b",
+            "/../x",
+            "/a/./b",
+            "/a\tb",
+            "/a\x85b",
+            "/a\ufeffb",
+            "/a\u200bb",
             "/" + "a" * 500,
         ]:
             with self.subTest(link=link), self.assertRaises(CustomResponseException) as raised:
