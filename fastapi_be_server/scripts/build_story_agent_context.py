@@ -7851,7 +7851,23 @@ def build_episode_scene_canonical_character_packet(
             and str(item.get("work_role") or "") == "main_protagonist"
             and _inventory_row_uses_only_generic_first_person_source(item)
         )
-        if entity_kind != "person" and not anonymous_first_person_main:
+        identity_review = dict(item.get("character_identity_review") or {})
+        operator_reviewed_named_main = (
+            entity_kind == "stable_role"
+            and str(item.get("work_role") or "") == "main_protagonist"
+            and bool(item.get("public_chat_eligible"))
+            and str(identity_review.get("review_origin") or "") == "operator_cli"
+            and identity_review.get("force_main_protagonist") is True
+            and identity_review.get("anonymous_protagonist") is not True
+            and str(identity_review.get("canonical_display_name") or "").strip()
+            and str(identity_review.get("target_scope_key") or "").strip()
+            == scope_key
+        )
+        if (
+            entity_kind != "person"
+            and not anonymous_first_person_main
+            and not operator_reviewed_named_main
+        ):
             continue
         aliases = [
             str(alias).strip()

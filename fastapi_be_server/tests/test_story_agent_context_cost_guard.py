@@ -998,6 +998,54 @@ class GroundedInventoryReadinessTests(IsolatedAsyncioTestCase):
         for source in ("protagonist:first_person", "protagonist:generic", "protagonist:generic:2", "protagonist:generic:10", "protagonist:generic:11"):
             self.assertTrue(module._is_generic_protagonist_source_key(source))
 
+    def test_operator_reviewed_named_main_stable_role_enters_scene_packet(self):
+        module = load_module()
+        scope = "character:이도현"
+        reviewed_main = {
+            "canonical_character_key": scope,
+            "display_name": "이도현",
+            "aliases": ["이도현", "도현", "나(주인공)"],
+            "entity_kind": "stable_role",
+            "work_role": "main_protagonist",
+            "is_protagonist": True,
+            "public_chat_eligible": True,
+            "character_identity_review": {
+                "review_origin": "operator_cli",
+                "force_main_protagonist": True,
+                "anonymous_protagonist": False,
+                "canonical_display_name": "이도현",
+                "target_scope_key": scope,
+            },
+            "first_seen_episode_no": 1,
+            "distinct_episode_count": 26,
+        }
+
+        packet = module.build_episode_scene_canonical_character_packet(
+            {scope: reviewed_main}
+        )
+
+        self.assertEqual(
+            [item["scope_key"] for item in packet["characters"]],
+            [scope],
+        )
+        for missing_review_field in (
+            "review_origin",
+            "force_main_protagonist",
+            "canonical_display_name",
+        ):
+            incomplete = deepcopy(reviewed_main)
+            incomplete["character_identity_review"] = {
+                key: value
+                for key, value in reviewed_main["character_identity_review"].items()
+                if key != missing_review_field
+            }
+            self.assertEqual(
+                module.build_episode_scene_canonical_character_packet(
+                    {scope: incomplete}
+                ),
+                {"characters": []},
+            )
+
     async def test_repair_postcondition_requires_the_exact_free_source_for_requested_and_automatic_work(self):
         for anonymous, requested, has_raw in ((anonymous, requested, has_raw) for anonymous in (False, True) for requested, has_raw in ((True, False), (True, True), (False, True))):
             with self.subTest(anonymous=anonymous, requested=requested, has_raw=has_raw):
