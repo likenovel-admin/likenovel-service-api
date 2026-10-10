@@ -226,11 +226,33 @@ class SDKTransportTests(unittest.TestCase):
                         session = http.return_value.__aenter__.return_value
                         session.post = AsyncMock(return_value=Mock())
                         revoke = client.post("/revoke", data={"client_id": policy.CLIENT_ID,
-                            "token": refreshed.json()["refresh_token"], "token_type_hint": "refresh_token"})
+                            "token": tokens["access_token"], "token_type_hint": "access_token"})
                         self.assertEqual(revoke.status_code, 200, revoke.text)
                     self.assertEqual(client.post("/mcp", headers=headers, json=initialize).status_code, 401)
                     self.assertEqual(client.post("/mcp", headers=original_headers, json=initialize).status_code, 401)
                     self.assertEqual(client.post("/mcp", headers=middle_headers, json=initialize).status_code, 401)
+                    self.assertEqual(client.post("/token", data={**refresh_request,
+                        "refresh_token": refreshed.json()["refresh_token"]}).status_code, 400)
+                    # Current refresh-token revocation remains supported for the provided public client.
+                    second_auth = client.get("/authorize", params=params)
+                    second_page = client.get(second_auth.headers["location"])
+                    second_form = {**form,
+                        "flow": parse_qs(urlsplit(second_auth.headers["location"]).query)["flow"][0],
+                        "csrf": re.search(r'name="csrf" value="([^"]+)"', second_page.text).group(1)}
+                    second_login = client.post("/oauth/login", data=second_form,
+                        headers={"Origin": "https://api.likenovel.net"})
+                    self.assertEqual(second_login.status_code, 303)
+                    second_code = parse_qs(urlsplit(second_login.headers["location"]).query)["code"][0]
+                    second_tokens = client.post("/token", data={**token_request, "code": second_code}).json()
+                    second_headers = {**headers, "Authorization": "Bearer " + second_tokens["access_token"]}
+                    self.assertEqual(client.post("/mcp", headers=second_headers, json=initialize).status_code, 200)
+                    with patch.object(oauth, "AsyncClient") as http:
+                        http.return_value.__aenter__.return_value.post = AsyncMock(return_value=Mock())
+                        second_revoke = client.post("/revoke", data={"client_id": policy.CLIENT_ID,
+                            "token": second_tokens["refresh_token"], "token_type_hint": "refresh_token"})
+                        self.assertEqual(second_revoke.status_code, 200)
+                    self.assertEqual(client.post("/mcp", headers=second_headers, json=initialize).status_code, 401)
+
 
 
 if __name__ == "__main__":
