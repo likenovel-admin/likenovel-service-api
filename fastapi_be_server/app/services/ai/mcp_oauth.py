@@ -310,7 +310,11 @@ button{{background:#182638;color:white;border:0;border-radius:8px}}</style>
 <label for="username">CMS 관리자 이메일</label><input id="username" name="username" type="email" required autocomplete="username">
 <label for="password">CMS 관리자 비밀번호</label><input id="password" name="password" type="password" required autocomplete="current-password">
 <button type="submit">로그인하고 닷에 구좌 운영 연결</button></form></html>"""
-    response = HTMLResponse(body, headers=HEADERS)
+    # Chromium applies form-action to POST redirects too: permit only the registered callback.
+    login_headers = {**HEADERS, "Content-Security-Policy": HEADERS["Content-Security-Policy"].replace(
+        "form-action 'self';", f"form-action 'self' {load_config()['oauth_callback']};",
+    )}
+    response = HTMLResponse(body, headers=login_headers)
     response.set_cookie("ln_mcp_csrf", record["csrf"], max_age=600, secure=True,
                         httponly=True, samesite="lax", path="/oauth")
     return response
