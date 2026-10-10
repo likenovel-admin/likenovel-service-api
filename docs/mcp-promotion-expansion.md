@@ -13,6 +13,13 @@
 - `prepare_paid_approval`: 활성 `review` 신청과 CP 계약을 계획에 고정한다.
   기존 `admin_user_service.accept_apply_rank_up` 재사용은 심사 승인만 수행한다.
   가격 저장이나 실제 유료 전환은 별도 운영 단계다. 자동으로 가격을 설정하지 않는다.
+- `prepare_paid_conversion(owner, before, actor, paid_episode_no)`: 승인된 활성
+  신청과 일반 무료 연재 작품, 현재 회차/캠페인, 사용자가 지정한 유료 시작 회차를
+  고정한다. 조회는 `paid_conversion_snapshot(apply_id, db, lock=False)`를 사용한다.
+  별도 `paid-conversion` 계획과 scope로 `apply_paid_conversion_by_admin`를 재사용한다.
+  기존 유료 설정이 있거나 심사 승인 전이면 거절한다. 유료 시작 회차는 양의 정수이며
+  기존 서비스와 동일하게 현재 활성 회차수 + 1 이하여야 한다.
+  기다리면 무료 프로모션은 이 전환에 암묵적으로 동반하지 않는다.
 - `prepare_banner`: 기존 `PostBannerReqBody`와 위치 검증기를 사용한다.
   서버의 허용 호스트 목록에 속한 HTTPS 링크와 실제 업로드된 파일 ID가 필요하다.
   준비는 파일 ID의 실제 업로드나 픽셀을 증명하지 않으며, 배너 적용은 명시적으로 막힌다.
@@ -22,6 +29,28 @@
   기존 `mcp_store`의 durable claim이 중복 실행을 막고, 불확실한 적용 상태는 자동 재시도하지 않는다.
   저장 후 readback을 검사하고 비대상 상품 필드 변경은 rollback한다.
   공개 노출은 아직 검증되지 않았으므로 `public_verified=false`다.
+- `verify_public(owner, plan_id)`: completed 상태의 본인 적용 receipt를 대상으로
+  현재 DB와 익명 공개 API를 읽는다. 계획·설정·receipt를 변경하지 않는다.
+  심사 승인은 현재 `accepted`/활성 상태만 확인하고
+  `public_verification_required=false`, `public_verified=null`로 공개 검증이
+  불필요함을 표시한다.
+  실제 유료 전환은 DB의 작품 유료 상태·시작회차·기준 이후 활성 회차 가격을
+  확인하여 `effective_conversion_verified`를 별도로 반환한다.
+  공개 API 실패·일부 페이지 누락·가격 불일치이면 DB 반영이 확인돼도
+  `public_verified=false`다.
+  100화 무료는 현재 1~100화 무료, 101화가 있으면 유료, 시작 유료회차 101,
+  정확한 종료 일시(저장 정밀도 1초 미만 허용), 진행 기간 및 기존 복원 범위를 확인한다.
+
+공개 검증은 source에서 확인한 익명 조회 경로
+`/v1/query/products/{product_id}/detail-shell`와
+`/v1/query/products/{product_id}/episodes`를 사용한다.
+detail-shell은 side-effect-free이고 episode 목록은 인증이 선택 사항인 조회다.
+MCP resource의 같은 origin만 사용하고 관리자 인증 정보를 전달하지 않는다.
+회차 페이지는 최대 100행×20페이지, 응답당 2 MiB 스트림 제한,
+전체 60초 제한, 요청 10초 timeout, redirect 금지다.
+페이지가 전부 수집되지 않거나 수집 중 totalCount가 달라지면 성공으로 보고하지 않는다.
+공개된 현재 회차 전체와 DB 기대 가격을 비교하고, 100화 무료는 공개 1~100화가 모두
+존재해야 공개 검증 성공이다. 비공개 회차를 공개 노출로 간주하지 않는다.
 
 호스트만 제공하는 `actor`, `scopes`, `approved_plan_id`, `writes_enabled`,
 `expected_cp_company_name`은 모델 호출 인자로 노출하면 안 된다.
@@ -36,6 +65,7 @@
 | 100화 무료 설정 | `likenovel.mcp.promotion.write` |
 | 배너 게시 | `likenovel.mcp.banner.write` |
 | 유료 심사 승인 | `likenovel.mcp.paid-approval.write` |
+| 실제 유료 전환 설정 | `likenovel.mcp.paid-conversion.write` |
 
 현재 OAuth scope, `mcp_server.py`, config, 공유 receipt/schema 파일은 변경하지 않았다.
 실제 CP 로그인·매핑과 신규 scope의 재동의가 끝나기 전에는 등록/활성화하지 않는다.
@@ -49,6 +79,14 @@
   현재 `status_code`, `primary_genre_id`, `sub_genre_id` 값을 그대로 patch에 포함한다.
   장르를 모두 생략하면 기본값 `None == None`으로 거절되는 경로를 실제 서비스
   검증·query builder 테스트(DB transport만 대체)로 재현하고 방지했다.
+- `admin_user_service.apply_paid_conversion_by_admin`은
+  `paid_open_date=NOW()`, `paid_episode_no`를 저장한다.
+  작품·회차 `price_type=paid` 실제 반영은
+  `dist/batch/episode_state_transition_minute_batch.sql`의 분 단위 배치가 수행한다.
+  적용 receipt의 `completed`는 **설정 저장 완료**를 뜻하고,
+  `transition_pending=true`, `effective_conversion_verified=false`,
+  `public_verified=false`가 함께 반환된다. 실제 유료 노출은 별도 readback 이후에
+  완료로 보고해야 한다. 저장 직후 직접 SQL로 가격·회차 상태를 강제 전환하지 않는다.
 - 종료 시 복원은 **1~25화 무료, 26화부터 유료**로 고정되어 있다.
   캠페인 전 임의의 무료 범위를 복원하는 기능은 아니다.
   기존 `dist/batch/free_episode_campaign_expire_batch.sql`과 cron 등록은 5분 주기다.
@@ -84,8 +122,21 @@ main-bot / promotion / search는 현재 정책 함수에 크기 규격이 없다
 2. 신규 scope의 승인과 첫 번째 당사자 intent 저장/plan 연결.
 3. MCP tool 등록 및 신규 config별 비활성 → 활성 절차.
 4. 이미지 생성 provider, 실제 upload/pixel proof, 배너 public readback.
-5. 100화 무료 공개 가격/readback과 실제 종료 복원 배치 실행 확인.
-6. 유료 승인 이후 별도의 실제 가격/전환 단계에 대한 구체적인 사용자 지시.
+5. 실제 종료 복원 배치 실행 확인.
+6. 도구 통합 및 승인된 실제 유료 전환/100화 무료의 DB·공개 검증 실행.
+
+## CP 인증 연결 방법과 경계
+
+파트너 로그인은 `partner_command.login_partner`의
+`auth_service.post_auth_signin(call_from="partner")` 기존 경로다.
+반환 토큰을 기존 JWT/Keycloak 검증으로 확인한 뒤
+`check_user(kc_user_id=검증된 sub, db=db)` 결과가 실제 `role=CP`인지 확인한다.
+승인된 `tb_user_profile_apply`의 `apply_type=cp`, `approval_code=accepted`,
+`approval_date IS NOT NULL` 회사명을 다시 조회하고 서버에 검증된 회사명과 exact match한다.
+현재 `check_user`는 `role_type=admin`을 우선하며, 관리자에게 CP 신청 기록이 있어도
+`role=admin`을 반환한다. 계정 ID나 회사명이 모델 입력에 있다는 이유로 이를 CP로
+치환하지 않는다. 별도의 실제 CP 로그인 grant 또는 서버에서 사전에 검증해 보관한
+CP grant가 필요하다. CP 역할 부여·신청 승인·암호 변경·새 계정 생성은 이 작업에서 하지 않았다.
 
 대상·기간·배너·유료 심사 후보는 미리 알려 줄 수 있지만, 어떤 작품에 무엇을
 적용할지 사용자가 지정하거나 구체적 계획을 승인하기 전에는 실행하지 않는다.

@@ -1,43 +1,40 @@
-# 라이크노벨 닷 MCP 확장 준비
+# 라이크노벨 닷 MCP 운영 확장
 
-2026-10-11 사용자 요청. 상태: 소스 조사 및 도구 계약 준비. 아래 도구는 아직 설치된 MCP에 노출하거나 활성화하지 않았다. 현재 구좌 7개 도구의 자동운영 허가가 다른 영역에 자동 확장되지는 않는다.
+2026-10-11. 등록 코드는 기존 구좌 7개에 확장 15개를 추가한다. 운영 배포·계정 연결의 최종 상태는 실제 MCP status와 배포 ledger로 확인한다. 모듈 준비와 실제 배포를 혼동하지 않는다.
 
-## 기존 코드 연결점
+## 사용자 실행 경계
 
-| 영역 | 현재 코드 | 확장 입력 및 결과 |
+- 기존 일반 구좌 5개 매일 10:00 KST, 유료 단일구좌 3개·문구 월·목 10:05는 기존 상시 허가를 유지한다.
+- AI 독자·회원메일·100화 무료·배너 게시·심사 승인·실제 유료 전환은 구체적인 계획에 대한 사용자 실행 승인이 필요하다. 조회·계획·이미지 시안·배치 제안은 적극적으로 준비한다.
+- 모델이 만든 승인 문자열은 승인 증거가 아니다. 준비 도구는 서버에 고정된 계획과 15분 유효한 일회 승인 nonce를 만들고, nonce는 MCP `_meta`로 승인 화면에만 전달한다. `content`·`structuredContent`·공개 receipt에는 nonce가 없다.
+- 실행 도구는 `ui.visibility=[app]`/private로 모델에 공개하지 않는다. 사용자 승인 버튼만 정확한 nonce를 전달한다. 닷이 브라우저로 대신 버튼을 누르거나 자율 제안을 실행 지시로 바꾸지 않도록 닷 규칙도 함께 유지해야 한다.
+- 실행 시 owner·kind·계획 hash·TTL·atomic consume·각 쓰기 scope·기능 스위치를 검사한다. 직접 지시도 모델의 자기 주장으로 인증하지 않으며, 호스트가 검증한 승인 화면에서 구체화한다.
+- nonce는 승인 화면용 bearer capability다. 전체 MCP 응답을 읽을 수 있는 외부 API 클라이언트를 사람으로 증명하는 수단은 아니다. 이 연결은 해당 계정의 닷·사용자 화면으로 한정한다.
+
+## 기능과 실제 도구
+
+| 기능 | 조회·준비 | 실행·결과 |
 |---|---|---|
-| AI 독자 | `app/services/admin/admin_ai_reader_service.py`, `app/schemas/admin.py`, admin `ai-readers` query/command | 인원, 시작일(KST), 운영일수, 시간대, 일일 세션/LLM 예산, 읽기/댓글 설정; dry-run 대상 수와 종료일, 적용 후 active 및 schedule 수 |
-| 회원 메일 | `app/services/admin/admin_user_service.py`의 `tb_user`, `app/services/user/user_notification_service.py`의 `tb_user_notification` | 대상 조건, 메일 목적, 제목/본문, 발송시각; 수신자 스냅샷 수, 제외 이유, 발송별 receipt 및 Sent readback |
-| 백화무료 | `app/services/partner/partner_product_service.py:put_product`, `app/schemas/partner.py` | 정확한 작품, 라이크노벨 CP identity, 시작/종료, `hundred_free_campaign_enabled`, `hundred_free_campaign_ends_at`; 1~100화 무료 설정 및 종료 복원 readback |
-| 배너 | `app/services/admin/admin_event_service.py`, `PostBannerReqBody`, `PutBannerReqBody` | PC/모바일 이미지, 위치/세부위치, 노출 기간, 순서, 링크; image id, banner id, 공개 노출 및 링크 확인 |
-| 유료전환 | `app/services/admin/admin_user_service.py:accept_apply_rank_up`, `apply_paid_conversion_by_admin`, `PostApplyPaidConversionReqBody` | 신청 id/작품, 승인 여부, 유료 시작 회차, 기다리면 무료 옵션; 승인과 실제 유료 적용을 별도 receipt로 확인 |
+| AI 독자 | `likenovel_ai_reader_status`, `likenovel_prepare_ai_readers(count,starts_on,duration_days,mode)` | 기존 CMS dry-run/HMAC, 정확한 인원·일수·KST 시작일·종료 자동정지; 승인 뒤 서비스 재사용. 미래 시작·기간 밖 잔여 스케줄·액션은 공유 guard로 차단 |
+| 회원메일 | `likenovel_member_preview(filters)`, `likenovel_prepare_member_mail(preview_id,subject,body)` | admin@likenovel.net 고정·전원 BCC, 최신 마케팅 동의와 실제 회원 테이블, exact audience/text hash, DWD와 Sent readback. 단일 캠페인 최대 500명; 초과 전체 발송은 분할 manifest 구현 전 차단 |
+| 100화 무료 | `likenovel_cp_connection`, `likenovel_promotion_snapshot`, `likenovel_prepare_hundred_free(product_id,ends_at)` | 별도 실제 CP OAuth 로그인·승인 회사 exact·소유 작품 검증. 즉시 시작과 명시 종료; 기존 복원 정책은 1~25 무료/26부터 유료 |
+| 배너 | `likenovel_banner_brief`, `likenovel_prepare_banner(request,file,mobile_file)` | 닷 자체 이미지 생성 → ChatGPT fileParams → private 원본 저장·실제 픽셀/hash 검사 → 시안 승인 → 기존 storage upload + CMS insert. 기존 위치 순서 CAS·중복 게시 방지·공개 이미지/링크 확인 |
+| 유료전환 | `likenovel_paid_applications`, `likenovel_prepare_paid_approval`, `likenovel_prepare_paid_conversion(apply_id,paid_episode_no)` | 심사 승인과 실제 유료 설정은 별도 scope/계획. 실제 가격은 기존 분 배치 반영 뒤 확인. 저장 완료를 공개 전환 완료로 보고하지 않음 |
+| 상태·결과 | `likenovel_expansion_status`, `likenovel_expansion_receipt` | 기능별 설정/권한과 실제 영수증을 조회. 불확실한 실행은 즉시 반복하지 말고 먼저 결과 확인 |
 
-## 예정 도구 계약
+## 배너 이미지와 배치 제안
 
-- `likenovel_ai_reader_snapshot`: 기존 인원/상태/일정 조회.
-- `likenovel_plan_ai_readers(count, starts_on, duration_days, ...)`: 기존 `apply=false` dry-run으로 실제 가능한 대상과 비용 관련 예산 확인. `bootstrap`(새 전용 계정 생성), `resume`(기존 paused 재개), `restart`(기존 전체 활동 교체)는 구분한다.
-- `likenovel_apply_ai_reader_plan(plan_id)`: 사용자가 지정한 인원과 기간만 적용. `auto_pause_schedule_end_date` 기존 처리를 사용하고 신규 독자 worker를 별도 구현하지 않는다. 재시도는 동일 계획 receipt로 합친다.
-- `likenovel_pause_ai_readers(plan_id)`: 해당 계획이 만든/재개한 독자만 멈춘다. 기존 `pause-all`은 명시적인 전체 중지 지시에만 사용한다.
-- `likenovel_prepare_member_mail(filters, purpose, subject, body, send_at)`: 회원 테이블을 페이지 단위로 조회하고 `use_yn`, 실제 이메일, 중복, AI 전용/관리자 계정, 목적에 따른 수신설정을 검증한다. `noti_yn` 하나만으로 모든 메일 동의를 추정하지 않는다. 마케팅 목적은 `noti_type=marketing` 설정과 실제 정책을 확인한다.
-- `likenovel_send_member_mail(campaign_id)`: 발신자 고정 `admin@likenovel.net`, 수신자 확정 스냅샷/본문 해시/배치별 receipt 사용. 대량 주소를 다른 수신자에게 노출하지 않는다. 불확실한 Gmail 응답은 Sent 조회로 조정하며 즉시 재발송하지 않는다.
-- `likenovel_plan_hundred_free(product_id, cp_identity, starts_at, ends_at)`: 라이크노벨 CP 소유/계약 범위, 현재 유료작, 충분한 회차, 종료일, 기존 캠페인 확인. 기존 `put_product` 전체 요청의 비대상 필드를 현재 값으로 유지한다.
-- `likenovel_apply_hundred_free(plan_id)`: 기존 파트너 서비스와 캠페인 테이블 사용. 관리자 전체권한으로 CP identity를 흉내내지 않는다. 예약 시작/종료와 1~100화 공개/무료 실제 노출 확인.
-- `likenovel_prepare_banner(brief, products, placements, starts_at, ends_at, url)`: 표지/제목/혜택 근거와 현재 CMS 이미지 규격을 확인해 PC/모바일 결과물을 준비한다. 이미지 생성은 닷의 이미지 생성 도구 또는 검증된 서버 이미지 공급자를 사용한다. 현재 Pillow는 검증용이며 이미지 생성 모델이 아니다.
-- `likenovel_publish_banner(plan_id)`: 승인된 이미지 업로드/파일 등록을 통해 image id를 얻고 공식 배너 서비스를 호출한다. 대상 위치의 기존 순서는 보존하며 동일 계획 중복 게시를 막는다. 공개 이미지와 링크/노출기간 확인.
-- `likenovel_review_paid_application(apply_id)`, `likenovel_accept_paid_application(plan_id)`, `likenovel_apply_paid_conversion(plan_id)`: 신청 승인과 실제 가격 전환은 별개로 처리한다. 현재 서비스는 승인된 일반연재 무료작만 실제 적용 가능하므로 해당 검증을 유지한다.
+- 닷이 후보 작품, 실제 혜택 근거, 문구, 이미지 시안, PC/모바일 규격, 위치, 순서, 링크, 기간을 묶어 제안한다. 이미지 제작을 사용자의 매번 요청에만 맡기지 않는다.
+- 같은 작품을 며칠 안에 다시 제안하지 않는다. 최근 7일 제안·노출 이력을 우선 제외하고, 남은 신작·기존작에 동등하게 기회를 준다. 조회수·반응·오래된 정도로 기회를 편중하지 않는다.
+- CMS 규격 SSOT: main-top/paid/review 364×414, companyNotice 734×367, main-mid 1080×116, viewer PC839×122/모바일375×122. 규격 없는 position은 명시된 width/height가 필요하다.
+- 실제 파일은 허용된 ChatGPT file host, public DNS, redirect 금지, 15 MiB 제한을 검사한다. 이미 검증한 원본에서 만든 제한된 미리보기를 승인 화면에 표시한다. 원본 파일은 변경하지 않는다.
+- 작품·혜택 근거가 없는 과장 문구를 만들지 않는다. 유료/무료 변경 승인 전의 시안은 실제 게시와 구분한다.
 
-## 준비된 것과 남은 연결
+## 인증·배포·검증
 
-- 소스에서 AI 독자 `schedule_date`, `schedule_duration_days`, `agent_count`, 종료 자동정지와 dry-run을 확인했다. 인원/기간/시작일은 사용자가 지정할 예정이다.
-- 백화무료 기존 서비스는 유료작만 허용하고 무료 범위를 1~100으로 정하며 종료 일시를 필수로 받는다. 소유/계약 권한도 기존 CP 검증을 유지한다.
-- 배너는 `position`, `division`, `show_start_date`, `show_end_date`, `show_order`, `url`, `image_id`, `mobile_image_id`를 사용한다. 실제 규격/업로드 경로 및 이미지 생성 공급자는 구현 단계에서 readback이 필요하다.
-- 기존 Google Workspace DWD 경로는 Windows 로컬에 있다. PC가 꺼져도 발송하려면 서버용 제한된 admin 발송 인증을 별도로 연결해야 한다. 로컬 키를 문서/닷/소스에 복사하지 않는다. 계정 권한이 없다고 추정하지 말고 기존 인증 로직을 재사용한다.
-- 현재 로컬 계정 문서는 CMS 관리자용 1개만 확인했다. 라이크노벨 CP의 실제 로그인 identity/허용 작품을 확인한 다음 해당 파트너 권한으로 연동한다.
-- 확장 시 read / AI 독자 / 메일 / CP 캠페인 / 배너 / 유료전환을 분리된 OAuth scope와 서버 기능 스위치로 제한한다. 도구 목록 변경 후 닷 플러그인을 새로고침하고 넓어진 영역에 대한 1회 계정 권한 허용을 별도로 받는다.
-- 영수증/동시 변경 방지/실제 readback을 재사용하되 메일, 배너, 캠페인은 같은 DB transaction으로 묶을 수 없으므로 단계별 상태와 실패 복구를 기록한다. 부분 실패를 전체 성공으로 보고하지 않는다.
-
-## 검증 및 실행 경계
-
-이번 준비는 코드 및 스키마 조사이며 운영 인원 투입, 회원 이메일 추출/발송, CP 로그인, 무료회차 변경, 배너 생성/게시, 유료 승인·가격변경은 실행하지 않았다. 회원 개인정보와 OAuth/Workspace 자격증명은 이 문서에 포함하지 않았다.
-
-구현 수용기준: exact identity/scopes, dry-run과 실제 대상 수 비교, 같은 계획 재시도 중복 효과 없음, concurrent edit 차단, 시작/종료 KST 검증, 실패/부분성공 receipt, 공개 readback 또는 Gmail Sent readback. 실제 입력을 받으면 먼저 해당 계획을 구체화하고 허용된 영역만 실행한다.
+- 기존 관리자 인증 서버 client/PKCE와 암호화 offline grant를 재사용하며 realm 권한을 만들지 않는다. 확장은 별도 OAuth scopes를 받는다.
+- 실제 CP 계정은 서버의 `mcp_cp_auth`에서 로그인·role CP·승인 회사명을 검증한다. 관리자 identity를 CP로 바꾸지 않는다. CP 비밀번호·토큰을 닷·tracked 코드·문서에 반환하지 않는다.
+- Workspace 키는 서버의 private mode600 파일에만 두고 `member_mail_service_account_file`에서 참조한다. 앱 발신자는 admin 계정으로 제한한다. 발송 없이 DWD profile 검증이 가능하다.
+- 기능별 `ai_reader_writes_enabled`, `member_mail_enabled`, `promotion_writes_enabled`, `banner_writes_enabled`, `paid_conversion_writes_enabled`를 독립적으로 적용한다.
+- 회귀 검증에는 SDK/PKCE/refresh/revocation, 승인 nonce wire·owner/replay/변조·scope, 위젯 envelope와 명시 클릭, AI 기간 bounds, Gmail 불확실 발송/Sent, 실제 기존 서비스 호출, 배너 픽셀·SSRF·CAS·이미지 보존과 공개 검증이 포함된다.
+- 구체적인 운영 계획 없이 AI 독자 투입·회원메일 발송·무료회차 설정·배너 게시·유료전환을 시험하지 않는다. 계정 인증/읽기·이미지 시안 준비까지의 live 증거와 실제 실행/자연발동은 별도로 보고한다.

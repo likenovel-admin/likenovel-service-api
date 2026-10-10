@@ -27,7 +27,8 @@ from app.services.ai import mcp_store as store, mcp_policy as policy
 from app.services.ai.mcp_config import load as load_config
 
 logger = logging.getLogger(__name__)
-SCOPES = [policy.READ_SCOPE, policy.WRITE_SCOPE, "offline_access"]
+from app.services.ai.mcp_extensions import EXTRA_SCOPES
+SCOPES = [policy.READ_SCOPE, policy.WRITE_SCOPE, "offline_access", *EXTRA_SCOPES]
 
 
 def _key(kind: str, value: str) -> str:
@@ -309,7 +310,9 @@ button{{background:#182638;color:white;border:0;border-radius:8px}}</style>
 <p>기존 CMS 관리자 계정으로 로그인하면 닷에 다음 운영 권한을 연결합니다.</p>
 <ul><li>일반 구좌 5개: 매일 오전 10시 검토 후 필요한 변경</li>
 <li>유료 단일구좌 3개와 문구: 월·목 오전 10시 5분 교체</li>
-<li>한국시간 기준, 매번 승인 없이 운영하며 결과는 닷으로 보고</li></ul>
+<li>한국시간 기준, 위 구좌만 매번 승인 없이 운영하며 결과는 닷으로 보고</li>
+<li>AI 독자·회원메일·프로모션·배너·유료전환은 조회·계획 가능. 실제 실행은 해당 계획의 사용자 승인 버튼으로만 허용</li>
+<li>배너 이미지 제작과 배치 제안, 최근 중복을 피한 적극적인 운영 제안</li></ul>
 <p>CMS 비밀번호는 라이크노벨에서 확인하며 닷에 전달하지 않습니다.</p>
 <form method="post" action="/oauth/login">
 <input type="hidden" name="flow" value="{html.escape(flow, quote=True)}">

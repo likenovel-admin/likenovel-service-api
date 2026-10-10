@@ -242,6 +242,22 @@ class MemberMailTests(unittest.IsolatedAsyncioTestCase):
                 await mail.WorkspaceAdminGmail(str(path))._token(client)
         self.assertEqual(len(requests), 2)
 
+    async def test_profile_proof_requires_fixed_admin_and_never_sends(self):
+        gmail = mail.WorkspaceAdminGmail(self.config["member_mail_service_account_file"])
+        with patch.object(gmail, "request", AsyncMock(return_value={
+            "emailAddress": mail.SENDER, "messagesTotal": 123, "threadsTotal": 90,
+        })) as request:
+            result = await gmail.verify_connection()
+        request.assert_awaited_once_with("/profile")
+        self.assertTrue(result["profile_verified"])
+        self.assertFalse(result["send_runtime_verified"])
+        self.assertNotIn("messagesTotal", result)
+        with patch.object(gmail, "request", AsyncMock(return_value={
+            "emailAddress": "other@example.test",
+        })):
+            with self.assertRaisesRegex(RuntimeError, "fixed admin"):
+                await gmail.verify_connection()
+
 
 if __name__ == "__main__":
     unittest.main()

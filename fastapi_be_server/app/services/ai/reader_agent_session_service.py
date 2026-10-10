@@ -313,7 +313,7 @@ async def ensure_reader_daily_schedules(
     for schedule_date in normalized_dates:
         schedule_start_at = datetime.combine(schedule_date, datetime.min.time())
         result = await db.execute(
-            text("""
+            text(f"""
                 select
                     a.ai_reader_agent_id,
                     a.activity_pattern_json
@@ -328,20 +328,9 @@ async def ensure_reader_daily_schedules(
                           from tb_user_social us
                          where us.user_id = u.user_id
                    )
-                   and (
-                        json_extract(a.activity_pattern_json, '$.auto_pause_after') is null
-                        or timestamp(cast(nullif(
-                            json_unquote(json_extract(a.activity_pattern_json, '$.auto_pause_after')),
-                            'null'
-                        ) as char)) > :schedule_start_at
-                   )
-                   and (
-                        json_extract(a.activity_pattern_json, '$.auto_pause_schedule_end_date') is null
-                        or date(cast(nullif(
-                            json_unquote(json_extract(a.activity_pattern_json, '$.auto_pause_schedule_end_date')),
-                            'null'
-                        ) as char)) >= :schedule_date
-                   )
+                   and {action_service.reader_operation_window_sql(
+                        schedule_date=":schedule_date", now=":schedule_start_at"
+                   )}
                    and not exists (
                         select 1
                           from tb_ai_reader_daily_schedule s
@@ -401,6 +390,10 @@ async def pause_expired_active_reader_agents(
                      where s.ai_reader_agent_id = a.ai_reader_agent_id
                        and s.status in ('ready', 'running')
                        and s.active_end_at > current_timestamp
+                       and s.active_start_at < timestamp(cast(nullif(
+                            json_unquote(json_extract(a.activity_pattern_json, '$.auto_pause_after')),
+                            'null'
+                       ) as char))
                )
              order by a.ai_reader_agent_id
              limit :limit
@@ -839,6 +832,7 @@ async def _select_claimable_reader_session_rows(
                and s.active_start_at >= timestampadd(day, -1, current_timestamp)
                and s.active_end_at > current_timestamp
                and a.status = 'active'
+               and {action_service.reader_operation_window_sql(schedule_date="s.schedule_date")}
                and u.use_yn = 'Y'
                and lower(substring_index(u.email, '@', -1)) in :allowed_domains
                and not exists (
@@ -1177,13 +1171,14 @@ async def _reader_session_finalization_block_reason(
     worker_id: str | None = None,
 ) -> str | None:
     result = await db.execute(
-        text("""
+        text(f"""
             select a.status as agent_status
                  , s.status as schedule_status
                  , s.locked_by as locked_by
                  , case
                     when s.active_start_at <= current_timestamp
                      and s.active_end_at > current_timestamp
+                     and {action_service.reader_operation_window_sql(schedule_date="s.schedule_date")}
                     then 1
                     else 0
                    end as within_active_window
@@ -2531,7 +2526,7 @@ async def reserve_reader_llm_decision(
 ) -> int:
     request_hash = _reader_llm_request_hash(snapshot)
     budget_result = await db.execute(
-        text("""
+        text(f"""
             select a.daily_llm_budget
                  , (
                     select count(*)
@@ -2545,6 +2540,7 @@ async def reserve_reader_llm_decision(
              where a.ai_reader_agent_id = :ai_reader_agent_id
                and a.user_id = :user_id
                and a.status = 'active'
+               and {action_service.reader_operation_window_sql()}
              for update
         """),
         {

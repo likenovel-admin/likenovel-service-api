@@ -29,6 +29,34 @@ READ_POOL_GUARD_RETRY_REASONS = frozenset(
         "insufficient_read_pool",
     }
 )
+
+
+def reader_operation_window_sql(
+    *, schedule_date: str = "current_date()", now: str = "current_timestamp",
+) -> str:
+    """Internal SQL expressions only; alias a is the AI-reader agent."""
+    return f"""
+        (
+            json_extract(a.activity_pattern_json, '$.auto_start_schedule_start_date') is null
+            or date(cast(nullif(json_unquote(json_extract(
+                a.activity_pattern_json, '$.auto_start_schedule_start_date'
+            )), 'null') as char)) <= {schedule_date}
+        )
+        and (
+            json_extract(a.activity_pattern_json, '$.auto_pause_schedule_end_date') is null
+            or date(cast(nullif(json_unquote(json_extract(
+                a.activity_pattern_json, '$.auto_pause_schedule_end_date'
+            )), 'null') as char)) >= {schedule_date}
+        )
+        and (
+            json_extract(a.activity_pattern_json, '$.auto_pause_after') is null
+            or timestamp(cast(nullif(json_unquote(json_extract(
+                a.activity_pattern_json, '$.auto_pause_after'
+            )), 'null') as char)) > {now}
+        )
+    """
+
+
 AI_READER_BOOKMARK_ADD_DAILY_LIMIT = 12
 AI_READER_BOOKMARK_ADD_DAILY_LIMIT_LOCK_KEY = "ai-reader:bookmark-add-daily-limit"
 AI_READER_BOOKMARK_ADD_DAILY_LIMIT_LOCK_TIMEOUT_SECONDS = 5
@@ -332,7 +360,7 @@ async def _claim_due_actions(
 
     allowed_domains = _allowed_ai_reader_account_domains()
     result = await db.execute(
-        text("""
+        text(f"""
             select q.ai_reader_action_id
                  , q.ai_reader_agent_id
                  , q.user_id
@@ -366,6 +394,7 @@ async def _claim_due_actions(
                         and q.attempt_count < :max_attempt_count
                     )
                )
+               and {reader_operation_window_sql()}
              order by q.available_at, q.ai_reader_action_id
              limit :limit
              for update skip locked
@@ -383,7 +412,7 @@ async def _claim_due_actions(
 
     action_ids = [row.get("ai_reader_action_id") for row in rows]
     result = await db.execute(
-        text("""
+        text(f"""
             update tb_ai_reader_action_queue q
               join tb_ai_reader_agent a
                 on a.ai_reader_agent_id = q.ai_reader_agent_id
@@ -403,6 +432,7 @@ async def _claim_due_actions(
                  , q.attempt_count = q.attempt_count + 1
              where q.ai_reader_action_id in :action_ids
                and q.status in ('queued', 'running')
+               and {reader_operation_window_sql()}
         """).bindparams(
             bindparam("action_ids", expanding=True),
             bindparam("allowed_domains", expanding=True),
@@ -660,7 +690,7 @@ async def _get_action_agent_block_reason(
     db: AsyncSession,
 ) -> str | None:
     result = await db.execute(
-        text("""
+        text(f"""
             select a.status
                  , lower(substring_index(u.email, '@', -1)) as email_domain
                  , u.use_yn as user_use_yn
@@ -669,6 +699,7 @@ async def _get_action_agent_block_reason(
                 on u.user_id = a.user_id
              where a.ai_reader_agent_id = :ai_reader_agent_id
                and a.user_id = :user_id
+               and {reader_operation_window_sql()}
              limit 1
              for update
         """),
