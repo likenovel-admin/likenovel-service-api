@@ -1,8 +1,10 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from app.services.ai import mcp_single_copy as core
+
+NOW = datetime(2026, 10, 12, 10, 5, tzinfo=core.KST)
 
 
 def candidate(product_id, *, last_seen=None, hits=0, bookmarks=0):
@@ -19,54 +21,68 @@ def candidate(product_id, *, last_seen=None, hits=0, bookmarks=0):
 
 
 class RotationFairnessTests(unittest.TestCase):
-    def test_unseen_and_older_opportunities_precede_recent_popular_work(self):
+    def test_recent_exposure_and_proposal_are_excluded_and_exact_seven_days_allowed(self):
         candidates = [
-            candidate(3, hits=1_000_000, bookmarks=100_000),
-            candidate(2, last_seen=datetime(2026, 9, 1, tzinfo=core.KST)),
-            candidate(1),
+            candidate(1, last_seen=NOW - timedelta(days=7) + timedelta(microseconds=1)),
+            candidate(2, last_seen=NOW - timedelta(days=7)),
+            candidate(3, last_seen=NOW - timedelta(days=30)),
+            candidate(4, last_seen=NOW + timedelta(days=1)),
         ]
         state = core.empty_state()
-        state["last_proposed_at"] = {"3": "2026-10-10T10:05:00+09:00"}
-        with patch.object(core.random, "shuffle", side_effect=lambda rows: rows.reverse()):
-            ranked = core.rank_candidates(candidates, state)
-        self.assertEqual([row["product_id"] for row in ranked], [1, 2, 3])
+        state["last_proposed_at"] = {"3": (NOW - timedelta(days=1)).isoformat()}
+        with patch.object(core.random, "shuffle", side_effect=lambda rows: None):
+            ranked = core.rank_candidates(candidates, state, now=NOW)
+        self.assertEqual([row["product_id"] for row in ranked], [2])
 
-    def test_same_kst_opportunity_day_uses_shuffle_not_views_or_microseconds(self):
+    def test_old_and_unseen_works_can_rotate_in_either_order_despite_popularity(self):
         candidates = [
-            candidate(1, last_seen=datetime(2026, 10, 8, 0, 0, tzinfo=core.KST),
-                      hits=1_000_000, bookmarks=100_000),
-            candidate(2, last_seen=datetime(2026, 10, 8, 23, 59, tzinfo=core.KST)),
+            candidate(1, last_seen=NOW - timedelta(days=90)),
+            candidate(2, hits=1_000_000, bookmarks=100_000),
         ]
-        with patch.object(core.random, "shuffle", side_effect=lambda rows: rows.reverse()):
-            ranked = core.rank_candidates(candidates, core.empty_state())
-        self.assertEqual([row["product_id"] for row in ranked], [2, 1])
-        self.assertEqual([row["product_id"] for row in candidates], [1, 2])
-
-    def test_unseen_tier_can_rotate_in_either_order_despite_popularity(self):
-        candidates = [candidate(1), candidate(2, hits=1_000_000, bookmarks=100_000)]
         for reverse, expected in [(False, [1, 2]), (True, [2, 1])]:
             with self.subTest(reverse=reverse):
                 shuffle = (lambda rows: rows.reverse()) if reverse else (lambda rows: None)
                 with patch.object(core.random, "shuffle", side_effect=shuffle):
-                    ranked = core.rank_candidates(candidates, core.empty_state())
+                    ranked = core.rank_candidates(candidates, core.empty_state(), now=NOW)
                 self.assertEqual([row["product_id"] for row in ranked], expected)
+        self.assertEqual([row["product_id"] for row in candidates], [1, 2])
 
-    def test_proposal_and_exposure_history_use_latest_kst_day(self):
+    def test_unknown_history_date_is_not_inferred_from_count_or_views(self):
+        row = candidate(1, hits=1_000_000)
+        row["history_count"] = 100
+        with patch.object(core.random, "shuffle", side_effect=lambda rows: None):
+            ranked = core.rank_candidates([row], core.empty_state(), now=NOW)
+        self.assertEqual(ranked, [row])
+        self.assertIsNone(ranked[0]["last_single_slot_at"])
+
+    def test_latest_proposal_or_exposure_controls_cooldown_across_timezones(self):
         candidates = [
-            candidate(1, last_seen=datetime(2026, 10, 1, tzinfo=core.KST)),
-            candidate(2, last_seen=datetime(2026, 10, 8, tzinfo=core.KST)),
+            candidate(1, last_seen=NOW - timedelta(days=30)),
+            candidate(2, last_seen=NOW - timedelta(days=1)),
         ]
         state = core.empty_state()
-        # UTC evening is the next calendar day in KST.
-        state["last_proposed_at"] = {"1": "2026-10-08T16:00:00+00:00"}
+        state["last_proposed_at"] = {
+            "1": "2026-10-08T16:00:00+00:00",
+            "2": "2026-09-01T10:05:00+09:00",
+        }
         with patch.object(core.random, "shuffle", side_effect=lambda rows: None):
-            ranked = core.rank_candidates(candidates, state)
-        self.assertEqual([row["product_id"] for row in ranked], [2, 1])
+            ranked = core.rank_candidates(candidates, state, now=NOW)
+        self.assertEqual(ranked, [])
+
+    def test_cooldown_shortage_does_not_backfill_with_recent_works(self):
+        candidates = [candidate(1), candidate(2), candidate(3, last_seen=NOW)]
+        with patch.object(core.random, "shuffle", side_effect=lambda rows: None):
+            ranked = core.rank_candidates(candidates, core.empty_state(), now=NOW)
+        with patch.object(core, "inspect_cover", return_value={"eligible": True}):
+            selected, rejected = core.select_cover_valid_candidates(ranked)
+        self.assertEqual([row["product_id"] for row in selected], [1, 2])
+        self.assertLess(len(selected), core.REQUIRED_COUNT)
+        self.assertEqual(rejected, [])
 
     def test_cover_rejection_still_selects_three_distinct_eligible_works(self):
         candidates = [candidate(value) for value in range(1, 5)]
         with patch.object(core.random, "shuffle", side_effect=lambda rows: None):
-            ranked = core.rank_candidates(candidates, core.empty_state())
+            ranked = core.rank_candidates(candidates, core.empty_state(), now=NOW)
         def cover(path):
             return {"eligible": path != "cover-1", "reason": "invalid"}
         with patch.object(core, "inspect_cover", side_effect=cover):
