@@ -8,6 +8,8 @@ import json
 
 import re
 
+import random
+
 import time
 
 from datetime import datetime
@@ -349,31 +351,17 @@ def rank_candidates(
     candidates: Iterable[dict[str, Any]], state: dict[str, Any]
 ) -> list[dict[str, Any]]:
     proposed_at = state["last_proposed_at"]
+    ranked = list(candidates)
+    # Stable sorting preserves a random order within each opportunity-day tier.
+    random.shuffle(ranked)
 
     def key(candidate: dict[str, Any]):
-        product_id = candidate["product_id"]
-        never_shown = candidate["history_count"] == 0
-        never_proposed = str(product_id) not in proposed_at
-        if never_shown and never_proposed:
-            freshness_bucket = 0
-        elif never_proposed:
-            freshness_bucket = 1
-        else:
-            freshness_bucket = 2
         last_seen = _combined_last_seen(candidate, proposed_at)
-        last_seen_value = last_seen.timestamp() if last_seen else 0
-        paid_open = candidate.get("paid_open_at")
-        paid_open_value = paid_open.timestamp() if paid_open else 0
-        return (
-            freshness_bucket,
-            last_seen_value,
-            -paid_open_value,
-            -candidate["count_bookmark"],
-            -candidate["count_hit"],
-            -product_id,
-        )
+        never_seen = candidate["history_count"] == 0 and last_seen is None
+        last_seen_day = last_seen.astimezone(KST).date().toordinal() if last_seen else 0
+        return (0 if never_seen else 1, last_seen_day)
 
-    return sorted(candidates, key=key)
+    return sorted(ranked, key=key)
 
 def cover_is_eligible(metadata: dict[str, Any]) -> tuple[bool, str | None]:
     sha256 = str(metadata.get("sha256") or "").lower()
