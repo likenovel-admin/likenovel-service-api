@@ -6,9 +6,9 @@ authors = ["likenovel-dev <infra@likenovel.net>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = ">=3.12,<3.14"
 fastapi = "^0.112.2"
-uvicorn = {extras = ["standard"], version = "^0.30.6"}
+uvicorn = {version = "^0.31.1", extras = ["standard"]}
 gunicorn = "^23.0.0"
 uvicorn-worker = "^0.2.0"
 # Keep exact: newer SQLAlchemy/PyMySQL breaks aiomysql 0.2.0 pool_pre_ping.
@@ -29,8 +29,10 @@ ebooklib = "^0.18"
 portone-server-sdk = "^0.8.0"
 bcrypt = "^4.3.0"
 firebase-admin = "7.0.0"
-python-multipart = "^0.0.6"
+python-multipart = "^0.0.22"
 pycryptodome = "^3.23.0"
+mcp = "1.30.0"
+pillow = "12.3.0"
 
 [tool.poetry.group.test]
 optional = true
