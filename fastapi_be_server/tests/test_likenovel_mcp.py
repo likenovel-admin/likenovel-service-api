@@ -155,6 +155,8 @@ class SDKTransportTests(unittest.TestCase):
                     self.assertEqual(auth.status_code, 302)
                     page = client.get(auth.headers["location"])
                     self.assertEqual(page.status_code, 200)
+                    # Preserve same-site POST Origin; cross-site navigation still has no referrer.
+                    self.assertEqual(page.headers["referrer-policy"], "same-origin")
                     csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
                     flow = parse_qs(urlsplit(auth.headers["location"]).query)["flow"][0]
                     form = {"flow": flow, "csrf": csrf, "username": "admin@example.test", "password": "test-only"}

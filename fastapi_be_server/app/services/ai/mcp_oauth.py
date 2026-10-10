@@ -246,7 +246,7 @@ class AdminOAuthProvider:
 
 
 HEADERS = {
-    "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store", "Referrer-Policy": "same-origin",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
     "X-Content-Type-Options": "nosniff",
 }
