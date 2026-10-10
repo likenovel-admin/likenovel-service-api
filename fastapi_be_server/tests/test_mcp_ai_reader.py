@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -166,7 +167,7 @@ class AiReaderTests(unittest.IsolatedAsyncioTestCase):
         agent = Mock()
         agent.mappings.return_value.all.return_value = [{
             "agent_key": "reader-1", "status": "active", "daily_llm_budget": 8,
-            "activity_pattern_json": '{"auto_pause_schedule_end_date":"2026-10-13"}',
+            "activity_pattern_json": json.dumps(record["preview"]["preview"][0]["activity_pattern"]),
         }]
         schedules = Mock()
         schedules.mappings.return_value.all.return_value = [{
@@ -189,6 +190,42 @@ class AiReaderTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "period does not match"):
             await self.make_plan()
 
+    async def test_future_start_boundary_is_persisted_in_the_apply_transaction(self):
+        public = await self.make_plan()
+        record = ops._read_plan("admin", public["plan_id"])
+        db = Mock(execute=AsyncMock())
+        await ops._apply_start_boundary(db, record)
+        saved = json.loads(db.execute.await_args.args[1][0]["pattern"])
+        self.assertEqual(saved["auto_start_schedule_start_date"], "2026-10-12")
+        self.assertEqual(saved["auto_pause_schedule_end_date"], "2026-10-13")
+        self.assertIn("status='active'", str(db.execute.await_args.args[0]))
+
+    async def test_worker_queries_share_start_end_and_time_bounds(self):
+        from app.services.ai import reader_agent_action_service as actions
+        from app.services.ai import reader_agent_session_service as sessions
+        query = actions.reader_operation_window_sql(
+            schedule_date=":scheduled_day", now=":scheduled_at",
+        )
+        self.assertIn("auto_start_schedule_start_date", query)
+        self.assertIn("<= :scheduled_day", query)
+        self.assertIn("auto_pause_schedule_end_date", query)
+        self.assertIn(">= :scheduled_day", query)
+        self.assertIn("auto_pause_after", query)
+        self.assertIn("> :scheduled_at", query)
+        result = Mock()
+        result.mappings.return_value.all.return_value = []
+        db = Mock(execute=AsyncMock(return_value=result))
+        await sessions.ensure_reader_daily_schedules(db, schedule_dates=[date(2026, 10, 11)])
+        await sessions._select_claimable_reader_session_rows(
+            db, index_name="idx_ai_reader_daily_schedule_due",
+            condition_sql="s.status='ready'", limit=1, lease_timeout_seconds=300,
+        )
+        for call in db.execute.await_args_list:
+            sql = str(call.args[0])
+            self.assertIn("auto_start_schedule_start_date", sql)
+            self.assertIn("auto_pause_schedule_end_date", sql)
+            self.assertIn("auto_pause_after", sql)
+
     async def test_completed_receipt_is_durable_and_not_reapplied(self):
         public = await self.make_plan()
         operation_id = "ai-reader-apply:" + public["plan_id"].split(":")[1]
@@ -200,3 +237,21 @@ class AiReaderTests(unittest.IsolatedAsyncioTestCase):
             result = await ops.apply("admin", public["plan_id"], authorized_plan_hash=public["plan_hash"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.service.await_count, 1)
+
+    async def test_successful_apply_persists_start_boundary_before_committing_receipt(self):
+        public = await self.make_plan()
+        engine = Mock()
+        engine.connect.return_value = _Context()
+        db = _Context()
+        db.execute = AsyncMock()
+        db.commit = AsyncMock()
+        self.service.return_value = {"applied": True, "reactivated_agent_count": 1}
+        with patch.object(ops, "load_config", return_value={"ai_reader_writes_enabled": True}), \
+             patch.object(ops, "likenovel_db_engine", engine), \
+             patch.object(ops, "AsyncSession", return_value=db), \
+             patch.object(ops, "_verify_applied", AsyncMock(return_value={"active_count": 1})):
+            receipt = await ops.apply("admin", public["plan_id"], authorized_plan_hash=public["plan_hash"])
+        self.assertEqual(receipt["status"], "completed")
+        saved = json.loads(db.execute.await_args.args[1][0]["pattern"])
+        self.assertEqual(saved["auto_start_schedule_start_date"], "2026-10-12")
+        db.commit.assert_awaited_once()

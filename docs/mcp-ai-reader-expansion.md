@@ -11,6 +11,8 @@
 - `plan(owner, count, starts_on, duration_days, mode="resume", email_prefix=None)`: 읽기 전용 미리보기.
   인원은 기존 schema의 1~1,000명, 기간은 1~90일, 시작일은 한국시간 오늘 이후의 `YYYY-MM-DD`.
   시작일 포함 N일이며 종료일은 시작일 + N - 1일이다. 기존 활동 패턴과 종료 후 자동 일시중지를 재사용한다.
+  새 계획은 `auto_start_schedule_start_date`를 저장하며 워커의 생성·세션/행동 선택·실행 전 검증에
+  시작일 하한과 종료일·종료시각 상한을 적용한다. 미래 계획을 미리 적용해도 시작 전 투입은 차단한다.
   즉시 시작은 꺼져 있으며, 기존 CMS 기본 시간표에 따른다. 시간 단위 시작 지정은 미지원이다.
 - `bootstrap`: 기존 전용 AI 회원만 사용한다. `email_prefix`가 필요하며 부족분 자동 계정 발급·부분 인원 적용은 금지한다.
 - `resume`: 선택한 paused 독자만 재개한다. 다른 active 독자의 상태는 바꾸지 않는다.
@@ -36,6 +38,8 @@
 CMS 함수의 자체 `commit()`은 bound `AsyncSession(join_transaction_mode="create_savepoint")`의 savepoint를
 종료하며 외부 transaction/행 잠금은 유지된다.
 독자 active 상태, 계획 활동 패턴(자동 중지 날짜 포함), 인원, 일별 스케줄의 시작·종료일과 날짜 수를 readback한 뒤 외부 commit한다.
+기간 밖의 오래된 스케줄이 남아 있어도 새 세션·행동 선택은 금지하며 자동 중지를 늦추지 않도록
+만료 판정은 종료시각 전 시작한 스케줄만 대기한다. 메타데이터가 없는 기존 독자의 기존 동작은 유지한다.
 계획 consume과 durable applying intent가 적용 전에 기록되므로 동일 plan은 재실행하지 않는다.
 commit/응답 경계의 실패 또는 프로세스 중단 때 `applying`은 성공으로 해석하지 않으며 운영자가 DB readback으로 조정해야 한다.
 현재 구현은 불확실한 intent의 자동 복구/재실행을 제공하지 않는다.
@@ -44,7 +48,11 @@ commit/응답 경계의 실패 또는 프로세스 중단 때 `applying`은 성�
 
 - 상위 MCP 등록, OAuth scope 노출/동의, 직접 사용자 지시를 검증해 hash를 공급하는 권한 wrapper.
 - 실제 MySQL/InnoDB와 CMS 서비스에 대한 외부 transaction/savepoint·기간 readback 통합 검증.
-  mock 단위 테스트는 실DB 동시성·배치 동작의 증명이 아니다.
+  2026-10-11 운영 MySQL에서 상수 JSON/날짜 derived `SELECT` 7개 경계(시작 전/정각/종료일/
+  종료 후/오래된 날짜의 종료 후 실행/메타데이터 없는 기존 독자)를 읽기 전용으로 검증했다.
+  같은 연결에서 `AsyncSession(create_savepoint)`의 commit·rollback이 외부 transaction을 유지하는
+  것도 `SELECT`만으로 확인했다. 실제 CMS 데이터 write·행 잠금·최종 rollback 검증은 아직 하지 않았다.
+  mock 단위 테스트와 이 상수 SQL 검증은 실DB 동시성·워커 자연발동의 증명이 아니다.
 - 실제 워커가 새 스케줄을 소비하고 기간 종료 후 중지하는 자연발동 검증.
 - 사용자가 지정할 정확한 인원·시작일·기간·모드. 아직 운영 계획이나 독자를 생성하지 않았다.
 - 새로운 전용 회원이 필요하면 기존 CMS의 계정 발급 경로에 대한 별도 계획과 명시 지시가 필요하다.

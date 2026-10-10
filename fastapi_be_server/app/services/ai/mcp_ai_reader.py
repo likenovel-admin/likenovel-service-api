@@ -150,6 +150,8 @@ async def plan(owner: str, count: int, starts_on: str, duration_days: int,
         or preview.get("requested_count") != count
     ):
         raise ValueError("CMS dry-run count/period does not match the request")
+    for item in selected:
+        item["activity_pattern"]["auto_start_schedule_start_date"] = starts_on
     payload = {
         "kind": "ai-reader", "mode": mode, "request": req.model_dump(mode="json"),
         "preview": preview, "state_hash": _digest(before),
@@ -221,6 +223,17 @@ async def _verify_applied(db, record):
     return {"active_count": len(rows), "schedules": schedules}
 
 
+async def _apply_start_boundary(db, record):
+    await db.execute(text("""
+        UPDATE tb_ai_reader_agent
+        SET activity_pattern_json=:pattern, updated_date=current_timestamp
+        WHERE agent_key=:agent_key AND status='active'
+    """), [
+        {"agent_key": item["agent_key"], "pattern": json.dumps(item["activity_pattern"], ensure_ascii=False)}
+        for item in record["preview"]["preview"]
+    ])
+
+
 async def apply(owner: str, plan_id: str, *, authorized_plan_hash: str | None = None) -> dict:
     """The OAuth wrapper must supply a hash authorized by a direct user command.
 
@@ -259,7 +272,12 @@ async def apply(owner: str, plan_id: str, *, authorized_plan_hash: str | None = 
                 # A durable intent remains on exceptions. Retrying never repeats
                 # effects after an uncertain commit/response or process crash.
                 result = _clean(await getattr(cms, MODES[record["mode"]][1])(req_body=req, db=db))
+                if result.get("applied") is not True:
+                    raise ValueError("CMS did not confirm the AI-reader apply contract")
+                await _apply_start_boundary(db, record)
                 verification = await _verify_applied(db, record)
+                # Persist the boundary update in the session's savepoint.
+                await db.commit()
     store.save(operation_id, owner, "completed", {
         **intent, "result": result, "readback": verification,
     })

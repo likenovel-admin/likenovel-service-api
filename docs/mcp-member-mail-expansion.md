@@ -27,6 +27,8 @@
 - 기능 연결은 기존 구좌 자동허가에 포함되지 않는다. 회원 메일은 직접 실행 지시 또는 구체적 계획 승인에만 의존하며 자율 제안으로 실행하지 않는다.
 - `member_mail_enabled=true`와 `member_mail_service_account_file=<WAS private credential path>`는 보안 검토·정확한 서버 credential 연결 이후에만 설정한다. 현재 두 설정이 없으면 명시적으로 disabled이다. Windows credential을 채팅/저장소에 복사하지 않는다.
 - `capability_status()`의 configured/enabled는 설정 유무이고 `runtime_connection_verified=false`는 실제 인증 미검증을 뜻한다. 설정만 보고 연결 성공으로 보고하지 않는다.
+- WAS key 설치 후 발송 없는 검증은 `await WorkspaceAdminGmail(config["member_mail_service_account_file"]).verify_connection()`으로 수행한다. 실제 DWD token exchange와 `GET /users/me/profile`을 실행하여 `emailAddress`가 고정 admin과 일치해야 한다. 성공은 프로필 조회·인증만 입증하며 발송 결과까지 입증하지 않는다. `gmail.readonly`와 `gmail.compose`를 함께 요청하므로 DWD에 두 scope 모두 승인되어 있어야 한다.
+- 현재 500명 limit는 단일 캠페인 제한이다. 500명 넘는 exact audience는 전체 대상을 한 번 고정·dedupe한 batch manifest, 공통 승인 hash, 순서대로 최대 500명씩 나뉜 자식 receipt가 필요하다. batch 전체+각 자식에 동일한 발신자/본문을 bind하고 완료된 자식은 건너뛰며 uncertain 자식에서 정지해야 한다. 매번 회원 필터를 재조회해 페이지를 나누면 대상 변동·중복 위험이 있으므로 금지한다. 이 serial batch 구현은 현재 모듈에 포함되지 않았다.
 - 일반 서비스 공지는 프로모션 내용을 담지 않는 실제 운영 공지로 한정한다. 프로모션 메일은 `marketing` 목적을 써서 수신동의를 확인한다.
 - 적극적 제안/알림은 캠페인 계획·부족한 조건·대상 변경·실패/불명확한 결과를 Dot에 보고하는 별도 흐름으로 연결한다. 준비 모듈은 자율 제안을 승인으로 승격하지 않는다.
 - Gmail timeout/readback mismatch는 실패/미확인 알림을 만들고 정확한 Sent 검증으로만 해결한다. 무조건 재전송 버튼이나 일반 retry loop에 연결하지 않는다.
@@ -37,4 +39,4 @@
 
 실제 MySQL schema/query 실행, Workspace 서버 인증, Gmail 발송, Dot tool 호출, OAuth 권한 확대, cloud notification은 미검증이다.
 
-Google 공식 계약: [MIME/raw Gmail 발송](https://developers.google.com/workspace/gmail/api/guides/sending), [서비스 계정과 DWD](https://developers.google.com/identity/protocols/oauth2/service-account), [messages.get format](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get).
+Google 공식 계약: [MIME/raw Gmail 발송](https://developers.google.com/workspace/gmail/api/guides/sending), [서비스 계정과 DWD](https://developers.google.com/identity/protocols/oauth2/service-account), [messages.get format](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get), [발송 없는 users.getProfile](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users/getProfile).

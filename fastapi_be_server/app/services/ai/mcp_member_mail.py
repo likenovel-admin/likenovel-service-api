@@ -284,6 +284,16 @@ class WorkspaceAdminGmail:
     def __init__(self, credential_file: str):
         self.credential_file = credential_file
 
+    async def verify_connection(self) -> dict:
+        """Read-only impersonated-account proof, without sending test mail."""
+        profile = await self.request("/profile")
+        if profile.get("emailAddress", "").lower() != SENDER:
+            raise RuntimeError("Workspace Gmail profile does not match the fixed admin sender")
+        return {
+            "sender": SENDER, "profile_verified": True,
+            "requested_scopes": list(GMAIL_SCOPES), "send_runtime_verified": False,
+        }
+
     async def _token(self, client: AsyncClient) -> str:
         path = Path(self.credential_file)
         if not path.is_absolute() or not path.is_file() \
@@ -307,7 +317,7 @@ class WorkspaceAdminGmail:
 
     async def request(self, path: str, *, raw: bytes | None = None, params: dict | None = None) -> dict:
         # Paths are exclusively generated internally, not MCP input.
-        if path not in {"/messages", "/messages/send"} \
+        if path not in {"/profile", "/messages", "/messages/send"} \
                 and not re.fullmatch(r"/messages/[A-Za-z0-9_-]+", path):
             raise ValueError("Invalid internal Gmail path")
         async with AsyncClient(timeout=30, follow_redirects=False) as client:
