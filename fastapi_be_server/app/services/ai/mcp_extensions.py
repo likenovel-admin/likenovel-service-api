@@ -90,6 +90,7 @@ def register(mcp, identity):
         if ui:
             meta.update({"ui": {"resourceUri": UI_URI}, "openai/outputTemplate": UI_URI})
         if private:
+            meta["securitySchemes"][0]["scopes"] = [READ_OPERATIONS, *sorted({value[0] for value in ACTIONS.values()})]
             meta.update({"ui": {"visibility": ["app"]}, "openai/visibility": "private",
                          "openai/widgetAccessible": True})
         if files:
