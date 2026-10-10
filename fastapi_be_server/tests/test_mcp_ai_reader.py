@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from datetime import date
+from decimal import Decimal
 from unittest.mock import AsyncMock, Mock, patch
 
 from app.services.ai import mcp_ai_reader as ops, mcp_store as store
@@ -161,12 +162,12 @@ class AiReaderTests(unittest.IsolatedAsyncioTestCase):
             await ops._verify_applied(db, record)
 
     async def test_schedule_days_readback_and_changed_budget(self):
-        self.preview["preview"][0]["daily_llm_budget"] = 8
+        self.preview["preview"][0]["daily_llm_budget"] = Decimal("8.000000")
         public = await self.make_plan()
         record = ops._read_plan("admin", public["plan_id"])
         agent = Mock()
         agent.mappings.return_value.all.return_value = [{
-            "agent_key": "reader-1", "status": "active", "daily_llm_budget": 8,
+            "agent_key": "reader-1", "status": "active", "daily_llm_budget": Decimal("8.0000"),
             "activity_pattern_json": json.dumps(record["preview"]["preview"][0]["activity_pattern"]),
         }]
         schedules = Mock()
@@ -184,6 +185,14 @@ class AiReaderTests(unittest.IsolatedAsyncioTestCase):
         db.execute.side_effect = [agent]
         with self.assertRaisesRegex(ValueError, "LLM budget"):
             await ops._verify_applied(db, record)
+
+    async def test_live_decimal_status_serializes_exact_budget_without_email(self):
+        response={"items":[{"email":"private@example.test","daily_llm_budget":Decimal("3.500000")}],"total":1}
+        with patch.object(ops.cms,"list_ai_reader_agents",AsyncMock(return_value=response)):
+            result=await ops.status()
+        self.assertEqual(result["items"][0]["daily_llm_budget"],"3.500000")
+        self.assertNotIn("email",result["items"][0])
+        json.dumps(result)
 
     async def test_inconsistent_cms_preview_period_never_saved(self):
         self.preview["schedule_end_date"] = "2026-10-15"

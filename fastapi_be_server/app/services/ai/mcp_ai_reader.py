@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, text
@@ -39,6 +40,8 @@ STATE_QUERY = """
 def _json(value):
     if isinstance(value, (date, datetime)):
         return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
     raise TypeError(type(value).__name__)
 
 
@@ -198,7 +201,10 @@ async def _verify_applied(db, record):
             pattern = json.loads(pattern)
         if row["status"] != "active" or pattern != expected[row["agent_key"]]:
             raise ValueError("AI-reader status/period readback does not match the plan")
-        if budgets[row["agent_key"]] is not None and row["daily_llm_budget"] != budgets[row["agent_key"]]:
+        if budgets[row["agent_key"]] is not None and (
+            row["daily_llm_budget"] is None or Decimal(str(row["daily_llm_budget"]))
+            != Decimal(str(budgets[row["agent_key"]]))
+        ):
             raise ValueError("AI-reader LLM budget readback does not match the plan")
     result = await db.execute(text("""
         SELECT a.agent_key, COUNT(DISTINCT s.schedule_date) AS scheduled_days,
