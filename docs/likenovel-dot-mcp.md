@@ -49,6 +49,9 @@ Dot, and never returned by tools. The login form enforces its exact Origin,
 CSRF-cookie binding, bounded request bodies and a shared attempt limit. Login
 flows expire in ten minutes, authorization codes in one minute, MCP access in
 five minutes, and rotating refresh tokens in thirty days.
+Refresh rotation keeps already-issued access valid until its existing expiry,
+so concurrent connector requests do not invalidate each other. Refresh tokens
+remain single use, and grant revocation immediately rejects every access token.
 
 Every MCP access validates active identity authorization and the current admin
 role. The grant is bound to the configured resource, subject and client.
