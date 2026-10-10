@@ -277,10 +277,17 @@ async def revoke_public(request):
     if form.get("client_id") != policy.CLIENT_ID:
         return JSONResponse({"error": "invalid_client"}, status_code=400, headers=headers)
     raw_token = form.get("token", "")
-    record = store.get(_key("refresh", raw_token), _owner()) or store.get(_key("access", raw_token), _owner())
-    if record and record["client_id"] == policy.CLIENT_ID and record["resource"] == load_config()["resource"]:
+    record = store.get(_key("access", raw_token), _owner())
+    is_access = record is not None
+    if record is None:
+        record = store.get(_key("refresh", raw_token), _owner())
+    if _valid(record, "active") and record["client_id"] == policy.CLIENT_ID and record["resource"] == load_config()["resource"]:
         grant = store.get(record["grant_id"], _owner())
-        if grant and grant["status"] == "active" and grant["generation"] == record["generation"]:
+        generation_matches = bool(grant and (
+            record["generation"] <= grant["generation"] if is_access
+            else record["generation"] == grant["generation"]
+        ))
+        if grant and grant["status"] == "active" and generation_matches:
             await AdminOAuthProvider().revoke_token(AdminRefreshToken(
                 token=raw_token, client_id=policy.CLIENT_ID, scopes=record["scopes"],
                 grant_id=record["grant_id"], resource=record["resource"], subject=_owner(),
