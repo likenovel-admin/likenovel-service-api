@@ -199,12 +199,23 @@ class SDKTransportTests(unittest.TestCase):
                     self.assertEqual(refreshed.status_code, 200, refreshed.text)
                     self.assertNotEqual(refreshed.json()["refresh_token"], tokens["refresh_token"])
                     self.assertEqual(client.post("/token", data=refresh_request).status_code, 400)
-                    self.assertEqual(client.post("/mcp", headers=headers, json=initialize).status_code, 401)
+                    # Two connector sessions may rotate before an earlier request reaches the server.
+                    original_headers = dict(headers)
+                    self.assertEqual(client.post("/mcp", headers=headers, json=initialize).status_code, 200)
+                    middle_headers = {**headers, "Authorization": "Bearer " + refreshed.json()["access_token"]}
+                    again = client.post("/token", data={**refresh_request,
+                        "refresh_token": refreshed.json()["refresh_token"]})
+                    self.assertEqual(again.status_code, 200)
+                    self.assertEqual(client.post("/mcp", headers=original_headers, json=initialize).status_code, 200)
+                    self.assertEqual(client.post("/mcp", headers=middle_headers, json=initialize).status_code, 200)
+                    self.assertEqual(client.post("/token", data={**refresh_request,
+                        "refresh_token": refreshed.json()["refresh_token"]}).status_code, 400)
+                    refreshed = again
                     headers["Authorization"] = "Bearer " + refreshed.json()["access_token"]
                     self.assertEqual(client.post("/mcp", headers=headers, json=initialize).status_code, 200)
                     access_key = oauth._key("access", refreshed.json()["access_token"])
                     access_record = store.get(access_key, "authorized-admin")
-                    for override in ({"resource": "wrong-resource"}, {"subject": "another-admin"}, {"client_id": "other"}, {"expires_at": 1}):
+                    for override in ({"resource": "wrong-resource"}, {"subject": "another-admin"}, {"client_id": "other"}, {"expires_at": 1}, {"generation": 999}):
                         store.save(access_key, "authorized-admin", "active", {**access_record, **override})
                         self.assertEqual(client.post("/mcp", headers=headers, json=initialize).status_code, 401)
                     store.save(access_key, "authorized-admin", "active", access_record)
@@ -218,6 +229,8 @@ class SDKTransportTests(unittest.TestCase):
                             "token": refreshed.json()["refresh_token"], "token_type_hint": "refresh_token"})
                         self.assertEqual(revoke.status_code, 200, revoke.text)
                     self.assertEqual(client.post("/mcp", headers=headers, json=initialize).status_code, 401)
+                    self.assertEqual(client.post("/mcp", headers=original_headers, json=initialize).status_code, 401)
+                    self.assertEqual(client.post("/mcp", headers=middle_headers, json=initialize).status_code, 401)
 
 
 if __name__ == "__main__":

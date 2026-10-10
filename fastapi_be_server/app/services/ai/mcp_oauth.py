@@ -213,7 +213,7 @@ class AdminOAuthProvider:
                 or record["subject"] != _owner() or record["client_id"] != policy.CLIENT_ID:
             return None
         grant = store.get(record["grant_id"], _owner())
-        if not grant or grant["status"] != "active" or grant["generation"] != record["generation"]:
+        if not grant or grant["status"] != "active" or record["generation"] > grant["generation"]:
             return None
         try:
             subject, user_id = await _verify_admin(_decrypt(grant["kc_access"]))
