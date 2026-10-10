@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from fastapi import APIRouter
 import app.routers as routers_pkg
+from app import mcp_server
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,11 @@ async def lifespan(app: FastAPI):
         await run_auto_migrations()
     except Exception as e:
         logger.error(f"[auto_migrate] 초기화 실패 (앱은 계속 실행): {e}")
-    yield
+    if mcp_server.mcp is not None:
+        async with mcp_server.mcp.session_manager.run():
+            yield
+    else:
+        yield
     # shutdown
 
 
@@ -255,3 +260,9 @@ auto_include_routers(be_app)
 @be_app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# Register last so existing API routes retain precedence. Child lifespan is
+# managed above; stateless SDK transport is safe across gunicorn workers.
+if mcp_server.http_app is not None:
+    be_app.mount("/", mcp_server.http_app)
