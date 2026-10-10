@@ -65,7 +65,7 @@ class CPAuthTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn("관리자 계정은 연결할 수 없습니다", page.text)
         self.assertIn("frame-ancestors 'none'", page.headers["content-security-policy"])
-        self.assertEqual(page.headers["referrer-policy"], "no-referrer")
+        self.assertEqual(page.headers["referrer-policy"], "same-origin")
         flow = parse_qs(urlsplit(begun["login_url"]).query)["flow"][0]
         csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
         return {"flow": flow, "csrf": csrf, "username": "cp@example.test", "password": "test-only"}
@@ -184,8 +184,3 @@ class CPAuthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-class CPHeaderRegressionTests(unittest.TestCase):
-    def test_form_keeps_same_origin_for_chromium_post(self):
-        from app.services.ai import mcp_cp_auth
-        self.assertEqual(mcp_cp_auth.HEADERS["Referrer-Policy"], "same-origin")
