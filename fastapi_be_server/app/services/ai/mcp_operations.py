@@ -6,7 +6,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import text, bindparam
@@ -20,6 +20,7 @@ from app.services.ai.mcp_config import load as load_config
 
 logger = logging.getLogger(__name__)
 _tasks: set[asyncio.Task] = set()
+DIRECT_COOLDOWN_DAYS = 7
 
 SINGLE_QUERY = """
     SELECT single_slot_id, slot_key, slot_name, slot_order, product_id,
@@ -62,6 +63,68 @@ async def single_rows(db, lock=False):
     return _clean([dict(row) for row in result.mappings().all()])
 
 
+def _direct_cooldown(owner: str, current: list[dict], cycle_date: date) -> dict:
+    # A work becomes eligible again on added_date + 7 KST calendar days.
+    first_date = cycle_date - timedelta(days=DIRECT_COOLDOWN_DAYS - 1)
+    with store.connection() as db:
+        rows = db.execute(
+            """SELECT job_id,payload FROM receipts
+               WHERE owner=? AND status='completed' AND job_id>=? AND job_id<=?
+               ORDER BY job_id LIMIT 8""",
+            (owner, f"direct:{first_date.isoformat()}", f"direct:{cycle_date.isoformat()}"),
+        ).fetchall()
+    if len(rows) > DIRECT_COOLDOWN_DAYS:
+        raise ValueError("Direct cooldown history is inconsistent; nothing was written")
+    added_at = {}
+    for job_id, raw in rows:
+        try:
+            added_date = date.fromisoformat(job_id.removeprefix("direct:"))
+            payload = json.loads(raw)
+            if job_id != f"direct:{added_date.isoformat()}" or payload["kind"] != "direct":
+                raise ValueError("Invalid direct receipt")
+            before, after = payload["before"], payload["after"]
+            if not isinstance(before, list) or not isinstance(after, list) or not before:
+                raise ValueError("Invalid direct receipt slots")
+            before_by_id = {row["slot_id"]: row for row in before}
+            after_by_id = {row["slot_id"]: row for row in after}
+            if (
+                len(before_by_id) != len(before) or len(after_by_id) != len(after)
+                or before_by_id.keys() != after_by_id.keys()
+            ):
+                raise ValueError("Invalid direct receipt slot IDs")
+            for slot_id, old in before_by_id.items():
+                new = after_by_id[slot_id]
+                if (
+                    type(slot_id) is not int or slot_id <= 0
+                    or {k: v for k, v in old.items() if k != "product_ids"}
+                    != {k: v for k, v in new.items() if k != "product_ids"}
+                ):
+                    raise ValueError("Invalid direct receipt metadata")
+                if not isinstance(old["product_ids"], list) or not isinstance(new["product_ids"], list):
+                    raise ValueError("Invalid direct receipt product IDs")
+                old_ids = policy.validate_ids(old["product_ids"]) if old["product_ids"] else []
+                new_ids = policy.validate_ids(new["product_ids"]) if new["product_ids"] else []
+                for product_id in set(new_ids) - set(old_ids):
+                    added_at[product_id] = added_date
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Direct cooldown history is invalid; nothing was written") from exc
+    current_ids = {product_id for row in current for product_id in row["product_ids"]}
+    return {
+        "cooldown_days": DIRECT_COOLDOWN_DAYS,
+        "date_basis": "Asia/Seoul calendar date; eligible on added_date + 7 days",
+        "history_source": "This admin's completed MCP direct receipts",
+        "legacy_local_proposal_history": "unknown; not imported",
+        "recently_added": [
+            {
+                "product_id": product_id, "last_added_date": added_date.isoformat(),
+                "eligible_again_on": (added_date + timedelta(days=DIRECT_COOLDOWN_DAYS)).isoformat(),
+            }
+            for product_id, added_date in sorted(added_at.items())
+        ],
+        "avoid_reproposal_product_ids": sorted(set(added_at) - current_ids),
+    }
+
+
 async def direct_snapshot(owner: str) -> dict:
     async with likenovel_db_session() as db:
         result = await curator.build_scheduled_snapshot(db)
@@ -79,6 +142,7 @@ async def direct_snapshot(owner: str) -> dict:
         standing_authorization=True,
         writes_enabled=load_config().get("writes_enabled", False),
         cadence="Daily 10:00 Asia/Seoul; change only with evidence",
+        rotation_policy=_direct_cooldown(owner, result["slots"], datetime.now(policy.KST).date()),
     )
     return result
 
@@ -113,6 +177,12 @@ async def apply_direct(owner: str, snapshot_id: str, updates: list[dict]) -> dic
             by_slot = {row["slot_id"]: row for row in after}
             for update in updates:
                 by_slot[update["slot_id"]]["product_ids"] = update["product_ids"]
+            cooldown = _direct_cooldown(owner, current, date.fromisoformat(job_id.split(":")[1]))
+            added_ids = {
+                product_id for row in after for product_id in row["product_ids"]
+            } - {product_id for row in current for product_id in row["product_ids"]}
+            if added_ids.intersection(cooldown["avoid_reproposal_product_ids"]):
+                raise ValueError("A newly added work is still in its 7-day cooldown; nothing was written")
             result = {"kind": "direct", "before": current, "after": after, "changes": updates}
             # Intent is fsynced before any CMS mutation. A lost response is reconciled by state.
             store.save(job_id, owner, "applying", {"after": after, "result": result})
@@ -180,9 +250,15 @@ async def _generate_single_inner(job_id: str, owner: str):
             except core.CopyValidationError:
                 if attempt == 2:
                     raise
+        generated_at = datetime.now(policy.KST).isoformat()
+        for item in proposals:
+            state["last_proposed_at"][str(item["product_id"])] = generated_at
+        store.save("rotation", owner, "state", {
+            "last_proposed_at": state["last_proposed_at"],
+        })
         store.save(job_id, owner, "ready", {
             "kind": "single", "before": before, "candidates": proposals,
-            "generated_at": datetime.now(policy.KST).isoformat(),
+            "generated_at": generated_at,
             "provider": "openrouter", "model": core.OPENROUTER_MODEL,
             "attempts": attempt, "rejected_covers": rejected[:20],
         })

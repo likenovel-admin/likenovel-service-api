@@ -103,10 +103,20 @@ single-slot write is performed by the MCP module.
 
 The copy core was migrated from the existing local single-slot job. It preserves
 paid/all-ages/ongoing/public eligibility, real CDN-cover fingerprints and image
-checks, rotation ranking, Gemini completion checks, exact source evidence, and
+checks, recent-repeat exclusion and random rotation, Gemini completion checks, exact source evidence, and
 two-line 8–24-character copy validation. Existing OpenRouter credentials are
 read from the backend environment; credentials are never returned to the Dot.
 Carry over the existing `last_proposed_at` state to the rotation state file once.
+
+Publication age, views and bookmarks do not determine the single-slot ranking.
+Candidates shown or proposed in the preceding seven days are excluded, and all
+remaining works are shuffled equally. A validated Gemini proposal is recorded
+before `ready`, so failure to apply does not lose its cooldown. Do not backfill
+an insufficient set with recent works. Direct snapshots expose seven KST calendar
+days of newly added works from this administrator's completed MCP receipts; a
+fresh apply rejects re-adding a recent work absent from all current slots.
+Keeping current works is not a new recommendation. Legacy unexecuted local direct
+proposals remain unknown; Dot notes must also track proposals it only discussed.
 
 Generation is asynchronous within the API process and saves its completed result
 before apply. A process restart during generation can leave a `generating`
@@ -126,17 +136,29 @@ Do not clear an uncertain `applying` receipt and blindly rerun a write.
 5. Create and install the personal ChatGPT MCP plugin with its provided client
    ID, exact resource URL and scopes. Complete any required one-time security
    authorization. Configure automatic execution of these specific tools.
-6. Ask the user's Dot to save both cloud schedules and verify them in Scheduled.
-   A chat acknowledgment alone is insufficient.
-7. Enable writes, perform a scoped end-to-end run when due, verify committed and
-   public results, and verify the report actually arrives in the Dot.
-8. Only then pause old local automation `10` and
-   `main-single-slot-paid-proposals`, preserving their prompts and state.
+6. Ask the user's Dot to save both recurring operator schedules and the daily
+   briefing through its cloud scheduler. Re-read exact IDs, timezone, schedule and
+   enabled state through its saved-automation list. A chat acknowledgment alone
+   is insufficient. Dot-owned schedules may be listed separately from the
+   standalone Scheduled UI; do not duplicate across these stores.
+7. Confirm an actual read-only scheduled wake and report in Dot. Enable writes
+   only after authenticated reads, saved schedules and report delivery are
+   verified. Do not force CMS writes outside the approved cadence. The first
+   natural apply remains pending until due and must be reported as such.
+8. Pause old local automation `10` and `main-single-slot-paid-proposals` after
+   these setup gates, preserving their prompts/state. At the first natural
+   operator run, verify committed and public results separately.
 
 Reports must distinguish committed state from public exposure and include actual
 titles, removed/added works, positions and the resulting single-slot copy.
-Notify on meaningful changes, completion, failure or required user action.
-Unchanged or non-actionable checks stay quiet.
+Report the daily general-slot result briefly even on unchanged days; report
+single-slot rotations with their actual titles and copy. Proactively suggest
+operational opportunities, upcoming expirations, incomplete banners, failures
+and decisions, using only connected and verified data. Do not repeat a retained
+work as a new proposal. Expanded AI-reader/mail/promotion/banner/paid-conversion
+operations need a direct user command or approval of a concrete plan; standing
+slot authorization does not grant those operations. A specific direct command is
+itself authorization, so do not demand a duplicate confirmation.
 
 Rollback: disable writes, pause the new Dot schedules, disconnect the plugin,
 and resume the preserved local proposal jobs. Keep receipts and prior CMS

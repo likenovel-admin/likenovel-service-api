@@ -12,7 +12,7 @@ import random
 
 import time
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from http.client import HTTPException
 
@@ -348,20 +348,22 @@ def _combined_last_seen(
     return max(present) if present else None
 
 def rank_candidates(
-    candidates: Iterable[dict[str, Any]], state: dict[str, Any]
+    candidates: Iterable[dict[str, Any]], state: dict[str, Any],
+    *, now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     proposed_at = state["last_proposed_at"]
-    ranked = list(candidates)
-    # Stable sorting preserves a random order within each opportunity-day tier.
-    random.shuffle(ranked)
-
-    def key(candidate: dict[str, Any]):
+    current = now if now is not None else datetime.now(KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    cutoff = current - timedelta(days=7)
+    ranked = []
+    for candidate in candidates:
         last_seen = _combined_last_seen(candidate, proposed_at)
-        never_seen = candidate["history_count"] == 0 and last_seen is None
-        last_seen_day = last_seen.astimezone(KST).date().toordinal() if last_seen else 0
-        return (0 if never_seen else 1, last_seen_day)
-
-    return sorted(ranked, key=key)
+        if last_seen is None or last_seen <= cutoff:
+            ranked.append(candidate)
+    # All cooldown-eligible works have equal opportunity, regardless of age or views.
+    random.shuffle(ranked)
+    return ranked
 
 def cover_is_eligible(metadata: dict[str, Any]) -> tuple[bool, str | None]:
     sha256 = str(metadata.get("sha256") or "").lower()
