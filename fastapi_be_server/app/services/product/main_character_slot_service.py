@@ -661,7 +661,23 @@ async def _ensure_character_slot_selection_eligible(
     product_id: int,
     character_scope_key: str,
     db: AsyncSession,
+    for_image_upload: bool = False,
 ) -> str:
+    if for_image_upload:
+        # Image registration follows the public chat catalog, which also includes
+        # major characters outside the curated main-slot roster.
+        catalog = await _load_public_character_catalog_base(
+            adult_yn="Y", db=db, product_ids=[product_id],
+        )
+        selected = next((item for item in catalog if
+            int(item["productId"]) == product_id
+            and item["characterScopeKey"] == character_scope_key), None)
+        if selected is None:
+            raise CustomResponseException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="공개 캐릭터 목록에 사용할 수 없는 인물입니다.",
+            )
+        return selected["characterName"]
     roster = await _load_eligible_main_character_roster(product_id, db)
     selected = next(
         (item for item in roster if item["scopeKey"] == character_scope_key),
@@ -1693,10 +1709,20 @@ async def _load_public_character_catalog_base(
     *,
     adult_yn: str,
     db: AsyncSession,
+    product_ids: list[int] | None = None,
 ) -> list[dict]:
+    if product_ids is not None and not product_ids:
+        return []
+    product_query = text(build_public_character_catalog_query(
+        restrict_to_product_ids=product_ids is not None,
+    ))
+    params = {"adult_yn": adult_yn}
+    if product_ids is not None:
+        product_query = product_query.bindparams(bindparam("product_ids", expanding=True))
+        params["product_ids"] = product_ids
     result = await db.execute(
-        text(build_public_character_catalog_query()),
-        {"adult_yn": adult_yn},
+        product_query,
+        params,
     )
     product_rows = [dict(row) for row in result.mappings().all()]
     product_ids = sorted(
@@ -2594,6 +2620,7 @@ async def _validated_character_slot_params(
         product_id=req_body.product_id,
         character_scope_key=req_body.character_scope_key,
         db=db,
+        for_image_upload=req_body.character_image_file_id is not None,
     )
     if req_body.character_image_file_id is not None:
         await _ensure_character_image_file(

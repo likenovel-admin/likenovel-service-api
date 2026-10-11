@@ -2478,6 +2478,67 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
         assert response["results"][0]["productId"] == 1192
         assert response["results"][0]["chatQuality"] == "good"
 
+    async def test_catalog_image_upload_accepts_major_character_outside_main_roster(self):
+        from app.schemas.admin import PostMainCharacterSlotReqBody, PutMainCharacterSlotReqBody
+        from app.services.product import main_character_slot_service as service
+
+        for operation in ("create", "update"):
+            with self.subTest(operation=operation):
+                schema = PostMainCharacterSlotReqBody if operation == "create" else PutMainCharacterSlotReqBody
+                req = schema(product_id=1108, character_scope_key="character:하르샤",
+                             character_image_file_id=10, card_order=1000)
+                db = AsyncMock()
+                db.execute.return_value.lastrowid = 91
+                db.execute.return_value.rowcount = 1
+                with (
+                    patch.object(service, "_load_eligible_main_character_roster", AsyncMock(return_value=[])),
+                    patch.object(service, "_load_public_character_catalog_base", AsyncMock(return_value=[{
+                        "productId": 1108, "characterScopeKey": "character:하르샤",
+                        "characterName": "하르샤", "characterRole": "major_character", "chatQuality": "normal",
+                    }])) as catalog,
+                    patch.object(service, "_ensure_character_image_file", AsyncMock()) as image,
+                ):
+                    if operation == "create":
+                        response = await service.post_admin_main_character_slot(req_body=req, admin_user_id=7, db=db)
+                    else:
+                        response = await service.update_admin_main_character_slot(character_slot_id=91, req_body=req, admin_user_id=7, db=db)
+                self.assertEqual(response, {"result": {"characterSlotId": 91}})
+                catalog.assert_awaited_once_with(adult_yn="Y", db=db, product_ids=[1108])
+                image.assert_awaited_once_with(character_image_file_id=10, db=db)
+                self.assertEqual(db.execute.await_args.args[1]["character_name"], "하르샤")
+
+    async def test_catalog_image_upload_rejects_missing_or_cross_product_character(self):
+        from app.exceptions import CustomResponseException
+        from app.schemas.admin import PostMainCharacterSlotReqBody
+        from app.services.product import main_character_slot_service as service
+
+        for candidates in ([], [{"productId": 999, "characterScopeKey": "character:하르샤", "characterName": "하르샤"}]):
+            db = AsyncMock()
+            req = PostMainCharacterSlotReqBody(product_id=1108, character_scope_key="character:하르샤",
+                                              character_image_file_id=10, card_order=1000)
+            with (
+                patch.object(service, "_load_public_character_catalog_base", AsyncMock(return_value=candidates)),
+                patch.object(service, "_load_eligible_main_character_roster", AsyncMock(return_value=[])),
+                patch.object(service, "_ensure_character_image_file", AsyncMock()) as image,
+            ):
+                with self.assertRaises(CustomResponseException):
+                    await service.post_admin_main_character_slot(req_body=req, admin_user_id=7, db=db)
+            image.assert_not_awaited()
+            db.execute.assert_not_awaited()
+
+    async def test_catalog_image_validation_only_queries_requested_product(self):
+        from app.services.product import main_character_slot_service as service
+
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = []
+        db = AsyncMock()
+        db.execute.return_value = result
+        self.assertEqual(await service._load_public_character_catalog_base(adult_yn="Y", db=db, product_ids=[1108]), [])
+        query, params = db.execute.await_args.args
+        self.assertTrue(query._bindparams["product_ids"].expanding)
+        self.assertEqual(params, {"adult_yn": "Y", "product_ids": [1108]})
+        self.assertIn("p.product_id IN", str(query))
+
     async def test_selection_validation_rejects_scope_missing_from_strict_roster(self):
         from app.exceptions import CustomResponseException
         from app.services.product import main_character_slot_service
@@ -2561,6 +2622,7 @@ class MainCharacterSlotServiceAsyncTest(unittest.IsolatedAsyncioTestCase):
             product_id=1182,
             character_scope_key="character:adelite",
             db=db,
+            for_image_upload=True,
         )
         ensure_image.assert_awaited_once_with(character_image_file_id=10, db=db)
         executed_sql = "\n".join(str(call.args[0]) for call in db.execute.await_args_list)
