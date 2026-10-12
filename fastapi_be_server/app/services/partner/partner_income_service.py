@@ -313,30 +313,24 @@ def _format_won(value) -> str:
 
 
 MYSQL_DUPLICATE_ENTRY = 1062
+# 정산신청 최소 금액: 지난 신청 이후 새로 확정된 정산금(수수료, 원천세 공제 후) 기준
+SPONSORSHIP_SETTLEMENT_REQUEST_MIN_AMOUNT = 50000
 
 
-async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: dict):
-    """
-    작가의 후원금 정산신청을 운영 메일(settings.SUPPORT_EMAIL)로 전달한다.
-    CP 계약 작품을 포함해 후원금은 작가에게만 정산하므로 CP 계정은 신청할 수 없다.
-    신청은 작가별 월 1회이며, tb_ptn_sponsorship_settlement_request의 유니크 키로 보장한다.
-    운영자가 메일을 확인한 뒤 신청 계좌로 직접 입금한다.
-    계좌번호와 주민등록번호는 메일 본문에만 담고 DB나 로그에는 남기지 않는다.
-    """
+def _require_sponsorship_settlement_author(user_data: dict) -> int:
+    # CP 계약 작품을 포함해 후원금은 작가에게만 정산하므로 작가 계정만 허용한다.
     if user_data["role"] != "author":
         raise CustomResponseException(
             status_code=status.HTTP_403_FORBIDDEN,
             message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_FORBIDDEN,
         )
-    user_id = int(user_data["user_id"])
+    return int(user_data["user_id"])
 
-    result = await db.execute(
-        text("SELECT u.email FROM tb_user u WHERE u.user_id = :user_id"),
-        {"user_id": user_id},
-    )
-    user_row = result.mappings().first()
-    account_email = (user_row or {}).get("email") or ""
 
+async def _get_sponsorship_settlement_snapshot(
+    db: AsyncSession, user_id: int, request_month: str
+) -> dict:
+    """작가의 작품별 후원/확정 정산액과 지난 신청 이후 새로 확정된 신청 가능 금액을 계산한다."""
     result = await db.execute(
         text("""
             SELECT p.product_id
@@ -370,21 +364,92 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
     )
     products = result.mappings().all()
 
+    result = await db.execute(
+        text("""
+            SELECT COALESCE(MAX(confirmed_final), 0) AS last_confirmed_final
+                 , COALESCE(SUM(request_month = :request_month), 0) AS requested_this_month
+              FROM tb_ptn_sponsorship_settlement_request
+             WHERE user_id = :user_id
+        """),
+        {"user_id": user_id, "request_month": request_month},
+    )
+    history = result.mappings().first() or {}
+
     total_donation = sum(int(row["total_donation"] or 0) for row in products)
-    if total_donation <= 0:
+    confirmed_gross = sum(int(row["confirmed_gross"] or 0) for row in products)
+    confirmed_final = sum(int(round(float(row["confirmed_final"] or 0))) for row in products)
+    last_confirmed_final = int(history.get("last_confirmed_final") or 0)
+    return {
+        "products": products,
+        "total_donation": total_donation,
+        "confirmed_final": confirmed_final,
+        "pending_gross": max(total_donation - confirmed_gross, 0),
+        "last_confirmed_final": last_confirmed_final,
+        "requestable_amount": max(confirmed_final - last_confirmed_final, 0),
+        "requested_this_month": int(history.get("requested_this_month") or 0) > 0,
+    }
+
+
+async def get_sponsorship_settlement_eligibility(db: AsyncSession, user_data: dict):
+    """후원금 정산신청 버튼 활성화 여부와 안내에 필요한 금액을 돌려준다."""
+    user_id = _require_sponsorship_settlement_author(user_data)
+    snapshot = await _get_sponsorship_settlement_snapshot(
+        db, user_id, datetime.now().strftime("%Y-%m")
+    )
+    can_request = (
+        not snapshot["requested_this_month"]
+        and snapshot["requestable_amount"] >= SPONSORSHIP_SETTLEMENT_REQUEST_MIN_AMOUNT
+    )
+    return {
+        "data": {
+            "min_amount": SPONSORSHIP_SETTLEMENT_REQUEST_MIN_AMOUNT,
+            "requestable_amount": snapshot["requestable_amount"],
+            "confirmed_final": snapshot["confirmed_final"],
+            "requested_this_month": snapshot["requested_this_month"],
+            "can_request": can_request,
+        }
+    }
+
+
+async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: dict):
+    """
+    작가의 후원금 정산신청을 운영 메일(settings.SUPPORT_EMAIL)로 전달한다.
+    CP 계약 작품을 포함해 후원금은 작가에게만 정산하므로 CP 계정은 신청할 수 없다.
+    신청은 작가별 월 1회이며, tb_ptn_sponsorship_settlement_request의 유니크 키로 보장한다.
+    지난 신청 이후 새로 확정된 정산금이 최소 금액 이상일 때만 신청할 수 있다.
+    운영자가 메일을 확인한 뒤 신청 계좌로 직접 입금한다.
+    계좌번호와 주민등록번호는 메일 본문에만 담고 DB나 로그에는 남기지 않는다.
+    """
+    user_id = _require_sponsorship_settlement_author(user_data)
+
+    result = await db.execute(
+        text("SELECT u.email FROM tb_user u WHERE u.user_id = :user_id"),
+        {"user_id": user_id},
+    )
+    user_row = result.mappings().first()
+    account_email = (user_row or {}).get("email") or ""
+
+    now = datetime.now()
+    requested_at = now.strftime("%Y-%m-%d %H:%M")
+    request_month = now.strftime("%Y-%m")
+    snapshot = await _get_sponsorship_settlement_snapshot(db, user_id, request_month)
+    products = snapshot["products"]
+
+    if snapshot["total_donation"] <= 0:
         raise CustomResponseException(
             status_code=status.HTTP_400_BAD_REQUEST,
             message=ErrorMessages.NO_SPONSORSHIP_TO_SETTLE,
         )
-    confirmed_gross = sum(int(row["confirmed_gross"] or 0) for row in products)
-    confirmed_final = sum(int(round(float(row["confirmed_final"] or 0))) for row in products)
-    pending_gross = max(total_donation - confirmed_gross, 0)
-
-    author_names = sorted({row["author_name"] for row in products if row["author_name"]})
-    requester_label = ", ".join(author_names) or f"user_id {user_id}"
-    now = datetime.now()
-    requested_at = now.strftime("%Y-%m-%d %H:%M")
-    request_month = now.strftime("%Y-%m")
+    if snapshot["requested_this_month"]:
+        raise CustomResponseException(
+            status_code=status.HTTP_409_CONFLICT,
+            message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_ALREADY_THIS_MONTH,
+        )
+    if snapshot["requestable_amount"] < SPONSORSHIP_SETTLEMENT_REQUEST_MIN_AMOUNT:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_BELOW_MIN_AMOUNT,
+        )
 
     # 메일 발송 전에 이번 달 신청 자리를 먼저 확보한다. 동시 요청은 유니크 키에서 한 건만 통과한다.
     try:
@@ -397,8 +462,8 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
             {
                 "user_id": user_id,
                 "request_month": request_month,
-                "total_donation": total_donation,
-                "confirmed_final": confirmed_final,
+                "total_donation": snapshot["total_donation"],
+                "confirmed_final": snapshot["confirmed_final"],
             },
         )
         request_id = int(result.lastrowid)
@@ -411,6 +476,9 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
                 message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_ALREADY_THIS_MONTH,
             )
         raise
+
+    author_names = sorted({row["author_name"] for row in products if row["author_name"]})
+    requester_label = ", ".join(author_names) or f"user_id {user_id}"
 
     product_rows_html = "".join(
         "<tr>"
@@ -427,6 +495,8 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
         f"<p><strong>신청자:</strong> {escape(requester_label)} (작가, user_id {user_id})</p>"
         f"<p><strong>계정 이메일:</strong> {escape(account_email)}</p>"
         f"<p><strong>신청 시각:</strong> {requested_at}</p>"
+        f"<p><strong>이번 신청 금액:</strong> {_format_won(snapshot['requestable_amount'])}"
+        " (지난 신청 이후 새로 확정된 정산금, 수수료 10%와 원천징수 3.3% 공제 후)</p>"
         "<h3>입금 계좌 및 원천징수 정보</h3>"
         f"<p><strong>예금주:</strong> {escape(req_body.account_holder)}</p>"
         f"<p><strong>은행:</strong> {escape(req_body.bank_name)}</p>"
@@ -438,12 +508,11 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
         "<th>확정 정산액</th></tr>"
         f"{product_rows_html}"
         "</table>"
-        f"<p><strong>후원 총액:</strong> {_format_won(total_donation)}</p>"
-        f"<p><strong>확정 정산액 누적:</strong> {_format_won(confirmed_final)}"
-        " (수수료 10%, 원천징수 3.3% 공제 후)</p>"
-        f"<p><strong>아직 확정 전 후원액:</strong> {_format_won(pending_gross)}"
-        " (다음 달 1일 월 배치에서 확정)</p>"
-        "<p>확정 정산액은 누적 금액입니다. 이전 입금분을 확인한 뒤 차액을 입금해 주세요.</p>"
+        f"<p><strong>후원 총액:</strong> {_format_won(snapshot['total_donation'])}</p>"
+        f"<p><strong>확정 정산액 누적:</strong> {_format_won(snapshot['confirmed_final'])}</p>"
+        f"<p><strong>지난 신청 시점 확정 정산액 누적:</strong> {_format_won(snapshot['last_confirmed_final'])}</p>"
+        f"<p><strong>아직 확정 전 후원액:</strong> {_format_won(snapshot['pending_gross'])}"
+        " (다음 정산 때 확정)</p>"
     )
     subject = " ".join(
         f"[라이크노벨 후원금 정산신청 #{request_id}] {requester_label} (user_id {user_id}, {request_month})".splitlines()
@@ -470,8 +539,9 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
         "data": {
             "requested": True,
             "request_month": request_month,
-            "total_donation": total_donation,
-            "confirmed_final": confirmed_final,
+            "requestable_amount": snapshot["requestable_amount"],
+            "total_donation": snapshot["total_donation"],
+            "confirmed_final": snapshot["confirmed_final"],
         }
     }
 

@@ -28,9 +28,13 @@ class _Result:
 
 
 class FakeDb:
-    def __init__(self, product_rows, *, duplicate=False):
+    def __init__(self, product_rows, *, duplicate=False, last_confirmed_final=0, requested_this_month=0):
         self.product_rows = product_rows
         self.duplicate = duplicate
+        self.history = {
+            "last_confirmed_final": last_confirmed_final,
+            "requested_this_month": requested_this_month,
+        }
         self.events = []
 
     def sql_calls(self, keyword):
@@ -46,6 +50,8 @@ class FakeDb:
             return _Result(lastrowid=41)
         if "delete from tb_ptn_sponsorship_settlement_request" in lowered:
             return _Result()
+        if "from tb_ptn_sponsorship_settlement_request" in lowered:
+            return _Result([self.history])
         if "from tb_user u" in lowered:
             return _Result([{"email": "author@example.com"}])
         return _Result(self.product_rows)
@@ -112,6 +118,7 @@ class SponsorshipSettlementRequestTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("900101-1234567", html_body)
         self.assertIn("무언마존&lt;無言魔尊&gt;", html_body)
         self.assertIn("52,218", html_body)
+        self.assertIn("이번 신청 금액:</strong> 52,218원", html_body)
 
         (insert_sql, insert_params), = db.sql_calls("insert into tb_ptn_sponsorship_settlement_request")
         self.assertEqual(insert_params["user_id"], 2269)
@@ -139,6 +146,54 @@ class SponsorshipSettlementRequestTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIn("rollback", [kind for kind, _, _ in db.events])
         send_email.assert_not_awaited()
+
+    async def test_rejects_when_month_already_recorded_before_insert(self):
+        db = FakeDb(PRODUCT_ROWS, requested_this_month=1)
+        send_email = AsyncMock()
+
+        with patch.object(partner_income_service, "send_email", send_email):
+            with self.assertRaises(CustomResponseException) as ctx:
+                await partner_income_service.request_sponsorship_settlement(_body(), db, AUTHOR)
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(db.sql_calls("insert into"), [])
+        send_email.assert_not_awaited()
+
+    async def test_rejects_when_newly_confirmed_amount_is_below_minimum(self):
+        # 누적 52,218원 중 10,000원은 지난 신청에 포함됐으므로 이번 신청 가능 금액은 42,218원이다.
+        db = FakeDb(PRODUCT_ROWS, last_confirmed_final=10000)
+        send_email = AsyncMock()
+
+        with patch.object(partner_income_service, "send_email", send_email):
+            with self.assertRaises(CustomResponseException) as ctx:
+                await partner_income_service.request_sponsorship_settlement(_body(), db, AUTHOR)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("50,000원", ctx.exception.message)
+        self.assertEqual(db.sql_calls("insert into"), [])
+        send_email.assert_not_awaited()
+
+    async def test_eligibility_reports_requestable_amount_and_minimum(self):
+        cases = (
+            ({}, 52218, True),
+            ({"last_confirmed_final": 10000}, 42218, False),
+            ({"requested_this_month": 1}, 52218, False),
+        )
+        for history, requestable, can_request in cases:
+            db = FakeDb(PRODUCT_ROWS, **history)
+            result = await partner_income_service.get_sponsorship_settlement_eligibility(db, AUTHOR)
+            data = result["data"]
+            self.assertEqual(data["min_amount"], 50000, history)
+            self.assertEqual(data["requestable_amount"], requestable, history)
+            self.assertEqual(data["confirmed_final"], 52218, history)
+            self.assertEqual(data["can_request"], can_request, history)
+
+    async def test_eligibility_rejects_cp_account(self):
+        with self.assertRaises(CustomResponseException) as ctx:
+            await partner_income_service.get_sponsorship_settlement_eligibility(
+                FakeDb(PRODUCT_ROWS), {"user_id": 77, "role": "CP"}
+            )
+        self.assertEqual(ctx.exception.status_code, 403)
 
     async def test_mail_failure_releases_monthly_slot(self):
         db = FakeDb(PRODUCT_ROWS)
