@@ -109,28 +109,8 @@ select a.product_id
    and b.episode_id = c.episode_id
 ;
 
--- 후원 내역 (당일 데이터 삭제 후 재생성)
-delete from tb_ptn_sponsorship_recodes where DATE(created_date) = CURDATE();
-
-insert into tb_ptn_sponsorship_recodes (product_id, title, author_nickname, user_name, donation_price, created_id, updated_id)
-with tmp_product_donation_summary as (
-    select z.product_id
-         , x.user_name
-         , (z.item_price * z.quantity) as donation_price
-      from tb_batch_daily_sales_summary z
-     inner join tb_user x on z.user_id = x.user_id
-     where z.item_type = 'sponsorship'
-)
-select a.product_id
-     , a.title
-     , a.author_nickname
-     , b.user_name
-     , b.donation_price
-     , 0 as created_id
-     , 0 as updated_id
-  from tb_batch_daily_product_info_summary a
- inner join tmp_product_donation_summary b on a.product_id = b.product_id
-;
+-- 후원 내역(tb_ptn_sponsorship_recodes)은 후원 시점에 sponsor_service가 기록한다.
+-- 배치에서 다시 넣으면 같은 후원이 두 번 기록되고, 당일 삭제가 실시간 기록까지 지우므로 다루지 않는다.
 
 -- 기타 수익 내역 (당일 데이터 삭제 후 재생성)
 delete from tb_ptn_income_recodes where DATE(created_date) = CURDATE();
