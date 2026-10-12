@@ -314,20 +314,33 @@ tmp_common_rate3 as (
         max(case when code_key = 'default_settlement_rate' then cast(code_value as decimal(10,4)) * 100 else 0 end) as settlement_rate
     from tb_common_code
     where code_group = 'common_rate' and use_yn = 'Y'
+),
+tmp_income_settlement_target as (
+    select b.product_id
+         , b.item_type
+         , b.device_type
+         , b.sum_income_price
+         , case
+               -- 후원: 수수료 10% (작가 90% 지급, 원천징수 3.3% 별도)
+               when b.item_type = 'sponsorship' then 10
+               -- 기타 수익: 결제 수수료 + 플랫폼 수수료
+               else (c.fee_rate + (100 - c.settlement_rate))
+           end as total_fee_rate
+      from tmp_income_settlement_summary b
+     cross join tmp_common_rate3 c
 )
 select a.product_id
      , b.item_type
      , b.device_type
      , b.sum_income_price
-     , (c.fee_rate + (100 - c.settlement_rate)) as total_fee_rate -- 결제 수수료 + 플랫폼 수수료
-     , round(b.sum_income_price * (100 - (c.fee_rate + (100 - c.settlement_rate))) / 100, 1) as sum_income_price_exclude_fee
+     , b.total_fee_rate
+     , round(b.sum_income_price * (100 - b.total_fee_rate) / 100, 1) as sum_income_price_exclude_fee
      , 3.3 as withholding_tax_rate
-     , round(round(b.sum_income_price * (100 - (c.fee_rate + (100 - c.settlement_rate))) / 100, 1) * 0.967, 1) as sum_income_price_final
+     , round(round(b.sum_income_price * (100 - b.total_fee_rate) / 100, 1) * 0.967, 1) as sum_income_price_final
      , 0 as created_id
      , 0 as updated_id
   from tb_batch_daily_product_info_summary a
- inner join tmp_income_settlement_summary b on a.product_id = b.product_id
- cross join tmp_common_rate3 c
+ inner join tmp_income_settlement_target b on a.product_id = b.product_id
 ;
 
 update tb_cms_batch_job_process a

@@ -128,12 +128,20 @@ async def sponsorship_recodes_list(
     total_count = count_result.mappings().first()["total_count"]
 
     # 실제 데이터 조회
+    # 정산 상태는 후원 건별로 판정한다. 후원일 다음 날 임시 집계에 들어가고,
+    # 그 집계일이 속한 달의 다음 달 1일 월 배치가 정산 행을 만든다.
     query = text(f"""
         select *,
             case
-                when (select count(*) from tb_ptn_income_settlement_temp_summary where product_id = sr.product_id and item_type = 'sponsorship') > 0 then 'uncompleted-settlement'
-                when (select count(*) from tb_ptn_income_settlement where product_id = sr.product_id and item_type = 'sponsorship') > 0 then 'completed-settlement'
-                else 'not-in-settlement'
+                when sr.product_id = 0 then 'not-in-settlement'
+                when exists (
+                    select 1
+                    from tb_ptn_income_settlement s
+                    where s.product_id = sr.product_id
+                      and s.item_type = 'sponsorship'
+                      and s.created_date >= date_add(last_day(date_add(date(sr.created_date), interval 1 day)), interval 1 day)
+                ) then 'completed-settlement'
+                else 'uncompleted-settlement'
             end as settlement_status
         from tb_ptn_sponsorship_recodes sr
         WHERE 1=1 {where}
