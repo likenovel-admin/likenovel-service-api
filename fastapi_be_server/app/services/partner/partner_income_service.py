@@ -313,22 +313,17 @@ def _format_won(value) -> str:
 
 async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: dict):
     """
-    작가/CP의 후원금 정산신청을 운영 메일(settings.SUPPORT_EMAIL)로 전달한다.
+    작가의 후원금 정산신청을 운영 메일(settings.SUPPORT_EMAIL)로 전달한다.
+    CP 계약 작품을 포함해 후원금은 작가에게만 정산하므로 CP 계정은 신청할 수 없다.
     운영자가 메일을 확인한 뒤 신청 계좌로 직접 입금한다.
     계좌 정보는 메일 본문에만 담고 DB나 로그에는 남기지 않는다.
     """
-    role = user_data["role"]
-    if role not in ("author", "CP"):
+    if user_data["role"] != "author":
         raise CustomResponseException(
             status_code=status.HTTP_403_FORBIDDEN,
             message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_FORBIDDEN,
         )
     user_id = int(user_data["user_id"])
-    owner_where = (
-        "p.author_id = :user_id"
-        if role == "author"
-        else "(p.cp_user_id = :user_id OR p.user_id = :user_id)"
-    )
 
     result = await db.execute(
         text("SELECT u.email FROM tb_user u WHERE u.user_id = :user_id"),
@@ -338,7 +333,7 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
     account_email = (user_row or {}).get("email") or ""
 
     result = await db.execute(
-        text(f"""
+        text("""
             SELECT p.product_id
                  , p.title
                  , p.author_name
@@ -362,7 +357,7 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
                      WHERE item_type = 'sponsorship'
                      GROUP BY product_id
               ) s ON s.product_id = p.product_id
-             WHERE {owner_where}
+             WHERE p.author_id = :user_id
                AND (d.total_donation > 0 OR s.confirmed_final > 0)
              ORDER BY p.product_id
         """),
@@ -382,7 +377,6 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
 
     author_names = sorted({row["author_name"] for row in products if row["author_name"]})
     requester_label = ", ".join(author_names) or f"user_id {user_id}"
-    role_label = "작가" if role == "author" else "CP"
     requested_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     product_rows_html = "".join(
@@ -397,7 +391,7 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
     )
     html_body = (
         "<h2>후원금 정산신청</h2>"
-        f"<p><strong>신청자:</strong> {escape(requester_label)} ({role_label}, user_id {user_id})</p>"
+        f"<p><strong>신청자:</strong> {escape(requester_label)} (작가, user_id {user_id})</p>"
         f"<p><strong>계정 이메일:</strong> {escape(account_email)}</p>"
         f"<p><strong>신청 시각:</strong> {requested_at}</p>"
         "<h3>입금 계좌</h3>"
