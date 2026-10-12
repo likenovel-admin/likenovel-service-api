@@ -92,18 +92,6 @@ class SponsorshipSettlementRequestTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("p.author_id = :user_id", product_sql)
         self.assertEqual(product_params, {"user_id": 2269})
 
-    async def test_cp_request_uses_cp_owned_products(self):
-        db = FakeDb(PRODUCT_ROWS)
-
-        with patch.object(partner_income_service, "send_email", AsyncMock()):
-            await partner_income_service.request_sponsorship_settlement(
-                _body(), db, {"user_id": 77, "role": "CP"}
-            )
-
-        product_sql, product_params = db.calls[-1]
-        self.assertIn("p.cp_user_id = :user_id or p.user_id = :user_id", product_sql.lower())
-        self.assertEqual(product_params, {"user_id": 77})
-
     async def test_rejects_request_without_sponsorship(self):
         db = FakeDb([])
         send_email = AsyncMock()
@@ -117,19 +105,20 @@ class SponsorshipSettlementRequestTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         send_email.assert_not_awaited()
 
-    async def test_rejects_admin_account(self):
-        db = FakeDb(PRODUCT_ROWS)
-        send_email = AsyncMock()
+    async def test_rejects_non_author_accounts_including_cp(self):
+        for role in ("CP", "admin"):
+            db = FakeDb(PRODUCT_ROWS)
+            send_email = AsyncMock()
 
-        with patch.object(partner_income_service, "send_email", send_email):
-            with self.assertRaises(CustomResponseException) as ctx:
-                await partner_income_service.request_sponsorship_settlement(
-                    _body(), db, {"user_id": 1, "role": "admin"}
-                )
+            with patch.object(partner_income_service, "send_email", send_email):
+                with self.assertRaises(CustomResponseException) as ctx:
+                    await partner_income_service.request_sponsorship_settlement(
+                        _body(), db, {"user_id": 77, "role": role}
+                    )
 
-        self.assertEqual(ctx.exception.status_code, 403)
-        self.assertEqual(db.calls, [])
-        send_email.assert_not_awaited()
+            self.assertEqual(ctx.exception.status_code, 403, role)
+            self.assertEqual(db.calls, [], role)
+            send_email.assert_not_awaited()
 
     async def test_mail_failure_is_reported_to_requester(self):
         db = FakeDb(PRODUCT_ROWS)
