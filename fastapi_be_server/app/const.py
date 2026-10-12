@@ -568,6 +568,12 @@ class ErrorMessages:
     PAYMENT_FEE_NEGATIVE = "결제 수수료가 0보다 작을 수는 없습니다."
     SETTLEMENT_DATA_CREATION_FAILED = "정산 데이터 생성에 실패했습니다."
     NO_SPONSORSHIP_TO_SETTLE = "정산할 후원 내역이 없습니다."
+    SPONSORSHIP_SETTLEMENT_REQUEST_FORBIDDEN = (
+        "작가 또는 CP 계정만 후원금 정산신청을 할 수 있습니다."
+    )
+    SPONSORSHIP_SETTLEMENT_REQUEST_MAIL_FAILED = (
+        "정산신청 메일 발송에 실패했습니다. 잠시 후 다시 시도해 주세요."
+    )
     SETTLEMENT_FIELDS_REQUIRED = "매출 정보는 유상 정산액, 무상 정산액, 세액 3가지 값이 필요하고, 매출 관리는 정산율, 결제 수수료, 세액 3가지 값이 필요합니다."
     CP_WRITER_SETTLEMENT_POSITIVE = (
         "cp사-작가 정산시 작가의 정산비는 양수로 입력해주세요."

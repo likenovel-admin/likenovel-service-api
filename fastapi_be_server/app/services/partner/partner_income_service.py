@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime
+from html import escape
 from fastapi import status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,8 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.exceptions import CustomResponseException
 from app.utils.query import get_pagination_params
 from app.utils.response import build_paginated_response
+from app.utils.email import send_email
 from app.const import CommonConstants
 from app.const import ErrorMessages
+from app.const import settings
 
 logger = logging.getLogger("partner_app")  # 커스텀 로거 생성
 
@@ -302,6 +305,140 @@ async def settlement_sponsorship_recodes(product_id: int, db: AsyncSession):
     await db.execute(query, {"product_id": product_id})
 
     return {"results": True}
+
+
+def _format_won(value) -> str:
+    return f"{int(round(float(value or 0))):,}원"
+
+
+async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: dict):
+    """
+    작가/CP의 후원금 정산신청을 운영 메일(settings.SUPPORT_EMAIL)로 전달한다.
+    운영자가 메일을 확인한 뒤 신청 계좌로 직접 입금한다.
+    계좌 정보는 메일 본문에만 담고 DB나 로그에는 남기지 않는다.
+    """
+    role = user_data["role"]
+    if role not in ("author", "CP"):
+        raise CustomResponseException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_FORBIDDEN,
+        )
+    user_id = int(user_data["user_id"])
+    owner_where = (
+        "p.author_id = :user_id"
+        if role == "author"
+        else "(p.cp_user_id = :user_id OR p.user_id = :user_id)"
+    )
+
+    result = await db.execute(
+        text("SELECT u.email FROM tb_user u WHERE u.user_id = :user_id"),
+        {"user_id": user_id},
+    )
+    user_row = result.mappings().first()
+    account_email = (user_row or {}).get("email") or ""
+
+    result = await db.execute(
+        text(f"""
+            SELECT p.product_id
+                 , p.title
+                 , p.author_name
+                 , COALESCE(d.donation_count, 0) AS donation_count
+                 , COALESCE(d.total_donation, 0) AS total_donation
+                 , COALESCE(s.confirmed_gross, 0) AS confirmed_gross
+                 , COALESCE(s.confirmed_final, 0) AS confirmed_final
+              FROM tb_product p
+              LEFT JOIN (
+                    SELECT product_id
+                         , COUNT(*) AS donation_count
+                         , SUM(donation_price) AS total_donation
+                      FROM tb_ptn_sponsorship_recodes
+                     GROUP BY product_id
+              ) d ON d.product_id = p.product_id
+              LEFT JOIN (
+                    SELECT product_id
+                         , SUM(sum_income_price) AS confirmed_gross
+                         , SUM(sum_income_price_final) AS confirmed_final
+                      FROM tb_ptn_income_settlement
+                     WHERE item_type = 'sponsorship'
+                     GROUP BY product_id
+              ) s ON s.product_id = p.product_id
+             WHERE {owner_where}
+               AND (d.total_donation > 0 OR s.confirmed_final > 0)
+             ORDER BY p.product_id
+        """),
+        {"user_id": user_id},
+    )
+    products = result.mappings().all()
+
+    total_donation = sum(int(row["total_donation"] or 0) for row in products)
+    if total_donation <= 0:
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.NO_SPONSORSHIP_TO_SETTLE,
+        )
+    confirmed_gross = sum(int(row["confirmed_gross"] or 0) for row in products)
+    confirmed_final = sum(int(round(float(row["confirmed_final"] or 0))) for row in products)
+    pending_gross = max(total_donation - confirmed_gross, 0)
+
+    author_names = sorted({row["author_name"] for row in products if row["author_name"]})
+    requester_label = ", ".join(author_names) or f"user_id {user_id}"
+    role_label = "작가" if role == "author" else "CP"
+    requested_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    product_rows_html = "".join(
+        "<tr>"
+        f"<td>{int(row['product_id'])}</td>"
+        f"<td>{escape(str(row['title'] or ''))}</td>"
+        f"<td>{int(row['donation_count'] or 0)}건</td>"
+        f"<td>{_format_won(row['total_donation'])}</td>"
+        f"<td>{_format_won(row['confirmed_final'])}</td>"
+        "</tr>"
+        for row in products
+    )
+    html_body = (
+        "<h2>후원금 정산신청</h2>"
+        f"<p><strong>신청자:</strong> {escape(requester_label)} ({role_label}, user_id {user_id})</p>"
+        f"<p><strong>계정 이메일:</strong> {escape(account_email)}</p>"
+        f"<p><strong>신청 시각:</strong> {requested_at}</p>"
+        "<h3>입금 계좌</h3>"
+        f"<p><strong>예금주:</strong> {escape(req_body.account_holder)}</p>"
+        f"<p><strong>은행:</strong> {escape(req_body.bank_name)}</p>"
+        f"<p><strong>계좌번호:</strong> {escape(req_body.account_number)}</p>"
+        "<h3>후원 정산 현황</h3>"
+        "<table border='1' cellpadding='6' cellspacing='0'>"
+        "<tr><th>작품ID</th><th>작품명</th><th>후원 건수</th><th>후원 총액</th>"
+        "<th>확정 정산액</th></tr>"
+        f"{product_rows_html}"
+        "</table>"
+        f"<p><strong>후원 총액:</strong> {_format_won(total_donation)}</p>"
+        f"<p><strong>확정 정산액 누적:</strong> {_format_won(confirmed_final)}"
+        " (수수료 10%, 원천징수 3.3% 공제 후)</p>"
+        f"<p><strong>아직 확정 전 후원액:</strong> {_format_won(pending_gross)}"
+        " (다음 달 1일 월 배치에서 확정)</p>"
+        "<p>확정 정산액은 누적 금액입니다. 이전 입금분을 확인한 뒤 차액을 입금해 주세요.</p>"
+    )
+    subject = " ".join(
+        f"[라이크노벨 후원금 정산신청] {requester_label} (user_id {user_id})".splitlines()
+    )
+
+    try:
+        await send_email(settings.SUPPORT_EMAIL, subject, html_body)
+    except Exception as exc:
+        logger.error(
+            f"sponsorshipSettlementRequestMail: user_id={user_id} error={type(exc).__name__}"
+        )
+        raise CustomResponseException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_MAIL_FAILED,
+        )
+
+    return {
+        "data": {
+            "requested": True,
+            "total_donation": total_donation,
+            "confirmed_final": confirmed_final,
+        }
+    }
 
 
 async def income_recodes_list(

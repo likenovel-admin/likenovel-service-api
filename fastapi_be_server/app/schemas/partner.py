@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 from typing import Optional
 
@@ -102,6 +102,25 @@ class PutPtnProductSalesReqBody(AdminBase):
         default=None, examples=[70], description="정산율"
     )
     fee: Optional[float] = Field(default=None, examples=[30], description="결제 수수료")
+
+
+class PostSponsorshipSettlementRequestReqBody(AdminBase):
+    # 파트너 후원금 정산신청 request body (계좌 정보는 운영 메일로만 전달)
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    account_holder: str = Field(
+        min_length=1, max_length=50, examples=["홍길동"], description="예금주명"
+    )
+    bank_name: str = Field(
+        min_length=1, max_length=50, examples=["국민은행"], description="은행명"
+    )
+    account_number: str = Field(
+        min_length=5,
+        max_length=30,
+        pattern=r"^[0-9-]+$",
+        examples=["123-456-7890"],
+        description="계좌번호 (숫자와 하이픈)",
+    )
 
 
 """
