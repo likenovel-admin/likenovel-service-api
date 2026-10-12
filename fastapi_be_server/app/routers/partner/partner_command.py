@@ -108,3 +108,23 @@ async def settlement_sponsorship_recodes(
         raise e
 
     return await partner_income_service.settlement_sponsorship_recodes(id, db=db)
+
+
+# 계좌 정보가 본문에 담기므로 요청 내용을 기록하는 analysis_logger는 붙이지 않는다.
+@router.post(
+    "/sponsorship-settlement-requests",
+    tags=["파트너 - 후원 및 기타 정산"],
+)
+async def request_sponsorship_settlement(
+    req_body: partner_schema.PostSponsorshipSettlementRequestReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    파트너 - 후원 및 기타 정산 > 후원금 정산신청 (운영 메일 발송)
+    """
+    user_data = await check_user(kc_user_id=user.get("sub"), db=db)
+
+    return await partner_income_service.request_sponsorship_settlement(
+        req_body, db, user_data
+    )
