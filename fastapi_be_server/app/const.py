@@ -577,6 +577,9 @@ class ErrorMessages:
     SPONSORSHIP_SETTLEMENT_REQUEST_ALREADY_THIS_MONTH = (
         "이번 달에는 이미 후원금 정산신청을 하셨습니다. 다음 달에 다시 신청해 주세요."
     )
+    SPONSORSHIP_SETTLEMENT_REQUEST_BELOW_MIN_AMOUNT = (
+        "후원금 정산신청은 신청 가능 금액이 50,000원 이상일 때 할 수 있습니다."
+    )
     SETTLEMENT_FIELDS_REQUIRED = "매출 정보는 유상 정산액, 무상 정산액, 세액 3가지 값이 필요하고, 매출 관리는 정산율, 결제 수수료, 세액 3가지 값이 필요합니다."
     CP_WRITER_SETTLEMENT_POSITIVE = (
         "cp사-작가 정산시 작가의 정산비는 양수로 입력해주세요."

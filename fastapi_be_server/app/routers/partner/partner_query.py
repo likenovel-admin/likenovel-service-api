@@ -3596,6 +3596,25 @@ async def income_settlement_summary(
 
 
 @router.get(
+    "/sponsorship-settlement-requests/eligibility",
+    tags=["파트너 - 후원 및 기타 정산"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def sponsorship_settlement_eligibility(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """
+    파트너 - 후원 및 기타 정산 > 후원금 정산신청 가능 여부 (최소 금액, 월 1회)
+    """
+    user_data = await check_user(kc_user_id=user.get("sub"), db=db)
+
+    return await partner_income_service.get_sponsorship_settlement_eligibility(
+        db, user_data
+    )
+
+
+@router.get(
     "/product-discovery-statistics",
     tags=["파트너 - 발굴 통계"],
     responses={
