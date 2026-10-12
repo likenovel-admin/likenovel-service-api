@@ -1,4 +1,6 @@
-from pydantic import BaseModel, ConfigDict, Field
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime
 from typing import Optional
 
@@ -121,6 +123,20 @@ class PostSponsorshipSettlementRequestReqBody(AdminBase):
         examples=["123-456-7890"],
         description="계좌번호 (숫자와 하이픈)",
     )
+    resident_registration_number: str = Field(
+        min_length=13,
+        max_length=14,
+        examples=["900101-1234567"],
+        description="주민등록번호 (원천징수 신고용, 저장하지 않음)",
+    )
+
+    @field_validator("resident_registration_number")
+    @classmethod
+    def normalize_resident_registration_number(cls, value: str) -> str:
+        match = re.fullmatch(r"(\d{6})-?(\d{7})", value)
+        if not match:
+            raise ValueError("주민등록번호는 숫자 13자리로 입력해 주세요.")
+        return f"{match.group(1)}-{match.group(2)}"
 
 
 """

@@ -3,6 +3,7 @@ from datetime import datetime
 from html import escape
 from fastapi import status
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.exceptions import CustomResponseException
@@ -311,12 +312,16 @@ def _format_won(value) -> str:
     return f"{int(round(float(value or 0))):,}원"
 
 
+MYSQL_DUPLICATE_ENTRY = 1062
+
+
 async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: dict):
     """
     작가의 후원금 정산신청을 운영 메일(settings.SUPPORT_EMAIL)로 전달한다.
     CP 계약 작품을 포함해 후원금은 작가에게만 정산하므로 CP 계정은 신청할 수 없다.
+    신청은 작가별 월 1회이며, tb_ptn_sponsorship_settlement_request의 유니크 키로 보장한다.
     운영자가 메일을 확인한 뒤 신청 계좌로 직접 입금한다.
-    계좌 정보는 메일 본문에만 담고 DB나 로그에는 남기지 않는다.
+    계좌번호와 주민등록번호는 메일 본문에만 담고 DB나 로그에는 남기지 않는다.
     """
     if user_data["role"] != "author":
         raise CustomResponseException(
@@ -377,7 +382,35 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
 
     author_names = sorted({row["author_name"] for row in products if row["author_name"]})
     requester_label = ", ".join(author_names) or f"user_id {user_id}"
-    requested_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now()
+    requested_at = now.strftime("%Y-%m-%d %H:%M")
+    request_month = now.strftime("%Y-%m")
+
+    # 메일 발송 전에 이번 달 신청 자리를 먼저 확보한다. 동시 요청은 유니크 키에서 한 건만 통과한다.
+    try:
+        result = await db.execute(
+            text("""
+                INSERT INTO tb_ptn_sponsorship_settlement_request
+                    (user_id, request_month, total_donation, confirmed_final)
+                VALUES (:user_id, :request_month, :total_donation, :confirmed_final)
+            """),
+            {
+                "user_id": user_id,
+                "request_month": request_month,
+                "total_donation": total_donation,
+                "confirmed_final": confirmed_final,
+            },
+        )
+        request_id = int(result.lastrowid)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if getattr(exc.orig, "args", (None,))[0] == MYSQL_DUPLICATE_ENTRY:
+            raise CustomResponseException(
+                status_code=status.HTTP_409_CONFLICT,
+                message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_ALREADY_THIS_MONTH,
+            )
+        raise
 
     product_rows_html = "".join(
         "<tr>"
@@ -394,10 +427,11 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
         f"<p><strong>신청자:</strong> {escape(requester_label)} (작가, user_id {user_id})</p>"
         f"<p><strong>계정 이메일:</strong> {escape(account_email)}</p>"
         f"<p><strong>신청 시각:</strong> {requested_at}</p>"
-        "<h3>입금 계좌</h3>"
+        "<h3>입금 계좌 및 원천징수 정보</h3>"
         f"<p><strong>예금주:</strong> {escape(req_body.account_holder)}</p>"
         f"<p><strong>은행:</strong> {escape(req_body.bank_name)}</p>"
         f"<p><strong>계좌번호:</strong> {escape(req_body.account_number)}</p>"
+        f"<p><strong>주민등록번호:</strong> {escape(req_body.resident_registration_number)}</p>"
         "<h3>후원 정산 현황</h3>"
         "<table border='1' cellpadding='6' cellspacing='0'>"
         "<tr><th>작품ID</th><th>작품명</th><th>후원 건수</th><th>후원 총액</th>"
@@ -412,15 +446,21 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
         "<p>확정 정산액은 누적 금액입니다. 이전 입금분을 확인한 뒤 차액을 입금해 주세요.</p>"
     )
     subject = " ".join(
-        f"[라이크노벨 후원금 정산신청] {requester_label} (user_id {user_id})".splitlines()
+        f"[라이크노벨 후원금 정산신청 #{request_id}] {requester_label} (user_id {user_id}, {request_month})".splitlines()
     )
 
     try:
         await send_email(settings.SUPPORT_EMAIL, subject, html_body)
     except Exception as exc:
         logger.error(
-            f"sponsorshipSettlementRequestMail: user_id={user_id} error={type(exc).__name__}"
+            f"sponsorshipSettlementRequestMail: request_id={request_id} user_id={user_id} error={type(exc).__name__}"
         )
+        # 메일이 나가지 않았으므로 이번 달 신청 자리를 돌려줘 다시 신청할 수 있게 한다.
+        await db.execute(
+            text("DELETE FROM tb_ptn_sponsorship_settlement_request WHERE id = :id"),
+            {"id": request_id},
+        )
+        await db.commit()
         raise CustomResponseException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             message=ErrorMessages.SPONSORSHIP_SETTLEMENT_REQUEST_MAIL_FAILED,
@@ -429,6 +469,7 @@ async def request_sponsorship_settlement(req_body, db: AsyncSession, user_data: 
     return {
         "data": {
             "requested": True,
+            "request_month": request_month,
             "total_donation": total_donation,
             "confirmed_final": confirmed_final,
         }
