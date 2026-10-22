@@ -28,7 +28,10 @@ from app.services.ai.mcp_config import load as load_config
 
 logger = logging.getLogger(__name__)
 from app.services.ai.mcp_extensions import EXTRA_SCOPES
+from app.services.ai.mcp_event import WRITE_EVENT
 SCOPES = [policy.READ_SCOPE, policy.WRITE_SCOPE, "offline_access", *EXTRA_SCOPES]
+# Event writes require a separately requested grant; preserve existing default consent.
+DEFAULT_SCOPES = [scope for scope in SCOPES if scope != WRITE_EVENT]
 
 
 def _key(kind: str, value: str) -> str:
@@ -115,7 +118,7 @@ class AdminOAuthProvider:
             raise AuthorizeError("invalid_request", "Wrong MCP resource")
         if str(params.redirect_uri) != config["oauth_callback"]:
             raise AuthorizeError("invalid_request", "Unregistered callback")
-        scopes = params.scopes or SCOPES
+        scopes = params.scopes or DEFAULT_SCOPES
         if set(scopes) - set(SCOPES) or not {policy.READ_SCOPE, policy.WRITE_SCOPE}.issubset(scopes):
             raise AuthorizeError("invalid_scope", "Both narrow slot scopes are required")
         if len(params.code_challenge) != 43:
@@ -126,7 +129,7 @@ class AdminOAuthProvider:
         flow = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
         store.save(_key("flow", flow), _owner(), "pending", {
-            "params": params.model_dump(mode="json"),
+            "params": {**params.model_dump(mode="json"), "scopes": scopes},
             "csrf": csrf, "expires_at": time.time() + 600,
         })
         return config["resource"].removesuffix("/mcp") + "/oauth/login?flow=" + flow
@@ -369,7 +372,7 @@ async def login_submit(request):
         code = secrets.token_urlsafe(32)
         params = record["params"]
         store.save(_key("code", code), subject, "ready", {
-            "scopes": params["scopes"] or SCOPES, "expires_at": time.time() + 60,
+            "scopes": params["scopes"] or DEFAULT_SCOPES, "expires_at": time.time() + 60,
             "client_id": policy.CLIENT_ID, "code_challenge": params["code_challenge"],
             "redirect_uri": params["redirect_uri"],
             "redirect_uri_provided_explicitly": params["redirect_uri_provided_explicitly"],
