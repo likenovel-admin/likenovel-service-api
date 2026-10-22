@@ -10,7 +10,7 @@ from mcp.types import ToolAnnotations
 
 from app.services.ai.mcp_config import load as load_config
 from app.services.ai import mcp_operations as operations, mcp_policy as policy, mcp_store as store
-from app.services.ai.mcp_oauth import AdminAccessToken, AdminOAuthProvider, SCOPES, login_page, login_submit, revoke_public
+from app.services.ai.mcp_oauth import AdminAccessToken, AdminOAuthProvider, SCOPES, DEFAULT_SCOPES, login_page, login_submit, revoke_public
 
 
 def identity(write=False) -> AdminAccessToken:
@@ -52,7 +52,7 @@ if config:
             required_scopes=[policy.READ_SCOPE, policy.WRITE_SCOPE],
             validate_token_resource=True,
             client_registration_options=ClientRegistrationOptions(
-                enabled=False, valid_scopes=SCOPES, default_scopes=SCOPES,
+                enabled=False, valid_scopes=SCOPES, default_scopes=DEFAULT_SCOPES,
             ),
             revocation_options=RevocationOptions(enabled=True),
         ),

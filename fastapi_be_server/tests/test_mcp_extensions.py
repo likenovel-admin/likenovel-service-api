@@ -64,7 +64,7 @@ console.log('widget hydration/explicit click/single-use: passed');
         self.assertEqual(apply.meta["ui"]["visibility"],["app"])
         self.assertEqual(apply.meta["openai/visibility"],"private")
         self.assertFalse(apply.annotations.readOnlyHint)
-        self.assertTrue({value[0] for value in ext.ACTIONS.values()}.issubset(apply.meta["securitySchemes"][0]["scopes"]))
+        self.assertTrue({value[0] for kind, value in ext.ACTIONS.items() if kind != "event"}.issubset(apply.meta["securitySchemes"][0]["scopes"]))
         schema=tools["likenovel_prepare_banner"].inputSchema
         filedef=schema["$defs"]["ChatGPTFile"]
         self.assertEqual(set(filedef["required"]),{"download_url","file_id"})

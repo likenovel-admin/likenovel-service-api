@@ -6,17 +6,18 @@ import secrets
 import time
 from datetime import datetime
 from mcp.types import CallToolResult, TextContent, ImageContent
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictInt
 from sqlalchemy import text
 from app.rdb import likenovel_db_session
 from app.services.ai import mcp_store as store
 from app.services.ai.mcp_config import load as load_config
 from app.services.ai import mcp_ai_reader as readers, mcp_member_mail as mail, mcp_promotion as promotion
+from app.services.ai import mcp_event as events
 
 READ_OPERATIONS = "likenovel.mcp.operations.read"
 EXTRA_SCOPES = [READ_OPERATIONS, readers.READ_AI, readers.WRITE_AI, mail.READ_MEMBERS,
                 mail.WRITE_MAIL, promotion.CAMPAIGN_SCOPE, promotion.PAID_APPROVAL_SCOPE,
-                promotion.BANNER_SCOPE, promotion.PAID_CONVERSION_SCOPE]
+                promotion.BANNER_SCOPE, promotion.PAID_CONVERSION_SCOPE, events.WRITE_EVENT]
 UI_URI = "ui://likenovel/operation-approval.html"
 ACTIONS = {
     "ai-reader": (readers.WRITE_AI, "ai_reader_writes_enabled"),
@@ -25,6 +26,7 @@ ACTIONS = {
     "paid-conversion": (promotion.PAID_CONVERSION_SCOPE, "paid_conversion_writes_enabled"),
     "hundred-free": (promotion.CAMPAIGN_SCOPE, "promotion_writes_enabled"),
     "banner": (promotion.BANNER_SCOPE, "banner_writes_enabled"),
+    "event": (events.WRITE_EVENT, "event_writes_enabled"),
 }
 
 
@@ -50,7 +52,8 @@ def approval(owner, kind, plan_id, summary, previews=None):
     store.save(key, owner, "pending", {**frozen, "hash": digest(frozen),
         "nonce_hash": hashlib.sha256(nonce.encode()).hexdigest(), "expires_at": time.time()+900})
     result_id = ({"ai-reader": "ai-reader-apply:" + plan_id.split(":")[-1],
-                  "member-mail": plan_id, "banner": "banner-publish:" + plan_id}.get(kind)
+                  "member-mail": plan_id, "banner": "banner-publish:" + plan_id,
+                  "event": "event-apply:" + plan_id}.get(kind)
                  or "promotion-apply:" + plan_id)
     display = {**summary, "operation": kind, "result_receipt_id": result_id}
     public = {**display, "approval_id": key, "execution_requires_user_approval": True,
@@ -85,12 +88,13 @@ def register(mcp, identity):
         if scope not in admin.scopes:
             raise PermissionError("Reconnect this app to authorize its separate expansion scope")
         return admin
-    def tool(name, scope=READ_OPERATIONS, ui=False, private=False, files=None):
+    def tool(name, scope=READ_OPERATIONS, ui=False, private=False, files=None, execution_scope=None):
         meta = {"securitySchemes": [{"type": "oauth2", "scopes": [scope]}]}
         if ui:
             meta.update({"ui": {"resourceUri": UI_URI}, "openai/outputTemplate": UI_URI})
         if private:
-            meta["securitySchemes"][0]["scopes"] = [READ_OPERATIONS, *sorted({value[0] for value in ACTIONS.values()})]
+            meta["securitySchemes"][0]["scopes"] = [READ_OPERATIONS, *([execution_scope] if execution_scope else
+                sorted({value[0] for kind, value in ACTIONS.items() if kind != "event"}))]
             meta.update({"ui": {"visibility": ["app"]}, "openai/visibility": "private",
                          "openai/widgetAccessible": True})
         if files:
@@ -101,7 +105,7 @@ def register(mcp, identity):
 
     def recent_receipts(owner):
         with store.connection() as db:
-            rows=db.execute("SELECT job_id,status,updated FROM receipts WHERE owner=? AND (job_id LIKE 'ai-reader-apply:%' OR job_id LIKE 'promotion-apply:%' OR job_id LIKE 'banner-publish:%' OR (job_id LIKE 'mail:campaign:%' AND status NOT IN ('prepared','used'))) ORDER BY updated DESC LIMIT 20",(owner,)).fetchall()
+            rows=db.execute("SELECT job_id,status,updated FROM receipts WHERE owner=? AND (job_id LIKE 'ai-reader-apply:%' OR job_id LIKE 'promotion-apply:%' OR job_id LIKE 'banner-publish:%' OR job_id LIKE 'event-apply:%' OR (job_id LIKE 'mail:campaign:%' AND status NOT IN ('prepared','used'))) ORDER BY updated DESC LIMIT 20",(owner,)).fetchall()
         return [{"receipt_id":r[0],"status":r[1],"updated_at":r[2]} for r in rows]
 
     @tool("likenovel_expansion_status")
@@ -218,13 +222,49 @@ def register(mcp, identity):
         return approval(admin.subject,"banner",result["plan_id"],result,
                         previews=banner.get_previews(admin.subject,result["plan_id"]))
 
+    @tool("likenovel_events")
+    async def event_list(type: str="all", page: int=1, count_per_page: int=20) -> dict:
+        """Read the existing CMS event list without modifying events or banners."""
+        require(READ_OPERATIONS)
+        async with likenovel_db_session() as db:
+            return await events.events_list(db,type,page,count_per_page)
+
+    @tool("likenovel_event_detail")
+    async def event_detail(event_id: StrictInt) -> dict:
+        """Read CMS event fields, separate image references and the public detail link."""
+        require(READ_OPERATIONS)
+        async with likenovel_db_session() as db:
+            return await events.event_detail(db,event_id)
+
+    @tool("likenovel_paid_open_weeks")
+    async def paid_open_weeks(starts_on: str, ends_before: str) -> dict:
+        """Group actual paid_open_date by Monday-based weeks in Asia/Seoul."""
+        require(READ_OPERATIONS)
+        async with likenovel_db_session() as db:
+            return await events.paid_open_weeks(db,starts_on,ends_before)
+
+    @tool("likenovel_prepare_event", ui=True)
+    async def prepare_event(request: dict, idempotency_key: str, event_id: StrictInt | None=None,
+                            week_start: str | None=None, event_url: str | None=None) -> CallToolResult:
+        """Freeze exact CMS event create/update fields and existing image/product references.
+        Preparation never writes CMS data. Home banner publication is a separate plan.
+        """
+        admin=require(READ_OPERATIONS)
+        async with likenovel_db_session() as db:
+            result=await events.prepare(admin.subject,request,db,idempotency_key=idempotency_key,
+                                       event_id=event_id,week_start=week_start,event_url=event_url)
+        return approval(admin.subject,"event",result["plan_id"],result)
+
     @tool("likenovel_expansion_receipt")
     async def expansion_receipt(receipt_id: str) -> dict:
         admin=require(READ_OPERATIONS)
-        if not re.fullmatch(r"(?:ai-reader-apply:[a-f0-9]{32}|promotion-apply:[a-f0-9-]{36}|mail:campaign:[a-f0-9]{32}|banner-publish:[a-f0-9-]{36})",receipt_id):
+        if not re.fullmatch(r"(?:ai-reader-apply:[a-f0-9]{32}|promotion-apply:[a-f0-9-]{36}|mail:campaign:[a-f0-9]{32}|banner-publish:[a-f0-9-]{36}|event-apply:[a-f0-9-]{36})",receipt_id):
             raise ValueError("Only expansion operation receipts may be read")
         row=store.get(receipt_id,admin.subject)
         if row is None: raise ValueError("Receipt not found")
+        if receipt_id.startswith("event-apply:"):
+            async with likenovel_db_session() as db:
+                return await events.verify_receipt(admin.subject, receipt_id.removeprefix("event-apply:"), db)
         if receipt_id.startswith("banner-publish:"):
             from app.services.ai import mcp_banner as banner
             return await banner.verify_public(admin.subject, receipt_id.removeprefix("banner-publish:"))
@@ -239,6 +279,8 @@ def register(mcp, identity):
         """UI-only. Executes only after the user clicks the exact plan's approval button."""
         admin=identity()
         row=consume_approval(admin.subject,approval_id,nonce)
+        if row["kind"] == "event":
+            raise PermissionError("Use the separately scoped event approval tool")
         scope,flag=ACTIONS[row["kind"]]
         require(scope)
         if load_config().get(flag) is not True:
@@ -267,6 +309,33 @@ def register(mcp, identity):
                 actor,approved_plan_id=row["plan_id"],scopes=admin.scopes,writes_enabled=True,
                 expected_cp_company_name=load_config().get("cp_company_name"))
 
+    @tool("likenovel_execute_approved_event", private=True, execution_scope=events.WRITE_EVENT)
+    async def execute_approved_event(approval_id: str, nonce: str) -> dict:
+        """UI-only. Execute the exact event plan after the human approval button."""
+        admin=identity()
+        row=consume_approval(admin.subject,approval_id,nonce)
+        if row["kind"] != "event":
+            raise PermissionError("Only event approvals are accepted by this tool")
+        if events.WRITE_EVENT not in admin.scopes:
+            raise PermissionError("This event operation requires its separate expansion scope")
+        if load_config().get("event_writes_enabled") is not True:
+            raise PermissionError("This expansion's write capability is disabled")
+        if not store.consume(approval_id,admin.subject,"pending"):
+            raise PermissionError("Approval already used")
+        payload={key:value for key,value in row.items()
+                 if key not in ("job_id","status","updated_at")}
+        try:
+            async with likenovel_db_session() as db:
+                result=await events.apply_plan(admin.subject,row["plan_id"],db,
+                    {"role":"admin","user_id":admin.admin_user_id},
+                    approved_plan_id=row["plan_id"],approved_plan_hash=row["summary"]["plan_hash"],
+                    scopes=admin.scopes,writes_enabled=True)
+        except Exception:
+            store.save(approval_id,admin.subject,"uncertain",payload)
+            raise
+        store.save(approval_id,admin.subject,"executed",{**payload,"result":result})
+        return result
+
     @mcp.resource(UI_URI, mime_type="text/html+skybridge", meta={"openai/widgetDescription":
         "Shows the exact LikeNovel operation for user review. Only a user's explicit approval button executes it."})
     def approval_widget() -> str:
@@ -281,6 +350,7 @@ APPROVAL_HTML = r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta n
 const plan=document.getElementById('plan'),button=document.getElementById('approve'),status=document.getElementById('status');
 let approval=null,submitted=false,summary=null;
 function describe(s){
+ if(s.operation==='event')return '이벤트 '+({create:'생성',update:'수정'}[s.action]||s.action)+'\n'+JSON.stringify(s,null,2);
  if(s.body!==undefined)return ['발신: '+s.sender,'제목: '+s.subject,'대상: '+s.recipient_count+'명 (수신자는 서로 공개되지 않습니다)','대상 조건: '+JSON.stringify(s.filters),'',s.body].join('\n');
  if(s.starts_on)return ['AI 독자 '+s.count+'명','기간: '+s.starts_on+' ~ '+s.ends_on+' (한국시간, '+s.duration_days+'일)','운영: '+({resume:'일시중지 독자 재개',restart:'전체 독자 재설정',bootstrap:'전용 독자 구성'}[s.mode]||s.mode),s.restart_affects_all_existing_agents?'전체 재설정은 기존 '+s.existing_agent_count+'명에도 영향을 줍니다.':'요청한 독자만 구성합니다.'].join('\n');
  const r=s.request||{},p=s.before?.product||{};
@@ -293,7 +363,7 @@ function describe(s){
 function render(){const raw=window.openai?.toolResponseMetadata;const meta=raw?._meta||raw?.mcp_tool_result?._meta||raw?.call_tool_result?._meta||raw;if(!meta?.approval)return;approval=meta.approval;summary=meta.summary;plan.textContent=describe(summary);const images=document.getElementById('images');images.replaceChildren();for(const url of meta.images||[]){if(!/^data:image\/(webp|png|jpeg);base64,/.test(url))continue;const img=document.createElement('img');img.src=url;img.alt='게시 예정 배너 시안';img.style.maxWidth='100%';images.append(img);}button.disabled=submitted;}
 window.addEventListener('openai:set_globals',render);render();
 button.addEventListener('click',async()=>{if(!approval||submitted)return;submitted=true;button.disabled=true;status.textContent='승인된 계획을 실행하고 결과를 확인하고 있습니다.';
-try{const result=await window.openai.callTool('likenovel_execute_approved_expansion',{approval_id:approval.id,nonce:approval.nonce});
+try{const result=await window.openai.callTool(summary?.operation==='event'?'likenovel_execute_approved_event':'likenovel_execute_approved_expansion',{approval_id:approval.id,nonce:approval.nonce});
 status.textContent='실행 응답을 받았습니다. 닷이 실제 적용·노출 결과를 확인하도록 요청합니다.';if(window.openai.sendFollowUpMessage&&summary?.result_receipt_id)await window.openai.sendFollowUpMessage({prompt:'사용자가 방금 실행 계획을 승인했습니다. '+summary.result_receipt_id+' 영수증을 읽기 전용으로 조회해 실제 결과를 한국어로 보고해주세요. 완료 여부를 추정하지 말고 불확실하면 다시 실행하지 마세요.'});}
 catch(error){status.textContent='실행 결과를 확인해야 합니다. 다시 실행하지 말고 닷에 결과 영수증 조회를 요청하세요.';}});
 </script></html>"""
