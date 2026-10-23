@@ -168,14 +168,14 @@ async def paid_open_weeks(db, starts_on, ends_before):
     start, end = _day(starts_on), _day(ends_before)
     if not 0 < (end - start).days <= 93:
         raise ValueError("Use a paid_open_date range of 1..93 days")
-    result = await db.execute(text("""SELECT product_id,title,paid_open_date,price_type,use_yn,status_code
-        FROM tb_product WHERE use_yn='Y' AND paid_open_date >= :start AND paid_open_date < :end
+    result = await db.execute(text("""SELECT product_id,title,paid_open_date,price_type,open_yn,blind_yn,status_code
+        FROM tb_product WHERE open_yn='Y' AND COALESCE(blind_yn,'N')='N' AND paid_open_date >= :start AND paid_open_date < :end
         ORDER BY paid_open_date,product_id"""), {"start":start.isoformat(), "end":end.isoformat()})
     groups = {}
     for raw in result.mappings().all():
         row = dict(raw)
         paid = _paid_at(row["paid_open_date"])
-        if row["use_yn"] != "Y" or not start <= paid.date() < end:
+        if row["open_yn"] != "Y" or row.get("blind_yn") not in (None,"N") or not start <= paid.date() < end:
             continue
         week = (paid.date() - timedelta(days=paid.weekday())).isoformat()
         groups.setdefault(week, []).append({**_clean(row), "paid_open_date":paid.isoformat()})
@@ -189,11 +189,11 @@ async def _references(db, request, *, lock=False):
     products = []
     if ids:
         params = {"p"+str(index):value for index,value in enumerate(ids)}
-        result = await db.execute(text("SELECT product_id,title,paid_open_date,price_type,use_yn,status_code "
+        result = await db.execute(text("SELECT product_id,title,paid_open_date,price_type,open_yn,blind_yn,status_code "
             "FROM tb_product WHERE product_id IN (" + ",".join(":"+key for key in params) + ")"
             " ORDER BY product_id" + (" FOR UPDATE" if lock else "")), params)
         products = _clean([dict(row) for row in result.mappings().all()])
-        if sorted(row["product_id"] for row in products) != ids or any(row["use_yn"] != "Y" for row in products):
+        if sorted(row["product_id"] for row in products) != ids or any(row["open_yn"] != "Y" or row.get("blind_yn") not in (None,"N") for row in products):
             raise ValueError("A referenced product is missing or inactive")
     image_ids = {"thumbnail": request["thumbnail_image_id"], "detail": request["detail_image_id"]}
     params = {"i"+str(index):value for index,value in enumerate(sorted(image_ids.values()))}

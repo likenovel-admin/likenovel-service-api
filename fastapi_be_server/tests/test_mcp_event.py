@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from PIL import Image
+from app.models.product import Product as ProductModel
 
 from app.services.ai import mcp_event as event, mcp_extensions as ext, mcp_store as store
 
@@ -62,7 +63,7 @@ class DB:
     """In-memory external DB boundary; native CMS insert/update code remains real."""
     def __init__(self):
         self.events = {}
-        self.products = {1235: dict(product_id=1235, title="실제 작품", use_yn="Y",
+        self.products = {1235: dict(product_id=1235, title="실제 작품", open_yn="Y", blind_yn="N",
             price_type="paid", status_code="ongoing", paid_open_date=datetime(2026, 10, 8, 10))}
         self.images = {n: dict(file_group_id=n, group_type="user", use_yn="Y", item_use_yn="Y",
             file_name=str(n)+".png", file_org_name=str(n)+".png",
@@ -89,6 +90,11 @@ class DB:
             ids = [value for value in params.values() if type(value) is int]
             return Result([self.images[n] for n in ids if n in self.images])
         if "FROM tb_product" in sql and "FROM tb_event_v2" not in sql:
+            selected = re.search(r"SELECT (.+?) FROM tb_product",sql).group(1)
+            columns = {value.strip().split(".")[-1] for value in selected.split(",")}
+            unknown = columns - set(ProductModel.__table__.columns.keys())
+            if unknown:
+                raise AssertionError("Product query uses fields absent from the real ORM: "+str(sorted(unknown)))
             if "paid_open_date >=" in sql:
                 return Result(list(self.products.values()))
             ids = [value for value in params.values() if type(value) is int]
@@ -174,10 +180,11 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(same_day["request"]["end_date"], "2026-10-05")
 
     async def test_missing_hidden_references_and_week_mismatch_are_rejected(self):
-        for change in ("missing-product", "hidden-product", "missing-image", "hidden-image", "week"):
+        for change in ("missing-product", "hidden-product", "blind-product", "missing-image", "hidden-image", "week"):
             db = self.db
             if change == "missing-product": db.products.clear()
-            if change == "hidden-product": db.products[1235]["use_yn"] = "N"
+            if change == "hidden-product": db.products[1235]["open_yn"] = "N"
+            if change == "blind-product": db.products[1235]["blind_yn"] = "Y"
             if change == "missing-image": db.images.pop(12)
             if change == "hidden-image": db.images[12]["item_use_yn"] = "N"
             if change == "week": db.products[1235]["paid_open_date"] = datetime(2026,10,12)
