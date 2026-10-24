@@ -2385,7 +2385,11 @@ async def _get_websochat_summary_candidates(
         key = f"keyword_{idx}"
         params[key] = f"%{keyword}%"
         score_parts.append(f"CASE WHEN summary_text LIKE :{key} THEN 1 ELSE 0 END")
-    score_sql = " + ".join(score_parts) if score_parts else "0"
+    # Bare score terms are omitted when no keywords match: MySQL parses a bare
+    # "(0)" ORDER BY item as a column ordinal and rejects the query (error 1054).
+    score_expr = " + ".join(score_parts) if score_parts else ""
+    score_match_sql = f"CASE WHEN ({score_expr}) > 0 THEN 0 ELSE 1 END," if score_expr else ""
+    score_order_sql = f"{score_match_sql} ({score_expr}) DESC," if score_expr else ""
 
     resolved_mode, exact_episode_no, range_anchor, limit = _resolve_websochat_summary_mode(
         query_text=query_text,
@@ -2395,14 +2399,11 @@ async def _get_websochat_summary_candidates(
     )
 
     where_sql = ""
-    order_sql = (
-        f"""
-          CASE WHEN ({score_sql}) > 0 THEN 0 ELSE 1 END,
-          ({score_sql}) DESC,
+    order_sql = f"""
+          {score_order_sql}
           episode_to DESC,
           summary_id DESC
         """
-    )
 
     if resolved_mode == "exact":
         resolved_episode_no = await _resolve_websochat_exact_episode_no(
@@ -2423,7 +2424,7 @@ async def _get_websochat_summary_candidates(
           AND episode_to >= :exact_episode_no
         """
         order_sql = f"""
-          CASE WHEN ({score_sql}) > 0 THEN 0 ELSE 1 END,
+          {score_match_sql}
           ABS(episode_to - :exact_episode_no) ASC,
           summary_id DESC
         """
@@ -2433,8 +2434,7 @@ async def _get_websochat_summary_candidates(
           AND episode_to <= :early_upper_bound
         """
         order_sql = f"""
-          CASE WHEN ({score_sql}) > 0 THEN 0 ELSE 1 END,
-          ({score_sql}) DESC,
+          {score_order_sql}
           episode_to ASC,
           summary_id ASC
         """
