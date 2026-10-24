@@ -6517,10 +6517,18 @@ async def _build_websochat_rp_exact_recall_context(
                 score = sum(1 for keyword in keywords if keyword and keyword in chunk_text)
                 if keywords and score <= 0:
                     continue
+                # Score on the full episode text, but carry a match-centered
+                # excerpt: the selection clip below keeps the episode head, so a
+                # raw full text would drop the very passage that scored.
+                excerpt_text = _build_websochat_search_chunk_snippet(
+                    text_value=chunk_text,
+                    keywords=keywords,
+                    query_text=search_query or user_prompt,
+                )
                 prioritized_rows.append(
                     {
                         "episodeNo": episode_no,
-                        "chunkText": chunk_text,
+                        "chunkText": excerpt_text,
                         "matchScore": score,
                     }
                 )
