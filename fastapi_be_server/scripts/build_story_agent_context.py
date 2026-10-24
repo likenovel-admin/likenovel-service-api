@@ -3745,6 +3745,106 @@ def get_episode_character_signals_grounding_error(
     return None
 
 
+def _signal_evidence_item_ok(evidence: dict, source_parts: dict[str, str]) -> bool:
+    quote = str(evidence.get("quote") or "").strip()
+    source = source_parts.get(evidence.get("source_part"), "")
+    return bool(quote) and len(quote) <= 400 and quote in source
+
+
+def _signal_identity_claim_ok(claim: dict, source_parts: dict[str, str]) -> bool:
+    quote = str(claim.get("evidence") or "").strip()
+    return bool(quote) and any(quote in source for source in source_parts.values())
+
+
+def _signal_voice_mode_supported(voice_mode: str, kinds: set[str]) -> bool:
+    # Mirrors get_episode_character_signals_grounding_error; unknown modes are
+    # rejected earlier by the schema contract check and cannot reach here.
+    if voice_mode in {"dialogue", "monologue"}:
+        return voice_mode in kinds
+    if voice_mode == "narration_only":
+        return bool(kinds.intersection({"narrated_action", "narrated_state", "presence", "relation"}))
+    return True
+
+
+def sanitize_episode_character_signals_grounding(
+    payload: dict,
+    *,
+    source_parts: dict[str, str],
+) -> tuple[dict, list[dict]]:
+    """Quarantine invalid characters/evidence instead of rejecting the episode.
+
+    Must be canonically stable: validating an accepted payload again returns
+    the identical content, because attempt receipts replay this validator and
+    require canonical equality. A failed identity claim quarantines the whole
+    character: dropping only the claim can flip the possessed_as ->
+    anonymous_work_role -> generic/named protagonist key in normalization.
+    """
+    characters = list(payload.get("mentioned_characters") or [])
+    kept: list[dict] = []
+    records: list[dict] = []
+    dropped_evidence_items = 0
+    for index, character in enumerate(characters):
+        evidence = list(character.get("evidence") or [])
+        kept_evidence = [item for item in evidence if _signal_evidence_item_ok(item, source_parts)]
+        dropped_evidence_items += len(evidence) - len(kept_evidence)
+        reasons: list[str] = []
+        if any(
+            not _signal_identity_claim_ok(claim, source_parts)
+            for claim in list(character.get("identity_claims") or [])
+        ):
+            reasons.append("identity_claim_evidence")
+        candidate = character
+        if kept_evidence:
+            if len(kept_evidence) != len(evidence):
+                candidate = {**character, "evidence": kept_evidence}
+            kinds = {str(item.get("kind") or "") for item in kept_evidence}
+            if not _signal_voice_mode_supported(str(character.get("voice_mode") or ""), kinds):
+                reasons.append("voice_mode_unsupported")
+        else:
+            reasons.append("no_valid_evidence")
+        if reasons:
+            records.append(
+                {
+                    "index": index,
+                    "display_name": str(character.get("display_name") or ""),
+                    "reasons": reasons,
+                }
+            )
+            continue
+        kept.append(candidate)
+    if not records and dropped_evidence_items == 0:
+        return payload, []
+    sanitized = {**payload, "mentioned_characters": kept}
+    if records:
+        logger.warning(
+            "story_agent_character_signals_quarantine quarantined_characters=%s dropped_evidence_items=%s records=%s",
+            len(records),
+            dropped_evidence_items,
+            json.dumps(records, ensure_ascii=False),
+        )
+    return sanitized, records
+
+
+def validate_episode_character_signals_provider_payload(
+    payload: dict,
+    *,
+    episode_no: int,
+    source_parts: dict[str, str],
+) -> dict:
+    """Request-time contract + grounding gate with per-character quarantine."""
+    error = get_episode_character_signals_contract_error(payload, episode_no=episode_no)
+    if error:
+        raise ValueError(error)
+    sanitized, _records = sanitize_episode_character_signals_grounding(
+        payload, source_parts=source_parts
+    )
+    # An empty character list is a valid "nothing observed" response; only a
+    # non-empty input reduced to zero survivors is a whole-payload rejection.
+    if payload.get("mentioned_characters") and not sanitized.get("mentioned_characters"):
+        raise ValueError("mentioned_characters.quarantined_all")
+    return sanitized
+
+
 def get_stored_character_signals_error(
     payload: object,
     *,
@@ -5595,17 +5695,15 @@ async def request_episode_character_signals_payload(
 ) -> dict:
     user_prompt = build_episode_character_signals_user_prompt(row, summary_text, opening_text)
     episode_no = int(row.get("episode_no") or 0)
+    source_parts = {
+        "episode_summary": summary_text,
+        "episode_source": opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS],
+    }
 
     def validate(payload):
-        error = get_episode_character_signals_contract_error(payload, episode_no=episode_no)
-        if not error:
-            error = get_episode_character_signals_grounding_error(payload, source_parts={
-                "episode_summary": summary_text,
-                "episode_source": opening_text[:EPISODE_SUMMARY_MAX_INPUT_CHARS],
-            })
-        if error:
-            raise ValueError(error)
-        return payload
+        return validate_episode_character_signals_provider_payload(
+            payload, episode_no=episode_no, source_parts=source_parts
+        )
 
     if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
         provider = "anthropic"
