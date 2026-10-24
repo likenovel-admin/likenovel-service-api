@@ -12,6 +12,9 @@ WEBSOCHAT_SCOPE_SUMMARY_LIMIT = 6
 WEBSOCHAT_SCOPE_CHARACTER_LIMIT = 12
 WEBSOCHAT_SCOPE_RELATION_LIMIT = 16
 WEBSOCHAT_SCOPE_HOOK_LIMIT = 8
+# The signal aggregation targets the reader's whole read range; the cap only
+# bounds parse cost for very long works (readers beyond it get the newest window).
+WEBSOCHAT_SCOPE_SIGNAL_SCAN_LIMIT = 100
 WEBSOCHAT_CHARACTER_ENTRY_SCENE_LIMIT = 64
 WEBSOCHAT_CHARACTER_ENTRY_SUMMARY_MAX_CHARS = 1600
 WEBSOCHAT_CHARACTER_ENTRY_SCENE_VALUE_MAX_CHARS = 800
@@ -662,8 +665,11 @@ def _aggregate_scoped_signal_rows(signal_rows: list[dict[str, Any]]) -> tuple[li
                     "relation_episode_count": 0,
                 },
             )
-            current["display_name"] = display_name
-            current["entity_kind"] = entity_kind
+            # Rows arrive newest-first; keep the name from the latest sighting so
+            # older-episode aliases do not overwrite the current display name.
+            if episode_no >= max(current["episode_nos"] or {0}):
+                current["display_name"] = display_name
+                current["entity_kind"] = entity_kind
             for alias in item.get("aliases") or []:
                 alias_text = str(alias).strip()
                 if alias_text:
@@ -791,7 +797,7 @@ async def load_websochat_scope_context(
         {
             "product_id": product_id,
             "read_episode_to": safe_scope,
-            "limit": WEBSOCHAT_SCOPE_SUMMARY_LIMIT,
+            "limit": WEBSOCHAT_SCOPE_SIGNAL_SCAN_LIMIT,
         },
     )
     signal_rows = [dict(row) for row in signal_result.mappings().all()]
