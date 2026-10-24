@@ -156,6 +156,8 @@ class _SessionDb(_Db):
             return _Result([{"episodeFrom": boundary, "episodeTo": boundary, "summaryText": json.dumps(scene)}])
         if "SELECT COUNT(*) AS cnt" in query:
             return _Result([{"cnt": self.used_count}])
+        if "FROM tb_user_event_cashbook" in query:
+            return _Result([])
         if "FROM tb_user_cashbook" in query:
             self.cash_balance_reads += 1
             return _Result([{"balance": 10000}])
@@ -250,7 +252,7 @@ class GroundedCharacterContractTest(unittest.IsolatedAsyncioTestCase):
                      patch.object(websochat_service, "call_websochat_model", new_callable=AsyncMock,
                                   return_value='{"needs_exact_recall":false,"search_query":""}') as recall, \
                      patch.object(websochat_service, "likenovel_db_engine", SimpleNamespace(connect=AsyncMock(return_value=db))), \
-                     patch.object(websochat_service.settings, "GEMINI_API_KEY", "fake-provider-boundary"):
+                     patch.object(websochat_service.settings, "OPENROUTER_API_KEY", "fake-provider-boundary"):
                     await websochat_service.create_session(
                         req_body=PostWebsochatSessionReqBody(product_id=1182, locked_character_scope_key=SCOPE_KEY,
                                                             account_read_episode_to=5),
