@@ -91,10 +91,3 @@ def validate_direct_updates(updates: list[dict], slots: list[dict], candidates: 
             )
             if ids != [item["product_id"] for item in eligible[:len(slot["product_ids"])]]:
                 raise ValueError("Free new slot must preserve capacity and newest-first order")
-        protected = {
-            item["product_id"] for item in candidates
-            if item["title"] == "실명자들 : 소리내는 순간 죽는다"
-            and item.get("exclude_from_recommend_yn") != "Y"
-        }
-        if protected.intersection(slot["product_ids"]) - set(ids):
-            raise ValueError("An explicitly retained work cannot be removed automatically")
