@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 from collections import defaultdict
 
 from fastapi import status
@@ -1789,9 +1790,16 @@ async def get_public_main_character_slots(*, adult_yn: str, db: AsyncSession):
     catalog_items = await read_public_character_catalog_snapshot(
         adult_yn=_normalize_public_character_catalog_adult_yn(adult_yn),
         db=db,
-        limit=AUTO_MAIN_CHARACTER_SLOT_LIMIT,
     )
-    return {"data": catalog_items}
+    selected_items = random.sample(
+        catalog_items, min(AUTO_MAIN_CHARACTER_SLOT_LIMIT, len(catalog_items))
+    )
+    return {
+        "data": [
+            {**item, "cardOrder": order}
+            for order, item in enumerate(selected_items, start=1)
+        ]
+    }
 
 
 async def _load_public_character_catalog_base(

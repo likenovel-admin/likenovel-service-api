@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1186,10 +1187,118 @@ def test_public_home_auto_mode_does_not_build_the_full_catalog_in_request():
     read_snapshot.assert_awaited_once_with(
         adult_yn="N",
         db=db,
-        limit=12,
     )
     assert response == {"data": catalog_items}
     db.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("adult_yn", ["N", "Y"])
+@pytest.mark.parametrize("candidate_count", [0, 5, 12, 134])
+def test_public_home_auto_samples_all_eligible_candidates_without_duplicates(
+    adult_yn, candidate_count
+):
+    from app.services.product import main_character_slot_service
+
+    catalog = [
+        {"characterSlotId": index, "cardOrder": index}
+        for index in range(1, candidate_count + 1)
+    ]
+    original_catalog = [dict(item) for item in catalog]
+    rng = random.Random(7)
+    expected_ids = random.Random(7).sample(
+        list(range(1, candidate_count + 1)), min(12, candidate_count)
+    )
+    db = AsyncMock()
+    with (
+        patch.object(
+            main_character_slot_service,
+            "get_main_character_slot_display_mode",
+            new_callable=AsyncMock,
+            return_value="auto",
+        ),
+        patch.object(
+            main_character_slot_service,
+            "read_public_character_catalog_snapshot",
+            new_callable=AsyncMock,
+            return_value=catalog,
+        ) as read_snapshot,
+        patch("random.sample", side_effect=rng.sample),
+    ):
+        response = asyncio.run(
+            main_character_slot_service.get_public_main_character_slots(
+                adult_yn=adult_yn, db=db
+            )
+        )
+
+    selected = response["data"]
+    assert [item["characterSlotId"] for item in selected] == expected_ids
+    assert len({item["characterSlotId"] for item in selected}) == min(12, candidate_count)
+    assert [item["cardOrder"] for item in selected] == list(range(1, len(selected) + 1))
+    assert catalog == original_catalog
+    read_snapshot.assert_awaited_once_with(adult_yn=adult_yn, db=db)
+    db.execute.assert_not_awaited()
+
+
+def test_public_home_manual_mode_keeps_editor_order_without_sampling():
+    from app.services.product import main_character_slot_service
+
+    manual_response = {"data": [{"characterSlotId": 20}, {"characterSlotId": 3}]}
+    db = AsyncMock()
+    with (
+        patch.object(
+            main_character_slot_service,
+            "get_main_character_slot_display_mode",
+            new_callable=AsyncMock,
+            return_value="manual",
+        ),
+        patch.object(
+            main_character_slot_service,
+            "_get_public_manual_main_character_slots",
+            new_callable=AsyncMock,
+            return_value=manual_response,
+        ) as read_manual,
+        patch.object(
+            main_character_slot_service,
+            "read_public_character_catalog_snapshot",
+            new_callable=AsyncMock,
+        ) as read_snapshot,
+        patch("random.sample") as sample,
+    ):
+        response = asyncio.run(
+            main_character_slot_service.get_public_main_character_slots(
+                adult_yn="N", db=db
+            )
+        )
+
+    assert response == manual_response
+    read_manual.assert_awaited_once_with(adult_yn="N", db=db)
+    read_snapshot.assert_not_awaited()
+    sample.assert_not_called()
+
+
+def test_public_home_http_response_does_not_cache_a_previous_draw():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.routers.common import main_query
+    from app.services.product import main_character_slot_service
+
+    app = FastAPI()
+    app.include_router(main_query.router)
+    app.dependency_overrides[main_query.analysis_logger] = lambda: None
+    app.dependency_overrides[main_query.get_likenovel_db] = lambda: AsyncMock()
+    with patch.object(
+        main_character_slot_service,
+        "get_public_main_character_slots",
+        new_callable=AsyncMock,
+        return_value={"data": []},
+    ) as get_slots:
+        response = TestClient(app).get("/products/main-character-slots?adult_yn=N")
+
+    assert response.status_code == 200
+    assert response.json() == {"data": []}
+    assert response.headers.get("cache-control") == "no-store"
+    assert get_slots.await_args.kwargs["adult_yn"] == "N"
 
 
 def test_main_character_slot_request_schema_enforces_optional_period_contract():
