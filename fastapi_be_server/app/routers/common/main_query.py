@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.rdb import get_likenovel_db
@@ -16,9 +16,11 @@ router = APIRouter()
     dependencies=[Depends(analysis_logger)],
 )
 async def get_main_character_slots(
+    response: Response,
     adult_yn: str = Query("N", description="성인등급 작품 포함 여부 (Y/N)"),
     db: AsyncSession = Depends(get_likenovel_db),
 ):
+    response.headers["Cache-Control"] = "no-store"
     return await main_character_slot_service.get_public_main_character_slots(
         adult_yn=adult_yn,
         db=db,
