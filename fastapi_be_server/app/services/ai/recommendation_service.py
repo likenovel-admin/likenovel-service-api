@@ -19,6 +19,10 @@ import httpx
 
 from app.const import settings, LOGGER_TYPE, ErrorMessages
 from app.exceptions import CustomResponseException
+from app.services.common.ai_model_config import (
+    get_model_binding, has_ai_model_snapshot, load_ai_model_snapshot, use_ai_model_snapshot,
+)
+from app.services.common.ai_model_gateway import post_model_chat_completion_async
 from app.config.log_config import service_error_logger
 from app.schemas.ai_recommendation import MAX_EVENT_PAYLOAD_LENGTH
 
@@ -328,8 +332,38 @@ async def _call_claude(
     *,
     max_tokens: int = 1024,
     fail_on_max_tokens: bool = False,
+    routing_feature_key: str = "recommendation",
 ) -> str:
-    """Anthropic Messages API 호출. httpx로 직접 호출 (추가 패키지 불필요)."""
+    """Preserve native Anthropic until a job pins an OpenAI-compatible override."""
+    binding = get_model_binding(routing_feature_key, default_model=settings.ANTHROPIC_MODEL, default_route="anthropic")
+    if binding.billing_route != "anthropic":
+        structured = routing_feature_key == "recommendation"
+        if structured and binding.billing_route == "hive":
+            raise ValueError("Hive is not enabled for recommendation JSON")
+        payload = {"model": binding.model_id, "max_tokens": max_tokens,
+                   "reasoning": {"effort": "none", "exclude": True},
+                   "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
+        if structured:
+            payload["response_format"] = {"type": "json_object"}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await post_model_chat_completion_async(
+                client, feature_key=routing_feature_key, base_url=settings.OPENROUTER_BASE_URL,
+                api_key=settings.OPENROUTER_API_KEY,
+                headers={"Content-Type": "application/json", "X-Title": "LikeNovel Recommendation"},
+                json=payload, background=False,
+            )
+        if response.status_code != 200:
+            raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, message="AI 서비스 호출에 실패했습니다.")
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices or ((structured or fail_on_max_tokens) and choices[0].get("finish_reason") != "stop"):
+            raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, message="AI 응답이 완성되지 않았습니다.")
+        reply = (choices[0].get("message") or {}).get("content")
+        if not isinstance(reply, str) or not reply.strip():
+            raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, message="AI 서비스 응답이 비어 있습니다.")
+        if structured and not isinstance(_parse_json_from_llm(reply), dict):
+            raise ValueError("recommendation response must be a JSON object")
+        return reply
     if not settings.ANTHROPIC_API_KEY:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -345,7 +379,7 @@ async def _call_claude(
                 "content-type": "application/json",
             },
             json={
-                "model": settings.ANTHROPIC_MODEL,
+                "model": binding.model_id,
                 "max_tokens": max_tokens,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_prompt}],
@@ -1707,6 +1741,10 @@ async def process_onboarding(
     adult_yn: str,
     db: AsyncSession,
 ) -> dict:
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await process_onboarding(kc_user_id, product_ids, moods, hero_tags, world_tone_tags, relation_tags, adult_yn, db)
     user_id = await _get_user_id_by_kc(kc_user_id, db)
     if not user_id:
         raise CustomResponseException(
@@ -3530,6 +3568,10 @@ async def ai_recommend(
     db: AsyncSession,
     context: dict | None = None,
 ) -> dict:
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await ai_recommend(kc_user_id, query_text, preset, exclude_ids, adult_yn, db, context=context)
     normalized_query_text = (query_text or "").strip()
     query_text = normalized_query_text or None
     adult_yn = (adult_yn or "N").upper()
@@ -3597,6 +3639,10 @@ async def ai_chat(
     db: AsyncSession,
 ) -> dict:
     """AI 챗 최소 구현: 프리셋은 프리셋 필터, 자유질문은 히스토리 맥락 반영."""
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await ai_chat(kc_user_id, messages, context, preset, exclude_ids, adult_yn, db)
     normalized_preset = (preset or "").strip() or None
 
     if normalized_preset:
@@ -4752,7 +4798,7 @@ async def _generate_reason(product: dict, profile: dict | None, context: str) ->
 위 정보로 독자에게 이 작품을 추천하는 사유를 작성하세요."""
 
     try:
-        return await _call_claude(system_prompt, user_prompt)
+        return await _call_claude(system_prompt, user_prompt, routing_feature_key="recommendation.answer")
     except Exception:
         return product.get("premise") or product.get("protagonist_desc") or "추천 작품입니다."
 

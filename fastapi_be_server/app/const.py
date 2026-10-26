@@ -2,6 +2,8 @@ from pydantic_settings import BaseSettings
 import os
 from enum import Enum
 
+FLASH_1017_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+
 """
 상수 모음
 @lru_cache는 캐시 초기화와 관련된 운영 이슈가 발생할 수 있어서 제외함
@@ -271,7 +273,7 @@ class Settings(BaseSettings):
         "AI_PROVIDER_HEALTH_OPENROUTER_DEEPSEEK_MODEL",
         os.getenv(
             "STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL",
-            os.getenv("AI_DNA_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"),
+            os.getenv("AI_DNA_OPENROUTER_MODEL", FLASH_1017_MODEL),
         ),
     )
     AI_PROVIDER_HEALTH_TIMEOUT_SECONDS: float = float(

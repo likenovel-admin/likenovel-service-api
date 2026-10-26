@@ -263,6 +263,9 @@ def fake_work_cursor(_conn):
 class FakeResponse:
     def __init__(self, payload):
         self._payload = payload
+        self.status_code = 200
+        self.headers = {}
+        self.extensions = {}
 
     def raise_for_status(self):
         return None
@@ -439,7 +442,7 @@ class EpisodeCharacterSignalsContractTests(IsolatedAsyncioTestCase):
             for name, value in (
                 ("OPENROUTER_API_KEY", "openrouter-key"),
                 ("RP_REASONING_MODEL", ""),
-                ("EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro-0813"),
+                ("EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"),
                 ("DEEPSEEK_OPENROUTER_PROVIDER_ONLY", ""),
             ):
                 stack.enter_context(patch.object(module, name, value))
@@ -3536,7 +3539,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         with patch.object(module, "work_cursor", fake_work_cursor), \
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
              patch.object(module, "RP_REASONING_MODEL", ""), \
              patch.object(module, "fetch_existing_summary", return_value=None), \
              patch.object(module, "request_episode_character_signals_payload", request_mock), \
@@ -3568,7 +3571,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         with patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
              patch.object(module, "RP_REASONING_MODEL", ""), \
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
              patch.object(module.asyncio, "sleep", AsyncMock()) as sleep_mock:
             for _ in range(2):
                 with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "inflight"):
@@ -3824,7 +3827,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "RP_REASONING_MODEL", ""), \
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
              patch.object(module, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"), \
-             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"):
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"):
             payload = await module.request_episode_character_signals_payload(
                 client,
                 row={"episode_id": 1001, "episode_no": 1, "title": "테스트", "episode_title": "1화"},
@@ -3834,7 +3837,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertEqual(payload["mentioned_characters"][0]["display_name"], "백이현")
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["url"], "https://openrouter.ai/api/v1/chat/completions")
-        self.assertEqual(client.calls[0]["json"]["model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(client.calls[0]["json"]["model"], "deepseek/deepseek-v4.1-flash-1017")
         self.assertEqual(client.calls[0]["json"]["max_tokens"], module.EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS)
         response_format = client.calls[0]["json"]["response_format"]
         self.assertEqual(response_format["type"], "json_schema")
@@ -3882,7 +3885,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
                     request=request,
                     json={
                         "id": "openrouter-1",
-                        "model": "deepseek/deepseek-v4-pro",
+                        "model": "deepseek/deepseek-v4.1-flash-1017",
                         "choices": [
                             {
                                 "message": {
@@ -3909,7 +3912,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         with patch.object(module.settings, "ANTHROPIC_API_KEY", "anthropic-key"), \
              patch.object(module, "RP_REASONING_MODEL", "claude-haiku-4-5-20251001"), \
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
              patch.object(module, "_storyctx_usage_connection", object()), \
              patch.object(module, "persist_ai_provider_usage_pymysql", return_value=True) as persist_usage:
             for _ in range(2):
@@ -4060,7 +4063,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         )
 
         with patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
              patch.object(module.asyncio, "sleep", AsyncMock()) as sleep_mock:
             for _ in range(2):
                 with self.assertRaisesRegex(module.CharacterAssetAttemptBlocked, "inflight"):
@@ -4085,7 +4088,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         ):
             module = load_module()
 
-        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL, "deepseek/deepseek-v4-pro-0813")
+        self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL, "deepseek/deepseek-v4.1-flash-1017")
         self.assertEqual(module.EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS, 5000)
         self.assertEqual(module.EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS, 120.0)
         self.assertIn("핵심 장면 2~3개", module.EPISODE_SCENE_EXTRACTION_SYSTEM)
@@ -4102,7 +4105,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(
             module.EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
-            "deepseek/deepseek-v4-pro-0813",
+            "deepseek/deepseek-v4.1-flash-1017",
         )
         self.assertEqual(
             module.EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
@@ -4114,10 +4117,10 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
 
         with patch.object(module, "RP_REASONING_MODEL", ""), \
              patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"):
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"):
             self.assertEqual(
                 module.build_rp_reasoning_signature(),
-                "openrouter|deepseek/deepseek-v4-pro|reasoning:none",
+                "openrouter|deepseek/deepseek-v4.1-flash-1017|reasoning:none",
             )
 
         with patch.object(module, "RP_REASONING_MODEL", ""), \
@@ -4150,7 +4153,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "EPISODE_SUMMARY_MODEL", "deepseek/deepseek-v3.2"), \
              patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
              patch.object(module, "RP_REASONING_MODEL", ""), \
-             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
              patch.object(module, "RP_OPENROUTER_MODEL", "google/gemma-4-31b-it"), \
              patch.object(module, "RP_OPENROUTER_PROVIDER_ONLY", "deepinfra,together"):
             line = module.build_storyctx_provider_summary_line()
@@ -4158,7 +4161,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
         self.assertIn("episode_summary_provider=openrouter", line)
         self.assertIn("episode_summary_model=deepseek/deepseek-v3.2", line)
         self.assertIn("episode_character_signals_provider=openrouter", line)
-        self.assertIn("episode_character_signals_model=deepseek/deepseek-v4-pro", line)
+        self.assertIn("episode_character_signals_model=deepseek/deepseek-v4.1-flash-1017", line)
         self.assertIn("rp_profile_provider=openrouter", line)
         self.assertIn("rp_profile_model=google/gemma-4-31b-it", line)
         self.assertIn("rp_openrouter_provider_only=deepinfra,together", line)
@@ -4213,7 +4216,7 @@ class StoryAgentContextCostGuardTest(IsolatedAsyncioTestCase):
              patch.object(module, "EPISODE_SUMMARY_MODEL", "deepseek/deepseek-v3.2"), \
              patch.object(module.settings, "ANTHROPIC_API_KEY", ""), \
              patch.object(module, "RP_REASONING_MODEL", ""), \
-             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+             patch.object(module, "EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
              redirect_stdout(stdout):
             module.print_summary(results=results, apply=True)
 
@@ -6173,6 +6176,7 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                 if scenario == "failed_budget":
                     rows.append({**row, "product_id": 688, "episode_id": 1002})
                 connections = []
+                selection_connections = []
                 failure_writes = []
                 client = FakeOpenRouterClient({})
                 client.aclose = AsyncMock()
@@ -6187,11 +6191,16 @@ class StoryAgentContextDeltaValidationTest(IsolatedAsyncioTestCase):
                     conn = MagicMock()
                     cur = conn.cursor.return_value.__enter__.return_value
                     cur.lastrowid = 1
-                    cur.fetchall.return_value = rows if not connections else []
+                    is_selection = not kwargs.get("autocommit", False) and not selection_connections
+                    if not kwargs.get("autocommit", False):
+                        selection_connections.append(conn)
+                    cur.fetchall.return_value = rows if is_selection else []
 
                     def execute(sql, params=()):
                         cur.fetchone.return_value = None
-                        if "GET_LOCK(" in sql:
+                        if "information_schema.statistics" in sql:
+                            cur.fetchone.return_value = {"non_unique": 0}
+                        elif "GET_LOCK(" in sql:
                             cur.fetchone.return_value = {"locked": 1}
                         elif "AS total_episode_count" in sql:
                             cur.fetchone.return_value = {"total_episode_count": 1}

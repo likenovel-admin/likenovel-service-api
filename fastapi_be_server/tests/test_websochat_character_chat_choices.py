@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import status
 
@@ -13,6 +13,19 @@ from app.services.websochat.websochat_service import (
     _build_websochat_character_chat_choice_prompt,
     _parse_and_validate_websochat_character_chat_choices,
 )
+
+
+def _config_db():
+    db = AsyncMock()
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = []
+    async def execute(statement, params=None):
+        if "FROM tb_ai_model_config" not in str(statement):
+            raise AssertionError(f"Unexpected database read: {statement}")
+        return result
+
+    db.execute.side_effect = execute
+    return db
 
 
 class WebsochatCharacterChatChoicesTest(unittest.TestCase):
@@ -330,7 +343,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                     session_id=10,
                     req_body=req_body,
                     kc_user_id=None,
-                    db=object(),
+                    db=_config_db(),
                 )
 
         self.assertEqual(captured.exception.status_code, status.HTTP_400_BAD_REQUEST)
@@ -436,7 +449,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 session_id=10,
                 req_body=req_body,
                 kc_user_id=None,
-                db=object(),
+                db=_config_db(),
             )
 
         self.assertEqual(result["data"]["choices"], [])
@@ -494,7 +507,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 session_id=10,
                 req_body=req_body,
                 kc_user_id=None,
-                db=object(),
+                db=_config_db(),
             )
 
         self.assertEqual(
@@ -646,7 +659,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 session_id=10,
                 req_body=req_body,
                 kc_user_id=None,
-                db=object(),
+                db=_config_db(),
             )
 
         self.assertEqual(len(result["data"]["choices"]), 3)
@@ -791,7 +804,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 session_id=10,
                 req_body=req_body,
                 kc_user_id=None,
-                db=object(),
+                db=_config_db(),
             )
 
         self.assertEqual(len(result["data"]["choices"]), 3)
@@ -963,7 +976,7 @@ class WebsochatCharacterChatChoicesServiceTest(unittest.IsolatedAsyncioTestCase)
                 session_id=10,
                 req_body=req_body,
                 kc_user_id=None,
-                db=object(),
+                db=_config_db(),
             )
 
         self.assertEqual(len(result["data"]["choices"]), 3)

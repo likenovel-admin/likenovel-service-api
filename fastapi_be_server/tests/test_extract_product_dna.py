@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import httpx
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -749,11 +750,9 @@ class AiDnaProductTargetQueryTest(TestCase):
 
     def test_openrouter_402_raises_batch_circuit_breaker(self):
         module = load_module()
-        response = MagicMock()
-        response.status_code = 402
-        response.json.return_value = {
+        response = httpx.Response(402, request=httpx.Request("POST", "https://provider.invalid/chat/completions"), json={
             "error": {"code": 402, "message": "insufficient credits"}
-        }
+        })
         client = MagicMock()
         credit_response = MagicMock()
         credit_response.json.return_value = {
@@ -771,13 +770,11 @@ class AiDnaProductTargetQueryTest(TestCase):
             with self.assertRaises(module.OpenRouterInsufficientCreditsError):
                 module.call_openrouter("system", "user", {})
 
-    def test_openrouter_non_402_keeps_existing_retry_path(self):
+    def test_openrouter_non_402_rejection_does_not_become_a_parse_retry(self):
         module = load_module()
-        response = MagicMock()
-        response.status_code = 429
-        response.json.return_value = {
+        response = httpx.Response(429, request=httpx.Request("POST", "https://provider.invalid/chat/completions"), json={
             "error": {"code": 429, "message": "rate limited"}
-        }
+        })
         client = MagicMock()
         credit_response = MagicMock()
         credit_response.json.return_value = {
@@ -792,7 +789,7 @@ class AiDnaProductTargetQueryTest(TestCase):
             patch.object(module, "_build_openrouter_response_format", return_value={}),
             patch.object(module.httpx, "Client", return_value=client),
         ):
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(httpx.HTTPStatusError) as ctx:
                 module.call_openrouter("system", "user", {})
 
         self.assertNotIsInstance(ctx.exception, module.OpenRouterInsufficientCreditsError)

@@ -107,6 +107,10 @@ def _migrate(connection):
     sql = (ROOT / "dist/init/111-create-character-asset-attempt.sql").read_text()
     with connection.cursor() as cur:
         cur.execute(sql)
+        guard_sql = (ROOT / "dist/init/118-guard-character-asset-inflight-scope.sql").read_text()
+        for statement in guard_sql.split(";"):
+            if statement.strip():
+                cur.execute(statement)
 
 
 def _summary_table(connection):

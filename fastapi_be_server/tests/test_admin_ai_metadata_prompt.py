@@ -28,6 +28,15 @@ class _MappingsResult:
         return self.rows[0] if self.rows else None
 
 
+def _allow_model_config_reads(db):
+    execute = db.execute
+    async def read(statement, *args, **kwargs):
+        if "FROM tb_ai_model_config" in str(statement):
+            return _MappingsResult([])
+        return await execute(statement, *args, **kwargs)
+    db.execute = AsyncMock(side_effect=read)
+
+
 class AdminAiMetadataPromptTest(unittest.TestCase):
     def test_prompt_and_schema_require_librarian_copy(self):
         prompt = admin_ai_metadata_service.DNA_SYSTEM_PROMPT
@@ -200,7 +209,7 @@ class AdminAiMetadataPromptTest(unittest.TestCase):
                     )
 
     def test_reanalyze_upsert_persists_librarian_columns(self):
-        source = inspect.getsource(admin_ai_metadata_service.reanalyze_ai_product_metadata)
+        source = inspect.getsource(admin_ai_metadata_service._reanalyze_ai_product_metadata)
 
         for column in ("librarian_intro", "librarian_points", "librarian_chips"):
             self.assertIn(f":{column}", source)
@@ -574,6 +583,7 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
         allowed = {axis: {f"{axis}-label"} for axis in admin_ai_metadata_service.AXIS_ORDER}
         response = unittest.mock.MagicMock()
         response.status_code = 200
+        response.extensions = {}
         response.json.return_value = {
             "model": "routed/provider-model",
             "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
@@ -592,7 +602,7 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
             patch.object(admin_ai_metadata_service.settings, "AI_DNA_OPENROUTER_MODEL", "deepseek/test-model"),
             patch.object(admin_ai_metadata_service.settings, "AI_DNA_OPENROUTER_TIMEOUT_SECONDS", 120.0),
             patch.object(admin_ai_metadata_service.settings, "AI_DNA_MAX_OUTPUT_TOKENS", 8192),
-            patch.object(admin_ai_metadata_service, "post_openrouter_background_chat_completion_async", post),
+            patch.object(admin_ai_metadata_service, "post_model_chat_completion_async", post),
         ):
             raw, call_meta = await admin_ai_metadata_service._call_openrouter_dna(
                 "system", "user", allowed
@@ -620,7 +630,7 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
 
     def test_dna_admin_module_has_no_anthropic_execution_or_model_persistence(self):
         module_source = inspect.getsource(admin_ai_metadata_service)
-        reanalyze_source = inspect.getsource(admin_ai_metadata_service.reanalyze_ai_product_metadata)
+        reanalyze_source = inspect.getsource(admin_ai_metadata_service._reanalyze_ai_product_metadata)
 
         self.assertNotIn("_call_claude", reanalyze_source)
         self.assertNotIn("settings.ANTHROPIC_MODEL", module_source)
@@ -635,7 +645,7 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(admin_ai_metadata_service.settings, "OPENROUTER_API_KEY", "test-key"),
             patch.object(admin_ai_metadata_service.settings, "AI_DNA_OPENROUTER_MODEL", "deepseek/test-model"),
-            patch.object(admin_ai_metadata_service, "post_openrouter_background_chat_completion_async", post),
+            patch.object(admin_ai_metadata_service, "post_model_chat_completion_async", post),
             self.assertRaises(OpenRouterBackgroundCreditReserveError),
         ):
             await admin_ai_metadata_service._call_openrouter_dna("system", "user", allowed)
@@ -695,6 +705,7 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=(json.dumps(payload, ensure_ascii=False), call_meta)),
             ) as call_openrouter,
         ):
+            _allow_model_config_reads(db)
             result = await admin_ai_metadata_service.reanalyze_ai_product_metadata(200, db)
 
         self.assertEqual(result["data"]["analysis_status"], "success")
@@ -761,6 +772,7 @@ class AdminAiMetadataOpenRouterTest(unittest.IsolatedAsyncioTestCase):
             ) as mark_failed,
             self.assertRaisesRegex(Exception, "최대 3회 시도"),
         ):
+            _allow_model_config_reads(db)
             await admin_ai_metadata_service.reanalyze_ai_product_metadata(200, db)
 
         self.assertEqual(call_openrouter.await_count, 3)

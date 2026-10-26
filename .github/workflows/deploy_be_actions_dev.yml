@@ -68,6 +68,7 @@ jobs:
         run: |
           set -e
           printf '%s' "$BACKEND_ENV_DEV" | tr -d '\r' > .env.production
+          printf '\nAI_PROVIDER_ACCOUNTS_FILE=/home/ln-admin/.config/likenovel/ai-provider-accounts.json\n' >> .env.production
 
       - name: Deploy with AWS codedeploy (DEV)
         id: deploy

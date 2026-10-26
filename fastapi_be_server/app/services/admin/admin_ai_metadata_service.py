@@ -13,10 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.const import settings
 from app.exceptions import CustomResponseException
+from app.services.common.ai_model_config import (
+    get_model_binding, load_ai_model_snapshot, use_ai_model_snapshot,
+    MODEL_SUBMISSION_UNKNOWN_PREFIX,
+)
+from app.services.common.ai_model_gateway import post_model_chat_completion_async
 from app.services.common.openrouter_background_credit_guard import (
     OpenRouterBackgroundCreditGuardError,
     OpenRouterBackgroundCreditReserveError,
-    post_openrouter_background_chat_completion_async,
 )
 
 logger = logging.getLogger("admin_app")
@@ -492,11 +496,12 @@ def _compact_model_slug(model: str) -> str:
 
 
 def _dna_analysis_version() -> str:
+    binding = get_model_binding("dna.analysis", default_model=settings.AI_DNA_OPENROUTER_MODEL)
     return "|".join(
         (
             settings.AI_DNA_ANALYSIS_PIPELINE_VERSION,
-            "or",
-            _compact_model_slug(settings.AI_DNA_OPENROUTER_MODEL),
+            "or" if binding.billing_route == "openrouter" else binding.billing_route,
+            _compact_model_slug(binding.model_id),
             "auto",
             "schema",
         )
@@ -716,14 +721,15 @@ async def _call_openrouter_dna(
     user_prompt: str,
     allowed_labels: dict[str, set[str]],
 ) -> tuple[str, dict[str, Any]]:
-    if not settings.OPENROUTER_API_KEY or not settings.AI_DNA_OPENROUTER_MODEL:
+    binding = get_model_binding("dna.analysis", default_model=settings.AI_DNA_OPENROUTER_MODEL)
+    if not settings.OPENROUTER_API_KEY or not binding.model_id:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             message="DNA OpenRouter 서비스가 설정되지 않았습니다.",
         )
 
     request_payload = {
-        "model": settings.AI_DNA_OPENROUTER_MODEL,
+        "model": get_model_binding("dna.analysis", default_model=settings.AI_DNA_OPENROUTER_MODEL).model_id,
         "temperature": 0.1,
         "max_tokens": settings.AI_DNA_MAX_OUTPUT_TOKENS,
         "response_format": _build_openrouter_dna_response_format(allowed_labels),
@@ -734,8 +740,9 @@ async def _call_openrouter_dna(
         ],
     }
     async with httpx.AsyncClient(timeout=settings.AI_DNA_OPENROUTER_TIMEOUT_SECONDS) as client:
-        response = await post_openrouter_background_chat_completion_async(
+        response = await post_model_chat_completion_async(
             client,
+            feature_key="dna.analysis",
             base_url=settings.OPENROUTER_BASE_URL,
             api_key=settings.OPENROUTER_API_KEY,
             headers={
@@ -751,16 +758,17 @@ async def _call_openrouter_dna(
         )
     if response.status_code != 200:
         logger.error("DNA OpenRouter API error: status=%s", response.status_code)
-        raise CustomResponseException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            message="DNA OpenRouter 호출에 실패했습니다.",
+        raise httpx.HTTPStatusError(
+            "DNA provider rejected the request; automatic replay disabled",
+            request=response.request, response=response,
         )
 
     data = response.json()
     call_meta = {
-        "provider": "openrouter",
-        "routing": "auto",
-        "requested_model": settings.AI_DNA_OPENROUTER_MODEL,
+        "provider": (response.extensions.get("ai_route") or {}).get("provider", "openrouter"),
+        "routing": (response.extensions.get("ai_route") or {}).get("account_alias", "auto"),
+        "model_route": dict(response.extensions.get("ai_route") or {}),
+        "requested_model": get_model_binding("dna.analysis", default_model=settings.AI_DNA_OPENROUTER_MODEL).model_id,
         "response_model": str(data.get("model") or "")[:120] or None,
         "response_format": "json_schema",
         "usage": _safe_openrouter_usage(data.get("usage")),
@@ -1956,12 +1964,34 @@ async def put_ai_product_metadata_exclude(
     return {"data": {"message": "추천 제외 설정이 변경되었습니다."}}
 
 
+async def _mark_dna_submission_unknown(product_id: int, attempt_count: int, error_type: str, db: AsyncSession) -> None:
+    await db.execute(
+        text("""INSERT INTO tb_product_ai_metadata
+                    (product_id, analysis_status, analysis_attempt_count, analysis_error_message, model_version)
+                VALUES (:product_id, 'failed', :attempt_count, :error_message, :model_version)
+                ON DUPLICATE KEY UPDATE
+                    analysis_error_message = VALUES(analysis_error_message),
+                    analysis_attempt_count = IF(analysis_status = 'success', analysis_attempt_count, VALUES(analysis_attempt_count)),
+                    updated_date = NOW()"""),
+        {"product_id": product_id, "attempt_count": attempt_count,
+         "error_message": MODEL_SUBMISSION_UNKNOWN_PREFIX + error_type,
+         "model_version": _dna_analysis_version()},
+    )
+    await db.commit()
+
+
 async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> dict[str, Any]:
+    snapshot = await load_ai_model_snapshot(db)
+    with use_ai_model_snapshot(snapshot):
+        return await _reanalyze_ai_product_metadata(product_id, db)
+
+
+async def _reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> dict[str, Any]:
     product = await _get_product_for_analysis(product_id, db)
 
     current_query = text(
         """
-        SELECT analysis_attempt_count
+        SELECT analysis_attempt_count, analysis_error_message
         FROM tb_product_ai_metadata
         WHERE product_id = :product_id
         LIMIT 1
@@ -1969,6 +1999,11 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
     )
     current_result = await db.execute(current_query, {"product_id": product_id})
     current_row = current_result.mappings().one_or_none()
+    if str((current_row or {}).get("analysis_error_message") or "").startswith(MODEL_SUBMISSION_UNKNOWN_PREFIX):
+        raise CustomResponseException(
+            status_code=status.HTTP_409_CONFLICT, code="recovery_required",
+            message="이전 DNA 요청의 처리 결과가 불명확합니다. 운영 확인 전에는 재요청하지 않습니다.",
+        )
     base_attempt_count = (current_row or {}).get("analysis_attempt_count", 0) or 0
 
     episodes = await _get_episodes_for_analysis(product_id, db)
@@ -2149,6 +2184,14 @@ async def reanalyze_ai_product_metadata(product_id: int, db: AsyncSession) -> di
                     "axis_labels": _build_axis_labels_from_columns(normalized),
                 }
             }
+        except httpx.HTTPError as error:
+            await db.rollback()
+            if not isinstance(error, httpx.HTTPStatusError) or error.response.status_code >= 500:
+                await _mark_dna_submission_unknown(product_id, attempt_count, type(error).__name__, db)
+            raise CustomResponseException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                message="DNA 모델 요청의 전송 결과를 확인할 수 없어 자동 재시도를 중단했습니다.",
+            ) from error
         except OpenRouterDnaResponseError as error:
             llm_calls.append(error.call_meta)
             await db.rollback()

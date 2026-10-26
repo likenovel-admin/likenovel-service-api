@@ -9,10 +9,11 @@ from fastapi import status
 import httpx
 
 from app.const import settings
+from app.services.common.ai_model_config import get_model_binding
+from app.services.common.ai_model_gateway import post_model_chat_completion_async
 from app.exceptions import CustomResponseException
 from app.services.common.openrouter_background_credit_guard import (
     OpenRouterBackgroundCreditReserveError,
-    post_openrouter_background_chat_completion_async,
 )
 
 
@@ -89,12 +90,14 @@ class ReaderLlmResponseError(CustomResponseException):
 class ReaderLlmResponse:
     content: str
     usage: ReaderLlmUsage | None
+    model_route: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ReaderLlmDecisionResult:
     decision: ReaderLlmDecision
     usage: ReaderLlmUsage | None
+    model_routes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -195,10 +198,13 @@ async def request_reader_decision_with_usage(
     last_error: InvalidReaderDecisionError | None = None
     total_usage: ReaderLlmUsage | None = None
     usage_incomplete = False
+    model_routes: list[dict[str, Any]] = []
     for attempt_no in range(1, READER_DECISION_PARSE_MAX_ATTEMPTS + 1):
         response = await caller(system_prompt, user_prompt, READER_DECISION_MAX_TOKENS)
         if isinstance(response, ReaderLlmResponse):
             raw_response = response.content
+            if response.model_route:
+                model_routes.append(dict(response.model_route))
             if response.usage is None:
                 usage_incomplete = True
             else:
@@ -210,6 +216,7 @@ async def request_reader_decision_with_usage(
             return ReaderLlmDecisionResult(
                 decision=parse_llm_decision(raw_response),
                 usage=None if usage_incomplete else total_usage,
+                model_routes=tuple(model_routes),
             )
         except InvalidReaderDecisionError as exc:
             last_error = exc
@@ -544,14 +551,14 @@ async def _call_openrouter_chat_completion(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             message="AI 추천 서비스가 설정되지 않았습니다.",
         )
-    if not settings.AI_READER_OPENROUTER_MODEL:
+    if not reader_llm_model_name():
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             message="AI reader 모델이 설정되지 않았습니다.",
         )
 
     payload: dict[str, Any] = {
-        "model": settings.AI_READER_OPENROUTER_MODEL,
+        "model": reader_llm_model_name(),
         "temperature": settings.AI_READER_OPENROUTER_TEMPERATURE,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
@@ -560,12 +567,10 @@ async def _call_openrouter_chat_completion(
             {"role": "user", "content": user_prompt},
         ],
     }
+    payload["provider"] = {"require_parameters": True}
     provider_only = _split_csv(settings.AI_READER_OPENROUTER_PROVIDER_ONLY)
     if provider_only:
-        payload["provider"] = {
-            "only": provider_only,
-            "require_parameters": True,
-        }
+        payload["provider"]["only"] = provider_only
 
     last_error: Exception | None = None
     total_usage: ReaderLlmUsage | None = None
@@ -580,6 +585,7 @@ async def _call_openrouter_chat_completion(
             return ReaderLlmResponse(
                 content=response.content,
                 usage=None if usage_incomplete else total_usage,
+                model_route=response.model_route,
             )
         except (CustomResponseException, httpx.HTTPError) as exc:
             last_error = exc
@@ -615,8 +621,9 @@ async def _post_openrouter_chat_completion(
     async with httpx.AsyncClient(
         timeout=settings.AI_READER_OPENROUTER_TIMEOUT_SECONDS
     ) as client:
-        resp = await post_openrouter_background_chat_completion_async(
+        resp = await post_model_chat_completion_async(
             client,
+            feature_key="ai_reader.decision",
             base_url=settings.OPENROUTER_BASE_URL,
             api_key=settings.OPENROUTER_API_KEY,
             headers={
@@ -655,7 +662,7 @@ async def _post_openrouter_chat_completion(
             message=exc.message,
             usage=usage,
         ) from exc
-    return ReaderLlmResponse(content=raw, usage=usage)
+    return ReaderLlmResponse(content=raw, usage=usage, model_route=dict(resp.extensions.get("ai_route") or {}))
 
 
 def _extract_openrouter_usage(data: Any) -> ReaderLlmUsage | None:
@@ -693,13 +700,13 @@ def _extract_openrouter_usage(data: Any) -> ReaderLlmUsage | None:
 
 def _is_retryable_openrouter_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPError):
-        return True
+        # A transport failure may follow a billable submit. Do not replay it.
+        return False
     if not isinstance(exc, CustomResponseException):
         return False
     if exc.status_code != status.HTTP_502_BAD_GATEWAY:
         return False
     return exc.message in {
-        "AI 서비스 호출에 실패했습니다.",
         "AI 응답 형식이 유효하지 않습니다.",
     } or str(exc).startswith("AI 응답이 비어 있습니다.")
 
@@ -729,7 +736,7 @@ def _validate_openrouter_choice(payload: dict[str, Any]) -> dict[str, Any]:
         )
     choice = choices[0] or {}
     finish_reason = choice.get("finish_reason")
-    if finish_reason and finish_reason not in OPENROUTER_ALLOWED_FINISH_REASONS:
+    if finish_reason not in OPENROUTER_ALLOWED_FINISH_REASONS:
         raise CustomResponseException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             message=f"AI 응답이 중단되었습니다. (finish_reason={finish_reason})",
@@ -772,4 +779,6 @@ def _split_csv(value: str | None) -> list[str]:
 
 
 def reader_llm_model_name() -> str:
-    return settings.AI_READER_OPENROUTER_MODEL or "openrouter"
+    return get_model_binding(
+        "ai_reader.decision", default_model=settings.AI_READER_OPENROUTER_MODEL or None,
+    ).model_id

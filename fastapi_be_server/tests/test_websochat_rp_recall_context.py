@@ -82,6 +82,46 @@ class WebsochatRpRecallContextExcerptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("크리스탈 검을 처음으로", context["raw_recall_context"])
         self.assertIn("UNIQUE_EPISODE_HEAD_MARKER", context["raw_recall_context"])
 
+    async def test_prioritized_recall_preserves_match_at_episode_end(self):
+        passage = "크리스탈 검이 빛났고 모두가 그 빛을 기억했다."
+        for suffix in ("", "장면 종료. " * 80):
+            with self.subTest(suffix_length=len(suffix)):
+                content = "배경 설명. " * 500 + passage + suffix
+                context, search = await self._build_context(episode_content=content)
+                excerpt = context["raw_recall_context"].split("[2화 원문 일부]\n", 1)[1]
+                self.assertIn(passage, excerpt)
+                self.assertGreater(len(excerpt), 500)
+                self.assertLessEqual(len(excerpt), 1200)
+                search.assert_not_awaited()
+
+    async def test_recall_keeps_four_complete_excerpts_within_read_scope(self):
+        fetched = []
+
+        async def get_contents(**kwargs):
+            fetched.append(kwargs)
+            episode_no = kwargs["episode_from"]
+            return [{"episodeNo": episode_no, "content": "가" * 1500 + "크리스탈 검"}]
+
+        with (
+            patch.object(websochat_service, "_resolve_websochat_rp_recall_need", AsyncMock(return_value=(True, "크리스탈 검"))),
+            patch.object(websochat_service, "_get_websochat_summary_candidates", AsyncMock(return_value=[])),
+            patch.object(websochat_service, "_get_websochat_episode_contents", side_effect=get_contents),
+        ):
+            context = await websochat_service._build_websochat_rp_exact_recall_context(
+                product_row={"productId": 1, "latestEpisodeNo": 10},
+                user_prompt="크리스탈 검", recent_messages=[], db=AsyncMock(),
+                rp_context={"anchor_episode_no": 1, "trajectory_history": [{"episode_no": n} for n in (2, 3, 4, 5, 7)], "session_memory": {"read_episode_to": 5}},
+            )
+        recall = context["raw_recall_context"]
+        self.assertEqual(recall.count("화 원문 일부]"), 4)
+        self.assertEqual(recall.count("크리스탈 검"), 4)
+        for episode_no in range(1, 5):
+            self.assertIn(f"[{episode_no}화 원문 일부]", recall)
+        self.assertNotIn("[5화 원문 일부]", recall)
+        self.assertNotIn("[7화 원문 일부]", recall)
+        self.assertEqual([row["episode_from"] for row in fetched], [1, 2, 3, 4, 5])
+        self.assertTrue(all(row["latest_episode_no"] == 5 for row in fetched))
+
 
 if __name__ == "__main__":
     unittest.main()

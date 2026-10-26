@@ -1,7 +1,7 @@
 import json
 import unittest
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.exceptions import CustomResponseException
 from app.schemas.websochat import PostWebsochatMessageReqBody, PostWebsochatSessionReqBody
@@ -40,6 +40,19 @@ def test_marked_grounding_exact_provenance_preserves_unbounded_episode_numbers(r
     ]}
     selected = select_character_chat_grounding_v1(profile, examples, expected_character_key="character:lead", read_episode_to=read_to)
     assert [item["episode_no"] for item in selected] == expected
+
+
+def _config_db():
+    db = AsyncMock()
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = []
+    async def execute(statement, params=None):
+        if "FROM tb_ai_model_config" not in str(statement):
+            raise AssertionError(f"Unexpected database read: {statement}")
+        return result
+
+    db.execute.side_effect = execute
+    return db
 
 
 class _Mappings:
@@ -286,7 +299,7 @@ class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
                         "read_episode_to": 1,
                         "character_chat_entry_context": entry_context,
                     },
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
         future = {"episode_no": 7, "text": "후반부 말투 예시"}
@@ -388,7 +401,7 @@ class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
                     req_body=req_body,
                     kc_user_id=None,
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
         self.assertEqual(raised.exception.code, "CHARACTER_CHAT_PRODUCT_INELIGIBLE")
@@ -441,7 +454,7 @@ class CharacterChatProductPolicyTest(unittest.IsolatedAsyncioTestCase):
                     session_id=77,
                     req_body=req_body,
                     kc_user_id=None,
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
         self.assertEqual(raised.exception.code, "CHARACTER_CHAT_PRODUCT_INELIGIBLE")

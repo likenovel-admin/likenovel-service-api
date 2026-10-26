@@ -86,6 +86,8 @@ class _Db:
     async def execute(self, statement, params=None):
         params = params or {}
         query = str(statement)
+        if "FROM tb_ai_model_config" in query:
+            return _Result([])
         if "summary_type = 'character_inventory_v3'" in query:
             return _Result([{"scopeKey": self.scope_key, "summaryText": json.dumps(self.assets["character_inventory_v3"])}])
         if params.get("summary_type"):

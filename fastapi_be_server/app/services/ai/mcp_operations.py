@@ -13,6 +13,10 @@ from sqlalchemy import text, bindparam
 from httpx import AsyncClient
 
 from app.rdb import likenovel_db_session
+from app.services.common.ai_model_config import (
+    get_model_binding, load_ai_model_snapshot, use_ai_model_snapshot,
+    serialize_model_snapshot, deserialize_model_snapshot,
+)
 from app.schemas.admin import PutDirectRecommendReqBody, PostMainSingleSlotPublishNowReqBody
 from app.services.ai import direct_curator_service as curator
 from app.services.ai import mcp_policy as policy, mcp_store as store
@@ -197,7 +201,7 @@ async def apply_direct(owner: str, snapshot_id: str, updates: list[dict]) -> dic
     return store.get(job_id, owner)
 
 
-async def _generate_single_inner(job_id: str, owner: str):
+async def _generate_single_pinned(job_id: str, owner: str):
     from app.services.ai import mcp_single_copy as core
 
     try:
@@ -259,11 +263,31 @@ async def _generate_single_inner(job_id: str, owner: str):
         store.save(job_id, owner, "ready", {
             "kind": "single", "before": before, "candidates": proposals,
             "generated_at": generated_at,
-            "provider": "openrouter", "model": core.OPENROUTER_MODEL,
+            "provider": (payload.get("_model_route") or {}).get("provider", get_model_binding("mcp.single_copy").billing_route),
+            "model": get_model_binding("mcp.single_copy", default_model=core.OPENROUTER_MODEL).model_id,
+            "model_route": payload.get("_model_route") or {},
             "attempts": attempt, "rejected_covers": rejected[:20],
         })
     except Exception as exc:
         logger.exception("MCP single-slot generation failed for %s", job_id)
+        store.save(job_id, owner, "failed", {"error_type": type(exc).__name__})
+
+
+async def _generate_single_inner(job_id: str, owner: str):
+    try:
+        receipt = store.get(job_id, owner) or {}
+        if receipt.get("model_snapshot") is not None:
+            snapshot = deserialize_model_snapshot(receipt["model_snapshot"])
+        else:
+            async with likenovel_db_session() as db:
+                snapshot = await load_ai_model_snapshot(db)
+            store.save(job_id, owner, "generating", {
+                "kind": "single", "model_snapshot": serialize_model_snapshot(snapshot),
+            })
+        with use_ai_model_snapshot(snapshot):
+            await _generate_single_pinned(job_id, owner)
+    except Exception as exc:
+        logger.exception("MCP model configuration failed for %s", job_id)
         store.save(job_id, owner, "failed", {"error_type": type(exc).__name__})
 
 
@@ -280,7 +304,11 @@ async def start_single(owner: str) -> dict:
     receipt = store.get(job_id, owner)
     if receipt:
         return receipt
-    if store.claim(job_id, owner, {"kind": "single"}):
+    async with likenovel_db_session() as db:
+        model_snapshot = await load_ai_model_snapshot(db)
+    if store.claim(job_id, owner, {
+        "kind": "single", "model_snapshot": serialize_model_snapshot(model_snapshot),
+    }):
         task = asyncio.create_task(_generate_single(job_id, owner))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)

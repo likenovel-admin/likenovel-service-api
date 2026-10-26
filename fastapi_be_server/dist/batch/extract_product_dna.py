@@ -84,9 +84,13 @@ for api_root_candidate in (
             sys.path.insert(0, str(api_root_candidate))
         break
 
+from app.services.common.ai_model_config import (  # noqa: E402
+    get_model_binding, load_ai_model_snapshot_sync, use_ai_model_snapshot,
+    MODEL_SUBMISSION_UNKNOWN_PREFIX,
+)
+from app.services.common.ai_model_gateway import post_model_chat_completion  # noqa: E402
 from app.services.common.openrouter_background_credit_guard import (  # noqa: E402
     OpenRouterBackgroundCreditGuardError,
-    post_openrouter_background_chat_completion,
 )
 
 LABELS_JSON_CANDIDATES = [
@@ -317,9 +321,10 @@ def db_connect():
 def get_products(conn, product_id: int | None = None, force: bool = False):
     """분석 대상 작품 목록 조회."""
     with conn.cursor() as cur:
-        params: list[Any] = []
+        params: list[Any] = [MODEL_SUBMISSION_UNKNOWN_PREFIX, MODEL_SUBMISSION_UNKNOWN_PREFIX]
         where = f"""
             p.open_yn = 'Y'
+            AND LEFT(COALESCE(m.analysis_error_message, ''), CHAR_LENGTH(%s)) <> %s
             AND COALESCE(p.blind_yn, 'N') = 'N'
             AND COALESCE(p.ai_content_service_enabled_yn, 'N') = 'Y'
             AND COALESCE(u.role_type, 'normal') != 'admin'
@@ -766,11 +771,12 @@ def _current_analysis_version() -> str:
     if AI_DNA_PROVIDER != "openrouter":
         return ANALYSIS_PIPELINE_VERSION[:50]
     provider = (_split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY) or ["auto"])[0]
+    binding = get_model_binding("dna.analysis", default_model=AI_DNA_OPENROUTER_MODEL)
     version = "|".join(
         [
             ANALYSIS_PIPELINE_VERSION,
-            "or",
-            _compact_model_slug(AI_DNA_OPENROUTER_MODEL),
+            "or" if binding.billing_route == "openrouter" else binding.billing_route,
+            _compact_model_slug(binding.model_id),
             provider,
             _compact_response_format(AI_DNA_RESPONSE_FORMAT),
         ]
@@ -1369,7 +1375,7 @@ def _validate_openrouter_choice(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("OpenRouter invalid response: missing choices")
     choice = choices[0] or {}
     finish_reason = choice.get("finish_reason")
-    if finish_reason and finish_reason not in OPENROUTER_ALLOWED_FINISH_REASONS:
+    if finish_reason not in OPENROUTER_ALLOWED_FINISH_REASONS:
         raise RuntimeError(f"OpenRouter incomplete response: finish_reason={finish_reason}")
     return choice
 
@@ -1386,7 +1392,7 @@ def call_openrouter(
         raise RuntimeError("AI_DNA_OPENROUTER_MODEL 환경변수를 설정하세요.")
 
     payload: dict[str, Any] = {
-        "model": AI_DNA_OPENROUTER_MODEL,
+        "model": get_model_binding("dna.analysis", default_model=AI_DNA_OPENROUTER_MODEL).model_id,
         "temperature": 0.1,
         "max_tokens": MAX_LLM_OUTPUT_TOKENS,
         "response_format": _build_openrouter_response_format(allowed_labels),
@@ -1400,16 +1406,15 @@ def call_openrouter(
             payload["reasoning"] = {"effort": AI_DNA_OPENROUTER_REASONING}
         elif AI_DNA_OPENROUTER_REASONING in ("enabled", "on", "true", "1"):
             payload["reasoning"] = {"enabled": True}
+    payload["provider"] = {"require_parameters": True}
     provider_only = _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY)
     if provider_only:
-        payload["provider"] = {
-            "only": provider_only,
-            "require_parameters": True,
-        }
+        payload["provider"]["only"] = provider_only
 
     with httpx.Client(timeout=AI_DNA_TIMEOUT_SECONDS) as client:
-        resp = post_openrouter_background_chat_completion(
+        resp = post_model_chat_completion(
             client,
+            feature_key="dna.analysis",
             base_url=OPENROUTER_BASE_URL,
             api_key=OPENROUTER_API_KEY,
             headers={
@@ -1422,10 +1427,14 @@ def call_openrouter(
     if resp.status_code == 402:
         raise OpenRouterInsufficientCreditsError(_sanitize_openrouter_error(resp))
     if resp.status_code != 200:
-        raise RuntimeError(_sanitize_openrouter_error(resp))
+        raise httpx.HTTPStatusError(
+            "DNA provider rejected the request; automatic replay disabled",
+            request=resp.request, response=resp,
+        )
 
     data = resp.json()
     usage = _usage_summary(data.get("usage"))
+    usage["model_route"] = dict(resp.extensions.get("ai_route") or {})
     try:
         _validate_openrouter_choice(data)
         raw = _extract_openrouter_message_text(data)
@@ -1456,8 +1465,9 @@ def _call_llm(
         raise RuntimeError(f"unsupported AI_DNA_PROVIDER: {AI_DNA_PROVIDER}")
     raw, usage = call_openrouter(system_prompt, user_prompt, allowed_labels)
     return raw, {
-        "provider": "openrouter",
-        "model": AI_DNA_OPENROUTER_MODEL,
+        "provider": (usage.get("model_route") or {}).get("provider", get_model_binding("dna.analysis").billing_route),
+        "model": get_model_binding("dna.analysis", default_model=AI_DNA_OPENROUTER_MODEL).model_id,
+        "model_route": usage.get("model_route") or {},
         "provider_only": _split_csv(AI_DNA_OPENROUTER_PROVIDER_ONLY),
         "response_format": AI_DNA_RESPONSE_FORMAT,
         "usage": _usage_summary(usage),
@@ -1474,7 +1484,7 @@ def _attach_llm_meta(parsed: dict[str, Any], calls: list[dict[str, Any]]) -> dic
             total_cost += float(usage["cost"])
             found_cost = True
     enriched["_llm_meta"] = {
-        "analysis_version": CURRENT_ANALYSIS_VERSION,
+        "analysis_version": _current_analysis_version(),
         "calls": calls,
         "total_cost": round(total_cost, 8) if found_cost else None,
     }
@@ -1683,7 +1693,7 @@ def save_dna(conn, product_id: int, dna: dict, parsed: dict, attempt_count: int)
                 json.dumps(dna["librarian_points"], ensure_ascii=False) if dna.get("librarian_points") else None,
                 json.dumps(dna["librarian_chips"], ensure_ascii=False) if dna.get("librarian_chips") else None,
                 json.dumps(raw_analysis, ensure_ascii=False),
-                CURRENT_ANALYSIS_VERSION,
+                _current_analysis_version(),
                 attempt_count,
             ),
         )
@@ -1724,8 +1734,23 @@ def save_failed(conn, product_id: int, attempt_count: int, error_message: str):
                 product_id,
                 attempt_count,
                 (error_message or "unknown error")[:1000],
-                CURRENT_ANALYSIS_VERSION,
+                _current_analysis_version(),
             ),
+        )
+
+
+def mark_submission_unknown(conn, product_id: int, attempt_count: int, error_type: str) -> None:
+    """Block automatic re-submission without replacing last-known-good analysis."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO tb_product_ai_metadata
+                   (product_id, analysis_status, analysis_attempt_count, analysis_error_message, model_version)
+               VALUES (%s, 'failed', %s, %s, %s)
+               ON DUPLICATE KEY UPDATE
+                   analysis_error_message = VALUES(analysis_error_message),
+                   analysis_attempt_count = IF(analysis_status = 'success', analysis_attempt_count, VALUES(analysis_attempt_count)),
+                   updated_date = NOW()""",
+            (product_id, attempt_count, MODEL_SUBMISSION_UNKNOWN_PREFIX + error_type, _current_analysis_version()),
         )
 
 
@@ -1757,7 +1782,7 @@ def main():
     conn = db_connect()
     print(f"[OK] DB 연결 성공 ({DB_HOST}:{DB_PORT})")
     print(f"[OK] 라벨 SSOT 로드 완료: {next(path for path in LABELS_JSON_CANDIDATES if path.exists())}")
-    print(f"[INFO] provider={AI_DNA_PROVIDER}, version={CURRENT_ANALYSIS_VERSION}")
+    print(f"[INFO] provider={AI_DNA_PROVIDER}, pipeline={ANALYSIS_PIPELINE_VERSION}; model pinned per product")
 
     products = get_products(conn, args.product_id, args.force)
     print(f"[INFO] 분석 대상: {len(products)}개 작품")
@@ -1779,48 +1804,53 @@ def main():
             print(f"SKIP: insufficient episodes ({used_count})")
             continue
 
-        last_error = "unknown error"
-        last_attempt = 0
-        analyzed = False
-        for retry_idx in range(MAX_RETRY_COUNT + 1):
-            attempt = retry_idx + 1
-            last_attempt = attempt
-            try:
-                dna, parsed = analyze_product(product, allowed_labels, episode_context, used_count)
-                save_dna(conn, pid, dna, parsed, attempt)
-                success += 1
-                analyzed = True
-                print(f"OK (attempt={attempt}{_format_cost_from_parsed(parsed)})")
-                break
-            except UnsupportedLabelError as e:
-                last_error = _format_failure_message(e)
-                break
-            except OpenRouterInsufficientCreditsError as e:
-                last_error = _format_failure_message(e)
-                provider_circuit_open = True
-                break
-            except OpenRouterBackgroundCreditGuardError as e:
-                last_error = _format_failure_message(e)
-                provider_circuit_open = True
-                reserve_circuit_open = True
-                break
-            except Exception as e:
-                last_error = _format_failure_message(e)
-                if attempt <= MAX_RETRY_COUNT:
-                    time.sleep(1.0)
+        model_snapshot = load_ai_model_snapshot_sync(conn)
+        with use_ai_model_snapshot(model_snapshot):
+            last_error = "unknown error"
+            last_attempt = 0
+            analyzed = False
+            for retry_idx in range(MAX_RETRY_COUNT + 1):
+                attempt = retry_idx + 1
+                last_attempt = attempt
+                try:
+                    dna, parsed = analyze_product(product, allowed_labels, episode_context, used_count)
+                    save_dna(conn, pid, dna, parsed, attempt)
+                    success += 1
+                    analyzed = True
+                    print(f"OK (attempt={attempt}{_format_cost_from_parsed(parsed)})")
+                    break
+                except UnsupportedLabelError as e:
+                    last_error = _format_failure_message(e)
+                    break
+                except OpenRouterInsufficientCreditsError as e:
+                    last_error = _format_failure_message(e)
+                    provider_circuit_open = True
+                    break
+                except OpenRouterBackgroundCreditGuardError as e:
+                    last_error = _format_failure_message(e)
+                    provider_circuit_open = True
+                    reserve_circuit_open = True
+                    break
+                except httpx.HTTPError as e:
+                    if not isinstance(e, httpx.HTTPStatusError) or e.response.status_code >= 500:
+                        mark_submission_unknown(conn, pid, attempt, type(e).__name__)
+                    raise RuntimeError("DNA provider request stopped; manual review required") from e
+                except Exception as e:
+                    last_error = _format_failure_message(e)
+                    if attempt <= MAX_RETRY_COUNT:
+                        time.sleep(1.0)
 
-        if not analyzed and not reserve_circuit_open:
-            fail += 1
-            save_failed(conn, pid, last_attempt or 1, last_error)
-            print(f"FAIL: {last_error}")
-        elif not analyzed:
-            print(f"PAUSE: {last_error}")
+            if not analyzed and not reserve_circuit_open:
+                fail += 1
+                save_failed(conn, pid, last_attempt or 1, last_error)
+                print(f"FAIL: {last_error}")
+            elif not analyzed:
+                print(f"PAUSE: {last_error}")
 
-        if provider_circuit_open:
-            reason = "background reserve" if reserve_circuit_open else "insufficient credits"
-            print(f"[ABORT] OpenRouter {reason}; stopping AI DNA batch.")
-            break
-
+            if provider_circuit_open:
+                reason = "background reserve" if reserve_circuit_open else "insufficient credits"
+                print(f"[ABORT] OpenRouter {reason}; stopping AI DNA batch.")
+                break
         time.sleep(1)  # rate limit 방지
 
     conn.close()

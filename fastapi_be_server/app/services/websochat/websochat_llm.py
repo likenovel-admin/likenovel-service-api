@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import replace
 from time import monotonic
 from typing import Any, Callable
 
@@ -12,6 +13,12 @@ from fastapi import status
 
 from app.const import settings
 from app.exceptions import CustomResponseException
+from app.services.common.ai_model_config import get_model_binding
+from app.services.common.ai_model_gateway import (
+    AiModelGatewayTransportError,
+    post_model_chat_completion_async,
+    stream_model_chat_completion_async,
+)
 from app.services.common.ai_provider_usage import (
     AiProviderUsageAttempt,
     AiProviderUsageOperation,
@@ -346,6 +353,8 @@ async def _call_websochat_openrouter_stream(
     usage_operation: AiProviderUsageOperation,
     usage_result_validator: Callable[[str], bool] | None,
     reasoning_effort: str | None = None,
+    routing_feature_key: str = "websochat.speed",
+    response_format: dict[str, Any] | None = None,
 ) -> str:
     payload = {
         "model": model,
@@ -355,6 +364,7 @@ async def _call_websochat_openrouter_stream(
         "stream": True,
         "stream_options": {"include_usage": True},
         **_openrouter_reasoning_payload(reasoning_effort),
+        **({"response_format": response_format} if response_format else {}),
     }
     accumulated = ""
     latest_usage_event: dict[str, Any] = {}
@@ -363,15 +373,18 @@ async def _call_websochat_openrouter_stream(
     attempt_status = "internal_error"
     error_code: str | None = None
     usage_attempt = usage_operation.start_attempt(
-        provider="openrouter",
+        provider=get_model_binding(routing_feature_key, default_model=model).billing_route,
         requested_model=model,
         request_mode="stream",
     )
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            async with client.stream(
-                "POST",
-                f"{settings.OPENROUTER_BASE_URL}/chat/completions",
+            async with stream_model_chat_completion_async(
+                client,
+                feature_key=routing_feature_key,
+                base_url=settings.OPENROUTER_BASE_URL,
+                api_key=settings.OPENROUTER_API_KEY,
+                background=False,
                 headers={
                     "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
@@ -379,6 +392,9 @@ async def _call_websochat_openrouter_stream(
                 },
                 json=payload,
             ) as response:
+                route = getattr(response, "extensions", {}).get("ai_route", {})
+                if route:
+                    usage_attempt = replace(usage_attempt, provider=route["provider"], requested_model=route["requested_model"])
                 http_status = response.status_code
                 response_headers = getattr(response, "headers", None)
                 if response.status_code != 200:
@@ -432,6 +448,13 @@ async def _call_websochat_openrouter_stream(
             operation="chat/completions stream",
             provider="OpenRouter",
         )
+    except AiModelGatewayTransportError as exc:
+        attempt_status = "provider_error"
+        error_code = "AI_PROVIDER_UNAVAILABLE"
+        raise CustomResponseException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code=error_code, message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+        ) from exc
     except httpx.HTTPError as exc:
         attempt_status = _websochat_attempt_status_from_exception(exc)
         error_code = "AI_PROVIDER_UNAVAILABLE"
@@ -493,8 +516,12 @@ async def call_websochat_openrouter(
     usage_operation: AiProviderUsageOperation | None = None,
     usage_result_validator: Callable[[str], bool] | None = None,
     reasoning_effort: str | None = None,
+    routing_feature_key: str = "websochat.speed",
+    response_format: dict[str, Any] | None = None,
 ) -> str:
-    if not settings.OPENROUTER_API_KEY:
+    binding = get_model_binding(routing_feature_key, default_model=model)
+    model = binding.model_id
+    if binding.billing_route == "openrouter" and not settings.OPENROUTER_API_KEY:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             code="AI_PROVIDER_NOT_CONFIGURED",
@@ -513,37 +540,15 @@ async def call_websochat_openrouter(
         stage_key="chat",
     )
     if stream_enabled:
-        stream_state = {"emitted": False}
-        try:
-            return await _call_websochat_openrouter_stream(
-                model=model,
-                system_prompt=system_prompt,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout_seconds=timeout_seconds,
-                stream_state=stream_state,
-                usage_operation=operation,
-                usage_result_validator=usage_result_validator,
-                reasoning_effort=reasoning_effort,
-            )
-        except CustomResponseException as exc:
-            if stream_state["emitted"] or exc.code != "AI_PROVIDER_EMPTY_RESPONSE":
-                raise
-            logger.warning(
-                "OpenRouter stream returned no content; retrying same provider nonstream"
-            )
-        except Exception:
-            if stream_state["emitted"]:
-                logger.exception("OpenRouter stream failed after content delta")
-                raise CustomResponseException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    code="AI_PROVIDER_UNAVAILABLE",
-                    message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
-                )
-            logger.exception(
-                "OpenRouter stream failed before content; retrying same provider nonstream"
-            )
+        # A submitted stream with no content still has an unknown billing outcome.
+        # Account/credit fallback belongs to the gateway before any stream is yielded.
+        return await _call_websochat_openrouter_stream(
+            model=model, system_prompt=system_prompt, messages=messages,
+            max_tokens=max_tokens, temperature=temperature, timeout_seconds=timeout_seconds,
+            stream_state={"emitted": False}, usage_operation=operation,
+            usage_result_validator=usage_result_validator, reasoning_effort=reasoning_effort,
+            routing_feature_key=routing_feature_key, response_format=response_format,
+        )
 
     payload = {
         "model": model,
@@ -552,6 +557,7 @@ async def call_websochat_openrouter(
         "temperature": temperature,
         "stream": False,
         **_openrouter_reasoning_payload(reasoning_effort),
+        **({"response_format": response_format} if response_format else {}),
     }
     response_json: dict[str, Any] = {}
     response_headers: object | None = None
@@ -559,14 +565,18 @@ async def call_websochat_openrouter(
     attempt_status = "internal_error"
     error_code: str | None = None
     usage_attempt = operation.start_attempt(
-        provider="openrouter",
+        provider=get_model_binding(routing_feature_key, default_model=model).billing_route,
         requested_model=model,
         request_mode="nonstream",
     )
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(
-                f"{settings.OPENROUTER_BASE_URL}/chat/completions",
+            response = await post_model_chat_completion_async(
+                client,
+                feature_key=routing_feature_key,
+                base_url=settings.OPENROUTER_BASE_URL,
+                api_key=settings.OPENROUTER_API_KEY,
+                background=False,
                 headers={
                     "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
@@ -574,6 +584,9 @@ async def call_websochat_openrouter(
                 },
                 json=payload,
             )
+        route = getattr(response, "extensions", {}).get("ai_route", {})
+        if route:
+            usage_attempt = replace(usage_attempt, provider=route["provider"], requested_model=route["requested_model"])
         http_status = response.status_code
         response_headers = getattr(response, "headers", None)
         if response.status_code != 200:
@@ -594,6 +607,10 @@ async def call_websochat_openrouter(
                 response_json["error"],
                 operation="chat/completions",
             )
+        if response_format:
+            choices = response_json.get("choices") or []
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict) or choices[0].get("finish_reason") != "stop":
+                raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, code="AI_PROVIDER_INCOMPLETE_RESPONSE", message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE)
         reply = _extract_websochat_openrouter_text(response_json)
         if not reply:
             attempt_status = "empty_response"
@@ -603,6 +620,17 @@ async def call_websochat_openrouter(
                 code="AI_PROVIDER_EMPTY_RESPONSE",
                 message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
             )
+        if response_format:
+            try:
+                parsed = json.loads(reply)
+                if not isinstance(parsed, dict):
+                    raise ValueError("expected JSON object")
+            except (ValueError, TypeError) as exc:
+                attempt_status = "parse_error"
+                raise CustomResponseException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    code="AI_PROVIDER_INVALID_RESPONSE", message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+                ) from exc
         attempt_status = _classify_websochat_reply_status(
             reply,
             usage_result_validator,
@@ -615,6 +643,13 @@ async def call_websochat_openrouter(
             operation="chat/completions",
             provider="OpenRouter",
         )
+    except AiModelGatewayTransportError as exc:
+        attempt_status = "provider_error"
+        error_code = "AI_PROVIDER_UNAVAILABLE"
+        raise CustomResponseException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code=error_code, message=WEBSOCHAT_AI_PROVIDER_UNAVAILABLE_MESSAGE,
+        ) from exc
     except httpx.HTTPError as exc:
         attempt_status = _websochat_attempt_status_from_exception(exc)
         error_code = "AI_PROVIDER_UNAVAILABLE"
@@ -938,21 +973,33 @@ async def call_websochat_model(
         session_id=usage_session_id,
         scope_key=usage_scope_key,
     )
-    if spec.provider == "openrouter":
+    structured_stages = {
+        "internal_json", "active_character_resolution", "reference_resolution",
+        "qa_correction", "intent_routing", "rp_recall_decision",
+        "character_chat_choices", "game_candidate_selection",
+    }
+    structured = operation.stage_key in structured_stages
+    routing_feature_key = "websochat.structured" if structured else f"websochat.{spec.model_key}"
+    binding = get_model_binding(routing_feature_key, default_model=spec.provider_model, default_route=spec.provider)
+    if binding.billing_route in {"openrouter", "hive", "river"}:
+        if structured and binding.billing_route == "hive":
+            raise ValueError("Hive is not enabled for structured websochat requests")
+        reasoning_effort = "none" if structured else _resolve_websochat_reasoning_effort(spec.thinking_level, max_tokens)
+        if binding.billing_route in {"hive", "river"}:
+            reasoning_effort = {"minimal": "none", "medium": "low"}.get(reasoning_effort, reasoning_effort)
         return await call_websochat_openrouter(
-            model=spec.provider_model,
+            model=binding.model_id,
             system_prompt=system_prompt,
             messages=generic_messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            stream=stream,
+            stream=False if structured else stream,
             timeout_seconds=timeout_seconds,
             usage_operation=operation,
             usage_result_validator=usage_result_validator,
-            reasoning_effort=_resolve_websochat_reasoning_effort(
-                spec.thinking_level,
-                max_tokens,
-            ),
+            reasoning_effort=reasoning_effort,
+            routing_feature_key=routing_feature_key,
+            response_format={"type": "json_object"} if structured else None,
         )
     return await call_websochat_gemini(
         system_prompt=system_prompt,

@@ -1,5 +1,7 @@
 import json
 import unittest
+
+import httpx
 from unittest.mock import AsyncMock, patch
 
 from fastapi import status
@@ -143,12 +145,11 @@ class WebsochatLlmTimeoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/models/default-model:generateContent", _FakeGeminiAsyncClient.urls[0])
 
 
-class _FakeOpenRouterResponse:
+class _FakeOpenRouterResponse(httpx.Response):
     def __init__(self, *, status_code=200, payload=None, lines=None):
-        self.status_code = status_code
         self._payload = payload or {}
         self._lines = list(lines or [])
-        self.text = json.dumps(self._payload)
+        super().__init__(status_code, json=self._payload, request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"))
 
     async def __aenter__(self):
         return self
@@ -360,47 +361,24 @@ class WebsochatOpenRouterTest(unittest.IsolatedAsyncioTestCase):
             ["stream"],
         )
 
-    async def test_openrouter_empty_stream_retries_same_provider_nonstream(self):
-        _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(
-            lines=["data: [DONE]"]
-        )
-        _FakeOpenRouterAsyncClient.post_response = _FakeOpenRouterResponse(
-            payload={"choices": [{"message": {"content": "재시도 응답"}}]}
-        )
+    async def test_openrouter_empty_stream_does_not_resubmit_unknown_outcome(self):
+        _FakeOpenRouterAsyncClient.stream_response = _FakeOpenRouterResponse(lines=["data: [DONE]"])
         with (
             patch.object(websochat_llm.settings, "OPENROUTER_API_KEY", "or-key"),
             patch.object(websochat_llm.httpx, "AsyncClient", _FakeOpenRouterAsyncClient),
-            patch.object(
-                websochat_llm,
-                "persist_ai_provider_usage_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ) as persist_usage,
+            patch.object(websochat_llm, "persist_ai_provider_usage_async", new_callable=AsyncMock, return_value=True) as persist_usage,
         ):
-            reply = await websochat_llm.call_websochat_openrouter(
-                model="google/gemma-4-31b-it",
-                system_prompt="system",
-                messages=[{"role": "user", "content": "질문"}],
-                stream=True,
-                usage_operation=websochat_llm.AiProviderUsageOperation(
-                    feature_key="websochat",
-                    stage_key="qa_reply",
-                    product_id=123,
-                ),
-            )
-
-        self.assertEqual(reply, "재시도 응답")
-        self.assertEqual(
-            [call["kind"] for call in _FakeOpenRouterAsyncClient.calls],
-            ["stream", "post"],
-        )
+            with self.assertRaises(CustomResponseException) as failure:
+                await websochat_llm.call_websochat_openrouter(
+                    model="google/gemma-4-31b-it", system_prompt="system",
+                    messages=[{"role": "user", "content": "질문"}], stream=True,
+                    usage_operation=websochat_llm.AiProviderUsageOperation(feature_key="websochat", stage_key="qa_reply", product_id=123),
+                )
+        self.assertEqual(failure.exception.code, "AI_PROVIDER_EMPTY_RESPONSE")
+        self.assertEqual([call["kind"] for call in _FakeOpenRouterAsyncClient.calls], ["stream"])
         records = [call.args[0] for call in persist_usage.await_args_list]
-        self.assertEqual([record.attempt_no for record in records], [1, 2])
-        self.assertEqual(
-            [record.attempt_status for record in records],
-            ["empty_response", "success"],
-        )
-        self.assertEqual(records[0].operation_id, records[1].operation_id)
+        self.assertEqual([record.attempt_no for record in records], [1])
+        self.assertEqual([record.attempt_status for record in records], ["empty_response"])
 
     async def test_openrouter_local_config_rejection_creates_no_physical_call_row(self):
         with (

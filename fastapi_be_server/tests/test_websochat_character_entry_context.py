@@ -1055,7 +1055,8 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
         }
         opening = {"opening_text": "아델리트가 먼저 움직였다.\n\n\"이제 시작하지.\""}
         db = AsyncMock()
-        db.execute.return_value.lastrowid = 77
+        db.execute.return_value = MagicMock(lastrowid=77)
+        db.execute.return_value.mappings.return_value.all.return_value = []
 
         with (
             patch.object(websochat_service, "_resolve_actor", new_callable=AsyncMock) as resolve_actor,
@@ -1163,7 +1164,8 @@ class WebsochatCharacterEntryContextRefreshTests(unittest.IsolatedAsyncioTestCas
 
         self.assertEqual(result["data"]["sessionId"], 77)
         self.assertEqual(result["data"]["selectedModelKey"], "deep")
-        create_params = db.execute.await_args_list[0].args[1]
+        create_call = next(call for call in db.execute.await_args_list if "INSERT INTO tb_story_agent_session" in str(call.args[0]))
+        create_params = create_call.args[1]
         self.assertEqual(
             json.loads(create_params["session_memory_json"])["selected_model_key"],
             "deep",

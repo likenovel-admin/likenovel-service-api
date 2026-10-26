@@ -11,7 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy.exc import InvalidRequestError, OperationalError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
 
 
 class AiReaderAgentPhase1Test(unittest.TestCase):
@@ -333,13 +333,14 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
         class FakeResponse:
             status_code = 200
+            extensions = {}
 
             def json(self):
                 return {
                     "choices": [
                         {
                             "finish_reason": "stop",
-                            "message": {"content": raw_decision},
+                            "finish_reason": "stop", "message": {"content": raw_decision},
                         }
                     ],
                     "usage": {
@@ -485,7 +486,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
         with patch.object(
             service,
-            "post_openrouter_background_chat_completion_async",
+            "post_model_chat_completion_async",
             AsyncMock(return_value=FakeResponse()),
         ):
             with self.assertRaises(OpenRouterBackgroundCreditReserveError):
@@ -510,6 +511,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
 
         class FakeResponse:
             status_code = 200
+            extensions = {}
 
             def __init__(self, payload):
                 self._payload = payload
@@ -553,7 +555,7 @@ class AiReaderAgentPhase1Test(unittest.TestCase):
                         "choices": [
                             {
                                 "finish_reason": "stop",
-                                "message": {"content": raw_decision},
+                                "finish_reason": "stop", "message": {"content": raw_decision},
                             }
                         ],
                         "usage": {
@@ -5977,6 +5979,16 @@ class AiReaderAdminScheduleOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["schedule_count"], 2)
 
 
+def _allow_reader_model_config_reads(db):
+    execute = db.execute
+    async def read(statement, *args, **kwargs):
+        sql = str(statement)
+        if "FROM tb_ai_model_config" in sql or "SELECT input_snapshot_json, model_name" in sql:
+            return AiReaderSessionPlannerTest._FakeMappingsResult([])
+        return await execute(statement, *args, **kwargs)
+    db.execute = AsyncMock(side_effect=read)
+
+
 class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
     class _FakeMappingsResult:
         def __init__(self, rows, rowcount=1, inserted_primary_key=None, lastrowid=None):
@@ -6949,6 +6961,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             activity_pattern_json='{"active_hours": [20, 21]}',
         )
 
+        _allow_reader_model_config_reads(db)
         result = await service.process_reader_session_decision(
             session,
             db,
@@ -7098,6 +7111,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             activity_pattern_json="{}",
         )
 
+        _allow_reader_model_config_reads(db)
         result = await service.process_reader_session_decision(
             session,
             db,
@@ -7182,6 +7196,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(service.InvalidReaderSessionError):
+            _allow_reader_model_config_reads(db)
             await service.process_reader_session_decision(session, db, llm_call=fake_llm)
 
         self.assertEqual(events, [])
@@ -7194,10 +7209,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             self._FakeMappingsResult(
                 [{"daily_llm_budget": 2, "used_llm_count": 1}]
             ),
-            self._FakeMappingsResult([], rowcount=2, inserted_primary_key=[], lastrowid=91),
-            self._FakeMappingsResult(
-                [{"ai_reader_llm_decision_id": 91, "decision_status": "success"}]
-            ),
+            IntegrityError("insert", {}, Exception(1062, "duplicate decision")),
         ]
         session = service.ReaderClaimedSession(
             ai_reader_schedule_id=1,
@@ -7222,7 +7234,8 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
 
         reserve_call = db.execute.await_args_list[1]
         reserve_sql = str(reserve_call.args[0])
-        self.assertIn("last_insert_id(ai_reader_llm_decision_id)", reserve_sql.lower())
+        self.assertNotIn("on duplicate key update", reserve_sql.lower())
+        self.assertEqual(db.execute.await_count, 2)
         self.assertNotIn("decision_status = 'pending'", reserve_sql)
         self.assertNotIn("decision_json = null", reserve_sql)
         self.assertNotIn("error_message = null", reserve_sql)
@@ -7261,7 +7274,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         reserve_params = db.execute.await_args_list[1].args[1]
         self.assertEqual(reserve_params["model_name"], "deepseek/deepseek-v3.2")
 
-    async def test_reserve_reader_llm_decision_reuses_existing_pending_session_audit_when_budget_is_exhausted(self):
+    async def test_reserve_reader_llm_decision_blocks_existing_pending_when_budget_is_exhausted(self):
         from app.services.ai import reader_agent_session_service as service
 
         db = AsyncMock()
@@ -7290,14 +7303,14 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             claimed_session_no=2,
         )
 
-        llm_decision_id = await service.reserve_reader_llm_decision(
-            session=session,
-            snapshot=snapshot,
-            db=db,
-        )
+        with self.assertRaisesRegex(service.ReaderLlmDecisionAlreadyReservedError, "recovery_required"):
+            await service.reserve_reader_llm_decision(
+                session=session,
+                snapshot=snapshot,
+                db=db,
+            )
         executed_sql = "\n".join(str(call.args[0]).lower() for call in db.execute.await_args_list)
 
-        self.assertEqual(llm_decision_id, 91)
         self.assertIn("session_id = :session_id", executed_sql)
         self.assertIn("request_hash = :request_hash", executed_sql)
         self.assertIn("decision_status = 'pending'", executed_sql)
@@ -7472,6 +7485,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(decision_service.InvalidReaderDecisionError):
+            _allow_reader_model_config_reads(db)
             await service.process_reader_session_decision(session, db, llm_call=fake_llm)
 
         self.assertEqual(
@@ -7601,6 +7615,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             activity_pattern_json='{"active_hours": [20, 21]}',
         )
 
+        _allow_reader_model_config_reads(db)
         result = await service.process_claimed_reader_session(
             session,
             db,
@@ -7705,6 +7720,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             ) as persist_decision,
         ):
             with self.assertRaises(service.InvalidReaderSessionError) as raised:
+                _allow_reader_model_config_reads(db)
                 await service._process_reader_session_decision(
                     session,
                     db,
@@ -7806,6 +7822,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             ) as persist_decision,
         ):
             with self.assertRaises(service.InvalidReaderSessionError) as raised:
+                _allow_reader_model_config_reads(db)
                 await service._process_reader_session_decision(
                     session,
                     db,
@@ -7935,6 +7952,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             activity_pattern_json="{}",
         )
 
+        _allow_reader_model_config_reads(db)
         result = await service.process_reader_session_decision(
             session,
             db,
@@ -8809,6 +8827,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             activity_pattern_json="{}",
         )
 
+        _allow_reader_model_config_reads(db)
         result = await service.process_claimed_reader_session(
             session,
             db,
@@ -8830,6 +8849,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             events.append(f"failed:{schedule_id}:{worker_id}:{error_message}")
 
         with self.assertRaises(RuntimeError):
+            _allow_reader_model_config_reads(db)
             await service.process_claimed_reader_session(
                 session,
                 db,
@@ -8879,6 +8899,7 @@ class AiReaderSessionPlannerTest(unittest.IsolatedAsyncioTestCase):
             activity_pattern_json="{}",
         )
 
+        _allow_reader_model_config_reads(db)
         result = await service.process_claimed_reader_session(
             session,
             db,

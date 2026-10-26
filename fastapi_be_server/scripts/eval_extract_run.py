@@ -90,7 +90,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--deepseek-model",
-        help="지정 시 OpenRouter에서 해당 DeepSeek 모델로 호출(예: deepseek-v4-pro). "
+        help="지정 시 OpenRouter에서 해당 DeepSeek 모델로 호출(예: deepseek-v4.1-flash-1017). "
         "OPENROUTER_API_KEY 필요",
     )
     parser.add_argument(
