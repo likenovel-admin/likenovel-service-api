@@ -126,6 +126,11 @@ before apply. A process restart during generation can leave a `generating`
 receipt; it must be reported as interrupted, not as success or no candidates.
 Do not clear an uncertain `applying` receipt and blindly rerun a write.
 
+The historical title-specific retention exception for product 1238 was
+explicitly withdrawn by the owner on 2026-10-26. It is no longer hard-coded:
+that work follows the same eligibility, capacity and newest-first rules as
+other free-new works. This removes only that obsolete exception.
+
 ## Cutover gates
 
 1. Run `python -m unittest discover -s tests -p test_likenovel_mcp.py -v`,
