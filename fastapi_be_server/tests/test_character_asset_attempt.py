@@ -34,6 +34,9 @@ class ReceiptCursor:
         pass
 
     def execute(self, sql, params=()):
+        if "information_schema.statistics" in sql:
+            self.result = {"non_unique": 0}
+            return
         if "WHERE 1 = 0" in sql:
             return
         if sql.lstrip().startswith("SELECT"):
@@ -42,6 +45,8 @@ class ReceiptCursor:
             key = tuple(params[:4])
             if key in self.conn.rows:
                 raise pymysql.err.IntegrityError(1062, "duplicate")
+            if any(other[:3] == key[:3] and row["status"] == "inflight" for other, row in self.conn.rows.items()):
+                raise pymysql.err.IntegrityError(1062, "inflight scope duplicate")
             self.conn.rows[key] = {"status": "inflight", "accepted_payload": None, "payload_hash": None, "error_code": None}
             self.rowcount = 1
         elif sql.lstrip().startswith("UPDATE"):
@@ -105,6 +110,30 @@ def test_hash_uses_request_not_surrogate_or_execution_mode():
     assert key == attempt_key(10, "signals", "episode:1", "v5", {"a": 1, "b": 2})
     assert key != attempt_key(10, "signals", "episode:1", "v6", {"a": 1, "b": 2})
     assert key != attempt_key(10, "signals", "episode:1", "v5", {"a": 2, "b": 2})
+
+
+def test_unresolved_scope_blocks_a_different_model_without_erasing_receipt():
+    db = ReceiptConnection()
+    store = CharacterAssetAttemptStore(db)
+    first = attempt_key(10, "signals", "episode:1", "v5", {"model": "old"})
+    second = attempt_key(10, "signals", "episode:1", "v5", {"model": "new"})
+    store.claim(first)
+    with pytest.raises(CharacterAssetAttemptBlocked, match="duplicate_claim"):
+        store.claim(second)
+    assert list(db.rows) == [first]
+    assert db.rows[first]["status"] == "inflight"
+
+
+def test_confirmed_terminal_receipt_does_not_block_a_new_model_request():
+    db = ReceiptConnection()
+    store = CharacterAssetAttemptStore(db)
+    first = attempt_key(10, "signals", "episode:1", "v5", {"model": "old"})
+    second = attempt_key(10, "signals", "episode:1", "v5", {"model": "new"})
+    store.claim(first)
+    store.reject(first, "invalid_json")
+    store.claim(second)
+    assert db.rows[first]["status"] == "terminal_invalid"
+    assert db.rows[second]["status"] == "inflight"
 
 
 class CharacterAssetHTTPTests(IsolatedAsyncioTestCase):

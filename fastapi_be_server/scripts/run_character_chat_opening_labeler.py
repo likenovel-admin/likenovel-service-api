@@ -7,11 +7,21 @@ import json
 import os
 import re
 import signal
+import sys
+from dataclasses import replace
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pymysql
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+from app.const import settings
+from app.services.common.ai_model_config import get_model_binding, load_ai_model_snapshot_sync, use_ai_model_snapshot
+from app.services.common.ai_model_gateway import post_model_chat_completion
 
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -757,8 +767,10 @@ def request_openrouter_label(
     model: str,
     row: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    response = client.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
+    binding = get_model_binding("character.opening_label", default_model=model)
+    response = post_model_chat_completion(
+        client, feature_key="character.opening_label",
+        base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY,
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
@@ -766,7 +778,7 @@ def request_openrouter_label(
             "X-Title": "LikeNovel Character Chat Opening Labeler",
         },
         json={
-            "model": model,
+            "model": binding.model_id,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": build_user_prompt(row)},
@@ -774,24 +786,31 @@ def request_openrouter_label(
             "temperature": 0.1,
             "max_tokens": MAX_OUTPUT_TOKENS,
             "response_format": {"type": "json_object"},
+            "provider": {"require_parameters": True},
         },
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     raw_payload = response.json()
+    choices = raw_payload.get("choices")
+    if not isinstance(choices, list) or not choices or choices[0].get("finish_reason") != "stop":
+        raise LabelParseError("incomplete model response", "")
     raw_text = extract_openrouter_message_text(raw_payload)
     try:
         parsed = extract_json_object(raw_text)
     except Exception as exc:
         raise LabelParseError(str(exc), raw_text) from exc
-    return parsed, raw_payload.get("usage") or {}
+    usage = dict(raw_payload.get("usage") or {})
+    if isinstance(response.extensions.get("ai_route"), dict):
+        usage["ai_route"] = dict(response.extensions["ai_route"])
+    return parsed, usage
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="캐릭터챗 opening labeler 실행")
     parser.add_argument("--input", required=True, help="build_character_chat_opening_label_inputs.py JSONL")
     parser.add_argument("--output", required=True, help="라벨 결과 JSONL")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", default=None, help="명시하면 이번 수동 작업만 OpenRouter 모델 override; 생략 시 CMS 설정")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--offset", type=int, default=0, help="입력 JSONL 앞에서 N줄 건너뛰기")
     parser.add_argument("--sleep", type=float, default=0.2)
@@ -819,7 +838,7 @@ def main() -> int:
                     "mode": "dry_run",
                     "input": args.input,
                     "output": args.output,
-                    "model": args.model,
+                    "model": args.model or DEFAULT_MODEL,
                     "offset": args.offset,
                     "inputRows": len(rows),
                     "firstPromptChars": len(build_user_prompt(rows[0])) if rows else 0,
@@ -837,6 +856,29 @@ def main() -> int:
     if not OPENROUTER_API_KEY:
         raise SystemExit("OPENROUTER_API_KEY is required unless --dry-run is set")
 
+    connection = pymysql.connect(
+        host=os.getenv("BATCH_DB_HOST", os.getenv("DB_IP", settings.DB_IP)),
+        port=int(os.getenv("BATCH_DB_PORT", os.getenv("DB_PORT", str(settings.DB_PORT)))),
+        user=os.getenv("BATCH_DB_USER", os.getenv("DB_USER_ID", settings.DB_USER_ID)),
+        password=os.getenv("BATCH_DB_PASSWORD", os.getenv("DB_USER_PW", settings.DB_USER_PW)),
+        database=os.getenv("BATCH_DB_NAME", "likenovel"),
+        charset="utf8mb4", autocommit=True, connect_timeout=5,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        snapshot = load_ai_model_snapshot_sync(connection)
+    finally:
+        connection.close()
+    if args.model:
+        snapshot = {**snapshot, "character.opening_label": replace(
+            snapshot["character.opening_label"], model_id=args.model, billing_route="openrouter", revision=0,
+        )}
+    with use_ai_model_snapshot(snapshot):
+        args.model = get_model_binding("character.opening_label").model_id
+        return _run_label_jobs(args, rows)
+
+
+def _run_label_jobs(args, rows) -> int:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     existing_by_file = load_existing_results(out_path) if args.resume else {}

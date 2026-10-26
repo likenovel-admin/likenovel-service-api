@@ -21,6 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.log_config import service_error_logger
 from app.const import LOGGER_TYPE, settings
 from app.exceptions import CustomResponseException
+from app.services.common.ai_model_config import (
+    get_model_binding, has_ai_model_snapshot, load_ai_model_snapshot, use_ai_model_snapshot,
+)
+from app.services.common.ai_model_gateway import post_model_chat_completion_async
 from app.utils.query import get_file_path_sub_query
 import app.services.ai.recommendation_service as recommendation_service
 
@@ -519,6 +523,73 @@ async def _result_mappings_first(result: Any) -> Any:
     return row
 
 
+def _anthropic_messages_to_chat_messages(system_prompt: str, messages: list[dict]) -> list[dict]:
+    """Translate the existing librarian tool history without changing tool IDs."""
+    converted = [{"role": "system", "content": system_prompt}]
+    for message in messages:
+        role = message["role"]
+        content = message.get("content", "")
+        if isinstance(content, str):
+            converted.append({"role": role, "content": content})
+            continue
+        texts = []
+        tool_calls = []
+        tool_results = []
+        for block in content:
+            kind = block.get("type")
+            if kind == "text":
+                texts.append(str(block.get("text") or ""))
+            elif kind == "tool_use" and role == "assistant":
+                tool_calls.append({"id": block["id"], "type": "function", "function": {
+                    "name": block["name"], "arguments": json.dumps(block["input"], ensure_ascii=False),
+                }})
+            elif kind == "tool_result" and role == "user":
+                result = block.get("content", "")
+                if isinstance(result, list):
+                    if any(item.get("type") != "text" for item in result):
+                        raise ValueError("unsupported librarian tool result content")
+                    result = "\n".join(str(item.get("text") or "") for item in result)
+                if not isinstance(result, str):
+                    result = json.dumps(result, ensure_ascii=False)
+                if block.get("is_error"):
+                    result = json.dumps({"is_error": True, "content": result}, ensure_ascii=False)
+                tool_results.append({"role": "tool", "tool_call_id": block["tool_use_id"], "content": result})
+            else:
+                raise ValueError("unsupported librarian message block")
+        converted.extend(tool_results)
+        if texts or tool_calls:
+            row = {"role": role, "content": "\n".join(texts) or None}
+            if tool_calls:
+                row["tool_calls"] = tool_calls
+            converted.append(row)
+    return converted
+
+
+def _chat_response_to_anthropic(payload: dict) -> dict:
+    """Keep the existing tool executor's input contract; reject incomplete JSON."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError("librarian response missing choice")
+    choice = choices[0]
+    if choice.get("finish_reason") not in {"stop", "tool_calls"}:
+        raise ValueError("librarian response is incomplete")
+    message = choice.get("message") or {}
+    content = []
+    if message.get("content"):
+        if not isinstance(message["content"], str):
+            raise ValueError("librarian response text is invalid")
+        content.append({"type": "text", "text": message["content"]})
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        arguments = json.loads(function.get("arguments") or "")
+        if not isinstance(arguments, dict) or not call.get("id") or not function.get("name"):
+            raise ValueError("librarian tool arguments must be a JSON object")
+        content.append({"type": "tool_use", "id": call["id"], "name": function["name"], "input": arguments})
+    if not content:
+        raise ValueError("librarian response is empty")
+    return {"content": content, "stop_reason": "tool_use" if message.get("tool_calls") else "end_turn"}
+
+
 async def _call_claude_messages(
     *,
     system_prompt: str,
@@ -528,6 +599,43 @@ async def _call_claude_messages(
     max_tokens: int = 1024,
     timeout_seconds: float = 35.0,
 ) -> dict:
+    binding = get_model_binding("ai_chat.tools", default_model=settings.ANTHROPIC_MODEL, default_route="anthropic")
+    if binding.billing_route != "anthropic":
+        if binding.billing_route == "hive":
+            raise ValueError("Hive is not enabled for librarian tool JSON")
+        payload: dict[str, Any] = {
+            "model": binding.model_id, "max_tokens": max_tokens,
+            "messages": _anthropic_messages_to_chat_messages(system_prompt, messages),
+            "reasoning": {"effort": "none", "exclude": True},
+        }
+        if tools:
+            payload["tools"] = [{"type": "function", "function": {
+                "name": tool["name"], "description": tool.get("description", ""),
+                "parameters": tool["input_schema"],
+            }} for tool in tools]
+        if tool_choice:
+            kind = tool_choice.get("type")
+            if kind == "tool":
+                payload["tool_choice"] = {"type": "function", "function": {"name": tool_choice["name"]}}
+            elif kind in {"auto", "any", "none"}:
+                payload["tool_choice"] = "required" if kind == "any" else kind
+            else:
+                raise ValueError("unsupported librarian tool choice")
+            if "disable_parallel_tool_use" in tool_choice:
+                payload["parallel_tool_calls"] = not tool_choice["disable_parallel_tool_use"]
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await post_model_chat_completion_async(
+                client, feature_key="ai_chat.tools", base_url=settings.OPENROUTER_BASE_URL,
+                api_key=settings.OPENROUTER_API_KEY,
+                headers={"Content-Type": "application/json", "X-Title": "LikeNovel AI Librarian"},
+                json=payload, background=False,
+            )
+        if response.status_code != 200:
+            raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, message="AI 서비스 호출에 실패했습니다.")
+        try:
+            return _chat_response_to_anthropic(response.json())
+        except (ValueError, TypeError, KeyError) as exc:
+            raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, message="AI 도구 응답 형식을 확인하지 못했습니다.") from exc
     if not settings.ANTHROPIC_API_KEY:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -535,7 +643,7 @@ async def _call_claude_messages(
         )
 
     payload: dict[str, Any] = {
-        "model": settings.ANTHROPIC_MODEL,
+        "model": binding.model_id,
         "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": messages,
@@ -585,6 +693,26 @@ async def _call_gemini_text(
     temperature: float = 1.0,
     timeout_seconds: float = 45.0,
 ) -> str:
+    binding = get_model_binding("ai_chat.answer", default_model=settings.AI_CHAT_GEMINI_MODEL, default_route="gemini")
+    if binding.billing_route != "gemini":
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await post_model_chat_completion_async(
+                client, feature_key="ai_chat.answer", base_url=settings.OPENROUTER_BASE_URL,
+                api_key=settings.OPENROUTER_API_KEY,
+                headers={"Content-Type": "application/json", "X-Title": "LikeNovel AI Librarian Answer"},
+                json={"model": binding.model_id, "max_tokens": max_tokens, "temperature": temperature,
+                      "reasoning": {"effort": "none", "exclude": True},
+                      "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]},
+                background=False,
+            )
+        if response.status_code != 200:
+            raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, message="AI 서비스 호출에 실패했습니다.")
+        payload = response.json()
+        choices = payload.get("choices") or []
+        reply = str((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+        if not reply:
+            raise CustomResponseException(status_code=status.HTTP_502_BAD_GATEWAY, message="AI 서비스 응답이 비어 있습니다.")
+        return reply
     if not settings.GEMINI_API_KEY:
         raise CustomResponseException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -604,7 +732,7 @@ async def _call_gemini_text(
     }
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         response = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.AI_CHAT_GEMINI_MODEL}:generateContent",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{binding.model_id}:generateContent",
             headers={
                 "content-type": "application/json",
                 "x-goog-api-key": settings.GEMINI_API_KEY,
@@ -2055,6 +2183,11 @@ async def handle_chat(
     adult_yn: str,
     db: AsyncSession,
 ) -> dict:
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await handle_chat(kc_user_id=kc_user_id, messages=messages, context=context,
+                                     preset=preset, exclude_ids=exclude_ids, adult_yn=adult_yn, db=db)
     normalized_adult = _normalize_adult_yn(adult_yn)
     normalized_preset = str(preset or "").strip() or None
 

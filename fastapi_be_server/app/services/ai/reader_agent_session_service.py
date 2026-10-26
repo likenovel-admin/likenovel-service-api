@@ -10,6 +10,11 @@ from typing import Any, Awaitable, Callable
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
+
+from app.services.common.ai_model_config import (
+    AiModelBinding, get_model_binding, load_ai_model_snapshot, use_ai_model_snapshot,
+)
 
 from app.const import settings
 from app.services.ai import reader_agent_action_service as action_service
@@ -1046,6 +1051,38 @@ async def mark_reader_session_failed(
     _ensure_rows_changed(result, "mark_reader_session_failed", 1)
 
 
+async def _reader_model_snapshot(session: ReaderClaimedSession, db: AsyncSession):
+    snapshot = dict(await load_ai_model_snapshot(db))
+    result = await db.execute(
+        text("""SELECT input_snapshot_json, model_name
+                FROM tb_ai_reader_llm_decision
+                WHERE ai_reader_agent_id = :agent_id AND user_id = :user_id
+                  AND session_id = :session_id AND decision_status = 'pending'
+                ORDER BY ai_reader_llm_decision_id DESC LIMIT 1"""),
+        {"agent_id": session.ai_reader_agent_id, "user_id": session.user_id,
+         "session_id": _reader_session_id(session)},
+    )
+    row = result.mappings().one_or_none()
+    stored = None
+    if row is not None:
+        stored = row["input_snapshot_json"]
+        stored = json.loads(stored) if isinstance(stored, str) else stored
+        if not isinstance(stored, dict):
+            raise ReaderLlmDecisionAlreadyReservedError("recovery_required:reader_pending_snapshot_invalid")
+        binding = stored.get("ai_model_binding") if isinstance(stored, dict) else None
+        if binding is not None:
+            restored = AiModelBinding(**binding)
+            if restored.feature_key != "ai_reader.decision":
+                raise InvalidReaderSessionError("reader model snapshot feature mismatch")
+            snapshot["ai_reader.decision"] = restored
+        elif row.get("model_name"):
+            # Existing pending decisions predate model settings and used OpenRouter.
+            snapshot["ai_reader.decision"] = AiModelBinding(
+                "ai_reader.decision", str(row["model_name"]), "openrouter", 0,
+            )
+    return snapshot, stored
+
+
 async def process_reader_session_decision(
     session: ReaderClaimedSession,
     db: AsyncSession,
@@ -1063,7 +1100,25 @@ async def _process_reader_session_decision(
     worker_id: str | None = None,
     post_success: PostSuccessFunc | None = None,
 ) -> ReaderSessionDecisionResult:
+    model_snapshot, persisted_snapshot = await _reader_model_snapshot(session, db)
+    if persisted_snapshot is not None:
+        raise ReaderLlmDecisionAlreadyReservedError("recovery_required:reader_pending_decision")
+    with use_ai_model_snapshot(model_snapshot):
+        return await _process_reader_session_decision_pinned(
+            session, db, llm_call=llm_call, worker_id=worker_id, post_success=post_success,
+        )
+
+
+async def _process_reader_session_decision_pinned(
+    session: ReaderClaimedSession,
+    db: AsyncSession,
+    *,
+    llm_call: decision_service.ReaderLlmCall | None = None,
+    worker_id: str | None = None,
+    post_success: PostSuccessFunc | None = None,
+) -> ReaderSessionDecisionResult:
     snapshot = await build_reader_decision_snapshot(session, db)
+    snapshot["ai_model_binding"] = asdict(get_model_binding("ai_reader.decision"))
     await _commit_active_transaction(db)
 
     async with _transaction_scope(db):
@@ -1135,6 +1190,7 @@ async def _process_reader_session_decision(
                     llm_decision_id=llm_decision_id,
                     decision=llm_decision,
                     usage=llm_usage,
+                    model_routes=llm_result.model_routes,
                 )
                 result = await persist_reader_session_decision(
                     session=session,
@@ -1150,6 +1206,7 @@ async def _process_reader_session_decision(
                 llm_decision_id=llm_decision_id,
                 decision=llm_decision,
                 usage=llm_usage,
+                model_routes=llm_result.model_routes,
             )
             result = await persist_reader_session_decision(
                 session=session,
@@ -1224,7 +1281,21 @@ async def prepare_reader_session_decision(
     *,
     llm_call: decision_service.ReaderLlmCall | None = None,
 ) -> ReaderPreparedSessionDecision:
+    model_snapshot, persisted_snapshot = await _reader_model_snapshot(session, db)
+    if persisted_snapshot is not None:
+        raise ReaderLlmDecisionAlreadyReservedError("recovery_required:reader_pending_decision")
+    with use_ai_model_snapshot(model_snapshot):
+        return await _prepare_reader_session_decision_pinned(session, db, llm_call=llm_call)
+
+
+async def _prepare_reader_session_decision_pinned(
+    session: ReaderClaimedSession,
+    db: AsyncSession,
+    *,
+    llm_call: decision_service.ReaderLlmCall | None = None,
+) -> ReaderPreparedSessionDecision:
     snapshot = await build_reader_decision_snapshot(session, db)
+    snapshot["ai_model_binding"] = asdict(get_model_binding("ai_reader.decision"))
     llm_decision = await decision_service.request_reader_decision(
         snapshot,
         llm_call=llm_call,
@@ -2560,54 +2631,60 @@ async def reserve_reader_llm_decision(
             db=db,
         )
         if existing_pending_id is not None:
-            return existing_pending_id
+            raise ReaderLlmDecisionAlreadyReservedError(
+                f"recovery_required:reader_pending_decision:{existing_pending_id}"
+            )
         raise InvalidReaderSessionError("daily llm budget exceeded")
 
     snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-    result = await db.execute(
-        text("""
-            insert into tb_ai_reader_llm_decision
-                (
-                    ai_reader_agent_id,
-                    user_id,
-                    session_id,
-                    product_id,
-                    episode_id,
-                    prompt_version,
-                    model_name,
-                    request_hash,
-                    input_snapshot_json,
-                    decision_status
-                )
-            values
-                (
-                    :ai_reader_agent_id,
-                    :user_id,
-                    :session_id,
-                    :product_id,
-                    :episode_id,
-                    :prompt_version,
-                    :model_name,
-                    :request_hash,
-                    :input_snapshot_json,
-                    'pending'
-                )
-            on duplicate key update
-                ai_reader_llm_decision_id = last_insert_id(ai_reader_llm_decision_id),
-                updated_date = updated_date
-        """),
-        {
-            "ai_reader_agent_id": session.ai_reader_agent_id,
-            "user_id": session.user_id,
-            "session_id": _reader_session_id(session),
-            "product_id": snapshot["product"]["product_id"],
-            "episode_id": snapshot["episode"]["episode_id"],
-            "prompt_version": decision_service.READER_DECISION_PROMPT_VERSION,
-            "model_name": decision_service.reader_llm_model_name(),
-            "request_hash": request_hash,
-            "input_snapshot_json": snapshot_json,
-        },
-    )
+    try:
+        result = await db.execute(
+            text("""
+                insert into tb_ai_reader_llm_decision
+                    (
+                        ai_reader_agent_id,
+                        user_id,
+                        session_id,
+                        product_id,
+                        episode_id,
+                        prompt_version,
+                        model_name,
+                        request_hash,
+                        input_snapshot_json,
+                        decision_status
+                    )
+                values
+                    (
+                        :ai_reader_agent_id,
+                        :user_id,
+                        :session_id,
+                        :product_id,
+                        :episode_id,
+                        :prompt_version,
+                        :model_name,
+                        :request_hash,
+                        :input_snapshot_json,
+                        'pending'
+                    )
+            """),
+            {
+                "ai_reader_agent_id": session.ai_reader_agent_id,
+                "user_id": session.user_id,
+                "session_id": _reader_session_id(session),
+                "product_id": snapshot["product"]["product_id"],
+                "episode_id": snapshot["episode"]["episode_id"],
+                "prompt_version": decision_service.READER_DECISION_PROMPT_VERSION,
+                "model_name": (snapshot.get("ai_model_binding") or {}).get("model_id") or decision_service.reader_llm_model_name(),
+                "request_hash": request_hash,
+                "input_snapshot_json": snapshot_json,
+            },
+        )
+    except IntegrityError as exc:
+        if getattr(exc.orig, "args", (None,))[0] != 1062:
+            raise
+        raise ReaderLlmDecisionAlreadyReservedError(
+            "recovery_required:reader_decision_reservation_conflict"
+        ) from exc
     llm_decision_id = _resolve_inserted_primary_key(
         result,
         "reserve_reader_llm_decision",
@@ -2619,7 +2696,9 @@ async def reserve_reader_llm_decision(
             db=db,
         )
         if existing_pending_id is not None:
-            return existing_pending_id
+            raise ReaderLlmDecisionAlreadyReservedError(
+                f"recovery_required:reader_pending_decision:{existing_pending_id}"
+            )
         raise ReaderLlmDecisionAlreadyReservedError(
             f"llm decision already reserved: {llm_decision_id}"
         )
@@ -2665,8 +2744,12 @@ async def mark_reader_llm_decision_succeeded(
     llm_decision_id: int,
     decision: decision_service.ReaderLlmDecision,
     usage: decision_service.ReaderLlmUsage | None = None,
+    model_routes: tuple[dict[str, Any], ...] = (),
 ) -> None:
-    decision_json = json.dumps(asdict(decision), ensure_ascii=False, sort_keys=True)
+    decision_payload = asdict(decision)
+    if model_routes:
+        decision_payload["_ai_model_routes"] = list(model_routes)
+    decision_json = json.dumps(decision_payload, ensure_ascii=False, sort_keys=True)
     result = await db.execute(
         text("""
             update tb_ai_reader_llm_decision
@@ -2778,7 +2861,7 @@ async def _save_reader_llm_decision(
             "product_id": snapshot["product"]["product_id"],
             "episode_id": snapshot["episode"]["episode_id"],
             "prompt_version": decision_service.READER_DECISION_PROMPT_VERSION,
-            "model_name": decision_service.reader_llm_model_name(),
+            "model_name": (snapshot.get("ai_model_binding") or {}).get("model_id") or decision_service.reader_llm_model_name(),
             "request_hash": request_hash,
             "input_snapshot_json": snapshot_json,
             "decision_json": decision_json,

@@ -69,6 +69,7 @@ jobs:
       - name: Write .env.production (PROD)
         run: |
           printf '%s' "${{ secrets.BACKEND_ENV_PROD }}" | tr -d '\r' > .env.production
+          printf '\nAI_PROVIDER_ACCOUNTS_FILE=/home/ln-admin/.config/likenovel/ai-provider-accounts.json\n' >> .env.production
         working-directory: ./fastapi_be_server/dist
 
       - name: Deploy with AWS codedeploy

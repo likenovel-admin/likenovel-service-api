@@ -533,7 +533,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
             with patch.object(module, "work_cursor", fake_work_cursor), \
                  patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
                  patch.object(module, "RP_OPENROUTER_MODEL", ""), \
-                 patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+                 patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
                  patch.object(module, "fetch_existing_summary", return_value=None), \
                  patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
                  patch.object(module, "request_episode_scene_extraction_payload", request_mock), \
@@ -577,7 +577,7 @@ class StoryAgentSceneExtractionTest(unittest.TestCase):
         async def run():
             with patch.object(module, "work_cursor", fake_work_cursor), \
                  patch.object(module, "OPENROUTER_API_KEY", "openrouter-key"), \
-                 patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4-pro"), \
+                 patch.object(module, "EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
                  patch.object(module, "fetch_existing_summary", return_value=None), \
                  patch.object(module, "fetch_active_summary_by_scope", return_value=None), \
                  patch.object(module, "request_episode_scene_extraction_payload", request_mock), \

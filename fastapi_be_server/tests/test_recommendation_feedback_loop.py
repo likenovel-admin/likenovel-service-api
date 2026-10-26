@@ -2,10 +2,23 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.ai import recommendation_service
 from app.schemas.ai_recommendation import PostAiSignalEventReqBody
+
+
+def _config_db():
+    db = AsyncMock()
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = []
+    async def execute(statement, params=None):
+        if "FROM tb_ai_model_config" not in str(statement):
+            raise AssertionError(f"Unexpected database read: {statement}")
+        return result
+
+    db.execute.side_effect = execute
+    return db
 
 
 class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
@@ -908,7 +921,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
                 preset="stacked-chapters",
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
             self.assertEqual(
@@ -1491,7 +1504,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
                 preset="completed",
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
         self.assertEqual(mocked_recommend.await_count, 1)
@@ -1537,7 +1550,7 @@ class RecommendationFeedbackLoopUnitTest(unittest.IsolatedAsyncioTestCase):
                 preset="completed",
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
                 context={"page_type": "home"},
             )
 

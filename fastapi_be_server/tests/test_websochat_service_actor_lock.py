@@ -1,7 +1,7 @@
 import json
 import unittest
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import status
 
@@ -24,6 +24,10 @@ class _FakeDb:
         self.authorization_query_count = 0
 
     async def execute(self, *args, **kwargs):
+        if args and "FROM tb_ai_model_config" in str(args[0]):
+            result = MagicMock()
+            result.mappings.return_value.all.return_value = []
+            return result
         self.next_lastrowid += 1
         self.executions.append((args, kwargs))
         statement = str(args[0]) if args else ""

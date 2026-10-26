@@ -13,6 +13,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.const import settings
+from app.services.common.ai_model_config import (
+    get_model_binding, has_ai_model_snapshot, load_ai_model_snapshot, use_ai_model_snapshot,
+)
+from app.services.common.ai_model_gateway import post_model_chat_completion_async
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +65,7 @@ def _provider_specs() -> list[ProviderSpec]:
         ),
         ProviderSpec(
             provider="openrouter_deepseek",
-            model=settings.AI_PROVIDER_HEALTH_OPENROUTER_DEEPSEEK_MODEL,
+            model=get_model_binding("provider_health.deepseek", default_model=settings.AI_PROVIDER_HEALTH_OPENROUTER_DEEPSEEK_MODEL).model_id,
             api_key=settings.OPENROUTER_API_KEY,
             base_url=settings.OPENROUTER_BASE_URL,
             affected_features="story_context,dna_fallback",
@@ -125,6 +129,10 @@ def classify_provider_exception(exc: Exception) -> dict[str, str | None]:
 
 
 async def run_ai_provider_health_checks(db: AsyncSession) -> dict[str, list[dict[str, Any]]]:
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await run_ai_provider_health_checks(db)
     results: list[dict[str, Any]] = []
     for spec in _provider_specs():
         result = await _check_provider(spec)
@@ -135,6 +143,10 @@ async def run_ai_provider_health_checks(db: AsyncSession) -> dict[str, list[dict
 
 
 async def get_ai_provider_health_summary(db: AsyncSession) -> list[dict[str, Any]]:
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await get_ai_provider_health_summary(db)
     latest_result = await db.execute(text("""
         SELECT h.provider,
                h.model,
@@ -187,7 +199,8 @@ async def get_ai_provider_health_summary(db: AsyncSession) -> list[dict[str, Any
 
 async def _check_provider(spec: ProviderSpec) -> dict[str, Any]:
     checked_at = datetime.now()
-    if not spec.api_key:
+    prepaid_probe = spec.provider == "openrouter_deepseek" and get_model_binding("provider_health.deepseek", default_model=spec.model).billing_route in {"hive", "river"}
+    if not spec.api_key and not prepaid_probe:
         return _health_result(
             spec=spec,
             status=NOT_CONFIGURED_STATUS,
@@ -288,6 +301,13 @@ async def _post_health_prompt(spec: ProviderSpec) -> httpx.Response:
                     "require_parameters": True,
                 }
 
+        if spec.provider == "openrouter_deepseek":
+            return await post_model_chat_completion_async(
+                client, feature_key="provider_health.deepseek", base_url=spec.base_url,
+                api_key=spec.api_key,
+                headers={"Content-Type": "application/json", "X-Title": "LikeNovel AI Provider Health"},
+                json=payload, background=False,
+            )
         return await client.post(
             _join_url(spec.base_url, "/chat/completions"),
             headers={

@@ -41,7 +41,7 @@ class FakeAsyncClient:
 
     async def post(self, url, **kwargs):
         self.__class__.calls.append({"url": url, **kwargs})
-        return FakeHealthResponse()
+        return httpx.Response(200, request=httpx.Request("POST", url))
 
 
 class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
@@ -72,6 +72,7 @@ class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_get_ai_provider_health_summary_returns_all_known_providers(self):
         db = AsyncMock()
         db.execute.side_effect = [
+            FakeResult([]),  # pinned model configuration
             FakeResult([
                 {
                     "provider": "gemini",
@@ -111,6 +112,7 @@ class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_health_check_records_not_configured_without_http_call(self):
         db = AsyncMock()
+        db.execute.return_value = FakeResult([])
 
         with (
             patch.object(ai_provider_health_service.settings, "GEMINI_API_KEY", ""),
@@ -123,7 +125,9 @@ class AiProviderHealthServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["results"]), 4)
         self.assertTrue(all(row["status"] == "not_configured" for row in result["results"]))
         post_prompt.assert_not_called()
-        self.assertEqual(db.execute.call_count, 4)
+        inserts = [call for call in db.execute.call_args_list if "INSERT INTO tb_ai_provider_health_check" in str(call.args[0])]
+        self.assertEqual(len(inserts), 4)
+        self.assertEqual(db.execute.call_count, 5)  # one snapshot read + four writes
         db.commit.assert_awaited()
 
     async def test_openrouter_health_payload_includes_reader_provider_only(self):

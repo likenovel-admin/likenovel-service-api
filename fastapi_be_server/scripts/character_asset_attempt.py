@@ -39,8 +39,17 @@ class CharacterAssetAttemptStore:
         self.connection = connection
         with connection.cursor() as cur:
             cur.execute("""SELECT product_id, stage_key, scope_key, input_hash, status,
-                accepted_payload, payload_hash, error_code
+                accepted_payload, payload_hash, error_code, inflight_scope_key
                 FROM tb_story_agent_character_asset_attempt WHERE 1 = 0""")
+            cur.execute("""SELECT NON_UNIQUE AS non_unique
+                FROM information_schema.statistics
+                WHERE table_schema=DATABASE()
+                  AND table_name='tb_story_agent_character_asset_attempt'
+                  AND index_name='uq_character_asset_inflight_scope'
+                  AND column_name='inflight_scope_key'""")
+            guard = cur.fetchone()
+            if guard is None or int(guard.get("non_unique", 1)) != 0:
+                raise CharacterAssetAttemptBlocked("character_asset_inflight_guard_missing")
 
     def load(self, key, validate: Callable[[object], dict]) -> dict | None:
         with self.connection.cursor() as cur:

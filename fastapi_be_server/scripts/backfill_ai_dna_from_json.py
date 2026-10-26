@@ -6,7 +6,7 @@ LLM 재호출이 없다. 적재 전 대상 product_id의 기존 행 전체를 JS
 
 기본은 dry-run(백업 + 적재 대상 카운트만). 실제 write는 --apply 필요.
 model_version은 실행 시점 env로 결정된 CURRENT_ANALYSIS_VERSION이 기록되므로,
-v4-pro env(AI_DNA_OPENROUTER_MODEL 등)를 export한 뒤 실행해야 한다.
+모델 env(AI_DNA_OPENROUTER_MODEL 등)를 확인한 뒤 실행해야 한다.
 
 사용:
   python3 backfill_ai_dna_from_json.py --input /tmp/eval_v4pro_backfill.json            # dry-run

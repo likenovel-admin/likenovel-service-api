@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import status
 from fastapi.security import HTTPAuthorizationCredentials
@@ -9,6 +9,19 @@ from app.routers.ai import ai_command
 from app.schemas.ai_recommendation import PostAiChatReqBody
 from app.services.ai import ai_chat_service
 from app.utils import auth as auth_utils
+
+
+def _config_db():
+    db = AsyncMock()
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = []
+    async def execute(statement, params=None):
+        if "FROM tb_ai_model_config" not in str(statement):
+            raise AssertionError(f"Unexpected database read: {statement}")
+        return result
+
+    db.execute.side_effect = execute
+    return db
 
 
 class _FakeMappings:
@@ -79,7 +92,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
             result = await ai_command.post_ai_chat(
                 req_body=req_body,
                 user={},
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
         self.assertEqual(result["data"]["reply"], "추천 후보를 찾았습니다.")
@@ -125,7 +138,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 preset=None,
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
         self.assertEqual(result["reply"], "조건을 조금 더 알려주시면 작품을 찾아볼게요.")
@@ -195,7 +208,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 preset=None,
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
         self.assertEqual(result["product"], focus_product)
@@ -294,7 +307,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 preset=None,
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
         self.assertEqual(result["product"]["productId"], 2020)
@@ -534,7 +547,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 preset=None,
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
         self.assertEqual(result["product"]["productId"], 2020)
@@ -655,7 +668,7 @@ class AiChatGuestAccessTests(unittest.IsolatedAsyncioTestCase):
                 preset=None,
                 exclude_ids=[],
                 adult_yn="N",
-                db=AsyncMock(),
+                db=_config_db(),
             )
 
         self.assertEqual(result["product"]["productId"], 2020)

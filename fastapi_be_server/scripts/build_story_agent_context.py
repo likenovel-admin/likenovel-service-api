@@ -22,7 +22,7 @@ import sys
 from collections import Counter
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable
@@ -38,6 +38,14 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.const import settings  # noqa: E402
+from app.services.common.ai_model_config import (  # noqa: E402
+    FLASH_1017_MODEL,
+    get_model_binding,
+    has_ai_model_snapshot,
+    load_ai_model_snapshot_sync,
+    use_ai_model_snapshot,
+)
+from app.services.common.ai_model_gateway import post_model_chat_completion_async  # noqa: E402
 from app.services.common import comm_service  # noqa: E402
 from app.services.common.ai_provider_usage import (  # noqa: E402
     AiProviderUsageAttempt,
@@ -49,8 +57,6 @@ from app.services.common.openrouter_background_credit_guard import (  # noqa: E4
     OpenRouterBackgroundCreditGuardError,
     OpenRouterBackgroundCreditReserveError,
     assert_openrouter_background_credit_available_async,
-    post_openrouter_background_chat_completion_async,
-    openrouter_background_credit_reservation_async,
 )
 from scripts.character_asset_attempt import (  # noqa: E402
     CharacterAssetAttemptBlocked, CharacterAssetAttemptStore, attempt_key,
@@ -119,7 +125,7 @@ EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_CHARACT
 WORK_PROTAGONIST_RESOLUTION_MAX_OUTPUT_TOKENS = 1200
 EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL = (
     os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL", "").strip()
-    or "deepseek/deepseek-v4-pro-0813"
+    or FLASH_1017_MODEL
 )
 EPISODE_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS = float(
     os.getenv("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_TIMEOUT_SECONDS", "60")
@@ -181,7 +187,7 @@ EPISODE_SCENE_EXTRACTION_MAX_INPUT_CHARS = int(os.getenv("STORY_AGENT_SCENE_EXTR
 EPISODE_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("STORY_AGENT_SCENE_EXTRACTION_MAX_OUTPUT_TOKENS", "5000"))
 EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL = (
     os.getenv("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL", "").strip()
-    or "deepseek/deepseek-v4-pro-0813"
+    or FLASH_1017_MODEL
 )
 EPISODE_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS = float(
     os.getenv("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_TIMEOUT_SECONDS", "120")
@@ -964,6 +970,19 @@ class StoryctxProviderAttempt:
     def observe_response(self, response: object) -> None:
         self.http_status = int(getattr(response, "status_code", 0) or 0) or None
         self.response_headers = getattr(response, "headers", None)
+        extensions = getattr(response, "extensions", None)
+        route = extensions.get("ai_route") if isinstance(extensions, dict) else None
+        if isinstance(route, dict):
+            self.attempt = replace(
+                self.attempt,
+                provider=str(route["provider"]),
+                requested_model=str(route["requested_model"]),
+            )
+            logger.info(
+                "storyctx_model_route stage=%s provider=%s account=%s model=%s revision=%s",
+                self.attempt.stage_key, route["provider"], route["account_alias"],
+                route["resolved_model"], route["config_revision"],
+            )
 
     def capture_response(self, response: object) -> dict[str, object]:
         self.observe_response(response)
@@ -1544,7 +1563,7 @@ def split_csv_values(value: str) -> list[str]:
 
 
 def require_paid_rp_openrouter_model() -> str:
-    model = str(RP_OPENROUTER_MODEL or "").strip()
+    model = get_model_binding("storyctx.rp", default_model=RP_OPENROUTER_MODEL).model_id.strip()
     if not model:
         raise RuntimeError("STORY_AGENT_RP_OPENROUTER_MODEL is empty")
     if model.lower().endswith(":free"):
@@ -1553,7 +1572,7 @@ def require_paid_rp_openrouter_model() -> str:
 
 
 def require_paid_character_signals_openrouter_model() -> str:
-    model = str(EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL or "").strip()
+    model = get_model_binding("storyctx.signals", default_model=EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL).model_id.strip()
     if not model:
         raise RuntimeError("STORY_AGENT_CHARACTER_SIGNALS_OPENROUTER_MODEL is empty")
     if model.lower().endswith(":free"):
@@ -1562,7 +1581,7 @@ def require_paid_character_signals_openrouter_model() -> str:
 
 
 def require_paid_episode_scene_extraction_openrouter_model() -> str:
-    model = str(EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL or "").strip()
+    model = get_model_binding("storyctx.scenes", default_model=EPISODE_SCENE_EXTRACTION_OPENROUTER_MODEL).model_id.strip()
     if not model:
         raise RuntimeError("STORY_AGENT_SCENE_EXTRACTION_OPENROUTER_MODEL is empty")
     if model.lower().endswith(":free"):
@@ -1668,18 +1687,40 @@ def build_episode_scene_extraction_openrouter_payload(*, user_prompt: str) -> di
     return payload
 
 
+def _require_complete_character_asset_response(payload: dict, *, provider: str) -> None:
+    if provider == "anthropic":
+        if payload.get("stop_reason") not in {"end_turn", "tool_use"}:
+            raise ValueError("character_asset_incomplete_response")
+        return
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError("character_asset_missing_choices")
+    if choices[0].get("finish_reason") != "stop":
+        raise ValueError("character_asset_incomplete_response")
+
+
 async def _request_character_asset_json(
     client, *, stage: str, scope: str, contract: str, request_payload: dict,
     validate, title: str, product_id: int | None = None,
     timeout: float | None = None, provider: str = "openrouter",
 ) -> dict:
-    """One physical request per durable input; serving promotion belongs to the caller."""
+    """Pin the logical request before lookup; claim immediately before submission."""
     store = _character_asset_attempt_store
     if store is None:
         raise CharacterAssetAttemptBlocked("character_asset_attempt_store_not_initialized")
+    feature_key = {
+        "signals": "storyctx.signals", "scenes": "storyctx.scenes",
+        "protagonist_resolution": "storyctx.protagonist",
+        "rp_profile": "storyctx.rp", "rp_dialogue": "storyctx.rp",
+    }[stage]
+    binding = get_model_binding(feature_key, default_model=request_payload["model"], default_route=provider)
+    request_payload = {**request_payload, "model": binding.model_id}
+    # Billing-account changes do not invalidate accepted receipts for the same
+    # logical OpenAI request. Native Anthropic uses a different request contract.
+    protocol = "anthropic" if binding.billing_route == "anthropic" else "openrouter"
     key = attempt_key(
         int(product_id or _character_asset_product_id.get()), stage, scope,
-        contract, {"provider": provider, "body": request_payload},
+        contract, {"provider": protocol, "body": request_payload},
     )
     cached = store.load(key, validate)
     if cached is not None:
@@ -1690,51 +1731,48 @@ async def _request_character_asset_json(
             "protagonist_resolution": "work_protagonist_resolution", "rp_dialogue": "rp_dialogue_collection",
         }.get(stage, stage), product_id=key[0], scope_key=scope,
     )
-    reservation = (
-        openrouter_background_credit_reservation_async(
-            client, base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY,
-            priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
-        ) if provider == "openrouter" else nullcontext()
-    )
-    async with reservation:
-        store.claim(key)
-        async with storyctx_provider_attempt(operation, provider=provider, model=str(request_payload["model"])) as usage:
-            try:
-                response = await asyncio.wait_for(
-                    client.post(
-                        f"{OPENROUTER_BASE_URL}/chat/completions" if provider == "openrouter" else "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                            "Content-Type": "application/json", "X-Title": title,
-                        } if provider == "openrouter" else {
-                            "x-api-key": settings.ANTHROPIC_API_KEY,
-                            "anthropic-version": "2023-06-01", "content-type": "application/json",
-                        },
-                        json=request_payload, timeout=timeout or RP_OPENROUTER_TIMEOUT_SECONDS,
-                    ), timeout=timeout or RP_OPENROUTER_TIMEOUT_SECONDS,
+    async with storyctx_provider_attempt(operation, provider=binding.billing_route, model=binding.model_id) as usage:
+        try:
+            if protocol == "anthropic":
+                store.claim(key)
+                pending = client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": settings.ANTHROPIC_API_KEY,
+                             "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json=request_payload, timeout=timeout or RP_OPENROUTER_TIMEOUT_SECONDS,
                 )
-                usage.observe_response(response)
-                response.raise_for_status()
-            except (asyncio.TimeoutError, HTTPStatusError, RequestError) as exc:
-                # Submit outcome is ambiguous: never delete/reset the durable claim.
-                usage.finish("provider_error", error_code=type(exc).__name__)
-                raise CharacterAssetAttemptBlocked("character_asset_attempt:inflight:transport_attention") from exc
-            try:
-                envelope = usage.capture_response(response)
-                parsed = (
-                    extract_json_object(extract_openrouter_message_text(envelope))
-                    if provider == "openrouter" else
-                    extract_anthropic_tool_input(envelope, tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME)
-                    or extract_json_object(extract_anthropic_message_text(envelope))
+            else:
+                pending = post_model_chat_completion_async(
+                    client, feature_key=feature_key,
+                    base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY,
+                    priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
+                    headers={"Content-Type": "application/json", "X-Title": title},
+                    json=request_payload, timeout=timeout or RP_OPENROUTER_TIMEOUT_SECONDS,
+                    before_submit=lambda: store.claim(key),
                 )
-                accepted = validate(parsed)
-            except (ValueError, TypeError, KeyError) as exc:
-                store.reject(key, str(exc) or type(exc).__name__)
-                usage.finish("validation_error", error_code=type(exc).__name__)
-                raise CharacterAssetAttemptBlocked("character_asset_attempt:terminal_invalid:contract") from exc
-            store.accept(key, accepted)
-            usage.finish("success")
-            return accepted
+            response = await asyncio.wait_for(pending, timeout=timeout or RP_OPENROUTER_TIMEOUT_SECONDS)
+            usage.observe_response(response)
+            response.raise_for_status()
+        except (asyncio.TimeoutError, HTTPStatusError, RequestError) as exc:
+            usage.finish("provider_error", error_code=type(exc).__name__)
+            raise CharacterAssetAttemptBlocked("character_asset_attempt:inflight:transport_attention") from exc
+        try:
+            envelope = usage.capture_response(response)
+            _require_complete_character_asset_response(envelope, provider=protocol)
+            parsed = (
+                extract_json_object(extract_openrouter_message_text(envelope))
+                if protocol == "openrouter" else
+                extract_anthropic_tool_input(envelope, tool_name=EPISODE_CHARACTER_SIGNALS_TOOL_NAME)
+                or extract_json_object(extract_anthropic_message_text(envelope))
+            )
+            accepted = validate(parsed)
+        except (ValueError, TypeError, KeyError) as exc:
+            store.reject(key, str(exc) or type(exc).__name__)
+            usage.finish("validation_error", error_code=type(exc).__name__)
+            raise CharacterAssetAttemptBlocked("character_asset_attempt:terminal_invalid:contract") from exc
+        store.accept(key, accepted)
+        usage.finish("success")
+        return accepted
 
 
 async def request_rp_openrouter_json_payload(
@@ -1752,7 +1790,7 @@ async def request_rp_openrouter_json_payload(
     scope_key: str | None = None,
 ) -> dict | None:
     request_timeout_seconds = timeout_seconds or RP_OPENROUTER_TIMEOUT_SECONDS
-    requested_model = model or RP_OPENROUTER_MODEL
+    requested_model = get_model_binding("storyctx.rp", default_model=model or RP_OPENROUTER_MODEL).model_id
     if stage_key == "rp_profile":
         def validate(payload):
             error = get_structured_payload_contract_error(payload, RP_PROFILE_RESPONSE_FORMAT["json_schema"]["schema"])
@@ -1781,8 +1819,9 @@ async def request_rp_openrouter_json_payload(
         model=requested_model,
     ) as usage:
         response = await asyncio.wait_for(
-            post_openrouter_background_chat_completion_async(
+            post_model_chat_completion_async(
                 client,
+                feature_key="storyctx.rp",
                 base_url=OPENROUTER_BASE_URL,
                 api_key=OPENROUTER_API_KEY,
                 priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
@@ -1805,6 +1844,7 @@ async def request_rp_openrouter_json_payload(
         usage.observe_response(response)
         response.raise_for_status()
         response_json = usage.capture_response(response)
+        _require_complete_character_asset_response(response_json, provider="openrouter")
         parsed = extract_json_object(extract_openrouter_message_text(response_json))
         usage.finish("success" if parsed else "parse_error")
         return parsed
@@ -1998,6 +2038,7 @@ async def request_episode_summary_text(
     row: dict,
     normalized_text: str,
 ) -> str:
+    binding = get_model_binding("storyctx.summary", default_model=EPISODE_SUMMARY_MODEL)
     operation = AiProviderUsageOperation(
         feature_key="storyctx",
         stage_key="episode_summary",
@@ -2008,10 +2049,11 @@ async def request_episode_summary_text(
     async with storyctx_provider_attempt(
         operation,
         provider="openrouter",
-        model=EPISODE_SUMMARY_MODEL,
+        model=binding.model_id,
     ) as usage:
-        response = await post_openrouter_background_chat_completion_async(
+        response = await post_model_chat_completion_async(
             client,
+            feature_key="storyctx.summary",
             base_url=OPENROUTER_BASE_URL,
             api_key=OPENROUTER_API_KEY,
             priority_headroom_usd=STORYCTX_OPENROUTER_PRIORITY_HEADROOM_USD,
@@ -2021,7 +2063,7 @@ async def request_episode_summary_text(
                 "X-Title": "LikeNovel Story Agent Episode Summary Batch",
             },
             json={
-                "model": EPISODE_SUMMARY_MODEL,
+                "model": binding.model_id,
                 "temperature": EPISODE_SUMMARY_TEMPERATURE,
                 "max_completion_tokens": EPISODE_SUMMARY_MAX_OUTPUT_TOKENS,
                 "messages": [
@@ -2051,6 +2093,13 @@ def is_anthropic_billing_error(exc: BaseException) -> bool:
 async def assert_storyctx_openrouter_apply_ready(client: AsyncClient | None) -> None:
     if client is None or not OPENROUTER_API_KEY or not (EPISODE_SUMMARY_MODEL or RP_OPENROUTER_MODEL):
         return
+    # Mixed/prepaid jobs are checked at the actual submission boundary. An
+    # exhausted OpenRouter reserve must not reject work served by a prepaid pool.
+    if has_ai_model_snapshot() and any(
+        get_model_binding(feature).billing_route != "openrouter"
+        for feature in ("storyctx.summary", "storyctx.signals", "storyctx.scenes", "storyctx.rp", "storyctx.protagonist")
+    ):
+        return
     await assert_openrouter_background_credit_available_async(
         client,
         base_url=OPENROUTER_BASE_URL,
@@ -2061,6 +2110,8 @@ async def assert_storyctx_openrouter_apply_ready(client: AsyncClient | None) -> 
 
 async def assert_storyctx_anthropic_apply_ready(client: AsyncClient | None) -> None:
     if client is None or not settings.ANTHROPIC_API_KEY or not RP_REASONING_MODEL:
+        return
+    if has_ai_model_snapshot() and get_model_binding("storyctx.signals").billing_route != "anthropic":
         return
     operation = AiProviderUsageOperation(
         feature_key="storyctx",
@@ -2224,21 +2275,28 @@ def build_compound_summary_source_hash(format_version: str, components: list[str
 
 
 def build_rp_reasoning_signature() -> str:
-    if RP_REASONING_MODEL:
+    if not has_ai_model_snapshot() and not (RP_REASONING_MODEL or EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL):
+        return "none"
+    binding = get_model_binding(
+        "storyctx.signals",
+        default_model=RP_REASONING_MODEL or EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+        default_route="anthropic" if RP_REASONING_MODEL else "openrouter",
+    )
+    if binding.billing_route == "anthropic":
         return "|".join(
             [
                 "anthropic",
-                RP_REASONING_MODEL,
+                binding.model_id,
                 RP_REASONING_EFFORT,
                 RP_REASONING_THINKING_DISPLAY,
             ]
         )
-    if not EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL:
+    if not binding.model_id:
         return "none"
     return "|".join(
         [
             "openrouter",
-            require_paid_character_signals_openrouter_model(),
+            binding.model_id,
             "reasoning:none",
         ]
     )
@@ -2290,18 +2348,30 @@ def build_storyctx_provider_summary_line() -> str:
         signal_fallback_provider = "none"
         signal_fallback_model = "none"
 
+    summary_model = EPISODE_SUMMARY_MODEL
+    rp_model = RP_OPENROUTER_MODEL
+    if has_ai_model_snapshot():
+        summary_binding = get_model_binding("storyctx.summary")
+        signal_binding = get_model_binding("storyctx.signals")
+        rp_binding = get_model_binding("storyctx.rp")
+        episode_summary_provider, summary_model = summary_binding.billing_route, summary_binding.model_id
+        signal_provider, signal_model = signal_binding.billing_route, signal_binding.model_id
+        rp_openrouter_provider, rp_model = rp_binding.billing_route, rp_binding.model_id
+        signal_fallback_provider = "openrouter" if signal_provider in {"hive", "river"} else "none"
+        signal_fallback_model = signal_model if signal_fallback_provider == "openrouter" else "none"
+
     return (
         "storyctx-provider "
         f"episode_summary_provider={episode_summary_provider} "
-        f"episode_summary_model={_log_value(EPISODE_SUMMARY_MODEL)} "
+        f"episode_summary_model={_log_value(summary_model)} "
         f"episode_character_signals_provider={signal_provider} "
         f"episode_character_signals_model={_log_value(signal_model)} "
         f"episode_character_signals_fallback_provider={signal_fallback_provider} "
         f"episode_character_signals_fallback_model={_log_value(signal_fallback_model)} "
         f"rp_character_plan_provider={rp_openrouter_provider} "
-        f"rp_character_plan_model={_log_value(RP_OPENROUTER_MODEL)} "
+        f"rp_character_plan_model={_log_value(rp_model)} "
         f"rp_profile_provider={rp_openrouter_provider} "
-        f"rp_profile_model={_log_value(RP_OPENROUTER_MODEL)} "
+        f"rp_profile_model={_log_value(rp_model)} "
         f"rp_openrouter_provider_only={_log_value(RP_OPENROUTER_PROVIDER_ONLY)}"
     )
 
@@ -5705,15 +5775,21 @@ async def request_episode_character_signals_payload(
             payload, episode_no=episode_no, source_parts=source_parts
         )
 
-    if settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL:
+    native_anthropic = bool(settings.ANTHROPIC_API_KEY and RP_REASONING_MODEL)
+    binding = get_model_binding(
+        "storyctx.signals",
+        default_model=RP_REASONING_MODEL if native_anthropic else EPISODE_CHARACTER_SIGNALS_OPENROUTER_MODEL,
+        default_route="anthropic" if native_anthropic else "openrouter",
+    )
+    if binding.billing_route == "anthropic":
         provider = "anthropic"
         body = {
-            "model": RP_REASONING_MODEL, "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
+            "model": binding.model_id, "max_tokens": EPISODE_CHARACTER_SIGNALS_MAX_OUTPUT_TOKENS,
             "system": EPISODE_CHARACTER_SIGNALS_PROMPT,
             "messages": [{"role": "user", "content": user_prompt}],
             "tools": [EPISODE_CHARACTER_SIGNALS_TOOL_SCHEMA],
             "tool_choice": {"type": "tool", "name": EPISODE_CHARACTER_SIGNALS_TOOL_NAME},
-            **build_anthropic_reasoning_options(RP_REASONING_MODEL),
+            **build_anthropic_reasoning_options(binding.model_id),
         }
     else:
         provider = "openrouter"
@@ -20748,9 +20824,22 @@ def write_delta_verification_json(path_str: str, results: dict[str, object]) -> 
 
 
 async def main() -> int:
-    global _character_asset_attempt_store
     args = parse_args()
     validate_delta_args(args)
+    if not args.apply:
+        return await _prepare_storyctx_job(args)
+    snapshot_conn = db_connect(autocommit=True, timeout_seconds=5)
+    try:
+        model_snapshot = load_ai_model_snapshot_sync(snapshot_conn)
+    finally:
+        snapshot_conn.close()
+    # A scheduled child or explicit manual CLI invocation is one model job.
+    # Capture before selection/repair writes and retain through every retry.
+    with use_ai_model_snapshot(model_snapshot):
+        return await _prepare_storyctx_job(args)
+
+
+async def _prepare_storyctx_job(args: argparse.Namespace) -> int:
     query, params = build_target_query(args=args, use_epub_fallback=args.use_epub_fallback)
     rows: list[dict] = []
     character_asset_repair_rows: list[dict] = []
@@ -20783,6 +20872,19 @@ async def main() -> int:
     finally:
         conn.close()
 
+    return await _execute_storyctx_job(
+        args, rows, character_asset_repair_rows, inventory_reaggregation_rows,
+        delta_status_repaired_products,
+    )
+
+async def _execute_storyctx_job(
+    args: argparse.Namespace,
+    rows: list[dict],
+    character_asset_repair_rows: list[dict],
+    inventory_reaggregation_rows: list[dict],
+    delta_status_repaired_products: list[dict[str, object]],
+) -> int:
+    global _character_asset_attempt_store
     if args.apply:
         _open_storyctx_usage_connection()
     attempt_conn = None

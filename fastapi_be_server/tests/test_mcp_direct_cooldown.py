@@ -31,6 +31,10 @@ class _Session:
 
 class _GenerationSession(_Session):
     async def execute(self, *args):
+        if "FROM tb_ai_model_config" in str(args[0]):
+            result = Mock()
+            result.mappings.return_value.all.return_value = []
+            return result
         return Mock(all=Mock(return_value=[
             (2, 1, "chapter"), (3, 1, "chapter"), (4, 1, "chapter"),
         ]))
@@ -167,7 +171,12 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.get("single:2026-10-12", "owner")["generated_at"],
                          generated_at.isoformat())
         statuses = [(call.args[0], call.args[2]) for call in save.call_args_list]
-        self.assertEqual(statuses, [("rotation", "state"), ("single:2026-10-12", "ready")])
+        self.assertEqual(statuses, [
+            ("single:2026-10-12", "generating"),
+            ("rotation", "state"),
+            ("single:2026-10-12", "ready"),
+        ])
+        self.assertIn("model_snapshot", save.call_args_list[0].args[3])
 
     async def test_failed_single_copy_does_not_record_proposals(self):
         from app.services.ai import mcp_single_copy as core
@@ -183,14 +192,16 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
              patch.object(core, "_decode_hex", return_value="첫 회차"), \
              patch.object(core, "build_gemini_prompt", return_value="source evidence"), \
              patch.object(core, "run_openrouter", return_value={}), \
-             patch.object(core, "choose_proposals", side_effect=core.CopyValidationError("invalid")), \
+             patch.object(core, "choose_proposals", side_effect=core.CopyValidationError("invalid")) as choose, \
              patch.object(ops.logger, "exception"), \
              patch.object(store, "save", wraps=store.save) as save:
             await ops._generate_single_inner("single:2026-10-12", "owner")
         self.assertEqual(store.get("rotation", "owner")["last_proposed_at"], original)
         self.assertEqual(store.get("single:2026-10-12", "owner")["status"], "failed")
+        self.assertEqual(store.get("single:2026-10-12", "owner")["error_type"], "CopyValidationError")
+        self.assertEqual(choose.call_count, 2)
         self.assertEqual([(call.args[0], call.args[2]) for call in save.call_args_list],
-                         [("single:2026-10-12", "failed")])
+                         [("single:2026-10-12", "generating"), ("single:2026-10-12", "failed")])
 
 
 if __name__ == "__main__":

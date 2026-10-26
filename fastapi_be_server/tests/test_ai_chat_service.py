@@ -1,12 +1,22 @@
 import unittest
 from datetime import datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.exceptions import CustomResponseException
 from app.services.ai import ai_chat_service
+
+
+def _config_db():
+    # Configuration is a real DB boundary; use an empty override result while
+    # individual journey tests continue mocking their own domain lookups.
+    db = AsyncMock()
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = []
+    db.execute.return_value = result
+    return db
 
 
 class AiChatServiceUnitTest(unittest.TestCase):
@@ -163,7 +173,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 system_prompt = mocked_call_claude.await_args.kwargs["system_prompt"]
@@ -256,7 +266,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 mocked_call_claude.assert_awaited_once()
@@ -554,7 +564,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 mocked_recommend_chat.assert_not_awaited()
@@ -668,7 +678,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertIsNone(payload["product"])
@@ -764,7 +774,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertEqual(payload["product"]["productId"], 777)
@@ -853,7 +863,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertEqual(payload["product"]["productId"], 555)
@@ -961,7 +971,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertEqual(payload["product"]["productId"], 321)
@@ -1050,7 +1060,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertIsNone(payload["product"])
@@ -1146,7 +1156,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertEqual(payload["product"]["productId"], 909)
@@ -1244,7 +1254,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertEqual(mocked_dispatch_tool.await_count, 2)
@@ -1325,7 +1335,7 @@ class AiChatServiceUnitTest(unittest.TestCase):
                     preset=None,
                     exclude_ids=[],
                     adult_yn="N",
-                    db=AsyncMock(),
+                    db=_config_db(),
                 )
 
                 self.assertEqual(

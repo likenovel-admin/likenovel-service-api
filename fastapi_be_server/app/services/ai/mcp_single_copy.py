@@ -26,6 +26,11 @@ from urllib import request
 
 from zoneinfo import ZoneInfo
 
+import httpx
+
+from app.services.common.ai_model_config import get_model_binding
+from app.services.common.ai_model_gateway import stream_model_chat_completion
+
 KST = ZoneInfo("Asia/Seoul")
 
 OPENROUTER_MODEL = "google/gemini-3.8-flash"
@@ -689,70 +694,64 @@ def _read_openrouter_stream(
             finish_reason = reason
     raise ProposalError("OpenRouter incomplete stream: missing [DONE]")
 
+class _HttpxSseReader:
+    """Keep the existing byte-level SSE validation on an httpx stream."""
+    def __init__(self, response: httpx.Response):
+        self._chunks = iter(response.iter_bytes())
+        self._buffer = b""
+
+    def readline(self) -> bytes:
+        while b"\n" not in self._buffer:
+            try:
+                self._buffer += next(self._chunks)
+            except StopIteration:
+                line, self._buffer = self._buffer, b""
+                return line
+            if len(self._buffer) > 1_000_000:
+                raise ProposalError("Model SSE event exceeds the response size limit")
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return line + b"\n"
+
+
 def run_openrouter(
-    api_key: str, prompt: str, timeout: int = OPENROUTER_IDLE_TIMEOUT
+    api_key: str | Path, prompt: str, timeout: int = OPENROUTER_IDLE_TIMEOUT
 ) -> dict[str, Any]:
+    # The durable MCP caller supplies the existing server-local key path.
+    key = api_key.read_text(encoding="utf-8").strip() if isinstance(api_key, Path) else api_key
+    binding = get_model_binding("mcp.single_copy", default_model=OPENROUTER_MODEL)
     body = {
-        "model": OPENROUTER_MODEL,
+        "model": binding.model_id,
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
+        "provider": {"require_parameters": True},
         "reasoning": {"effort": EFFORT},
         "temperature": 0.2,
         "max_tokens": OPENROUTER_MAX_TOKENS,
         "stream": True,
     }
-    http_request = request.Request(
-        OPENROUTER_API_URL,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "HTTP-Referer": "https://www.likenovel.net/",
-            "X-OpenRouter-Title": "LikeNovel single-slot proposal automation",
-        },
-        method="POST",
-    )
     started_at = time.monotonic()
-    stage = "connect"
-
-    def timeout_detail() -> str:
-        return (
-            f"OpenRouter timeout: stage={stage}; "
-            f"elapsed_s={time.monotonic() - started_at:.1f}; "
-            f"idle_timeout_s={timeout}; total_timeout_s={OPENROUTER_TOTAL_TIMEOUT}; "
-            f"model={OPENROUTER_MODEL}"
-        )
-
     try:
-        with request.urlopen(http_request, timeout=timeout) as response:
-            stage = "stream_read"
-            return _read_openrouter_stream(
-                response, started_at, OPENROUTER_TOTAL_TIMEOUT
-            )
-    except TimeoutError as exc:
-        raise ProposalError(timeout_detail()) from exc
-    except urlerror.HTTPError as exc:
-        try:
-            raw_error = exc.read(65_536).decode("utf-8", errors="replace")
-            error_payload: Any = json.loads(raw_error)
-        except (OSError, HTTPException, json.JSONDecodeError):
-            error_payload = None
-        raise ProposalError(
-            f"OpenRouter call failed: status={exc.code}; "
-            f"{_openrouter_error_detail(error_payload)}"
-        ) from exc
-    except urlerror.URLError as exc:
-        if isinstance(exc.reason, TimeoutError):
-            raise ProposalError(timeout_detail()) from exc
-        reason = _safe_diagnostic_text(exc.reason, limit=400)
-        raise ProposalError(
-            f"OpenRouter transport failed: stage={stage}; {reason}"
-        ) from exc
-    except (OSError, HTTPException) as exc:
-        raise ProposalError(
-            f"OpenRouter transport failed: stage={stage}; error_type={type(exc).__name__}"
-        ) from exc
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            with stream_model_chat_completion(
+                client, feature_key="mcp.single_copy",
+                base_url=OPENROUTER_API_URL.removesuffix("/chat/completions"),
+                api_key=key,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json", "Accept": "text/event-stream",
+                    "HTTP-Referer": "https://www.likenovel.net/",
+                    "X-OpenRouter-Title": "LikeNovel single-slot proposal automation",
+                },
+                json=body,
+            ) as response:
+                if response.status_code != 200:
+                    raise ProposalError(f"Model provider rejected request: status={response.status_code}")
+                result = _read_openrouter_stream(_HttpxSseReader(response), started_at, OPENROUTER_TOTAL_TIMEOUT)
+                result["_model_route"] = dict(response.extensions.get("ai_route") or {})
+                return result
+    except httpx.HTTPError as exc:
+        raise ProposalError("Model transport outcome is unknown; request was not resubmitted") from exc
+
 
 def validate_summary(summary: Any, title: str) -> tuple[bool, str | None, list[int]]:
     if not isinstance(summary, str):

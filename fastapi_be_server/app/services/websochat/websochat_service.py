@@ -19,6 +19,11 @@ from app.const import ErrorMessages, settings
 from app.exceptions import CustomResponseException
 from app.rdb import likenovel_db_engine
 from app.services.common.ai_provider_usage import AiProviderUsageOperation
+from app.services.common.ai_model_config import (
+    has_ai_model_snapshot,
+    load_ai_model_snapshot,
+    use_ai_model_snapshot,
+)
 from app.schemas.websochat import (
     PostWebsochatMessageReqBody,
     PostWebsochatCharacterChoicesReqBody,
@@ -837,7 +842,11 @@ WEBSOCHAT_REFERENCE_RESOLUTION_MAX_TOKENS = 220
 WEBSOCHAT_INTENT_MAX_TOKENS = 120
 WEBSOCHAT_QA_CORRECTION_MAX_TOKENS = 180
 WEBSOCHAT_RP_RECALL_DECISION_MAX_TOKENS = 120
-WEBSOCHAT_RP_RECALL_CONTEXT_CHAR_LIMIT = 1800
+WEBSOCHAT_RP_RECALL_EXCERPT_CHAR_LIMIT = 1200
+WEBSOCHAT_RP_RECALL_EXCERPT_LIMIT = 4
+WEBSOCHAT_RP_RECALL_CONTEXT_CHAR_LIMIT = (
+    WEBSOCHAT_RP_RECALL_EXCERPT_CHAR_LIMIT * WEBSOCHAT_RP_RECALL_EXCERPT_LIMIT
+)
 WEBSOCHAT_ALLOWED_INTENTS = {
     "factual",
     "comparative",
@@ -6580,13 +6589,13 @@ async def _build_websochat_rp_exact_recall_context(
                 score = sum(1 for keyword in keywords if keyword and keyword in chunk_text)
                 if keywords and score <= 0:
                     continue
-                # Score on the full episode text, but carry a match-centered
-                # excerpt: the selection clip below keeps the episode head, so a
-                # raw full text would drop the very passage that scored.
+                # Keep the same window through selection so a match near the
+                # episode end is not lost when the snippet is backfilled.
                 excerpt_text = _build_websochat_search_chunk_snippet(
                     text_value=chunk_text,
                     keywords=keywords,
                     query_text=search_query or user_prompt,
+                    window_chars=WEBSOCHAT_RP_RECALL_EXCERPT_CHAR_LIMIT,
                 )
                 prioritized_rows.append(
                     {
@@ -6634,10 +6643,11 @@ async def _build_websochat_rp_exact_recall_context(
         if total_chars >= WEBSOCHAT_RP_RECALL_CONTEXT_CHAR_LIMIT:
             break
         seen_episode_nos.add(episode_no)
-        clipped = chunk_text[:500]
+        remaining_chars = WEBSOCHAT_RP_RECALL_CONTEXT_CHAR_LIMIT - total_chars
+        clipped = chunk_text[:min(WEBSOCHAT_RP_RECALL_EXCERPT_CHAR_LIMIT, remaining_chars)]
         selected_rows.append({"episode_no": episode_no, "chunk_text": clipped})
         total_chars += len(clipped)
-        if len(selected_rows) >= 4:
+        if len(selected_rows) >= WEBSOCHAT_RP_RECALL_EXCERPT_LIMIT:
             break
     if not selected_rows:
         return {}
@@ -8136,6 +8146,10 @@ async def create_session(
     adult_yn: str,
     db: AsyncSession,
 ):
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await create_session(req_body, kc_user_id, adult_yn, db)
     user_id, resolved_guest_key = await _resolve_actor(kc_user_id, req_body.guest_key, db)
     effective_adult_yn = await _resolve_effective_adult_yn(
         kc_user_id=kc_user_id,
@@ -8724,6 +8738,10 @@ async def post_character_chat_choices(
     kc_user_id: str | None,
     db: AsyncSession,
 ):
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await post_character_chat_choices(session_id, req_body, kc_user_id, db)
     user_id, resolved_guest_key = await _resolve_actor(kc_user_id, req_body.guest_key, db)
     session_row = await _get_session_row(session_id, user_id, resolved_guest_key, db)
     session_memory = _normalize_websochat_session_memory(session_row.get("session_memory_json"))
@@ -8969,6 +8987,10 @@ async def post_message(
     kc_user_id: str | None,
     db: AsyncSession,
 ):
+    if not has_ai_model_snapshot():
+        snapshot = await load_ai_model_snapshot(db)
+        with use_ai_model_snapshot(snapshot):
+            return await post_message(session_id, req_body, kc_user_id, db)
     logger.info(
         "websochat_debug post_message:start session_id=%s starter_mode_key=%s qa_action_key=%s rp_mode=%s active_character=%s game_mode=%s client_message_id=%s prompt_preview=%r",
         session_id,

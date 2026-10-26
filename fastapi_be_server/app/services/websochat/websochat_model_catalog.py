@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 from app.const import settings
+from app.services.common.ai_model_config import get_model_binding
+from app.services.common.ai_model_gateway import AiModelGatewayConfigurationError, load_provider_accounts
 
 
 WebsochatModelKey = Literal["speed", "balance", "deep"]
 WebsochatThinkingLevel = Literal["minimal", "medium", "high"]
-WebsochatModelProvider = Literal["gemini", "openrouter"]
+WebsochatModelProvider = Literal["gemini", "openrouter", "hive", "river"]
 
 @dataclass(frozen=True)
 class WebsochatModelSpec:
@@ -67,7 +69,15 @@ def normalize_websochat_model_key(value: object) -> WebsochatModelKey:
 
 
 def get_websochat_model_spec(model_key: object) -> WebsochatModelSpec:
-    return WEBSOCHAT_MODEL_CATALOG_BY_KEY[normalize_websochat_model_key(model_key)]
+    spec = WEBSOCHAT_MODEL_CATALOG_BY_KEY[normalize_websochat_model_key(model_key)]
+    binding = get_model_binding(
+        f"websochat.{spec.model_key}",
+        default_model=spec.provider_model,
+        default_route=spec.provider,
+    )
+    if binding.billing_route not in {"gemini", "openrouter", "hive", "river"}:
+        raise ValueError("unsupported websochat billing route")
+    return replace(spec, provider=cast(WebsochatModelProvider, binding.billing_route), provider_model=binding.model_id)
 
 
 def build_websochat_model_used(model_key: object) -> str:
@@ -79,4 +89,9 @@ def is_websochat_model_provider_configured(model_key: object) -> bool:
     spec = get_websochat_model_spec(model_key)
     if spec.provider == "openrouter":
         return bool(settings.OPENROUTER_API_KEY)
+    if spec.provider in {"hive", "river"}:
+        try:
+            return bool(load_provider_accounts(spec.provider))
+        except AiModelGatewayConfigurationError:
+            return False
     return bool(settings.GEMINI_API_KEY)
