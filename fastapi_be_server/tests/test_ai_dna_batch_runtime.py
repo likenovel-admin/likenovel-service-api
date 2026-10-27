@@ -106,3 +106,38 @@ class AiDnaBatchRuntimeTest(TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertIn("AI DNA provider=openrouter", stdout)
+
+    def test_early_exit_before_job_start_releases_lock(self) -> None:
+        # A run that stops at the DB credential check must not leave the lock
+        # behind, or the next scheduled run is skipped as "already running".
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "batch"
+            batch_dir.mkdir(parents=True)
+            lock_dir = root / "ai-dna.lock"
+            batch_script = batch_dir / BATCH_SCRIPT.name
+            batch_script.write_text(
+                BATCH_SCRIPT.read_text(encoding="utf-8").replace(
+                    'LOCK_DIR="/tmp/ai-dna-extract-daily-batch.lock"',
+                    f'LOCK_DIR="{lock_dir}"',
+                ),
+                encoding="utf-8",
+            )
+            shutil.copy2(TIMESTAMP_HELPER, batch_dir / TIMESTAMP_HELPER.name)
+            env = {
+                key: value for key, value in os.environ.items()
+                if key not in {"DB_USER", "DB_PW"}
+            }
+            env["PATH"] = "/usr/bin:/bin"
+            completed = subprocess.run(
+                ["/bin/bash", str(batch_script)],
+                cwd=batch_dir,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            self.assertIn("Missing DB_USER or DB_PW", completed.stdout + completed.stderr)
+            self.assertFalse(lock_dir.exists())
