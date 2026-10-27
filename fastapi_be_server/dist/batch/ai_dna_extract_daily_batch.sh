@@ -47,6 +47,9 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   fi
 fi
 echo "$$" > "$LOCK_PID_FILE"
+# Release the lock on early exits (env/DB/python checks) before the full
+# cleanup trap below takes over; otherwise the lock directory is left behind.
+trap 'rm -rf "$LOCK_DIR"' EXIT
 
 # PID 1에서 환경변수 로딩 (cron_env.sh 누락/cron 직접 실행 fallback)
 if [ -r /proc/1/environ ]; then
