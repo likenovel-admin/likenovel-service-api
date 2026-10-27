@@ -1,5 +1,6 @@
 import asyncio
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
@@ -158,6 +159,33 @@ class OpenRouterBackgroundCreditGuardTest(TestCase):
         ):
             self.assertIn(variable_name, cron_env)
             self.assertIn(variable_name, ai_dna_batch)
+
+    def test_batch_environment_exports_prepaid_provider_account_pool_path(self):
+        # Hive/River routes in cron batches fail before any request when this
+        # path is not exported (AiModelGatewayConfigurationError).
+        root = Path(__file__).resolve().parents[1]
+        cron_env = root / "dist" / "batch" / "cron_env.sh"
+        accounts_path = "/srv/likenovel/ai-provider-accounts.json"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text(
+                f"DB_HOST=db.local\nAI_PROVIDER_ACCOUNTS_FILE={accounts_path}\nUNLISTED_SECRET=x\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; printf "%s|%s" "$AI_PROVIDER_ACCOUNTS_FILE" "${UNLISTED_SECRET-unset}"',
+                    "_", str(cron_env),
+                ],
+                env={"PATH": os.environ.get("PATH", ""), "BATCH_ENV_FILE": str(env_file)},
+                capture_output=True, text=True, check=True,
+            )
+        self.assertEqual(result.stdout, f"{accounts_path}|unset")
+        ai_dna_batch = (root / "dist" / "batch" / "ai_dna_extract_daily_batch.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("|AI_PROVIDER_ACCOUNTS_FILE)", ai_dna_batch)
 
     def test_character_asset_reservation_preserves_story_context_headroom(self):
         from tests.test_story_agent_context_cost_guard import load_module
