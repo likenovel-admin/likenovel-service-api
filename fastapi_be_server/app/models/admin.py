@@ -302,6 +302,15 @@ class DirectRecommend(Base):
     exposure_end_time_weekend: Mapped[str] = mapped_column(
         String(1000), nullable=False, comment="노출 시간 주말 종료 시간"
     )
+    source_type: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        server_default=text("'manual'"),
+        comment="manual | external_distribution",
+    )
+    source_platform: Mapped[str] = mapped_column(
+        String(20), nullable=True, comment="외부 유통 자동 구좌 플랫폼"
+    )
     created_id: Mapped[int] = mapped_column(
         Integer, nullable=True, comment="row를 생성한 id"
     )
@@ -311,6 +320,40 @@ class DirectRecommend(Base):
     updated_id: Mapped[int] = mapped_column(
         Integer, nullable=True, comment="row를 갱신한 id"
     )
+    updated_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP,
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    )
+
+
+class ProductExternalDistribution(Base):
+    __tablename__ = "tb_product_external_distribution"  # 외부 유통 연재본 매핑
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    platform: Mapped[str] = mapped_column(String(20), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    external_title: Mapped[str] = mapped_column(String(500), nullable=True)
+    external_author: Mapped[str] = mapped_column(String(200), nullable=True)
+    match_method: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'active'")
+    )
+    miss_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    created_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    created_date: Mapped[datetime] = mapped_column(
+        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_id: Mapped[int] = mapped_column(Integer, nullable=True)
     updated_date: Mapped[datetime] = mapped_column(
         TIMESTAMP,
         nullable=False,

@@ -46,6 +46,7 @@ SLOT_QUERY = text("""
         exposure_start_time_weekend,
         exposure_end_time_weekend
     FROM tb_direct_recommend
+    WHERE COALESCE(source_type, 'manual') = 'manual'
     ORDER BY `order` ASC, id ASC
 """)
 

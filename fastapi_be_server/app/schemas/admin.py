@@ -284,6 +284,12 @@ class PostDirectRecommendReqBody(AdminBase):
     exposure_end_time_weekend: str = Field(
         examples=["18:00"], description="노출 시간 주말 종료 시간"
     )
+    source_type: Literal["manual", "external_distribution"] = Field(
+        default="manual", description="구성 방식: 수동 작품 목록 / 외부 유통 자동"
+    )
+    source_platform: Optional[Literal["kakaopage", "ridi"]] = Field(
+        default=None, description="외부 유통 자동 구좌의 플랫폼"
+    )
 
 
 class PutDirectRecommendReqBody(AdminBase):
@@ -313,6 +319,40 @@ class PutDirectRecommendReqBody(AdminBase):
     exposure_end_time_weekend: Optional[str] = Field(
         default=None, examples=["18:00"], description="노출 시간 주말 종료 시간"
     )
+    source_type: Optional[Literal["manual", "external_distribution"]] = Field(
+        default=None, description="구성 방식: 수동 작품 목록 / 외부 유통 자동"
+    )
+    source_platform: Optional[Literal["kakaopage", "ridi"]] = Field(
+        default=None, description="외부 유통 자동 구좌의 플랫폼"
+    )
+
+
+class ExternalDistributionObservation(AdminBase):
+    external_id: str = Field(examples=["66438235"], description="외부 연재본 ID")
+    title: str = Field(description="외부 플랫폼 표기 제목")
+    author: str = Field(description="외부 플랫폼 표기 작가명")
+    edition: Literal["serial", "single_volume"] = Field(
+        default="serial", description="연재본 / 단행본"
+    )
+
+
+class PostExternalDistributionSyncReqBody(AdminBase):
+    platform: Literal["kakaopage", "ridi"]
+    complete: bool = Field(
+        default=False,
+        description="수집이 끝까지 성공했을 때만 true. true일 때 미관측 자동 매핑의 miss_count를 올린다.",
+    )
+    observations: List[ExternalDistributionObservation] = Field(default_factory=list)
+
+
+class PostExternalDistributionReqBody(AdminBase):
+    product_id: int
+    platform: Literal["kakaopage", "ridi"]
+    external_id: str = Field(description="외부 연재본 ID")
+
+
+class PutExternalDistributionReqBody(AdminBase):
+    status: Literal["active", "hidden"]
 
 
 class PostMainSingleSlotReqBody(AdminBase):
