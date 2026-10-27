@@ -28,6 +28,7 @@ from app.services.admin import (
 )
 import app.services.product.main_single_slot_service as main_single_slot_service
 import app.services.product.main_character_slot_service as main_character_slot_service
+import app.services.product.external_distribution_service as external_distribution_service
 import app.services.auth.auth_service as auth_service
 from app.utils.common import check_user
 
@@ -981,6 +982,86 @@ async def delete_direct_recommend(
         raise e
 
     return await admin_recommend_service.delete_direct_recommend(id, db=db)
+
+
+@router.post(
+    "/external-distributions/sync",
+    tags=["CMS - 외부 유통 구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_external_distribution_sync(
+    req_body: admin_schema.PostExternalDistributionSyncReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """수집기가 관측한 외부 연재본을 유료연재 작품에 매칭해 저장"""
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await external_distribution_service.apply_sync(
+        platform=req_body.platform,
+        observations=[item.model_dump() for item in req_body.observations],
+        complete=req_body.complete,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.post(
+    "/external-distributions",
+    tags=["CMS - 외부 유통 구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def post_external_distribution(
+    req_body: admin_schema.PostExternalDistributionReqBody,
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """외부 연재본 수동 등록"""
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await external_distribution_service.post_admin_external_distribution(
+        product_id=req_body.product_id,
+        platform=req_body.platform,
+        external_id=req_body.external_id,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.put(
+    "/external-distributions/{mapping_id}",
+    tags=["CMS - 외부 유통 구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def put_external_distribution(
+    req_body: admin_schema.PutExternalDistributionReqBody,
+    mapping_id: int = Path(..., description="매핑 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """외부 연재본 노출/숨김"""
+    admin_user = await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await external_distribution_service.put_admin_external_distribution_status(
+        mapping_id=mapping_id,
+        new_status=req_body.status,
+        admin_user_id=admin_user.get("user_id"),
+        db=db,
+    )
+
+
+@router.delete(
+    "/external-distributions/{mapping_id}",
+    tags=["CMS - 외부 유통 구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def delete_external_distribution(
+    mapping_id: int = Path(..., description="매핑 ID"),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """외부 연재본 매핑 삭제"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await external_distribution_service.delete_admin_external_distribution(
+        mapping_id=mapping_id, db=db
+    )
 
 
 @router.post(

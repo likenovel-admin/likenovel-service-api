@@ -25,6 +25,7 @@ from app.services.admin import (
 )
 import app.services.product.main_single_slot_service as main_single_slot_service
 import app.services.product.main_character_slot_service as main_character_slot_service
+import app.services.product.external_distribution_service as external_distribution_service
 from app.utils.common import check_user
 
 router = APIRouter(prefix="/admins")
@@ -2553,6 +2554,39 @@ async def direct_recommend_list(
         raise e
 
     return await admin_recommend_service.direct_recommend_list(page, count_per_page, db)
+
+
+@router.get(
+    "/external-distributions",
+    tags=["CMS - 외부 유통 구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def external_distribution_list(
+    platform: Optional[str] = Query(None, description="kakaopage | ridi"),
+    page: int = Query(1, ge=1),
+    count_per_page: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """외부 유통 연재본 매핑 목록"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await external_distribution_service.get_admin_external_distributions(
+        platform=platform, page=page, count_per_page=count_per_page, db=db
+    )
+
+
+@router.get(
+    "/external-distributions/candidates",
+    tags=["CMS - 외부 유통 구좌"],
+    dependencies=[Depends(analysis_logger)],
+)
+async def external_distribution_candidates(
+    db: AsyncSession = Depends(get_likenovel_db),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+):
+    """수집기가 검색할 유료연재 작품(유료·공개·비블라인드) 목록"""
+    await check_user(kc_user_id=user.get("sub"), db=db, role="admin")
+    return await external_distribution_service.get_admin_sync_candidates(db=db)
 
 
 @router.get(

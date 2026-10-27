@@ -12,6 +12,7 @@ import app.services.product.product_notice_service as product_notice_service
 import app.services.product.home_ticker_service as home_ticker_service
 import app.services.product.rising_pick_service as rising_pick_service
 import app.services.product.main_single_slot_service as main_single_slot_service
+import app.services.product.external_distribution_service as external_distribution_service
 from app.const import LOGGER_TYPE, ErrorMessages
 from app.config.log_config import service_error_logger
 
@@ -129,6 +130,30 @@ async def products_of_main_single_slots(
     return await main_single_slot_service.get_public_main_single_slots(
         kc_user_id=user.get("sub"),
         adult_yn=adult_yn,
+        db=db,
+    )
+
+
+@router.get(
+    "/external-distribution",
+    tags=["작품"],
+    responses={200: {"description": "카카오페이지/리디에서도 연재되는 유료작 목록"}},
+    dependencies=[Depends(analysis_logger)],
+)
+async def products_of_external_distribution(
+    platform: str = Query(..., description="kakaopage | ridi"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(30, ge=1, le=60),
+    adult_yn: str = Query("N", description="성인등급 작품 포함 여부 (Y/N)"),
+    user: Dict[str, Any] = Depends(chk_cur_user),
+    db: AsyncSession = Depends(get_likenovel_db),
+):
+    return await external_distribution_service.get_public_external_distribution_products(
+        platform=platform,
+        page=page,
+        limit=limit,
+        adult_yn=adult_yn,
+        kc_user_id=user.get("sub"),
         db=db,
     )
 

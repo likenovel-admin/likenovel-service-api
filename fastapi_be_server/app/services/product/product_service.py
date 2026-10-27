@@ -5295,7 +5295,9 @@ async def get_direct_recommend_products(
             """
 
         recommend_query = text(f"""
-            SELECT id, name, product_ids, `order`
+            SELECT id, name, product_ids, `order`,
+                   COALESCE(source_type, 'manual') AS source_type,
+                   source_platform
             FROM tb_direct_recommend
             WHERE CURDATE() BETWEEN DATE(exposure_start_date) AND DATE(exposure_end_date)
               {time_condition}
@@ -5311,6 +5313,40 @@ async def get_direct_recommend_products(
         # 媛?異붿쿇 援ъ쥖蹂꾨줈 ?묓뭹 議고쉶
         results = []
         for recommend_row in recommend_rows:
+            if recommend_row["source_type"] == "external_distribution":
+                # 외부 유통 자동 구좌: 매핑 테이블에서 노출 조건을 만족하는 작품만 읽는다.
+                import app.services.product.external_distribution_service as external_distribution_service
+
+                platform = recommend_row["source_platform"]
+                if platform not in external_distribution_service.PLATFORMS:
+                    logger.warning(
+                        "direct recommend %s has invalid source_platform=%r",
+                        recommend_row["id"],
+                        platform,
+                    )
+                    continue
+                product_list = await external_distribution_service.get_visible_products(
+                    platform=platform,
+                    adult_yn=adult_yn,
+                    user_id=user_id,
+                    limit=external_distribution_service.HOME_SLOT_PRODUCT_LIMIT,
+                    offset=0,
+                    db=db,
+                )
+                if not product_list:
+                    continue
+                results.append(
+                    {
+                        "recommendId": recommend_row["id"],
+                        "title": recommend_row["name"],
+                        "order": recommend_row["order"],
+                        "sourceType": "external_distribution",
+                        "sourcePlatform": platform,
+                        "productList": product_list,
+                    }
+                )
+                continue
+
             product_ids = json.loads(recommend_row["product_ids"])
 
             if not product_ids or len(product_ids) == 0:
@@ -5345,6 +5381,8 @@ async def get_direct_recommend_products(
                     "recommendId": recommend_row["id"],
                     "title": recommend_row["name"],
                     "order": recommend_row["order"],
+                    "sourceType": "manual",
+                    "sourcePlatform": None,
                     "productList": [
                         convert_home_card_product_data(row) for row in product_rows
                     ],

@@ -768,6 +768,31 @@ async def algorithm_recommend_similar_csv_upload(
     return {"result": True}
 
 
+DIRECT_RECOMMEND_SOURCE_MANUAL = "manual"
+DIRECT_RECOMMEND_SOURCE_EXTERNAL = "external_distribution"
+DIRECT_RECOMMEND_SOURCE_PLATFORMS = ("kakaopage", "ridi")
+
+
+def _validate_direct_recommend_source(source_type, source_platform) -> None:
+    """외부 유통 자동 구좌는 플랫폼이 반드시 있어야 한다."""
+    if source_type not in (
+        DIRECT_RECOMMEND_SOURCE_MANUAL,
+        DIRECT_RECOMMEND_SOURCE_EXTERNAL,
+    ):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.INVALID_REQUEST_DATA,
+        )
+    if (
+        source_type == DIRECT_RECOMMEND_SOURCE_EXTERNAL
+        and source_platform not in DIRECT_RECOMMEND_SOURCE_PLATFORMS
+    ):
+        raise CustomResponseException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=ErrorMessages.INVALID_REQUEST_DATA,
+        )
+
+
 async def direct_recommend_list(page: int, count_per_page: int, db: AsyncSession):
     """
     직접 추천구좌 리스트 조회
@@ -847,6 +872,13 @@ async def post_direct_recommend(
     if req_body is not None:
         logger.info(f"direct_recommend: {req_body}")
 
+    _validate_direct_recommend_source(req_body.source_type, req_body.source_platform)
+    if req_body.source_type == DIRECT_RECOMMEND_SOURCE_EXTERNAL:
+        # 자동 구좌의 작품 목록은 매핑 테이블이 결정하므로 수동 목록은 비워 둔다.
+        req_body.product_ids = []
+    else:
+        req_body.source_platform = None
+
     exposure_start_date = datetime.strptime(req_body.exposure_start_date, "%Y-%m-%d")
     exposure_end_date = datetime.strptime(req_body.exposure_end_date, "%Y-%m-%d")
     if exposure_start_date > exposure_end_date:
@@ -891,6 +923,8 @@ async def post_direct_recommend(
             "exposure_end_time_weekday",
             "exposure_start_time_weekend",
             "exposure_end_time_weekend",
+            "source_type",
+            "source_platform",
         ],
         field_mapping={"order": "`order`"},
         field_transforms={"product_ids": json.dumps},
@@ -932,6 +966,16 @@ async def put_direct_recommend(
     check_exists_or_404(rows, ErrorMessages.NOT_FOUND_RECOMMEND_SLOT)
 
     org_direct_recommend = dict(rows[0])
+
+    next_source_type = req_body.source_type or org_direct_recommend.get(
+        "source_type", DIRECT_RECOMMEND_SOURCE_MANUAL
+    )
+    next_source_platform = (
+        req_body.source_platform
+        if req_body.source_platform is not None
+        else org_direct_recommend.get("source_platform")
+    )
+    _validate_direct_recommend_source(next_source_type, next_source_platform)
 
     if (
         req_body.exposure_start_date is not None
@@ -1018,6 +1062,13 @@ async def put_direct_recommend(
         field_transforms={"product_ids": json.dumps},
     )
     params["id"] = id
+    set_clause += ", source_type = :source_type, source_platform = :source_platform"
+    params["source_type"] = next_source_type
+    params["source_platform"] = (
+        next_source_platform
+        if next_source_type == DIRECT_RECOMMEND_SOURCE_EXTERNAL
+        else None
+    )
 
     query = text(f"UPDATE tb_direct_recommend SET {set_clause} WHERE id = :id")
 
