@@ -2018,7 +2018,17 @@ async def ai_api_usage_statistics(
             UNION ALL
 
             SELECT
-                CONVERT('openrouter' USING utf8mb4) COLLATE utf8mb4_general_ci AS provider,
+                CONVERT(COALESCE((
+                    SELECT CASE
+                        WHEN COUNT(*) = 0 OR COUNT(NULLIF(routes.provider, '')) <> COUNT(*) THEN 'unknown'
+                        WHEN COUNT(DISTINCT routes.provider) > 1 THEN 'mixed'
+                        ELSE MIN(routes.provider)
+                    END
+                    FROM JSON_TABLE(
+                        COALESCE(JSON_EXTRACT(d.decision_json, '$._ai_model_routes'), JSON_ARRAY()),
+                        '$[*]' COLUMNS(provider VARCHAR(32) PATH '$.provider' NULL ON EMPTY NULL ON ERROR)
+                    ) AS routes
+                ), 'unknown') USING utf8mb4) COLLATE utf8mb4_general_ci AS provider,
                 CONVERT(COALESCE(d.model_name, 'unknown') USING utf8mb4) COLLATE utf8mb4_general_ci AS model_name,
                 CONVERT('ai_reader_batch' USING utf8mb4) COLLATE utf8mb4_general_ci AS source_key,
                 COUNT(*) AS request_count,
@@ -2028,7 +2038,7 @@ async def ai_api_usage_statistics(
             FROM tb_ai_reader_llm_decision d
             WHERE 1 = 1
             {date_filters["reader"]}
-            GROUP BY model_name
+            GROUP BY provider, model_name
 
             UNION ALL
 

@@ -7,6 +7,8 @@ second inference request. Credentials remain outside model configuration and DB.
 from __future__ import annotations
 
 import copy
+import asyncio
+import logging
 import json as json_module
 import os
 import re
@@ -24,6 +26,14 @@ from app.services.common.openrouter_background_credit_guard import (
     assert_openrouter_background_credit_available,
     openrouter_background_credit_reservation_async,
 )
+from app.services.common.ai_provider_usage import (
+    AiProviderUsageOperation,
+    AiProviderUsageAttempt,
+    build_ai_provider_usage_record,
+    persist_ai_provider_usage_async,
+)
+
+logger = logging.getLogger(__name__)
 
 
 _PREPAID_BASE_URLS = {
@@ -302,6 +312,7 @@ async def post_model_chat_completion_async(
     headers: dict[str, str], json: dict[str, Any],
     priority_headroom_usd: Any | None = None, background: bool = True,
     before_submit: Callable[[], None] | None = None,
+    usage_operation: AiProviderUsageOperation | None = None,
     **request_kwargs: Any,
 ) -> httpx.Response:
     plan = _request_plan(feature_key, json, base_url, api_key)
@@ -309,6 +320,9 @@ async def post_model_chat_completion_async(
     for target in plan.targets:
         body = _payload_for_target(json, target, stream=False)
         target_headers = _headers_for_target(headers, target)
+        attempt = None
+        response = None
+        attempt_status = "transport_error"
         try:
             reservation = (
                 openrouter_background_credit_reservation_async(
@@ -318,17 +332,67 @@ async def post_model_chat_completion_async(
             )
             async with reservation:
                 notify()
+                if usage_operation is not None:
+                    attempt = usage_operation.start_attempt(
+                        provider=target.provider, requested_model=plan.model_id,
+                        request_mode="nonstream",
+                    )
                 response = await client.post(
                     f"{target.base_url}/chat/completions", headers=target_headers,
                     json=body, **request_kwargs,
                 )
+                attempt_status = "success" if 200 <= response.status_code < 300 else "http_error"
+        except asyncio.CancelledError:
+            attempt_status = "cancelled"
+            raise
         except httpx.RequestError:
             raise AiModelGatewayTransportError(f"{target.provider} transport outcome is unknown; request was not resubmitted") from None
+        finally:
+            if attempt is not None:
+                await _record_gateway_usage(attempt, target, response, attempt_status)
         if target.provider != "openrouter" and _credit_exhausted(response):
             await response.aclose()
             continue
         return _annotate_response(response, target, plan)
     raise AssertionError("OpenRouter terminal target was not processed")
+
+
+async def _record_gateway_usage(
+    attempt: AiProviderUsageAttempt, target: _Target,
+    response: httpx.Response | None, attempt_status: str,
+) -> None:
+    """Account every submitted request, including rejections before fallback.
+
+    HTTP success means a response arrived, not that its decision JSON is valid.
+    Persistence failure must never cause a second billable inference request.
+    """
+    try:
+        payload = response.json() if response is not None else {}
+    except ValueError:
+        payload = {}
+        if attempt_status == "success":
+            attempt_status = "invalid_response"
+    if not isinstance(payload, dict):
+        payload = {}
+        if attempt_status == "success":
+            attempt_status = "invalid_response"
+    record = build_ai_provider_usage_record(
+        attempt, status=attempt_status,
+        response_json={**payload, "model": payload.get("model") or target.model_id},
+        response_headers=response.headers if response is not None else None,
+        http_status=response.status_code if response is not None else None,
+    )
+    logger.info(
+        "ai_provider_attempt call_id=%s operation_id=%s provider=%s account_alias=%s status=%s",
+        attempt.call_id, attempt.operation_id, target.provider, target.account_alias, attempt_status,
+    )
+    try:
+        persisted = await asyncio.wait_for(persist_ai_provider_usage_async(record), timeout=2.0)
+        if not persisted:
+            logger.error("ai_provider_usage not_persisted call_id=%s", attempt.call_id)
+    except Exception as exc:
+        logger.error("ai_provider_usage persist_failed call_id=%s error_class=%s",
+                     attempt.call_id, type(exc).__name__)
 
 
 @contextmanager

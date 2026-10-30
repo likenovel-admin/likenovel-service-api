@@ -109,12 +109,13 @@ def _bounded_text(value: object, limit: int) -> str | None:
 
 
 def _optional_nonnegative_int(value: object) -> int | None:
-    if value is None or value == "":
+    if isinstance(value, bool):
         return None
-    try:
-        return max(int(value), 0)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 20:
+        return int(value)
+    return None
 
 
 def _optional_decimal(value: object) -> Decimal | None:

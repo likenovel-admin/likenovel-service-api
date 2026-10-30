@@ -3,6 +3,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from typing import Any, Awaitable, Callable
 
 from fastapi import status
@@ -10,6 +11,7 @@ import httpx
 
 from app.const import settings
 from app.services.common.ai_model_config import get_model_binding
+from app.services.common.ai_provider_usage import AiProviderUsageOperation
 from app.services.common.ai_model_gateway import post_model_chat_completion_async
 from app.exceptions import CustomResponseException
 from app.services.common.openrouter_background_credit_guard import (
@@ -57,9 +59,9 @@ class ReaderLlmDecision:
 
 @dataclass(frozen=True)
 class ReaderLlmUsage:
-    input_tokens: int
-    output_tokens: int
-    estimated_cost_usd: Decimal
+    input_tokens: int | None
+    output_tokens: int | None
+    estimated_cost_usd: Decimal | None
 
 
 class InvalidReaderDecisionError(ValueError):
@@ -81,9 +83,11 @@ class ReaderLlmResponseError(CustomResponseException):
         code: str | None,
         message: str | None,
         usage: ReaderLlmUsage | None,
+        model_route: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(status_code=status_code, code=code, message=message)
         self.usage = usage
+        self.model_route = model_route or {}
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,7 @@ class ReaderLlmResponse:
     content: str
     usage: ReaderLlmUsage | None
     model_route: dict[str, Any] = field(default_factory=dict)
+    model_routes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -194,28 +199,38 @@ async def request_reader_decision_with_usage(
     llm_call: ReaderLlmCall | None = None,
 ) -> ReaderLlmDecisionResult:
     system_prompt, user_prompt = build_reader_decision_prompt(input_snapshot)
-    caller = llm_call or _default_llm_call
+    operation = AiProviderUsageOperation(
+        feature_key="ai_reader", stage_key="decision",
+        product_id=(input_snapshot.get("product") or {}).get("product_id"),
+        episode_id=(input_snapshot.get("episode") or {}).get("episode_id"),
+    )
+    caller = llm_call or partial(_default_llm_call, usage_operation=operation)
     last_error: InvalidReaderDecisionError | None = None
     total_usage: ReaderLlmUsage | None = None
-    usage_incomplete = False
     model_routes: list[dict[str, Any]] = []
     for attempt_no in range(1, READER_DECISION_PARSE_MAX_ATTEMPTS + 1):
-        response = await caller(system_prompt, user_prompt, READER_DECISION_MAX_TOKENS)
+        try:
+            response = await caller(system_prompt, user_prompt, READER_DECISION_MAX_TOKENS)
+        except (CustomResponseException, httpx.HTTPError) as exc:
+            exc.usage = _sum_reader_llm_usage(
+                total_usage, getattr(exc, "usage", None) or ReaderLlmUsage(None, None, None)
+            )
+            raise
         if isinstance(response, ReaderLlmResponse):
             raw_response = response.content
-            if response.model_route:
-                model_routes.append(dict(response.model_route))
-            if response.usage is None:
-                usage_incomplete = True
-            else:
-                total_usage = _sum_reader_llm_usage(total_usage, response.usage)
+            model_routes.extend(response.model_routes or (
+                (dict(response.model_route),) if response.model_route else ()
+            ))
+            total_usage = _sum_reader_llm_usage(
+                total_usage, response.usage or ReaderLlmUsage(None, None, None)
+            )
         else:
             raw_response = response
-            usage_incomplete = True
+            total_usage = _sum_reader_llm_usage(total_usage, ReaderLlmUsage(None, None, None))
         try:
             return ReaderLlmDecisionResult(
                 decision=parse_llm_decision(raw_response),
-                usage=None if usage_incomplete else total_usage,
+                usage=_known_reader_usage(total_usage),
                 model_routes=tuple(model_routes),
             )
         except InvalidReaderDecisionError as exc:
@@ -223,7 +238,7 @@ async def request_reader_decision_with_usage(
             if attempt_no >= READER_DECISION_PARSE_MAX_ATTEMPTS:
                 raise InvalidReaderDecisionError(
                     str(exc),
-                    usage=None if usage_incomplete else total_usage,
+                    usage=_known_reader_usage(total_usage),
                 ) from exc
             logger.warning(
                 "ai reader llm decision parse failed; retrying",
@@ -238,6 +253,14 @@ async def request_reader_decision_with_usage(
     raise InvalidReaderDecisionError("response is not valid json")
 
 
+def _known_reader_usage(usage: ReaderLlmUsage | None) -> ReaderLlmUsage | None:
+    # Keep an all-unknown accumulator internally so later retries cannot turn
+    # incomplete totals into apparently complete values. Preserve None at API boundaries.
+    if usage == ReaderLlmUsage(None, None, None):
+        return None
+    return usage
+
+
 def _sum_reader_llm_usage(
     total: ReaderLlmUsage | None,
     current: ReaderLlmUsage,
@@ -245,10 +268,13 @@ def _sum_reader_llm_usage(
     if total is None:
         return current
     return ReaderLlmUsage(
-        input_tokens=total.input_tokens + current.input_tokens,
-        output_tokens=total.output_tokens + current.output_tokens,
+        input_tokens=(total.input_tokens + current.input_tokens
+                      if total.input_tokens is not None and current.input_tokens is not None else None),
+        output_tokens=(total.output_tokens + current.output_tokens
+                       if total.output_tokens is not None and current.output_tokens is not None else None),
         estimated_cost_usd=(
             total.estimated_cost_usd + current.estimated_cost_usd
+            if total.estimated_cost_usd is not None and current.estimated_cost_usd is not None else None
         ),
     )
 
@@ -532,11 +558,14 @@ async def _default_llm_call(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
+    *,
+    usage_operation: AiProviderUsageOperation | None = None,
 ) -> ReaderLlmResponse:
     return await _call_openrouter_chat_completion(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_tokens=max_tokens,
+        usage_operation=usage_operation,
     )
 
 
@@ -545,6 +574,7 @@ async def _call_openrouter_chat_completion(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
+    usage_operation: AiProviderUsageOperation | None = None,
 ) -> ReaderLlmResponse:
     if not settings.OPENROUTER_API_KEY:
         raise CustomResponseException(
@@ -574,29 +604,32 @@ async def _call_openrouter_chat_completion(
 
     last_error: Exception | None = None
     total_usage: ReaderLlmUsage | None = None
-    usage_incomplete = False
+    model_routes: list[dict[str, Any]] = []
     for attempt_no in range(1, OPENROUTER_MAX_ATTEMPTS + 1):
         try:
-            response = await _post_openrouter_chat_completion(payload, max_tokens)
-            if response.usage is None:
-                usage_incomplete = True
-            else:
-                total_usage = _sum_reader_llm_usage(total_usage, response.usage)
+            response = await _post_openrouter_chat_completion(
+                payload, max_tokens, usage_operation=usage_operation,
+            )
+            total_usage = _sum_reader_llm_usage(
+                total_usage, response.usage or ReaderLlmUsage(None, None, None)
+            )
+            if response.model_route:
+                model_routes.append(dict(response.model_route))
             return ReaderLlmResponse(
                 content=response.content,
-                usage=None if usage_incomplete else total_usage,
+                usage=_known_reader_usage(total_usage),
                 model_route=response.model_route,
+                model_routes=tuple(model_routes),
             )
         except (CustomResponseException, httpx.HTTPError) as exc:
             last_error = exc
-            if isinstance(exc, ReaderLlmResponseError):
-                if exc.usage is None:
-                    usage_incomplete = True
-                else:
-                    total_usage = _sum_reader_llm_usage(total_usage, exc.usage)
+            if isinstance(exc, ReaderLlmResponseError) and exc.model_route:
+                model_routes.append(dict(exc.model_route))
+            total_usage = _sum_reader_llm_usage(
+                total_usage, getattr(exc, "usage", None) or ReaderLlmUsage(None, None, None)
+            )
             if attempt_no >= OPENROUTER_MAX_ATTEMPTS or not _is_retryable_openrouter_error(exc):
-                if isinstance(exc, ReaderLlmResponseError):
-                    exc.usage = None if usage_incomplete else total_usage
+                exc.usage = _known_reader_usage(total_usage)
                 raise
             logger.warning(
                 "OpenRouter transient response; retrying reader decision call",
@@ -617,6 +650,8 @@ async def _call_openrouter_chat_completion(
 async def _post_openrouter_chat_completion(
     payload: dict[str, Any],
     max_tokens: int,
+    *,
+    usage_operation: AiProviderUsageOperation | None = None,
 ) -> ReaderLlmResponse:
     async with httpx.AsyncClient(
         timeout=settings.AI_READER_OPENROUTER_TIMEOUT_SECONDS
@@ -632,6 +667,7 @@ async def _post_openrouter_chat_completion(
                 "X-Title": "LikeNovel AI Reader Agent",
             },
             json=payload,
+            usage_operation=usage_operation,
         )
     if resp.status_code == status.HTTP_402_PAYMENT_REQUIRED:
         raise OpenRouterBackgroundCreditReserveError(
@@ -661,6 +697,7 @@ async def _post_openrouter_chat_completion(
             code=exc.code,
             message=exc.message,
             usage=usage,
+            model_route=dict(resp.extensions.get("ai_route") or {}),
         ) from exc
     return ReaderLlmResponse(content=raw, usage=usage, model_route=dict(resp.extensions.get("ai_route") or {}))
 
@@ -673,23 +710,18 @@ def _extract_openrouter_usage(data: Any) -> ReaderLlmUsage | None:
 
     input_tokens = usage.get("prompt_tokens")
     output_tokens = usage.get("completion_tokens")
-    raw_cost = usage.get("cost")
     try:
-        cost = Decimal(str(raw_cost))
+        cost = Decimal(str(usage.get("cost")))
+        if not cost.is_finite() or cost < 0:
+            cost = None
     except (InvalidOperation, TypeError, ValueError):
-        logger.warning("OpenRouter reader response has invalid usage")
-        return None
-    if (
-        isinstance(input_tokens, bool)
-        or not isinstance(input_tokens, int)
-        or input_tokens < 0
-        or isinstance(output_tokens, bool)
-        or not isinstance(output_tokens, int)
-        or output_tokens < 0
-        or not cost.is_finite()
-        or cost < 0
-    ):
-        logger.warning("OpenRouter reader response has invalid usage")
+        cost = None
+    if isinstance(input_tokens, bool) or not isinstance(input_tokens, int) or input_tokens < 0:
+        input_tokens = None
+    if isinstance(output_tokens, bool) or not isinstance(output_tokens, int) or output_tokens < 0:
+        output_tokens = None
+    if input_tokens is None and output_tokens is None and cost is None:
+        logger.warning("AI reader response has no valid usage fields")
         return None
     return ReaderLlmUsage(
         input_tokens=input_tokens,
