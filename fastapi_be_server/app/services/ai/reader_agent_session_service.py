@@ -1150,17 +1150,7 @@ async def _process_reader_session_decision_pinned(
                 db,
                 llm_decision_id=llm_decision_id,
                 error_message=str(exc) or exc.__class__.__name__,
-                usage=(
-                    exc.usage
-                    if isinstance(
-                        exc,
-                        (
-                            decision_service.InvalidReaderDecisionError,
-                            decision_service.ReaderLlmResponseError,
-                        ),
-                    )
-                    else None
-                ),
+                usage=getattr(exc, "usage", None),
             )
         raise
 

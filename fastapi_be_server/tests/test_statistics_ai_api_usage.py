@@ -185,3 +185,40 @@ def test_statistics_query_exposes_ai_api_usage_route():
         for route in statistics_query.router.routes
     }
     assert "/statistics/ai-api-usage" in paths
+
+
+class AiReaderProviderAttributionMysqlTest(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(__import__('os').environ.get('AI_USAGE_READONLY_MYSQL_TEST') == '1',
+                         'opt-in read-only MySQL SELECT through installed ln-ops')
+    async def test_reader_provider_grouping_uses_observed_routes(self):
+        import json
+        import subprocess
+
+        db = AsyncMock()
+        db.execute.side_effect = [FakeResult([]) for _ in range(4)]
+        with patch.object(statistics_service.ai_provider_health_service,
+                          'get_ai_provider_health_summary', AsyncMock(return_value=[])):
+            await statistics_service.ai_api_usage_statistics('2026-10-30', '2026-10-30', db)
+        query = str(db.execute.call_args_list[1].args[0]).split('UNION ALL')[1].strip()
+        cases = [
+            ('hive', [{'provider': 'hive'}]),
+            ('river', [{'provider': 'river'}]),
+            ('hive', [{'provider': 'hive'}, {'provider': 'hive'}]),
+            ('mixed', [{'provider': 'hive'}, {'provider': 'openrouter'}]),
+            ('unknown', []),
+            ('unknown', None),
+            ('unknown', [{'provider': 'hive'}, {}]),
+            ('unknown', [{'provider': None}]),
+        ]
+        fixtures = []
+        for i, (_, routes) in enumerate(cases):
+            payload = json.dumps({'_ai_model_routes': routes} if routes is not None else {})
+            fixtures.append(f"SELECT '{payload}' AS decision_json, 'case{i}' AS model_name, "
+                            "NULL AS estimated_cost_usd, '2026-10-30' AS created_date")
+        query = query.replace('tb_ai_reader_llm_decision d', '(' + ' UNION ALL '.join(fixtures) + ') d')
+        query = query.replace(':start_date', "'2026-10-30'").replace(':end_date_exclusive', "'2026-10-31'")
+        result = subprocess.run(['ln-ops', '--json', 'sql', 'read', query],
+                                check=True, text=True, capture_output=True, timeout=60)
+        rows = json.loads(result.stdout)['result']['rows']
+        observed = {row[1]: row[0] for row in rows}
+        self.assertEqual(observed, {f'case{i}': expected for i, (expected, _) in enumerate(cases)})

@@ -602,3 +602,166 @@ def test_other_models_do_not_receive_a_flash_1017_reasoning_default(setup_route,
         gateway.post_model_chat_completion(client, background=False, **kwargs)
     body = json.loads(calls[0].content)
     assert "reasoning" not in body and "reasoning_effort" not in body
+
+
+@pytest.mark.parametrize('provider', ['hive', 'river'])
+def test_opt_in_usage_preserves_tokens_and_actual_route(setup_route, monkeypatch, provider):
+    from unittest.mock import AsyncMock
+    from app.services.common.ai_provider_usage import AiProviderUsageOperation
+    binding, _, _ = setup_route
+    binding.billing_route = provider
+    persist = AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway, 'persist_ai_provider_usage_async', persist)
+    operation = AiProviderUsageOperation(feature_key='ai_reader', stage_key='decision')
+
+    def handler(request):
+        return httpx.Response(200, json={'usage': {
+            'prompt_tokens': 18, 'completion_tokens': 42, 'total_tokens': 60,
+            'prompt_tokens_details': {'cached_tokens': 3},
+            'completion_tokens_details': {'reasoning_tokens': 20},
+        }})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await gateway.post_model_chat_completion_async(
+                client, **request_kwargs(), usage_operation=operation)
+    response = asyncio.run(run())
+    record = persist.await_args.args[0]
+    assert response.extensions['ai_route']['provider'] == provider
+    assert record.provider == provider
+    assert record.resolved_model == gateway._PROVIDER_MODEL_IDS[provider][MODEL]
+    assert (record.input_tokens, record.output_tokens, record.total_tokens) == (18, 42, 60)
+    assert (record.cached_input_tokens, record.reasoning_tokens) == (3, 20)
+    assert record.cost_usd is None and record.cost_source == 'unavailable'
+    assert record.attempt_no == 1 and record.operation_id == operation.operation_id
+
+
+def test_usage_records_each_credit_fallback_attempt(setup_route, monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.services.common.ai_provider_usage import AiProviderUsageOperation
+    persist = AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway, 'persist_ai_provider_usage_async', persist)
+    posts = []
+
+    def handler(request):
+        if request.method == 'GET':
+            return httpx.Response(200, json={'data': {'total_credits': 10, 'total_usage': 1}})
+        posts.append(request)
+        if request.url.host == 'api-cdn.thehive.ai':
+            return httpx.Response(402, json={'error': {'code': 'insufficient_credits'}})
+        return httpx.Response(200, json={'usage': {'prompt_tokens': 18, 'completion_tokens': 42, 'cost': .01}})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await gateway.post_model_chat_completion_async(client, **request_kwargs(),
+                usage_operation=AiProviderUsageOperation(feature_key='ai_reader', stage_key='decision'))
+    response = asyncio.run(run())
+    records = [call.args[0] for call in persist.await_args_list]
+    assert len(posts) == 3 and len(records) == 3
+    assert [r.provider for r in records] == ['hive', 'hive', 'openrouter']
+    assert [r.attempt_no for r in records] == [1, 2, 3]
+    assert len({r.operation_id for r in records}) == 1
+    assert [r.attempt_status for r in records] == ['http_error', 'http_error', 'success']
+    assert records[-1].cost_source == 'provider_reported'
+    assert response.extensions['ai_route']['provider'] == 'openrouter'
+
+
+@pytest.mark.parametrize('outcome', ['timeout', 'cancelled', 'malformed', 'db_failure'])
+def test_usage_failure_does_not_replay_inference(setup_route, monkeypatch, outcome):
+    from unittest.mock import AsyncMock
+    from app.services.common.ai_provider_usage import AiProviderUsageOperation
+    persist = AsyncMock(side_effect=RuntimeError('db unavailable')) if outcome == 'db_failure' else AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway, 'persist_ai_provider_usage_async', persist)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if outcome == 'timeout':
+            raise httpx.ReadTimeout('secret', request=request)
+        if outcome == 'cancelled':
+            raise asyncio.CancelledError()
+        if outcome == 'malformed':
+            return httpx.Response(200, content='not json')
+        return success(request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await gateway.post_model_chat_completion_async(client, **request_kwargs(),
+                usage_operation=AiProviderUsageOperation(feature_key='ai_reader', stage_key='decision'))
+    if outcome == 'timeout':
+        with pytest.raises(gateway.AiModelGatewayTransportError):
+            asyncio.run(run())
+    elif outcome == 'cancelled':
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run())
+    else:
+        assert asyncio.run(run()).status_code == 200
+    assert len(requests) == 1 and persist.await_count == 1
+    expected = {'timeout': 'transport_error', 'cancelled': 'cancelled', 'malformed': 'invalid_response', 'db_failure': 'success'}
+    assert persist.await_args.args[0].attempt_status == expected[outcome]
+
+
+def test_reader_parse_retry_shares_operation_and_keeps_no_cost_usage(setup_route, monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.services.ai import reader_agent_decision_service as reader
+    binding, _, _ = setup_route
+    monkeypatch.setattr(reader, 'get_model_binding', lambda *args, **kwargs: binding)
+    monkeypatch.setattr(reader.settings, 'OPENROUTER_API_KEY', 'test-openrouter-key')
+    persist = AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway, 'persist_ai_provider_usage_async', persist)
+    requests = []
+    valid = {'continue_reading': False, 'next_episode_count': 0, 'drop_product': False,
+             'bookmark_action': 'none', 'recommend_action': 'none',
+             'evaluation': {'should_evaluate': False, 'eval_code': None},
+             'taste_delta': {'positive': [], 'negative': []}, 'reason': 'test'}
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            'usage': {'prompt_tokens': 18, 'completion_tokens': 42},
+            'choices': [{'finish_reason': 'stop', 'message': {
+                'content': 'invalid json' if len(requests) == 1 else json.dumps(valid),
+            }}],
+        })
+
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(reader.httpx, 'AsyncClient',
+                        lambda **kwargs: client_type(transport=httpx.MockTransport(handler), **kwargs))
+    result = asyncio.run(reader.request_reader_decision_with_usage(
+        {'product': {'product_id': 123}, 'episode': {'episode_id': 456}}))
+    records = [call.args[0] for call in persist.await_args_list]
+    assert len(requests) == len(records) == 2
+    assert {r.operation_id for r in records} == {records[0].operation_id}
+    assert [r.attempt_no for r in records] == [1, 2]
+    assert [(r.product_id, r.episode_id) for r in records] == [(123, 456), (123, 456)]
+    assert result.usage.input_tokens == 36 and result.usage.output_tokens == 84
+    assert result.usage.estimated_cost_usd is None
+    assert [r['provider'] for r in result.model_routes] == ['hive', 'hive']
+
+
+def test_pre_submit_credit_reserve_does_not_write_phantom_attempt(setup_route, monkeypatch):
+    from unittest.mock import AsyncMock
+    from contextlib import asynccontextmanager
+    from app.services.common.ai_provider_usage import AiProviderUsageOperation
+    from app.services.common.openrouter_background_credit_guard import OpenRouterBackgroundCreditReserveError
+    binding, _, _ = setup_route
+    binding.billing_route = 'openrouter'
+    persist = AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway, 'persist_ai_provider_usage_async', persist)
+
+    @asynccontextmanager
+    async def blocked(*args, **kwargs):
+        raise OpenRouterBackgroundCreditReserveError('reserve blocked')
+        yield
+
+    monkeypatch.setattr(gateway, 'openrouter_background_credit_reservation_async', blocked)
+    requests = []
+    operation = AiProviderUsageOperation(feature_key='ai_reader', stage_key='decision')
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: requests.append(r))) as client:
+            await gateway.post_model_chat_completion_async(client, **request_kwargs(), usage_operation=operation)
+    with pytest.raises(OpenRouterBackgroundCreditReserveError):
+        asyncio.run(run())
+    assert requests == [] and persist.await_count == 0
+    assert operation._attempt_no == 0
