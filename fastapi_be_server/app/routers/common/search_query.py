@@ -118,11 +118,12 @@ error_logger = service_error_logger(LOGGER_TYPE.LOGGER_INSTANCE_NAME_FOR_SERVICE
 async def products_of_searched(
     user: Dict[str, Any] = Depends(chk_cur_user),
     db: AsyncSession = Depends(get_likenovel_db),
-    keyword: str = Query(None, description="검색 키워드"),
+    keyword: str = Query("", max_length=100, description="검색 키워드"),
     adult_yn: str = Query(None, description="통합검색(일반검색-작품, 퀘스트, 이벤트)"),
-    orderby: str = Query(None, description="정렬 기준"),
-    page: int = Query(1, description="조회 시작 위치"),
-    limit: int = Query(10, description="한페이지 조회 개수"),
+    orderby: str = Query("relevance", pattern="^(relevance|update|view)$", description="정렬 기준"),
+    page: int = Query(1, ge=1, description="조회 시작 위치"),
+    limit: int = Query(10, ge=1, le=30, description="한페이지 조회 개수"),
+    tag: list[str] = Query(default=[], max_length=12, description="선택한 태그 ID (AND)"),
 ):
     """
     통합검색(일반검색-작품, 퀘스트, 이벤트)
@@ -136,6 +137,7 @@ async def products_of_searched(
         page=page,
         limit=limit,
         orderby=orderby,
+        tags=tag,
     )
 
 
@@ -176,16 +178,8 @@ async def results_of_autocomplete(
 @router.post(
     "/story",
     tags=["통합검색 - 스토리 검색"],
-    responses={
-        200: {
-            "description": "스토리 검색",
-            "content": {
-                "application/json": {
-                    "examples": {"success_1": {"summary": "스토리 검색", "value": {}}}
-                }
-            },
-        }
-    },
+    deprecated=True,
+    responses={410: {"description": "작품 검색으로 통합됨"}},
     dependencies=[Depends(analysis_logger)],
 )
 async def products_of_search_by_story(
