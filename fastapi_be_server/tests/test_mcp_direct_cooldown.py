@@ -91,16 +91,22 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_snapshot_returns_real_rotation_metadata(self):
         store.save("direct:2026-10-10", "owner", "completed", receipt([1], [2]))
+        singles = [{"slot_key": key, "product_id": index + 10}
+                   for index, key in enumerate(policy.SINGLE_KEYS)]
         with patch.object(ops, "likenovel_db_session", return_value=_Session()), \
              patch.object(ops.curator, "build_scheduled_snapshot", AsyncMock(return_value={
                  "slots": slots([1]), "slot_snapshot_stable": True, "objective_checks_error": None,
              })), \
              patch.object(ops.curator, "_load_candidates", AsyncMock(return_value=[])), \
+             patch.object(ops, "single_rows", AsyncMock(return_value=singles)), \
              patch.object(ops, "load_config", return_value={"writes_enabled": False}), \
              patch.object(ops, "datetime") as clock:
             clock.now.return_value = datetime(2026, 10, 12, 10, 0, tzinfo=policy.KST)
             result = await ops.direct_snapshot("owner")
         self.assertEqual(result["rotation_policy"]["avoid_reproposal_product_ids"], [2])
+        self.assertEqual(result["single_slots"], singles)
+        saved = store.get("snapshot:" + result["snapshot_id"], "owner")
+        self.assertEqual(saved["single_slots"], singles)
 
     async def test_fresh_history_guard_blocks_before_intent_or_cms_mutation(self):
         from app.services.admin import admin_recommend_service as cms
@@ -206,3 +212,4 @@ class CooldownTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
