@@ -134,11 +134,13 @@ async def direct_snapshot(owner: str) -> dict:
         result = await curator.build_scheduled_snapshot(db)
         # Full candidate records are required for authoritative write eligibility.
         candidates = await curator._load_candidates(db)
+        singles = await single_rows(db)
     if not result["slot_snapshot_stable"] or result["objective_checks_error"]:
         raise ValueError("Direct slot snapshot is unstable")
     snapshot_id = uuid.uuid4().hex
     store.save("snapshot:" + snapshot_id, owner, "snapshot", {
         "kind": "direct", "slots": result["slots"], "candidates": candidates,
+        "single_slots": singles,
     })
     result.update(
         mode="automatic_authorized",
@@ -146,6 +148,7 @@ async def direct_snapshot(owner: str) -> dict:
         standing_authorization=True,
         writes_enabled=load_config().get("writes_enabled", False),
         cadence="Daily 10:00 Asia/Seoul; change only with evidence",
+        single_slots=singles,
         rotation_policy=_direct_cooldown(owner, result["slots"], datetime.now(policy.KST).date()),
     )
     return result
@@ -300,6 +303,7 @@ async def _generate_single(job_id: str, owner: str):
 
 
 async def start_single(owner: str) -> dict:
+    _enabled()
     job_id = policy.cycle_key("single")
     receipt = store.get(job_id, owner)
     if receipt:
@@ -355,7 +359,20 @@ async def verify_public(owner: str, job_id: str) -> dict:
     return proof
 
 
-async def apply_single(owner: str, admin_user_id: int, job_id: str) -> dict:
+def validate_single_layout(current):
+    by_key = {row["slot_key"]: row for row in current}
+    if len(current) != 3 or set(by_key) != set(policy.SINGLE_KEYS):
+        raise ValueError("Exactly three current slots and no future reservations are required")
+    if any(
+        row["publish_end_at"] is not None
+        or datetime.fromisoformat(row["publish_start_at"]).replace(tzinfo=policy.KST)
+        > datetime.now(policy.KST)
+        for row in current
+    ):
+        raise ValueError("Reserved exposure dates require review; automatic write blocked")
+
+
+async def apply_single(owner: str, admin_user_id: int, job_id: str, snapshot_id: str | None = None) -> dict:
     from app.services.ai import mcp_single_copy as core
     from app.services.product import main_single_slot_service
 
@@ -386,15 +403,7 @@ async def apply_single(owner: str, admin_user_id: int, job_id: str) -> dict:
             if receipt["status"] != "ready" or current != receipt["before"]:
                 raise ValueError("CMS changed or generation is not ready; nothing was written")
             by_key = {row["slot_key"]: row for row in current}
-            if len(current) != 3 or set(by_key) != set(policy.SINGLE_KEYS):
-                raise ValueError("Exactly three current slots and no future reservations are required")
-            if any(
-                row["publish_end_at"] is not None
-                or datetime.fromisoformat(row["publish_start_at"]).replace(tzinfo=policy.KST)
-                > datetime.now(policy.KST)
-                for row in current
-            ):
-                raise ValueError("Reserved exposure dates require review; automatic write blocked")
+            validate_single_layout(current)
             eligible = core.rows_to_candidates(
                 (await db.execute(text(core.CANDIDATE_SQL))).all()
             )
@@ -402,6 +411,13 @@ async def apply_single(owner: str, admin_user_id: int, job_id: str) -> dict:
             proposals = receipt["candidates"]
             if len(proposals) != 3 or len({item["product_id"] for item in proposals}) != 3:
                 raise ValueError("Expected three distinct paid products")
+            if {item["slot_key"] for item in proposals} != set(policy.SINGLE_KEYS):
+                raise ValueError("Expected each authorized single slot exactly once")
+            if receipt.get("copy_source") == "operator_episode_body":
+                if not snapshot_id:
+                    raise ValueError("Read and supply a fresh snapshot immediately before applying")
+                from app.services.ai.mcp_single_plan import validate_manual_apply
+                await validate_manual_apply(owner, receipt, snapshot_id, current, db, eligible)
             for item in proposals:
                 if item["product_id"] not in eligible_ids:
                     raise ValueError("Product is no longer eligible")
@@ -412,6 +428,7 @@ async def apply_single(owner: str, admin_user_id: int, job_id: str) -> dict:
             result = {
                 "kind": "single", "before": current, "candidates": proposals,
                 "model": receipt["model"], "generated_at": receipt["generated_at"],
+                "copy_source": receipt.get("copy_source", "generated"),
             }
             store.save(job_id, owner, "applying", {"expected": expected, "result": result})
             for item in proposals:
@@ -435,3 +452,4 @@ async def apply_single(owner: str, admin_user_id: int, job_id: str) -> dict:
             proposed_at[str(item["product_id"])] = result["generated_at"]
         store.save("rotation", owner, "state", {"last_proposed_at": proposed_at})
     return store.get(job_id, owner)
+

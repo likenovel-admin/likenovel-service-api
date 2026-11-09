@@ -1,0 +1,42 @@
+name: Single manuscript copy regression
+
+on:
+  push:
+    branches:
+      - 'codex/single-manuscript-copy-*'
+  pull_request:
+    paths:
+      - 'fastapi_be_server/app/mcp_server.py'
+      - 'fastapi_be_server/app/services/ai/mcp_*.py'
+      - 'fastapi_be_server/tests/test_mcp_*.py'
+      - 'fastapi_be_server/tests/test_likenovel_mcp.py'
+      - 'fastapi_be_server/tests/test_main_single_slot_service.py'
+      - '.github/workflows/test_single_manuscript_copy.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: fastapi_be_server
+    env:
+      DB_IP: '127.0.0.1'
+      DB_USER_PW: 'local-test-only'
+      PYTHONPATH: '.'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install locked application and test dependencies
+        run: |
+          python -m pip install poetry
+          poetry install --with test --no-interaction
+      - name: Run MCP and single-slot regression tests without production credentials
+        run: |
+          mkdir -p logs/data
+          poetry run python -m pytest -q tests/test_mcp_*.py tests/test_likenovel_mcp.py tests/test_main_single_slot_service.py

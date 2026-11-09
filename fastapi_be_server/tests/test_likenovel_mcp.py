@@ -184,7 +184,8 @@ class SDKTransportTests(unittest.TestCase):
                     names = {tool["name"] for tool in result.json()["result"]["tools"]}
                     self.assertEqual(names, {"likenovel_events", "likenovel_event_detail", "likenovel_paid_open_weeks", "likenovel_prepare_event", "likenovel_execute_approved_event", "likenovel_expansion_receipt", "likenovel_execute_approved_expansion", "likenovel_prepare_ai_readers", "likenovel_banner_brief", "likenovel_member_preview", "likenovel_prepare_paid_approval", "likenovel_cp_connection", "likenovel_paid_applications", "likenovel_expansion_status", "likenovel_promotion_snapshot", "likenovel_prepare_paid_conversion", "likenovel_prepare_member_mail", "likenovel_prepare_banner", "likenovel_prepare_hundred_free", "likenovel_ai_reader_status", "likenovel_direct_snapshot", "likenovel_apply_direct",
                         "likenovel_start_single_generation", "likenovel_job_status", "likenovel_apply_single",
-                        "likenovel_operator_status", "likenovel_verify_public"})
+                        "likenovel_operator_status", "likenovel_verify_public",
+                        "likenovel_read_single_episode_evidence", "likenovel_prepare_single_plan"})
                     status_result = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 3,
                         "method": "tools/call", "params": {"name": "likenovel_operator_status", "arguments": {}}}).json()["result"]
                     self.assertFalse(status_result.get("isError", False), status_result)
@@ -257,3 +258,4 @@ class SDKTransportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

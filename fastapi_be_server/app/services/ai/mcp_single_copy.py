@@ -192,6 +192,12 @@ WHERE p.price_type = 'paid'
   AND COALESCE(ep.open_episode_count, 0) > 0
   AND COALESCE(cf.cover_image_path, '') != ''
   AND COALESCE(p.synopsis_text, '') != ''
+  AND COALESCE((
+    SELECT m.exclude_from_recommend_yn
+    FROM tb_product_ai_metadata m
+    WHERE m.product_id = p.product_id
+    ORDER BY m.id DESC LIMIT 1
+  ), 'N') != 'Y'
   AND NOT EXISTS (
     SELECT 1
     FROM tb_main_single_slot active
@@ -886,3 +892,4 @@ def choose_proposals(
             }
         )
     return proposals
+
