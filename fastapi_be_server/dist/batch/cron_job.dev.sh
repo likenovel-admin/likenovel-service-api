@@ -24,3 +24,5 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # 0 3 * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/ai_dna_extract_daily_batch.sh >> /home/ln-admin/likenovel/batch-dev/ai_dna_extract_daily_batch.log 2>&1
 * * * * *  ln-admin EPISODE_STATE_TRANSITION_BATCH_ENABLE=1 bash /home/ln-admin/likenovel/batch-dev/episode_state_transition_minute_batch.sh >> /home/ln-admin/likenovel/batch-dev/episode_state_transition_minute_batch.log 2>&1
 */5 * * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/free_episode_campaign_expire_batch.sh >> /home/ln-admin/likenovel/batch-dev/free_episode_campaign_expire_batch.log 2>&1
+# Weekly paid-new event refresh is intentionally disabled in DEV until explicitly enabled.
+# */10 * * * *  ln-admin bash /home/ln-admin/likenovel/batch-dev/weekly_paid_new_event_batch.sh >> /home/ln-admin/likenovel/batch-dev/weekly_paid_new_event_batch.log 2>&1
