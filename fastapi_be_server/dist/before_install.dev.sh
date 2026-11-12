@@ -3,6 +3,10 @@
 
 set -euo pipefail
 
+# Fail before changing deployment files/services; never extend the DB run.
+grep -qx 'LIFECYCLE_PROTOCOL = 2' /home/ln-admin/likenovel/dev-rds/dev-rds-reconcile.py
+python3 /home/ln-admin/likenovel/dev-rds/dev-rds-reconcile.py check-budget --seconds 600
+
 DEPLOY_DIR=/home/ln-admin/likenovel/api-dev-deploy
 
 case "$DEPLOY_DIR" in

@@ -43,6 +43,7 @@ jobs:
           # - 배포 산출물(wheel)만 생성합니다.
           poetry install
           poetry run python tests/test_ai_reader_worker_deploy.py
+          poetry run python tests/test_dev_rds_deploy_guard.py
           poetry run python -m unittest tests.test_admin_cash_charge_cancel_service
           bash -n dist/run_be.dev.sh
           bash -n dist/boot-start-api-dev.sh
@@ -58,84 +59,16 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Start DEV RDS staging lease
+      - name: Start DEV RDS for staging
         env:
-          DEV_RDS_INSTANCE_ID: "likenovel-dev"
-          DEV_RDS_WORK_TTL_TAG: "likenovel-dev-work-until-epoch"
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-
-          if [ "$DEV_RDS_INSTANCE_ID" != "likenovel-dev" ]; then
-            echo "[dev-rds] refusing non-DEV DB target: $DEV_RDS_INSTANCE_ID" >&2
-            exit 2
-          fi
-
-          region="${AWS_REGION:?AWS_REGION is required}"
-          arn="$(aws rds describe-db-instances \
-            --region "$region" \
-            --db-instance-identifier "$DEV_RDS_INSTANCE_ID" \
-            --query 'DBInstances[0].DBInstanceArn' \
-            --output text)"
-          current_deadline="$(aws rds list-tags-for-resource \
-            --region "$region" \
-            --resource-name "$arn" \
-            --query "TagList[?Key=='$DEV_RDS_WORK_TTL_TAG'].Value | [0]" \
-            --output text)"
-          deadline="$(( $(date -u '+%s') + 3600 ))"
-          if [[ "$current_deadline" =~ ^[0-9]+$ ]] && [ "$current_deadline" -gt "$deadline" ]; then
-            deadline="$current_deadline"
-          fi
-          aws rds add-tags-to-resource \
-            --region "$region" \
-            --resource-name "$arn" \
-            --tags "Key=$DEV_RDS_WORK_TTL_TAG,Value=$deadline"
-
-          status=""
-          start_requested=0
-          for _ in $(seq 1 120); do
-            status="$(aws rds describe-db-instances \
-              --region "$region" \
-              --db-instance-identifier "$DEV_RDS_INSTANCE_ID" \
-              --query 'DBInstances[0].DBInstanceStatus' \
-              --output text)"
-            case "$status" in
-              available)
-                echo "[dev-rds] likenovel-dev is already available"
-                break
-                ;;
-              stopped)
-                if [ "$start_requested" -eq 0 ]; then
-                  aws rds start-db-instance \
-                    --region "$region" \
-                    --db-instance-identifier "$DEV_RDS_INSTANCE_ID" >/dev/null
-                  start_requested=1
-                fi
-                ;;
-              *)
-                echo "[dev-rds] waiting for $DEV_RDS_INSTANCE_ID current=$status"
-                ;;
-            esac
-            sleep 10
-          done
-
-          if [ "$status" != "available" ]; then
-            echo "[dev-rds] timed out waiting for $DEV_RDS_INSTANCE_ID" >&2
-            exit 1
-          fi
-
-          current_deadline="$(aws rds list-tags-for-resource \
-            --region "$region" \
-            --resource-name "$arn" \
-            --query "TagList[?Key=='$DEV_RDS_WORK_TTL_TAG'].Value | [0]" \
-            --output text)"
-          deadline="$(( $(date -u '+%s') + 3600 ))"
-          if [[ "$current_deadline" =~ ^[0-9]+$ ]] && [ "$current_deadline" -gt "$deadline" ]; then
-            deadline="$current_deadline"
-          fi
-          aws rds add-tags-to-resource \
-            --region "$region" \
-            --resource-name "$arn" \
-            --tags "Key=$DEV_RDS_WORK_TTL_TAG,Value=$deadline"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/likenovel_dev_deploy_key
+          chmod 600 ~/.ssh/likenovel_dev_deploy_key
+          ssh -i ~/.ssh/likenovel_dev_deploy_key -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new ln-admin@3.34.11.39 \
+            "ssh -i /home/ln-admin/.ssh/ln_kp.pem -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new ln-admin@10.0.100.110 \"grep -qx 'LIFECYCLE_PROTOCOL = 2' /home/ln-admin/likenovel/dev-rds/dev-rds-reconcile.py && python3 /home/ln-admin/likenovel/dev-rds/dev-rds-reconcile.py start\""
 
       # ---------------------------------------------------------------------
       # Build env file (DO NOT COMMIT)
