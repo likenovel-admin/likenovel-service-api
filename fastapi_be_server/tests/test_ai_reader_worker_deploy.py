@@ -1,13 +1,13 @@
 import asyncio
 import inspect
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import sysconfig
 import tempfile
 import textwrap
-import time
 import tomllib
 from pathlib import Path
 
@@ -568,121 +568,41 @@ def test_dev_workflow_waits_for_codedeploy_and_verifies_runtime():
     assert 'printf \'%s\' "${{ secrets.BACKEND_ENV_DEV }}"' not in content
 
 
-def test_dev_workflow_renews_dev_rds_lease_without_restarting_available_db():
+def test_dev_workflow_starts_shared_controller_only_after_protocol_check():
     workflow = REPO_ROOT / ".github" / "workflows" / "deploy_be_actions_dev.yml"
     content = workflow.read_text(encoding="utf-8")
-
-    credentials_index = content.index("      - name: Configure AWS credentials")
-    lease_index = content.index("      - name: Start DEV RDS staging lease")
-    deploy_index = content.index("      - name: Deploy with AWS codedeploy (DEV)")
-    assert credentials_index < lease_index < deploy_index
-    assert 'DEV_RDS_INSTANCE_ID: "likenovel-dev"' in content
-    assert 'if [ "$DEV_RDS_INSTANCE_ID" != "likenovel-dev" ]; then' in content
-    assert "aws rds start-db-instance" in content
-    assert "stop-db-instance" not in content
-
-    section = content.split("      - name: Start DEV RDS staging lease\n", 1)[1]
-    run_block = section.split("        run: |\n", 1)[1].split("\n      #", 1)[0]
-    script = textwrap.dedent(run_block)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        bin_path = tmp_path / "bin"
-        bin_path.mkdir()
-        calls_path = tmp_path / "calls"
-        deadline_path = tmp_path / "deadline"
-        original_deadline = int(time.time()) + 7200
-        deadline_path.write_text(str(original_deadline), encoding="utf-8")
-
-        fake_aws = bin_path / "aws"
-        fake_aws.write_text(
-            textwrap.dedent(
-                """\
-                #!/usr/bin/env python3
-                import os
-                import sys
-                from pathlib import Path
-
-                args = sys.argv[1:]
-                operation = args[1]
-                state = Path(os.environ["FAKE_AWS_STATE"])
-                with (state / "calls").open("a", encoding="utf-8") as calls:
-                    calls.write(operation + "\\n")
-
-                if operation == "describe-db-instances":
-                    query = args[args.index("--query") + 1]
-                    if query.endswith("DBInstanceArn"):
-                        print("arn:aws:rds:ap-northeast-2:992382709044:db:likenovel-dev")
-                    elif (state / "statuses").exists():
-                        statuses = (state / "statuses").read_text(encoding="utf-8").splitlines()
-                        print(statuses.pop(0))
-                        (state / "statuses").write_text("\\n".join(statuses), encoding="utf-8")
-                    else:
-                        print("available")
-                elif operation == "list-tags-for-resource":
-                    print((state / "deadline").read_text(encoding="utf-8"))
-                elif operation == "add-tags-to-resource":
-                    tag = args[args.index("--tags") + 1]
-                    (state / "deadline").write_text(tag.rsplit("Value=", 1)[1], encoding="utf-8")
-                elif operation == "start-db-instance":
-                    pass
-                else:
-                    raise SystemExit(f"unexpected operation: {operation}")
-                """
-            ),
-            encoding="utf-8",
-        )
-        fake_aws.chmod(0o755)
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "AWS_REGION": "ap-northeast-2",
-                "DEV_RDS_INSTANCE_ID": "likenovel-dev",
-                "DEV_RDS_WORK_TTL_TAG": "likenovel-dev-work-until-epoch",
-                "FAKE_AWS_STATE": str(tmp_path),
-                "PATH": f"{bin_path}:{env['PATH']}",
-            }
-        )
-        result = subprocess.run(
-            ["bash", "-c", script],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=10,
-        )
-
-        assert result.returncode == 0, result.stderr
-        assert "likenovel-dev is already available" in result.stdout
-        assert "start-db-instance" not in calls_path.read_text(encoding="utf-8")
-        assert int(deadline_path.read_text(encoding="utf-8")) == original_deadline
-
-        calls_path.write_text("", encoding="utf-8")
-        (tmp_path / "statuses").write_text(
-            "stopped\nstarting\nrebooting\nconfiguring-enhanced-monitoring\navailable\n",
-            encoding="utf-8",
-        )
-        fake_sleep = bin_path / "sleep"
-        fake_sleep.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
-        fake_sleep.chmod(0o755)
-
-        starting_result = subprocess.run(
-            ["bash", "-c", script],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=10,
-        )
-
-        assert starting_result.returncode == 0, (
-            starting_result.stdout + starting_result.stderr
-        )
-        calls = calls_path.read_text(encoding="utf-8").splitlines()
-        assert calls.count("start-db-instance") == 1
-        assert "current=rebooting" in starting_result.stdout
-        assert "current=configuring-enhanced-monitoring" in starting_result.stdout
+    begin = content.index("      - name: Start DEV RDS for staging")
+    end = content.index("      - name:", begin + 1)
+    assert content.index("      - name: Configure AWS credentials") < begin < end
+    assert end < content.index("      - name: Deploy with AWS codedeploy (DEV)")
+    step = content[begin:end]
+    assert "aws rds" not in step
+    # Decode both SSH command boundaries as the invoking shells do.
+    ssh_line = step[step.index("          ssh -i "):].split("\n\n", 1)[0]
+    bastion = shlex.split(ssh_line.replace("\\\n", " "))
+    was = shlex.split(bastion[-1])
+    assert bastion[-2] == "ln-admin@3.34.11.39"
+    assert was[-2] == "ln-admin@10.0.100.110"
+    controller = "/home/ln-admin/likenovel/dev-rds/dev-rds-reconcile.py"
+    assert shlex.split(was[-1]) == [
+        "grep", "-qx", "LIFECYCLE_PROTOCOL = 2", controller,
+        "&&", "python3", controller, "start",
+    ]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        stub = Path(temp_dir) / "controller.py"
+        marker = Path(temp_dir) / "started"
+        command = was[-1].replace(controller, str(stub))
+        for protocol in (1, 2):
+            stub.write_text(
+                f"LIFECYCLE_PROTOCOL = {protocol}\n"
+                "import sys\nfrom pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text(sys.argv[1])\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(["bash", "-c", command], timeout=5)
+            assert (result.returncode == 0) == (protocol == 2)
+            assert marker.exists() == (protocol == 2)
+        assert marker.read_text() == "start"
 
 
 def test_dev_verify_script_checks_exact_release_process_port_and_health():
