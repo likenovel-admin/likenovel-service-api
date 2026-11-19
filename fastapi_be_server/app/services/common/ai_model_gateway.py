@@ -50,6 +50,11 @@ _PROVIDER_MODEL_IDS = {
         "deepseek/deepseek-v4.1-flash-1017": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
     },
 }
+# Hive's Chat Completions reference documents this exact 405 as Out of Balance.
+_HIVE_OUT_OF_BALANCE = (
+    "Your Organization is currently paused. Please check your account balance, "
+    "our terms and conditions, or contact support@thehive.ai for more information."
+)
 _CREDIT_ERROR_CODES = frozenset({
     "insufficient_credit", "insufficient_credits", "insufficient_balance",
     "credit_balance_exhausted", "credits_exhausted", "balance_exhausted",
@@ -85,7 +90,20 @@ class _Target:
 class _RequestPlan:
     model_id: str
     revision: int
-    targets: tuple[_Target, ...]
+    prepaid_providers: tuple[str, ...]
+    openrouter: _Target
+    loaded_accounts: list[_Target] = field(default_factory=list, repr=False, compare=False)
+
+    def iter_targets(self) -> Iterator[_Target]:
+        for provider in self.prepaid_providers:
+            native_model = provider_model_id(provider, self.model_id)
+            accounts = [
+                _Target(provider, account.id, _PREPAID_BASE_URLS[provider], account.api_key, native_model)
+                for account in load_provider_accounts(provider)
+            ]
+            self.loaded_accounts.extend(accounts)
+            yield from accounts
+        yield self.openrouter
 
 
 def load_provider_accounts(provider: str) -> tuple[ProviderAccount, ...]:
@@ -178,15 +196,11 @@ def _request_plan(feature_key: str, payload: dict[str, Any], base_url: str, api_
     route = str(binding.billing_route)
     if not model_id or route not in {"openrouter", "hive", "river"}:
         raise AiModelGatewayConfigurationError("invalid model billing route")
-    targets: list[_Target] = []
-    if route != "openrouter":
-        native_model = provider_model_id(route, model_id)
-        targets.extend(
-            _Target(route, account.id, _PREPAID_BASE_URLS[route], account.api_key, native_model)
-            for account in load_provider_accounts(route)
-        )
-    targets.append(_Target("openrouter", "openrouter", base_url.rstrip("/"), api_key, model_id))
-    return _RequestPlan(model_id, int(binding.revision), tuple(targets))
+    prepaid = () if route == "openrouter" else (route,)
+    if feature_key == "ai_reader.decision" and route == "hive":
+        prepaid = ("hive", "river")
+    return _RequestPlan(model_id, int(binding.revision), prepaid,
+                        _Target("openrouter", "openrouter", base_url.rstrip("/"), api_key, model_id))
 
 
 def _payload_for_target(payload: dict[str, Any], target: _Target, *, stream: bool) -> dict[str, Any]:
@@ -230,7 +244,9 @@ def _headers_for_target(headers: dict[str, str], target: _Target) -> dict[str, s
     return result
 
 
-def _credit_exhausted(response: httpx.Response) -> bool:
+def _advance_account(feature_key: str, provider: str, response: httpx.Response) -> bool:
+    if provider == "openrouter":
+        return False
     if response.status_code == 402:
         return True
     if response.status_code < 400:
@@ -241,6 +257,15 @@ def _credit_exhausted(response: httpx.Response) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
+    if (
+        feature_key == "ai_reader.decision"
+        and provider == "hive"
+        and response.status_code == 405
+        and payload.get("status_code") == 405
+        and payload.get("message") == _HIVE_OUT_OF_BALANCE
+        and not any(payload.get(key) for key in ("error", "code", "type"))
+    ):
+        return True
     error = payload.get("error")
     candidates = [payload.get("code"), payload.get("type")]
     if isinstance(error, dict):
@@ -251,7 +276,7 @@ def _credit_exhausted(response: httpx.Response) -> bool:
 def _annotate_response(response: httpx.Response, target: _Target, plan: _RequestPlan) -> httpx.Response:
     if response.status_code >= 400:
         content = response.content
-        for candidate in plan.targets:
+        for candidate in (*plan.loaded_accounts, plan.openrouter):
             if candidate.api_key:
                 content = content.replace(candidate.api_key.encode(), b"[redacted]")
         if content != response.content:
@@ -282,7 +307,7 @@ def post_model_chat_completion(
 ) -> httpx.Response:
     plan = _request_plan(feature_key, json, base_url, api_key)
     notify = _once_before_submit(before_submit)
-    for target in plan.targets:
+    for target in plan.iter_targets():
         body = _payload_for_target(json, target, stream=False)
         target_headers = _headers_for_target(headers, target)
         try:
@@ -300,7 +325,7 @@ def post_model_chat_completion(
                 )
         except httpx.RequestError:
             raise AiModelGatewayTransportError(f"{target.provider} transport outcome is unknown; request was not resubmitted") from None
-        if target.provider != "openrouter" and _credit_exhausted(response):
+        if _advance_account(feature_key, target.provider, response):
             response.close()
             continue
         return _annotate_response(response, target, plan)
@@ -317,7 +342,7 @@ async def post_model_chat_completion_async(
 ) -> httpx.Response:
     plan = _request_plan(feature_key, json, base_url, api_key)
     notify = _once_before_submit(before_submit)
-    for target in plan.targets:
+    for target in plan.iter_targets():
         body = _payload_for_target(json, target, stream=False)
         target_headers = _headers_for_target(headers, target)
         attempt = None
@@ -350,7 +375,7 @@ async def post_model_chat_completion_async(
         finally:
             if attempt is not None:
                 await _record_gateway_usage(attempt, target, response, attempt_status)
-        if target.provider != "openrouter" and _credit_exhausted(response):
+        if _advance_account(feature_key, target.provider, response):
             await response.aclose()
             continue
         return _annotate_response(response, target, plan)
@@ -404,7 +429,7 @@ def stream_model_chat_completion(
 ) -> Iterator[httpx.Response]:
     """Synchronous streaming preserves the caller's first-byte/total deadline."""
     plan = _request_plan(feature_key, json, base_url, api_key)
-    for target in plan.targets:
+    for target in plan.iter_targets():
         body = _payload_for_target(json, target, stream=True)
         target_headers = _headers_for_target(headers, target)
         try:
@@ -414,7 +439,7 @@ def stream_model_chat_completion(
             ) as response:
                 if response.status_code >= 400:
                     response.read()
-                if target.provider != "openrouter" and _credit_exhausted(response):
+                if _advance_account(feature_key, target.provider, response):
                     continue
                 yield _annotate_response(response, target, plan)
                 return
@@ -451,7 +476,7 @@ async def stream_model_chat_completion_async(
     **request_kwargs: Any,
 ) -> AsyncIterator[httpx.Response]:
     plan = _request_plan(feature_key, json, base_url, api_key)
-    for target in plan.targets:
+    for target in plan.iter_targets():
         body = _payload_for_target(json, target, stream=True)
         target_headers = _headers_for_target(headers, target)
         try:
@@ -461,7 +486,7 @@ async def stream_model_chat_completion_async(
             ) as response:
                 if response.status_code >= 400:
                     await response.aread()
-                if target.provider != "openrouter" and _credit_exhausted(response):
+                if _advance_account(feature_key, target.provider, response):
                     continue
                 # Nothing after this yield can advance the account/provider loop.
                 yield _annotate_response(response, target, plan)

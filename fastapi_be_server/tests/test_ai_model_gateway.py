@@ -125,6 +125,84 @@ def test_exhausted_account_advances_once_then_openrouter_credit_guard(setup_rout
     assert len(reads) == 1
 
 
+HIVE_BALANCE_RESPONSE = {
+    "status_code": 405,
+    "message": "Your Organization is currently paused. Please check your account balance, "
+               "our terms and conditions, or contact support@thehive.ai for more information.",
+}
+
+
+@pytest.mark.parametrize("winner", ["hive-2", "hive-5", "river-1", "river-2", "openrouter"])
+def test_reader_exhausts_hive_then_river_then_guarded_openrouter(setup_route, winner):
+    _, _, path = setup_route
+    pools = {name: [{"id": f"{name}-{i}", "api_key": f"test-{name}-{i}"}
+                    for i in range(1, count + 1)] for name, count in [("hive", 5), ("river", 2)]}
+    path.write_text(json.dumps(pools))
+    calls = []
+
+    def handler(request):
+        if request.method == "GET":
+            assert request.url.host == "openrouter.ai" and request.url.path.endswith("/credits")
+            calls.append("reserve")
+            return httpx.Response(200, json={"data": {"total_credits": 10, "total_usage": 1}})
+        alias = request.headers["authorization"].removeprefix("Bearer test-")
+        if request.url.host == "openrouter.ai":
+            alias = "openrouter"
+        else:
+            provider = alias.split("-")[0]
+            assert str(request.url) == gateway._PREPAID_BASE_URLS[provider] + "/chat/completions"
+            assert json.loads(request.content)["model"] == gateway.provider_model_id(provider, MODEL)
+        calls.append(alias)
+        if alias == winner:
+            return success(request)
+        if alias.startswith("hive-"):
+            return httpx.Response(405, json=HIVE_BALANCE_RESPONSE)
+        return httpx.Response(402)
+
+    async def run():
+        kwargs = request_kwargs()
+        kwargs["feature_key"] = "ai_reader.decision"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await gateway.post_model_chat_completion_async(client, **kwargs)
+
+    response = asyncio.run(run())
+    order = [account["id"] for accounts in pools.values() for account in accounts] + ["reserve", "openrouter"]
+    assert calls == order[:order.index(winner) + 1]
+    assert response.extensions["ai_route"]["account_alias"] == winner
+
+
+@pytest.mark.parametrize("provider,body", [
+    ("hive", {"status_code": 405, "message": "Model paused for review"}),
+    ("hive", {"message": HIVE_BALANCE_RESPONSE["message"]}),
+    ("hive", {**HIVE_BALANCE_RESPONSE, "code": "MODEL_PAUSED"}),
+    ("river", HIVE_BALANCE_RESPONSE),
+])
+def test_reader_unrelated_405_stops_on_first_account(setup_route, provider, body):
+    binding, _, _ = setup_route
+    binding.billing_route = provider
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(405, json=body)
+
+    kwargs = request_kwargs()
+    kwargs["feature_key"] = "ai_reader.decision"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        response = gateway.post_model_chat_completion(client, **kwargs)
+    assert response.status_code == 405
+    assert len(calls) == 1
+
+
+def test_reader_healthy_hive_does_not_require_river_credentials(setup_route):
+    _, _, path = setup_route
+    path.write_text(json.dumps({"hive": [{"id": "hive-1", "api_key": "hive-secret-one"}]}))
+    kwargs = request_kwargs()
+    kwargs["feature_key"] = "ai_reader.decision"
+    with httpx.Client(transport=httpx.MockTransport(success)) as client:
+        response = gateway.post_model_chat_completion(client, **kwargs)
+    assert response.extensions["ai_route"]["account_alias"] == "hive-1"
+
+
 def test_confirmed_credit_error_code_can_advance_without_402(setup_route):
     calls = []
 
@@ -636,7 +714,10 @@ def test_opt_in_usage_preserves_tokens_and_actual_route(setup_route, monkeypatch
     assert record.attempt_no == 1 and record.operation_id == operation.operation_id
 
 
-def test_usage_records_each_credit_fallback_attempt(setup_route, monkeypatch):
+@pytest.mark.parametrize("feature_key,last_provider", [
+    ("storyctx.signals", "openrouter"), ("ai_reader.decision", "river"),
+])
+def test_usage_records_each_credit_fallback_attempt(setup_route, monkeypatch, feature_key, last_provider):
     from unittest.mock import AsyncMock
     from app.services.common.ai_provider_usage import AiProviderUsageOperation
     persist = AsyncMock(return_value=True)
@@ -653,17 +734,19 @@ def test_usage_records_each_credit_fallback_attempt(setup_route, monkeypatch):
 
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            return await gateway.post_model_chat_completion_async(client, **request_kwargs(),
+            kwargs = request_kwargs()
+            kwargs["feature_key"] = feature_key
+            return await gateway.post_model_chat_completion_async(client, **kwargs,
                 usage_operation=AiProviderUsageOperation(feature_key='ai_reader', stage_key='decision'))
     response = asyncio.run(run())
     records = [call.args[0] for call in persist.await_args_list]
     assert len(posts) == 3 and len(records) == 3
-    assert [r.provider for r in records] == ['hive', 'hive', 'openrouter']
+    assert [r.provider for r in records] == ['hive', 'hive', last_provider]
     assert [r.attempt_no for r in records] == [1, 2, 3]
     assert len({r.operation_id for r in records}) == 1
     assert [r.attempt_status for r in records] == ['http_error', 'http_error', 'success']
     assert records[-1].cost_source == 'provider_reported'
-    assert response.extensions['ai_route']['provider'] == 'openrouter'
+    assert response.extensions['ai_route']['provider'] == last_provider
 
 
 @pytest.mark.parametrize('outcome', ['timeout', 'cancelled', 'malformed', 'db_failure'])
